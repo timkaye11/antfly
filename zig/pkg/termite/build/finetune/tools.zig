@@ -76,6 +76,13 @@ const commands = [_]common.CommandSpec{
         .native_link = .default,
     },
     .{
+        .name = "eval-gliner2-autodiff-adapter-dataset",
+        .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter_dataset.zig",
+        .description = "Evaluate saved GLiNER2 autodiff PEFT adapter exact-match entity precision/recall/F1 on JSONL data",
+        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .termite_linalg },
+        .native_link = .default,
+    },
+    .{
         .name = "prepare-entity-cleanup-cache",
         .root_source_file = "src/finetune/tools/prepare_entity_cleanup_cache.zig",
         .description = "Prepare learned entity cleanup cache from annotated mention spans",

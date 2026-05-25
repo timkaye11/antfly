@@ -6,12 +6,51 @@ or reclassified.
 
 ## Current Status
 
-Status: not production-ready yet. The repeatable local smoke/readiness gates
-pass, and the branch now has a single production-readiness workflow command
-that encodes the remaining release criteria:
+Status: nearing production-ready for the resident Metal path, but not declared
+production-ready until the semantic golden and canonical Metal gate both pass
+on the target machine. The branch has a single production-readiness workflow
+command plus a Metal preset that encodes the release criteria.
+
+Canonical resident Metal gate:
 
 ```sh
-zig build gliner2-production-readiness -- \
+zig build -Dmetal=true gliner2-production-readiness -- \
+  /private/tmp/termite-models/gliner2 \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/termite-gliner2-metal-prod-gate \
+  person,organization,location \
+  --production-metal-gate \
+  --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
+  --semantic-golden "Barack Obama visited Berlin" Barack organization 0.03 \
+  --quality-eval \
+  --min-entity-f1 0.0
+```
+
+The preset selects `--backend metal`, `--compiled-required`, `--epochs 1`,
+`--batch-size 1`, `--max-examples 200`, `--seq-len 32`, requires at least
+200 steps, zero device-resident transfers, a Metal optimizer backend,
+device-resident trainable bytes, finite/decreasing loss, and
+`avg_step_wall_ms <= 3000`. Semantic adapter reload remains required unless
+`--skip-semantic-eval` is supplied explicitly. Use repeatable
+`--semantic-golden TEXT EXPECT_TEXT EXPECT_LABEL MIN_SCORE` entries for the
+release gate; the older `--eval-text` / `--expect-label` / `--min-score`
+single-golden form remains available for quick checks.
+`--quality-eval` runs saved-adapter dataset evaluation and can enforce
+`--min-entity-precision`, `--min-entity-recall`, and `--min-entity-f1`.
+The evaluator reports exact-match precision/recall/F1 for all decoded entities
+above `--quality-min-prediction-score` / `--min-prediction-score`.
+Use `--quality-nms-overlap FLOAT` to suppress same-label overlapping spans
+and `--quality-sweep-thresholds CSV` to report calibration curves. Additional
+decode-shaping controls are `--quality-top-k-per-label`,
+`--quality-max-predictions-per-example`, and
+`--quality-best-span-per-label-start`. The evaluator also reports per-label
+score min/max/mean so collapsed label distributions are visible in gate logs.
+
+Generic production-readiness command:
+
+```sh
+zig build -Dmetal=true gliner2-production-readiness -- \
   /models/gliner2 \
   /data/gliner2_train.jsonl \
   /data/gliner2_eval.jsonl \
@@ -36,17 +75,34 @@ validation, LoRA bundle inspection, semantic fixed-text adapter reload, and
 optional merged-checkpoint materialization.
 
 The current blocker is no longer basic model loading, adapter artifact
-emission, PEFT config metadata validation, the zero-row token-loss
-denominator, classifier-head writeback, empty-supervision smoke validation,
-artifact reload/materialization, profiler visibility, or the broad-suite Metal
-active-frame crash, decoded entity-level inference from real-model token
-logits before and after a smoke training run, saved PEFT/task-head reload for
-that smoke, or a 100-example/500-step non-toy MLX-backed training/validation
-run. The remaining work is production fidelity: semantic trained-adapter
-entity/span quality goldens, stable accelerated-run launch ergonomics, agreed
-backend performance thresholds, and promoting the new graph-native
-`span-start` objective from smoke-verified implementation to non-toy,
-semantically accepted production path.
+emission, PEFT config metadata validation, the zero-row token-loss denominator,
+classifier-head writeback, empty-supervision smoke validation, artifact
+reload/materialization, profiler visibility, broad-suite Metal active-frame
+crashes, decoded entity-level inference from real-model token logits, saved
+PEFT/task-head reload, non-toy Metal training, or resident Metal AdamW updates.
+The remaining work is production fidelity: semantic trained-adapter
+entity/span quality goldens, one canonical 200-example Metal run with semantic
+eval enabled, and continued graph-kernel optimization after the residency gate
+is stable.
+
+## Remaining Production Plan
+
+1. Expand semantic goldens from one smoke sentence to a small fixed suite that
+   covers person, organization, location, multi-token spans, and negative
+   distractors. The readiness command now supports repeatable
+   `--semantic-golden` entries.
+2. Add stronger span calibration beyond overlap NMS/top-k filtering. Full decoded
+   multi-entity precision, recall, and F1 are wired through
+   `eval-gliner2-autodiff-adapter-dataset`, with same-label overlap NMS,
+   top-k/max-prediction caps, best-span-per-start filtering, threshold sweeps,
+   and per-label score stats. The current adapter still collapses to
+   organization and has tightly clustered low scores.
+3. Repeat the canonical gate on a clean Apple Silicon environment and record
+   machine class, macOS version, Metal availability, peak resident bytes, and
+   average step time.
+4. Continue kernel optimization after the residency gate: attention
+   `dot_general`, reshape/transpose views, and remaining backward graph
+   partition hot spots are the next likely speed wins.
 
 ## Known Local Artifacts
 

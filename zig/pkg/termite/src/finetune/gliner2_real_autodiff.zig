@@ -101,6 +101,11 @@ pub const GlinerAutodiffConfig = struct {
     /// the MVP relies on zero target rows rather than consuming this value
     /// directly inside the graph.
     ignore_index: i32 = -100,
+    /// Positive/negative weights for the span-start multi-label loss. The
+    /// default positive weight offsets the sparse entity-label signal in a
+    /// large valid-span grid.
+    span_start_positive_weight: f32 = 32.0,
+    span_start_negative_weight: f32 = 1.0,
 };
 
 /// Trainer-opaque context that owns the graph-construction state and (after
@@ -373,7 +378,14 @@ pub const GlinerAutodiffCtx = struct {
         const entity_logits = try bld.sliceLastDim(all_logits, 1, @intCast(C));
         self.span_logits = entity_logits;
 
-        return buildMaskedSpanStartMseLoss(bld, entity_logits, labels, mask);
+        return buildMaskedSpanStartMseLoss(
+            bld,
+            entity_logits,
+            labels,
+            mask,
+            self.config.span_start_positive_weight,
+            self.config.span_start_negative_weight,
+        );
     }
 };
 
@@ -414,6 +426,8 @@ fn buildMaskedSpanStartMseLoss(
     logits: NodeId,
     labels: NodeId,
     mask: NodeId,
+    positive_weight: f32,
+    negative_weight: f32,
 ) !NodeId {
     const in_shape = bld.graph.node(logits).output_shape;
     const rank = in_shape.rank();
@@ -422,10 +436,18 @@ fn buildMaskedSpanStartMseLoss(
 
     const probs = try bld.sigmoid(logits);
     const diff = try bld.sub(probs, labels);
-    const masked = try bld.mul(diff, mask);
-    const sq = try bld.mul(masked, masked);
-    const numerator = try bld.reduceSum(sq, all_axes[0..rank]);
-    const denom = try bld.reduceSum(mask, all_axes[0..rank]);
+    const pos_weight = try bld.scalarConst(.f32, positive_weight);
+    const neg_weight = try bld.scalarConst(.f32, negative_weight);
+    const one = try bld.scalarConst(.f32, 1.0);
+    const pos_term = try bld.mul(labels, pos_weight);
+    const inverse_labels = try bld.sub(one, labels);
+    const neg_term = try bld.mul(inverse_labels, neg_weight);
+    const label_weights = try bld.add(pos_term, neg_term);
+    const weighted_mask = try bld.mul(mask, label_weights);
+    const sq = try bld.mul(diff, diff);
+    const weighted_sq = try bld.mul(sq, weighted_mask);
+    const numerator = try bld.reduceSum(weighted_sq, all_axes[0..rank]);
+    const denom = try bld.reduceSum(weighted_mask, all_axes[0..rank]);
     const eps = try bld.scalarConst(.f32, 1e-12);
     const denom_safe = try bld.add(denom, eps);
     return bld.div(numerator, denom_safe);
@@ -701,10 +723,14 @@ pub fn spanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) 
     });
 }
 
+pub const max_span_start_entity_types = 256;
+
 pub const SpanStartTargetStats = struct {
     valid_span_count: u64 = 0,
     positive_span_label_count: u64 = 0,
     ignored_span_count: u64 = 0,
+    entity_type_count: usize = 0,
+    positive_counts_by_entity_type: [max_span_start_entity_types]u64 = [_]u64{0} ** max_span_start_entity_types,
 };
 
 /// Pack `gliner2_data.EncodedBatch` span labels into the single trainer
@@ -717,9 +743,10 @@ pub fn fillSpanStartTargetsFromEncodedBatch(
     const rows = batch.batch_size * batch.max_spans;
     const width = 2 * E + 1;
     if (out.len != rows * width) return error.InvalidGlinerSpanTargetShape;
+    if (E > max_span_start_entity_types) return error.TooManyEntityTypes;
 
     @memset(out, 0.0);
-    var stats = SpanStartTargetStats{};
+    var stats = SpanStartTargetStats{ .entity_type_count = E };
 
     for (0..batch.batch_size) |sample_idx| {
         const word_pos_offset = sample_idx * batch.max_words_per_sample;
@@ -752,7 +779,10 @@ pub fn fillSpanStartTargetsFromEncodedBatch(
                 const label = batch.span_labels[flat_span_idx * E + entity_type_idx];
                 out[row + entity_type_idx] = label;
                 out[row + E + entity_type_idx] = 1.0;
-                if (label > 0.0) stats.positive_span_label_count += 1;
+                if (label > 0.0) {
+                    stats.positive_span_label_count += 1;
+                    stats.positive_counts_by_entity_type[entity_type_idx] += 1;
+                }
             }
             out[row + 2 * E] = @as(f32, @floatFromInt(sample_idx * batch.max_length + token_pos));
             stats.valid_span_count += 1;
@@ -885,6 +915,9 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
     try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
     try testing.expectEqual(@as(u64, 2), stats.positive_span_label_count);
     try testing.expectEqual(@as(u64, 1), stats.ignored_span_count);
+    try testing.expectEqual(@as(usize, 2), stats.entity_type_count);
+    try testing.expectEqual(@as(u64, 1), stats.positive_counts_by_entity_type[0]);
+    try testing.expectEqual(@as(u64, 1), stats.positive_counts_by_entity_type[1]);
 
     try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 2.0 }, targets[0..5]);
     try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 3.0 }, targets[5..10]);

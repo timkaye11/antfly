@@ -90,6 +90,8 @@ const Options = struct {
     num_classes: u32 = 5,
     objective: gliner2_autodiff.GlinerObjective = .token,
     max_span_width: u32 = 4,
+    span_positive_weight: f32 = 32.0,
+    span_negative_weight: f32 = 1.0,
     max_examples: usize = 0,
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
@@ -130,6 +132,8 @@ pub fn main(init: std.process.Init) !void {
     var num_classes: u32 = 5;
     var objective: gliner2_autodiff.GlinerObjective = .token;
     var max_span_width: u32 = 4;
+    var span_positive_weight: f32 = 32.0;
+    var span_negative_weight: f32 = 1.0;
     var max_examples: usize = 0;
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
@@ -176,6 +180,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--max-span-width")) {
             const val = args.next() orelse return error.MissingMaxSpanWidth;
             max_span_width = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--span-positive-weight")) {
+            const val = args.next() orelse return error.MissingSpanPositiveWeight;
+            span_positive_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--span-negative-weight")) {
+            const val = args.next() orelse return error.MissingSpanNegativeWeight;
+            span_negative_weight = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
             const val = args.next() orelse return error.MissingMaxExamples;
             max_examples = try std.fmt.parseUnsigned(usize, val, 10);
@@ -226,6 +236,8 @@ pub fn main(init: std.process.Init) !void {
         .num_classes = num_classes,
         .objective = objective,
         .max_span_width = max_span_width,
+        .span_positive_weight = span_positive_weight,
+        .span_negative_weight = span_negative_weight,
         .max_examples = max_examples,
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
@@ -269,7 +281,14 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_grad_norm,
         opts.grad_accum,
     });
-    print("  objective={s} max_span_width={d}\n", .{ objectiveName(opts.objective), opts.max_span_width });
+    print("  objective={s} max_span_width={d} span_pos_weight={d:.3} span_neg_weight={d:.3}\n", .{
+        objectiveName(opts.objective),
+        opts.max_span_width,
+        opts.span_positive_weight,
+        opts.span_negative_weight,
+    });
+    if (!std.math.isFinite(opts.span_positive_weight) or opts.span_positive_weight <= 0.0) return error.InvalidSpanPositiveWeight;
+    if (!std.math.isFinite(opts.span_negative_weight) or opts.span_negative_weight <= 0.0) return error.InvalidSpanNegativeWeight;
 
     // ------------------------------------------------------------------
     // 2. Load DeBERTa config — GLiNER2 stores the encoder config under
@@ -587,6 +606,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .graph_config = graph_config,
         .num_classes = opts.num_classes,
         .objective = opts.objective,
+        .span_start_positive_weight = opts.span_positive_weight,
+        .span_start_negative_weight = opts.span_negative_weight,
     });
 
     // ------------------------------------------------------------------
@@ -653,6 +674,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
     var cumulative_loss: f64 = 0.0;
     var total_steps: u64 = 0;
+    var run_target_stats = BatchTargetStats{};
     var metrics_jsonl: std.Io.Writer.Allocating = .init(allocator);
     defer metrics_jsonl.deinit();
 
@@ -754,6 +776,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             epoch_loss += result.loss;
             epoch_steps += 1;
             epoch_target_stats.add(target_stats);
+            run_target_stats.add(target_stats);
             total_steps += 1;
             try writeStepMetric(&metrics_jsonl.writer, epoch + 1, total_steps, epoch_steps, result.loss, result.grad_norm, result.optimizer_stepped, target_stats, timing);
 
@@ -828,7 +851,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count);
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, run_target_stats);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -857,6 +880,7 @@ fn writeStepMetric(
         .entity_token_count = target_stats.entity_token_count,
         .ignored_token_count = target_stats.ignored_token_count,
         .entity_token_rate = target_stats.entityTokenRate(),
+        .entity_label_positive_counts = target_stats.positiveCounts(),
         .target_build_ms = nsToMillis(timing.target_build_ns),
         .train_step_ms = nsToMillis(timing.train_step_ns),
         .step_wall_ms = nsToMillis(timing.step_wall_ns),
@@ -899,6 +923,7 @@ fn writeEpochMetric(
         .entity_token_count = target_stats.entity_token_count,
         .ignored_token_count = target_stats.ignored_token_count,
         .entity_token_rate = target_stats.entityTokenRate(),
+        .entity_label_positive_counts = target_stats.positiveCounts(),
         .epoch_wall_ms = nsToMillis(timing.epoch_wall_ns),
         .supervised_tokens_per_second = tokensPerSecond(target_stats.supervised_token_count, timing.epoch_wall_ns),
     }, .{}, writer);
@@ -917,6 +942,7 @@ fn writeTrainingManifest(
     adapter_parameter_file_count: usize,
     peft_adapter_tensor_count: usize,
     regular_trainable_tensor_count: usize,
+    target_stats: BatchTargetStats,
 ) !void {
     const manifest_path = try std.fs.path.join(allocator, &.{ opts.out_dir, run_validation.manifest_file_name });
     defer allocator.free(manifest_path);
@@ -950,9 +976,16 @@ fn writeTrainingManifest(
         .num_classes = opts.num_classes,
         .objective = objectiveName(opts.objective),
         .max_span_width = opts.max_span_width,
+        .span_positive_weight = opts.span_positive_weight,
+        .span_negative_weight = opts.span_negative_weight,
         .hidden_size = hidden_size,
         .entity_labels = entity_labels,
         .entity_label_count = entity_labels.len,
+        .entity_label_positive_counts = target_stats.positiveCounts(),
+        .supervised_token_count = target_stats.supervised_token_count,
+        .entity_token_count = target_stats.entity_token_count,
+        .ignored_token_count = target_stats.ignored_token_count,
+        .entity_token_rate = target_stats.entityTokenRate(),
         .max_examples = opts.max_examples,
         .max_grad_norm = opts.max_grad_norm,
         .grad_accum = opts.grad_accum,
@@ -1053,6 +1086,8 @@ const BatchTargetStats = struct {
     supervised_token_count: u64 = 0,
     entity_token_count: u64 = 0,
     ignored_token_count: u64 = 0,
+    entity_type_count: usize = 0,
+    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = [_]u64{0} ** gliner2_autodiff.max_span_start_entity_types,
 
     fn entityTokenRate(self: BatchTargetStats) f64 {
         if (self.supervised_token_count == 0) return 0.0;
@@ -1060,18 +1095,31 @@ const BatchTargetStats = struct {
             @as(f64, @floatFromInt(self.supervised_token_count));
     }
 
+    fn positiveCounts(self: *const BatchTargetStats) []const u64 {
+        return self.positive_counts_by_entity_type[0..self.entity_type_count];
+    }
+
     fn add(self: *BatchTargetStats, other: BatchTargetStats) void {
         self.supervised_token_count += other.supervised_token_count;
         self.entity_token_count += other.entity_token_count;
         self.ignored_token_count += other.ignored_token_count;
+        if (other.entity_type_count > self.entity_type_count) self.entity_type_count = other.entity_type_count;
+        for (0..other.entity_type_count) |idx| {
+            self.positive_counts_by_entity_type[idx] += other.positive_counts_by_entity_type[idx];
+        }
     }
 
     fn fromSpanStart(stats: gliner2_autodiff.SpanStartTargetStats, num_entity_types: usize) BatchTargetStats {
-        return .{
+        var out = BatchTargetStats{
             .supervised_token_count = stats.valid_span_count * @as(u64, @intCast(num_entity_types)),
             .entity_token_count = stats.positive_span_label_count,
             .ignored_token_count = stats.ignored_span_count * @as(u64, @intCast(num_entity_types)),
+            .entity_type_count = stats.entity_type_count,
         };
+        for (0..stats.entity_type_count) |idx| {
+            out.positive_counts_by_entity_type[idx] = stats.positive_counts_by_entity_type[idx];
+        }
+        return out;
     }
 };
 
@@ -1411,6 +1459,8 @@ fn printUsage() void {
         \\  --num-classes <n>         Entity classes incl. O tag (default: 5)
         \\  --objective <name>        token or span-start (default: token)
         \\  --max-span-width <n>      Max span width for span-start objective (default: 4)
+        \\  --span-positive-weight <f> Positive span-label loss weight (default: 32)
+        \\  --span-negative-weight <f> Negative span-label loss weight (default: 1)
         \\  --max-examples <n>        Cap on training examples (default: 0 = all)
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)

@@ -21374,6 +21374,177 @@ test "metal_compute: multiply keeps device scalar rhs broadcast resident" {
     try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8, 10, 12 }, out_data);
 }
 
+test "metal_compute: generic broadcast keeps device tensors resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 1, 3 });
+    defer metal_cb.free(input_host);
+    const input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
+    const input = try metal_compute.ctFromOwnedMetalTensor(input_mt);
+    defer metal_cb.free(input);
+
+    const out = try metal_cb.primBroadcastInDim(input, &.{ 2, 4, 3 }, &.{ 0, 1, 2 }, &.{ 2, 1, 3 });
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{
+        1, 2, 3,
+        1, 2, 3,
+        1, 2, 3,
+        1, 2, 3,
+        4, 5, 6,
+        4, 5, 6,
+        4, 5, 6,
+        4, 5, 6,
+    }, out_data);
+}
+
+test "metal_compute: large host broadcast uploads and stays resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var input_data: [128]f32 = undefined;
+    for (&input_data, 0..) |*value, idx| value.* = @floatFromInt(idx + 1);
+    const input = try metal_cb.fromFloat32Shape(&input_data, &.{ 2, 1, 64 });
+    defer metal_cb.free(input);
+
+    const out = try metal_cb.primBroadcastInDim(input, &.{ 2, 32, 64 }, &.{ 0, 1, 2 }, &.{ 2, 1, 64 });
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 32, 64 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqual(@as(usize, 4096), out_data.len);
+    for (out_data, 0..) |value, idx| {
+        const batch = idx / (32 * 64);
+        const col = idx % 64;
+        const expected: f32 = @floatFromInt(batch * 64 + col + 1);
+        try std.testing.expectEqual(expected, value);
+    }
+}
+
+test "metal_compute: non-last-axis reduce sum and mean stay resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_host = try metal_cb.fromFloat32Shape(&.{
+        1,  2,  3,  4,
+        5,  6,  7,  8,
+        9,  10, 11, 12,
+        13, 14, 15, 16,
+        17, 18, 19, 20,
+        21, 22, 23, 24,
+    }, &.{ 2, 3, 4 });
+    defer metal_cb.free(input_host);
+    const input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
+    const input = try metal_compute.ctFromOwnedMetalTensor(input_mt);
+    defer metal_cb.free(input);
+
+    const sum = try metal_cb.primReduceSum(input, &.{1}, &.{ 2, 3, 4 });
+    defer metal_cb.free(sum);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, sum));
+    const sum_shape = try metal_cb.tensorShape(sum, allocator);
+    defer allocator.free(sum_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1, 4 }, sum_shape);
+    const sum_data = try metal_cb.toFloat32(sum, allocator);
+    defer allocator.free(sum_data);
+    try std.testing.expectEqualSlices(f32, &.{
+        15, 18, 21, 24,
+        51, 54, 57, 60,
+    }, sum_data);
+
+    const mean = try metal_cb.primReduceMean(input, &.{1}, &.{ 2, 3, 4 });
+    defer metal_cb.free(mean);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, mean));
+    const mean_shape = try metal_cb.tensorShape(mean, allocator);
+    defer allocator.free(mean_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1, 4 }, mean_shape);
+    const mean_data = try metal_cb.toFloat32(mean, allocator);
+    defer allocator.free(mean_data);
+    try std.testing.expectEqualSlices(f32, &.{
+        5,  6,  7,  8,
+        17, 18, 19, 20,
+    }, mean_data);
+}
+
+test "metal_compute: lazy multiply reduce last dim stays resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var lhs_data: [4096]f32 = undefined;
+    var rhs_data: [4096]f32 = undefined;
+    for (&lhs_data, &rhs_data, 0..) |*lhs_value, *rhs_value, idx| {
+        lhs_value.* = @floatFromInt((idx % 8) + 1);
+        rhs_value.* = 2.0;
+    }
+    const lhs_host = try metal_cb.fromFloat32Shape(&lhs_data, &.{ 64, 8, 8 });
+    defer metal_cb.free(lhs_host);
+    const rhs_host = try metal_cb.fromFloat32Shape(&rhs_data, &.{ 64, 8, 8 });
+    defer metal_cb.free(rhs_host);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+
+    const product = try metal_cb.multiply(lhs, rhs);
+    defer metal_cb.free(product);
+    try std.testing.expect(MetalCompute.toBuf(product).lazy_multiply != null);
+
+    const reduced = try metal_cb.primReduceSum(product, &.{2}, &.{ 64, 8, 8 });
+    defer metal_cb.free(reduced);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, reduced));
+    const reduced_shape = try metal_cb.tensorShape(reduced, allocator);
+    defer allocator.free(reduced_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 64, 8, 1 }, reduced_shape);
+    const reduced_data = try metal_cb.toFloat32(reduced, allocator);
+    defer allocator.free(reduced_data);
+    try std.testing.expectEqual(@as(usize, 512), reduced_data.len);
+    for (reduced_data) |value| try std.testing.expectApproxEqAbs(@as(f32, 72.0), value, 1e-5);
+}
+
 test "metal_compute: batched dot_general keeps attention matmul resident" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;

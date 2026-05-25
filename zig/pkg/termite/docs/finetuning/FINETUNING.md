@@ -111,7 +111,42 @@ GLiNER2 is not declared production-ready until the production-readiness gate
 passes on a non-toy train/eval dataset with a semantic adapter-reload golden:
 
 ```sh
-zig build gliner2-production-readiness -- \
+zig build -Dmetal=true gliner2-production-readiness -- \
+  /private/tmp/termite-models/gliner2 \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/termite-gliner2-metal-prod-gate \
+  person,organization,location \
+  --production-metal-gate \
+  --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
+  --semantic-golden "Barack Obama visited Berlin" Barack organization 0.03 \
+  --quality-eval \
+  --min-entity-f1 0.0
+```
+
+`--production-metal-gate` is the canonical resident Metal preset: backend
+`metal`, compiled required, 200 examples/steps, batch size 1, sequence length
+32, Metal optimizer, zero device-resident transfers, nonzero resident
+trainable bytes, finite/decreasing loss, and `avg_step_wall_ms <= 3000`.
+Semantic adapter reload is required by default. Use repeatable
+`--semantic-golden TEXT EXPECT_TEXT EXPECT_LABEL MIN_SCORE` entries for a
+stronger release gate; the older single-golden `--eval-text`,
+`--expect-label`, and `--min-score` form remains supported.
+`--quality-eval` runs saved-adapter dataset evaluation and supports
+`--min-entity-precision`, `--min-entity-recall`, and `--min-entity-f1`.
+The evaluator reports exact-match metrics for all decoded entities above
+`--quality-min-prediction-score` / `--min-prediction-score`. Span calibration
+uses same-label overlap NMS by default; use `--quality-nms-overlap FLOAT`,
+`--quality-no-nms`, and `--quality-sweep-thresholds CSV` to inspect decoding
+calibration. `--quality-top-k-per-label`,
+`--quality-max-predictions-per-example`, and
+`--quality-best-span-per-label-start` provide stricter decode shaping before
+raising model-quality thresholds.
+
+For custom thresholds, pass the explicit options instead of the preset:
+
+```sh
+zig build -Dmetal=true gliner2-production-readiness -- \
   /models/gliner2 \
   /data/gliner2_train.jsonl \
   /data/gliner2_eval.jsonl \

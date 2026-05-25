@@ -1512,10 +1512,11 @@ test "build simple gliner2 batch" {
     var entities = [_]Entity{
         .{ .text = "john", .label = "person", .start = 0, .end = 4 },
         .{ .text = "acme", .label = "organization", .start = 14, .end = 18 },
+        .{ .text = "paris", .label = "location", .start = 22, .end = 27 },
     };
     const examples = [_]Example{
         .{
-            .text = "john works at acme",
+            .text = "john works at acme in paris",
             .entities = entities[0..],
         },
     };
@@ -1534,10 +1535,11 @@ test "decode gliner2 span predictions from score grid" {
     var entities = [_]Entity{
         .{ .text = "john", .label = "person", .start = 0, .end = 4 },
         .{ .text = "acme", .label = "organization", .start = 14, .end = 18 },
+        .{ .text = "paris", .label = "location", .start = 22, .end = 27 },
     };
     const examples = [_]Example{
         .{
-            .text = "john works at acme",
+            .text = "john works at acme in paris",
             .entities = entities[0..],
         },
     };
@@ -1546,7 +1548,7 @@ test "decode gliner2 span predictions from score grid" {
 
     const predictions = try decodeSpanPredictionsAlloc(allocator, &batch, entity_types[0..], batch.span_labels, 0.5);
     defer allocator.free(predictions);
-    try std.testing.expectEqual(@as(usize, 2), predictions.len);
+    try std.testing.expectEqual(@as(usize, 3), predictions.len);
     try std.testing.expectEqual(@as(usize, 0), predictions[0].sample_index);
     try std.testing.expectEqual(@as(usize, 0), predictions[0].word_start);
     try std.testing.expectEqual(@as(usize, 0), predictions[0].word_end);
@@ -1560,9 +1562,15 @@ test "decode gliner2 span predictions from score grid" {
     try std.testing.expectEqualStrings("organization", predictions[1].label);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), predictions[1].score, 1e-6);
 
+    try std.testing.expectEqual(@as(usize, 5), predictions[2].word_start);
+    try std.testing.expectEqual(@as(usize, 5), predictions[2].word_end);
+    try std.testing.expectEqual(@as(usize, 2), predictions[2].entity_type_index);
+    try std.testing.expectEqualStrings("location", predictions[2].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), predictions[2].score, 1e-6);
+
     const entity_predictions = try decodeEntityPredictionsAlloc(allocator, &batch, examples[0..], entity_types[0..], batch.span_labels, 0.5);
     defer allocator.free(entity_predictions);
-    try std.testing.expectEqual(@as(usize, 2), entity_predictions.len);
+    try std.testing.expectEqual(@as(usize, 3), entity_predictions.len);
 
     try std.testing.expectEqual(@as(usize, 0), entity_predictions[0].start);
     try std.testing.expectEqual(@as(usize, 4), entity_predictions[0].end);
@@ -1575,6 +1583,12 @@ test "decode gliner2 span predictions from score grid" {
     try std.testing.expectEqualStrings("acme", entity_predictions[1].text);
     try std.testing.expectEqualStrings("organization", entity_predictions[1].label);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), entity_predictions[1].score, 1e-6);
+
+    try std.testing.expectEqual(@as(usize, 22), entity_predictions[2].start);
+    try std.testing.expectEqual(@as(usize, 27), entity_predictions[2].end);
+    try std.testing.expectEqualStrings("paris", entity_predictions[2].text);
+    try std.testing.expectEqualStrings("location", entity_predictions[2].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), entity_predictions[2].score, 1e-6);
 }
 
 test "decode gliner2 entity predictions from token logits" {

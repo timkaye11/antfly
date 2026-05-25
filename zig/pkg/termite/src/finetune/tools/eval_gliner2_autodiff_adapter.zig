@@ -61,7 +61,7 @@ const Manifest = struct {
     }
 };
 
-const EvalOptions = struct {
+pub const EvalOptions = struct {
     model_dir: []const u8,
     adapter_dir: []const u8,
     text: []const u8,
@@ -72,9 +72,10 @@ const EvalOptions = struct {
     expect_text: ?[]const u8 = null,
     expect_label: ?[]const u8 = null,
     min_score: ?f32 = null,
+    prediction_threshold: ?f32 = null,
 };
 
-const TopEntity = struct {
+pub const TopEntity = struct {
     text: []const u8,
     label: []const u8,
     start: usize,
@@ -170,7 +171,7 @@ fn parseArgs(args_in: std.process.Args, allocator: std.mem.Allocator) !OwnedOpti
     return .{ .value = opts, .owned_entity_types_csv = owned_entity_types_csv };
 }
 
-const EvalSummary = struct {
+pub const EvalSummary = struct {
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     adapter_dir: []const u8,
@@ -183,8 +184,9 @@ const EvalSummary = struct {
     lora_alpha: f64,
     loaded_base_weight_count: usize,
     top: TopEntity,
+    predictions: []TopEntity,
 
-    fn deinit(self: *EvalSummary, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *EvalSummary, allocator: std.mem.Allocator) void {
         allocator.free(self.model_dir);
         allocator.free(self.adapter_dir);
         allocator.free(self.text);
@@ -192,6 +194,11 @@ const EvalSummary = struct {
         allocator.free(self.entity_types);
         allocator.free(self.top.text);
         allocator.free(self.top.label);
+        for (self.predictions) |prediction| {
+            allocator.free(prediction.text);
+            allocator.free(prediction.label);
+        }
+        allocator.free(self.predictions);
         self.* = undefined;
     }
 
@@ -207,6 +214,7 @@ const EvalSummary = struct {
         lora_alpha: f64,
         loaded_base_weight_count: usize,
         top_entity: TopEntity,
+        predictions: []const TopEntity,
     } {
         return .{
             .model_dir = self.model_dir,
@@ -220,9 +228,14 @@ const EvalSummary = struct {
             .lora_alpha = self.lora_alpha,
             .loaded_base_weight_count = self.loaded_base_weight_count,
             .top_entity = self.top,
+            .predictions = self.predictions,
         };
     }
 };
+
+pub fn evalSavedAdapterText(allocator: std.mem.Allocator, opts: EvalOptions) !EvalSummary {
+    return evalSavedAdapter(allocator, .{ .value = opts });
+}
 
 fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !EvalSummary {
     const opts = owned_opts.value;
@@ -311,7 +324,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
     try loadPeftAdaptersIntoTrainer(allocator, adapter_checkpoint_path, &trainer);
     try loadTaskHeadIntoTrainer(&task_head, &trainer);
 
-    const top = try decodeTextTopEntity(
+    const predictions = try decodeTextEntities(
         allocator,
         &tokenizer,
         entity_types,
@@ -322,7 +335,10 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         opts.max_span_width,
         &trainer,
         &gliner_ctx,
+        opts.prediction_threshold,
     );
+    errdefer freeTopEntities(allocator, predictions);
+    if (predictions.len == 0) return error.NoEntityPredictions;
 
     return .{
         .allocator = allocator,
@@ -337,12 +353,13 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         .lora_alpha = manifest.lora_alpha,
         .loaded_base_weight_count = loaded_base_weight_count,
         .top = .{
-            .text = try allocator.dupe(u8, top.text),
-            .label = try allocator.dupe(u8, top.label),
-            .start = top.start,
-            .end = top.end,
-            .score = top.score,
+            .text = try allocator.dupe(u8, predictions[0].text),
+            .label = try allocator.dupe(u8, predictions[0].label),
+            .start = predictions[0].start,
+            .end = predictions[0].end,
+            .score = predictions[0].score,
         },
+        .predictions = predictions,
     };
 }
 
@@ -470,7 +487,7 @@ fn ensureGraphBuilt(
     }
 }
 
-fn decodeTextTopEntity(
+fn decodeTextEntities(
     allocator: std.mem.Allocator,
     tokenizer: *const gliner2_data.Tokenizer,
     entity_types: []const []const u8,
@@ -481,9 +498,10 @@ fn decodeTextTopEntity(
     max_span_width: usize,
     trainer: *real_autodiff.RealAutodiffTrainer,
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
-) !TopEntity {
+    prediction_threshold: ?f32,
+) ![]TopEntity {
     return switch (objective) {
-        .token => decodeTextTopEntityFromTokenBridge(
+        .token => decodeTextEntitiesFromTokenBridge(
             allocator,
             tokenizer,
             entity_types,
@@ -493,8 +511,9 @@ fn decodeTextTopEntity(
             max_span_width,
             trainer,
             gliner_ctx,
+            prediction_threshold,
         ),
-        .span_start => decodeTextTopEntityFromSpanStart(
+        .span_start => decodeTextEntitiesFromSpanStart(
             allocator,
             tokenizer,
             entity_types,
@@ -503,11 +522,12 @@ fn decodeTextTopEntity(
             max_span_width,
             trainer,
             gliner_ctx,
+            prediction_threshold,
         ),
     };
 }
 
-fn decodeTextTopEntityFromTokenBridge(
+fn decodeTextEntitiesFromTokenBridge(
     allocator: std.mem.Allocator,
     tokenizer: *const gliner2_data.Tokenizer,
     entity_types: []const []const u8,
@@ -517,7 +537,8 @@ fn decodeTextTopEntityFromTokenBridge(
     max_span_width: usize,
     trainer: *real_autodiff.RealAutodiffTrainer,
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
-) !TopEntity {
+    prediction_threshold: ?f32,
+) ![]TopEntity {
     const input_ids = try allocator.alloc(i64, seq_len);
     defer allocator.free(input_ids);
     const attention_mask = try allocator.alloc(f32, seq_len);
@@ -560,26 +581,21 @@ fn decodeTextTopEntityFromTokenBridge(
     }
     if (max_span_score <= 0.0) return error.NoPositiveSpanScores;
 
+    const threshold = prediction_threshold orelse max_span_score - 1e-6;
     const predictions = try gliner2_data.decodeEntityPredictionsAlloc(
         allocator,
         &decoded_batch,
         &examples,
         entity_types,
         span_scores,
-        max_span_score - 1e-6,
+        threshold,
     );
     defer allocator.free(predictions);
     if (predictions.len == 0) return error.NoEntityPredictions;
-    return .{
-        .text = predictions[0].text,
-        .label = predictions[0].label,
-        .start = predictions[0].start,
-        .end = predictions[0].end,
-        .score = predictions[0].score,
-    };
+    return copyPredictions(allocator, predictions);
 }
 
-fn decodeTextTopEntityFromSpanStart(
+fn decodeTextEntitiesFromSpanStart(
     allocator: std.mem.Allocator,
     tokenizer: *const gliner2_data.Tokenizer,
     entity_types: []const []const u8,
@@ -588,7 +604,8 @@ fn decodeTextTopEntityFromSpanStart(
     max_span_width: usize,
     trainer: *real_autodiff.RealAutodiffTrainer,
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
-) !TopEntity {
+    prediction_threshold: ?f32,
+) ![]TopEntity {
     const examples = [_]gliner2_data.Example{.{ .text = text, .entities = &.{} }};
     var decoded_batch = try gliner2_data.buildSimpleBatch(
         allocator,
@@ -645,23 +662,49 @@ fn decodeTextTopEntityFromSpanStart(
     }
     if (max_span_score <= 0.0) return error.NoPositiveSpanScores;
 
+    const threshold = prediction_threshold orelse max_span_score - 1e-6;
     const predictions = try gliner2_data.decodeEntityPredictionsAlloc(
         allocator,
         &decoded_batch,
         &examples,
         entity_types,
         span_scores,
-        max_span_score - 1e-6,
+        threshold,
     );
     defer allocator.free(predictions);
     if (predictions.len == 0) return error.NoEntityPredictions;
-    return .{
-        .text = predictions[0].text,
-        .label = predictions[0].label,
-        .start = predictions[0].start,
-        .end = predictions[0].end,
-        .score = predictions[0].score,
-    };
+    return copyPredictions(allocator, predictions);
+}
+
+fn copyPredictions(allocator: std.mem.Allocator, predictions: []const gliner2_data.EntityPrediction) ![]TopEntity {
+    var out = try allocator.alloc(TopEntity, predictions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |prediction| {
+            allocator.free(prediction.text);
+            allocator.free(prediction.label);
+        }
+        allocator.free(out);
+    }
+    for (predictions, 0..) |prediction, idx| {
+        out[idx] = .{
+            .text = try allocator.dupe(u8, prediction.text),
+            .label = try allocator.dupe(u8, prediction.label),
+            .start = prediction.start,
+            .end = prediction.end,
+            .score = prediction.score,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeTopEntities(allocator: std.mem.Allocator, predictions: []TopEntity) void {
+    for (predictions) |prediction| {
+        allocator.free(prediction.text);
+        allocator.free(prediction.label);
+    }
+    allocator.free(predictions);
 }
 
 fn fillInferenceBuffers(

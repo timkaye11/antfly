@@ -21,9 +21,17 @@ const validation = termite.finetune.gliner2_run_validation;
 
 const train_gliner2_autodiff = @import("train/train_gliner2_autodiff.zig");
 const eval_gliner2_autodiff_adapter = @import("tools/eval_gliner2_autodiff_adapter.zig");
+const eval_gliner2_autodiff_adapter_dataset = @import("tools/eval_gliner2_autodiff_adapter_dataset.zig");
 const materialize_gliner2_lora = @import("tools/materialize_gliner2_lora.zig");
 
 const CommandMain = *const fn (std.process.Init) anyerror!void;
+
+const SemanticGolden = struct {
+    text: []const u8,
+    expect_text: []const u8,
+    expect_label: []const u8,
+    min_score: []const u8,
+};
 
 const Options = struct {
     model_dir: []const u8,
@@ -41,11 +49,14 @@ const Options = struct {
     lora_alpha: []const u8 = "32",
     objective: []const u8 = "span-start",
     max_span_width: []const u8 = "4",
+    span_positive_weight: []const u8 = "32",
+    span_negative_weight: []const u8 = "1",
     max_grad_norm: []const u8 = "1.0",
     grad_accum: []const u8 = "1",
     seed: []const u8 = "42",
     backend: []const u8 = "auto",
     compiled_required: bool = false,
+    production_metal_gate: bool = false,
     num_classes_override: ?[]const u8 = null,
 
     min_train_examples: usize = 100,
@@ -71,7 +82,21 @@ const Options = struct {
     expect_text: ?[]const u8 = null,
     expect_label: ?[]const u8 = null,
     min_score: ?[]const u8 = null,
+    semantic_goldens: [16]SemanticGolden = undefined,
+    semantic_golden_count: usize = 0,
     skip_semantic_eval: bool = false,
+    quality_eval: bool = false,
+    quality_max_examples: ?[]const u8 = null,
+    quality_min_prediction_score: ?[]const u8 = null,
+    quality_sweep_thresholds: ?[]const u8 = null,
+    quality_nms_overlap: ?[]const u8 = null,
+    quality_disable_nms: bool = false,
+    quality_max_predictions_per_example: ?[]const u8 = null,
+    quality_top_k_per_label: ?[]const u8 = null,
+    quality_best_span_per_label_start: bool = false,
+    min_entity_precision: ?[]const u8 = null,
+    min_entity_recall: ?[]const u8 = null,
+    min_entity_f1: ?[]const u8 = null,
 
     materialized_dir: ?[]const u8 = null,
     dry_run: bool = false,
@@ -170,23 +195,25 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     const num_classes_arg = try std.fmt.bufPrint(&num_classes_buf, "{d}", .{num_classes});
 
     const train_args = [_][]const u8{
-        "--model-dir",      opts.model_dir,
-        "--train-data",     opts.train_data,
-        "--out-dir",        opts.out_dir,
-        "--epochs",         opts.epochs,
-        "--batch-size",     opts.batch_size,
-        "--max-examples",   opts.max_examples,
-        "--seq-len",        opts.seq_len,
-        "--num-classes",    num_classes_arg,
-        "--learning-rate",  opts.learning_rate,
-        "--lora-rank",      opts.lora_rank,
-        "--lora-alpha",     opts.lora_alpha,
-        "--objective",      opts.objective,
-        "--max-span-width", opts.max_span_width,
-        "--max-grad-norm",  opts.max_grad_norm,
-        "--grad-accum",     opts.grad_accum,
-        "--seed",           opts.seed,
-        "--backend",        opts.backend,
+        "--model-dir",            opts.model_dir,
+        "--train-data",           opts.train_data,
+        "--out-dir",              opts.out_dir,
+        "--epochs",               opts.epochs,
+        "--batch-size",           opts.batch_size,
+        "--max-examples",         opts.max_examples,
+        "--seq-len",              opts.seq_len,
+        "--num-classes",          num_classes_arg,
+        "--learning-rate",        opts.learning_rate,
+        "--lora-rank",            opts.lora_rank,
+        "--lora-alpha",           opts.lora_alpha,
+        "--objective",            opts.objective,
+        "--max-span-width",       opts.max_span_width,
+        "--span-positive-weight", opts.span_positive_weight,
+        "--span-negative-weight", opts.span_negative_weight,
+        "--max-grad-norm",        opts.max_grad_norm,
+        "--grad-accum",           opts.grad_accum,
+        "--seed",                 opts.seed,
+        "--backend",              opts.backend,
     };
     var train_args_list = std.ArrayListUnmanaged([]const u8).empty;
     defer train_args_list.deinit(allocator);
@@ -220,31 +247,25 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
 
     const semantic_required = !opts.skip_semantic_eval;
     if (semantic_required) {
-        const eval_text = opts.eval_text orelse return error.MissingSemanticEvalText;
-        const expect_label = opts.expect_label orelse return error.MissingSemanticExpectedLabel;
-        const min_score = opts.min_score orelse return error.MissingSemanticMinScore;
-        var eval_args_list = std.ArrayListUnmanaged([]const u8).empty;
-        defer eval_args_list.deinit(allocator);
-        try eval_args_list.appendSlice(allocator, &.{
-            opts.model_dir,
-            opts.out_dir,
-            eval_text,
-            opts.entity_types_csv,
-            "--seq-len",
-            opts.seq_len,
-            "--max-span-width",
-            opts.max_span_width,
-            "--objective",
-            opts.objective,
-            "--expect-label",
-            expect_label,
-            "--min-score",
-            min_score,
-        });
-        if (opts.expect_text) |expect_text| {
-            try eval_args_list.appendSlice(allocator, &.{ "--expect-text", expect_text });
+        if (opts.semantic_golden_count > 0) {
+            for (opts.semantic_goldens[0..opts.semantic_golden_count]) |golden| {
+                try runSemanticEval(init, allocator, opts, golden);
+            }
+        } else {
+            const eval_text = opts.eval_text orelse return error.MissingSemanticEvalText;
+            const expect_label = opts.expect_label orelse return error.MissingSemanticExpectedLabel;
+            const min_score = opts.min_score orelse return error.MissingSemanticMinScore;
+            try runSemanticEval(init, allocator, opts, .{
+                .text = eval_text,
+                .expect_text = opts.expect_text orelse "",
+                .expect_label = expect_label,
+                .min_score = min_score,
+            });
         }
-        try runCommand(init, allocator, "eval-gliner2-autodiff-adapter", eval_gliner2_autodiff_adapter.main, eval_args_list.items);
+    }
+
+    if (opts.quality_eval) {
+        try runQualityEval(init, allocator, opts);
     }
 
     if (opts.materialized_dir) |materialized_dir| {
@@ -273,6 +294,69 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     validation.freeRunValidationSummary(allocator, &run_summary);
     gliner2_data.freeDatasetReadinessSummary(allocator, &eval_readiness);
     gliner2_data.freeDatasetReadinessSummary(allocator, &train_readiness);
+}
+
+fn runQualityEval(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: Options,
+) !void {
+    var quality_args_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer quality_args_list.deinit(allocator);
+    try quality_args_list.appendSlice(allocator, &.{
+        opts.model_dir,
+        opts.out_dir,
+        opts.eval_data,
+        opts.entity_types_csv,
+        "--seq-len",
+        opts.seq_len,
+        "--max-span-width",
+        opts.max_span_width,
+        "--objective",
+        opts.objective,
+    });
+    if (opts.quality_max_examples) |value| try quality_args_list.appendSlice(allocator, &.{ "--max-examples", value });
+    if (opts.quality_min_prediction_score) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-prediction-score", value });
+    if (opts.quality_sweep_thresholds) |value| try quality_args_list.appendSlice(allocator, &.{ "--sweep-thresholds", value });
+    if (opts.quality_nms_overlap) |value| try quality_args_list.appendSlice(allocator, &.{ "--nms-overlap", value });
+    if (opts.quality_disable_nms) try quality_args_list.append(allocator, "--no-nms");
+    if (opts.quality_max_predictions_per_example) |value| try quality_args_list.appendSlice(allocator, &.{ "--max-predictions-per-example", value });
+    if (opts.quality_top_k_per_label) |value| try quality_args_list.appendSlice(allocator, &.{ "--top-k-per-label", value });
+    if (opts.quality_best_span_per_label_start) try quality_args_list.append(allocator, "--best-span-per-label-start");
+    if (opts.min_entity_precision) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-precision", value });
+    if (opts.min_entity_recall) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-recall", value });
+    if (opts.min_entity_f1) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-f1", value });
+    try runCommand(init, allocator, "eval-gliner2-autodiff-adapter-dataset", eval_gliner2_autodiff_adapter_dataset.main, quality_args_list.items);
+}
+
+fn runSemanticEval(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    golden: SemanticGolden,
+) !void {
+    var eval_args_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer eval_args_list.deinit(allocator);
+    try eval_args_list.appendSlice(allocator, &.{
+        opts.model_dir,
+        opts.out_dir,
+        golden.text,
+        opts.entity_types_csv,
+        "--seq-len",
+        opts.seq_len,
+        "--max-span-width",
+        opts.max_span_width,
+        "--objective",
+        opts.objective,
+        "--expect-label",
+        golden.expect_label,
+        "--min-score",
+        golden.min_score,
+    });
+    if (golden.expect_text.len > 0) {
+        try eval_args_list.appendSlice(allocator, &.{ "--expect-text", golden.expect_text });
+    }
+    try runCommand(init, allocator, "eval-gliner2-autodiff-adapter", eval_gliner2_autodiff_adapter.main, eval_args_list.items);
 }
 
 fn resolveNumClasses(
@@ -351,6 +435,19 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\out_dir: {s}
         \\entity_types: {s}
         \\objective: {s}
+        \\production_metal_gate: {}
+        \\backend: {s}
+        \\compiled_required: {}
+        \\max_examples: {s}
+        \\seq_len: {s}
+        \\batch_size: {s}
+        \\span_positive_weight: {s}
+        \\span_negative_weight: {s}
+        \\max_avg_step_wall_ms: {?d}
+        \\max_device_resident_transfer_count: {?}
+        \\min_device_trainable_bytes: {?}
+        \\semantic_golden_count: {}
+        \\quality_eval: {}
         \\semantic_eval_required: {}
         \\
     , .{
@@ -360,6 +457,19 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.out_dir,
         opts.entity_types_csv,
         opts.objective,
+        opts.production_metal_gate,
+        opts.backend,
+        opts.compiled_required,
+        opts.max_examples,
+        opts.seq_len,
+        opts.batch_size,
+        opts.span_positive_weight,
+        opts.span_negative_weight,
+        opts.max_avg_step_wall_ms,
+        opts.max_device_resident_transfer_count,
+        opts.min_device_trainable_bytes,
+        opts.semantic_golden_count,
+        opts.quality_eval,
         !opts.skip_semantic_eval,
     });
     try writer.interface.flush();
@@ -408,6 +518,10 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.objective = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-span-width")) {
             opts.max_span_width = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--span-positive-weight")) {
+            opts.span_positive_weight = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--span-negative-weight")) {
+            opts.span_negative_weight = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-grad-norm")) {
             opts.max_grad_norm = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--grad-accum")) {
@@ -418,6 +532,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.backend = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--compiled-required")) {
             opts.compiled_required = true;
+        } else if (std.mem.eql(u8, arg, "--production-metal-gate")) {
+            applyProductionMetalGateDefaults(&opts);
         } else if (std.mem.eql(u8, arg, "--num-classes")) {
             opts.num_classes_override = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--min-train-examples")) {
@@ -462,8 +578,44 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.expect_label = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--min-score")) {
             opts.min_score = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--semantic-golden")) {
+            if (opts.semantic_golden_count >= opts.semantic_goldens.len) return error.TooManySemanticGoldens;
+            opts.semantic_goldens[opts.semantic_golden_count] = .{
+                .text = args.next() orelse return usageError(),
+                .expect_text = args.next() orelse return usageError(),
+                .expect_label = args.next() orelse return usageError(),
+                .min_score = args.next() orelse return usageError(),
+            };
+            opts.semantic_golden_count += 1;
         } else if (std.mem.eql(u8, arg, "--skip-semantic-eval")) {
             opts.skip_semantic_eval = true;
+        } else if (std.mem.eql(u8, arg, "--quality-eval")) {
+            opts.quality_eval = true;
+        } else if (std.mem.eql(u8, arg, "--quality-max-examples")) {
+            opts.quality_max_examples = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--quality-min-prediction-score")) {
+            opts.quality_min_prediction_score = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--quality-sweep-thresholds")) {
+            opts.quality_sweep_thresholds = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--quality-nms-overlap")) {
+            opts.quality_nms_overlap = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--quality-no-nms")) {
+            opts.quality_disable_nms = true;
+        } else if (std.mem.eql(u8, arg, "--quality-max-predictions-per-example")) {
+            opts.quality_max_predictions_per_example = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--quality-top-k-per-label")) {
+            opts.quality_top_k_per_label = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--quality-best-span-per-label-start")) {
+            opts.quality_best_span_per_label_start = true;
+        } else if (std.mem.eql(u8, arg, "--min-entity-precision")) {
+            opts.min_entity_precision = args.next() orelse return usageError();
+            opts.quality_eval = true;
+        } else if (std.mem.eql(u8, arg, "--min-entity-recall")) {
+            opts.min_entity_recall = args.next() orelse return usageError();
+            opts.quality_eval = true;
+        } else if (std.mem.eql(u8, arg, "--min-entity-f1")) {
+            opts.min_entity_f1 = args.next() orelse return usageError();
+            opts.quality_eval = true;
         } else if (std.mem.eql(u8, arg, "--materialized-dir")) {
             opts.materialized_dir = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -476,6 +628,29 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
         }
     }
     return opts;
+}
+
+fn applyProductionMetalGateDefaults(opts: *Options) void {
+    opts.production_metal_gate = true;
+    opts.epochs = "1";
+    opts.batch_size = "1";
+    opts.max_examples = "200";
+    opts.seq_len = "32";
+    opts.backend = "metal";
+    opts.compiled_required = true;
+    opts.min_train_examples = 200;
+    opts.min_eval_examples = 200;
+    opts.min_total_entities = 100;
+    opts.min_unique_labels = 3;
+    opts.min_positive_span_labels = 100;
+    opts.min_steps = 200;
+    opts.min_supervised_tokens = 1000;
+    opts.min_entity_tokens = 100;
+    opts.max_avg_step_wall_ms = 3000.0;
+    opts.max_device_resident_transfer_count = 0;
+    opts.min_device_trainable_bytes = 1;
+    opts.require_loss_decrease = true;
+    opts.skip_semantic_eval = false;
 }
 
 fn parseUsizeArg(args: *std.process.Args.Iterator, name: []const u8) !usize {
@@ -515,6 +690,20 @@ fn printUsage() void {
         \\  --eval-text TEXT
         \\  --expect-label LABEL
         \\  --min-score FLOAT
+        \\  --semantic-golden TEXT EXPECT_TEXT EXPECT_LABEL MIN_SCORE
+        \\      Repeatable stronger form. When present, these replace --eval-text.
+        \\  --quality-eval
+        \\  --quality-max-examples N
+        \\  --quality-min-prediction-score FLOAT
+        \\  --quality-sweep-thresholds CSV
+        \\  --quality-nms-overlap FLOAT
+        \\  --quality-no-nms
+        \\  --quality-max-predictions-per-example N
+        \\  --quality-top-k-per-label N
+        \\  --quality-best-span-per-label-start
+        \\  --min-entity-precision FLOAT
+        \\  --min-entity-recall FLOAT
+        \\  --min-entity-f1 FLOAT
         \\
         \\Common options:
         \\  --objective token|span-start      Training/eval objective (default: span-start)
@@ -523,8 +712,11 @@ fn printUsage() void {
         \\  --seq-len N                      Sequence length (default: 256)
         \\  --batch-size N                   Batch size (default: 1)
         \\  --learning-rate FLOAT            Learning rate (default: 1e-3)
+        \\  --span-positive-weight FLOAT     Positive span-label loss weight (default: 32)
+        \\  --span-negative-weight FLOAT     Negative span-label loss weight (default: 1)
         \\  --backend auto|metal|mlx|native  Training backend (default: auto)
         \\  --compiled-required              Fail if requested compiled backend falls back
+        \\  --production-metal-gate          Canonical 200-step resident Metal gate
         \\  --materialized-dir DIR           Also materialize merged model artifacts
         \\  --dry-run                        Print the gate shape without touching model/data files
         \\
