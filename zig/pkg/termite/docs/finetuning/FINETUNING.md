@@ -105,6 +105,29 @@ termite finetune smoke-fast
 
 `smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/termite-finetune-smoke-fast/fast_smoke_summary.json` by default.
 
+### GLiNER2 Production Readiness
+
+GLiNER2 is not declared production-ready until the production-readiness gate
+passes on a non-toy train/eval dataset with a semantic adapter-reload golden:
+
+```sh
+zig build gliner2-production-readiness -- \
+  /models/gliner2 \
+  /data/gliner2_train.jsonl \
+  /data/gliner2_eval.jsonl \
+  /runs/gliner2-prod-gate \
+  person,organization,location \
+  --eval-text "Alice joined Acme in Paris" \
+  --expect-label organization \
+  --min-score 0.05 \
+  --materialized-dir /runs/gliner2-prod-gate/materialized
+```
+
+The gate performs dataset readiness checks, full autodiff training, artifact
+validation, LoRA bundle inspection, fixed-text semantic eval against the
+reloaded adapter, and optional materialization. Use `--dry-run
+--skip-semantic-eval` to verify build wiring without local model/data files.
+
 ### Adapter Matrix
 
 | Recipe | Family | Current route |

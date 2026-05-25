@@ -421,7 +421,7 @@ fn printMetalRuntimeProfile(before: ops.BackendDebugTimingSnapshot, after: ops.B
     const b = before.provider;
     const a = after.provider;
     std.debug.print(
-        "gliner_metal_profile: frame_begins={} frame_submits={} frame_wait_ms={d:.3} frame_gpu_ms={d:.3} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active_frame={} mps_standalone_wait_ms={d:.3} mps_standalone_gpu_ms={d:.3} last_frame_mps={} graph_plan_count={} graph_plan_slots={} graph_plan_bytes={} graph_plan_reuses={} deberta_encoder_plan_attempts={} deberta_encoder_plan_successes={} deberta_encoder_plan_reuses={} deberta_encoder_plan_failures={} deberta_embeddings_attempts={} deberta_embeddings_successes={} deberta_embeddings_fallbacks={} deberta_encoder_layer_attempts={} deberta_encoder_layer_successes={} deberta_encoder_layer_fallbacks={} deberta_ffn_fused={} deberta_ffn_fused_mps={} deberta_ffn_fused_fallbacks={} deberta_attention_gemm={} deberta_attention_gemm_fallbacks={} deberta_attention_legacy={} mpsgraph_ffn={} mpsgraph_ffn_fallbacks={} mpsgraph_ffn_compiles={} mpsgraph_ffn_cache_hits={}\n",
+        "gliner_metal_profile: frame_begins={} frame_submits={} frame_wait_ms={d:.3} frame_gpu_ms={d:.3} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active_frame={} mps_standalone_wait_ms={d:.3} mps_standalone_gpu_ms={d:.3} last_frame_mps={} graph_plan_count={} graph_plan_slots={} graph_plan_bytes={} graph_plan_reuses={} deberta_encoder_plan_attempts={} deberta_encoder_plan_successes={} deberta_encoder_plan_reuses={} deberta_encoder_plan_failures={} deberta_embeddings_attempts={} deberta_embeddings_successes={} deberta_embeddings_fallbacks={} deberta_encoder_layer_attempts={} deberta_encoder_layer_successes={} deberta_encoder_layer_fallbacks={} deberta_ffn_fused={} deberta_ffn_fused_mps={} deberta_ffn_fused_fallbacks={} deberta_attention_gemm={} deberta_attention_gemm_fallbacks={} deberta_attention_legacy={}\n",
         .{
             deltaU64(a.decoder_runtime_frame_begins, b.decoder_runtime_frame_begins),
             deltaU64(a.decoder_runtime_frame_submits, b.decoder_runtime_frame_submits),
@@ -454,6 +454,11 @@ fn printMetalRuntimeProfile(before: ops.BackendDebugTimingSnapshot, after: ops.B
             deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls),
             deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks),
             deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls),
+        },
+    );
+    std.debug.print(
+        "gliner_metal_profile_mpsgraph: ffn={} ffn_fallbacks={} ffn_compiles={} ffn_cache_hits={}\n",
+        .{
             deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls),
             deltaU64(a.metal_runtime_mpsgraph_ffn_fallbacks, b.metal_runtime_mpsgraph_ffn_fallbacks),
             deltaU64(a.metal_runtime_mpsgraph_ffn_compiles, b.metal_runtime_mpsgraph_ffn_compiles),

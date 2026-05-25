@@ -46,11 +46,15 @@ const build_options = @import("build_options");
 const termite = @import("termite_internal");
 const ml = @import("ml");
 const native_compute = termite.native_compute.native;
+const metal_compute = if (build_options.enable_metal) termite.native_compute.metal else struct {};
+const gpu_hosted_store = termite.native_compute.gpu_hosted_store;
+const metal_runtime = termite.metal_runtime;
 const compat = termite.io.compat;
 const weight_source_mod = termite.models.weight_source;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const LoadedWeight = weight_source_mod.LoadedWeight;
 const Tensor = termite.backends.Tensor;
+const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
 
 // MLX backend (Apple Silicon GPU acceleration).
 const mlx_mod = termite.backends.mlx;
@@ -90,6 +94,15 @@ const Options = struct {
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
     seed: u64 = 42,
+    backend: Gliner2TrainBackend = .auto,
+    compiled_required: bool = false,
+};
+
+const Gliner2TrainBackend = enum {
+    auto,
+    metal,
+    mlx,
+    native,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +134,8 @@ pub fn main(init: std.process.Init) !void {
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
     var seed: u64 = 42;
+    var backend: Gliner2TrainBackend = .auto;
+    var compiled_required: bool = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -173,6 +188,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--seed")) {
             const val = args.next() orelse return error.MissingSeed;
             seed = try std.fmt.parseUnsigned(u64, val, 10);
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            const val = args.next() orelse return error.MissingBackend;
+            backend = parseBackend(val) orelse return error.InvalidBackend;
+        } else if (std.mem.eql(u8, arg, "--compiled-required")) {
+            compiled_required = true;
         } else {
             print("error: unknown argument: {s}\n", .{arg});
             printUsage();
@@ -210,6 +230,8 @@ pub fn main(init: std.process.Init) !void {
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
         .seed = seed,
+        .backend = backend,
+        .compiled_required = compiled_required,
     };
 
     try runTraining(allocator, opts);
@@ -283,6 +305,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // of which backend branch we take.
     var mlx_ws: if (build_options.enable_mlx) mlx_compute.WeightStore else void = undefined;
     var mlx_backend: if (build_options.enable_mlx) mlx_compute.MlxCompute else void = undefined;
+    var metal_ws: MetalWeightStore = undefined;
+    var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
     var native_ws: native_compute.WeightStore = undefined;
     var native_backend: native_compute.NativeCompute = undefined;
 
@@ -291,6 +315,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     defer if (safetensors_source) |s| s.weightSource().deinit();
 
     const force_native = envFlag("TERMITE_GLINER2_FORCE_NATIVE");
+    const metal_runtime_available = if (comptime build_options.enable_metal)
+        (!force_native and metal_runtime.metalDeviceAvailable())
+    else
+        false;
     const mlx_runtime_available = if (comptime build_options.enable_mlx)
         (!force_native and (mlx.metalDeviceAvailable() or mlx.allowCpuStreamWithoutMetal()))
     else
@@ -303,8 +331,31 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         }
     }
 
-    const use_mlx = if (comptime build_options.enable_mlx) mlx_runtime_available else false;
-    const cb = if (use_mlx) blk: {
+    const selected_backend = selectBackend(opts.backend, force_native, metal_runtime_available, mlx_runtime_available) catch |err| {
+        switch (err) {
+            error.MetalBackendUnavailable => print("error: --backend metal requested but Metal is not built or no Metal device is available\n", .{}),
+            error.MlxBackendUnavailable => print("error: --backend mlx requested but MLX is not built or unavailable\n", .{}),
+        }
+        return err;
+    };
+
+    const cb = if (selected_backend == .metal) blk: {
+        if (comptime build_options.enable_metal) {
+            metal_ws = .{
+                .allocator = allocator,
+                .resident_weights = if (comptime build_options.enable_mlx) mlx_c.mlx_map_string_to_array_new() else {},
+                .stream = if (comptime build_options.enable_mlx) mlx.openDefaultStream().stream else {},
+                .prefix = "",
+                .lazy_weights = .{},
+            };
+            try loadSafetensorsIntoGpuHostedStore(allocator, &metal_ws, st_path);
+            try initClassifierHeadInGpuHostedStore(allocator, &metal_ws, opts.seed, deberta_config.hidden_size, opts.num_classes);
+            metal_compute.initPrefetchQueue(&metal_ws, allocator);
+            metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_ws, null);
+            break :blk metal_backend.computeBackend();
+        } else unreachable;
+    } else if (selected_backend == .mlx) blk: {
+        if (comptime !build_options.enable_mlx) unreachable;
         // ── MLX path: load weights directly into MLX arrays ──────────
         const raw_weights = try mlx.loadSafetensors(st_path, allocator, mlx.openDefaultStream().stream);
         // Build a new map with "encoder." prefix stripped.
@@ -423,9 +474,18 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         native_backend = native_compute.NativeCompute.init(allocator, &native_ws, null);
         break :blk native_backend.computeBackend();
     };
-    defer if (!use_mlx) deinitNativeWeightStore(allocator, &native_ws);
+    defer switch (selected_backend) {
+        .native => deinitNativeWeightStore(allocator, &native_ws),
+        .metal => if (comptime build_options.enable_metal) deinitGpuHostedWeightStore(allocator, &metal_ws),
+        else => {},
+    };
+    defer switch (selected_backend) {
+        .metal => if (comptime build_options.enable_metal) metal_backend.deinit(),
+        .mlx => if (comptime build_options.enable_mlx) mlx_backend.deinit(),
+        else => {},
+    };
 
-    print("  backend: {s}\n", .{if (use_mlx) "MLX (Apple Silicon)" else "native CPU/BLAS"});
+    print("  backend: {s}\n", .{backendLabel(selected_backend)});
 
     // ------------------------------------------------------------------
     // 5. Load training data (JSONL with text + entities)
@@ -552,6 +612,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .num_layers_hint = deberta_config.num_hidden_layers,
             .seed = opts.seed,
             .regular_trainable_params = &regular_trainable_params,
+            .execution_engine = if (selected_backend == .metal) .compiled_metal else .interpreter,
+            .compiled_required = opts.compiled_required,
         },
     );
     defer trainer.deinit();
@@ -738,6 +800,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 11. Save adapters
     // ------------------------------------------------------------------
+    try trainer.syncDeviceTrainablesToHost();
     try trainer.saveAdapters(opts.out_dir);
     const autodiff_params = try collectAutodiffAdapterParams(allocator, &trainer);
     defer allocator.free(autodiff_params);
@@ -765,7 +828,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, deberta_config.hidden_size, entity_types, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count);
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -799,10 +862,15 @@ fn writeStepMetric(
         .step_wall_ms = nsToMillis(timing.step_wall_ns),
         .graph_build_ms = nsToMillis(timing.profile.graph_build_ns),
         .runtime_input_ms = nsToMillis(timing.profile.runtime_input_ns),
+        .compile_ms = nsToMillis(timing.profile.compile_ns),
         .autodiff_ms = nsToMillis(timing.profile.autodiff_ns),
         .execute_ms = nsToMillis(timing.profile.execute_ns),
         .extract_ms = nsToMillis(timing.profile.extract_ns),
         .optimizer_update_ms = nsToMillis(timing.profile.optimizer_update_ns),
+        .device_optimizer_ms = nsToMillis(timing.profile.device_optimizer_ns),
+        .optimizer_backend = @tagName(timing.profile.optimizer_backend),
+        .device_resident_transfer_count = timing.profile.device_resident_transfer_count,
+        .device_trainable_bytes = timing.profile.device_trainable_bytes,
         .trainer_total_ms = nsToMillis(timing.profile.total_ns),
         .peak_resident_bytes = timing.profile.peak_resident_bytes,
         .supervised_tokens_per_second = timing.supervisedTokensPerSecond(target_stats),
@@ -840,6 +908,7 @@ fn writeEpochMetric(
 fn writeTrainingManifest(
     allocator: std.mem.Allocator,
     opts: Options,
+    backend_label: []const u8,
     hidden_size: u32,
     entity_labels: []const []const u8,
     example_count: usize,
@@ -858,6 +927,8 @@ fn writeTrainingManifest(
         .schema_version = "gliner2_autodiff_training/v1",
         .artifact_family_version = "gliner2_autodiff_adapter/v1",
         .model_dir = opts.model_dir,
+        .backend = backend_label,
+        .compiled_required = opts.compiled_required,
         .train_data = opts.train_data,
         .out_dir = opts.out_dir,
         .metrics_file = run_validation.metrics_file_name,
@@ -1179,6 +1250,145 @@ fn stripEncoderPrefix(name: []const u8) []const u8 {
     return name;
 }
 
+fn parseBackend(value: []const u8) ?Gliner2TrainBackend {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
+    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
+    if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
+    return null;
+}
+
+fn selectBackend(
+    requested: Gliner2TrainBackend,
+    force_native: bool,
+    metal_available: bool,
+    mlx_available: bool,
+) !Gliner2TrainBackend {
+    if (force_native) return .native;
+    return switch (requested) {
+        .auto => if (metal_available) .metal else if (mlx_available) .mlx else .native,
+        .metal => if (metal_available) .metal else error.MetalBackendUnavailable,
+        .mlx => if (mlx_available) .mlx else error.MlxBackendUnavailable,
+        .native => .native,
+    };
+}
+
+fn backendLabel(backend: Gliner2TrainBackend) []const u8 {
+    return switch (backend) {
+        .auto => "auto",
+        .metal => "Metal",
+        .mlx => "MLX (Apple Silicon)",
+        .native => "native CPU/BLAS",
+    };
+}
+
+fn loadSafetensorsIntoGpuHostedStore(
+    allocator: std.mem.Allocator,
+    weight_store: *MetalWeightStore,
+    st_path: []const u8,
+) !void {
+    if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+    var source = try SafetensorsSource.initAbsolute(allocator, st_path);
+    errdefer source.weightSource().deinit();
+    const ws = source.weightSource();
+    const names = try ws.listNames(allocator);
+    defer allocator.free(names);
+
+    var loaded_count: usize = 0;
+    for (names) |name| {
+        var loaded = ws.getTensor(name) catch continue;
+        defer loaded.deinit();
+        var owned_loaded = try cloneLoadedWeight(allocator, loaded, stripEncoderPrefix(name));
+        errdefer owned_loaded.deinit();
+        const stripped = stripEncoderPrefix(name);
+        const owned_name = try allocator.dupe(u8, stripped);
+        errdefer allocator.free(owned_name);
+        try weight_store.lazy_weights.put(allocator, owned_name, .{
+            .tensor_ref = undefined,
+            .host_loaded = owned_loaded,
+            .active_tier = .host,
+            .loaded_bytes = owned_loaded.tensor.data.len,
+        });
+        loaded_count += 1;
+    }
+    print("  loaded {d} weights via Metal from {s}\n", .{ loaded_count, st_path });
+    source.weightSource().deinit();
+}
+
+fn cloneLoadedWeight(allocator: std.mem.Allocator, loaded: LoadedWeight, name: []const u8) !LoadedWeight {
+    if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedQuantizedTrainingWeight;
+    const owned_data = try allocator.dupe(u8, loaded.tensor.data);
+    errdefer allocator.free(owned_data);
+    const owned_shape = try allocator.dupe(i64, loaded.tensor.shape);
+    errdefer allocator.free(owned_shape);
+    _ = name;
+    return .{
+        .tensor = .{
+            .data = owned_data,
+            .dtype = loaded.tensor.dtype,
+            .shape = owned_shape,
+            .name = "",
+            .allocator = allocator,
+            .owns_data = true,
+            .owns_shape = true,
+        },
+        .quantized = false,
+    };
+}
+
+fn initClassifierHeadInGpuHostedStore(
+    allocator: std.mem.Allocator,
+    weight_store: *MetalWeightStore,
+    seed: u64,
+    hidden_size: u32,
+    num_classes: u32,
+) !void {
+    if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+    var rng_init = std.Random.DefaultPrng.init(seed);
+    var prng_init = rng_init.random();
+    const H = hidden_size;
+    const C = num_classes;
+
+    const w_data = try allocator.alloc(f32, @as(usize, @intCast(C)) * @as(usize, @intCast(H)));
+    defer allocator.free(w_data);
+    const sd: f32 = 0.02;
+    for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
+    const w_tensor = try Tensor.initFloat32(allocator, "classifier.weight", &.{ C, H }, w_data);
+    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "classifier.weight"), .{
+        .tensor_ref = undefined,
+        .host_loaded = .{ .tensor = w_tensor },
+        .active_tier = .host,
+        .loaded_bytes = w_tensor.data.len,
+    });
+
+    const b_data = try allocator.alloc(f32, C);
+    defer allocator.free(b_data);
+    @memset(b_data, 0.0);
+    const b_tensor = try Tensor.initFloat32(allocator, "classifier.bias", &.{C}, b_data);
+    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "classifier.bias"), .{
+        .tensor_ref = undefined,
+        .host_loaded = .{ .tensor = b_tensor },
+        .active_tier = .host,
+        .loaded_bytes = b_tensor.data.len,
+    });
+    print("  initialized classifier head (Metal): [{d}, {d}] + [{d}]\n", .{ C, H, C });
+}
+
+fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeightStore) void {
+    if (comptime !build_options.enable_metal) return;
+    metal_compute.deinitPrefetchQueue(weight_store);
+    var it = weight_store.lazy_weights.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        if (entry.value_ptr.host_loaded) |*loaded| loaded.deinit();
+        if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
+    }
+    weight_store.lazy_weights.deinit(allocator);
+    if (comptime build_options.enable_mlx) {
+        _ = mlx_c.mlx_map_string_to_array_free(weight_store.resident_weights);
+    }
+}
+
 fn printUsage() void {
     // Zig 0.16: std.debug.print requires a format tuple. For plain string
     // output, use a no-arg format with the text inlined.
@@ -1205,6 +1415,8 @@ fn printUsage() void {
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --seed <n>                RNG seed (default: 42)
+        \\  --backend <name>          auto, metal, mlx, or native (default: auto)
+        \\  --compiled-required       Fail if the requested compiled backend cannot run
         \\
         \\notes:
         \\  Tokenization uses gliner2_data.Tokenizer.initGLiNER2HF and the

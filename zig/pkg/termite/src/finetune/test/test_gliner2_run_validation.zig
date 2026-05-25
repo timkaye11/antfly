@@ -40,8 +40,8 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = metrics_path,
         .data =
-        \\{"event":"step","step":1,"loss":1.5,"grad_norm":0.2,"optimizer_stepped":true,"supervised_token_count":10,"entity_token_count":2,"ignored_token_count":3,"entity_token_rate":0.2,"target_build_ms":1.0,"train_step_ms":999.0,"step_wall_ms":1000.0,"graph_build_ms":10.0,"runtime_input_ms":20.0,"autodiff_ms":300.0,"execute_ms":600.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"trainer_total_ms":950.0,"peak_resident_bytes":4096,"supervised_tokens_per_second":10.0}
-        \\{"event":"step","step":2,"loss":1.0,"grad_norm":0.1,"optimizer_stepped":true,"supervised_token_count":8,"entity_token_count":1,"ignored_token_count":5,"entity_token_rate":0.125,"target_build_ms":1.0,"train_step_ms":1999.0,"step_wall_ms":2000.0,"graph_build_ms":1.0,"runtime_input_ms":20.0,"autodiff_ms":500.0,"execute_ms":1400.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"trainer_total_ms":1950.0,"peak_resident_bytes":8192,"supervised_tokens_per_second":4.0}
+        \\{"event":"step","step":1,"loss":1.5,"grad_norm":0.2,"optimizer_stepped":true,"supervised_token_count":10,"entity_token_count":2,"ignored_token_count":3,"entity_token_rate":0.2,"target_build_ms":1.0,"train_step_ms":999.0,"step_wall_ms":1000.0,"graph_build_ms":10.0,"runtime_input_ms":20.0,"autodiff_ms":300.0,"execute_ms":600.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"device_optimizer_ms":0.25,"optimizer_backend":"metal","device_resident_transfer_count":0,"device_trainable_bytes":128,"trainer_total_ms":950.0,"peak_resident_bytes":4096,"supervised_tokens_per_second":10.0}
+        \\{"event":"step","step":2,"loss":1.0,"grad_norm":0.1,"optimizer_stepped":true,"supervised_token_count":8,"entity_token_count":1,"ignored_token_count":5,"entity_token_rate":0.125,"target_build_ms":1.0,"train_step_ms":1999.0,"step_wall_ms":2000.0,"graph_build_ms":1.0,"runtime_input_ms":20.0,"autodiff_ms":500.0,"execute_ms":1400.0,"extract_ms":5.0,"optimizer_update_ms":2.0,"device_optimizer_ms":0.75,"optimizer_backend":"metal","device_resident_transfer_count":0,"device_trainable_bytes":128,"trainer_total_ms":1950.0,"peak_resident_bytes":8192,"supervised_tokens_per_second":4.0}
         \\{"event":"epoch","epoch":1,"avg_loss":1.25,"supervised_token_count":18,"entity_token_count":3,"ignored_token_count":8,"entity_token_rate":0.16666666666666666,"epoch_wall_ms":3000.0,"supervised_tokens_per_second":6.0}
         \\
         ,
@@ -51,7 +51,13 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try writeOneTensorSafetensors(allocator, peft_checkpoint_path);
     try writeTaskHeadSafetensors(allocator, task_head_checkpoint_path);
 
-    var summary = try validation.validateRun(allocator, out_dir, .{ .require_loss_decrease = true });
+    var summary = try validation.validateRun(allocator, out_dir, .{
+        .require_loss_decrease = true,
+        .require_backend = "Metal",
+        .require_optimizer_backend = "metal",
+        .max_device_resident_transfer_count = 0,
+        .min_device_trainable_bytes = 128,
+    });
     defer validation.freeRunValidationSummary(allocator, &summary);
     try std.testing.expectEqual(@as(usize, 1), summary.adapter_file_count);
     try std.testing.expectEqual(@as(usize, 1), summary.peft_adapter_tensor_count);
@@ -64,6 +70,7 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try std.testing.expectEqual(@as(usize, 1), summary.manifest_batch_size);
     try std.testing.expectEqual(@as(usize, 64), summary.manifest_seq_len);
     try std.testing.expectEqual(@as(usize, 3), summary.manifest_entity_label_count);
+    try std.testing.expectEqualStrings("Metal", summary.manifest_backend);
     try std.testing.expectEqual(@as(usize, 2), summary.step_record_count);
     try std.testing.expectEqual(@as(usize, 18), summary.supervised_token_count);
     try std.testing.expectEqual(@as(usize, 3), summary.entity_token_count);
@@ -77,6 +84,9 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try std.testing.expectApproxEqAbs(@as(f64, 2000.0), summary.total_execute_ms, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 10.0), summary.total_extract_ms, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 4.0), summary.total_optimizer_update_ms, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), summary.total_device_optimizer_ms, 0.001);
+    try std.testing.expectEqual(@as(u64, 0), summary.max_device_resident_transfer_count);
+    try std.testing.expectEqual(@as(usize, 128), summary.max_device_trainable_bytes);
     try std.testing.expectEqual(@as(usize, 8192), summary.max_peak_resident_bytes);
     try std.testing.expect(summary.loss_decreased);
 }
@@ -414,6 +424,7 @@ fn writeManifestWithRun(
         \\{{
         \\  "schema_version": "gliner2_autodiff_training/v1",
         \\  "artifact_family_version": "gliner2_autodiff_adapter/v1",
+        \\  "backend": "Metal",
         \\  "metrics_file": "training_metrics.jsonl",
         \\  "adapter_parameter_file_count": {},
         \\  "peft_adapter_checkpoint": "adapter_model.safetensors",

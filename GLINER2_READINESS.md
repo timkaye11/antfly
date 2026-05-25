@@ -6,8 +6,34 @@ or reclassified.
 
 ## Current Status
 
-Status: not production-ready yet, but the repeatable local smoke/readiness
-gate now passes on this machine.
+Status: not production-ready yet. The repeatable local smoke/readiness gates
+pass, and the branch now has a single production-readiness workflow command
+that encodes the remaining release criteria:
+
+```sh
+zig build gliner2-production-readiness -- \
+  /models/gliner2 \
+  /data/gliner2_train.jsonl \
+  /data/gliner2_eval.jsonl \
+  /runs/gliner2-prod-gate \
+  person,organization,location \
+  --eval-text "Alice joined Acme in Paris" \
+  --expect-label organization \
+  --min-score 0.05 \
+  --materialized-dir /runs/gliner2-prod-gate/materialized
+```
+
+Use `--dry-run` to verify build wiring without local model/data files:
+
+```sh
+zig build gliner2-production-readiness -- \
+  /models/gliner2 /data/train.jsonl /data/eval.jsonl /runs/gliner2 \
+  person,organization,location --dry-run --skip-semantic-eval
+```
+
+The workflow runs dataset readiness checks, `train-gliner2-autodiff`, artifact
+validation, LoRA bundle inspection, semantic fixed-text adapter reload, and
+optional merged-checkpoint materialization.
 
 The current blocker is no longer basic model loading, adapter artifact
 emission, PEFT config metadata validation, the zero-row token-loss

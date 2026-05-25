@@ -34,6 +34,10 @@ pub const ValidationOptions = struct {
     min_entity_labels: ?usize = null,
     min_supervised_tokens: ?usize = null,
     min_entity_tokens: ?usize = null,
+    require_backend: ?[]const u8 = null,
+    require_optimizer_backend: ?[]const u8 = null,
+    max_device_resident_transfer_count: ?u64 = null,
+    min_device_trainable_bytes: ?usize = null,
 };
 
 pub const RunValidationSummary = struct {
@@ -57,6 +61,7 @@ pub const RunValidationSummary = struct {
     manifest_batch_size: usize,
     manifest_seq_len: usize,
     manifest_entity_label_count: usize,
+    manifest_backend: []const u8,
     metric_record_count: usize,
     step_record_count: usize,
     epoch_record_count: usize,
@@ -72,6 +77,9 @@ pub const RunValidationSummary = struct {
     total_execute_ms: f64,
     total_extract_ms: f64,
     total_optimizer_update_ms: f64,
+    total_device_optimizer_ms: f64,
+    max_device_resident_transfer_count: u64,
+    max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
@@ -105,6 +113,7 @@ pub fn validateRun(
     const metrics_bytes = try compat.cwd().readFileAlloc(compat.io(), metrics_path, allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(metrics_bytes);
     const metrics = try inspectMetricsJsonl(allocator, metrics_bytes);
+    defer if (metrics.optimizer_backend) |backend| allocator.free(backend);
     if (metrics.step_record_count == 0) return error.NoStepMetrics;
     if (metrics.step_record_count != manifest.total_steps) return error.TrainingManifestMetricsMismatch;
     if (metrics.epoch_record_count != manifest.epochs) return error.TrainingManifestMetricsMismatch;
@@ -144,6 +153,18 @@ pub fn validateRun(
     if (options.min_entity_tokens) |min_entity_tokens| {
         if (metrics.entity_token_count < min_entity_tokens) return error.EntityTokenCountBelowThreshold;
     }
+    if (options.require_backend) |backend| {
+        if (!std.mem.eql(u8, manifest.backend, backend)) return error.TrainingBackendMismatch;
+    }
+    if (options.require_optimizer_backend) |backend| {
+        if (metrics.optimizer_backend_mismatch or !std.mem.eql(u8, metrics.optimizer_backend orelse "", backend)) return error.OptimizerBackendMismatch;
+    }
+    if (options.max_device_resident_transfer_count) |max_transfers| {
+        if (metrics.max_device_resident_transfer_count > max_transfers) return error.DeviceResidentTransferCountAboveThreshold;
+    }
+    if (options.min_device_trainable_bytes) |min_bytes| {
+        if (metrics.max_device_trainable_bytes < min_bytes) return error.DeviceTrainableBytesBelowThreshold;
+    }
     if (options.require_loss_decrease and !metrics.loss_decreased) return error.LossDidNotDecrease;
 
     const adapter_file_count = try countAdapterParameterFiles(out_dir);
@@ -181,6 +202,7 @@ pub fn validateRun(
         .manifest_batch_size = manifest.batch_size,
         .manifest_seq_len = manifest.seq_len,
         .manifest_entity_label_count = manifest.entity_label_count,
+        .manifest_backend = try allocator.dupe(u8, manifest.backend),
         .metric_record_count = metrics.metric_record_count,
         .step_record_count = metrics.step_record_count,
         .epoch_record_count = metrics.epoch_record_count,
@@ -196,6 +218,9 @@ pub fn validateRun(
         .total_execute_ms = metrics.total_execute_ms,
         .total_extract_ms = metrics.total_extract_ms,
         .total_optimizer_update_ms = metrics.total_optimizer_update_ms,
+        .total_device_optimizer_ms = metrics.total_device_optimizer_ms,
+        .max_device_resident_transfer_count = metrics.max_device_resident_transfer_count,
+        .max_device_trainable_bytes = metrics.max_device_trainable_bytes,
         .max_peak_resident_bytes = metrics.max_peak_resident_bytes,
         .first_step_loss = metrics.first_step_loss,
         .final_step_loss = metrics.final_step_loss,
@@ -208,6 +233,7 @@ pub fn freeRunValidationSummary(allocator: std.mem.Allocator, summary: *RunValid
     allocator.free(summary.output_dir);
     allocator.free(summary.manifest_path);
     allocator.free(summary.metrics_path);
+    allocator.free(summary.manifest_backend);
     allocator.free(summary.peft_adapter_checkpoint_path);
     allocator.free(summary.peft_adapter_config_path);
     allocator.free(summary.task_head_checkpoint_path);
@@ -228,10 +254,15 @@ const MetricsInspection = struct {
     total_execute_ms: f64 = 0,
     total_extract_ms: f64 = 0,
     total_optimizer_update_ms: f64 = 0,
+    total_device_optimizer_ms: f64 = 0,
+    max_device_resident_transfer_count: u64 = 0,
+    max_device_trainable_bytes: usize = 0,
     max_peak_resident_bytes: usize = 0,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
     all_step_losses_finite: bool = true,
+    optimizer_backend: ?[]const u8 = null,
+    optimizer_backend_mismatch: bool = false,
 
     fn lossDecreased(self: MetricsInspection) bool {
         const first = self.first_step_loss orelse return false;
@@ -268,6 +299,7 @@ const ManifestInspection = struct {
     total_steps: usize,
     final_avg_loss: f64,
     entity_label_count: usize,
+    backend: []const u8,
 };
 
 fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
@@ -302,6 +334,8 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
     const total_steps = jsonUsize(obj.get("total_steps")) orelse return error.InvalidTrainingManifest;
     const final_avg_loss = jsonF64(obj.get("final_avg_loss")) orelse return error.InvalidTrainingManifest;
     const entity_label_count = try inspectEntityLabels(obj.get("entity_labels"));
+    const backend = jsonString(obj.get("backend")) orelse return error.InvalidTrainingManifest;
+    if (std.mem.trim(u8, backend, " \t\r\n").len == 0) return error.InvalidTrainingManifest;
     if (epochs == 0 or batch_size == 0 or seq_len == 0 or example_count == 0 or total_steps == 0) return error.InvalidTrainingManifest;
     if (!std.math.isFinite(final_avg_loss)) return error.InvalidTrainingManifest;
     if (entity_label_count == 0 or entity_label_count + 1 > num_classes) return error.InvalidTrainingManifest;
@@ -326,6 +360,7 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
         .total_steps = total_steps,
         .final_avg_loss = final_avg_loss,
         .entity_label_count = entity_label_count,
+        .backend = backend,
     };
 }
 
@@ -360,13 +395,19 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     total_execute_ms: f64,
     total_extract_ms: f64,
     total_optimizer_update_ms: f64,
+    total_device_optimizer_ms: f64,
+    max_device_resident_transfer_count: u64,
+    max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
     first_step_loss: ?f64,
     final_step_loss: ?f64,
     all_step_losses_finite: bool,
     loss_decreased: bool,
+    optimizer_backend: ?[]const u8,
+    optimizer_backend_mismatch: bool,
 } {
     var inspection = MetricsInspection{};
+    errdefer if (inspection.optimizer_backend) |backend| allocator.free(backend);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
@@ -393,10 +434,15 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             const step_wall_ms = jsonF64(obj.get("step_wall_ms")) orelse return error.InvalidMetricsRecord;
             const graph_build_ms = jsonF64(obj.get("graph_build_ms")) orelse return error.InvalidMetricsRecord;
             const runtime_input_ms = jsonF64(obj.get("runtime_input_ms")) orelse return error.InvalidMetricsRecord;
+            const compile_ms = jsonF64(obj.get("compile_ms")) orelse 0;
             const autodiff_ms = jsonF64(obj.get("autodiff_ms")) orelse return error.InvalidMetricsRecord;
             const execute_ms = jsonF64(obj.get("execute_ms")) orelse return error.InvalidMetricsRecord;
             const extract_ms = jsonF64(obj.get("extract_ms")) orelse return error.InvalidMetricsRecord;
             const optimizer_update_ms = jsonF64(obj.get("optimizer_update_ms")) orelse return error.InvalidMetricsRecord;
+            const device_optimizer_ms = jsonF64(obj.get("device_optimizer_ms")) orelse 0;
+            const optimizer_backend = jsonString(obj.get("optimizer_backend"));
+            const device_resident_transfer_count = jsonU64(obj.get("device_resident_transfer_count")) orelse 0;
+            const device_trainable_bytes = jsonUsize(obj.get("device_trainable_bytes")) orelse 0;
             const trainer_total_ms = jsonF64(obj.get("trainer_total_ms")) orelse return error.InvalidMetricsRecord;
             const peak_resident_bytes = jsonUsize(obj.get("peak_resident_bytes")) orelse return error.InvalidMetricsRecord;
             const supervised_tokens_per_second = jsonF64(obj.get("supervised_tokens_per_second")) orelse return error.InvalidMetricsRecord;
@@ -405,20 +451,32 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             if (!std.math.isFinite(step_wall_ms) or step_wall_ms <= 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(graph_build_ms) or graph_build_ms < 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(runtime_input_ms) or runtime_input_ms < 0) return error.InvalidPerformanceMetrics;
-            if (!std.math.isFinite(autodiff_ms) or autodiff_ms <= 0) return error.InvalidPerformanceMetrics;
+            if (!std.math.isFinite(compile_ms) or compile_ms < 0) return error.InvalidPerformanceMetrics;
+            if (!std.math.isFinite(autodiff_ms) or (autodiff_ms <= 0 and compile_ms <= 0)) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(execute_ms) or execute_ms <= 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(extract_ms) or extract_ms < 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(optimizer_update_ms) or optimizer_update_ms < 0) return error.InvalidPerformanceMetrics;
+            if (!std.math.isFinite(device_optimizer_ms) or device_optimizer_ms < 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(trainer_total_ms) or trainer_total_ms <= 0) return error.InvalidPerformanceMetrics;
             if (peak_resident_bytes == 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(supervised_tokens_per_second) or supervised_tokens_per_second <= 0) return error.InvalidPerformanceMetrics;
             inspection.total_step_wall_ms += step_wall_ms;
             inspection.total_graph_build_ms += graph_build_ms;
             inspection.total_runtime_input_ms += runtime_input_ms;
-            inspection.total_autodiff_ms += autodiff_ms;
+            inspection.total_autodiff_ms += if (autodiff_ms > 0) autodiff_ms else compile_ms;
             inspection.total_execute_ms += execute_ms;
             inspection.total_extract_ms += extract_ms;
             inspection.total_optimizer_update_ms += optimizer_update_ms;
+            inspection.total_device_optimizer_ms += device_optimizer_ms;
+            inspection.max_device_resident_transfer_count = @max(inspection.max_device_resident_transfer_count, device_resident_transfer_count);
+            inspection.max_device_trainable_bytes = @max(inspection.max_device_trainable_bytes, device_trainable_bytes);
+            if (optimizer_backend) |backend| {
+                if (inspection.optimizer_backend) |first_backend| {
+                    if (!std.mem.eql(u8, first_backend, backend)) inspection.optimizer_backend_mismatch = true;
+                } else {
+                    inspection.optimizer_backend = try allocator.dupe(u8, backend);
+                }
+            }
             inspection.max_peak_resident_bytes = @max(inspection.max_peak_resident_bytes, peak_resident_bytes);
         } else if (std.mem.eql(u8, event, "epoch")) {
             inspection.epoch_record_count += 1;
@@ -443,11 +501,16 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .total_execute_ms = inspection.total_execute_ms,
         .total_extract_ms = inspection.total_extract_ms,
         .total_optimizer_update_ms = inspection.total_optimizer_update_ms,
+        .total_device_optimizer_ms = inspection.total_device_optimizer_ms,
+        .max_device_resident_transfer_count = inspection.max_device_resident_transfer_count,
+        .max_device_trainable_bytes = inspection.max_device_trainable_bytes,
         .max_peak_resident_bytes = inspection.max_peak_resident_bytes,
         .first_step_loss = inspection.first_step_loss,
         .final_step_loss = inspection.final_step_loss,
         .all_step_losses_finite = inspection.all_step_losses_finite,
         .loss_decreased = inspection.lossDecreased(),
+        .optimizer_backend = inspection.optimizer_backend,
+        .optimizer_backend_mismatch = inspection.optimizer_backend_mismatch,
     };
 }
 
@@ -588,6 +651,14 @@ fn jsonF64(value: ?std.json.Value) ?f64 {
 }
 
 fn jsonUsize(value: ?std.json.Value) ?usize {
+    const v = value orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        else => null,
+    };
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
     const v = value orelse return null;
     return switch (v) {
         .integer => |i| if (i >= 0) @intCast(i) else null,
