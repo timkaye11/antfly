@@ -268,6 +268,7 @@ const MetricsInspection = struct {
     final_step_loss: ?f64 = null,
     first_loss_window_sum: f64 = 0,
     first_loss_window_count: usize = 0,
+    final_epoch_avg_loss: ?f64 = null,
     recent_loss_window: [loss_trend_window]f64 = [_]f64{0} ** loss_trend_window,
     recent_loss_count: usize = 0,
     recent_loss_index: usize = 0,
@@ -278,6 +279,12 @@ const MetricsInspection = struct {
     fn lossDecreased(self: MetricsInspection) bool {
         const first = self.first_step_loss orelse return false;
         const final = self.final_step_loss orelse return false;
+        if (self.final_epoch_avg_loss) |epoch_avg| {
+            if (self.first_loss_window_count > 0) {
+                const first_window_avg = self.first_loss_window_sum / @as(f64, @floatFromInt(self.first_loss_window_count));
+                if (epoch_avg < first_window_avg) return true;
+            }
+        }
         if (self.step_record_count > loss_trend_window and self.first_loss_window_count == loss_trend_window) {
             const count = @min(self.recent_loss_count, loss_trend_window);
             if (count == loss_trend_window) {
@@ -509,6 +516,7 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.epoch_record_count += 1;
             const avg_loss = jsonF64(obj.get("avg_loss")) orelse return error.InvalidMetricsRecord;
             if (!std.math.isFinite(avg_loss)) inspection.all_step_losses_finite = false;
+            inspection.final_epoch_avg_loss = avg_loss;
         }
     }
 

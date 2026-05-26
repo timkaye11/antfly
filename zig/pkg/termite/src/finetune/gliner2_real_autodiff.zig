@@ -850,13 +850,18 @@ pub const SpanStartTargetStats = struct {
     positive_counts_by_entity_type: [max_span_start_entity_types]u64 = [_]u64{0} ** max_span_start_entity_types,
 };
 
+pub const SpanStartTargetOptions = struct {
+    positive_weights_by_entity_type: ?[]const f32 = null,
+    hard_negative_weight: f32 = 1.0,
+};
+
 /// Pack `gliner2_data.EncodedBatch` span labels into the single trainer
 /// target tensor consumed by `.span_start`.
 pub fn fillSpanStartTargetsFromEncodedBatch(
     batch: *const gliner2_data.EncodedBatch,
     out: []f32,
 ) !SpanStartTargetStats {
-    return fillSpanStartTargetsFromEncodedBatchInternal(batch, null, out);
+    return fillSpanStartTargetsFromEncodedBatchWithOptions(batch, .{}, out);
 }
 
 pub fn fillWeightedSpanStartTargetsFromEncodedBatch(
@@ -864,23 +869,26 @@ pub fn fillWeightedSpanStartTargetsFromEncodedBatch(
     positive_weights_by_entity_type: []const f32,
     out: []f32,
 ) !SpanStartTargetStats {
-    return fillSpanStartTargetsFromEncodedBatchInternal(batch, positive_weights_by_entity_type, out);
+    return fillSpanStartTargetsFromEncodedBatchWithOptions(batch, .{
+        .positive_weights_by_entity_type = positive_weights_by_entity_type,
+    }, out);
 }
 
-fn fillSpanStartTargetsFromEncodedBatchInternal(
+pub fn fillSpanStartTargetsFromEncodedBatchWithOptions(
     batch: *const gliner2_data.EncodedBatch,
-    positive_weights_by_entity_type: ?[]const f32,
+    options: SpanStartTargetOptions,
     out: []f32,
 ) !SpanStartTargetStats {
     const E = batch.num_entity_types;
     const rows = batch.batch_size * batch.max_spans;
-    if (positive_weights_by_entity_type) |weights| {
+    if (!std.math.isFinite(options.hard_negative_weight) or options.hard_negative_weight <= 0.0) return error.InvalidSpanHardNegativeWeight;
+    if (options.positive_weights_by_entity_type) |weights| {
         if (weights.len != E) return error.InvalidGlinerSpanTargetShape;
         for (weights) |weight| {
             if (!std.math.isFinite(weight) or weight <= 0.0) return error.InvalidSpanPositiveWeight;
         }
     }
-    const has_positive_weights = positive_weights_by_entity_type != null;
+    const has_positive_weights = options.positive_weights_by_entity_type != null;
     const width = if (has_positive_weights) weightedSpanStartTargetWidth(E) else spanStartTargetWidth(E);
     if (out.len != rows * width) return error.InvalidGlinerSpanTargetShape;
     if (E > max_span_start_entity_types) return error.TooManyEntityTypes;
@@ -927,8 +935,11 @@ fn fillSpanStartTargetsFromEncodedBatchInternal(
             for (0..E) |entity_type_idx| {
                 const label = batch.span_labels[flat_span_idx * E + entity_type_idx];
                 out[row + entity_type_idx] = label;
-                out[row + E + entity_type_idx] = 1.0;
-                if (positive_weights_by_entity_type) |weights| {
+                out[row + E + entity_type_idx] = if (label <= 0.0 and options.hard_negative_weight > 1.0 and spanOverlapsPositiveLabel(batch, sample_idx, span_idx))
+                    options.hard_negative_weight
+                else
+                    1.0;
+                if (options.positive_weights_by_entity_type) |weights| {
                     out[row + 2 * E + entity_type_idx] = weights[entity_type_idx];
                 }
                 if (label > 0.0) {
@@ -944,6 +955,35 @@ fn fillSpanStartTargetsFromEncodedBatchInternal(
     }
 
     return stats;
+}
+
+fn spanOverlapsPositiveLabel(batch: *const gliner2_data.EncodedBatch, sample_idx: usize, span_idx: usize) bool {
+    const E = batch.num_entity_types;
+    const flat_span_idx = sample_idx * batch.max_spans + span_idx;
+    const start_raw = batch.span_indices[flat_span_idx * 2];
+    const end_raw = batch.span_indices[flat_span_idx * 2 + 1];
+    if (start_raw < 0 or end_raw < start_raw) return false;
+    const start: usize = @intCast(start_raw);
+    const end: usize = @intCast(end_raw);
+    for (0..batch.max_spans) |candidate_idx| {
+        const flat_candidate_idx = sample_idx * batch.max_spans + candidate_idx;
+        if (batch.span_mask[flat_candidate_idx] <= 0.0) continue;
+        var has_positive = false;
+        for (0..E) |entity_type_idx| {
+            if (batch.span_labels[flat_candidate_idx * E + entity_type_idx] > 0.0) {
+                has_positive = true;
+                break;
+            }
+        }
+        if (!has_positive) continue;
+        const candidate_start_raw = batch.span_indices[flat_candidate_idx * 2];
+        const candidate_end_raw = batch.span_indices[flat_candidate_idx * 2 + 1];
+        if (candidate_start_raw < 0 or candidate_end_raw < candidate_start_raw) continue;
+        const candidate_start: usize = @intCast(candidate_start_raw);
+        const candidate_end: usize = @intCast(candidate_end_raw);
+        if (start <= candidate_end and candidate_start <= end) return true;
+    }
+    return false;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1139,6 +1179,62 @@ test "fillWeightedSpanStartTargetsFromEncodedBatch packs per-label positive weig
     try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 32.0, 96.0, 2.0, 2.0 }, targets[0..8]);
     try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 32.0, 96.0, 3.0, 4.0 }, targets[8..16]);
     try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[16..24]);
+}
+
+test "fillSpanStartTargetsFromEncodedBatchWithOptions weights overlapping hard negatives" {
+    var input_ids = [_]i32{ 10, 11, 12, 13, 14, 0, 0, 0 };
+    var attention_mask = [_]i32{ 1, 1, 1, 1, 1, 0, 0, 0 };
+    var words_mask = [_]i32{ 0, 0, 1, 2, 3, 0, 0, 0 };
+    var first_token_positions = [_]i32{ 2, 3, 4 };
+    var word_lengths = [_]f32{ 5, 4, 6 };
+    var word_has_digit = [_]f32{0.0} ** 3;
+    var word_is_title = [_]f32{0.0} ** 3;
+    var word_is_all_caps = [_]f32{0.0} ** 3;
+    var span_indices = [_]i32{
+        0, 1,
+        1, 1,
+        2, 2,
+    };
+    var span_mask = [_]f32{ 1.0, 1.0, 1.0 };
+    var span_labels = [_]f32{
+        1.0, 0.0,
+        0.0, 0.0,
+        0.0, 0.0,
+    };
+    var e_token_positions = [_]i32{ 0, 1 };
+    var e_token_end_positions = [_]i32{ 0, 1 };
+    var entity_type_kind = [_]i32{ 1, 2 };
+
+    const batch = gliner2_data.EncodedBatch{
+        .allocator = testing.allocator,
+        .owns_memory = false,
+        .input_ids = &input_ids,
+        .attention_mask = &attention_mask,
+        .words_mask = &words_mask,
+        .first_token_positions = &first_token_positions,
+        .word_lengths = &word_lengths,
+        .word_has_digit = &word_has_digit,
+        .word_is_title = &word_is_title,
+        .word_is_all_caps = &word_is_all_caps,
+        .span_indices = &span_indices,
+        .span_mask = &span_mask,
+        .span_labels = &span_labels,
+        .e_token_positions = &e_token_positions,
+        .e_token_end_positions = &e_token_end_positions,
+        .entity_type_kind = &entity_type_kind,
+        .batch_size = 1,
+        .max_length = 8,
+        .max_words_per_sample = 3,
+        .max_spans = 3,
+        .num_entity_types = 2,
+    };
+
+    var targets = [_]f32{0.0} ** (3 * 6);
+    _ = try fillSpanStartTargetsFromEncodedBatchWithOptions(&batch, .{ .hard_negative_weight = 4.0 }, &targets);
+
+    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 4.0, 2.0, 3.0 }, targets[0..6]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 4.0, 4.0, 3.0, 3.0 }, targets[6..12]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 1.0, 1.0, 4.0, 4.0 }, targets[12..18]);
 }
 
 test "makeTrainerInput populates the expected fields for token classification" {

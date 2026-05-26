@@ -53,6 +53,7 @@ const Options = struct {
     span_positive_weight: []const u8 = "32",
     span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: []const u8 = "1",
+    span_hard_negative_weight: []const u8 = "1",
     max_grad_norm: []const u8 = "1.0",
     grad_accum: []const u8 = "1",
     seed: []const u8 = "42",
@@ -110,6 +111,7 @@ const Options = struct {
     quality_best_span_per_label_start: bool = false,
     quality_best_label_per_span_start: bool = false,
     quality_require_entitylike_span: bool = false,
+    quality_diagnostic_limit: []const u8 = "50",
     min_entity_precision: ?[]const u8 = null,
     min_entity_recall: ?[]const u8 = null,
     min_entity_f1: ?[]const u8 = null,
@@ -131,6 +133,8 @@ const ReadinessGateSummary = struct {
     run_validation: validation.RunValidationSummary,
     lora_inspection: gliner2.LoRABundleInspectionSummary,
     semantic_eval_required: bool,
+    quality_summary_path: ?[]const u8,
+    quality_thresholds_path: ?[]const u8,
     materialized_dir: ?[]const u8,
     status: []const u8 = "passed",
 };
@@ -211,26 +215,27 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     const num_classes_arg = try std.fmt.bufPrint(&num_classes_buf, "{d}", .{num_classes});
 
     const train_args = [_][]const u8{
-        "--model-dir",            opts.model_dir,
-        "--train-data",           opts.train_data,
-        "--out-dir",              opts.out_dir,
-        "--epochs",               opts.epochs,
-        "--batch-size",           opts.batch_size,
-        "--max-examples",         opts.max_examples,
-        "--seq-len",              opts.seq_len,
-        "--num-classes",          num_classes_arg,
-        "--entity-types",         opts.entity_types_csv,
-        "--learning-rate",        opts.learning_rate,
-        "--lora-rank",            opts.lora_rank,
-        "--lora-alpha",           opts.lora_alpha,
-        "--objective",            opts.objective,
-        "--max-span-width",       opts.max_span_width,
-        "--span-loss",            opts.span_loss,
-        "--span-positive-weight", opts.span_positive_weight,
-        "--max-grad-norm",        opts.max_grad_norm,
-        "--grad-accum",           opts.grad_accum,
-        "--seed",                 opts.seed,
-        "--backend",              opts.backend,
+        "--model-dir",                 opts.model_dir,
+        "--train-data",                opts.train_data,
+        "--out-dir",                   opts.out_dir,
+        "--epochs",                    opts.epochs,
+        "--batch-size",                opts.batch_size,
+        "--max-examples",              opts.max_examples,
+        "--seq-len",                   opts.seq_len,
+        "--num-classes",               num_classes_arg,
+        "--entity-types",              opts.entity_types_csv,
+        "--learning-rate",             opts.learning_rate,
+        "--lora-rank",                 opts.lora_rank,
+        "--lora-alpha",                opts.lora_alpha,
+        "--objective",                 opts.objective,
+        "--max-span-width",            opts.max_span_width,
+        "--span-loss",                 opts.span_loss,
+        "--span-positive-weight",      opts.span_positive_weight,
+        "--span-hard-negative-weight", opts.span_hard_negative_weight,
+        "--max-grad-norm",             opts.max_grad_norm,
+        "--grad-accum",                opts.grad_accum,
+        "--seed",                      opts.seed,
+        "--backend",                   opts.backend,
     };
     var train_args_list = std.ArrayListUnmanaged([]const u8).empty;
     defer train_args_list.deinit(allocator);
@@ -295,8 +300,14 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         }
     }
 
+    var quality_summary_path: ?[]const u8 = null;
+    var quality_thresholds_path: ?[]const u8 = null;
+    defer if (quality_summary_path) |path| allocator.free(path);
+    defer if (quality_thresholds_path) |path| allocator.free(path);
     if (opts.quality_eval) {
-        try runQualityEval(init, allocator, opts);
+        quality_summary_path = try std.fs.path.join(allocator, &.{ opts.out_dir, "quality_summary.json" });
+        quality_thresholds_path = try std.fs.path.join(allocator, &.{ opts.out_dir, "quality_thresholds.csv" });
+        try runQualityEval(init, allocator, opts, quality_summary_path.?, quality_thresholds_path.?);
     }
 
     if (opts.materialized_dir) |materialized_dir| {
@@ -317,6 +328,8 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .run_validation = run_summary,
         .lora_inspection = lora_summary,
         .semantic_eval_required = semantic_required,
+        .quality_summary_path = quality_summary_path,
+        .quality_thresholds_path = quality_thresholds_path,
         .materialized_dir = opts.materialized_dir,
     };
     try printJson(init, report);
@@ -331,6 +344,8 @@ fn runQualityEval(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     opts: Options,
+    quality_summary_path: []const u8,
+    quality_thresholds_path: []const u8,
 ) !void {
     var quality_args_list = std.ArrayListUnmanaged([]const u8).empty;
     defer quality_args_list.deinit(allocator);
@@ -345,6 +360,12 @@ fn runQualityEval(
         opts.max_span_width,
         "--objective",
         opts.objective,
+        "--out",
+        quality_summary_path,
+        "--thresholds-out",
+        quality_thresholds_path,
+        "--diagnostic-limit",
+        opts.quality_diagnostic_limit,
     });
     if (opts.quality_max_examples) |value| try quality_args_list.appendSlice(allocator, &.{ "--max-examples", value });
     if (opts.quality_min_prediction_score) |value| try quality_args_list.appendSlice(allocator, &.{ "--min-prediction-score", value });
@@ -490,6 +511,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\span_positive_weight: {s}
         \\span_label_positive_weights: {?s}
         \\span_negative_weight: {s}
+        \\span_hard_negative_weight: {s}
         \\max_avg_step_wall_ms: {?d}
         \\max_device_resident_transfer_count: {?}
         \\min_device_trainable_bytes: {?}
@@ -497,6 +519,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\quality_eval: {}
         \\quality_max_examples: {?s}
         \\quality_min_prediction_score: {?s}
+        \\quality_diagnostic_limit: {s}
         \\min_entity_f1: {?s}
         \\semantic_eval_required: {}
         \\
@@ -518,6 +541,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.span_positive_weight,
         opts.span_label_positive_weights,
         opts.span_negative_weight,
+        opts.span_hard_negative_weight,
         opts.max_avg_step_wall_ms,
         opts.max_device_resident_transfer_count,
         opts.min_device_trainable_bytes,
@@ -525,6 +549,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.quality_eval,
         opts.quality_max_examples,
         opts.quality_min_prediction_score,
+        opts.quality_diagnostic_limit,
         opts.min_entity_f1,
         !opts.skip_semantic_eval,
     });
@@ -582,6 +607,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.span_label_positive_weights = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-negative-weight")) {
             opts.span_negative_weight = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--span-hard-negative-weight")) {
+            opts.span_hard_negative_weight = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-grad-norm")) {
             opts.max_grad_norm = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--grad-accum")) {
@@ -695,6 +722,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.quality_best_label_per_span_start = true;
         } else if (std.mem.eql(u8, arg, "--quality-require-entitylike-span")) {
             opts.quality_require_entitylike_span = true;
+        } else if (std.mem.eql(u8, arg, "--quality-diagnostic-limit")) {
+            opts.quality_diagnostic_limit = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--min-entity-precision")) {
             opts.min_entity_precision = args.next() orelse return usageError();
             opts.quality_eval = true;
@@ -740,6 +769,17 @@ fn applyProductionMetalGateDefaults(opts: *Options) void {
     opts.min_device_trainable_bytes = 1;
     opts.require_loss_decrease = true;
     opts.skip_semantic_eval = false;
+    opts.semantic_require_entitylike_span = true;
+    opts.quality_eval = true;
+    opts.quality_max_examples = "25";
+    opts.quality_min_prediction_score = "0.03";
+    opts.quality_sweep_thresholds = "0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30";
+    opts.quality_nms_overlap = "0.0";
+    opts.quality_max_predictions_per_example = "3";
+    opts.quality_top_k_per_label = "1";
+    opts.quality_best_span_per_label_start = true;
+    opts.quality_require_entitylike_span = true;
+    opts.min_entity_f1 = "0.15";
 }
 
 fn applyProductionMlxGateDefaults(opts: *Options) void {
@@ -838,6 +878,7 @@ fn printUsage() void {
         \\  --quality-best-span-per-label-start
         \\  --quality-best-label-per-span-start
         \\  --quality-require-entitylike-span
+        \\  --quality-diagnostic-limit N
         \\  --min-entity-precision FLOAT
         \\  --min-entity-recall FLOAT
         \\  --min-entity-f1 FLOAT
@@ -853,6 +894,7 @@ fn printUsage() void {
         \\  --span-positive-weight FLOAT     Positive span-label loss weight (default: 32)
         \\  --span-label-positive-weights CSV Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight FLOAT     Negative span-label loss weight (default: 1)
+        \\  --span-hard-negative-weight FLOAT Extra negative weight for spans overlapping gold entities (default: 1)
         \\  --backend auto|metal|mlx|native  Training backend (default: auto)
         \\  --compiled-required              Fail if requested compiled backend falls back
         \\  --production-metal-gate          Canonical 200-step resident Metal gate
@@ -895,5 +937,19 @@ test "production MLX gate defaults require compiled resident optimizer" {
     try std.testing.expect(opts.quality_eval);
     try std.testing.expectEqualStrings("25", opts.quality_max_examples.?);
     try std.testing.expectEqualStrings("0.15", opts.min_entity_f1.?);
+    try std.testing.expect(opts.quality_require_entitylike_span);
+}
+
+test "production Metal gate defaults include shaped quality eval" {
+    var opts = Options{};
+    applyProductionMetalGateDefaults(&opts);
+
+    try std.testing.expect(opts.production_metal_gate);
+    try std.testing.expectEqualStrings("metal", opts.backend);
+    try std.testing.expect(opts.compiled_required);
+    try std.testing.expect(opts.quality_eval);
+    try std.testing.expectEqualStrings("25", opts.quality_max_examples.?);
+    try std.testing.expectEqualStrings("0.15", opts.min_entity_f1.?);
+    try std.testing.expect(opts.semantic_require_entitylike_span);
     try std.testing.expect(opts.quality_require_entitylike_span);
 }

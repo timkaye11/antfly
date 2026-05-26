@@ -17,6 +17,7 @@ const termite = @import("termite_internal");
 
 const gliner2_data = termite.finetune.gliner2_data;
 const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
+const compat = termite.io.compat;
 const adapter_eval = @import("eval_gliner2_autodiff_adapter.zig");
 
 const Options = struct {
@@ -41,6 +42,9 @@ const Options = struct {
     min_precision: ?f64 = null,
     min_recall: ?f64 = null,
     min_f1: ?f64 = null,
+    out_path: ?[]const u8 = null,
+    thresholds_out_path: ?[]const u8 = null,
+    diagnostic_limit: usize = 50,
 };
 
 const LabelThreshold = struct {
@@ -91,6 +95,9 @@ const QualitySummary = struct {
     threshold_sweep: []const ThresholdMetric,
     best_threshold: ?ThresholdMetric,
     best_per_label_thresholds: []const LabelThresholdMetric,
+    recommended_label_thresholds_csv: []const u8,
+    diagnostic_limit: usize,
+    diagnostics: []const QualityDiagnostic,
     status: []const u8,
 };
 
@@ -133,6 +140,33 @@ const LabelThresholdMetric = struct {
     precision: f64,
     recall: f64,
     f1: f64,
+};
+
+const DiagnosticEntity = struct {
+    text: []const u8,
+    label: []const u8,
+    start: usize,
+    end: usize,
+    score: ?f32 = null,
+};
+
+const QualityDiagnostic = struct {
+    kind: []const u8,
+    example_index: usize,
+    example_text: []const u8,
+    gold: ?DiagnosticEntity = null,
+    prediction: ?DiagnosticEntity = null,
+};
+
+const DiagnosticContext = struct {
+    items: *std.ArrayListUnmanaged(QualityDiagnostic),
+    example_index: usize,
+    limit: usize,
+
+    fn append(self: *DiagnosticContext, allocator: std.mem.Allocator, diagnostic: QualityDiagnostic) !void {
+        if (self.items.items.len >= self.limit) return;
+        try self.items.append(allocator, diagnostic);
+    }
 };
 
 const EvalAccumulator = struct {
@@ -225,7 +259,10 @@ pub fn main(init: std.process.Init) !void {
     }
     defer for (sweep_accums) |*accum| accum.deinit(allocator);
 
-    for (loaded.examples[0..limit]) |ex| {
+    var diagnostics = std.ArrayListUnmanaged(QualityDiagnostic).empty;
+    defer diagnostics.deinit(allocator);
+
+    for (loaded.examples[0..limit], 0..) |ex, example_index| {
         for (ex.entities) |ent| {
             if (indexOfLabel(entity_types, ent.label)) |label_idx| {
                 main_accum.addGold(label_idx);
@@ -247,8 +284,13 @@ pub fn main(init: std.process.Init) !void {
         defer summary.deinit(allocator);
 
         observeScores(score_stats, entity_types, summary.predictions);
-        try scoreExample(allocator, &main_accum, ex, entity_types, summary.predictions, opts);
-        for (sweep_accums) |*accum| try scoreExample(allocator, accum, ex, entity_types, summary.predictions, opts);
+        var diagnostic_ctx = DiagnosticContext{
+            .items = &diagnostics,
+            .example_index = example_index,
+            .limit = opts.diagnostic_limit,
+        };
+        try scoreExample(allocator, &main_accum, ex, entity_types, summary.predictions, opts, &diagnostic_ctx);
+        for (sweep_accums) |*accum| try scoreExample(allocator, accum, ex, entity_types, summary.predictions, opts, null);
     }
 
     main_accum.finish();
@@ -257,30 +299,17 @@ pub fn main(init: std.process.Init) !void {
     const recall = main_accum.recall();
     const f1 = main_accum.f1();
 
-    if (opts.min_precision) |threshold| {
-        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
-        if (precision < threshold) return error.EntityPrecisionBelowThreshold;
-    }
-    if (opts.min_recall) |threshold| {
-        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
-        if (recall < threshold) return error.EntityRecallBelowThreshold;
-    }
-    if (opts.min_f1) |threshold| {
-        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
-        if (f1 < threshold) return error.EntityF1BelowThreshold;
-    }
-
     const threshold_sweep = try allocator.alloc(ThresholdMetric, sweep_accums.len);
     defer allocator.free(threshold_sweep);
     for (sweep_accums, threshold_sweep) |accum, *metric| metric.* = accum.thresholdMetric();
     const best_threshold = bestThresholdMetric(threshold_sweep);
     const best_per_label_thresholds = try bestPerLabelThresholdMetrics(allocator, sweep_accums, entity_types);
     defer allocator.free(best_per_label_thresholds);
+    const recommended_label_thresholds_csv = try formatLabelThresholdCsv(allocator, best_per_label_thresholds);
+    defer allocator.free(recommended_label_thresholds_csv);
+    const quality_gate_failure = try qualityGateFailure(precision, recall, f1, opts);
 
-    const stdout = std.Io.File.stdout();
-    var buf: [32768]u8 = undefined;
-    var writer = stdout.writer(init.io, &buf);
-    try std.json.Stringify.value(QualitySummary{
+    const summary = QualitySummary{
         .model_dir = opts.model_dir,
         .adapter_dir = opts.adapter_dir,
         .eval_data = opts.eval_data,
@@ -311,10 +340,75 @@ pub fn main(init: std.process.Init) !void {
         .threshold_sweep = threshold_sweep,
         .best_threshold = best_threshold,
         .best_per_label_thresholds = best_per_label_thresholds,
-        .status = "passed",
-    }, .{ .whitespace = .indent_2 }, &writer.interface);
+        .recommended_label_thresholds_csv = recommended_label_thresholds_csv,
+        .diagnostic_limit = opts.diagnostic_limit,
+        .diagnostics = diagnostics.items,
+        .status = if (quality_gate_failure == null) "passed" else "failed",
+    };
+
+    if (opts.out_path) |out_path| try writeQualitySummary(init, out_path, summary);
+    if (opts.thresholds_out_path) |thresholds_out_path| try writeTextFile(init, thresholds_out_path, recommended_label_thresholds_csv);
+
+    const stdout = std.Io.File.stdout();
+    var buf: [32768]u8 = undefined;
+    var writer = stdout.writer(init.io, &buf);
+    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
+
+    if (quality_gate_failure) |failure| return qualityGateFailureError(failure);
+}
+
+const QualityGateFailure = enum {
+    precision,
+    recall,
+    f1,
+};
+
+fn qualityGateFailure(precision: f64, recall: f64, f1: f64, opts: Options) !?QualityGateFailure {
+    if (opts.min_precision) |threshold| {
+        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
+        if (precision < threshold) return .precision;
+    }
+    if (opts.min_recall) |threshold| {
+        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
+        if (recall < threshold) return .recall;
+    }
+    if (opts.min_f1) |threshold| {
+        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
+        if (f1 < threshold) return .f1;
+    }
+    return null;
+}
+
+fn qualityGateFailureError(failure: QualityGateFailure) anyerror {
+    return switch (failure) {
+        .precision => error.EntityPrecisionBelowThreshold,
+        .recall => error.EntityRecallBelowThreshold,
+        .f1 => error.EntityF1BelowThreshold,
+    };
+}
+
+fn writeQualitySummary(init: std.process.Init, out_path: []const u8, summary: QualitySummary) !void {
+    var file = try compat.cwd().createFile(init.io, out_path, .{ .truncate = true });
+    defer file.close(init.io);
+
+    var buf: [32768]u8 = undefined;
+    var writer = file.writer(init.io, &buf);
+    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+    try writer.interface.writeByte('\n');
+    try writer.end();
+}
+
+fn writeTextFile(init: std.process.Init, out_path: []const u8, text: []const u8) !void {
+    var file = try compat.cwd().createFile(init.io, out_path, .{ .truncate = true });
+    defer file.close(init.io);
+
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(init.io, &buf);
+    try writer.interface.writeAll(text);
+    try writer.interface.writeByte('\n');
+    try writer.end();
 }
 
 fn bestThresholdMetric(metrics: []const ThresholdMetric) ?ThresholdMetric {
@@ -362,6 +456,16 @@ fn labelThresholdMetric(label: []const u8, threshold: f32, metric: LabelMetric) 
     };
 }
 
+fn formatLabelThresholdCsv(allocator: std.mem.Allocator, metrics: []const LabelThresholdMetric) ![]const u8 {
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buffer.deinit();
+    for (metrics, 0..) |metric, idx| {
+        if (idx > 0) try buffer.writer.writeByte(',');
+        try buffer.writer.print("{s}={d:.6}", .{ metric.label, metric.min_prediction_score });
+    }
+    return buffer.toOwnedSlice();
+}
+
 fn observeScores(score_stats: []LabelScoreStats, entity_types: []const []const u8, predictions: []const adapter_eval.TopEntity) void {
     for (predictions) |prediction| {
         if (indexOfLabel(entity_types, prediction.label)) |label_idx| score_stats[label_idx].observe(prediction.score);
@@ -382,6 +486,7 @@ fn scoreExample(
     entity_types: []const []const u8,
     predictions: []const adapter_eval.TopEntity,
     opts: Options,
+    diagnostic_ctx: ?*DiagnosticContext,
 ) !void {
     const selected = try selectPredictions(allocator, predictions, accum.threshold, opts);
     defer allocator.free(selected);
@@ -402,7 +507,64 @@ fn scoreExample(
             }
         }
         accum.addPrediction(pred_label_idx, correct);
+        if (!correct) {
+            if (diagnostic_ctx) |ctx| try appendFalsePositiveDiagnostic(allocator, ctx, ex, prediction, entity_types[pred_label_idx]);
+        }
     }
+
+    if (diagnostic_ctx) |ctx| {
+        for (ex.entities, 0..) |ent, gold_idx| {
+            if (gold_matched[gold_idx]) continue;
+            const label_idx = indexOfLabel(entity_types, ent.label) orelse continue;
+            try appendFalseNegativeDiagnostic(allocator, ctx, ex, ent, entity_types[label_idx]);
+        }
+    }
+}
+
+fn appendFalsePositiveDiagnostic(
+    allocator: std.mem.Allocator,
+    ctx: *DiagnosticContext,
+    ex: gliner2_data.Example,
+    prediction: adapter_eval.TopEntity,
+    label: []const u8,
+) !void {
+    try ctx.append(allocator, .{
+        .kind = "false_positive",
+        .example_index = ctx.example_index,
+        .example_text = ex.text,
+        .prediction = .{
+            .text = spanText(ex.text, prediction.start, prediction.end),
+            .label = label,
+            .start = prediction.start,
+            .end = prediction.end,
+            .score = prediction.score,
+        },
+    });
+}
+
+fn appendFalseNegativeDiagnostic(
+    allocator: std.mem.Allocator,
+    ctx: *DiagnosticContext,
+    ex: gliner2_data.Example,
+    ent: gliner2_data.Entity,
+    label: []const u8,
+) !void {
+    try ctx.append(allocator, .{
+        .kind = "false_negative",
+        .example_index = ctx.example_index,
+        .example_text = ex.text,
+        .gold = .{
+            .text = if (ent.text.len > 0) ent.text else spanText(ex.text, ent.start, ent.end),
+            .label = label,
+            .start = ent.start,
+            .end = ent.end,
+        },
+    });
+}
+
+fn spanText(text: []const u8, start: usize, end: usize) []const u8 {
+    if (start > end or end > text.len) return "";
+    return text[start..end];
 }
 
 fn selectPredictions(
@@ -574,6 +736,12 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
             opts.min_recall = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--min-f1")) {
             opts.min_f1 = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            opts.out_path = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--thresholds-out")) {
+            opts.thresholds_out_path = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--diagnostic-limit")) {
+            opts.diagnostic_limit = try parseUsize(args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return null;
@@ -760,6 +928,87 @@ fn printUsage() void {
         \\  --min-precision FLOAT
         \\  --min-recall FLOAT
         \\  --min-f1 FLOAT
+        \\  --out PATH
+        \\  --thresholds-out PATH
+        \\  --diagnostic-limit N
         \\
     , .{});
+}
+
+test "dataset evaluator records false positive and false negative diagnostics" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{"person"};
+    var accum = try EvalAccumulator.init(allocator, 0.5, &labels);
+    defer accum.deinit(allocator);
+    accum.addGold(0);
+
+    const entities = [_]gliner2_data.Entity{.{
+        .text = "Alice",
+        .label = "person",
+        .start = 0,
+        .end = 5,
+    }};
+    const ex = gliner2_data.Example{
+        .text = "Alice met Bob",
+        .entities = &entities,
+    };
+    const predictions = [_]adapter_eval.TopEntity{.{
+        .text = "Bob",
+        .label = "person",
+        .start = 10,
+        .end = 13,
+        .score = 0.9,
+    }};
+    const opts = Options{
+        .model_dir = "",
+        .adapter_dir = "",
+        .eval_data = "",
+        .entity_types_csv = "person",
+        .min_prediction_score = 0.5,
+    };
+    var diagnostics = std.ArrayListUnmanaged(QualityDiagnostic).empty;
+    defer diagnostics.deinit(allocator);
+    var diagnostic_ctx = DiagnosticContext{
+        .items = &diagnostics,
+        .example_index = 7,
+        .limit = 8,
+    };
+
+    try scoreExample(allocator, &accum, ex, &labels, &predictions, opts, &diagnostic_ctx);
+
+    try std.testing.expectEqual(@as(usize, 1), accum.predicted_total);
+    try std.testing.expectEqual(@as(usize, 0), accum.correct_total);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqualStrings("false_positive", diagnostics.items[0].kind);
+    try std.testing.expectEqualStrings("Bob", diagnostics.items[0].prediction.?.text);
+    try std.testing.expectEqualStrings("false_negative", diagnostics.items[1].kind);
+    try std.testing.expectEqualStrings("Alice", diagnostics.items[1].gold.?.text);
+}
+
+test "dataset evaluator formats reusable per-label threshold csv" {
+    const allocator = std.testing.allocator;
+    const metrics = [_]LabelThresholdMetric{
+        .{
+            .label = "person",
+            .min_prediction_score = 0.15,
+            .predicted_entity_count = 2,
+            .correct_entity_count = 1,
+            .precision = 0.5,
+            .recall = 0.25,
+            .f1 = 0.333,
+        },
+        .{
+            .label = "organization",
+            .min_prediction_score = 0.25,
+            .predicted_entity_count = 1,
+            .correct_entity_count = 1,
+            .precision = 1.0,
+            .recall = 0.5,
+            .f1 = 0.666,
+        },
+    };
+    const csv = try formatLabelThresholdCsv(allocator, &metrics);
+    defer allocator.free(csv);
+
+    try std.testing.expectEqualStrings("person=0.150000,organization=0.250000", csv);
 }

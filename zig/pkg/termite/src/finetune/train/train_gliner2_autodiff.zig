@@ -95,6 +95,7 @@ const Options = struct {
     span_positive_weight: f32 = 32.0,
     span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: f32 = 1.0,
+    span_hard_negative_weight: f32 = 1.0,
     max_examples: usize = 0,
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
@@ -140,6 +141,7 @@ pub fn main(init: std.process.Init) !void {
     var span_positive_weight: f32 = 32.0;
     var span_label_positive_weights: ?[]const u8 = null;
     var span_negative_weight: f32 = 1.0;
+    var span_hard_negative_weight: f32 = 1.0;
     var max_examples: usize = 0;
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
@@ -199,6 +201,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--span-negative-weight")) {
             const val = args.next() orelse return error.MissingSpanNegativeWeight;
             span_negative_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--span-hard-negative-weight")) {
+            const val = args.next() orelse return error.MissingSpanHardNegativeWeight;
+            span_hard_negative_weight = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
             const val = args.next() orelse return error.MissingMaxExamples;
             max_examples = try std.fmt.parseUnsigned(usize, val, 10);
@@ -254,6 +259,7 @@ pub fn main(init: std.process.Init) !void {
         .span_positive_weight = span_positive_weight,
         .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = span_negative_weight,
+        .span_hard_negative_weight = span_hard_negative_weight,
         .max_examples = max_examples,
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
@@ -297,18 +303,20 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_grad_norm,
         opts.grad_accum,
     });
-    print("  objective={s} max_span_width={d} span_loss={s} span_pos_weight={d:.3} span_neg_weight={d:.3}\n", .{
+    print("  objective={s} max_span_width={d} span_loss={s} span_pos_weight={d:.3} span_neg_weight={d:.3} span_hard_neg_weight={d:.3}\n", .{
         objectiveName(opts.objective),
         opts.max_span_width,
         spanLossName(opts.span_loss),
         opts.span_positive_weight,
         opts.span_negative_weight,
+        opts.span_hard_negative_weight,
     });
     if (opts.span_label_positive_weights) |weights| {
         print("  span_label_positive_weights={s}\n", .{weights});
     }
     if (!std.math.isFinite(opts.span_positive_weight) or opts.span_positive_weight <= 0.0) return error.InvalidSpanPositiveWeight;
     if (!std.math.isFinite(opts.span_negative_weight) or opts.span_negative_weight <= 0.0) return error.InvalidSpanNegativeWeight;
+    if (!std.math.isFinite(opts.span_hard_negative_weight) or opts.span_hard_negative_weight <= 0.0) return error.InvalidSpanHardNegativeWeight;
 
     // ------------------------------------------------------------------
     // 2. Load DeBERTa config — GLiNER2 stores the encoder config under
@@ -784,17 +792,14 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     else
                         gliner2_autodiff.spanStartTargetWidth(encoded.num_entity_types);
                     const target_len = encoded.batch_size * encoded.max_spans * width;
-                    const span_stats = if (use_label_positive_weights)
-                        try gliner2_autodiff.fillWeightedSpanStartTargetsFromEncodedBatch(
-                            &encoded,
-                            resolved_span_label_positive_weights,
-                            targets_buf[0..target_len],
-                        )
-                    else
-                        try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatch(
-                            &encoded,
-                            targets_buf[0..target_len],
-                        );
+                    const span_stats = try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatchWithOptions(
+                        &encoded,
+                        .{
+                            .positive_weights_by_entity_type = if (use_label_positive_weights) resolved_span_label_positive_weights else null,
+                            .hard_negative_weight = opts.span_hard_negative_weight,
+                        },
+                        targets_buf[0..target_len],
+                    );
                     target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
                     targets_shape = if (use_label_positive_weights)
                         gliner2_autodiff.weightedSpanStartTargetsShape(
@@ -1040,6 +1045,7 @@ fn writeTrainingManifest(
         .span_positive_weight = opts.span_positive_weight,
         .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = opts.span_negative_weight,
+        .span_hard_negative_weight = opts.span_hard_negative_weight,
         .hidden_size = hidden_size,
         .entity_labels = entity_labels,
         .entity_label_count = entity_labels.len,
@@ -1526,6 +1532,7 @@ fn printUsage() void {
         \\  --span-positive-weight <f> Positive span-label loss weight (default: 32)
         \\  --span-label-positive-weights <csv> Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight <f> Negative span-label loss weight (default: 1)
+        \\  --span-hard-negative-weight <f> Extra negative weight for spans overlapping gold entities (default: 1)
         \\  --max-examples <n>        Cap on training examples (default: 0 = all)
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)

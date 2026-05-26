@@ -135,6 +135,8 @@ zig build -Dmetal=true gliner2-production-readiness -- \
 `metal`, compiled required, 200 examples/steps, batch size 1, sequence length
 32, Metal optimizer, zero device-resident transfers, nonzero resident
 trainable bytes, finite/decreasing loss, and `avg_step_wall_ms <= 3000`.
+It also runs the same 25-example shaped quality eval and requires
+`f1 >= 0.15`.
 `--production-mlx-gate` is the canonical resident MLX preset: backend `mlx`,
 compiled required, 200 examples/steps, batch size 1, sequence length 32, MLX
 optimizer, zero device-resident transfers, nonzero resident trainable bytes,
@@ -148,6 +150,9 @@ optimize sparse positive span labels with a weighted binary objective. Use
 manifests include
 `entity_label_positive_counts`, aligned to `entity_labels`, so target-label
 coverage can be audited alongside prediction quality.
+`--span-hard-negative-weight` adds extra loss weight to negative span labels
+whose candidate span overlaps a gold entity, which is useful when diagnostics
+show partial-span or wrong-label predictions near true entities.
 For long runs, loss-decrease validation uses a first-window vs last-window
 trend instead of comparing only the first and final individual step. Semantic
 goldens pass when the expected entity appears among decoded predictions above
@@ -175,6 +180,14 @@ sweeps report both a global `best_threshold` and
 `--quality-max-predictions-per-example`, and
 `--quality-best-span-per-label-start` provide stricter decode shaping before
 raising model-quality thresholds.
+When quality eval is enabled, the production gate also writes
+`quality_summary.json` and `quality_thresholds.csv` in the run directory and
+includes both paths in the final gate JSON. The summary sidecar contains
+per-label metrics, threshold-sweep calibration candidates, a reusable
+`recommended_label_thresholds_csv` string, and a bounded FP/FN diagnostic sample
+controlled by `--quality-diagnostic-limit`. The CSV file can be fed back into
+`--semantic-label-thresholds` or `--quality-label-thresholds` for calibrated
+decode checks.
 
 Latest 200-step resident Metal quality gate passed with
 `avg_step_wall_ms=2792.75`, `max_device_resident_transfer_count=0`,
