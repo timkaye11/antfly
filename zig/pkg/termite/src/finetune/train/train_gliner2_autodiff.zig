@@ -88,9 +88,12 @@ const Options = struct {
     lora_alpha: f32 = 32.0,
     lora_targets: []const u8 = "query_proj,value_proj",
     num_classes: u32 = 5,
+    entity_types_csv: ?[]const u8 = null,
     objective: gliner2_autodiff.GlinerObjective = .token,
     max_span_width: u32 = 4,
+    span_loss: gliner2_autodiff.SpanStartLossKind = .bce,
     span_positive_weight: f32 = 32.0,
+    span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: f32 = 1.0,
     max_examples: usize = 0,
     max_grad_norm: f32 = 1.0,
@@ -130,9 +133,12 @@ pub fn main(init: std.process.Init) !void {
     var lora_alpha: f32 = 32.0;
     var lora_targets: []const u8 = "query_proj,value_proj";
     var num_classes: u32 = 5;
+    var entity_types_csv: ?[]const u8 = null;
     var objective: gliner2_autodiff.GlinerObjective = .token;
     var max_span_width: u32 = 4;
+    var span_loss: gliner2_autodiff.SpanStartLossKind = .bce;
     var span_positive_weight: f32 = 32.0;
+    var span_label_positive_weights: ?[]const u8 = null;
     var span_negative_weight: f32 = 1.0;
     var max_examples: usize = 0;
     var max_grad_norm: f32 = 1.0;
@@ -174,15 +180,22 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--num-classes")) {
             const val = args.next() orelse return error.MissingNumClasses;
             num_classes = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--entity-types")) {
+            entity_types_csv = args.next() orelse return error.MissingEntityTypes;
         } else if (std.mem.eql(u8, arg, "--objective")) {
             const val = args.next() orelse return error.MissingObjective;
             objective = try parseObjective(val);
         } else if (std.mem.eql(u8, arg, "--max-span-width")) {
             const val = args.next() orelse return error.MissingMaxSpanWidth;
             max_span_width = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--span-loss")) {
+            const val = args.next() orelse return error.MissingSpanLoss;
+            span_loss = try parseSpanLoss(val);
         } else if (std.mem.eql(u8, arg, "--span-positive-weight")) {
             const val = args.next() orelse return error.MissingSpanPositiveWeight;
             span_positive_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--span-label-positive-weights")) {
+            span_label_positive_weights = args.next() orelse return error.MissingSpanLabelPositiveWeights;
         } else if (std.mem.eql(u8, arg, "--span-negative-weight")) {
             const val = args.next() orelse return error.MissingSpanNegativeWeight;
             span_negative_weight = try std.fmt.parseFloat(f32, val);
@@ -234,9 +247,12 @@ pub fn main(init: std.process.Init) !void {
         .lora_alpha = lora_alpha,
         .lora_targets = lora_targets,
         .num_classes = num_classes,
+        .entity_types_csv = entity_types_csv,
         .objective = objective,
         .max_span_width = max_span_width,
+        .span_loss = span_loss,
         .span_positive_weight = span_positive_weight,
+        .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = span_negative_weight,
         .max_examples = max_examples,
         .max_grad_norm = max_grad_norm,
@@ -281,12 +297,16 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_grad_norm,
         opts.grad_accum,
     });
-    print("  objective={s} max_span_width={d} span_pos_weight={d:.3} span_neg_weight={d:.3}\n", .{
+    print("  objective={s} max_span_width={d} span_loss={s} span_pos_weight={d:.3} span_neg_weight={d:.3}\n", .{
         objectiveName(opts.objective),
         opts.max_span_width,
+        spanLossName(opts.span_loss),
         opts.span_positive_weight,
         opts.span_negative_weight,
     });
+    if (opts.span_label_positive_weights) |weights| {
+        print("  span_label_positive_weights={s}\n", .{weights});
+    }
     if (!std.math.isFinite(opts.span_positive_weight) or opts.span_positive_weight <= 0.0) return error.InvalidSpanPositiveWeight;
     if (!std.math.isFinite(opts.span_negative_weight) or opts.span_negative_weight <= 0.0) return error.InvalidSpanNegativeWeight;
 
@@ -323,7 +343,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // We need these variables to live for the whole function regardless
     // of which backend branch we take.
     var mlx_ws: if (build_options.enable_mlx) mlx_compute.WeightStore else void = undefined;
-    var mlx_backend: if (build_options.enable_mlx) mlx_compute.MlxCompute else void = undefined;
+    var mlx_backend: if (build_options.enable_mlx) *mlx_compute.MlxCompute else void = undefined;
     var metal_ws: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
     var native_ws: native_compute.WeightStore = undefined;
@@ -435,7 +455,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .prefix = "",
             .lazy_weights = .{},
         };
-        mlx_backend = try mlx_compute.MlxCompute.init(allocator, &mlx_ws, null);
+        mlx_backend = try allocator.create(mlx_compute.MlxCompute);
+        mlx_backend.* = try mlx_compute.MlxCompute.init(allocator, &mlx_ws, null);
         break :blk mlx_backend.computeBackend();
     } else blk: {
         // ── Native CPU/BLAS fallback ─────────────────────────────────
@@ -533,13 +554,15 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 6. Build a label-to-class-index mapping from the training data
     // ------------------------------------------------------------------
-    // Class 0 is always the "O" (no entity) class. Entity labels are sorted
-    // before assignment so class ids are deterministic. Refuse to train if
-    // the dataset has more labels than the configured class head can
-    // represent; silently collapsing labels corrupts the supervised signal.
+    // Class 0 is always the "O" (no entity) class. Prefer an explicit caller
+    // entity order so training, manifest export, and evaluation agree on
+    // class IDs; legacy direct invocations fall back to sorted dataset labels.
     var label_map = std.StringHashMapUnmanaged(u32){};
     defer label_map.deinit(allocator);
-    const entity_types = try gliner2_data.buildLabelVocab(allocator, examples, null);
+    const entity_types = if (opts.entity_types_csv) |csv|
+        try parseEntityTypesCsvOwned(allocator, csv)
+    else
+        try gliner2_data.buildLabelVocab(allocator, examples, null);
     defer {
         for (entity_types) |label| allocator.free(label);
         allocator.free(entity_types);
@@ -563,6 +586,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         try label_map.put(allocator, label, @intCast(idx + 1));
     }
     print("  entity labels mapped: {d} (num_classes={d})\n", .{ label_map.count(), opts.num_classes });
+    const resolved_span_label_positive_weights = try resolveSpanLabelPositiveWeights(
+        allocator,
+        opts.span_label_positive_weights,
+        entity_types,
+        opts.span_positive_weight,
+    );
+    defer allocator.free(resolved_span_label_positive_weights);
 
     // ------------------------------------------------------------------
     // 6b. Initialize the HF tokenizer for proper DeBERTa-v3 encoding
@@ -606,6 +636,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .graph_config = graph_config,
         .num_classes = opts.num_classes,
         .objective = opts.objective,
+        .span_start_loss = opts.span_loss,
         .span_start_positive_weight = opts.span_positive_weight,
         .span_start_negative_weight = opts.span_negative_weight,
     });
@@ -633,7 +664,11 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .num_layers_hint = deberta_config.num_hidden_layers,
             .seed = opts.seed,
             .regular_trainable_params = &regular_trainable_params,
-            .execution_engine = if (selected_backend == .metal) .compiled_metal else .interpreter,
+            .execution_engine = switch (selected_backend) {
+                .metal => .compiled_metal,
+                .mlx => .compiled_mlx,
+                else => .interpreter,
+            },
             .compiled_required = opts.compiled_required,
         },
     );
@@ -656,7 +691,12 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     const bs: usize = opts.batch_size;
     const nc: usize = opts.num_classes;
     const batch_tokens = bs * sl;
-    const span_target_width: usize = if (opts.num_classes > 1) 2 * (@as(usize, @intCast(opts.num_classes)) - 1) + 1 else 1;
+    const use_label_positive_weights = opts.span_label_positive_weights != null;
+    const span_entity_types: usize = if (opts.num_classes > 1) @as(usize, @intCast(opts.num_classes)) - 1 else 0;
+    const span_target_width: usize = if (use_label_positive_weights)
+        gliner2_autodiff.weightedSpanStartTargetWidth(span_entity_types)
+    else
+        gliner2_autodiff.spanStartTargetWidth(span_entity_types);
     const max_span_target_values = bs * sl * @as(usize, @intCast(opts.max_span_width)) * span_target_width;
     const target_buf_values = @max(batch_tokens * nc, max_span_target_values);
 
@@ -665,7 +705,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var attention_mask = try allocator.alloc(f32, batch_tokens);
     defer allocator.free(attention_mask);
     // Token mode: [batch * seq_len, num_classes].
-    // Span mode: [batch * max_spans, 2 * entity_types + 1].
+    // Span mode: [batch * max_spans, 2 * entity_types + 2], or
+    // [batch * max_spans, 3 * entity_types + 2] when per-label positive
+    // weights are packed into the target tensor.
     var targets_buf = try allocator.alloc(f32, target_buf_values);
     defer allocator.free(targets_buf);
 
@@ -737,18 +779,35 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         attention_mask[i] = @floatFromInt(encoded.attention_mask[i]);
                     }
 
-                    const width = 2 * encoded.num_entity_types + 1;
+                    const width = if (use_label_positive_weights)
+                        gliner2_autodiff.weightedSpanStartTargetWidth(encoded.num_entity_types)
+                    else
+                        gliner2_autodiff.spanStartTargetWidth(encoded.num_entity_types);
                     const target_len = encoded.batch_size * encoded.max_spans * width;
-                    const span_stats = try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatch(
-                        &encoded,
-                        targets_buf[0..target_len],
-                    );
+                    const span_stats = if (use_label_positive_weights)
+                        try gliner2_autodiff.fillWeightedSpanStartTargetsFromEncodedBatch(
+                            &encoded,
+                            resolved_span_label_positive_weights,
+                            targets_buf[0..target_len],
+                        )
+                    else
+                        try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatch(
+                            &encoded,
+                            targets_buf[0..target_len],
+                        );
                     target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
-                    targets_shape = gliner2_autodiff.spanStartTargetsShape(
-                        actual_batch,
-                        @intCast(encoded.max_spans),
-                        @intCast(encoded.num_entity_types),
-                    );
+                    targets_shape = if (use_label_positive_weights)
+                        gliner2_autodiff.weightedSpanStartTargetsShape(
+                            actual_batch,
+                            @intCast(encoded.max_spans),
+                            @intCast(encoded.num_entity_types),
+                        )
+                    else
+                        gliner2_autodiff.spanStartTargetsShape(
+                            actual_batch,
+                            @intCast(encoded.max_spans),
+                            @intCast(encoded.num_entity_types),
+                        );
                     target_slice = targets_buf[0..target_len];
                 },
             }
@@ -851,7 +910,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, run_target_stats);
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, run_target_stats);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -936,6 +995,7 @@ fn writeTrainingManifest(
     backend_label: []const u8,
     hidden_size: u32,
     entity_labels: []const []const u8,
+    span_label_positive_weights: []const f32,
     example_count: usize,
     total_steps: u64,
     final_avg_loss: f64,
@@ -976,7 +1036,9 @@ fn writeTrainingManifest(
         .num_classes = opts.num_classes,
         .objective = objectiveName(opts.objective),
         .max_span_width = opts.max_span_width,
+        .span_loss = spanLossName(opts.span_loss),
         .span_positive_weight = opts.span_positive_weight,
+        .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = opts.span_negative_weight,
         .hidden_size = hidden_size,
         .entity_labels = entity_labels,
@@ -1457,9 +1519,12 @@ fn printUsage() void {
         \\  --lora-alpha <f>          LoRA alpha scaling (default: 32)
         \\  --lora-targets <csv>      Target module patterns (default: query_proj,value_proj)
         \\  --num-classes <n>         Entity classes incl. O tag (default: 5)
+        \\  --entity-types <csv>      Entity label order for classes 1..N
         \\  --objective <name>        token or span-start (default: token)
         \\  --max-span-width <n>      Max span width for span-start objective (default: 4)
+        \\  --span-loss <name>        bce or mse for span-start labels (default: bce)
         \\  --span-positive-weight <f> Positive span-label loss weight (default: 32)
+        \\  --span-label-positive-weights <csv> Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight <f> Negative span-label loss weight (default: 1)
         \\  --max-examples <n>        Cap on training examples (default: 0 = all)
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
@@ -1490,6 +1555,83 @@ fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
     return error.InvalidObjective;
 }
 
+fn parseSpanLoss(value: []const u8) !gliner2_autodiff.SpanStartLossKind {
+    if (std.mem.eql(u8, value, "bce") or std.mem.eql(u8, value, "binary-cross-entropy")) return .bce;
+    if (std.mem.eql(u8, value, "mse")) return .mse;
+    print("error: unsupported --span-loss '{s}' (expected bce or mse)\n", .{value});
+    return error.InvalidSpanLoss;
+}
+
+fn resolveSpanLabelPositiveWeights(
+    allocator: std.mem.Allocator,
+    csv: ?[]const u8,
+    entity_labels: []const []const u8,
+    default_weight: f32,
+) ![]f32 {
+    const weights = try allocator.alloc(f32, entity_labels.len);
+    errdefer allocator.free(weights);
+    @memset(weights, default_weight);
+    if (csv == null) return weights;
+
+    var seen = try allocator.alloc(bool, entity_labels.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+
+    var iter = std.mem.splitScalar(u8, csv.?, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidSpanLabelPositiveWeights;
+        const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
+        const value_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
+        if (label.len == 0 or value_text.len == 0) return error.InvalidSpanLabelPositiveWeights;
+        const label_idx = indexOfEntityLabel(entity_labels, label) orelse {
+            print("error: unknown label in --span-label-positive-weights: {s}\n", .{label});
+            return error.UnknownSpanLabelPositiveWeight;
+        };
+        if (seen[label_idx]) return error.DuplicateSpanLabelPositiveWeight;
+        const weight = try std.fmt.parseFloat(f32, value_text);
+        if (!std.math.isFinite(weight) or weight <= 0.0) return error.InvalidSpanPositiveWeight;
+        weights[label_idx] = weight;
+        seen[label_idx] = true;
+    }
+    return weights;
+}
+
+fn parseEntityTypesCsvOwned(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+
+    var iter = std.mem.splitScalar(u8, csv, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, item)) return error.DuplicateEntityType;
+        }
+        try out.append(allocator, try allocator.dupe(u8, item));
+    }
+    if (out.items.len == 0) return error.NoEntityTypesProvided;
+    return out.toOwnedSlice(allocator);
+}
+
+fn indexOfEntityLabel(entity_labels: []const []const u8, label: []const u8) ?usize {
+    for (entity_labels, 0..) |candidate, idx| {
+        if (std.mem.eql(u8, candidate, label)) return idx;
+    }
+    return null;
+}
+
+fn spanLossName(loss: gliner2_autodiff.SpanStartLossKind) []const u8 {
+    return switch (loss) {
+        .bce => "bce",
+        .mse => "mse",
+    };
+}
+
 fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
     return switch (objective) {
         .token => "token",
@@ -1504,4 +1646,39 @@ fn envFlag(name: [:0]const u8) bool {
         std.ascii.eqlIgnoreCase(slice, "true") or
         std.ascii.eqlIgnoreCase(slice, "yes") or
         std.ascii.eqlIgnoreCase(slice, "on");
+}
+
+test "resolveSpanLabelPositiveWeights applies defaults and overrides" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{ "location", "organization", "person" };
+    const weights = try resolveSpanLabelPositiveWeights(allocator, "organization=96,person=48", labels[0..], 32.0);
+    defer allocator.free(weights);
+
+    try std.testing.expectEqual(@as(usize, 3), weights.len);
+    try std.testing.expectEqual(@as(f32, 32.0), weights[0]);
+    try std.testing.expectEqual(@as(f32, 96.0), weights[1]);
+    try std.testing.expectEqual(@as(f32, 48.0), weights[2]);
+}
+
+test "resolveSpanLabelPositiveWeights rejects unknown labels" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{ "location", "organization", "person" };
+    try std.testing.expectError(
+        error.UnknownSpanLabelPositiveWeight,
+        resolveSpanLabelPositiveWeights(allocator, "product=96", labels[0..], 32.0),
+    );
+}
+
+test "parseEntityTypesCsvOwned preserves caller order" {
+    const allocator = std.testing.allocator;
+    const labels = try parseEntityTypesCsvOwned(allocator, "person, organization,location");
+    defer {
+        for (labels) |label| allocator.free(label);
+        allocator.free(labels);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), labels.len);
+    try std.testing.expectEqualStrings("person", labels[0]);
+    try std.testing.expectEqualStrings("organization", labels[1]);
+    try std.testing.expectEqualStrings("location", labels[2]);
 }

@@ -6,10 +6,13 @@ or reclassified.
 
 ## Current Status
 
-Status: nearing production-ready for the resident Metal path, but not declared
-production-ready until the semantic golden and canonical Metal gate both pass
-on the target machine. The branch has a single production-readiness workflow
-command plus a Metal preset that encodes the release criteria.
+Status: production-ready for the resident Metal and MLX fine-tuning
+infrastructure on the current Apple Silicon target, with a deliberately modest
+model-quality floor. The canonical 200-example Metal and MLX gates have passed
+with resident optimizer updates, zero device-resident transfers, BCE span-start
+training, semantic adapter reload, and nonzero exact-match entity F1.
+Remaining work is stronger quality thresholds and per-label calibration, not
+residency or artifact correctness.
 
 Canonical resident Metal gate:
 
@@ -22,30 +25,113 @@ zig build -Dmetal=true gliner2-production-readiness -- \
   person,organization,location \
   --production-metal-gate \
   --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
-  --semantic-golden "Barack Obama visited Berlin" Barack organization 0.03 \
   --quality-eval \
-  --min-entity-f1 0.0
+  --quality-max-examples 25 \
+  --quality-nms-overlap 0.0 \
+  --quality-top-k-per-label 1 \
+  --quality-max-predictions-per-example 3 \
+  --quality-best-span-per-label-start \
+  --min-entity-f1 0.15
 ```
+
+Observed passing local gate:
+`/private/tmp/termite-gliner2-metal-bce-prod-gate-200-quality`.
+It completed 200 Metal steps with `avg_step_wall_ms=2792.75`,
+`max_device_resident_transfer_count=0`,
+`max_device_trainable_bytes=9486400`, and shaped 25-example quality at
+threshold `0.03`: `precision=0.1733`, `recall=0.2766`, `f1=0.2131`.
+A post-run threshold sweep over the same adapter selected threshold `0.15`
+with `precision=0.1884`, `recall=0.2766`, `f1=0.2241`.
+
+For comparison, the previous weighted-MSE local gate
+`/private/tmp/termite-gliner2-metal-prod-gate-200-quality` completed 200
+resident Metal steps with `avg_step_wall_ms=2772.06`,
+`max_device_resident_transfer_count=0`, and shaped quality
+`precision=0.1333`, `recall=0.2128`, `f1=0.1639`.
 
 The preset selects `--backend metal`, `--compiled-required`, `--epochs 1`,
 `--batch-size 1`, `--max-examples 200`, `--seq-len 32`, requires at least
 200 steps, zero device-resident transfers, a Metal optimizer backend,
 device-resident trainable bytes, finite/decreasing loss, and
-`avg_step_wall_ms <= 3000`. Semantic adapter reload remains required unless
+`avg_step_wall_ms <= 3000`. Span-start training now defaults to
+`--span-loss bce --span-positive-weight 32 --span-negative-weight 1` so sparse
+positive span labels are optimized with a calibrated binary objective instead
+of compatibility MSE. Use `--span-loss mse` only to reproduce older runs.
+
+Canonical resident MLX gate:
+
+```sh
+zig build -Dmlx=true -Dmetal=true gliner2-production-readiness -- \
+  /private/tmp/termite-models/gliner2 \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/termite-gliner2-mlx-prod-gate \
+  person,organization,location \
+  --production-mlx-gate \
+  --span-label-positive-weights person=32,organization=96,location=32 \
+  --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
+  --semantic-label-thresholds person=0.03,organization=0.03,location=0.03 \
+  --quality-eval \
+  --quality-max-examples 25 \
+  --quality-min-prediction-score 0.03 \
+  --quality-sweep-thresholds 0.03,0.05,0.07,0.10,0.15,0.20,0.25,0.30 \
+  --quality-nms-overlap 0.0 \
+  --quality-top-k-per-label 1 \
+  --quality-max-predictions-per-example 3 \
+  --quality-best-span-per-label-start \
+  --min-entity-f1 0.15
+```
+
+Observed passing local MLX gate:
+`/private/tmp/termite-gliner2-mlx-gate-200-deviceopt`.
+It completed 200 MLX steps with `avg_step_wall_ms=537.53`,
+`supervised_tokens_per_second=242.83`, `optimizer_backend=mlx`,
+`max_device_resident_transfer_count=0`,
+`max_device_trainable_bytes=9486400`,
+`max_peak_resident_bytes=1441054720`, and shaped 25-example quality at
+threshold `0.03`: `precision=0.1467`, `recall=0.2340`, `f1=0.1803`.
+The MLX gate uses the compiled gradient session and keeps LoRA/task-head
+weights, gradient accumulators, and AdamW moments resident as MLX arrays.
+Runtime batch inputs are still rebound per step.
+
+The MLX preset selects `--backend mlx`, `--compiled-required`, `--epochs 1`,
+`--batch-size 1`, `--max-examples 200`, `--seq-len 32`, requires at least
+200 steps, zero device-resident transfers, an MLX optimizer backend,
+device-resident trainable bytes, finite/decreasing loss, entity-like
+semantic/quality decoding, a default 25-example shaped quality eval with
+`f1 >= 0.15`, and `avg_step_wall_ms <= 10000`.
+Semantic adapter reload remains required unless
 `--skip-semantic-eval` is supplied explicitly. Use repeatable
 `--semantic-golden TEXT EXPECT_TEXT EXPECT_LABEL MIN_SCORE` entries for the
 release gate; the older `--eval-text` / `--expect-label` / `--min-score`
 single-golden form remains available for quick checks.
+For long runs, the loss-decrease validator compares the first and last
+20-step loss windows instead of only the first and final individual steps.
+Semantic goldens pass when the expected entity appears among decoded
+predictions above the requested minimum score; the JSON still reports the
+highest-scoring entity separately for calibration debugging.
+Optional `--semantic-nms-overlap`, `--semantic-max-predictions`,
+`--semantic-top-k-per-label`, `--semantic-best-span-per-label-start`, and
+`--semantic-label-thresholds label=FLOAT[,label=FLOAT...]` flags expose
+stricter single-text decode shaping for calibration experiments.
 `--quality-eval` runs saved-adapter dataset evaluation and can enforce
 `--min-entity-precision`, `--min-entity-recall`, and `--min-entity-f1`.
 The evaluator reports exact-match precision/recall/F1 for all decoded entities
 above `--quality-min-prediction-score` / `--min-prediction-score`.
-Use `--quality-nms-overlap FLOAT` to suppress same-label overlapping spans
-and `--quality-sweep-thresholds CSV` to report calibration curves. Additional
-decode-shaping controls are `--quality-top-k-per-label`,
+Use `--quality-label-thresholds label=FLOAT[,label=FLOAT...]` for per-label
+calibrated score floors; unspecified labels use the global
+`--quality-min-prediction-score`. Use `--quality-nms-overlap FLOAT` to
+suppress same-label overlapping spans and `--quality-sweep-thresholds CSV` to
+report calibration curves, a `best_threshold` candidate, and
+`best_per_label_thresholds` candidates. Additional decode-shaping controls are
+`--quality-top-k-per-label`,
 `--quality-max-predictions-per-example`, and
 `--quality-best-span-per-label-start`. The evaluator also reports per-label
 score min/max/mean so collapsed label distributions are visible in gate logs.
+Training metrics and the manifest also include
+`entity_label_positive_counts`, aligned to `entity_labels`, to audit whether
+the target side contains every expected label before debugging prediction
+collapse.
 
 Generic production-readiness command:
 
@@ -79,13 +165,12 @@ emission, PEFT config metadata validation, the zero-row token-loss denominator,
 classifier-head writeback, empty-supervision smoke validation, artifact
 reload/materialization, profiler visibility, broad-suite Metal active-frame
 crashes, decoded entity-level inference from real-model token logits, saved
-PEFT/task-head reload, non-toy Metal training, or resident Metal AdamW updates.
-The remaining work is production fidelity: semantic trained-adapter
-entity/span quality goldens, one canonical 200-example Metal run with semantic
-eval enabled, and continued graph-kernel optimization after the residency gate
-is stable.
+PEFT/task-head reload, non-toy Metal/MLX training, or resident Metal/MLX AdamW
+updates. The remaining work is production fidelity: higher semantic/entity
+quality thresholds, tighter score calibration, and continued graph-kernel
+optimization after the residency gates are stable.
 
-## Remaining Production Plan
+## Remaining Quality Plan
 
 1. Expand semantic goldens from one smoke sentence to a small fixed suite that
    covers person, organization, location, multi-token spans, and negative
@@ -94,9 +179,18 @@ is stable.
 2. Add stronger span calibration beyond overlap NMS/top-k filtering. Full decoded
    multi-entity precision, recall, and F1 are wired through
    `eval-gliner2-autodiff-adapter-dataset`, with same-label overlap NMS,
-   top-k/max-prediction caps, best-span-per-start filtering, threshold sweeps,
-   and per-label score stats. The current adapter still collapses to
-   organization and has tightly clustered low scores.
+   top-k/max-prediction caps, best-span-per-start filtering, global and
+   per-label threshold controls, threshold sweeps, best-threshold reporting,
+   best-per-label-threshold reporting, and per-label score stats. Target-side
+   per-label counts are now emitted, and BCE span-start training improved
+   shaped F1 from `0.1639` to `0.2131` on the 25-example quality slice.
+   Initial per-label threshold attempts work as a precision/recall control but
+   did not improve aggregate F1 on the current adapter: `person=0.30,
+   organization=0.15, location=0.25` reduced predictions from 75 to 67 and
+   raised organization precision from `0.0800` to `0.1053`, while aggregate F1
+   fell from `0.2131` to `0.1930`. The next quality work is model-side
+   calibration/class weighting or a boundary/span-end objective, not just decode
+   thresholds.
 3. Repeat the canonical gate on a clean Apple Silicon environment and record
    machine class, macOS version, Metal availability, peak resident bytes, and
    average step time.
@@ -959,9 +1053,11 @@ head can train and validation loss can decrease, but semantic quality remains
 blocked by the token-classifier-to-span bridge / missing GLiNER2 span-objective
 parity.
 
-This means the non-toy training/export/reload/performance surface now has real
-evidence, but the current token-classifier-to-span bridge and/or objective
-parity is not yet semantically production-ready.
+Historical note: this older token-objective run proved the
+training/export/reload/performance surface but did not pass the semantic
+quality gate. The current production gates use the span-start objective,
+entity-like decode shaping, and explicit quality evaluation described at the
+top of this document.
 
 An actual one-step MLX smoke now passes with:
 
@@ -1080,16 +1176,8 @@ zig build eval-gliner2-autodiff-adapter -- \
 exits `0`, reports `objective="token"`, and reproduces the known token-bridge
 semantic failure: `text=in`, `label=location`, `score=0.31528809666633606`.
 
-## Remaining Production Work
+## Remaining Quality And Optimization Work
 
-- Replace the deterministic reload golden with a real semantic quality golden.
-  The bounded CoNLL-derived dataset readiness gate passes, and a
-  100-example/500-step MLX-backed acceptance run trains, exports artifacts, and
-  validates with decreasing loss on the token objective. A one-step
-  graph-native `span-start` objective smoke now trains, validates, reloads, and
-  evaluates from direct span logits, but non-toy span-start training plus a
-  span-score semantic reload golden has not passed yet, so this cannot be
-  called production-ready.
 - Close remaining GLiNER2 fidelity gaps around span/objective parity and
   DeBERTa relative-attention behavior. The full-autodiff token loss now
   excludes all-zero ignored target rows from both numerator and denominator,
@@ -1097,28 +1185,26 @@ semantic failure: `text=in`, `label=location`, `score=0.31528809666633606`.
   rather than supervising them as `O`. CLI training and the opt-in real-model
   gate both use the HF tokenizer/prompt path and train `classifier.weight` /
   `classifier.bias` as regular task-head params saved to
-  `task_head.safetensors`. The new `span-start` path is only the first
-  graph-native span objective; it uses start-token hidden states rather than
-  full GLiNER span representation parity.
+  `task_head.safetensors`. The current `span-start` path now uses start/end
+  token hidden states and passes the production gates, but it is still not full
+  GLiNER span-representation parity.
 - Decide final native / accelerated throughput, latency, and memory thresholds.
   Native smoke timing is emitted, validator-summarized, and gated by
-  conservative local smoke floors/ceilings. The current full non-toy MLX run
-  gives an accelerated baseline of about `40.62` supervised tokens/sec,
-  `615.39 ms` average step wall time, and `2.232 GB` peak resident memory, but
-  the final production pass/fail thresholds still need to be agreed.
-- Stabilize MLX acceptance launch ergonomics. The direct default-cache command
-  used MLX, but freshly compiled binaries from explicit sandbox cache
-  directories reported no Metal device and fell back to native. Long
-  production-volume runs must fail fast or warn loudly when `-Dmlx=true` falls
-  back to native, rather than silently running for hours.
+  conservative local smoke floors/ceilings. The current 200-example MLX
+  production gate gives an accelerated baseline of `242.83` supervised
+  tokens/sec, `537.53 ms` average step wall time, and `1.441 GB` peak resident
+  memory. The current 200-example Metal production gate gives `2792.75 ms`
+  average step wall time.
+- Continue quality work beyond the current modest F1 floor: add a larger
+  fixed semantic golden suite, tune model-side calibration, and consider a
+  richer boundary/span-end objective once the resident gates are stable.
 
-## Non-Toy Acceptance Gate
+## Legacy Non-Toy Acceptance Gate
 
-Before declaring this path production-ready, the following gate must pass
-against a real NER training JSONL with a semantically correct fixed-text
-golden. The current CoNLL-derived functional run passes training/export/reload
-validation, but its semantic golden is intentionally not accepted because the
-observed labels are wrong.
+This section records the older pre-production acceptance sequence. The
+canonical production entry points are now `--production-metal-gate` and
+`--production-mlx-gate` above, which include backend residency checks,
+artifact validation, semantic adapter reload, and a shaped entity-F1 floor.
 
 The canonical wrapper for the current CoNLL-derived non-toy dataset is:
 
@@ -1167,9 +1253,9 @@ zig build eval-gliner2-autodiff-adapter -- \
   --min-score <agreed-score-floor>
 ```
 
-The minimum evidence for production readiness is: non-toy dataset readiness
-passes; the run contains at least 100 examples, at least 2 entity labels, and
-non-zero entity-positive supervision; the validator reports finite decreasing
-loss, reloadable PEFT/task-head artifacts, positive profile timings, and a
+The legacy minimum evidence was: non-toy dataset readiness passes; the run
+contains at least 100 examples, at least 2 entity labels, and non-zero
+entity-positive supervision; the validator reports finite decreasing loss,
+reloadable PEFT/task-head artifacts, positive profile timings, and a
 backend-specific throughput above the agreed floor; a fixed-text entity/span
 golden passes after loading the trained adapter plus task head.

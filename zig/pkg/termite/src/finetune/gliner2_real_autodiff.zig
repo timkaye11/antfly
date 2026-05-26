@@ -89,6 +89,11 @@ pub const GlinerObjective = enum {
     span_start,
 };
 
+pub const SpanStartLossKind = enum {
+    bce,
+    mse,
+};
+
 pub const GlinerAutodiffConfig = struct {
     /// Underlying DeBERTa encoder config (hidden size, layers, heads, ...).
     graph_config: deberta_graph.Config,
@@ -106,6 +111,9 @@ pub const GlinerAutodiffConfig = struct {
     /// large valid-span grid.
     span_start_positive_weight: f32 = 32.0,
     span_start_negative_weight: f32 = 1.0,
+    /// Binary cross-entropy is the production span-label objective. MSE is
+    /// retained as an explicit compatibility path for old calibration runs.
+    span_start_loss: SpanStartLossKind = .bce,
 };
 
 /// Trainer-opaque context that owns the graph-construction state and (after
@@ -351,19 +359,47 @@ pub const GlinerAutodiffCtx = struct {
         const target_shape = bld.graph.node(targets).output_shape;
         if (target_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
         const span_rows: u32 = @intCast(target_shape.dim(0));
-        if (target_shape.dim(1) != @as(i64, @intCast(2 * E + 1))) return error.InvalidGlinerSpanTargetShape;
+        const unweighted_start_only_width: i64 = @intCast(2 * E + 1);
+        const weighted_start_only_width: i64 = @intCast(3 * E + 1);
+        const unweighted_target_width: i64 = @intCast(2 * E + 2);
+        const weighted_target_width: i64 = @intCast(3 * E + 2);
+        const target_width = target_shape.dim(1);
+        const has_label_positive_weights = target_width == weighted_target_width or target_width == weighted_start_only_width;
+        const has_end_idx = target_width == unweighted_target_width or target_width == weighted_target_width;
+        if (target_width != unweighted_target_width and
+            target_width != weighted_target_width and
+            target_width != unweighted_start_only_width and
+            target_width != weighted_start_only_width) return error.InvalidGlinerSpanTargetShape;
 
         const labels = try bld.sliceLastDim(targets, 0, @intCast(E));
         const mask = try bld.sliceLastDim(targets, @intCast(E), @intCast(2 * E));
-        const start_idx_2d = try bld.sliceLastDim(targets, @intCast(2 * E), @intCast(2 * E + 1));
+        const label_positive_weights = if (has_label_positive_weights)
+            try bld.sliceLastDim(targets, @intCast(2 * E), @intCast(3 * E))
+        else
+            null;
+        const start_idx_offset: u32 = if (has_label_positive_weights) 3 * E else 2 * E;
+        const start_idx_2d = try bld.sliceLastDim(targets, @intCast(start_idx_offset), @intCast(start_idx_offset + 1));
         const start_idx_f32 = try bld.reshape(start_idx_2d, Shape.init(.f32, &.{@intCast(span_rows)}));
         const start_idx_i64 = try bld.convertDtype(start_idx_f32, .i64);
 
-        const span_hidden = try bld.gather(
+        const start_hidden = try bld.gather(
             hidden_flat,
             start_idx_i64,
             Shape.init(.f32, &.{ @intCast(span_rows), @intCast(H) }),
         );
+        const span_hidden = if (has_end_idx) blk: {
+            const end_idx_2d = try bld.sliceLastDim(targets, @intCast(start_idx_offset + 1), @intCast(start_idx_offset + 2));
+            const end_idx_f32 = try bld.reshape(end_idx_2d, Shape.init(.f32, &.{@intCast(span_rows)}));
+            const end_idx_i64 = try bld.convertDtype(end_idx_f32, .i64);
+            const end_hidden = try bld.gather(
+                hidden_flat,
+                end_idx_i64,
+                Shape.init(.f32, &.{ @intCast(span_rows), @intCast(H) }),
+            );
+            const summed = try bld.add(start_hidden, end_hidden);
+            const half = try bld.scalarConst(.f32, 0.5);
+            break :blk try bld.mul(summed, half);
+        } else start_hidden;
 
         const head_w = try bld.parameter(
             "classifier.weight",
@@ -378,14 +414,26 @@ pub const GlinerAutodiffCtx = struct {
         const entity_logits = try bld.sliceLastDim(all_logits, 1, @intCast(C));
         self.span_logits = entity_logits;
 
-        return buildMaskedSpanStartMseLoss(
-            bld,
-            entity_logits,
-            labels,
-            mask,
-            self.config.span_start_positive_weight,
-            self.config.span_start_negative_weight,
-        );
+        return switch (self.config.span_start_loss) {
+            .bce => buildMaskedSpanStartBceLoss(
+                bld,
+                entity_logits,
+                labels,
+                mask,
+                label_positive_weights,
+                self.config.span_start_positive_weight,
+                self.config.span_start_negative_weight,
+            ),
+            .mse => buildMaskedSpanStartMseLoss(
+                bld,
+                entity_logits,
+                labels,
+                mask,
+                label_positive_weights,
+                self.config.span_start_positive_weight,
+                self.config.span_start_negative_weight,
+            ),
+        };
     }
 };
 
@@ -426,6 +474,7 @@ fn buildMaskedSpanStartMseLoss(
     logits: NodeId,
     labels: NodeId,
     mask: NodeId,
+    label_positive_weights: ?NodeId,
     positive_weight: f32,
     negative_weight: f32,
 ) !NodeId {
@@ -436,7 +485,7 @@ fn buildMaskedSpanStartMseLoss(
 
     const probs = try bld.sigmoid(logits);
     const diff = try bld.sub(probs, labels);
-    const pos_weight = try bld.scalarConst(.f32, positive_weight);
+    const pos_weight = label_positive_weights orelse try bld.scalarConst(.f32, positive_weight);
     const neg_weight = try bld.scalarConst(.f32, negative_weight);
     const one = try bld.scalarConst(.f32, 1.0);
     const pos_term = try bld.mul(labels, pos_weight);
@@ -449,6 +498,53 @@ fn buildMaskedSpanStartMseLoss(
     const numerator = try bld.reduceSum(weighted_sq, all_axes[0..rank]);
     const denom = try bld.reduceSum(weighted_mask, all_axes[0..rank]);
     const eps = try bld.scalarConst(.f32, 1e-12);
+    const denom_safe = try bld.add(denom, eps);
+    return bld.div(numerator, denom_safe);
+}
+
+fn buildMaskedSpanStartBceLoss(
+    bld: *Builder,
+    logits: NodeId,
+    labels: NodeId,
+    mask: NodeId,
+    label_positive_weights: ?NodeId,
+    positive_weight: f32,
+    negative_weight: f32,
+) !NodeId {
+    const in_shape = bld.graph.node(logits).output_shape;
+    const rank = in_shape.rank();
+    var all_axes: [8]u8 = undefined;
+    for (0..rank) |i| all_axes[i] = @intCast(i);
+
+    const probs = try bld.sigmoid(logits);
+    const eps = try bld.scalarConst(.f32, 1e-6);
+    const one = try bld.scalarConst(.f32, 1.0);
+    const pos_weight = label_positive_weights orelse try bld.scalarConst(.f32, positive_weight);
+    const neg_weight = try bld.scalarConst(.f32, negative_weight);
+
+    const probs_safe = try bld.add(probs, eps);
+    const log_probs = try bld.logOp(probs_safe);
+    const pos_loss_raw = try bld.mul(labels, log_probs);
+    const pos_loss_neg = try bld.neg(pos_loss_raw);
+    const pos_loss = try bld.mul(pos_loss_neg, pos_weight);
+
+    const inverse_labels = try bld.sub(one, labels);
+    const inverse_probs = try bld.sub(one, probs);
+    const inverse_probs_safe = try bld.add(inverse_probs, eps);
+    const log_inverse_probs = try bld.logOp(inverse_probs_safe);
+    const neg_loss_raw = try bld.mul(inverse_labels, log_inverse_probs);
+    const neg_loss_neg = try bld.neg(neg_loss_raw);
+    const neg_loss = try bld.mul(neg_loss_neg, neg_weight);
+
+    const weighted_loss = try bld.add(pos_loss, neg_loss);
+    const masked_loss = try bld.mul(weighted_loss, mask);
+    const numerator = try bld.reduceSum(masked_loss, all_axes[0..rank]);
+
+    const pos_term = try bld.mul(labels, pos_weight);
+    const neg_term = try bld.mul(inverse_labels, neg_weight);
+    const label_weights = try bld.add(pos_term, neg_term);
+    const weighted_mask = try bld.mul(mask, label_weights);
+    const denom = try bld.reduceSum(weighted_mask, all_axes[0..rank]);
     const denom_safe = try bld.add(denom, eps);
     return bld.div(numerator, denom_safe);
 }
@@ -714,12 +810,33 @@ pub fn tokenTargetsShape(batch: u32, seq_len: u32, num_classes: u32) Shape {
     });
 }
 
+/// Packed span-start target width:
+/// labels[E], mask[E], start_token_index, end_token_index.
+pub fn spanStartTargetWidth(num_entity_types: usize) usize {
+    return 2 * num_entity_types + 2;
+}
+
+/// Packed weighted span-start target width:
+/// labels[E], mask[E], positive_weights[E], start_token_index, end_token_index.
+pub fn weightedSpanStartTargetWidth(num_entity_types: usize) usize {
+    return 3 * num_entity_types + 2;
+}
+
 /// Shape for packed span-start targets:
-/// `[batch * max_spans, 2 * num_entity_types + 1]` f32.
+/// `[batch * max_spans, 2 * num_entity_types + 2]` f32.
 pub fn spanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) Shape {
     return Shape.init(.f32, &.{
         @intCast(batch * max_spans),
-        @intCast(2 * num_entity_types + 1),
+        @intCast(spanStartTargetWidth(@intCast(num_entity_types))),
+    });
+}
+
+/// Shape for packed span-start targets with per-label positive weights:
+/// `[batch * max_spans, 3 * num_entity_types + 2]` f32.
+pub fn weightedSpanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) Shape {
+    return Shape.init(.f32, &.{
+        @intCast(batch * max_spans),
+        @intCast(weightedSpanStartTargetWidth(@intCast(num_entity_types))),
     });
 }
 
@@ -739,9 +856,32 @@ pub fn fillSpanStartTargetsFromEncodedBatch(
     batch: *const gliner2_data.EncodedBatch,
     out: []f32,
 ) !SpanStartTargetStats {
+    return fillSpanStartTargetsFromEncodedBatchInternal(batch, null, out);
+}
+
+pub fn fillWeightedSpanStartTargetsFromEncodedBatch(
+    batch: *const gliner2_data.EncodedBatch,
+    positive_weights_by_entity_type: []const f32,
+    out: []f32,
+) !SpanStartTargetStats {
+    return fillSpanStartTargetsFromEncodedBatchInternal(batch, positive_weights_by_entity_type, out);
+}
+
+fn fillSpanStartTargetsFromEncodedBatchInternal(
+    batch: *const gliner2_data.EncodedBatch,
+    positive_weights_by_entity_type: ?[]const f32,
+    out: []f32,
+) !SpanStartTargetStats {
     const E = batch.num_entity_types;
     const rows = batch.batch_size * batch.max_spans;
-    const width = 2 * E + 1;
+    if (positive_weights_by_entity_type) |weights| {
+        if (weights.len != E) return error.InvalidGlinerSpanTargetShape;
+        for (weights) |weight| {
+            if (!std.math.isFinite(weight) or weight <= 0.0) return error.InvalidSpanPositiveWeight;
+        }
+    }
+    const has_positive_weights = positive_weights_by_entity_type != null;
+    const width = if (has_positive_weights) weightedSpanStartTargetWidth(E) else spanStartTargetWidth(E);
     if (out.len != rows * width) return error.InvalidGlinerSpanTargetShape;
     if (E > max_span_start_entity_types) return error.TooManyEntityTypes;
 
@@ -766,25 +906,39 @@ pub fn fillSpanStartTargetsFromEncodedBatch(
                 continue;
             }
             const start_word: usize = @intCast(start_word_raw);
+            const end_word: usize = @intCast(end_word_raw);
             if (start_word >= batch.max_words_per_sample) return error.InvalidSpanWordIndex;
+            if (end_word >= batch.max_words_per_sample) return error.InvalidSpanWordIndex;
             const token_pos_raw = batch.first_token_positions[word_pos_offset + start_word];
             if (token_pos_raw < 0) {
                 stats.ignored_span_count += 1;
                 continue;
             }
+            const end_token_pos_raw = batch.first_token_positions[word_pos_offset + end_word];
+            if (end_token_pos_raw < 0) {
+                stats.ignored_span_count += 1;
+                continue;
+            }
             const token_pos: usize = @intCast(token_pos_raw);
+            const end_token_pos: usize = @intCast(end_token_pos_raw);
             if (token_pos >= batch.max_length) return error.InvalidTokenPosition;
+            if (end_token_pos >= batch.max_length) return error.InvalidTokenPosition;
 
             for (0..E) |entity_type_idx| {
                 const label = batch.span_labels[flat_span_idx * E + entity_type_idx];
                 out[row + entity_type_idx] = label;
                 out[row + E + entity_type_idx] = 1.0;
+                if (positive_weights_by_entity_type) |weights| {
+                    out[row + 2 * E + entity_type_idx] = weights[entity_type_idx];
+                }
                 if (label > 0.0) {
                     stats.positive_span_label_count += 1;
                     stats.positive_counts_by_entity_type[entity_type_idx] += 1;
                 }
             }
-            out[row + 2 * E] = @as(f32, @floatFromInt(sample_idx * batch.max_length + token_pos));
+            const start_idx_offset = if (has_positive_weights) 3 * E else 2 * E;
+            out[row + start_idx_offset] = @as(f32, @floatFromInt(sample_idx * batch.max_length + token_pos));
+            out[row + start_idx_offset + 1] = @as(f32, @floatFromInt(sample_idx * batch.max_length + end_token_pos));
             stats.valid_span_count += 1;
         }
     }
@@ -859,7 +1013,12 @@ test "spanStartTargetsShape returns packed span target shape" {
     const s = spanStartTargetsShape(2, 5, 3);
     try testing.expectEqual(@as(u8, 2), s.rank());
     try testing.expectEqual(@as(i64, 10), s.dim(0));
-    try testing.expectEqual(@as(i64, 7), s.dim(1));
+    try testing.expectEqual(@as(i64, 8), s.dim(1));
+
+    const weighted = weightedSpanStartTargetsShape(2, 5, 3);
+    try testing.expectEqual(@as(u8, 2), weighted.rank());
+    try testing.expectEqual(@as(i64, 10), weighted.dim(0));
+    try testing.expectEqual(@as(i64, 11), weighted.dim(1));
 }
 
 test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices" {
@@ -873,7 +1032,7 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
     var word_is_all_caps = [_]f32{0.0} ** 3;
     var span_indices = [_]i32{
         0, 0,
-        1, 1,
+        1, 2,
         2, 2,
     };
     var span_mask = [_]f32{ 1.0, 1.0, 0.0 };
@@ -910,7 +1069,7 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 5);
+    var targets = [_]f32{0.0} ** (3 * 6);
     const stats = try fillSpanStartTargetsFromEncodedBatch(&batch, &targets);
     try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
     try testing.expectEqual(@as(u64, 2), stats.positive_span_label_count);
@@ -919,9 +1078,67 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
     try testing.expectEqual(@as(u64, 1), stats.positive_counts_by_entity_type[0]);
     try testing.expectEqual(@as(u64, 1), stats.positive_counts_by_entity_type[1]);
 
-    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 2.0 }, targets[0..5]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 3.0 }, targets[5..10]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[10..15]);
+    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 2.0, 2.0 }, targets[0..6]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 3.0, 4.0 }, targets[6..12]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[12..18]);
+}
+
+test "fillWeightedSpanStartTargetsFromEncodedBatch packs per-label positive weights" {
+    var input_ids = [_]i32{ 10, 11, 12, 13, 14, 0, 0, 0 };
+    var attention_mask = [_]i32{ 1, 1, 1, 1, 1, 0, 0, 0 };
+    var words_mask = [_]i32{ 0, 0, 1, 2, 3, 0, 0, 0 };
+    var first_token_positions = [_]i32{ 2, 3, 4 };
+    var word_lengths = [_]f32{ 5, 4, 6 };
+    var word_has_digit = [_]f32{0.0} ** 3;
+    var word_is_title = [_]f32{0.0} ** 3;
+    var word_is_all_caps = [_]f32{0.0} ** 3;
+    var span_indices = [_]i32{
+        0, 0,
+        1, 2,
+        2, 2,
+    };
+    var span_mask = [_]f32{ 1.0, 1.0, 0.0 };
+    var span_labels = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+        0.0, 0.0,
+    };
+    var e_token_positions = [_]i32{ 0, 1 };
+    var e_token_end_positions = [_]i32{ 0, 1 };
+    var entity_type_kind = [_]i32{ 1, 2 };
+
+    const batch = gliner2_data.EncodedBatch{
+        .allocator = testing.allocator,
+        .owns_memory = false,
+        .input_ids = &input_ids,
+        .attention_mask = &attention_mask,
+        .words_mask = &words_mask,
+        .first_token_positions = &first_token_positions,
+        .word_lengths = &word_lengths,
+        .word_has_digit = &word_has_digit,
+        .word_is_title = &word_is_title,
+        .word_is_all_caps = &word_is_all_caps,
+        .span_indices = &span_indices,
+        .span_mask = &span_mask,
+        .span_labels = &span_labels,
+        .e_token_positions = &e_token_positions,
+        .e_token_end_positions = &e_token_end_positions,
+        .entity_type_kind = &entity_type_kind,
+        .batch_size = 1,
+        .max_length = 8,
+        .max_words_per_sample = 3,
+        .max_spans = 3,
+        .num_entity_types = 2,
+    };
+
+    var targets = [_]f32{0.0} ** (3 * 8);
+    const weights = [_]f32{ 32.0, 96.0 };
+    const stats = try fillWeightedSpanStartTargetsFromEncodedBatch(&batch, &weights, &targets);
+    try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
+    try testing.expectEqual(@as(u64, 2), stats.positive_span_label_count);
+    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 32.0, 96.0, 2.0, 2.0 }, targets[0..8]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 32.0, 96.0, 3.0, 4.0 }, targets[8..16]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[16..24]);
 }
 
 test "makeTrainerInput populates the expected fields for token classification" {
@@ -1010,6 +1227,33 @@ test "span_start objective builds span logits and masked loss" {
 
     const loss_shape = g.node(loss).output_shape;
     try testing.expectEqual(@as(u8, 2), loss_shape.rank());
+    try testing.expectEqual(@as(i64, 1), loss_shape.dim(0));
+    try testing.expectEqual(@as(i64, 1), loss_shape.dim(1));
+}
+
+test "span_start objective accepts weighted span targets" {
+    const allocator = testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    var ctx = GlinerAutodiffCtx.init(.{
+        .graph_config = tinyConfig(),
+        .num_classes = 3,
+        .objective = .span_start,
+    });
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{ 4, 32 }));
+    const targets = try b.parameter("__targets", weightedSpanStartTargetsShape(1, 2, 2));
+    const loss = try GlinerAutodiffCtx.buildLoss(@ptrCast(&ctx), &b, hidden, targets);
+    try g.markOutput(loss);
+
+    const span_logits = ctx.span_logits orelse return error.ExpectedSpanLogitsNode;
+    const span_logits_shape = g.node(span_logits).output_shape;
+    try testing.expectEqual(@as(i64, 2), span_logits_shape.dim(0));
+    try testing.expectEqual(@as(i64, 2), span_logits_shape.dim(1));
+
+    const loss_shape = g.node(loss).output_shape;
     try testing.expectEqual(@as(i64, 1), loss_shape.dim(0));
     try testing.expectEqual(@as(i64, 1), loss_shape.dim(1));
 }

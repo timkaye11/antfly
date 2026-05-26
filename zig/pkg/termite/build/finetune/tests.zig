@@ -77,7 +77,7 @@ const tests = [_]common.TestSpec{
         .step_name = "test-gliner2-cleanup-bundle",
         .root_source_file = "src/test_gliner2_cleanup_bundle.zig",
         .description = "Run GLiNER2 cleanup bundle propagation tests",
-        .imports = &.{ .build_options, .ml, .pjrt, .termite_linalg, .onnx_graph },
+        .imports = &.{ .antfly_platform, .build_options, .ml, .pjrt, .termite_linalg, .onnx_graph },
         .native_link = .default,
     },
     .{

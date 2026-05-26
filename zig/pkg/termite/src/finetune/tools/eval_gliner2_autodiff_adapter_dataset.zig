@@ -29,15 +29,26 @@ const Options = struct {
     objective: gliner2_autodiff.GlinerObjective = .span_start,
     max_examples: usize = 0,
     min_prediction_score: f32 = 0.03,
+    label_thresholds: []const LabelThreshold = &.{},
+    label_score_biases: []const LabelScoreBias = &.{},
     nms_overlap_threshold: ?f64 = 0.0,
     max_predictions_per_example: ?usize = null,
     top_k_per_label: ?usize = null,
     best_span_per_label_start: bool = false,
+    best_label_per_span_start: bool = false,
+    require_entitylike_span: bool = false,
     sweep_thresholds: []const f32 = &.{},
     min_precision: ?f64 = null,
     min_recall: ?f64 = null,
     min_f1: ?f64 = null,
 };
+
+const LabelThreshold = struct {
+    label: []const u8,
+    threshold: f32,
+};
+
+const LabelScoreBias = adapter_eval.LabelScoreBias;
 
 const LabelMetric = struct {
     label: []const u8,
@@ -67,13 +78,19 @@ const QualitySummary = struct {
     recall: f64,
     f1: f64,
     min_prediction_score: f32,
+    label_thresholds: []const LabelThreshold,
+    label_score_biases: []const LabelScoreBias,
     nms_overlap_threshold: ?f64,
     max_predictions_per_example: ?usize,
     top_k_per_label: ?usize,
     best_span_per_label_start: bool,
+    best_label_per_span_start: bool,
+    require_entitylike_span: bool,
     per_label_score_stats: []const LabelScoreStats,
     per_label: []const LabelMetric,
     threshold_sweep: []const ThresholdMetric,
+    best_threshold: ?ThresholdMetric,
+    best_per_label_thresholds: []const LabelThresholdMetric,
     status: []const u8,
 };
 
@@ -100,6 +117,16 @@ const LabelScoreStats = struct {
 };
 
 const ThresholdMetric = struct {
+    min_prediction_score: f32,
+    predicted_entity_count: usize,
+    correct_entity_count: usize,
+    precision: f64,
+    recall: f64,
+    f1: f64,
+};
+
+const LabelThresholdMetric = struct {
+    label: []const u8,
     min_prediction_score: f32,
     predicted_entity_count: usize,
     correct_entity_count: usize,
@@ -172,8 +199,12 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const opts = try parseOptions(init.minimal.args, allocator) orelse return;
     defer allocator.free(opts.sweep_thresholds);
+    defer freeLabelThresholds(allocator, opts.label_thresholds);
+    defer freeLabelScoreBiases(allocator, opts.label_score_biases);
     const entity_types = try parseCsv(allocator, opts.entity_types_csv);
     defer freeStringSlice(allocator, entity_types);
+    try validateLabelThresholds(opts.label_thresholds, entity_types);
+    try validateLabelScoreBiases(opts.label_score_biases, entity_types);
 
     var loaded = try gliner2_data.loadExamples(allocator, opts.eval_data, null);
     defer loaded.deinit();
@@ -211,6 +242,7 @@ pub fn main(init: std.process.Init) !void {
             .max_span_width = opts.max_span_width,
             .objective_override = opts.objective,
             .prediction_threshold = decode_floor,
+            .label_score_biases = opts.label_score_biases,
         });
         defer summary.deinit(allocator);
 
@@ -241,6 +273,9 @@ pub fn main(init: std.process.Init) !void {
     const threshold_sweep = try allocator.alloc(ThresholdMetric, sweep_accums.len);
     defer allocator.free(threshold_sweep);
     for (sweep_accums, threshold_sweep) |accum, *metric| metric.* = accum.thresholdMetric();
+    const best_threshold = bestThresholdMetric(threshold_sweep);
+    const best_per_label_thresholds = try bestPerLabelThresholdMetrics(allocator, sweep_accums, entity_types);
+    defer allocator.free(best_per_label_thresholds);
 
     const stdout = std.Io.File.stdout();
     var buf: [32768]u8 = undefined;
@@ -263,17 +298,68 @@ pub fn main(init: std.process.Init) !void {
         .recall = recall,
         .f1 = f1,
         .min_prediction_score = opts.min_prediction_score,
+        .label_thresholds = opts.label_thresholds,
+        .label_score_biases = opts.label_score_biases,
         .nms_overlap_threshold = opts.nms_overlap_threshold,
         .max_predictions_per_example = opts.max_predictions_per_example,
         .top_k_per_label = opts.top_k_per_label,
         .best_span_per_label_start = opts.best_span_per_label_start,
+        .best_label_per_span_start = opts.best_label_per_span_start,
+        .require_entitylike_span = opts.require_entitylike_span,
         .per_label_score_stats = score_stats,
         .per_label = main_accum.label_metrics,
         .threshold_sweep = threshold_sweep,
+        .best_threshold = best_threshold,
+        .best_per_label_thresholds = best_per_label_thresholds,
         .status = "passed",
     }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
+}
+
+fn bestThresholdMetric(metrics: []const ThresholdMetric) ?ThresholdMetric {
+    if (metrics.len == 0) return null;
+    var best = metrics[0];
+    for (metrics[1..]) |metric| {
+        if (metric.f1 > best.f1 or
+            (metric.f1 == best.f1 and metric.precision > best.precision) or
+            (metric.f1 == best.f1 and metric.precision == best.precision and metric.min_prediction_score > best.min_prediction_score))
+        {
+            best = metric;
+        }
+    }
+    return best;
+}
+
+fn bestPerLabelThresholdMetrics(allocator: std.mem.Allocator, sweep_accums: []const EvalAccumulator, entity_types: []const []const u8) ![]LabelThresholdMetric {
+    if (sweep_accums.len == 0) return try allocator.alloc(LabelThresholdMetric, 0);
+    const out = try allocator.alloc(LabelThresholdMetric, entity_types.len);
+    for (entity_types, 0..) |label, label_idx| {
+        var best = labelThresholdMetric(label, sweep_accums[0].threshold, sweep_accums[0].label_metrics[label_idx]);
+        for (sweep_accums[1..]) |accum| {
+            const candidate = labelThresholdMetric(label, accum.threshold, accum.label_metrics[label_idx]);
+            if (candidate.f1 > best.f1 or
+                (candidate.f1 == best.f1 and candidate.precision > best.precision) or
+                (candidate.f1 == best.f1 and candidate.precision == best.precision and candidate.min_prediction_score > best.min_prediction_score))
+            {
+                best = candidate;
+            }
+        }
+        out[label_idx] = best;
+    }
+    return out;
+}
+
+fn labelThresholdMetric(label: []const u8, threshold: f32, metric: LabelMetric) LabelThresholdMetric {
+    return .{
+        .label = label,
+        .min_prediction_score = threshold,
+        .predicted_entity_count = metric.predicted,
+        .correct_entity_count = metric.correct,
+        .precision = metric.precision,
+        .recall = metric.recall,
+        .f1 = metric.f1,
+    };
 }
 
 fn observeScores(score_stats: []LabelScoreStats, entity_types: []const []const u8, predictions: []const adapter_eval.TopEntity) void {
@@ -285,6 +371,7 @@ fn observeScores(score_stats: []LabelScoreStats, entity_types: []const []const u
 fn minDecodeThreshold(opts: Options) f32 {
     var threshold = opts.min_prediction_score;
     for (opts.sweep_thresholds) |candidate| threshold = @min(threshold, candidate);
+    for (opts.label_thresholds) |entry| threshold = @min(threshold, entry.threshold);
     return threshold;
 }
 
@@ -327,10 +414,11 @@ fn selectPredictions(
     var candidates = std.ArrayListUnmanaged(usize).empty;
     defer candidates.deinit(allocator);
     for (predictions, 0..) |prediction, idx| {
-        if (prediction.score >= threshold) try candidates.append(allocator, idx);
+        if (opts.require_entitylike_span and !adapter_eval.isEntityLikeSpanText(prediction.text)) continue;
+        if (prediction.score >= thresholdForLabel(opts.label_thresholds, prediction.label, threshold)) try candidates.append(allocator, idx);
     }
     std.mem.sort(usize, candidates.items, predictions, predictionBetterThan);
-    if (opts.nms_overlap_threshold == null and !opts.best_span_per_label_start and opts.top_k_per_label == null and opts.max_predictions_per_example == null) return candidates.toOwnedSlice(allocator);
+    if (opts.nms_overlap_threshold == null and !opts.best_span_per_label_start and !opts.best_label_per_span_start and opts.top_k_per_label == null and opts.max_predictions_per_example == null) return candidates.toOwnedSlice(allocator);
 
     var selected = std.ArrayListUnmanaged(usize).empty;
     errdefer selected.deinit(allocator);
@@ -347,6 +435,10 @@ fn selectPredictions(
         var suppressed = false;
         for (selected.items) |selected_idx| {
             const existing = predictions[selected_idx];
+            if (opts.best_label_per_span_start and candidate.start == existing.start) {
+                suppressed = true;
+                break;
+            }
             if (!std.mem.eql(u8, candidate.label, existing.label)) continue;
             if (opts.best_span_per_label_start and candidate.start == existing.start) {
                 suppressed = true;
@@ -368,6 +460,13 @@ fn selectPredictions(
         }
     }
     return selected.toOwnedSlice(allocator);
+}
+
+fn thresholdForLabel(label_thresholds: []const LabelThreshold, label: []const u8, fallback: f32) f32 {
+    for (label_thresholds) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return entry.threshold;
+    }
+    return fallback;
 }
 
 fn predictionBetterThan(predictions: []const adapter_eval.TopEntity, lhs_idx: usize, rhs_idx: usize) bool {
@@ -427,6 +526,16 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
     };
     var sweep_thresholds = std.ArrayListUnmanaged(f32).empty;
     errdefer sweep_thresholds.deinit(allocator);
+    var label_thresholds = std.ArrayListUnmanaged(LabelThreshold).empty;
+    errdefer {
+        freeLabelThresholdLabels(allocator, label_thresholds.items);
+        label_thresholds.deinit(allocator);
+    }
+    var label_score_biases = std.ArrayListUnmanaged(LabelScoreBias).empty;
+    errdefer {
+        freeLabelScoreBiasLabels(allocator, label_score_biases.items);
+        label_score_biases.deinit(allocator);
+    }
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--seq-len")) {
@@ -439,6 +548,10 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
             opts.max_examples = try parseUsize(args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--min-prediction-score")) {
             opts.min_prediction_score = try std.fmt.parseFloat(f32, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--label-thresholds")) {
+            try parseLabelThresholdCsv(allocator, args.next() orelse return usageError(), &label_thresholds);
+        } else if (std.mem.eql(u8, arg, "--label-score-biases")) {
+            try parseLabelScoreBiasCsv(allocator, args.next() orelse return usageError(), &label_score_biases);
         } else if (std.mem.eql(u8, arg, "--sweep-thresholds")) {
             try parseThresholdCsv(allocator, args.next() orelse return usageError(), &sweep_thresholds);
         } else if (std.mem.eql(u8, arg, "--nms-overlap")) {
@@ -451,6 +564,10 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
             opts.top_k_per_label = try parseUsize(args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--best-span-per-label-start")) {
             opts.best_span_per_label_start = true;
+        } else if (std.mem.eql(u8, arg, "--best-label-per-span-start")) {
+            opts.best_label_per_span_start = true;
+        } else if (std.mem.eql(u8, arg, "--require-entitylike-span")) {
+            opts.require_entitylike_span = true;
         } else if (std.mem.eql(u8, arg, "--min-precision")) {
             opts.min_precision = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--min-recall")) {
@@ -464,10 +581,13 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
             return usageError();
         }
     }
+    if (!std.math.isFinite(opts.min_prediction_score) or opts.min_prediction_score < 0 or opts.min_prediction_score > 1) return error.InvalidQualityThreshold;
     if (opts.nms_overlap_threshold) |threshold| {
         if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidNmsOverlapThreshold;
     }
     opts.sweep_thresholds = try sweep_thresholds.toOwnedSlice(allocator);
+    opts.label_thresholds = try label_thresholds.toOwnedSlice(allocator);
+    opts.label_score_biases = try label_score_biases.toOwnedSlice(allocator);
     return opts;
 }
 
@@ -515,6 +635,88 @@ fn parseThresholdCsv(allocator: std.mem.Allocator, value: []const u8, out: *std.
     }
 }
 
+fn parseLabelThresholdCsv(allocator: std.mem.Allocator, value: []const u8, out: *std.ArrayListUnmanaged(LabelThreshold)) !void {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidLabelThreshold;
+        const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
+        const threshold_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
+        if (label.len == 0 or threshold_text.len == 0) return error.InvalidLabelThreshold;
+        if (containsLabelThreshold(out.items, label)) return error.DuplicateLabelThreshold;
+        const threshold = try std.fmt.parseFloat(f32, threshold_text);
+        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
+        try out.append(allocator, .{
+            .label = try allocator.dupe(u8, label),
+            .threshold = threshold,
+        });
+    }
+}
+
+fn parseLabelScoreBiasCsv(allocator: std.mem.Allocator, value: []const u8, out: *std.ArrayListUnmanaged(LabelScoreBias)) !void {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidLabelScoreBias;
+        const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
+        const bias_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
+        if (label.len == 0 or bias_text.len == 0) return error.InvalidLabelScoreBias;
+        if (containsLabelScoreBias(out.items, label)) return error.DuplicateLabelScoreBias;
+        const bias = try std.fmt.parseFloat(f32, bias_text);
+        if (!std.math.isFinite(bias)) return error.InvalidLabelScoreBias;
+        try out.append(allocator, .{
+            .label = try allocator.dupe(u8, label),
+            .bias = bias,
+        });
+    }
+}
+
+fn containsLabelThreshold(values: []const LabelThreshold, label: []const u8) bool {
+    for (values) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return true;
+    }
+    return false;
+}
+
+fn containsLabelScoreBias(values: []const LabelScoreBias, label: []const u8) bool {
+    for (values) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return true;
+    }
+    return false;
+}
+
+fn validateLabelThresholds(label_thresholds: []const LabelThreshold, entity_types: []const []const u8) !void {
+    for (label_thresholds) |entry| {
+        if (indexOfLabel(entity_types, entry.label) == null) return error.UnknownLabelThreshold;
+    }
+}
+
+fn validateLabelScoreBiases(label_score_biases: []const LabelScoreBias, entity_types: []const []const u8) !void {
+    for (label_score_biases) |entry| {
+        if (indexOfLabel(entity_types, entry.label) == null) return error.UnknownLabelScoreBias;
+    }
+}
+
+fn freeLabelThresholds(allocator: std.mem.Allocator, values: []const LabelThreshold) void {
+    freeLabelThresholdLabels(allocator, values);
+    allocator.free(values);
+}
+
+fn freeLabelThresholdLabels(allocator: std.mem.Allocator, values: []const LabelThreshold) void {
+    for (values) |entry| allocator.free(entry.label);
+}
+
+fn freeLabelScoreBiases(allocator: std.mem.Allocator, values: []const LabelScoreBias) void {
+    freeLabelScoreBiasLabels(allocator, values);
+    allocator.free(values);
+}
+
+fn freeLabelScoreBiasLabels(allocator: std.mem.Allocator, values: []const LabelScoreBias) void {
+    for (values) |entry| allocator.free(entry.label);
+}
+
 fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| allocator.free(value);
     allocator.free(values);
@@ -545,12 +747,16 @@ fn printUsage() void {
         \\  --objective token|span-start
         \\  --max-examples N
         \\  --min-prediction-score FLOAT
+        \\  --label-thresholds label=FLOAT[,label=FLOAT...]
+        \\  --label-score-biases label=FLOAT[,label=FLOAT...]
         \\  --sweep-thresholds CSV
         \\  --nms-overlap FLOAT
         \\  --no-nms
         \\  --max-predictions-per-example N
         \\  --top-k-per-label N
         \\  --best-span-per-label-start
+        \\  --best-label-per-span-start
+        \\  --require-entitylike-span
         \\  --min-precision FLOAT
         \\  --min-recall FLOAT
         \\  --min-f1 FLOAT

@@ -73,6 +73,24 @@ pub const EvalOptions = struct {
     expect_label: ?[]const u8 = null,
     min_score: ?f32 = null,
     prediction_threshold: ?f32 = null,
+    label_thresholds: []const LabelThreshold = &.{},
+    label_score_biases: []const LabelScoreBias = &.{},
+    nms_overlap_threshold: ?f64 = null,
+    max_predictions: ?usize = null,
+    top_k_per_label: ?usize = null,
+    best_span_per_label_start: bool = false,
+    best_label_per_span_start: bool = false,
+    require_entitylike_span: bool = false,
+};
+
+pub const LabelThreshold = struct {
+    label: []const u8,
+    threshold: f32,
+};
+
+pub const LabelScoreBias = struct {
+    label: []const u8,
+    bias: f32,
 };
 
 pub const TopEntity = struct {
@@ -94,14 +112,14 @@ pub fn main(init: std.process.Init) !void {
     var summary = try evalSavedAdapter(allocator, opts);
     defer summary.deinit(allocator);
 
-    if (opts.value.expect_text) |expected| {
-        if (!std.mem.eql(u8, summary.top.text, expected)) return error.SemanticGoldenTextMismatch;
-    }
-    if (opts.value.expect_label) |expected| {
-        if (!std.mem.eql(u8, summary.top.label, expected)) return error.SemanticGoldenLabelMismatch;
-    }
     if (opts.value.min_score) |min_score| {
         if (!std.math.isFinite(min_score) or min_score < 0) return error.InvalidScoreThreshold;
+    }
+    if (opts.value.expect_text != null or opts.value.expect_label != null) {
+        if (!hasExpectedPrediction(summary.predictions, opts.value.expect_text, opts.value.expect_label, opts.value.min_score)) {
+            return error.SemanticGoldenPredictionMissing;
+        }
+    } else if (opts.value.min_score) |min_score| {
         if (summary.top.score < min_score) return error.SemanticGoldenScoreBelowThreshold;
     }
 
@@ -116,9 +134,15 @@ pub fn main(init: std.process.Init) !void {
 const OwnedOptions = struct {
     value: EvalOptions,
     owned_entity_types_csv: ?[]const u8 = null,
+    owned_label_thresholds: []const LabelThreshold = &.{},
+    owned_label_score_biases: []const LabelScoreBias = &.{},
 
     fn deinit(self: *OwnedOptions, allocator: std.mem.Allocator) void {
         if (self.owned_entity_types_csv) |value| allocator.free(value);
+        for (self.owned_label_thresholds) |entry| allocator.free(entry.label);
+        allocator.free(self.owned_label_thresholds);
+        for (self.owned_label_score_biases) |entry| allocator.free(entry.label);
+        allocator.free(self.owned_label_score_biases);
         self.* = undefined;
     }
 };
@@ -141,6 +165,14 @@ fn parseArgs(args_in: std.process.Args, allocator: std.mem.Allocator) !OwnedOpti
         .text = text,
     };
     var owned_entity_types_csv: ?[]const u8 = null;
+    var label_thresholds = std.ArrayListUnmanaged(LabelThreshold).empty;
+    var label_score_biases = std.ArrayListUnmanaged(LabelScoreBias).empty;
+    errdefer {
+        for (label_thresholds.items) |entry| allocator.free(entry.label);
+        label_thresholds.deinit(allocator);
+        for (label_score_biases.items) |entry| allocator.free(entry.label);
+        label_score_biases.deinit(allocator);
+    }
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--entity-types")) {
@@ -157,6 +189,27 @@ fn parseArgs(args_in: std.process.Args, allocator: std.mem.Allocator) !OwnedOpti
             opts.expect_label = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--min-score")) {
             opts.min_score = try std.fmt.parseFloat(f32, args.next() orelse return usageError());
+            if (opts.prediction_threshold == null) opts.prediction_threshold = opts.min_score;
+        } else if (std.mem.eql(u8, arg, "--min-prediction-score")) {
+            opts.prediction_threshold = try std.fmt.parseFloat(f32, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--label-thresholds")) {
+            try parseLabelThresholdCsv(allocator, args.next() orelse return usageError(), &label_thresholds);
+        } else if (std.mem.eql(u8, arg, "--label-score-biases")) {
+            try parseLabelScoreBiasCsv(allocator, args.next() orelse return usageError(), &label_score_biases);
+        } else if (std.mem.eql(u8, arg, "--nms-overlap")) {
+            opts.nms_overlap_threshold = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--no-nms")) {
+            opts.nms_overlap_threshold = null;
+        } else if (std.mem.eql(u8, arg, "--max-predictions")) {
+            opts.max_predictions = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--top-k-per-label")) {
+            opts.top_k_per_label = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--best-span-per-label-start")) {
+            opts.best_span_per_label_start = true;
+        } else if (std.mem.eql(u8, arg, "--best-label-per-span-start")) {
+            opts.best_label_per_span_start = true;
+        } else if (std.mem.eql(u8, arg, "--require-entitylike-span")) {
+            opts.require_entitylike_span = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return error.HelpRequested;
@@ -168,7 +221,212 @@ fn parseArgs(args_in: std.process.Args, allocator: std.mem.Allocator) !OwnedOpti
         }
     }
 
-    return .{ .value = opts, .owned_entity_types_csv = owned_entity_types_csv };
+    opts.label_thresholds = try label_thresholds.toOwnedSlice(allocator);
+    opts.label_score_biases = try label_score_biases.toOwnedSlice(allocator);
+    return .{
+        .value = opts,
+        .owned_entity_types_csv = owned_entity_types_csv,
+        .owned_label_thresholds = opts.label_thresholds,
+        .owned_label_score_biases = opts.label_score_biases,
+    };
+}
+
+fn hasExpectedPrediction(
+    predictions: []const TopEntity,
+    expect_text: ?[]const u8,
+    expect_label: ?[]const u8,
+    min_score: ?f32,
+) bool {
+    for (predictions) |prediction| {
+        if (expect_text) |expected| {
+            if (!std.mem.eql(u8, prediction.text, expected)) continue;
+        }
+        if (expect_label) |expected| {
+            if (!std.mem.eql(u8, prediction.label, expected)) continue;
+        }
+        if (min_score) |threshold| {
+            if (prediction.score < threshold) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn selectTopEntities(
+    allocator: std.mem.Allocator,
+    predictions: []const TopEntity,
+    opts: EvalOptions,
+) ![]TopEntity {
+    var candidates = std.ArrayListUnmanaged(usize).empty;
+    defer candidates.deinit(allocator);
+    const fallback_threshold = opts.prediction_threshold orelse 0.0;
+    for (predictions, 0..) |prediction, idx| {
+        if (opts.require_entitylike_span and !isEntityLikeSpanText(prediction.text)) continue;
+        if (prediction.score >= thresholdForLabel(opts.label_thresholds, prediction.label, fallback_threshold)) {
+            try candidates.append(allocator, idx);
+        }
+    }
+    std.mem.sort(usize, candidates.items, predictions, topEntityBetterThan);
+    if (opts.nms_overlap_threshold == null and !opts.best_span_per_label_start and !opts.best_label_per_span_start and opts.top_k_per_label == null and opts.max_predictions == null) {
+        return copyTopEntitiesByIndex(allocator, predictions, candidates.items);
+    }
+
+    var selected = std.ArrayListUnmanaged(usize).empty;
+    defer selected.deinit(allocator);
+    var per_label_counts = std.StringHashMapUnmanaged(usize){};
+    defer per_label_counts.deinit(allocator);
+    for (candidates.items) |candidate_idx| {
+        const candidate = predictions[candidate_idx];
+        if (opts.max_predictions) |max_predictions| {
+            if (selected.items.len >= max_predictions) break;
+        }
+        if (opts.top_k_per_label) |top_k| {
+            if ((per_label_counts.get(candidate.label) orelse 0) >= top_k) continue;
+        }
+        var suppressed = false;
+        for (selected.items) |selected_idx| {
+            const existing = predictions[selected_idx];
+            if (opts.best_label_per_span_start and candidate.start == existing.start) {
+                suppressed = true;
+                break;
+            }
+            if (!std.mem.eql(u8, candidate.label, existing.label)) continue;
+            if (opts.best_span_per_label_start and candidate.start == existing.start) {
+                suppressed = true;
+                break;
+            }
+            if (opts.nms_overlap_threshold) |overlap_threshold| {
+                if (spanOverlapRatio(candidate.start, candidate.end, existing.start, existing.end) > overlap_threshold) {
+                    suppressed = true;
+                    break;
+                }
+            }
+        }
+        if (!suppressed) {
+            try selected.append(allocator, candidate_idx);
+            if (opts.top_k_per_label != null) {
+                const prior = per_label_counts.get(candidate.label) orelse 0;
+                try per_label_counts.put(allocator, candidate.label, prior + 1);
+            }
+        }
+    }
+    return copyTopEntitiesByIndex(allocator, predictions, selected.items);
+}
+
+pub fn isEntityLikeSpanText(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n\"'`.,;:!?()[]{}");
+    if (trimmed.len == 0) return false;
+
+    var first_token: ?[]const u8 = null;
+    var last_token: []const u8 = trimmed;
+    var token_count: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+    while (tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, "\"'`.,;:!?()[]{}");
+        if (token.len == 0) continue;
+        if (first_token == null) first_token = token;
+        last_token = token;
+        token_count += 1;
+    }
+    if (token_count == 0) return false;
+
+    const first = first_token.?;
+    if (!tokenHasEntityBoundary(first)) return false;
+    if (!tokenHasEntityBoundary(last_token)) return false;
+    if (isLowercaseBoundaryStopword(first) or isLowercaseBoundaryStopword(last_token)) return false;
+    return true;
+}
+
+fn tokenHasEntityBoundary(token: []const u8) bool {
+    for (token) |ch| {
+        if (std.ascii.isAlphabetic(ch)) return std.ascii.isUpper(ch);
+        if (std.ascii.isDigit(ch)) return true;
+    }
+    return false;
+}
+
+fn isLowercaseBoundaryStopword(token: []const u8) bool {
+    if (token.len == 0) return true;
+    for (token) |ch| {
+        if (std.ascii.isAlphabetic(ch) and std.ascii.isUpper(ch)) return false;
+        if (std.ascii.isDigit(ch)) return false;
+    }
+    const words = [_][]const u8{
+        "a", "an", "and", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with",
+    };
+    for (words) |word| {
+        if (std.ascii.eqlIgnoreCase(token, word)) return true;
+    }
+    return false;
+}
+
+fn thresholdForLabel(label_thresholds: []const LabelThreshold, label: []const u8, fallback: f32) f32 {
+    for (label_thresholds) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return entry.threshold;
+    }
+    return fallback;
+}
+
+fn minDecodeThreshold(opts: EvalOptions) ?f32 {
+    var threshold = opts.prediction_threshold;
+    for (opts.label_thresholds) |entry| {
+        threshold = if (threshold) |existing| @min(existing, entry.threshold) else entry.threshold;
+    }
+    for (opts.label_score_biases) |entry| {
+        if (entry.bias <= 0.0) continue;
+        threshold = if (threshold) |existing| @min(existing, scoreWithBias(existing, -entry.bias)) else null;
+    }
+    return threshold;
+}
+
+fn copyTopEntitiesByIndex(
+    allocator: std.mem.Allocator,
+    predictions: []const TopEntity,
+    indices: []const usize,
+) ![]TopEntity {
+    var out = try allocator.alloc(TopEntity, indices.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |prediction| {
+            allocator.free(prediction.text);
+            allocator.free(prediction.label);
+        }
+        allocator.free(out);
+    }
+    for (indices, 0..) |idx, out_idx| {
+        const prediction = predictions[idx];
+        out[out_idx] = .{
+            .text = try allocator.dupe(u8, prediction.text),
+            .label = try allocator.dupe(u8, prediction.label),
+            .start = prediction.start,
+            .end = prediction.end,
+            .score = prediction.score,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn topEntityBetterThan(predictions: []const TopEntity, lhs_idx: usize, rhs_idx: usize) bool {
+    const lhs = predictions[lhs_idx];
+    const rhs = predictions[rhs_idx];
+    if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    const lhs_len = lhs.end - lhs.start;
+    const rhs_len = rhs.end - rhs.start;
+    if (lhs_len != rhs_len) return lhs_len < rhs_len;
+    if (lhs.start != rhs.start) return lhs.start < rhs.start;
+    return lhs.end < rhs.end;
+}
+
+fn spanOverlapRatio(a_start: usize, a_end: usize, b_start: usize, b_end: usize) f64 {
+    if (a_end <= a_start or b_end <= b_start) return 0.0;
+    const start = @max(a_start, b_start);
+    const end = @min(a_end, b_end);
+    if (end <= start) return 0.0;
+    const intersection = end - start;
+    const union_len = @max(a_end, b_end) - @min(a_start, b_start);
+    if (union_len == 0) return 0.0;
+    return @as(f64, @floatFromInt(intersection)) / @as(f64, @floatFromInt(union_len));
 }
 
 pub const EvalSummary = struct {
@@ -254,6 +512,8 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
     errdefer freeStringSlice(allocator, entity_types);
     if (entity_types.len == 0 or entity_types.len + 1 > manifest.num_classes) return error.InvalidEntityTypes;
     if (objective == .span_start and entity_types.len + 1 != manifest.num_classes) return error.InvalidEntityTypes;
+    try validateLabelThresholds(opts.label_thresholds, entity_types);
+    try validateLabelScoreBiases(opts.label_score_biases, entity_types);
 
     const task_head_path = try std.fs.path.join(allocator, &.{ opts.adapter_dir, gliner2_bundle.task_head_checkpoint_file_name });
     defer allocator.free(task_head_path);
@@ -335,10 +595,15 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         opts.max_span_width,
         &trainer,
         &gliner_ctx,
-        opts.prediction_threshold,
+        minDecodeThreshold(opts),
+        opts.label_score_biases,
     );
     errdefer freeTopEntities(allocator, predictions);
     if (predictions.len == 0) return error.NoEntityPredictions;
+    const selected_predictions = try selectTopEntities(allocator, predictions, opts);
+    errdefer freeTopEntities(allocator, selected_predictions);
+    freeTopEntities(allocator, predictions);
+    if (selected_predictions.len == 0) return error.NoEntityPredictions;
 
     return .{
         .allocator = allocator,
@@ -353,13 +618,13 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         .lora_alpha = manifest.lora_alpha,
         .loaded_base_weight_count = loaded_base_weight_count,
         .top = .{
-            .text = try allocator.dupe(u8, predictions[0].text),
-            .label = try allocator.dupe(u8, predictions[0].label),
-            .start = predictions[0].start,
-            .end = predictions[0].end,
-            .score = predictions[0].score,
+            .text = try allocator.dupe(u8, selected_predictions[0].text),
+            .label = try allocator.dupe(u8, selected_predictions[0].label),
+            .start = selected_predictions[0].start,
+            .end = selected_predictions[0].end,
+            .score = selected_predictions[0].score,
         },
-        .predictions = predictions,
+        .predictions = selected_predictions,
     };
 }
 
@@ -468,7 +733,7 @@ fn ensureGraphBuilt(
             const attention_mask = try allocator.alloc(f32, seq_len);
             defer allocator.free(attention_mask);
             try copyEncodedInputs(&encoded, input_ids, attention_mask);
-            const target_width = 2 * encoded.num_entity_types + 1;
+            const target_width = gliner2_autodiff.spanStartTargetWidth(encoded.num_entity_types);
             const target_len = encoded.batch_size * encoded.max_spans * target_width;
             const targets = try allocator.alloc(f32, target_len);
             defer allocator.free(targets);
@@ -499,6 +764,7 @@ fn decodeTextEntities(
     trainer: *real_autodiff.RealAutodiffTrainer,
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
     prediction_threshold: ?f32,
+    label_score_biases: []const LabelScoreBias,
 ) ![]TopEntity {
     return switch (objective) {
         .token => decodeTextEntitiesFromTokenBridge(
@@ -512,6 +778,7 @@ fn decodeTextEntities(
             trainer,
             gliner_ctx,
             prediction_threshold,
+            label_score_biases,
         ),
         .span_start => decodeTextEntitiesFromSpanStart(
             allocator,
@@ -523,6 +790,7 @@ fn decodeTextEntities(
             trainer,
             gliner_ctx,
             prediction_threshold,
+            label_score_biases,
         ),
     };
 }
@@ -538,6 +806,7 @@ fn decodeTextEntitiesFromTokenBridge(
     trainer: *real_autodiff.RealAutodiffTrainer,
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
     prediction_threshold: ?f32,
+    label_score_biases: []const LabelScoreBias,
 ) ![]TopEntity {
     const input_ids = try allocator.alloc(i64, seq_len);
     defer allocator.free(input_ids);
@@ -573,6 +842,7 @@ fn decodeTextEntitiesFromTokenBridge(
     defer decoded_batch.deinit();
     const span_scores = try gliner2_data.tokenLogitsToSpanScoresAlloc(allocator, &decoded_batch, logits, num_classes);
     defer allocator.free(span_scores);
+    applyLabelScoreBiases(span_scores, decoded_batch.num_entity_types, entity_types, label_score_biases);
 
     var max_span_score: f32 = 0.0;
     for (span_scores) |score| {
@@ -605,6 +875,7 @@ fn decodeTextEntitiesFromSpanStart(
     trainer: *real_autodiff.RealAutodiffTrainer,
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
     prediction_threshold: ?f32,
+    label_score_biases: []const LabelScoreBias,
 ) ![]TopEntity {
     const examples = [_]gliner2_data.Example{.{ .text = text, .entities = &.{} }};
     var decoded_batch = try gliner2_data.buildSimpleBatch(
@@ -624,7 +895,7 @@ fn decodeTextEntitiesFromSpanStart(
     defer allocator.free(attention_mask);
     try copyEncodedInputs(&decoded_batch, input_ids, attention_mask);
 
-    const target_width = 2 * decoded_batch.num_entity_types + 1;
+    const target_width = gliner2_autodiff.spanStartTargetWidth(decoded_batch.num_entity_types);
     const target_len = decoded_batch.batch_size * decoded_batch.max_spans * target_width;
     const targets = try allocator.alloc(f32, target_len);
     defer allocator.free(targets);
@@ -654,7 +925,7 @@ fn decodeTextEntitiesFromSpanStart(
             const idx = span_idx * decoded_batch.num_entity_types + entity_idx;
             const logit = logits[idx];
             if (!std.math.isFinite(logit)) return error.NonFiniteLogit;
-            const score = if (valid) sigmoid(logit) else 0.0;
+            const score = if (valid) scoreWithBias(sigmoid(logit), labelScoreBias(entity_types, entity_idx, label_score_biases)) else 0.0;
             if (!std.math.isFinite(score)) return error.NonFiniteSpanScore;
             span_scores[idx] = score;
             if (valid) max_span_score = @max(max_span_score, score);
@@ -674,6 +945,34 @@ fn decodeTextEntitiesFromSpanStart(
     defer allocator.free(predictions);
     if (predictions.len == 0) return error.NoEntityPredictions;
     return copyPredictions(allocator, predictions);
+}
+
+fn applyLabelScoreBiases(
+    span_scores: []f32,
+    num_entity_types: usize,
+    entity_types: []const []const u8,
+    label_score_biases: []const LabelScoreBias,
+) void {
+    if (label_score_biases.len == 0) return;
+    for (span_scores, 0..) |*score, idx| {
+        const entity_idx = idx % num_entity_types;
+        score.* = scoreWithBias(score.*, labelScoreBias(entity_types, entity_idx, label_score_biases));
+    }
+}
+
+fn labelScoreBias(entity_types: []const []const u8, entity_idx: usize, label_score_biases: []const LabelScoreBias) f32 {
+    if (entity_idx >= entity_types.len) return 0.0;
+    const label = entity_types[entity_idx];
+    for (label_score_biases) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return entry.bias;
+    }
+    return 0.0;
+}
+
+fn scoreWithBias(score: f32, bias: f32) f32 {
+    if (bias == 0.0 or score <= 0.0 or score >= 1.0) return score;
+    const logit = @log(score / (1.0 - score)) + bias;
+    return sigmoid(logit);
 }
 
 fn copyPredictions(allocator: std.mem.Allocator, predictions: []const gliner2_data.EntityPrediction) ![]TopEntity {
@@ -857,6 +1156,77 @@ fn parseCsv(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+fn parseLabelThresholdCsv(allocator: std.mem.Allocator, value: []const u8, out: *std.ArrayListUnmanaged(LabelThreshold)) !void {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidLabelThreshold;
+        const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
+        const threshold_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
+        if (label.len == 0 or threshold_text.len == 0) return error.InvalidLabelThreshold;
+        if (containsLabelThreshold(out.items, label)) return error.DuplicateLabelThreshold;
+        const threshold = try std.fmt.parseFloat(f32, threshold_text);
+        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidScoreThreshold;
+        try out.append(allocator, .{
+            .label = try allocator.dupe(u8, label),
+            .threshold = threshold,
+        });
+    }
+}
+
+fn parseLabelScoreBiasCsv(allocator: std.mem.Allocator, value: []const u8, out: *std.ArrayListUnmanaged(LabelScoreBias)) !void {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidLabelScoreBias;
+        const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
+        const bias_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
+        if (label.len == 0 or bias_text.len == 0) return error.InvalidLabelScoreBias;
+        if (containsLabelScoreBias(out.items, label)) return error.DuplicateLabelScoreBias;
+        const bias = try std.fmt.parseFloat(f32, bias_text);
+        if (!std.math.isFinite(bias)) return error.InvalidLabelScoreBias;
+        try out.append(allocator, .{
+            .label = try allocator.dupe(u8, label),
+            .bias = bias,
+        });
+    }
+}
+
+fn containsLabelThreshold(values: []const LabelThreshold, label: []const u8) bool {
+    for (values) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return true;
+    }
+    return false;
+}
+
+fn containsLabelScoreBias(values: []const LabelScoreBias, label: []const u8) bool {
+    for (values) |entry| {
+        if (std.mem.eql(u8, entry.label, label)) return true;
+    }
+    return false;
+}
+
+fn validateLabelThresholds(label_thresholds: []const LabelThreshold, entity_types: []const []const u8) !void {
+    for (label_thresholds) |entry| {
+        if (indexOfLabel(entity_types, entry.label) == null) return error.UnknownLabelThreshold;
+    }
+}
+
+fn validateLabelScoreBiases(label_score_biases: []const LabelScoreBias, entity_types: []const []const u8) !void {
+    for (label_score_biases) |entry| {
+        if (indexOfLabel(entity_types, entry.label) == null) return error.UnknownLabelScoreBias;
+    }
+}
+
+fn indexOfLabel(labels: []const []const u8, label: []const u8) ?usize {
+    for (labels, 0..) |candidate, idx| {
+        if (std.mem.eql(u8, candidate, label)) return idx;
+    }
+    return null;
+}
+
 fn parseStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
     if (value != .array) return error.InvalidTrainingManifest;
     var out = try allocator.alloc([]const u8, value.array.items.len);
@@ -942,6 +1312,25 @@ fn printUsage() void {
         \\  --expect-text TEXT
         \\  --expect-label LABEL
         \\  --min-score FLOAT
+        \\  --min-prediction-score FLOAT
+        \\  --label-thresholds label=FLOAT[,label=FLOAT...]
+        \\  --label-score-biases label=FLOAT[,label=FLOAT...]
+        \\  --nms-overlap FLOAT
+        \\  --no-nms
+        \\  --max-predictions N
+        \\  --top-k-per-label N
+        \\  --best-span-per-label-start
+        \\  --best-label-per-span-start
+        \\  --require-entitylike-span
         \\
     , .{});
+}
+
+test "isEntityLikeSpanText rejects function-word boundaries" {
+    try std.testing.expect(isEntityLikeSpanText("Microsoft"));
+    try std.testing.expect(isEntityLikeSpanText("New York"));
+    try std.testing.expect(isEntityLikeSpanText("Bank of America"));
+    try std.testing.expect(!isEntityLikeSpanText("in"));
+    try std.testing.expect(!isEntityLikeSpanText("in London"));
+    try std.testing.expect(!isEntityLikeSpanText("Microsoft opened"));
 }

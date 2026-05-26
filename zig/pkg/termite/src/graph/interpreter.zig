@@ -1088,7 +1088,6 @@ fn executeScatterAdd(
     if (dest_data.len != out_rows * dim or values_data.len != value_rows * dim or index_data.len < value_rows) return error.ShapeMismatch;
 
     const output = try allocator.dupe(f32, dest_data);
-    errdefer allocator.free(output);
     defer allocator.free(output);
     for (0..value_rows) |row_idx| {
         const out_row_f = @round(index_data[row_idx]);

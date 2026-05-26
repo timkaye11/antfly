@@ -22,6 +22,7 @@ pub const metrics_file_name = "training_metrics.jsonl";
 pub const adapter_file_suffix = ".bin";
 pub const expected_manifest_schema_version = "gliner2_autodiff_training/v1";
 pub const expected_artifact_family_version = "gliner2_autodiff_adapter/v1";
+const loss_trend_window = 20;
 
 pub const ValidationOptions = struct {
     require_loss_decrease: bool = false,
@@ -78,6 +79,8 @@ pub const RunValidationSummary = struct {
     total_extract_ms: f64,
     total_optimizer_update_ms: f64,
     total_device_optimizer_ms: f64,
+    optimizer_backend: ?[]const u8,
+    optimizer_backend_mismatch: bool,
     max_device_resident_transfer_count: u64,
     max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
@@ -219,6 +222,8 @@ pub fn validateRun(
         .total_extract_ms = metrics.total_extract_ms,
         .total_optimizer_update_ms = metrics.total_optimizer_update_ms,
         .total_device_optimizer_ms = metrics.total_device_optimizer_ms,
+        .optimizer_backend = if (metrics.optimizer_backend) |backend| try allocator.dupe(u8, backend) else null,
+        .optimizer_backend_mismatch = metrics.optimizer_backend_mismatch,
         .max_device_resident_transfer_count = metrics.max_device_resident_transfer_count,
         .max_device_trainable_bytes = metrics.max_device_trainable_bytes,
         .max_peak_resident_bytes = metrics.max_peak_resident_bytes,
@@ -234,6 +239,7 @@ pub fn freeRunValidationSummary(allocator: std.mem.Allocator, summary: *RunValid
     allocator.free(summary.manifest_path);
     allocator.free(summary.metrics_path);
     allocator.free(summary.manifest_backend);
+    if (summary.optimizer_backend) |backend| allocator.free(backend);
     allocator.free(summary.peft_adapter_checkpoint_path);
     allocator.free(summary.peft_adapter_config_path);
     allocator.free(summary.task_head_checkpoint_path);
@@ -260,6 +266,11 @@ const MetricsInspection = struct {
     max_peak_resident_bytes: usize = 0,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
+    first_loss_window_sum: f64 = 0,
+    first_loss_window_count: usize = 0,
+    recent_loss_window: [loss_trend_window]f64 = [_]f64{0} ** loss_trend_window,
+    recent_loss_count: usize = 0,
+    recent_loss_index: usize = 0,
     all_step_losses_finite: bool = true,
     optimizer_backend: ?[]const u8 = null,
     optimizer_backend_mismatch: bool = false,
@@ -267,6 +278,15 @@ const MetricsInspection = struct {
     fn lossDecreased(self: MetricsInspection) bool {
         const first = self.first_step_loss orelse return false;
         const final = self.final_step_loss orelse return false;
+        if (self.step_record_count > loss_trend_window and self.first_loss_window_count == loss_trend_window) {
+            const count = @min(self.recent_loss_count, loss_trend_window);
+            if (count == loss_trend_window) {
+                var recent_sum: f64 = 0;
+                for (self.recent_loss_window[0..count]) |loss| recent_sum += loss;
+                return recent_sum / @as(f64, @floatFromInt(count)) <
+                    self.first_loss_window_sum / @as(f64, @floatFromInt(self.first_loss_window_count));
+            }
+        }
         return final < first;
     }
 
@@ -426,6 +446,13 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             if (!std.math.isFinite(loss)) inspection.all_step_losses_finite = false;
             if (inspection.first_step_loss == null) inspection.first_step_loss = loss;
             inspection.final_step_loss = loss;
+            if (inspection.first_loss_window_count < loss_trend_window) {
+                inspection.first_loss_window_sum += loss;
+                inspection.first_loss_window_count += 1;
+            }
+            inspection.recent_loss_window[inspection.recent_loss_index] = loss;
+            inspection.recent_loss_index = (inspection.recent_loss_index + 1) % loss_trend_window;
+            if (inspection.recent_loss_count < loss_trend_window) inspection.recent_loss_count += 1;
             inspection.supervised_token_count += jsonUsize(obj.get("supervised_token_count")) orelse return error.InvalidMetricsRecord;
             inspection.entity_token_count += jsonUsize(obj.get("entity_token_count")) orelse return error.InvalidMetricsRecord;
             inspection.ignored_token_count += jsonUsize(obj.get("ignored_token_count")) orelse return error.InvalidMetricsRecord;
