@@ -59,7 +59,7 @@
 //!   * The current full-autodiff MVP trains a token-classification objective.
 //!     The span grid in `gliner2_data.zig` is production-shaped and now has a
 //!     deterministic prediction decoder, but the real-model span/objective
-//!     parity work is still tracked in `GLINER2_READINESS.md`.
+//!     parity work is still under active calibration.
 
 const std = @import("std");
 const ml = @import("ml");

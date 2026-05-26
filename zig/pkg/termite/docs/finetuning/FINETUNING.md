@@ -176,8 +176,7 @@ sweeps report both a global `best_threshold` and
 `--quality-best-span-per-label-start` provide stricter decode shaping before
 raising model-quality thresholds.
 
-Latest local 200-step resident Metal quality gate:
-`/private/tmp/termite-gliner2-metal-bce-prod-gate-200-quality` passed with
+Latest 200-step resident Metal quality gate passed with
 `avg_step_wall_ms=2792.75`, `max_device_resident_transfer_count=0`,
 `max_device_trainable_bytes=9486400`, and 25-example shaped quality
 `precision=0.1733`, `recall=0.2766`, `f1=0.2131` at threshold `0.03`.
@@ -187,13 +186,12 @@ current adapter still needs model-side quality work: a stricter candidate
 `person=0.30,organization=0.15,location=0.25` reduced predictions from 75 to
 67 and raised organization precision, but aggregate F1 fell to `0.1930`.
 
-Latest local 200-step resident MLX quality gate:
-`/private/tmp/termite-gliner2-mlx-gate-200-deviceopt` passed with
-`avg_step_wall_ms=537.53`, `supervised_tokens_per_second=242.83`,
-`optimizer_backend=mlx`, `max_device_resident_transfer_count=0`,
-`max_device_trainable_bytes=9486400`, `max_peak_resident_bytes=1441054720`,
-and 25-example shaped quality `precision=0.1467`, `recall=0.2340`,
-`f1=0.1803` at threshold `0.03`. This gate uses the compiled MLX gradient
+Latest 200-step resident MLX quality gate passed with `avg_step_wall_ms=537.53`,
+`supervised_tokens_per_second=242.83`, `optimizer_backend=mlx`,
+`max_device_resident_transfer_count=0`, `max_device_trainable_bytes=9486400`,
+`max_peak_resident_bytes=1441054720`, and 25-example shaped quality
+`precision=0.1467`, `recall=0.2340`, `f1=0.1803` at threshold `0.03`.
+This gate uses the compiled MLX gradient
 session and keeps LoRA/task-head weights, gradient accumulators, and AdamW
 moments resident as MLX arrays; runtime batch inputs are still rebound per
 step.
