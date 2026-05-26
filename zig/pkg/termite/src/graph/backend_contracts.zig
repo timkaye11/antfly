@@ -777,6 +777,7 @@ pub const DecoderRuntimePrepareReuseResult = struct {
 pub const DecoderRuntimeDecodeContract = enum(u8) {
     gemma4_gated_ple_shared_kv,
     gliner_deberta_encoder,
+    qwen3_dense_text_embedding,
 };
 
 pub const DecoderRuntimeDecodeMode = enum(u8) {
@@ -860,6 +861,8 @@ pub const DecoderRuntimePrefillFramePlanRequest = struct {
     contract: DecoderRuntimeDecodeContract,
     layer_count: usize,
     rows: usize,
+    batch: usize = 1,
+    seq_len: usize = 0,
     hidden_size: usize,
     vocab_size: usize,
     num_attention_heads: usize,
@@ -875,11 +878,14 @@ pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
     contract: DecoderRuntimeDecodeContract,
     layer_count: usize,
     rows: usize,
+    batch: usize = 1,
+    seq_len: usize = 0,
     hidden_size: usize,
     vocab_size: usize,
     num_attention_heads: usize,
     global_head_dim: usize,
     ple_hidden_size: usize,
+    final_norm_slot: usize = 0,
     norm_eps: f32,
     rope_freq_scale: f32,
     rope_consecutive_pairs: bool,

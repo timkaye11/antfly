@@ -20,6 +20,7 @@
 //   - OpenAI (also works with Ollama, vLLM, and any OpenAI-compatible API)
 
 pub const types = @import("types.zig");
+pub const bedrock = @import("bedrock.zig");
 pub const termite = @import("termite.zig");
 pub const openai = @import("openai.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
@@ -36,9 +37,25 @@ pub const Role = types.Role;
 
 test "inference module compiles" {
     _ = types;
+    _ = bedrock;
     _ = termite;
     _ = openai;
     _ = managed_embedder;
+}
+
+test "bedrock provider request helpers" {
+    try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
+    try bedrock.testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages();
+    try bedrock.testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl();
+    try bedrock.testCohereV4BodyUsesBedrockImageUrlDataUri();
+    try bedrock.testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl();
+    try bedrock.testSharedCredentialsProfileParser();
+    try bedrock.testMetadataCredentialParsers();
+    try bedrock.testCredentialUrlEncoding();
+    try bedrock.testRequestShapeBatchesByProviderRequest();
+    try bedrock.testBedrockInvokePathEscapesModelId();
+    try bedrock.testBedrockSignerUsesBedrockServiceScope();
+    try bedrock.testEndpointHostIncludesExplicitPort();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {
