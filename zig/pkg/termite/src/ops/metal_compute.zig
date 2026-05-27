@@ -7146,7 +7146,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (quantized_storage) |storage| {
             if (!disableRuntimeEmbeddingLookup()) {
-                if (try metal_runtime.decoderRuntimeQuantEmbeddingLookup(self.provider_impl, storage, ids, total, dim, 1.0)) |tensor| {
+                const maybe_tensor = metal_runtime.decoderRuntimeQuantEmbeddingLookup(self.provider_impl, storage, ids, total, dim, 1.0) catch null;
+                if (maybe_tensor) |tensor| {
                     return self.ctFromOwnedMetalTensor(tensor);
                 }
             }
@@ -7227,11 +7228,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.total == 0 or request.hidden_size == 0) return null;
         if (request.input_ids.len != request.total or request.attention_mask.len != request.total) return null;
 
-        var weight_probe = try self.ownedMetalTensorFromCt(request.word_embeddings);
+        var weight_probe = self.ownedMetalTensorFromCt(request.word_embeddings) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
         defer weight_probe.deinit();
-        var gamma_probe = try self.ownedMetalTensorFromCt(request.layer_norm_weight);
+        var gamma_probe = self.ownedMetalTensorFromCt(request.layer_norm_weight) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
         defer gamma_probe.deinit();
-        var beta_probe = try self.ownedMetalTensorFromCt(request.layer_norm_bias);
+        var beta_probe = self.ownedMetalTensorFromCt(request.layer_norm_bias) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
         defer beta_probe.deinit();
         if (weight_probe.ndim() != 2 or gamma_probe.ndim() != 1 or beta_probe.ndim() != 1) return null;
         if (@as(usize, @intCast(weight_probe.dim(1))) != request.hidden_size) return null;
@@ -7481,8 +7491,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         const gamma_buf = toBuf(gamma);
         const beta_buf = toBuf(beta);
-        if (input_buf.quantized_storage != null or gamma_buf.quantized_storage != null or beta_buf.quantized_storage != null) return error.UnsupportedTensorType;
-        if (!disableRuntimeElementwise()) {
+        const has_quantized = bufHasAnyQuantizedStorage(input_buf) or
+            bufHasAnyQuantizedStorage(gamma_buf) or
+            bufHasAnyQuantizedStorage(beta_buf);
+        if (!has_quantized and !disableRuntimeElementwise()) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and
                     bufElemCount(gamma_buf) == dim and bufElemCount(beta_buf) == dim)
@@ -7502,9 +7514,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
-        const input_data = try hostSliceForBuf(input_buf);
-        const gamma_data = try hostSliceForBuf(gamma_buf);
-        const beta_data = try hostSliceForBuf(beta_buf);
+        const input_owned = if (bufHasAnyQuantizedStorage(input_buf)) try toFloat32Op(ctx, input, self.allocator) else null;
+        defer if (input_owned) |data| self.allocator.free(data);
+        const gamma_owned = if (bufHasAnyQuantizedStorage(gamma_buf)) try toFloat32Op(ctx, gamma, self.allocator) else null;
+        defer if (gamma_owned) |data| self.allocator.free(data);
+        const beta_owned = if (bufHasAnyQuantizedStorage(beta_buf)) try toFloat32Op(ctx, beta, self.allocator) else null;
+        defer if (beta_owned) |data| self.allocator.free(data);
+        const input_data = input_owned orelse try hostSliceForBuf(input_buf);
+        const gamma_data = gamma_owned orelse try hostSliceForBuf(gamma_buf);
+        const beta_data = beta_owned orelse try hostSliceForBuf(beta_buf);
         const output = try self.allocator.dupe(f32, input_data);
         errdefer self.allocator.free(output);
         activations_mod.layerNorm(output, gamma_data, beta_data, dim, eps);
