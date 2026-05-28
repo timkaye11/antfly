@@ -223,6 +223,9 @@ fn parseArgs(args_in: std.process.Args, allocator: std.mem.Allocator) !OwnedOpti
             opts.best_label_per_span_start = true;
         } else if (std.mem.eql(u8, arg, "--require-entitylike-span")) {
             opts.require_entitylike_span = true;
+        } else if (std.mem.eql(u8, arg, "--upstream-entity-decode")) {
+            opts.prediction_threshold = 0.5;
+            opts.nms_overlap_threshold = 0.0;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return error.HelpRequested;
@@ -544,6 +547,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
     var loaded_base_weight_count: usize = 0;
     var native_weight_store: WeightStore = undefined;
     var native_owned_names = std.ArrayListUnmanaged([]const u8).empty;
+    var native_safetensors_source: ?*SafetensorsSource = null;
     var native_backend: NativeCompute = undefined;
     var metal_weight_store: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
@@ -573,6 +577,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
             errdefer deinitGpuHostedWeightStore(allocator, &metal_weight_store);
             loaded_base_weight_count = try loadSafetensorsIntoGpuHostedStore(allocator, &metal_weight_store, safetensors_path);
             try addTaskHeadWeightsToGpuHostedStore(allocator, &metal_weight_store, &task_head);
+            try addParityTopLevelWeightsToGpuHostedStore(allocator, &metal_weight_store, manifest.hidden_size);
             metal_compute.initPrefetchQueue(&metal_weight_store, allocator);
             metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_weight_store, null);
             break :blk metal_backend.computeBackend();
@@ -589,6 +594,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
             };
             errdefer deinitMlxWeightStore(allocator, &mlx_weight_store);
             loaded_base_weight_count = resident_weights.loaded_count;
+            try addParityTopLevelWeightsToMlxStore(allocator, mlx_weight_store.resident_weights, manifest.hidden_size);
             mlx_backend = try allocator.create(mlx_compute.MlxCompute);
             errdefer allocator.destroy(mlx_backend);
             mlx_backend.* = try mlx_compute.MlxCompute.init(allocator, &mlx_weight_store, null);
@@ -600,17 +606,24 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
             .resident_weights = .{},
             .lazy_weights = .{},
         };
-        errdefer deinitNativeWeightStore(allocator, &native_weight_store, &native_owned_names);
+        errdefer {
+            deinitNativeWeightStore(allocator, &native_weight_store, &native_owned_names);
+            if (native_safetensors_source) |src| src.weightSource().deinit();
+        }
         const source_ptr = try SafetensorsSource.initAbsolute(allocator, safetensors_path);
+        native_safetensors_source = source_ptr;
         var ws = source_ptr.weightSource();
-        defer ws.deinit();
         loaded_base_weight_count = try loadBaseWeightsFromSource(allocator, &ws, &native_weight_store, &native_owned_names);
         try addTaskHeadWeights(allocator, &native_weight_store, &native_owned_names, &task_head);
+        try addParityTopLevelWeights(allocator, &native_weight_store, &native_owned_names, manifest.hidden_size);
         native_backend = NativeCompute.init(allocator, &native_weight_store, null);
         break :blk native_backend.computeBackend();
     };
     defer switch (selected_backend) {
-        .native => deinitNativeWeightStore(allocator, &native_weight_store, &native_owned_names),
+        .native => {
+            deinitNativeWeightStore(allocator, &native_weight_store, &native_owned_names);
+            if (native_safetensors_source) |src| src.weightSource().deinit();
+        },
         .metal => if (comptime build_options.enable_metal) deinitGpuHostedWeightStore(allocator, &metal_weight_store),
         .mlx => if (comptime build_options.enable_mlx) deinitMlxWeightStore(allocator, &mlx_weight_store),
         .auto => {},
@@ -630,7 +643,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         .objective = objective,
     });
 
-    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    const regular_trainable_params = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -762,19 +775,159 @@ fn addTaskHeadWeights(
     head: *const gliner2_bundle.ClassifierTaskHead,
 ) !void {
     {
-        const name = try allocator.dupe(u8, "classifier.weight");
+        const name = try allocator.dupe(u8, "task_classifier.weight");
         try owned_names.append(allocator, name);
         const shape = [_]i64{ @intCast(head.num_classes), @intCast(head.hidden_size) };
         const tensor = try Tensor.initFloat32(allocator, name, &shape, head.weight);
         try weight_store.resident_weights.put(allocator, name, LoadedWeight{ .tensor = tensor });
     }
     {
-        const name = try allocator.dupe(u8, "classifier.bias");
+        const name = try allocator.dupe(u8, "task_classifier.bias");
         try owned_names.append(allocator, name);
         const shape = [_]i64{@intCast(head.num_classes)};
         const tensor = try Tensor.initFloat32(allocator, name, &shape, head.bias);
         try weight_store.resident_weights.put(allocator, name, LoadedWeight{ .tensor = tensor });
     }
+}
+
+fn fillRectIdentity(data: []f32, out_dim: usize, in_dim: usize) void {
+    @memset(data, 0.0);
+    for (0..@min(out_dim, in_dim)) |i| data[i * in_dim + i] = 1.0;
+}
+
+const ParityWeightSpec = struct {
+    name: []const u8,
+    out_dim: u32,
+    in_dim: u32,
+};
+
+fn parityWeightSpecs(hidden_size: u32) [25]ParityWeightSpec {
+    const H = hidden_size;
+    const FF = H * 4;
+    const MID = H * 2;
+    const COUNT: u32 = 128;
+    const COUNT_FF: u32 = 256;
+    return .{
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .out_dim = FF, .in_dim = H },
+        .{ .name = "span_rep.span_rep_layer.project_start.3.weight", .out_dim = H, .in_dim = FF },
+        .{ .name = "span_rep.span_rep_layer.project_end.0.weight", .out_dim = FF, .in_dim = H },
+        .{ .name = "span_rep.span_rep_layer.project_end.3.weight", .out_dim = H, .in_dim = FF },
+        .{ .name = "span_rep.span_rep_layer.out_project.0.weight", .out_dim = FF, .in_dim = H * 2 },
+        .{ .name = "span_rep.span_rep_layer.out_project.3.weight", .out_dim = H, .in_dim = FF },
+        .{ .name = "classifier.0.weight", .out_dim = MID, .in_dim = H },
+        .{ .name = "classifier.2.weight", .out_dim = 1, .in_dim = MID },
+        .{ .name = "count_pred.0.weight", .out_dim = MID, .in_dim = H },
+        .{ .name = "count_pred.2.weight", .out_dim = 20, .in_dim = MID },
+        .{ .name = "count_embed.pos_embedding.weight", .out_dim = 20, .in_dim = H },
+        .{ .name = "count_embed.gru.weight_ih_l0", .out_dim = H * 3, .in_dim = H },
+        .{ .name = "count_embed.gru.weight_hh_l0", .out_dim = H * 3, .in_dim = H },
+        .{ .name = "count_embed.transformer.in_projector.weight", .out_dim = COUNT, .in_dim = H },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.in_proj_weight", .out_dim = COUNT * 3, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.out_proj.weight", .out_dim = COUNT, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear1.weight", .out_dim = COUNT_FF, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear2.weight", .out_dim = COUNT, .in_dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.in_proj_weight", .out_dim = COUNT * 3, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.out_proj.weight", .out_dim = COUNT, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear1.weight", .out_dim = COUNT_FF, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear2.weight", .out_dim = COUNT, .in_dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.out_projector.0.weight", .out_dim = H, .in_dim = H + COUNT },
+        .{ .name = "count_embed.transformer.out_projector.2.weight", .out_dim = H, .in_dim = H },
+        .{ .name = "count_embed.transformer.out_projector.4.weight", .out_dim = H, .in_dim = H },
+    };
+}
+
+const ParityVectorFill = enum { zero, one };
+
+const ParityVectorSpec = struct {
+    name: []const u8,
+    dim: u32,
+    fill: ParityVectorFill = .zero,
+};
+
+fn fillVector(data: []f32, fill: ParityVectorFill) void {
+    @memset(data, switch (fill) {
+        .zero => 0.0,
+        .one => 1.0,
+    });
+}
+
+fn parityVectorSpecs(hidden_size: u32) [22]ParityVectorSpec {
+    const H = hidden_size;
+    const COUNT: u32 = 128;
+    const COUNT_FF: u32 = 256;
+    return .{
+        .{ .name = "count_embed.gru.bias_ih_l0", .dim = H * 3 },
+        .{ .name = "count_embed.gru.bias_hh_l0", .dim = H * 3 },
+        .{ .name = "count_embed.transformer.in_projector.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.in_proj_bias", .dim = COUNT * 3 },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.out_proj.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm1.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm1.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear1.bias", .dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm2.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.in_proj_bias", .dim = COUNT * 3 },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.out_proj.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm1.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm1.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear1.bias", .dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm2.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.out_projector.0.bias", .dim = H },
+        .{ .name = "count_embed.transformer.out_projector.2.bias", .dim = H },
+        .{ .name = "count_embed.transformer.out_projector.4.bias", .dim = H },
+    };
+}
+
+fn addParityTopLevelWeights(
+    allocator: std.mem.Allocator,
+    weight_store: *WeightStore,
+    owned_names: *std.ArrayListUnmanaged([]const u8),
+    hidden_size: usize,
+) !void {
+    const specs = parityWeightSpecs(@intCast(hidden_size));
+    for (specs) |spec| {
+        if (weight_store.lazy_weights.contains(spec.name)) continue;
+        const out_dim: usize = @intCast(spec.out_dim);
+        const in_dim: usize = @intCast(spec.in_dim);
+        const data = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(data);
+        fillRectIdentity(data, out_dim, in_dim);
+        const name = try allocator.dupe(u8, spec.name);
+        const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+        const tensor = try Tensor.initFloat32(allocator, name, &shape, data);
+        try putMissingOwnedResidentWeight(allocator, weight_store, owned_names, name, LoadedWeight{ .tensor = tensor });
+    }
+    const vector_specs = parityVectorSpecs(@intCast(hidden_size));
+    for (vector_specs) |spec| {
+        const dim: usize = @intCast(spec.dim);
+        const data = try allocator.alloc(f32, dim);
+        defer allocator.free(data);
+        fillVector(data, spec.fill);
+        const name = try allocator.dupe(u8, spec.name);
+        const shape = [_]i64{@intCast(dim)};
+        const tensor = try Tensor.initFloat32(allocator, name, &shape, data);
+        try putMissingOwnedResidentWeight(allocator, weight_store, owned_names, name, LoadedWeight{ .tensor = tensor });
+    }
+}
+
+fn putMissingOwnedResidentWeight(
+    allocator: std.mem.Allocator,
+    weight_store: *WeightStore,
+    owned_names: *std.ArrayListUnmanaged([]const u8),
+    name: []const u8,
+    weight: LoadedWeight,
+) !void {
+    if (weight_store.resident_weights.contains(name)) {
+        var discard = weight;
+        discard.deinit();
+        allocator.free(name);
+        return;
+    }
+    try owned_names.append(allocator, name);
+    try weight_store.resident_weights.put(allocator, name, weight);
 }
 
 fn deinitNativeWeightStore(
@@ -850,8 +1003,8 @@ fn addTaskHeadWeightsToGpuHostedStore(
     if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
     {
         const shape = [_]i64{ @intCast(head.num_classes), @intCast(head.hidden_size) };
-        const tensor = try Tensor.initFloat32(allocator, "classifier.weight", &shape, head.weight);
-        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "classifier.weight"), .{
+        const tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &shape, head.weight);
+        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "task_classifier.weight"), .{
             .tensor_ref = undefined,
             .host_loaded = .{ .tensor = tensor },
             .active_tier = .host,
@@ -860,8 +1013,49 @@ fn addTaskHeadWeightsToGpuHostedStore(
     }
     {
         const shape = [_]i64{@intCast(head.num_classes)};
-        const tensor = try Tensor.initFloat32(allocator, "classifier.bias", &shape, head.bias);
-        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "classifier.bias"), .{
+        const tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &shape, head.bias);
+        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "task_classifier.bias"), .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+        });
+    }
+}
+
+fn addParityTopLevelWeightsToGpuHostedStore(
+    allocator: std.mem.Allocator,
+    weight_store: *MetalWeightStore,
+    hidden_size: usize,
+) !void {
+    if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+    const specs = parityWeightSpecs(@intCast(hidden_size));
+    for (specs) |spec| {
+        if (weight_store.lazy_weights.contains(spec.name)) continue;
+        const out_dim: usize = @intCast(spec.out_dim);
+        const in_dim: usize = @intCast(spec.in_dim);
+        const data = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(data);
+        fillRectIdentity(data, out_dim, in_dim);
+        const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+        const tensor = try Tensor.initFloat32(allocator, spec.name, &shape, data);
+        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, spec.name), .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+        });
+    }
+    const vector_specs = parityVectorSpecs(@intCast(hidden_size));
+    for (vector_specs) |spec| {
+        if (weight_store.lazy_weights.contains(spec.name)) continue;
+        const dim: usize = @intCast(spec.dim);
+        const data = try allocator.alloc(f32, dim);
+        defer allocator.free(data);
+        fillVector(data, spec.fill);
+        const shape = [_]i64{@intCast(dim)};
+        const tensor = try Tensor.initFloat32(allocator, spec.name, &shape, data);
+        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, spec.name), .{
             .tensor_ref = undefined,
             .host_loaded = .{ .tensor = tensor },
             .active_tier = .host,
@@ -934,10 +1128,58 @@ fn addTaskHeadWeightsToMlxStore(
     if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
     const weight_shape = [_]i32{ @intCast(head.num_classes), @intCast(head.hidden_size) };
     const weight_arr = mlx.arrayFromFloat32(head.weight, &weight_shape);
-    try mlx.insertWeight(weights, allocator, "classifier.weight", weight_arr);
+    try mlx.insertWeight(weights, allocator, "task_classifier.weight", weight_arr);
     const bias_shape = [_]i32{@intCast(head.num_classes)};
     const bias_arr = mlx.arrayFromFloat32(head.bias, &bias_shape);
-    try mlx.insertWeight(weights, allocator, "classifier.bias", bias_arr);
+    try mlx.insertWeight(weights, allocator, "task_classifier.bias", bias_arr);
+}
+
+fn addParityTopLevelWeightsToMlxStore(
+    allocator: std.mem.Allocator,
+    weights: MlxMap,
+    hidden_size: usize,
+) !void {
+    if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
+    const specs = parityWeightSpecs(@intCast(hidden_size));
+    for (specs) |spec| {
+        if (mlxMapContains(weights, spec.name)) continue;
+        const out_dim: usize = @intCast(spec.out_dim);
+        const in_dim: usize = @intCast(spec.in_dim);
+        const shape = [_]i32{ @intCast(out_dim), @intCast(in_dim) };
+        const data = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(data);
+        fillRectIdentity(data, out_dim, in_dim);
+        const arr = mlx.arrayFromFloat32(data, &shape);
+        try mlx.insertWeight(weights, allocator, spec.name, arr);
+    }
+    const vector_specs = parityVectorSpecs(@intCast(hidden_size));
+    for (vector_specs) |spec| {
+        if (mlxMapContains(weights, spec.name)) continue;
+        const dim: usize = @intCast(spec.dim);
+        const shape = [_]i32{@intCast(dim)};
+        const data = try allocator.alloc(f32, dim);
+        defer allocator.free(data);
+        fillVector(data, spec.fill);
+        const arr = mlx.arrayFromFloat32(data, &shape);
+        try mlx.insertWeight(weights, allocator, spec.name, arr);
+    }
+}
+
+fn mlxMapContains(weights: MlxMap, name: []const u8) bool {
+    if (comptime !build_options.enable_mlx) return false;
+    const it = mlx_c.mlx_map_string_to_array_iterator_new(weights);
+    defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
+    while (true) {
+        var key: [*c]const u8 = null;
+        var val = mlx_c.mlx_array_new();
+        if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
+            _ = mlx_c.mlx_array_free(val);
+            return false;
+        }
+        const found = key != null and std.mem.eql(u8, std.mem.span(key), name);
+        _ = mlx_c.mlx_array_free(val);
+        if (found) return true;
+    }
 }
 
 fn deinitMlxWeightStore(allocator: std.mem.Allocator, weight_store: *MlxWeightStore) void {
@@ -1399,11 +1641,11 @@ fn loadTaskHeadIntoTrainer(
     trainer: *real_autodiff.RealAutodiffTrainer,
 ) !void {
     for (trainer.regular_params.items) |*slot| {
-        if (std.mem.eql(u8, slot.name, "classifier.weight")) {
+        if (std.mem.eql(u8, slot.name, "task_classifier.weight")) {
             if (slot.weights.len != head.weight.len) return error.TaskHeadShapeMismatch;
             @memcpy(slot.weights, head.weight);
             @memset(slot.grad_accum, 0.0);
-        } else if (std.mem.eql(u8, slot.name, "classifier.bias")) {
+        } else if (std.mem.eql(u8, slot.name, "task_classifier.bias")) {
             if (slot.weights.len != head.bias.len) return error.TaskHeadShapeMismatch;
             @memcpy(slot.weights, head.bias);
             @memset(slot.grad_accum, 0.0);
@@ -1682,6 +1924,7 @@ fn printUsage() void {
         \\  --best-span-per-label-start
         \\  --best-label-per-span-start
         \\  --require-entitylike-span
+        \\  --upstream-entity-decode
         \\
     , .{});
 }

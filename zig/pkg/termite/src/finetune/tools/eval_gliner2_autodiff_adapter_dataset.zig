@@ -40,6 +40,7 @@ const Options = struct {
     best_span_per_label_start: bool = false,
     best_label_per_span_start: bool = false,
     require_entitylike_span: bool = false,
+    match_text_label_only: bool = false,
     sweep_thresholds: []const f32 = &.{},
     min_precision: ?f64 = null,
     min_recall: ?f64 = null,
@@ -92,6 +93,7 @@ const QualitySummary = struct {
     best_span_per_label_start: bool,
     best_label_per_span_start: bool,
     require_entitylike_span: bool,
+    match_mode: []const u8,
     per_label_score_stats: []const LabelScoreStats,
     per_label: []const LabelMetric,
     threshold_sweep: []const ThresholdMetric,
@@ -339,6 +341,7 @@ pub fn main(init: std.process.Init) !void {
         .best_span_per_label_start = opts.best_span_per_label_start,
         .best_label_per_span_start = opts.best_label_per_span_start,
         .require_entitylike_span = opts.require_entitylike_span,
+        .match_mode = if (opts.match_text_label_only) "text-label" else "exact-offset",
         .per_label_score_stats = score_stats,
         .per_label = main_accum.label_metrics,
         .threshold_sweep = threshold_sweep,
@@ -504,7 +507,7 @@ fn scoreExample(
         var correct = false;
         for (ex.entities, 0..) |ent, gold_idx| {
             if (gold_matched[gold_idx]) continue;
-            if (std.mem.eql(u8, ent.label, prediction.label) and ent.start == prediction.start and ent.end == prediction.end) {
+            if (predictionMatchesGold(ex, ent, prediction, opts)) {
                 gold_matched[gold_idx] = true;
                 correct = true;
                 break;
@@ -523,6 +526,23 @@ fn scoreExample(
             try appendFalseNegativeDiagnostic(allocator, ctx, ex, ent, entity_types[label_idx]);
         }
     }
+}
+
+fn predictionMatchesGold(
+    ex: gliner2_data.Example,
+    ent: gliner2_data.Entity,
+    prediction: adapter_eval.TopEntity,
+    opts: Options,
+) bool {
+    if (!std.mem.eql(u8, ent.label, prediction.label)) return false;
+    if (!opts.match_text_label_only) return ent.start == prediction.start and ent.end == prediction.end;
+
+    const gold_text = if (ent.text.len > 0) ent.text else spanText(ex.text, ent.start, ent.end);
+    return std.mem.eql(
+        u8,
+        std.mem.trim(u8, gold_text, " \t\r\n"),
+        std.mem.trim(u8, prediction.text, " \t\r\n"),
+    );
 }
 
 fn appendFalsePositiveDiagnostic(
@@ -738,6 +758,12 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
             opts.best_label_per_span_start = true;
         } else if (std.mem.eql(u8, arg, "--require-entitylike-span")) {
             opts.require_entitylike_span = true;
+        } else if (std.mem.eql(u8, arg, "--match-text-label-only")) {
+            opts.match_text_label_only = true;
+        } else if (std.mem.eql(u8, arg, "--upstream-entity-decode")) {
+            opts.min_prediction_score = 0.5;
+            opts.nms_overlap_threshold = 0.0;
+            opts.match_text_label_only = true;
         } else if (std.mem.eql(u8, arg, "--min-precision")) {
             opts.min_precision = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--min-recall")) {
@@ -943,6 +969,8 @@ fn printUsage() void {
         \\  --best-span-per-label-start
         \\  --best-label-per-span-start
         \\  --require-entitylike-span
+        \\  --match-text-label-only
+        \\  --upstream-entity-decode
         \\  --min-precision FLOAT
         \\  --min-recall FLOAT
         \\  --min-f1 FLOAT
@@ -951,6 +979,45 @@ fn printUsage() void {
         \\  --diagnostic-limit N
         \\
     , .{});
+}
+
+test "dataset evaluator can match by text and label without exact offsets" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{"location"};
+    var accum = try EvalAccumulator.init(allocator, 0.5, &labels);
+    defer accum.deinit(allocator);
+    accum.addGold(0);
+
+    const entities = [_]gliner2_data.Entity{.{
+        .text = "Seattle",
+        .label = "location",
+        .start = 20,
+        .end = 27,
+    }};
+    const ex = gliner2_data.Example{
+        .text = "Alice works from Seattle.",
+        .entities = &entities,
+    };
+    const predictions = [_]adapter_eval.TopEntity{.{
+        .text = "Seattle",
+        .label = "location",
+        .start = 19,
+        .end = 26,
+        .score = 0.9,
+    }};
+    const opts = Options{
+        .model_dir = "",
+        .adapter_dir = "",
+        .eval_data = "",
+        .entity_types_csv = "location",
+        .min_prediction_score = 0.5,
+        .match_text_label_only = true,
+    };
+
+    try scoreExample(allocator, &accum, ex, &labels, &predictions, opts, null);
+
+    try std.testing.expectEqual(@as(usize, 1), accum.predicted_total);
+    try std.testing.expectEqual(@as(usize, 1), accum.correct_total);
 }
 
 test "dataset evaluator records false positive and false negative diagnostics" {

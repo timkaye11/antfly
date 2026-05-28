@@ -43,8 +43,10 @@ const Shape = shape_mod.Shape;
 pub const LoRAConfig = struct {
     rank: u32,
     alpha: f32 = 1.0,
+    dropout: f32 = 0.0,
     target_patterns: []const []const u8,
     sharing: SharingMode = .by_weight,
+    strict_target_patterns: bool = false,
 };
 
 pub const SharingMode = enum {
@@ -68,6 +70,9 @@ pub const AdapterInfo = struct {
     lora_a_id: NodeId,
     /// NodeId of lora_B parameter in the modified graph.
     lora_b_id: NodeId,
+    /// Optional dropout mask parameter for the LoRA branch input.
+    dropout_mask_name: ?[]const u8 = null,
+    dropout_mask_id: NodeId = null_node,
     /// Monotonic use-site index among adapted linear ops. Zero for the first
     /// match. In `.by_weight` mode this is informational; in `.by_use` mode it
     /// is encoded into adapter parameter names.
@@ -109,6 +114,9 @@ pub fn injectLoRA(
     src: *const Graph,
     config: LoRAConfig,
 ) !LoRAResult {
+    if (!std.math.isFinite(config.dropout) or config.dropout < 0.0 or config.dropout >= 1.0) {
+        return error.InvalidLoRADropout;
+    }
     // Clone the source graph.
     var g = try cloneGraph(allocator, src);
     errdefer g.deinit();
@@ -144,6 +152,9 @@ pub fn injectLoRA(
     defer weight_use_counts.deinit(allocator);
     var weight_use_count_keys: std.ArrayListUnmanaged([]u8) = .empty;
     defer freeOwnedStrings(allocator, &weight_use_count_keys);
+    const matched_patterns = try allocator.alloc(bool, config.target_patterns.len);
+    defer allocator.free(matched_patterns);
+    @memset(matched_patterns, false);
 
     for (0..node_count) |i| {
         const id: NodeId = @intCast(i);
@@ -163,7 +174,8 @@ pub fn injectLoRA(
         const weight_name = g.parameterName(weight_node);
 
         // Check if this weight matches any target pattern.
-        if (!matchesPattern(weight_name, config.target_patterns)) continue;
+        const matched_pattern_idx = matchedPatternIndex(weight_name, config.target_patterns) orelse continue;
+        matched_patterns[matched_pattern_idx] = true;
 
         // Found a match. Inject LoRA path:
         //   lora_out = linearNoBias(x, A, rows, in_dim, rank)
@@ -215,13 +227,23 @@ pub fn injectLoRA(
             .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_B", .{weight_name}),
             .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_B", .{ weight_name, current_use_site }),
         };
+        const mask_name = if (config.dropout > 0.0) switch (config.sharing) {
+            .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_dropout_mask", .{weight_name}),
+            .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_dropout_mask", .{ weight_name, current_use_site }),
+        } else null;
 
         // A: [rank, in_dim], B: [out_dim, rank]
         const lora_a = try bld.parameter(a_name, Shape.init(.f32, &.{ @intCast(rank), @intCast(in_dim) }));
         const lora_b = try bld.parameter(b_name, Shape.init(.f32, &.{ @intCast(out_dim), @intCast(rank) }));
+        var dropout_mask_id: NodeId = null_node;
+        const lora_input = if (mask_name) |name| blk: {
+            const mask = try bld.parameter(name, Shape.init(.f32, &.{ @intCast(rows), @intCast(in_dim) }));
+            dropout_mask_id = mask;
+            break :blk try bld.mul(input_id, mask);
+        } else input_id;
 
         // x @ A^T → [rows, rank]
-        const after_a = try bld.linearNoBias(input_id, lora_a, rows, in_dim, rank);
+        const after_a = try bld.linearNoBias(lora_input, lora_a, rows, in_dim, rank);
         // [rows, rank] @ B^T → [rows, out_dim]
         const after_b = try bld.linearNoBias(after_a, lora_b, rows, rank, out_dim);
 
@@ -246,8 +268,15 @@ pub fn injectLoRA(
             .lora_b_name = b_name,
             .lora_a_id = lora_a,
             .lora_b_id = lora_b,
+            .dropout_mask_name = mask_name,
+            .dropout_mask_id = dropout_mask_id,
             .use_site_index = current_use_site,
         });
+    }
+    if (config.strict_target_patterns) {
+        for (matched_patterns) |matched| {
+            if (!matched) return error.LoRATargetPatternNotResolved;
+        }
     }
 
     return .{ .graph = g, .adapter = adapter };
@@ -339,10 +368,14 @@ pub fn mergeLoRA(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn matchesPattern(name: []const u8, patterns: []const []const u8) bool {
-    for (patterns) |pattern| {
-        if (std.mem.indexOf(u8, name, pattern) != null) return true;
+    return matchedPatternIndex(name, patterns) != null;
+}
+
+fn matchedPatternIndex(name: []const u8, patterns: []const []const u8) ?usize {
+    for (patterns, 0..) |pattern, idx| {
+        if (std.mem.indexOf(u8, name, pattern) != null) return idx;
     }
-    return false;
+    return null;
 }
 
 fn redirectConsumers(g: *Graph, old_id: NodeId, new_id: NodeId, start: u32, end: u32) void {

@@ -86,6 +86,10 @@ Recipe-level LoRA defaults are intentionally PEFT-like:
 - GRPO adapter-training routes default to `rank = 8`, `alpha = 32`; raise rank for larger policy tasks after an eval sweep justifies the extra adapter capacity.
 - Scaling is standard LoRA `alpha / rank`. Recipe `adapter.scaling` currently accepts only `standard` aliases; rank-stabilized scaling is not enabled in the graph trainer path.
 - Gemma4 defaults to `target_preset = "all-linear"`, which expands to attention and MLP linear patterns. Explicit `target_modules` override the preset.
+- GLiNER2 LoRA defaults match the upstream Python GLiNER2 LoRA surface:
+  `rank = 16`, `alpha = 32`, `lora_dropout = 0.1`, and target groups
+  `encoder,span_rep,classifier,count_embed,count_pred`. The encoder group
+  expands to query/key/value plus dense encoder projections.
 - Qwen/ColQwen optimizer-backed routes default to their all-linear target module lists. They also accept `target_preset = "all-linear"`, `attention-only`, or `mlp-only`; `moe-experts` is rejected until expert-aware rank and routing policy is wired through those bootstraps.
 - `init_lora_weights` and `use_dora` are currently Gemma4-only recipe knobs.
 

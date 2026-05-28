@@ -326,6 +326,7 @@ const ManifestInspection = struct {
     model_dir: []const u8,
     lora_rank: usize,
     lora_alpha: f64,
+    lora_dropout: f64,
     lora_targets: []const u8,
     epochs: usize,
     batch_size: usize,
@@ -359,8 +360,10 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
     if (std.mem.trim(u8, model_dir, " \t\r\n").len == 0) return error.InvalidTrainingManifest;
     const lora_rank = jsonUsize(obj.get("lora_rank")) orelse return error.InvalidTrainingManifest;
     const lora_alpha = jsonF64(obj.get("lora_alpha")) orelse return error.InvalidTrainingManifest;
+    const lora_dropout = jsonF64(obj.get("lora_dropout")) orelse 0.0;
     const lora_targets = jsonString(obj.get("lora_targets")) orelse return error.InvalidTrainingManifest;
     if (lora_rank == 0 or !std.math.isFinite(lora_alpha) or lora_alpha <= 0) return error.InvalidTrainingManifest;
+    if (!std.math.isFinite(lora_dropout) or lora_dropout < 0.0 or lora_dropout >= 1.0) return error.InvalidTrainingManifest;
     if (countCsvTargets(lora_targets) == 0 or hasEmptyCsvTarget(lora_targets)) return error.InvalidTrainingManifest;
     const epochs = jsonUsize(obj.get("epochs")) orelse return error.InvalidTrainingManifest;
     const batch_size = jsonUsize(obj.get("batch_size")) orelse return error.InvalidTrainingManifest;
@@ -387,6 +390,7 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
         .model_dir = model_dir,
         .lora_rank = lora_rank,
         .lora_alpha = lora_alpha,
+        .lora_dropout = lora_dropout,
         .lora_targets = lora_targets,
         .epochs = epochs,
         .batch_size = batch_size,
@@ -604,6 +608,8 @@ fn inspectPeftAdapterConfig(obj: std.json.ObjectMap, manifest: ManifestInspectio
     if (rank != manifest.lora_rank) return error.InvalidPeftAdapterConfig;
     const lora_alpha = jsonF64(obj.get("lora_alpha")) orelse return error.InvalidPeftAdapterConfig;
     if (!std.math.isFinite(lora_alpha) or @abs(lora_alpha - manifest.lora_alpha) > 1e-6) return error.InvalidPeftAdapterConfig;
+    const lora_dropout = jsonF64(obj.get("lora_dropout")) orelse 0.0;
+    if (!std.math.isFinite(lora_dropout) or @abs(lora_dropout - manifest.lora_dropout) > 1e-6) return error.InvalidPeftAdapterConfig;
     const use_dora = jsonBool(obj.get("use_dora")) orelse return error.InvalidPeftAdapterConfig;
     if (use_dora) return error.InvalidPeftAdapterConfig;
 

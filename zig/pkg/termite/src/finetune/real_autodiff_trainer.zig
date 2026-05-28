@@ -562,6 +562,39 @@ pub const RealAutodiffTrainer = struct {
             try putRuntimeInput(self.allocator, self.compute_backend, &rt, gs.targets_node, input.targets, target_dims);
         }
 
+        // LoRA dropout masks. These are non-trainable per-step inputs used
+        // only by adapters injected with config.lora.dropout > 0. Eval binds
+        // all-ones masks so reload/materialization paths are deterministic.
+        if (self.config.lora.dropout > 0.0) {
+            var mask_seed = self.config.seed ^ (self.step_count + 0x9e3779b97f4a7c15);
+            for (gs.lora_adapter.adapters.items, 0..) |info, idx| {
+                if (info.dropout_mask_id == null_node) continue;
+                const mask_node = gs.graph.node(info.dropout_mask_id);
+                const mask_dims = try shapeToDims(self.allocator, mask_node.output_shape);
+                defer self.allocator.free(mask_dims);
+                var mask_len: usize = 1;
+                for (mask_dims) |dim| {
+                    if (dim <= 0) return error.InvalidTensorShape;
+                    mask_len *= @intCast(dim);
+                }
+                const mask = try self.allocator.alloc(f32, mask_len);
+                defer self.allocator.free(mask);
+                if (mode == .train) {
+                    mask_seed +%= @as(u64, @intCast(idx)) *% 0xbf58476d1ce4e5b9;
+                    var prng = std.Random.DefaultPrng.init(mask_seed);
+                    var rng = prng.random();
+                    const keep_prob = 1.0 - self.config.lora.dropout;
+                    const keep_scale = 1.0 / keep_prob;
+                    for (mask) |*value| {
+                        value.* = if (rng.float(f32) < keep_prob) keep_scale else 0.0;
+                    }
+                } else {
+                    @memset(mask, 1.0);
+                }
+                try putRuntimeInput(self.allocator, self.compute_backend, &rt, info.dropout_mask_id, mask, mask_dims);
+            }
+        }
+
         // LoRA parameter slices.
         for (self.lora_params.items) |*slot| {
             if (slot.device) |device| {
@@ -1265,7 +1298,8 @@ pub const RealAutodiffTrainer = struct {
     fn buildGraphState(self: *RealAutodiffTrainer, input: TrainerInput) !void {
         // 1. Build the bare forward graph.
         var base_graph = Graph.init(self.allocator);
-        errdefer base_graph.deinit();
+        var base_graph_owned = true;
+        errdefer if (base_graph_owned) base_graph.deinit();
 
         var bld = Builder.init(&base_graph);
 
@@ -1299,6 +1333,7 @@ pub const RealAutodiffTrainer = struct {
         var lora_result = try lora_mod.injectLoRA(self.allocator, &base_graph, self.config.lora);
         // The original graph is no longer needed — LoRAResult owns a clone.
         base_graph.deinit();
+        base_graph_owned = false;
         errdefer {
             lora_result.graph.deinit();
             lora_result.adapter.deinit();
@@ -1323,6 +1358,7 @@ pub const RealAutodiffTrainer = struct {
         for (lora_result.adapter.adapters.items) |*info| {
             info.lora_a_id = sorted.id_map[info.lora_a_id];
             info.lora_b_id = sorted.id_map[info.lora_b_id];
+            if (info.dropout_mask_id != null_node) info.dropout_mask_id = sorted.id_map[info.dropout_mask_id];
         }
         if (input.remap_graph_nodes) |remap| try remap(input.ctx, sorted.id_map);
 

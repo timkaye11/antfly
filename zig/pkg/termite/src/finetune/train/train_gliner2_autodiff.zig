@@ -32,7 +32,8 @@
 //   --learning-rate <f>          Learning rate (default: 2e-5)
 //   --lora-rank <n>              LoRA rank (default: 16)
 //   --lora-alpha <f>             LoRA alpha scaling (default: 32)
-//   --lora-targets <csv>         Target module patterns (default: "query_proj,value_proj")
+//   --lora-dropout <f>           LoRA dropout probability (default: 0.1)
+//   --lora-targets <csv>         Target module groups (default: upstream GLiNER2 LoRA groups)
 //   --num-classes <n>            Entity classes including O (default: 5)
 //   --objective <name>           token or span-start (default: token)
 //   --max-span-width <n>         Max span width for span-start objective (default: 4)
@@ -86,12 +87,14 @@ const Options = struct {
     learning_rate: f32 = 2e-5,
     lora_rank: u32 = 16,
     lora_alpha: f32 = 32.0,
-    lora_targets: []const u8 = "query_proj,value_proj",
+    lora_dropout: f32 = gliner2_bundle.default_lora_dropout,
+    lora_targets: []const u8 = "encoder,span_rep,classifier,count_embed,count_pred",
     num_classes: u32 = 5,
     entity_types_csv: ?[]const u8 = null,
     objective: gliner2_autodiff.GlinerObjective = .token,
     max_span_width: u32 = 4,
     span_loss: gliner2_autodiff.SpanStartLossKind = .bce,
+    span_loss_reduction: gliner2_autodiff.SpanStartLossReduction = .mean,
     span_positive_weight: f32 = 32.0,
     span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: f32 = 1.0,
@@ -132,12 +135,14 @@ pub fn main(init: std.process.Init) !void {
     var learning_rate: f32 = 2e-5;
     var lora_rank: u32 = 16;
     var lora_alpha: f32 = 32.0;
-    var lora_targets: []const u8 = "query_proj,value_proj";
+    var lora_dropout: f32 = gliner2_bundle.default_lora_dropout;
+    var lora_targets: []const u8 = "encoder,span_rep,classifier,count_embed,count_pred";
     var num_classes: u32 = 5;
     var entity_types_csv: ?[]const u8 = null;
     var objective: gliner2_autodiff.GlinerObjective = .token;
     var max_span_width: u32 = 4;
     var span_loss: gliner2_autodiff.SpanStartLossKind = .bce;
+    var span_loss_reduction: gliner2_autodiff.SpanStartLossReduction = .mean;
     var span_positive_weight: f32 = 32.0;
     var span_label_positive_weights: ?[]const u8 = null;
     var span_negative_weight: f32 = 1.0;
@@ -177,6 +182,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--lora-alpha")) {
             const val = args.next() orelse return error.MissingLoraAlpha;
             lora_alpha = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--lora-dropout")) {
+            const val = args.next() orelse return error.MissingLoraDropout;
+            lora_dropout = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--lora-targets")) {
             lora_targets = args.next() orelse return error.MissingLoraTargets;
         } else if (std.mem.eql(u8, arg, "--num-classes")) {
@@ -193,6 +201,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--span-loss")) {
             const val = args.next() orelse return error.MissingSpanLoss;
             span_loss = try parseSpanLoss(val);
+        } else if (std.mem.eql(u8, arg, "--span-loss-reduction")) {
+            const val = args.next() orelse return error.MissingSpanLossReduction;
+            span_loss_reduction = try parseSpanLossReduction(val);
         } else if (std.mem.eql(u8, arg, "--span-positive-weight")) {
             const val = args.next() orelse return error.MissingSpanPositiveWeight;
             span_positive_weight = try std.fmt.parseFloat(f32, val);
@@ -250,12 +261,14 @@ pub fn main(init: std.process.Init) !void {
         .learning_rate = learning_rate,
         .lora_rank = lora_rank,
         .lora_alpha = lora_alpha,
+        .lora_dropout = lora_dropout,
         .lora_targets = lora_targets,
         .num_classes = num_classes,
         .entity_types_csv = entity_types_csv,
         .objective = objective,
         .max_span_width = max_span_width,
         .span_loss = span_loss,
+        .span_loss_reduction = span_loss_reduction,
         .span_positive_weight = span_positive_weight,
         .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = span_negative_weight,
@@ -292,21 +305,24 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.seq_len,
         opts.learning_rate,
     });
-    print("  lora_rank={d} lora_alpha={d:.1} lora_targets={s}\n", .{
+    print("  lora_rank={d} lora_alpha={d:.1} lora_dropout={d:.3} lora_targets={s}\n", .{
         opts.lora_rank,
         opts.lora_alpha,
+        opts.lora_dropout,
         opts.lora_targets,
     });
+    try gliner2_bundle.validateLoRADropout(opts.lora_dropout);
     print("  num_classes={d} seed={d} max_grad_norm={d:.2} grad_accum={d}\n", .{
         opts.num_classes,
         opts.seed,
         opts.max_grad_norm,
         opts.grad_accum,
     });
-    print("  objective={s} max_span_width={d} span_loss={s} span_pos_weight={d:.3} span_neg_weight={d:.3} span_hard_neg_weight={d:.3}\n", .{
+    print("  objective={s} max_span_width={d} span_loss={s} span_loss_reduction={s} span_pos_weight={d:.3} span_neg_weight={d:.3} span_hard_neg_weight={d:.3}\n", .{
         objectiveName(opts.objective),
         opts.max_span_width,
         spanLossName(opts.span_loss),
+        spanLossReductionName(opts.span_loss_reduction),
         opts.span_positive_weight,
         opts.span_negative_weight,
         opts.span_hard_negative_weight,
@@ -445,16 +461,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
             const w_shape = [_]i32{ @intCast(C), @intCast(H) };
             const w_arr = mlx.arrayFromFloat32(w_data, &w_shape);
-            try mlx.insertWeight(stripped_weights, allocator, "classifier.weight", w_arr);
+            try mlx.insertWeight(stripped_weights, allocator, "task_classifier.weight", w_arr);
 
             const b_data = try allocator.alloc(f32, C);
             defer allocator.free(b_data);
             @memset(b_data, 0.0);
             const b_shape = [_]i32{@intCast(C)};
             const b_arr = mlx.arrayFromFloat32(b_data, &b_shape);
-            try mlx.insertWeight(stripped_weights, allocator, "classifier.bias", b_arr);
+            try mlx.insertWeight(stripped_weights, allocator, "task_classifier.bias", b_arr);
             print("  initialized classifier head (MLX): [{d}, {d}] + [{d}]\n", .{ C, H, C });
         }
+        try initParityTopLevelWeightsMlx(allocator, stripped_weights, deberta_config.hidden_size);
 
         mlx_ws = .{
             .allocator = allocator,
@@ -507,17 +524,18 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             const w_data = try allocator.alloc(f32, C * H);
             const sd: f32 = 0.02;
             for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
-            const w_tensor = try Tensor.initFloat32(allocator, "classifier.weight", &.{ C, H }, w_data);
+            const w_tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &.{ C, H }, w_data);
             allocator.free(w_data);
-            try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, "classifier.weight"), .{ .tensor = w_tensor });
+            try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, "task_classifier.weight"), .{ .tensor = w_tensor });
 
             const b_data = try allocator.alloc(f32, C);
             @memset(b_data, 0.0);
-            const b_tensor = try Tensor.initFloat32(allocator, "classifier.bias", &.{C}, b_data);
+            const b_tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &.{C}, b_data);
             allocator.free(b_data);
-            try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, "classifier.bias"), .{ .tensor = b_tensor });
+            try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, "task_classifier.bias"), .{ .tensor = b_tensor });
             print("  initialized classifier head (native): [{d}, {d}] + [{d}]\n", .{ C, H, C });
         }
+        try initParityTopLevelWeightsNative(allocator, &native_ws, deberta_config.hidden_size);
 
         native_backend = native_compute.NativeCompute.init(allocator, &native_ws, null);
         break :blk native_backend.computeBackend();
@@ -626,6 +644,11 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             try target_patterns.append(allocator, std.mem.trim(u8, tok, " "));
         }
     }
+    const resolved_target_patterns = try gliner2_bundle.expandLoRATargetModules(allocator, target_patterns.items);
+    defer {
+        for (resolved_target_patterns) |item| allocator.free(item);
+        allocator.free(resolved_target_patterns);
+    }
 
     // ------------------------------------------------------------------
     // 8. Build the DeBERTa graph config + GlinerAutodiffCtx
@@ -645,6 +668,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .num_classes = opts.num_classes,
         .objective = opts.objective,
         .span_start_loss = opts.span_loss,
+        .span_start_loss_reduction = opts.span_loss_reduction,
         .span_start_positive_weight = opts.span_positive_weight,
         .span_start_negative_weight = opts.span_negative_weight,
     });
@@ -655,9 +679,16 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     const lora_config = ml.graph.lora.LoRAConfig{
         .rank = opts.lora_rank,
         .alpha = opts.lora_alpha,
-        .target_patterns = target_patterns.items,
+        .dropout = opts.lora_dropout,
+        .target_patterns = resolved_target_patterns,
+        .strict_target_patterns = true,
     };
-    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    const regular_trainable_params_with_classifier = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
+    const regular_trainable_params_bias_only = [_][]const u8{"task_classifier.bias"};
+    const regular_trainable_params = if (stringSliceContains(resolved_target_patterns, "classifier"))
+        regular_trainable_params_bias_only[0..]
+    else
+        regular_trainable_params_with_classifier[0..];
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
@@ -671,7 +702,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .hidden_size_hint = deberta_config.hidden_size,
             .num_layers_hint = deberta_config.num_hidden_layers,
             .seed = opts.seed,
-            .regular_trainable_params = &regular_trainable_params,
+            .regular_trainable_params = regular_trainable_params,
             .execution_engine = switch (selected_backend) {
                 .metal => .compiled_metal,
                 .mlx => .compiled_mlx,
@@ -897,16 +928,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.model_dir,
         opts.lora_rank,
         opts.lora_alpha,
+        opts.lora_dropout,
         target_patterns.items,
         autodiff_params,
     );
     defer gliner2_bundle.freeAutodiffAdapterExportSummary(allocator, &peft_export);
-    const regular_params = try collectRegularTrainableParams(allocator, &trainer);
-    defer allocator.free(regular_params);
+    var regular_params = try collectTaskHeadExportParams(allocator, &trainer, opts.num_classes, deberta_config.hidden_size);
+    defer regular_params.deinit();
     var regular_export = try gliner2_bundle.exportAutodiffRegularParamsAsSafetensors(
         allocator,
         opts.out_dir,
-        regular_params,
+        regular_params.params,
     );
     defer gliner2_bundle.freeAutodiffRegularParamExportSummary(allocator, &regular_export);
 
@@ -915,7 +947,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, run_target_stats);
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, resolved_target_patterns, run_target_stats);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -1008,6 +1040,7 @@ fn writeTrainingManifest(
     adapter_parameter_file_count: usize,
     peft_adapter_tensor_count: usize,
     regular_trainable_tensor_count: usize,
+    resolved_lora_targets: []const []const u8,
     target_stats: BatchTargetStats,
 ) !void {
     const manifest_path = try std.fs.path.join(allocator, &.{ opts.out_dir, run_validation.manifest_file_name });
@@ -1038,11 +1071,14 @@ fn writeTrainingManifest(
         .learning_rate = opts.learning_rate,
         .lora_rank = opts.lora_rank,
         .lora_alpha = opts.lora_alpha,
+        .lora_dropout = opts.lora_dropout,
         .lora_targets = opts.lora_targets,
+        .resolved_lora_targets = resolved_lora_targets,
         .num_classes = opts.num_classes,
         .objective = objectiveName(opts.objective),
         .max_span_width = opts.max_span_width,
         .span_loss = spanLossName(opts.span_loss),
+        .span_loss_reduction = spanLossReductionName(opts.span_loss_reduction),
         .span_positive_weight = opts.span_positive_weight,
         .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = opts.span_negative_weight,
@@ -1095,6 +1131,102 @@ fn collectRegularTrainableParams(
         };
     }
     return params;
+}
+
+const TaskHeadExportParams = struct {
+    allocator: std.mem.Allocator,
+    params: []gliner2_bundle.AutodiffAdapterParam,
+    owned_dims: [][]i32,
+    owned_weights: [][]f32,
+
+    fn deinit(self: *TaskHeadExportParams) void {
+        for (self.owned_dims) |dims| self.allocator.free(dims);
+        for (self.owned_weights) |weights| self.allocator.free(weights);
+        self.allocator.free(self.owned_dims);
+        self.allocator.free(self.owned_weights);
+        self.allocator.free(self.params);
+        self.* = undefined;
+    }
+};
+
+fn collectTaskHeadExportParams(
+    allocator: std.mem.Allocator,
+    trainer: *const real_autodiff.RealAutodiffTrainer,
+    num_classes: u32,
+    hidden_size: u32,
+) !TaskHeadExportParams {
+    const source_names = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
+    const export_names = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    var params = try allocator.alloc(gliner2_bundle.AutodiffAdapterParam, source_names.len);
+    errdefer allocator.free(params);
+    var owned_dims = try allocator.alloc([]i32, source_names.len);
+    errdefer allocator.free(owned_dims);
+    var owned_weights = try allocator.alloc([]f32, source_names.len);
+    errdefer allocator.free(owned_weights);
+    for (owned_dims) |*dims| dims.* = &.{};
+    for (owned_weights) |*weights| weights.* = &.{};
+    errdefer {
+        for (owned_dims) |dims| allocator.free(dims);
+        for (owned_weights) |weights| allocator.free(weights);
+    }
+
+    for (source_names, 0..) |name, idx| {
+        if (findRegularParamSlot(trainer, name)) |slot| {
+            owned_dims[idx] = try allocator.dupe(i32, slot.dims);
+            owned_weights[idx] = try allocator.dupe(f32, slot.weights);
+        } else {
+            const ct = try trainer.compute_backend.getWeight(name);
+            defer trainer.compute_backend.free(ct);
+            owned_weights[idx] = try trainer.compute_backend.toFloat32(ct, allocator);
+            owned_dims[idx] = try inferTaskHeadDims(allocator, name, owned_weights[idx].len, num_classes, hidden_size);
+        }
+        params[idx] = .{
+            .name = export_names[idx],
+            .dims = owned_dims[idx],
+            .weights = owned_weights[idx],
+        };
+    }
+
+    return .{
+        .allocator = allocator,
+        .params = params,
+        .owned_dims = owned_dims,
+        .owned_weights = owned_weights,
+    };
+}
+
+fn findRegularParamSlot(
+    trainer: *const real_autodiff.RealAutodiffTrainer,
+    name: []const u8,
+) ?*const real_autodiff.RealAutodiffTrainer.ParamSlot {
+    for (trainer.regular_params.items) |*slot| {
+        if (std.mem.eql(u8, slot.name, name)) return slot;
+    }
+    return null;
+}
+
+fn inferTaskHeadDims(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    element_count: usize,
+    num_classes: u32,
+    hidden_size: u32,
+) ![]i32 {
+    if (std.mem.eql(u8, name, "task_classifier.bias")) {
+        if (element_count != num_classes) return error.TaskHeadParameterShapeMismatch;
+        const dims = try allocator.alloc(i32, 1);
+        dims[0] = @intCast(num_classes);
+        return dims;
+    }
+    if (std.mem.eql(u8, name, "task_classifier.weight")) {
+        const expected = @as(usize, @intCast(num_classes)) * @as(usize, @intCast(hidden_size));
+        if (element_count != expected) return error.TaskHeadParameterShapeMismatch;
+        const dims = try allocator.alloc(i32, 2);
+        dims[0] = @intCast(num_classes);
+        dims[1] = @intCast(hidden_size);
+        return dims;
+    }
+    return error.InvalidTaskHeadParameter;
 }
 
 fn deinitNativeWeightStore(allocator: std.mem.Allocator, weight_store: *native_compute.WeightStore) void {
@@ -1470,8 +1602,8 @@ fn initClassifierHeadInGpuHostedStore(
     defer allocator.free(w_data);
     const sd: f32 = 0.02;
     for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
-    const w_tensor = try Tensor.initFloat32(allocator, "classifier.weight", &.{ C, H }, w_data);
-    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "classifier.weight"), .{
+    const w_tensor = try Tensor.initFloat32(allocator, "task_classifier.weight", &.{ C, H }, w_data);
+    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "task_classifier.weight"), .{
         .tensor_ref = undefined,
         .host_loaded = .{ .tensor = w_tensor },
         .active_tier = .host,
@@ -1481,14 +1613,234 @@ fn initClassifierHeadInGpuHostedStore(
     const b_data = try allocator.alloc(f32, C);
     defer allocator.free(b_data);
     @memset(b_data, 0.0);
-    const b_tensor = try Tensor.initFloat32(allocator, "classifier.bias", &.{C}, b_data);
-    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "classifier.bias"), .{
+    const b_tensor = try Tensor.initFloat32(allocator, "task_classifier.bias", &.{C}, b_data);
+    try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, "task_classifier.bias"), .{
         .tensor_ref = undefined,
         .host_loaded = .{ .tensor = b_tensor },
         .active_tier = .host,
         .loaded_bytes = b_tensor.data.len,
     });
     print("  initialized classifier head (Metal): [{d}, {d}] + [{d}]\n", .{ C, H, C });
+    try initParityTopLevelWeightsMetal(allocator, weight_store, H);
+}
+
+fn fillRectIdentity(data: []f32, out_dim: usize, in_dim: usize) void {
+    @memset(data, 0.0);
+    for (0..@min(out_dim, in_dim)) |i| data[i * in_dim + i] = 1.0;
+}
+
+fn initParityTopLevelWeightsNative(
+    allocator: std.mem.Allocator,
+    weight_store: *native_compute.WeightStore,
+    hidden_size: u32,
+) !void {
+    const specs = parityWeightSpecs(hidden_size);
+    for (specs) |spec| {
+        const out_dim: usize = @intCast(spec.out_dim);
+        const in_dim: usize = @intCast(spec.in_dim);
+        const data = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(data);
+        fillRectIdentity(data, out_dim, in_dim);
+        const tensor = try Tensor.initFloat32(allocator, spec.name, &.{ @as(i64, @intCast(out_dim)), @as(i64, @intCast(in_dim)) }, data);
+        try native_wsPutMissingOwned(allocator, weight_store, spec.name, tensor);
+    }
+    const vector_specs = parityVectorSpecs(hidden_size);
+    for (vector_specs) |spec| {
+        const dim: usize = @intCast(spec.dim);
+        const data = try allocator.alloc(f32, dim);
+        defer allocator.free(data);
+        fillVector(data, spec.fill);
+        const tensor = try Tensor.initFloat32(allocator, spec.name, &.{@as(i64, @intCast(dim))}, data);
+        try native_wsPutMissingOwned(allocator, weight_store, spec.name, tensor);
+    }
+}
+
+fn native_wsPutMissingOwned(
+    allocator: std.mem.Allocator,
+    weight_store: *native_compute.WeightStore,
+    name: []const u8,
+    tensor: Tensor,
+) !void {
+    if (weight_store.resident_weights.contains(name)) {
+        var discard = tensor;
+        discard.deinit();
+        return;
+    }
+    const owned_name = try allocator.dupe(u8, name);
+    try weight_store.resident_weights.put(allocator, owned_name, .{ .tensor = tensor });
+}
+
+fn initParityTopLevelWeightsMlx(
+    allocator: std.mem.Allocator,
+    weights: if (build_options.enable_mlx) mlx_c.mlx_map_string_to_array_t else void,
+    hidden_size: u32,
+) !void {
+    if (comptime !build_options.enable_mlx) return;
+    const specs = parityWeightSpecs(hidden_size);
+    for (specs) |spec| {
+        if (mlxMapContains(weights, spec.name)) continue;
+        const out_dim: usize = @intCast(spec.out_dim);
+        const in_dim: usize = @intCast(spec.in_dim);
+        const shape = [_]i32{ @intCast(out_dim), @intCast(in_dim) };
+        const data = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(data);
+        fillRectIdentity(data, out_dim, in_dim);
+        const arr = mlx.arrayFromFloat32(data, &shape);
+        try mlx.insertWeight(weights, allocator, spec.name, arr);
+    }
+    const vector_specs = parityVectorSpecs(hidden_size);
+    for (vector_specs) |spec| {
+        if (mlxMapContains(weights, spec.name)) continue;
+        const dim: usize = @intCast(spec.dim);
+        const shape = [_]i32{@intCast(dim)};
+        const data = try allocator.alloc(f32, dim);
+        defer allocator.free(data);
+        fillVector(data, spec.fill);
+        const arr = mlx.arrayFromFloat32(data, &shape);
+        try mlx.insertWeight(weights, allocator, spec.name, arr);
+    }
+}
+
+fn initParityTopLevelWeightsMetal(
+    allocator: std.mem.Allocator,
+    weight_store: *MetalWeightStore,
+    hidden_size: u32,
+) !void {
+    if (comptime !build_options.enable_metal) return;
+    const specs = parityWeightSpecs(hidden_size);
+    for (specs) |spec| {
+        if (weight_store.lazy_weights.contains(spec.name)) continue;
+        const out_dim: usize = @intCast(spec.out_dim);
+        const in_dim: usize = @intCast(spec.in_dim);
+        const data = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(data);
+        fillRectIdentity(data, out_dim, in_dim);
+        const tensor = try Tensor.initFloat32(allocator, spec.name, &.{ @as(i64, @intCast(out_dim)), @as(i64, @intCast(in_dim)) }, data);
+        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, spec.name), .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+        });
+    }
+    const vector_specs = parityVectorSpecs(hidden_size);
+    for (vector_specs) |spec| {
+        if (weight_store.lazy_weights.contains(spec.name)) continue;
+        const dim: usize = @intCast(spec.dim);
+        const data = try allocator.alloc(f32, dim);
+        defer allocator.free(data);
+        fillVector(data, spec.fill);
+        const tensor = try Tensor.initFloat32(allocator, spec.name, &.{@as(i64, @intCast(dim))}, data);
+        try weight_store.lazy_weights.put(allocator, try allocator.dupe(u8, spec.name), .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+        });
+    }
+}
+
+const ParityWeightSpec = struct {
+    name: []const u8,
+    out_dim: u32,
+    in_dim: u32,
+};
+
+fn parityWeightSpecs(hidden_size: u32) [25]ParityWeightSpec {
+    const H = hidden_size;
+    const FF = H * 4;
+    const MID = H * 2;
+    const COUNT: u32 = 128;
+    const COUNT_FF: u32 = 256;
+    return .{
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .out_dim = FF, .in_dim = H },
+        .{ .name = "span_rep.span_rep_layer.project_start.3.weight", .out_dim = H, .in_dim = FF },
+        .{ .name = "span_rep.span_rep_layer.project_end.0.weight", .out_dim = FF, .in_dim = H },
+        .{ .name = "span_rep.span_rep_layer.project_end.3.weight", .out_dim = H, .in_dim = FF },
+        .{ .name = "span_rep.span_rep_layer.out_project.0.weight", .out_dim = FF, .in_dim = H * 2 },
+        .{ .name = "span_rep.span_rep_layer.out_project.3.weight", .out_dim = H, .in_dim = FF },
+        .{ .name = "classifier.0.weight", .out_dim = MID, .in_dim = H },
+        .{ .name = "classifier.2.weight", .out_dim = 1, .in_dim = MID },
+        .{ .name = "count_pred.0.weight", .out_dim = MID, .in_dim = H },
+        .{ .name = "count_pred.2.weight", .out_dim = 20, .in_dim = MID },
+        .{ .name = "count_embed.pos_embedding.weight", .out_dim = 20, .in_dim = H },
+        .{ .name = "count_embed.gru.weight_ih_l0", .out_dim = H * 3, .in_dim = H },
+        .{ .name = "count_embed.gru.weight_hh_l0", .out_dim = H * 3, .in_dim = H },
+        .{ .name = "count_embed.transformer.in_projector.weight", .out_dim = COUNT, .in_dim = H },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.in_proj_weight", .out_dim = COUNT * 3, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.out_proj.weight", .out_dim = COUNT, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear1.weight", .out_dim = COUNT_FF, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear2.weight", .out_dim = COUNT, .in_dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.in_proj_weight", .out_dim = COUNT * 3, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.out_proj.weight", .out_dim = COUNT, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear1.weight", .out_dim = COUNT_FF, .in_dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear2.weight", .out_dim = COUNT, .in_dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.out_projector.0.weight", .out_dim = H, .in_dim = H + COUNT },
+        .{ .name = "count_embed.transformer.out_projector.2.weight", .out_dim = H, .in_dim = H },
+        .{ .name = "count_embed.transformer.out_projector.4.weight", .out_dim = H, .in_dim = H },
+    };
+}
+
+const ParityVectorFill = enum { zero, one };
+
+const ParityVectorSpec = struct {
+    name: []const u8,
+    dim: u32,
+    fill: ParityVectorFill = .zero,
+};
+
+fn fillVector(data: []f32, fill: ParityVectorFill) void {
+    @memset(data, switch (fill) {
+        .zero => 0.0,
+        .one => 1.0,
+    });
+}
+
+fn parityVectorSpecs(hidden_size: u32) [22]ParityVectorSpec {
+    const H = hidden_size;
+    const COUNT: u32 = 128;
+    const COUNT_FF: u32 = 256;
+    return .{
+        .{ .name = "count_embed.gru.bias_ih_l0", .dim = H * 3 },
+        .{ .name = "count_embed.gru.bias_hh_l0", .dim = H * 3 },
+        .{ .name = "count_embed.transformer.in_projector.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.in_proj_bias", .dim = COUNT * 3 },
+        .{ .name = "count_embed.transformer.transformer.layers.0.self_attn.out_proj.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm1.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm1.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear1.bias", .dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.transformer.layers.0.linear2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm2.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.0.norm2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.in_proj_bias", .dim = COUNT * 3 },
+        .{ .name = "count_embed.transformer.transformer.layers.1.self_attn.out_proj.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm1.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm1.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear1.bias", .dim = COUNT_FF },
+        .{ .name = "count_embed.transformer.transformer.layers.1.linear2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm2.weight", .dim = COUNT, .fill = .one },
+        .{ .name = "count_embed.transformer.transformer.layers.1.norm2.bias", .dim = COUNT },
+        .{ .name = "count_embed.transformer.out_projector.0.bias", .dim = H },
+        .{ .name = "count_embed.transformer.out_projector.2.bias", .dim = H },
+        .{ .name = "count_embed.transformer.out_projector.4.bias", .dim = H },
+    };
+}
+
+fn mlxMapContains(weights: if (build_options.enable_mlx) mlx_c.mlx_map_string_to_array_t else void, name: []const u8) bool {
+    if (comptime !build_options.enable_mlx) return false;
+    const it = mlx_c.mlx_map_string_to_array_iterator_new(weights);
+    defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
+    while (true) {
+        var key: [*c]const u8 = null;
+        var val = mlx_c.mlx_array_new();
+        if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
+            _ = mlx_c.mlx_array_free(val);
+            return false;
+        }
+        const found = key != null and std.mem.eql(u8, std.mem.span(key), name);
+        _ = mlx_c.mlx_array_free(val);
+        if (found) return true;
+    }
 }
 
 fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeightStore) void {
@@ -1524,12 +1876,14 @@ fn printUsage() void {
         \\  --learning-rate, --lr <f> Learning rate (default: 2e-5)
         \\  --lora-rank <n>           LoRA rank (default: 16)
         \\  --lora-alpha <f>          LoRA alpha scaling (default: 32)
-        \\  --lora-targets <csv>      Target module patterns (default: query_proj,value_proj)
+        \\  --lora-dropout <f>        LoRA dropout probability (default: 0.1)
+        \\  --lora-targets <csv>      Target module groups (default: encoder,span_rep,classifier,count_embed,count_pred)
         \\  --num-classes <n>         Entity classes incl. O tag (default: 5)
         \\  --entity-types <csv>      Entity label order for classes 1..N
         \\  --objective <name>        token or span-start (default: token)
         \\  --max-span-width <n>      Max span width for span-start objective (default: 4)
         \\  --span-loss <name>        bce or mse for span-start labels (default: bce)
+        \\  --span-loss-reduction <r> mean or sum (default: mean; sum matches upstream GLiNER2)
         \\  --span-positive-weight <f> Positive span-label loss weight (default: 32)
         \\  --span-label-positive-weights <csv> Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight <f> Negative span-label loss weight (default: 1)
@@ -1568,6 +1922,13 @@ fn parseSpanLoss(value: []const u8) !gliner2_autodiff.SpanStartLossKind {
     if (std.mem.eql(u8, value, "mse")) return .mse;
     print("error: unsupported --span-loss '{s}' (expected bce or mse)\n", .{value});
     return error.InvalidSpanLoss;
+}
+
+fn parseSpanLossReduction(value: []const u8) !gliner2_autodiff.SpanStartLossReduction {
+    if (std.mem.eql(u8, value, "mean")) return .mean;
+    if (std.mem.eql(u8, value, "sum")) return .sum;
+    print("error: unsupported --span-loss-reduction '{s}' (expected mean or sum)\n", .{value});
+    return error.InvalidSpanLossReduction;
 }
 
 fn resolveSpanLabelPositiveWeights(
@@ -1633,10 +1994,24 @@ fn indexOfEntityLabel(entity_labels: []const []const u8, label: []const u8) ?usi
     return null;
 }
 
+fn stringSliceContains(items: []const []const u8, needle: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
 fn spanLossName(loss: gliner2_autodiff.SpanStartLossKind) []const u8 {
     return switch (loss) {
         .bce => "bce",
         .mse => "mse",
+    };
+}
+
+fn spanLossReductionName(reduction: gliner2_autodiff.SpanStartLossReduction) []const u8 {
+    return switch (reduction) {
+        .mean => "mean",
+        .sum => "sum",
     };
 }
 

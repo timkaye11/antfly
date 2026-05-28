@@ -429,8 +429,14 @@ fn collectRegularTrainableParams(
 ) ![]gliner2_bundle.AutodiffAdapterParam {
     const params = try allocator.alloc(gliner2_bundle.AutodiffAdapterParam, trainer.regular_params.items.len);
     for (trainer.regular_params.items, 0..) |slot, idx| {
+        const export_name: []const u8 = if (std.mem.eql(u8, slot.name, "task_classifier.weight"))
+            "classifier.weight"
+        else if (std.mem.eql(u8, slot.name, "task_classifier.bias"))
+            "classifier.bias"
+        else
+            slot.name;
         params[idx] = .{
-            .name = slot.name,
+            .name = export_name,
             .dims = slot.dims,
             .weights = slot.weights,
         };
@@ -470,11 +476,11 @@ fn loadTaskHeadIntoTrainer(
     trainer: *real_autodiff.RealAutodiffTrainer,
 ) !void {
     for (trainer.regular_params.items) |*slot| {
-        if (std.mem.eql(u8, slot.name, "classifier.weight")) {
+        if (std.mem.eql(u8, slot.name, "task_classifier.weight")) {
             if (slot.weights.len != head.weight.len) return error.TaskHeadShapeMismatch;
             @memcpy(slot.weights, head.weight);
             @memset(slot.grad_accum, 0.0);
-        } else if (std.mem.eql(u8, slot.name, "classifier.bias")) {
+        } else if (std.mem.eql(u8, slot.name, "task_classifier.bias")) {
             if (slot.weights.len != head.bias.len) return error.TaskHeadShapeMismatch;
             @memcpy(slot.weights, head.bias);
             @memset(slot.grad_accum, 0.0);
@@ -591,25 +597,25 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
         var prng = std.Random.DefaultPrng.init(12345);
         const rng = prng.random();
 
-        // classifier.weight [C, H]
+        // task_classifier.weight [C, H]
         {
             const n_elems: usize = @intCast(C * H);
             const data = try allocator.alloc(f32, n_elems);
             defer allocator.free(data);
             const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(n_elems)));
             for (data) |*v| v.* = (rng.float(f32) * 2.0 - 1.0) * scale;
-            const name = try allocator.dupe(u8, "classifier.weight");
+            const name = try allocator.dupe(u8, "task_classifier.weight");
             try owned_names.append(allocator, name);
             const tensor = try Tensor.initFloat32(allocator, name, &.{ C, H }, data);
             try weight_store.resident_weights.put(allocator, name, LoadedWeight{ .tensor = tensor });
         }
-        // classifier.bias [C]
+        // task_classifier.bias [C]
         {
             const n_elems: usize = @intCast(C);
             const data = try allocator.alloc(f32, n_elems);
             defer allocator.free(data);
             @memset(data, 0.0);
-            const name = try allocator.dupe(u8, "classifier.bias");
+            const name = try allocator.dupe(u8, "task_classifier.bias");
             try owned_names.append(allocator, name);
             const tensor = try Tensor.initFloat32(allocator, name, &.{C}, data);
             try weight_store.resident_weights.put(allocator, name, LoadedWeight{ .tensor = tensor });
@@ -699,7 +705,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     });
 
     const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
-    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    const regular_trainable_params = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -812,7 +818,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     try std.testing.expectEqual(@as(usize, 2), trainer.regular_params.items.len);
     var classifier_bias_updated = false;
     for (trainer.regular_params.items) |slot| {
-        if (!std.mem.eql(u8, slot.name, "classifier.bias")) continue;
+        if (!std.mem.eql(u8, slot.name, "task_classifier.bias")) continue;
         for (slot.weights) |w| {
             if (w != 0.0) {
                 classifier_bias_updated = true;
@@ -851,6 +857,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
             model_dir,
             8,
             16.0,
+            0.0,
             &lora_targets,
             adapter_params,
         );

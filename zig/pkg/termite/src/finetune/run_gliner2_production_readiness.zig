@@ -47,6 +47,7 @@ const Options = struct {
     learning_rate: []const u8 = "1e-3",
     lora_rank: []const u8 = "16",
     lora_alpha: []const u8 = "32",
+    lora_dropout: []const u8 = "0.1",
     objective: []const u8 = "span-start",
     max_span_width: []const u8 = "4",
     span_loss: []const u8 = "bce",
@@ -228,6 +229,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         "--learning-rate",             opts.learning_rate,
         "--lora-rank",                 opts.lora_rank,
         "--lora-alpha",                opts.lora_alpha,
+        "--lora-dropout",              opts.lora_dropout,
         "--objective",                 opts.objective,
         "--max-span-width",            opts.max_span_width,
         "--span-loss",                 opts.span_loss,
@@ -515,6 +517,9 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\max_examples: {s}
         \\seq_len: {s}
         \\batch_size: {s}
+        \\lora_rank: {s}
+        \\lora_alpha: {s}
+        \\lora_dropout: {s}
         \\span_loss: {s}
         \\span_positive_weight: {s}
         \\span_label_positive_weights: {?s}
@@ -546,6 +551,9 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.max_examples,
         opts.seq_len,
         opts.batch_size,
+        opts.lora_rank,
+        opts.lora_alpha,
+        opts.lora_dropout,
         opts.span_loss,
         opts.span_positive_weight,
         opts.span_label_positive_weights,
@@ -605,6 +613,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.lora_rank = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--lora-alpha")) {
             opts.lora_alpha = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--lora-dropout")) {
+            opts.lora_dropout = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--objective")) {
             opts.objective = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-span-width")) {

@@ -28,7 +28,7 @@
 //! TASK SHAPE
 //!
 //!   * Inputs : `input_ids` [B, S] i64, `attention_mask` [B, S] f32
-//!   * Head   : `classifier.weight` [C, H], `classifier.bias` [C]
+//!   * Head   : `task_classifier.weight` [C, H], `task_classifier.bias` [C]
 //!   * Logits : `[B*S, C]`
 //!   * Loss   : masked cross-entropy over one-hot `targets` of shape `[B*S, C]`
 //!
@@ -51,7 +51,7 @@
 //!
 //!   * No disentangled relative-position attention — inherited from the
 //!     MVP simplification in `deberta_graph.zig`.
-//!   * `classifier.weight` and `classifier.bias` are regular trainable
+//!   * `task_classifier.weight` and `task_classifier.bias` are regular trainable
 //!     parameters rather than LoRA adapters. The trainer enrolls them through
 //!     `regular_trainable_params`, writes optimizer updates back into
 //!     trainer-owned slots, and the GLiNER2 training CLI exports them to
@@ -95,6 +95,11 @@ pub const SpanStartLossKind = enum {
     mse,
 };
 
+pub const SpanStartLossReduction = enum {
+    mean,
+    sum,
+};
+
 pub const GlinerAutodiffConfig = struct {
     /// Underlying DeBERTa encoder config (hidden size, layers, heads, ...).
     graph_config: deberta_graph.Config,
@@ -115,6 +120,9 @@ pub const GlinerAutodiffConfig = struct {
     /// Binary cross-entropy is the production span-label objective. MSE is
     /// retained as an explicit compatibility path for old calibration runs.
     span_start_loss: SpanStartLossKind = .bce,
+    /// Default keeps the existing normalized local training behavior; `.sum`
+    /// matches upstream GLiNER2 `compute_struct_loss` for parity runs.
+    span_start_loss_reduction: SpanStartLossReduction = .mean,
 };
 
 /// Trainer-opaque context that owns the graph-construction state and (after
@@ -304,16 +312,12 @@ pub const GlinerAutodiffCtx = struct {
                 Shape.init(.f32, &.{ @intCast(rows), @intCast(H) }),
             );
 
-        // Classifier head parameters. Names use the HF token-classification
-        // convention (`classifier.weight` / `classifier.bias`) so that a
-        // future `injectLoRA` run targeting `classifier.weight` can adopt
-        // them, and so `safetensors` save/load is straightforward.
         const head_w = try bld.parameter(
-            "classifier.weight",
+            "task_classifier.weight",
             Shape.init(.f32, &.{ @intCast(C), @intCast(H) }),
         );
         const head_b = try bld.parameter(
-            "classifier.bias",
+            "task_classifier.bias",
             Shape.init(.f32, &.{@intCast(C)}),
         );
 
@@ -360,17 +364,25 @@ pub const GlinerAutodiffCtx = struct {
         const target_shape = bld.graph.node(targets).output_shape;
         if (target_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
         const span_rows: u32 = @intCast(target_shape.dim(0));
-        const unweighted_start_only_width: i64 = @intCast(2 * E + 1);
-        const weighted_start_only_width: i64 = @intCast(3 * E + 1);
-        const unweighted_target_width: i64 = @intCast(2 * E + 2);
-        const weighted_target_width: i64 = @intCast(3 * E + 2);
+        const legacy_unweighted_start_only_width: i64 = @intCast(2 * E + 1);
+        const legacy_weighted_start_only_width: i64 = @intCast(3 * E + 1);
+        const legacy_unweighted_target_width: i64 = @intCast(2 * E + 2);
+        const legacy_weighted_target_width: i64 = @intCast(3 * E + 2);
+        const schema_legacy_unweighted_target_width: i64 = @intCast(4 * E + 2);
+        const schema_count_unweighted_target_width: i64 = @intCast(5 * E + 2);
+        const schema_count_weighted_target_width: i64 = @intCast(6 * E + 2);
         const target_width = target_shape.dim(1);
-        const has_label_positive_weights = target_width == weighted_target_width or target_width == weighted_start_only_width;
-        const has_end_idx = target_width == unweighted_target_width or target_width == weighted_target_width;
-        if (target_width != unweighted_target_width and
-            target_width != weighted_target_width and
-            target_width != unweighted_start_only_width and
-            target_width != weighted_start_only_width) return error.InvalidGlinerSpanTargetShape;
+        const is_schema_conditioned = target_width == schema_legacy_unweighted_target_width or target_width == schema_count_unweighted_target_width or target_width == schema_count_weighted_target_width;
+        const has_schema_count_idx = target_width == schema_count_unweighted_target_width or target_width == schema_count_weighted_target_width;
+        const has_label_positive_weights = target_width == schema_count_weighted_target_width or target_width == legacy_weighted_target_width or target_width == legacy_weighted_start_only_width;
+        const has_end_idx = is_schema_conditioned or target_width == legacy_unweighted_target_width or target_width == legacy_weighted_target_width;
+        if (target_width != schema_legacy_unweighted_target_width and
+            target_width != schema_count_unweighted_target_width and
+            target_width != schema_count_weighted_target_width and
+            target_width != legacy_unweighted_target_width and
+            target_width != legacy_weighted_target_width and
+            target_width != legacy_unweighted_start_only_width and
+            target_width != legacy_weighted_start_only_width) return error.InvalidGlinerSpanTargetShape;
 
         const labels = try bld.sliceLastDim(targets, 0, @intCast(E));
         const mask = try bld.sliceLastDim(targets, @intCast(E), @intCast(2 * E));
@@ -378,7 +390,12 @@ pub const GlinerAutodiffCtx = struct {
             try bld.sliceLastDim(targets, @intCast(2 * E), @intCast(3 * E))
         else
             null;
-        const start_idx_offset: u32 = if (has_label_positive_weights) 3 * E else 2 * E;
+        const schema_idx_offset: u32 = if (has_label_positive_weights) 3 * E else 2 * E;
+        const row_idx_offset: u32 = schema_idx_offset + E;
+        const count_idx_offset: u32 = row_idx_offset + E;
+        const start_idx_offset: u32 = if (is_schema_conditioned)
+            if (has_schema_count_idx) count_idx_offset + E else row_idx_offset + E
+        else if (has_label_positive_weights) 3 * E else 2 * E;
         const start_idx_2d = try bld.sliceLastDim(targets, @intCast(start_idx_offset), @intCast(start_idx_offset + 1));
         const start_idx_f32 = try bld.reshape(start_idx_2d, Shape.init(.f32, &.{@intCast(span_rows)}));
         const start_idx_i64 = try bld.convertDtype(start_idx_f32, .i64);
@@ -388,31 +405,61 @@ pub const GlinerAutodiffCtx = struct {
             start_idx_i64,
             Shape.init(.f32, &.{ @intCast(span_rows), @intCast(H) }),
         );
-        const span_hidden = if (has_end_idx) blk: {
+        const end_hidden_for_parity = if (has_end_idx) blk: {
             const end_idx_2d = try bld.sliceLastDim(targets, @intCast(start_idx_offset + 1), @intCast(start_idx_offset + 2));
             const end_idx_f32 = try bld.reshape(end_idx_2d, Shape.init(.f32, &.{@intCast(span_rows)}));
             const end_idx_i64 = try bld.convertDtype(end_idx_f32, .i64);
-            const end_hidden = try bld.gather(
+            break :blk try bld.gather(
                 hidden_flat,
                 end_idx_i64,
                 Shape.init(.f32, &.{ @intCast(span_rows), @intCast(H) }),
             );
-            const summed = try bld.add(start_hidden, end_hidden);
-            const half = try bld.scalarConst(.f32, 0.5);
-            break :blk try bld.mul(summed, half);
         } else start_hidden;
+        const projected_span = try buildParitySpanProjection(bld, start_hidden, end_hidden_for_parity, span_rows, H);
+        const entity_logits = if (is_schema_conditioned) blk: {
+            const schema_idx_2d = try bld.sliceLastDim(targets, @intCast(schema_idx_offset), @intCast(schema_idx_offset + E));
+            const schema_idx_f32 = try bld.reshape(schema_idx_2d, Shape.init(.f32, &.{@intCast(span_rows * E)}));
+            const schema_idx_i64 = try bld.convertDtype(schema_idx_f32, .i64);
+            const schema_hidden = try bld.gather(
+                hidden_flat,
+                schema_idx_i64,
+                Shape.init(.f32, &.{ @intCast(span_rows * E), @intCast(H) }),
+            );
+            const count_state_idx_i64 = if (has_schema_count_idx) count_idx: {
+                const count_idx_2d = try bld.sliceLastDim(targets, @intCast(count_idx_offset), @intCast(count_idx_offset + E));
+                const count_idx_f32 = try bld.reshape(count_idx_2d, Shape.init(.f32, &.{@intCast(span_rows * E)}));
+                break :count_idx try bld.convertDtype(count_idx_f32, .i64);
+            } else null;
+            const schema_projection = try buildParityCountEmbed(bld, schema_hidden, count_state_idx_i64, span_rows * E, H);
 
-        const head_w = try bld.parameter(
-            "classifier.weight",
-            Shape.init(.f32, &.{ @intCast(C), @intCast(H) }),
-        );
-        const head_b = try bld.parameter(
-            "classifier.bias",
-            Shape.init(.f32, &.{@intCast(C)}),
-        );
+            const row_idx_2d = try bld.sliceLastDim(targets, @intCast(row_idx_offset), @intCast(row_idx_offset + E));
+            const row_idx_f32 = try bld.reshape(row_idx_2d, Shape.init(.f32, &.{@intCast(span_rows * E)}));
+            const row_idx_i64 = try bld.convertDtype(row_idx_f32, .i64);
+            const repeated_span = try bld.gather(
+                projected_span,
+                row_idx_i64,
+                Shape.init(.f32, &.{ @intCast(span_rows * E), @intCast(H) }),
+            );
+            const span_schema_product = try bld.mul(repeated_span, schema_projection);
+            const span_schema_score_flat = try bld.reduceSum(span_schema_product, &.{1});
+            const schema_logits = try bld.reshape(span_schema_score_flat, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(E) }));
+            const aux_scalar = try buildSchemaObjectiveAuxiliaryZeroScalar(bld, projected_span, span_rows, H, C);
+            break :blk try bld.add(schema_logits, aux_scalar);
+        } else blk: {
+            const head_w = try bld.parameter(
+                "task_classifier.weight",
+                Shape.init(.f32, &.{ @intCast(C), @intCast(H) }),
+            );
+            const head_b = try bld.parameter(
+                "task_classifier.bias",
+                Shape.init(.f32, &.{@intCast(C)}),
+            );
 
-        const all_logits = try bld.linear(span_hidden, head_w, head_b, span_rows, H, C);
-        const entity_logits = try bld.sliceLastDim(all_logits, 1, @intCast(C));
+            const all_logits = try bld.linear(projected_span, head_w, head_b, span_rows, H, C);
+            const parity_scalar = try buildParityAuxiliaryHeads(bld, projected_span, span_rows, H);
+            const all_logits_with_parity = try bld.add(all_logits, parity_scalar);
+            break :blk try bld.sliceLastDim(all_logits_with_parity, 1, @intCast(C));
+        };
         self.span_logits = entity_logits;
 
         return switch (self.config.span_start_loss) {
@@ -424,6 +471,7 @@ pub const GlinerAutodiffCtx = struct {
                 label_positive_weights,
                 self.config.span_start_positive_weight,
                 self.config.span_start_negative_weight,
+                self.config.span_start_loss_reduction,
             ),
             .mse => buildMaskedSpanStartMseLoss(
                 bld,
@@ -433,10 +481,345 @@ pub const GlinerAutodiffCtx = struct {
                 label_positive_weights,
                 self.config.span_start_positive_weight,
                 self.config.span_start_negative_weight,
+                self.config.span_start_loss_reduction,
             ),
         };
     }
 };
+
+fn buildParitySpanProjection(
+    bld: *Builder,
+    start_hidden: NodeId,
+    end_hidden: NodeId,
+    span_rows: u32,
+    hidden_size: u32,
+) !NodeId {
+    const ff_dim: u32 = hidden_size * 4;
+
+    const start_0 = try linearNoBiasNamed(bld, start_hidden, "span_rep.span_rep_layer.project_start.0.weight", span_rows, hidden_size, ff_dim);
+    const start_act = try bld.gelu(start_0);
+    const start_out = try linearNoBiasNamed(bld, start_act, "span_rep.span_rep_layer.project_start.3.weight", span_rows, ff_dim, hidden_size);
+
+    const end_0 = try linearNoBiasNamed(bld, end_hidden, "span_rep.span_rep_layer.project_end.0.weight", span_rows, hidden_size, ff_dim);
+    const end_act = try bld.gelu(end_0);
+    const end_out = try linearNoBiasNamed(bld, end_act, "span_rep.span_rep_layer.project_end.3.weight", span_rows, ff_dim, hidden_size);
+
+    const joined = try bld.concat(start_out, end_out, 1);
+    const out_0 = try linearNoBiasNamed(bld, joined, "span_rep.span_rep_layer.out_project.0.weight", span_rows, hidden_size * 2, ff_dim);
+    const out_act = try bld.gelu(out_0);
+    return linearNoBiasNamed(bld, out_act, "span_rep.span_rep_layer.out_project.3.weight", span_rows, ff_dim, hidden_size);
+}
+
+fn buildParityAuxiliaryHeads(
+    bld: *Builder,
+    hidden: NodeId,
+    rows: u32,
+    hidden_size: u32,
+) !NodeId {
+    const classifier_mid: u32 = hidden_size * 2;
+    const classifier_0 = try linearNoBiasNamed(bld, hidden, "classifier.0.weight", rows, hidden_size, classifier_mid);
+    const classifier_act = try bld.gelu(classifier_0);
+    const classifier_scalar = try linearNoBiasNamed(bld, classifier_act, "classifier.2.weight", rows, classifier_mid, 1);
+
+    const count_pred_0 = try linearNoBiasNamed(bld, hidden, "count_pred.0.weight", rows, hidden_size, classifier_mid);
+    const count_pred_act = try bld.gelu(count_pred_0);
+    const count_pred = try linearNoBiasNamed(bld, count_pred_act, "count_pred.2.weight", rows, classifier_mid, 20);
+    const count_pred_sum = try bld.reduceSum(count_pred, &.{ 0, 1 });
+
+    const count_embed = try buildParityCountEmbed(bld, hidden, null, rows, hidden_size);
+    const count_embed_sum = try bld.reduceSum(count_embed, &.{ 0, 1 });
+    const classifier_sum = try bld.reduceSum(classifier_scalar, &.{ 0, 1 });
+    const aux_sum = try bld.add(try bld.add(classifier_sum, count_pred_sum), count_embed_sum);
+    const zero = try bld.scalarConst(.f32, 0.0);
+    return bld.mul(aux_sum, zero);
+}
+
+fn buildSchemaObjectiveAuxiliaryZeroScalar(
+    bld: *Builder,
+    hidden: NodeId,
+    rows: u32,
+    hidden_size: u32,
+    num_classes: u32,
+) !NodeId {
+    const classifier_mid: u32 = hidden_size * 2;
+    const task_head_w = try bld.parameter(
+        "task_classifier.weight",
+        Shape.init(.f32, &.{ @intCast(num_classes), @intCast(hidden_size) }),
+    );
+    const task_head_b = try bld.parameter(
+        "task_classifier.bias",
+        Shape.init(.f32, &.{@intCast(num_classes)}),
+    );
+    const task_head = try bld.linear(hidden, task_head_w, task_head_b, rows, hidden_size, num_classes);
+
+    const classifier_0 = try linearNoBiasNamed(bld, hidden, "classifier.0.weight", rows, hidden_size, classifier_mid);
+    const classifier_act = try bld.gelu(classifier_0);
+    const classifier_scalar = try linearNoBiasNamed(bld, classifier_act, "classifier.2.weight", rows, classifier_mid, 1);
+
+    const count_pred_0 = try linearNoBiasNamed(bld, hidden, "count_pred.0.weight", rows, hidden_size, classifier_mid);
+    const count_pred_act = try bld.gelu(count_pred_0);
+    const count_pred = try linearNoBiasNamed(bld, count_pred_act, "count_pred.2.weight", rows, classifier_mid, 20);
+
+    const task_head_sum = try bld.reduceSum(task_head, &.{ 0, 1 });
+    const classifier_sum = try bld.reduceSum(classifier_scalar, &.{ 0, 1 });
+    const count_pred_sum = try bld.reduceSum(count_pred, &.{ 0, 1 });
+    const aux_sum = try bld.add(try bld.add(task_head_sum, classifier_sum), count_pred_sum);
+    const zero = try bld.scalarConst(.f32, 0.0);
+    return bld.mul(aux_sum, zero);
+}
+
+fn buildParityCountEmbed(
+    bld: *Builder,
+    hidden: NodeId,
+    count_state_indices: ?NodeId,
+    rows: u32,
+    hidden_size: u32,
+) !NodeId {
+    const count_dim: u32 = 128;
+    const count_ff: u32 = 256;
+    const count_state = try buildCountLstmV2UnrolledState(bld, hidden, count_state_indices, rows, hidden_size);
+    const in_project = try linearNamed(bld, count_state, "count_embed.transformer.in_projector.weight", "count_embed.transformer.in_projector.bias", rows, hidden_size, count_dim);
+
+    const layer0_out = try buildCountTransformerLayer(bld, in_project, rows, count_dim, count_ff, 0);
+    const layer1_out = try buildCountTransformerLayer(bld, layer0_out, rows, count_dim, count_ff, 1);
+
+    const transformer_joined = try bld.concat(layer1_out, count_state, 1);
+    const out0 = try bld.relu(try linearNamed(bld, transformer_joined, "count_embed.transformer.out_projector.0.weight", "count_embed.transformer.out_projector.0.bias", rows, count_dim + hidden_size, hidden_size));
+    const out2 = try bld.relu(try linearNamed(bld, out0, "count_embed.transformer.out_projector.2.weight", "count_embed.transformer.out_projector.2.bias", rows, hidden_size, hidden_size));
+    return linearNamed(bld, out2, "count_embed.transformer.out_projector.4.weight", "count_embed.transformer.out_projector.4.bias", rows, hidden_size, hidden_size);
+}
+
+fn buildCountTransformerLayer(
+    bld: *Builder,
+    input: NodeId,
+    rows: u32,
+    hidden_size: u32,
+    ff_size: u32,
+    comptime layer: usize,
+) !NodeId {
+    const prefix = comptime std.fmt.comptimePrint("count_embed.transformer.transformer.layers.{d}", .{layer});
+    const attn_out = try buildCountSelfAttention(bld, input, rows, hidden_size, layer);
+    const attn_resid = try bld.add(input, attn_out);
+    const norm1 = try layerNormNamed(
+        bld,
+        attn_resid,
+        prefix ++ ".norm1.weight",
+        prefix ++ ".norm1.bias",
+        hidden_size,
+    );
+    const ff1 = try bld.relu(try linearNamed(
+        bld,
+        norm1,
+        prefix ++ ".linear1.weight",
+        prefix ++ ".linear1.bias",
+        rows,
+        hidden_size,
+        ff_size,
+    ));
+    const ff2 = try linearNamed(
+        bld,
+        ff1,
+        prefix ++ ".linear2.weight",
+        prefix ++ ".linear2.bias",
+        rows,
+        ff_size,
+        hidden_size,
+    );
+    const ff_resid = try bld.add(norm1, ff2);
+    return layerNormNamed(
+        bld,
+        ff_resid,
+        prefix ++ ".norm2.weight",
+        prefix ++ ".norm2.bias",
+        hidden_size,
+    );
+}
+
+fn buildCountSelfAttention(
+    bld: *Builder,
+    input: NodeId,
+    rows: u32,
+    hidden_size: u32,
+    comptime layer: usize,
+) !NodeId {
+    const prefix = comptime std.fmt.comptimePrint("count_embed.transformer.transformer.layers.{d}.self_attn", .{layer});
+    const qkv = try linearNamed(
+        bld,
+        input,
+        prefix ++ ".in_proj_weight",
+        prefix ++ ".in_proj_bias",
+        rows,
+        hidden_size,
+        hidden_size * 3,
+    );
+    const q = try bld.sliceLastDim(qkv, 0, @intCast(hidden_size));
+    const k = try bld.sliceLastDim(qkv, @intCast(hidden_size), @intCast(hidden_size * 2));
+    const v = try bld.sliceLastDim(qkv, @intCast(hidden_size * 2), @intCast(hidden_size * 3));
+    const context = try buildCountScaledDotProductAttention(bld, q, k, v, rows, hidden_size, 4);
+    return linearNamed(
+        bld,
+        context,
+        prefix ++ ".out_proj.weight",
+        prefix ++ ".out_proj.bias",
+        rows,
+        hidden_size,
+        hidden_size,
+    );
+}
+
+fn buildCountScaledDotProductAttention(
+    bld: *Builder,
+    q: NodeId,
+    k: NodeId,
+    v: NodeId,
+    rows: u32,
+    hidden_size: u32,
+    num_heads: u32,
+) !NodeId {
+    const head_dim = hidden_size / num_heads;
+    const q_heads = try bld.transpose(
+        try bld.reshape(q, Shape.init(.f32, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) })),
+        &.{ 1, 0, 2 },
+    );
+    const k_heads = try bld.transpose(
+        try bld.reshape(k, Shape.init(.f32, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) })),
+        &.{ 1, 2, 0 },
+    );
+    const v_heads = try bld.transpose(
+        try bld.reshape(v, Shape.init(.f32, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) })),
+        &.{ 1, 0, 2 },
+    );
+    const scores = try bld.matmul3D(q_heads, k_heads);
+    const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))));
+    const scaled_scores = try bld.mul(scores, scale);
+    const probs = try bld.softmax(scaled_scores);
+    const context_heads = try bld.matmul3D(probs, v_heads);
+    const context_rows_heads = try bld.transpose(context_heads, &.{ 1, 0, 2 });
+    return bld.reshape(context_rows_heads, Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden_size) }));
+}
+
+fn buildCountLstmV2UnrolledState(
+    bld: *Builder,
+    hidden: NodeId,
+    count_state_indices: ?NodeId,
+    rows: u32,
+    hidden_size: u32,
+) !NodeId {
+    const pos_weight = try bld.parameter(
+        "count_embed.pos_embedding.weight",
+        Shape.init(.f32, &.{ 20, @intCast(hidden_size) }),
+    );
+    var state = hidden;
+    var state_concat: NodeId = undefined;
+    for (0..20) |step| {
+        const pos_rows = try buildCountPositionRows(bld, pos_weight, @intCast(step), hidden, rows, hidden_size);
+        state = try buildCountGruStep(bld, pos_rows, state, rows, hidden_size);
+        if (step == 0) {
+            state_concat = state;
+        } else {
+            state_concat = try bld.concat(state_concat, state, 0);
+        }
+    }
+
+    if (count_state_indices) |indices| {
+        return bld.gather(
+            state_concat,
+            indices,
+            Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden_size) }),
+        );
+    }
+    return state;
+}
+
+fn buildCountPositionRows(
+    bld: *Builder,
+    pos_weight: NodeId,
+    step: i64,
+    hidden: NodeId,
+    rows: u32,
+    hidden_size: u32,
+) !NodeId {
+    const step_idx = try bld.tensorConstBytes(std.mem.asBytes(&step), Shape.init(.i64, &.{1}));
+    const pos = try bld.gather(
+        pos_weight,
+        step_idx,
+        Shape.init(.f32, &.{ 1, @intCast(hidden_size) }),
+    );
+    _ = rows;
+    return bld.add(try bld.mul(hidden, try bld.scalarConst(.f32, 0.0)), pos);
+}
+
+fn buildCountGruStep(
+    bld: *Builder,
+    pos_rows: NodeId,
+    hidden_state: NodeId,
+    rows: u32,
+    hidden_size: u32,
+) !NodeId {
+    const gi = try linearNamed(bld, pos_rows, "count_embed.gru.weight_ih_l0", "count_embed.gru.bias_ih_l0", rows, hidden_size, hidden_size * 3);
+    const gh = try linearNamed(bld, hidden_state, "count_embed.gru.weight_hh_l0", "count_embed.gru.bias_hh_l0", rows, hidden_size, hidden_size * 3);
+
+    const i_r = try bld.sliceLastDim(gi, 0, @intCast(hidden_size));
+    const i_z = try bld.sliceLastDim(gi, @intCast(hidden_size), @intCast(hidden_size * 2));
+    const i_n = try bld.sliceLastDim(gi, @intCast(hidden_size * 2), @intCast(hidden_size * 3));
+    const h_r = try bld.sliceLastDim(gh, 0, @intCast(hidden_size));
+    const h_z = try bld.sliceLastDim(gh, @intCast(hidden_size), @intCast(hidden_size * 2));
+    const h_n = try bld.sliceLastDim(gh, @intCast(hidden_size * 2), @intCast(hidden_size * 3));
+
+    const r = try bld.sigmoid(try bld.add(i_r, h_r));
+    const z = try bld.sigmoid(try bld.add(i_z, h_z));
+    const n = try bld.tanhOp(try bld.add(i_n, try bld.mul(r, h_n)));
+    const one = try bld.scalarConst(.f32, 1.0);
+    const one_minus_z = try bld.sub(one, z);
+    return bld.add(try bld.mul(one_minus_z, n), try bld.mul(z, hidden_state));
+}
+
+fn layerNormNamed(
+    bld: *Builder,
+    input: NodeId,
+    weight_name: []const u8,
+    bias_name: []const u8,
+    dim: u32,
+) !NodeId {
+    const gamma = try bld.parameter(weight_name, Shape.init(.f32, &.{@intCast(dim)}));
+    const beta = try bld.parameter(bias_name, Shape.init(.f32, &.{@intCast(dim)}));
+    return bld.layerNorm(input, gamma, beta, dim, 1e-5);
+}
+
+fn linearNoBiasNamed(
+    bld: *Builder,
+    input: NodeId,
+    name: []const u8,
+    rows: u32,
+    in_dim: u32,
+    out_dim: u32,
+) !NodeId {
+    const w = try bld.parameter(
+        name,
+        Shape.init(.f32, &.{ @intCast(out_dim), @intCast(in_dim) }),
+    );
+    return bld.linearNoBias(input, w, rows, in_dim, out_dim);
+}
+
+fn linearNamed(
+    bld: *Builder,
+    input: NodeId,
+    weight_name: []const u8,
+    bias_name: []const u8,
+    rows: u32,
+    in_dim: u32,
+    out_dim: u32,
+) !NodeId {
+    const w = try bld.parameter(
+        weight_name,
+        Shape.init(.f32, &.{ @intCast(out_dim), @intCast(in_dim) }),
+    );
+    const b = try bld.parameter(
+        bias_name,
+        Shape.init(.f32, &.{@intCast(out_dim)}),
+    );
+    return bld.linear(input, w, b, rows, in_dim, out_dim);
+}
 
 /// Masked soft-target cross-entropy for `[rows, classes]` logits/targets.
 ///
@@ -478,6 +861,7 @@ fn buildMaskedSpanStartMseLoss(
     label_positive_weights: ?NodeId,
     positive_weight: f32,
     negative_weight: f32,
+    reduction: SpanStartLossReduction,
 ) !NodeId {
     const in_shape = bld.graph.node(logits).output_shape;
     const rank = in_shape.rank();
@@ -497,6 +881,7 @@ fn buildMaskedSpanStartMseLoss(
     const sq = try bld.mul(diff, diff);
     const weighted_sq = try bld.mul(sq, weighted_mask);
     const numerator = try bld.reduceSum(weighted_sq, all_axes[0..rank]);
+    if (reduction == .sum) return numerator;
     const denom = try bld.reduceSum(weighted_mask, all_axes[0..rank]);
     const eps = try bld.scalarConst(.f32, 1e-12);
     const denom_safe = try bld.add(denom, eps);
@@ -511,39 +896,34 @@ fn buildMaskedSpanStartBceLoss(
     label_positive_weights: ?NodeId,
     positive_weight: f32,
     negative_weight: f32,
+    reduction: SpanStartLossReduction,
 ) !NodeId {
     const in_shape = bld.graph.node(logits).output_shape;
     const rank = in_shape.rank();
     var all_axes: [8]u8 = undefined;
     for (0..rank) |i| all_axes[i] = @intCast(i);
 
-    const probs = try bld.sigmoid(logits);
     const eps = try bld.scalarConst(.f32, 1e-6);
     const one = try bld.scalarConst(.f32, 1.0);
     const pos_weight = label_positive_weights orelse try bld.scalarConst(.f32, positive_weight);
     const neg_weight = try bld.scalarConst(.f32, negative_weight);
 
-    const probs_safe = try bld.add(probs, eps);
-    const log_probs = try bld.logOp(probs_safe);
-    const pos_loss_raw = try bld.mul(labels, log_probs);
-    const pos_loss_neg = try bld.neg(pos_loss_raw);
-    const pos_loss = try bld.mul(pos_loss_neg, pos_weight);
-
+    const relu_logits = try bld.relu(logits);
+    const labels_logits = try bld.mul(labels, logits);
+    const abs_logits = try bld.absOp(logits);
+    const neg_abs_logits = try bld.neg(abs_logits);
+    const exp_neg_abs = try bld.expOp(neg_abs_logits);
+    const log_term = try bld.logOp(try bld.add(one, exp_neg_abs));
+    const bce = try bld.add(try bld.sub(relu_logits, labels_logits), log_term);
     const inverse_labels = try bld.sub(one, labels);
-    const inverse_probs = try bld.sub(one, probs);
-    const inverse_probs_safe = try bld.add(inverse_probs, eps);
-    const log_inverse_probs = try bld.logOp(inverse_probs_safe);
-    const neg_loss_raw = try bld.mul(inverse_labels, log_inverse_probs);
-    const neg_loss_neg = try bld.neg(neg_loss_raw);
-    const neg_loss = try bld.mul(neg_loss_neg, neg_weight);
-
-    const weighted_loss = try bld.add(pos_loss, neg_loss);
-    const masked_loss = try bld.mul(weighted_loss, mask);
-    const numerator = try bld.reduceSum(masked_loss, all_axes[0..rank]);
-
     const pos_term = try bld.mul(labels, pos_weight);
     const neg_term = try bld.mul(inverse_labels, neg_weight);
     const label_weights = try bld.add(pos_term, neg_term);
+    const weighted_loss = try bld.mul(bce, label_weights);
+    const masked_loss = try bld.mul(weighted_loss, mask);
+    const numerator = try bld.reduceSum(masked_loss, all_axes[0..rank]);
+    if (reduction == .sum) return numerator;
+
     const weighted_mask = try bld.mul(mask, label_weights);
     const denom = try bld.reduceSum(weighted_mask, all_axes[0..rank]);
     const denom_safe = try bld.add(denom, eps);
@@ -840,19 +1220,22 @@ pub fn tokenTargetsShape(batch: u32, seq_len: u32, num_classes: u32) Shape {
 }
 
 /// Packed span-start target width:
-/// labels[E], mask[E], start_token_index, end_token_index.
+/// labels[E], mask[E], schema_token_indices[E], row_repeat_indices[E],
+/// count_state_indices[E],
+/// start_token_index, end_token_index.
 pub fn spanStartTargetWidth(num_entity_types: usize) usize {
-    return 2 * num_entity_types + 2;
+    return 5 * num_entity_types + 2;
 }
 
 /// Packed weighted span-start target width:
-/// labels[E], mask[E], positive_weights[E], start_token_index, end_token_index.
+/// labels[E], mask[E], positive_weights[E], schema_token_indices[E],
+/// row_repeat_indices[E], count_state_indices[E], start_token_index, end_token_index.
 pub fn weightedSpanStartTargetWidth(num_entity_types: usize) usize {
-    return 3 * num_entity_types + 2;
+    return 6 * num_entity_types + 2;
 }
 
 /// Shape for packed span-start targets:
-/// `[batch * max_spans, 2 * num_entity_types + 2]` f32.
+/// `[batch * max_spans, 5 * num_entity_types + 2]` f32.
 pub fn spanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) Shape {
     return Shape.init(.f32, &.{
         @intCast(batch * max_spans),
@@ -861,7 +1244,7 @@ pub fn spanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) 
 }
 
 /// Shape for packed span-start targets with per-label positive weights:
-/// `[batch * max_spans, 3 * num_entity_types + 2]` f32.
+/// `[batch * max_spans, 6 * num_entity_types + 2]` f32.
 pub fn weightedSpanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) Shape {
     return Shape.init(.f32, &.{
         @intCast(batch * max_spans),
@@ -927,6 +1310,7 @@ pub fn fillSpanStartTargetsFromEncodedBatchWithOptions(
 
     for (0..batch.batch_size) |sample_idx| {
         const word_pos_offset = sample_idx * batch.max_words_per_sample;
+        const count_index = spanStartEntityStructureCountIndex(batch, sample_idx);
         for (0..batch.max_spans) |span_idx| {
             const flat_span_idx = sample_idx * batch.max_spans + span_idx;
             const row = flat_span_idx * width;
@@ -976,7 +1360,21 @@ pub fn fillSpanStartTargetsFromEncodedBatchWithOptions(
                     stats.positive_counts_by_entity_type[entity_type_idx] += 1;
                 }
             }
-            const start_idx_offset = if (has_positive_weights) 3 * E else 2 * E;
+            const schema_idx_offset = if (has_positive_weights) 3 * E else 2 * E;
+            const row_idx_offset = schema_idx_offset + E;
+            const count_idx_offset = row_idx_offset + E;
+            for (0..E) |entity_type_idx| {
+                const label_token_pos_raw = batch.e_token_positions[sample_idx * E + entity_type_idx];
+                if (label_token_pos_raw < 0) return error.InvalidTokenPosition;
+                const label_token_pos: usize = @intCast(label_token_pos_raw);
+                if (label_token_pos >= batch.max_length) return error.InvalidTokenPosition;
+                out[row + schema_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(sample_idx * batch.max_length + label_token_pos));
+                out[row + row_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(flat_span_idx));
+                const schema_row_idx = flat_span_idx * E + entity_type_idx;
+                const state_idx = count_index * rows * E + schema_row_idx;
+                out[row + count_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(state_idx));
+            }
+            const start_idx_offset = count_idx_offset + E;
             out[row + start_idx_offset] = @as(f32, @floatFromInt(sample_idx * batch.max_length + token_pos));
             out[row + start_idx_offset + 1] = @as(f32, @floatFromInt(sample_idx * batch.max_length + end_token_pos));
             stats.valid_span_count += 1;
@@ -984,6 +1382,18 @@ pub fn fillSpanStartTargetsFromEncodedBatchWithOptions(
     }
 
     return stats;
+}
+
+fn spanStartEntityStructureCountIndex(batch: *const gliner2_data.EncodedBatch, sample_idx: usize) usize {
+    const E = batch.num_entity_types;
+    for (0..batch.max_spans) |span_idx| {
+        const flat_span_idx = sample_idx * batch.max_spans + span_idx;
+        if (batch.span_mask[flat_span_idx] <= 0.0) continue;
+        for (0..E) |entity_type_idx| {
+            if (batch.span_labels[flat_span_idx * E + entity_type_idx] > 0.0) return 0;
+        }
+    }
+    return 0;
 }
 
 fn spanOverlapsPositiveLabel(batch: *const gliner2_data.EncodedBatch, sample_idx: usize, span_idx: usize) bool {
@@ -1082,12 +1492,12 @@ test "spanStartTargetsShape returns packed span target shape" {
     const s = spanStartTargetsShape(2, 5, 3);
     try testing.expectEqual(@as(u8, 2), s.rank());
     try testing.expectEqual(@as(i64, 10), s.dim(0));
-    try testing.expectEqual(@as(i64, 8), s.dim(1));
+    try testing.expectEqual(@as(i64, 17), s.dim(1));
 
     const weighted = weightedSpanStartTargetsShape(2, 5, 3);
     try testing.expectEqual(@as(u8, 2), weighted.rank());
     try testing.expectEqual(@as(i64, 10), weighted.dim(0));
-    try testing.expectEqual(@as(i64, 11), weighted.dim(1));
+    try testing.expectEqual(@as(i64, 20), weighted.dim(1));
 }
 
 test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices" {
@@ -1138,7 +1548,7 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 6);
+    var targets = [_]f32{0.0} ** (3 * 12);
     const stats = try fillSpanStartTargetsFromEncodedBatch(&batch, &targets);
     try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
     try testing.expectEqual(@as(u64, 2), stats.positive_span_label_count);
@@ -1147,9 +1557,9 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
     try testing.expectEqual(@as(u64, 1), stats.positive_counts_by_entity_type[0]);
     try testing.expectEqual(@as(u64, 1), stats.positive_counts_by_entity_type[1]);
 
-    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 2.0, 2.0 }, targets[0..6]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 3.0, 4.0 }, targets[6..12]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[12..18]);
+    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 2.0 }, targets[0..12]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 4.0 }, targets[12..24]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[24..36]);
 }
 
 test "fillWeightedSpanStartTargetsFromEncodedBatch packs per-label positive weights" {
@@ -1200,14 +1610,14 @@ test "fillWeightedSpanStartTargetsFromEncodedBatch packs per-label positive weig
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 8);
+    var targets = [_]f32{0.0} ** (3 * 14);
     const weights = [_]f32{ 32.0, 96.0 };
     const stats = try fillWeightedSpanStartTargetsFromEncodedBatch(&batch, &weights, &targets);
     try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
     try testing.expectEqual(@as(u64, 2), stats.positive_span_label_count);
-    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 32.0, 96.0, 2.0, 2.0 }, targets[0..8]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 32.0, 96.0, 3.0, 4.0 }, targets[8..16]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[16..24]);
+    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 1.0, 32.0, 96.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 2.0 }, targets[0..14]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 1.0, 1.0, 1.0, 32.0, 96.0, 0.0, 1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 4.0 }, targets[14..28]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }, targets[28..42]);
 }
 
 test "fillSpanStartTargetsFromEncodedBatchWithOptions weights overlapping hard negatives" {
@@ -1258,12 +1668,12 @@ test "fillSpanStartTargetsFromEncodedBatchWithOptions weights overlapping hard n
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 6);
+    var targets = [_]f32{0.0} ** (3 * 12);
     _ = try fillSpanStartTargetsFromEncodedBatchWithOptions(&batch, .{ .hard_negative_weight = 4.0 }, &targets);
 
-    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 4.0, 2.0, 3.0 }, targets[0..6]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 4.0, 4.0, 3.0, 3.0 }, targets[6..12]);
-    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 1.0, 1.0, 4.0, 4.0 }, targets[12..18]);
+    try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 4.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 3.0 }, targets[0..12]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 4.0, 4.0, 0.0, 1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0 }, targets[12..24]);
+    try testing.expectEqualSlices(f32, &.{ 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 2.0, 2.0, 4.0, 5.0, 4.0, 4.0 }, targets[24..36]);
 }
 
 test "makeTrainerInput populates the expected fields for token classification" {

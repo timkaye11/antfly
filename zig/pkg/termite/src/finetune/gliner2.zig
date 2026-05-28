@@ -42,8 +42,22 @@ pub const tokenizer_config_file_name = "tokenizer_config.json";
 pub const special_tokens_map_file_name = "special_tokens_map.json";
 
 pub const default_lora_target_modules = [_][]const u8{
+    "encoder",
+    "span_rep",
+    "classifier",
+    "count_embed",
+    "count_pred",
+};
+
+pub const default_lora_dropout: f32 = 0.1;
+
+pub const expanded_encoder_lora_target_modules = [_][]const u8{
     "query_proj",
+    "key_proj",
     "value_proj",
+    "attention.output.dense",
+    "intermediate.dense",
+    "output.dense",
 };
 
 pub const BackboneConfig = struct {
@@ -136,6 +150,7 @@ pub const AdapterConfig = struct {
     task_type: ?[]const u8 = null,
     r: ?usize = null,
     lora_alpha: ?f64 = null,
+    lora_dropout: ?f64 = null,
     target_modules: ?[]const []const u8 = null,
     use_dora: ?bool = null,
 };
@@ -150,6 +165,7 @@ pub const LoRATargetTensor = struct {
 pub const BootstrapOptions = struct {
     rank: usize = 16,
     alpha: f32 = 32.0,
+    dropout: f32 = default_lora_dropout,
     base_model_name_or_path: ?[]const u8 = null,
     target_modules: ?[]const []const u8 = null,
 };
@@ -164,7 +180,9 @@ pub const BootstrapSummary = struct {
     base_model_name_or_path: []const u8,
     lora_rank: usize,
     lora_alpha: f32,
+    lora_dropout: f32,
     target_modules: []const []const u8,
+    resolved_target_modules: []const []const u8,
     resolved_tensors: []LoRATargetTensor,
 };
 
@@ -191,8 +209,11 @@ pub const LoRABundleInspectionSummary = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: ?usize = null,
     lora_alpha: ?f64 = null,
+    lora_dropout: ?f64 = null,
     target_module_count: usize = 0,
     target_modules: ?[]const []const u8 = null,
+    resolved_target_module_count: usize = 0,
+    resolved_target_modules: ?[]const []const u8 = null,
     resolved_tensor_count: usize = 0,
     trainable_parameter_count: usize = 0,
     dora_magnitude_tensor_count: usize = 0,
@@ -237,6 +258,7 @@ pub const LoadedLoRABundle = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: usize,
     lora_alpha: f32,
+    lora_dropout: f32 = default_lora_dropout,
     target_modules: []const []const u8,
     layers: []LoadedLoRALayer,
     passthrough_tensors: []LoadedPassthroughTensor,
@@ -271,6 +293,60 @@ pub const LoadedLoRABundle = struct {
         self.* = undefined;
     }
 };
+
+pub fn validateLoRADropout(dropout: f32) !void {
+    if (!std.math.isFinite(dropout) or dropout < 0.0 or dropout >= 1.0) return error.InvalidLoRADropout;
+}
+
+pub fn expandLoRATargetModules(
+    allocator: std.mem.Allocator,
+    requested_target_modules: []const []const u8,
+) ![]const []const u8 {
+    var expanded = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (expanded.items) |item| allocator.free(item);
+        expanded.deinit(allocator);
+    }
+
+    for (requested_target_modules) |raw| {
+        const target = std.mem.trim(u8, raw, " \t\r\n");
+        if (target.len == 0) return error.InvalidLoRATargetModule;
+        if (std.mem.eql(u8, target, "encoder")) {
+            for (expanded_encoder_lora_target_modules) |item| try appendUniqueString(allocator, &expanded, item);
+        } else if (std.mem.eql(u8, target, "encoder.query")) {
+            try appendUniqueString(allocator, &expanded, "query_proj");
+        } else if (std.mem.eql(u8, target, "encoder.key")) {
+            try appendUniqueString(allocator, &expanded, "key_proj");
+        } else if (std.mem.eql(u8, target, "encoder.value")) {
+            try appendUniqueString(allocator, &expanded, "value_proj");
+        } else if (std.mem.eql(u8, target, "encoder.dense")) {
+            try appendUniqueString(allocator, &expanded, "attention.output.dense");
+            try appendUniqueString(allocator, &expanded, "intermediate.dense");
+            try appendUniqueString(allocator, &expanded, "output.dense");
+        } else if (std.mem.eql(u8, target, "span_rep") or
+            std.mem.eql(u8, target, "classifier") or
+            std.mem.eql(u8, target, "count_embed") or
+            std.mem.eql(u8, target, "count_pred"))
+        {
+            try appendUniqueString(allocator, &expanded, target);
+        } else {
+            try appendUniqueString(allocator, &expanded, target);
+        }
+    }
+
+    return expanded.toOwnedSlice(allocator);
+}
+
+fn appendUniqueString(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (list.items) |item| {
+        if (std.mem.eql(u8, item, value)) return;
+    }
+    try list.append(allocator, try allocator.dupe(u8, value));
+}
 
 pub const LoRALayerAdamState = struct {
     allocator: std.mem.Allocator,
@@ -394,7 +470,9 @@ pub const AutodiffAdapterExportSummary = struct {
     exported_tensor_count: usize,
     lora_rank: usize,
     lora_alpha: f32,
+    lora_dropout: f32,
     target_modules: []const []const u8,
+    resolved_target_modules: []const []const u8,
 };
 
 pub const AutodiffRegularParamExportSummary = struct {
@@ -638,8 +716,14 @@ pub fn bootstrapLoRABundle(
     defer freeCheckpointInspection(allocator, &inspect);
 
     if (options.rank == 0) return error.InvalidLoRARank;
+    try validateLoRADropout(options.dropout);
     const requested_target_modules = options.target_modules orelse default_lora_target_modules[0..];
-    const resolved_tensors = try inferLoRATargetTensors(allocator, inspect.checkpoint_path, requested_target_modules);
+    const resolved_target_modules = try expandLoRATargetModules(allocator, requested_target_modules);
+    errdefer {
+        for (resolved_target_modules) |item| allocator.free(item);
+        allocator.free(resolved_target_modules);
+    }
+    const resolved_tensors = try inferLoRATargetTensors(allocator, inspect.checkpoint_path, resolved_target_modules);
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
@@ -656,7 +740,7 @@ pub fn bootstrapLoRABundle(
     errdefer allocator.free(base_model_name_or_path);
 
     try writeBootstrapAdapterCheckpoint(allocator, adapter_checkpoint_path, resolved_tensors, options.rank);
-    try writeAdapterConfigJson(allocator, adapter_config_path, base_model_name_or_path, options.rank, options.alpha, requested_target_modules, false);
+    try writeAdapterConfigJson(allocator, adapter_config_path, base_model_name_or_path, options.rank, options.alpha, options.dropout, requested_target_modules, false);
 
     return .{
         .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
@@ -668,7 +752,9 @@ pub fn bootstrapLoRABundle(
         .base_model_name_or_path = base_model_name_or_path,
         .lora_rank = options.rank,
         .lora_alpha = options.alpha,
+        .lora_dropout = options.dropout,
         .target_modules = try dupeStringSlice(allocator, requested_target_modules),
+        .resolved_target_modules = resolved_target_modules,
         .resolved_tensors = resolved_tensors,
     };
 }
@@ -715,10 +801,15 @@ pub fn inspectLoRABundle(
         const base_tensor_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{parsed.base_tensor_base_name});
         defer allocator.free(base_tensor_name);
         const adapter_b_info = adapter_reader.header.tensors.get(adapter_b_name) orelse return error.MissingAdapterPair;
-        const base_info = base_reader.header.tensors.get(base_tensor_name) orelse return error.MissingBaseTensorForAdapter;
-        if (adapter_a_info.shape.len != 2 or adapter_b_info.shape.len != 2 or base_info.shape.len != 2) return error.InvalidAdapterTensorShape;
-        if (adapter_a_info.shape[1] != base_info.shape[1]) return error.AdapterInputDimMismatch;
-        if (adapter_b_info.shape[0] != base_info.shape[0]) return error.AdapterOutputDimMismatch;
+        if (adapter_a_info.shape.len != 2 or adapter_b_info.shape.len != 2) return error.InvalidAdapterTensorShape;
+        const base_output_dim, const base_input_dim = if (isGraphOwnedLoRABaseModule(parsed.module_name)) blk: {
+            break :blk .{ adapter_b_info.shape[0], adapter_a_info.shape[1] };
+        } else if (base_reader.header.tensors.get(base_tensor_name)) |base_info| blk: {
+            if (base_info.shape.len != 2) return error.InvalidAdapterTensorShape;
+            break :blk .{ base_info.shape[0], base_info.shape[1] };
+        } else return error.MissingBaseTensorForAdapter;
+        if (adapter_a_info.shape[1] != base_input_dim) return error.AdapterInputDimMismatch;
+        if (adapter_b_info.shape[0] != base_output_dim) return error.AdapterOutputDimMismatch;
         if (adapter_a_info.shape[0] != adapter_b_info.shape[1]) return error.AdapterRankMismatch;
 
         const maybe_dora_name = try doraMagnitudeTensorName(allocator, base_tensor_name);
@@ -727,7 +818,7 @@ pub fn inspectLoRABundle(
         var dora_parameter_count: usize = 0;
         if (adapter_reader.header.tensors.get(maybe_dora_name)) |dora_info| {
             if (dora_info.shape.len != 1) return error.InvalidAdapterTensorShape;
-            if (dora_info.shape[0] != base_info.shape[0]) return error.AdapterOutputDimMismatch;
+            if (dora_info.shape[0] != base_output_dim) return error.AdapterOutputDimMismatch;
             dora_name_for_summary = try allocator.dupe(u8, maybe_dora_name);
             dora_parameter_count = @intCast(dora_info.shape[0]);
         }
@@ -738,8 +829,8 @@ pub fn inspectLoRABundle(
             .adapter_b_tensor_name = try allocator.dupe(u8, adapter_b_name),
             .dora_magnitude_tensor_name = dora_name_for_summary,
             .module_name = try allocator.dupe(u8, parsed.module_name),
-            .input_dim = @intCast(base_info.shape[1]),
-            .output_dim = @intCast(base_info.shape[0]),
+            .input_dim = @intCast(base_input_dim),
+            .output_dim = @intCast(base_output_dim),
             .rank = @intCast(adapter_a_info.shape[0]),
             .adapter_parameter_count = @as(usize, @intCast(adapter_a_info.shape[0])) * @as(usize, @intCast(adapter_a_info.shape[1])) +
                 @as(usize, @intCast(adapter_b_info.shape[0])) * @as(usize, @intCast(adapter_b_info.shape[1])) +
@@ -779,8 +870,11 @@ pub fn inspectLoRABundle(
         .base_model_name_or_path = try dupeOptionalString(allocator, adapter_config.base_model_name_or_path),
         .lora_rank = adapter_config.lora_rank,
         .lora_alpha = adapter_config.lora_alpha,
+        .lora_dropout = adapter_config.lora_dropout,
         .target_module_count = adapter_config.target_module_count,
         .target_modules = try dupeOptionalStringSlice(allocator, adapter_config.target_modules),
+        .resolved_target_module_count = adapter_config.resolved_target_module_count,
+        .resolved_target_modules = try dupeOptionalStringSlice(allocator, adapter_config.resolved_target_modules),
         .resolved_tensor_count = tensors.items.len,
         .trainable_parameter_count = trainable_parameter_count,
         .dora_magnitude_tensor_count = dora_magnitude_tensor_count,
@@ -913,6 +1007,7 @@ pub fn loadLoRABundle(
         .base_model_name_or_path = try dupeOptionalString(allocator, inspected.base_model_name_or_path),
         .lora_rank = inspected.lora_rank.?,
         .lora_alpha = @floatCast(inspected.lora_alpha.?),
+        .lora_dropout = if (inspected.lora_dropout) |value| @floatCast(value) else 0.0,
         .target_modules = if (inspected.target_modules) |items|
             try dupeStringSlice(allocator, items)
         else
@@ -995,6 +1090,7 @@ pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !voi
         bundle.base_model_name_or_path orelse bundle.base_model_dir,
         bundle.lora_rank,
         bundle.lora_alpha,
+        bundle.lora_dropout,
         bundle.target_modules,
         bundleHasDoRA(bundle),
     );
@@ -1014,9 +1110,16 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
     base_model_name_or_path: []const u8,
     rank: usize,
     alpha: f32,
+    dropout: f32,
     target_modules: []const []const u8,
     params: []const AutodiffAdapterParam,
 ) !AutodiffAdapterExportSummary {
+    try validateLoRADropout(dropout);
+    const resolved_target_modules = try expandLoRATargetModules(allocator, target_modules);
+    errdefer {
+        for (resolved_target_modules) |item| allocator.free(item);
+        allocator.free(resolved_target_modules);
+    }
     try compat.cwd().createDirPath(compat.io(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(checkpoint_path);
@@ -1055,7 +1158,7 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
     }
 
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, tensors[0..tensor_count]);
-    try writeAdapterConfigJson(allocator, config_path, base_model_name_or_path, rank, alpha, target_modules, false);
+    try writeAdapterConfigJson(allocator, config_path, base_model_name_or_path, rank, alpha, dropout, target_modules, false);
 
     return .{
         .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
@@ -1065,7 +1168,9 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
         .exported_tensor_count = tensor_count,
         .lora_rank = rank,
         .lora_alpha = alpha,
+        .lora_dropout = dropout,
         .target_modules = try dupeStringSlice(allocator, target_modules),
+        .resolved_target_modules = resolved_target_modules,
     };
 }
 
@@ -1279,6 +1384,8 @@ pub fn freeBootstrapSummary(allocator: std.mem.Allocator, summary: *BootstrapSum
     allocator.free(summary.base_model_name_or_path);
     for (summary.target_modules) |item| allocator.free(item);
     allocator.free(summary.target_modules);
+    for (summary.resolved_target_modules) |item| allocator.free(item);
+    allocator.free(summary.resolved_target_modules);
     freeLoRATargetTensors(allocator, summary.resolved_tensors);
     summary.* = undefined;
 }
@@ -1295,6 +1402,10 @@ pub fn freeLoRABundleInspectionSummary(allocator: std.mem.Allocator, summary: *L
         for (modules) |item| allocator.free(item);
         allocator.free(modules);
     }
+    if (summary.resolved_target_modules) |modules| {
+        for (modules) |item| allocator.free(item);
+        allocator.free(modules);
+    }
     for (summary.tensors) |*item| freeLoRATensorSummary(allocator, item);
     allocator.free(summary.tensors);
     summary.* = undefined;
@@ -1307,6 +1418,8 @@ pub fn freeAutodiffAdapterExportSummary(allocator: std.mem.Allocator, summary: *
     allocator.free(summary.adapter_config_path);
     for (summary.target_modules) |item| allocator.free(item);
     allocator.free(summary.target_modules);
+    for (summary.resolved_target_modules) |item| allocator.free(item);
+    allocator.free(summary.resolved_target_modules);
     summary.* = undefined;
 }
 
@@ -1359,16 +1472,31 @@ fn inferLoRATargetTensors(
 
 fn moduleNameForTensor(tensor_name: []const u8) ?[]const u8 {
     const ordered_modules = [_][]const u8{
+        "attention.output.dense",
+        "intermediate.dense",
+        "output.dense",
         "query_proj",
         "key_proj",
         "value_proj",
+        "classifier",
+        "span_rep",
+        "count_embed",
+        "count_pred",
     };
+    if (std.mem.eql(u8, tensor_name, "classifier.weight")) return "classifier";
+    if (std.mem.startsWith(u8, tensor_name, "classifier.") and std.mem.endsWith(u8, tensor_name, ".weight")) return "classifier";
+    if (std.mem.eql(u8, tensor_name, "span_rep.weight")) return "span_rep";
+    if (std.mem.eql(u8, tensor_name, "count_embed.weight")) return "count_embed";
+    if (std.mem.eql(u8, tensor_name, "count_pred.weight")) return "count_pred";
     inline for (ordered_modules) |module_name| {
         const dot_suffix = "." ++ module_name ++ ".weight";
         const slash_suffix = "/" ++ module_name ++ "/weight";
         if (std.mem.endsWith(u8, tensor_name, dot_suffix)) return module_name;
         if (std.mem.endsWith(u8, tensor_name, slash_suffix)) return module_name;
     }
+    if (std.mem.indexOf(u8, tensor_name, "span_rep") != null and std.mem.endsWith(u8, tensor_name, ".weight")) return "span_rep";
+    if (std.mem.indexOf(u8, tensor_name, "count_embed") != null and std.mem.endsWith(u8, tensor_name, ".weight")) return "count_embed";
+    if (std.mem.indexOf(u8, tensor_name, "count_pred") != null and std.mem.endsWith(u8, tensor_name, ".weight")) return "count_pred";
     return null;
 }
 
@@ -1418,17 +1546,39 @@ fn autodiffParamBaseToPeftName(allocator: std.mem.Allocator, base_no_weight: []c
 
 fn moduleNameForBaseTensor(base_tensor_name: []const u8) ?[]const u8 {
     const ordered_modules = [_][]const u8{
+        "attention.output.dense",
+        "intermediate.dense",
+        "output.dense",
         "query_proj",
         "key_proj",
         "value_proj",
+        "classifier",
+        "span_rep",
+        "count_embed",
+        "count_pred",
     };
+    if (std.mem.eql(u8, base_tensor_name, "classifier")) return "classifier";
+    if (std.mem.startsWith(u8, base_tensor_name, "classifier.")) return "classifier";
+    if (std.mem.eql(u8, base_tensor_name, "span_rep")) return "span_rep";
+    if (std.mem.eql(u8, base_tensor_name, "count_embed")) return "count_embed";
+    if (std.mem.eql(u8, base_tensor_name, "count_pred")) return "count_pred";
     inline for (ordered_modules) |module_name| {
         const dot_suffix = "." ++ module_name;
         const slash_suffix = "/" ++ module_name;
         if (std.mem.endsWith(u8, base_tensor_name, dot_suffix)) return module_name;
         if (std.mem.endsWith(u8, base_tensor_name, slash_suffix)) return module_name;
     }
+    if (std.mem.indexOf(u8, base_tensor_name, "span_rep") != null) return "span_rep";
+    if (std.mem.indexOf(u8, base_tensor_name, "count_embed") != null) return "count_embed";
+    if (std.mem.indexOf(u8, base_tensor_name, "count_pred") != null) return "count_pred";
     return null;
+}
+
+fn isGraphOwnedLoRABaseModule(module_name: []const u8) bool {
+    return std.mem.eql(u8, module_name, "classifier") or
+        std.mem.eql(u8, module_name, "span_rep") or
+        std.mem.eql(u8, module_name, "count_embed") or
+        std.mem.eql(u8, module_name, "count_pred");
 }
 
 fn writeBootstrapAdapterCheckpoint(
@@ -1579,9 +1729,11 @@ fn writeAdapterConfigJson(
     base_model_name_or_path: []const u8,
     rank: usize,
     alpha: f32,
+    dropout: f32,
     target_modules: []const []const u8,
     use_dora: bool,
 ) !void {
+    try validateLoRADropout(dropout);
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{
@@ -1590,6 +1742,7 @@ fn writeAdapterConfigJson(
         .task_type = "TOKEN_CLS",
         .r = rank,
         .lora_alpha = alpha,
+        .lora_dropout = dropout,
         .target_modules = target_modules,
         .use_dora = use_dora,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
@@ -1610,8 +1763,11 @@ const AdapterInspection = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: ?usize = null,
     lora_alpha: ?f64 = null,
+    lora_dropout: ?f64 = null,
     target_module_count: usize = 0,
     target_modules: ?[]const []const u8 = null,
+    resolved_target_module_count: usize = 0,
+    resolved_target_modules: ?[]const []const u8 = null,
     use_dora: ?bool = null,
 };
 
@@ -1643,8 +1799,18 @@ fn inspectAdapterConfig(allocator: std.mem.Allocator, input: []const u8) !Adapte
         .base_model_name_or_path = if (adapter_config) |cfg| try dupeOptionalString(allocator, cfg.base_model_name_or_path) else null,
         .lora_rank = if (adapter_config) |cfg| cfg.r else null,
         .lora_alpha = if (adapter_config) |cfg| cfg.lora_alpha else null,
+        .lora_dropout = if (adapter_config) |cfg| cfg.lora_dropout else null,
         .target_module_count = if (adapter_config) |cfg| if (cfg.target_modules) |items| items.len else 0 else 0,
         .target_modules = if (adapter_config) |cfg| try dupeOptionalStringSlice(allocator, cfg.target_modules) else null,
+        .resolved_target_module_count = if (adapter_config) |cfg| if (cfg.target_modules) |items| blk: {
+            const resolved = try expandLoRATargetModules(allocator, items);
+            defer {
+                for (resolved) |item| allocator.free(item);
+                allocator.free(resolved);
+            }
+            break :blk resolved.len;
+        } else 0 else 0,
+        .resolved_target_modules = if (adapter_config) |cfg| if (cfg.target_modules) |items| try expandLoRATargetModules(allocator, items) else null else null,
         .use_dora = if (adapter_config) |cfg| cfg.use_dora else null,
     };
 }
@@ -1655,6 +1821,10 @@ fn freeAdapterInspection(allocator: std.mem.Allocator, inspection: *AdapterInspe
     if (inspection.adapter_config_path) |value| allocator.free(value);
     if (inspection.base_model_name_or_path) |value| allocator.free(value);
     if (inspection.target_modules) |modules| {
+        for (modules) |item| allocator.free(item);
+        allocator.free(modules);
+    }
+    if (inspection.resolved_target_modules) |modules| {
         for (modules) |item| allocator.free(item);
         allocator.free(modules);
     }
@@ -1764,6 +1934,7 @@ fn dupeAdapterConfig(allocator: std.mem.Allocator, config: AdapterConfig) !Adapt
         .task_type = try dupeOptionalString(allocator, config.task_type),
         .r = config.r,
         .lora_alpha = config.lora_alpha,
+        .lora_dropout = config.lora_dropout,
         .target_modules = try dupeOptionalStringSlice(allocator, config.target_modules),
         .use_dora = config.use_dora,
     };
@@ -2870,6 +3041,33 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     try std.testing.expect(summary.core_backbone_loadable);
 }
 
+test "gliner2 upstream lora target groups expand to concrete modules" {
+    const allocator = std.testing.allocator;
+    const expanded = try expandLoRATargetModules(allocator, default_lora_target_modules[0..]);
+    defer {
+        for (expanded) |item| allocator.free(item);
+        allocator.free(expanded);
+    }
+
+    try std.testing.expect(stringSliceContains(expanded, "query_proj"));
+    try std.testing.expect(stringSliceContains(expanded, "key_proj"));
+    try std.testing.expect(stringSliceContains(expanded, "value_proj"));
+    try std.testing.expect(stringSliceContains(expanded, "attention.output.dense"));
+    try std.testing.expect(stringSliceContains(expanded, "intermediate.dense"));
+    try std.testing.expect(stringSliceContains(expanded, "output.dense"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep"));
+    try std.testing.expect(stringSliceContains(expanded, "classifier"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed"));
+    try std.testing.expect(stringSliceContains(expanded, "count_pred"));
+}
+
+test "gliner2 lora dropout validates python-compatible range" {
+    try validateLoRADropout(0.0);
+    try validateLoRADropout(0.1);
+    try std.testing.expectError(error.InvalidLoRADropout, validateLoRADropout(-0.1));
+    try std.testing.expectError(error.InvalidLoRADropout, validateLoRADropout(1.0));
+}
+
 test "gliner2 bootstrap and inspect lora bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_bootstrap_test_{d}", .{std.posix.system.getpid()});
@@ -3039,6 +3237,7 @@ test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
         root,
         2,
         4,
+        0.0,
         &.{"query_proj"},
         &params,
     );
