@@ -139,6 +139,13 @@ pub const GlinerAutodiffCtx = struct {
     built: ?deberta_graph.DebertaGraph = null,
     token_logits: ?NodeId = null,
     span_logits: ?NodeId = null,
+    span_debug_start_hidden: ?NodeId = null,
+    span_debug_end_hidden: ?NodeId = null,
+    span_debug_projected_span: ?NodeId = null,
+    span_debug_schema_hidden: ?NodeId = null,
+    span_debug_schema_projection: ?NodeId = null,
+    graph_batch: u32 = 0,
+    graph_seq_len: u32 = 0,
 
     pub fn init(config: GlinerAutodiffConfig) GlinerAutodiffCtx {
         return .{ .config = config };
@@ -171,6 +178,8 @@ pub const GlinerAutodiffCtx = struct {
         _ = attention_mask;
         const self: *GlinerAutodiffCtx = @ptrCast(@alignCast(ctx_opaque));
         const cfg = self.config.graph_config;
+        self.graph_batch = batch;
+        self.graph_seq_len = seq_len;
 
         // Flatten harness input_ids [B, S] → [B*S] so the shape matches the
         // `deberta_graph` expectation (its embedding lookup emits one row
@@ -250,6 +259,11 @@ pub const GlinerAutodiffCtx = struct {
         }
         if (self.token_logits) |node_id| self.token_logits = id_map[node_id];
         if (self.span_logits) |node_id| self.span_logits = id_map[node_id];
+        if (self.span_debug_start_hidden) |node_id| self.span_debug_start_hidden = id_map[node_id];
+        if (self.span_debug_end_hidden) |node_id| self.span_debug_end_hidden = id_map[node_id];
+        if (self.span_debug_projected_span) |node_id| self.span_debug_projected_span = id_map[node_id];
+        if (self.span_debug_schema_hidden) |node_id| self.span_debug_schema_hidden = id_map[node_id];
+        if (self.span_debug_schema_projection) |node_id| self.span_debug_schema_projection = id_map[node_id];
     }
 
     /// Task head + scalar loss. Token classification only — GLiNER2 does
@@ -416,21 +430,71 @@ pub const GlinerAutodiffCtx = struct {
             );
         } else start_hidden;
         const projected_span = try buildParitySpanProjection(bld, start_hidden, end_hidden_for_parity, span_rows, H);
+        self.span_debug_start_hidden = start_hidden;
+        self.span_debug_end_hidden = end_hidden_for_parity;
+        self.span_debug_projected_span = projected_span;
         const entity_logits = if (is_schema_conditioned) blk: {
+            const graph_batch = self.graph_batch;
+            if (graph_batch == 0 or span_rows == 0 or @mod(span_rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
+            const max_spans_per_sample = span_rows / graph_batch;
+            const compact_schema_rows = graph_batch * E;
+
+            const first_span_rows_buf = try bld.graph.allocator.alloc(f32, graph_batch);
+            defer bld.graph.allocator.free(first_span_rows_buf);
+            for (first_span_rows_buf, 0..) |*dst, sample_idx| {
+                dst.* = @floatFromInt(sample_idx * max_spans_per_sample);
+            }
+            const first_span_rows_f32 = try bld.tensorConst(
+                first_span_rows_buf,
+                Shape.init(.f32, &.{@intCast(graph_batch)}),
+            );
+            const first_span_rows_i64 = try bld.convertDtype(first_span_rows_f32, .i64);
+
             const schema_idx_2d = try bld.sliceLastDim(targets, @intCast(schema_idx_offset), @intCast(schema_idx_offset + E));
-            const schema_idx_f32 = try bld.reshape(schema_idx_2d, Shape.init(.f32, &.{@intCast(span_rows * E)}));
+            const compact_schema_idx_2d = try bld.gather(
+                schema_idx_2d,
+                first_span_rows_i64,
+                Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }),
+            );
+            const schema_idx_f32 = try bld.reshape(compact_schema_idx_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
             const schema_idx_i64 = try bld.convertDtype(schema_idx_f32, .i64);
             const schema_hidden = try bld.gather(
                 hidden_flat,
                 schema_idx_i64,
-                Shape.init(.f32, &.{ @intCast(span_rows * E), @intCast(H) }),
+                Shape.init(.f32, &.{ @intCast(compact_schema_rows), @intCast(H) }),
             );
+            self.span_debug_schema_hidden = schema_hidden;
             const count_state_idx_i64 = if (has_schema_count_idx) count_idx: {
                 const count_idx_2d = try bld.sliceLastDim(targets, @intCast(count_idx_offset), @intCast(count_idx_offset + E));
-                const count_idx_f32 = try bld.reshape(count_idx_2d, Shape.init(.f32, &.{@intCast(span_rows * E)}));
+                const compact_count_idx_2d = try bld.gather(
+                    count_idx_2d,
+                    first_span_rows_i64,
+                    Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }),
+                );
+                const count_idx_f32 = try bld.reshape(compact_count_idx_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
                 break :count_idx try bld.convertDtype(count_idx_f32, .i64);
             } else null;
-            const schema_projection = try buildParityCountEmbed(bld, schema_hidden, count_state_idx_i64, span_rows * E, H);
+            const compact_schema_projection = try buildParityCountEmbed(bld, schema_hidden, count_state_idx_i64, compact_schema_rows, H);
+            self.span_debug_schema_projection = compact_schema_projection;
+
+            const schema_repeat_rows_buf = try bld.graph.allocator.alloc(f32, span_rows * E);
+            defer bld.graph.allocator.free(schema_repeat_rows_buf);
+            for (0..span_rows) |span_row| {
+                const sample_idx = span_row / max_spans_per_sample;
+                for (0..E) |entity_type_idx| {
+                    schema_repeat_rows_buf[span_row * E + entity_type_idx] = @floatFromInt(sample_idx * E + entity_type_idx);
+                }
+            }
+            const schema_repeat_rows_f32 = try bld.tensorConst(
+                schema_repeat_rows_buf,
+                Shape.init(.f32, &.{@intCast(span_rows * E)}),
+            );
+            const schema_repeat_rows_i64 = try bld.convertDtype(schema_repeat_rows_f32, .i64);
+            const schema_projection = try bld.gather(
+                compact_schema_projection,
+                schema_repeat_rows_i64,
+                Shape.init(.f32, &.{ @intCast(span_rows * E), @intCast(H) }),
+            );
 
             const row_idx_2d = try bld.sliceLastDim(targets, @intCast(row_idx_offset), @intCast(row_idx_offset + E));
             const row_idx_f32 = try bld.reshape(row_idx_2d, Shape.init(.f32, &.{@intCast(span_rows * E)}));
@@ -496,18 +560,19 @@ fn buildParitySpanProjection(
 ) !NodeId {
     const ff_dim: u32 = hidden_size * 4;
 
-    const start_0 = try linearNoBiasNamed(bld, start_hidden, "span_rep.span_rep_layer.project_start.0.weight", span_rows, hidden_size, ff_dim);
-    const start_act = try bld.gelu(start_0);
-    const start_out = try linearNoBiasNamed(bld, start_act, "span_rep.span_rep_layer.project_start.3.weight", span_rows, ff_dim, hidden_size);
+    const start_0 = try linearNamed(bld, start_hidden, "span_rep.span_rep_layer.project_start.0.weight", "span_rep.span_rep_layer.project_start.0.bias", span_rows, hidden_size, ff_dim);
+    const start_act = try bld.relu(start_0);
+    const start_out = try linearNamed(bld, start_act, "span_rep.span_rep_layer.project_start.3.weight", "span_rep.span_rep_layer.project_start.3.bias", span_rows, ff_dim, hidden_size);
 
-    const end_0 = try linearNoBiasNamed(bld, end_hidden, "span_rep.span_rep_layer.project_end.0.weight", span_rows, hidden_size, ff_dim);
-    const end_act = try bld.gelu(end_0);
-    const end_out = try linearNoBiasNamed(bld, end_act, "span_rep.span_rep_layer.project_end.3.weight", span_rows, ff_dim, hidden_size);
+    const end_0 = try linearNamed(bld, end_hidden, "span_rep.span_rep_layer.project_end.0.weight", "span_rep.span_rep_layer.project_end.0.bias", span_rows, hidden_size, ff_dim);
+    const end_act = try bld.relu(end_0);
+    const end_out = try linearNamed(bld, end_act, "span_rep.span_rep_layer.project_end.3.weight", "span_rep.span_rep_layer.project_end.3.bias", span_rows, ff_dim, hidden_size);
 
     const joined = try bld.concat(start_out, end_out, 1);
-    const out_0 = try linearNoBiasNamed(bld, joined, "span_rep.span_rep_layer.out_project.0.weight", span_rows, hidden_size * 2, ff_dim);
-    const out_act = try bld.gelu(out_0);
-    return linearNoBiasNamed(bld, out_act, "span_rep.span_rep_layer.out_project.3.weight", span_rows, ff_dim, hidden_size);
+    const joined_relu = try bld.relu(joined);
+    const out_0 = try linearNamed(bld, joined_relu, "span_rep.span_rep_layer.out_project.0.weight", "span_rep.span_rep_layer.out_project.0.bias", span_rows, hidden_size * 2, ff_dim);
+    const out_act = try bld.relu(out_0);
+    return linearNamed(bld, out_act, "span_rep.span_rep_layer.out_project.3.weight", "span_rep.span_rep_layer.out_project.3.bias", span_rows, ff_dim, hidden_size);
 }
 
 fn buildParityAuxiliaryHeads(
@@ -577,7 +642,8 @@ fn buildParityCountEmbed(
 ) !NodeId {
     const count_dim: u32 = 128;
     const count_ff: u32 = 256;
-    const count_state = try buildCountLstmV2UnrolledState(bld, hidden, count_state_indices, rows, hidden_size);
+    const gru_state = try buildCountLstmV2UnrolledState(bld, hidden, count_state_indices, rows, hidden_size);
+    const count_state = try bld.add(gru_state, hidden);
     const in_project = try linearNamed(bld, count_state, "count_embed.transformer.in_projector.weight", "count_embed.transformer.in_projector.bias", rows, hidden_size, count_dim);
 
     const layer0_out = try buildCountTransformerLayer(bld, in_project, rows, count_dim, count_ff, 0);
@@ -1055,6 +1121,7 @@ pub fn tokenLogitsForBatch(
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
+    try bindEvalLoraDropoutMasks(allocator, trainer, gs, &rt);
 
     const saved_outputs = try allocator.dupe(NodeId, gs.graph.outputs.items);
     defer {
@@ -1146,6 +1213,7 @@ pub fn spanStartLogitsForBatch(
     if (trainer_input.bind_arch_inputs) |bind_fn| {
         try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
     }
+    try bindEvalLoraDropoutMasks(allocator, trainer, gs, &rt);
 
     const saved_outputs = try allocator.dupe(NodeId, gs.graph.outputs.items);
     defer {
@@ -1169,6 +1237,235 @@ pub fn spanStartLogitsForBatch(
     }
 
     return executeEvalGraphOutputToFloat32(allocator, trainer, &gs.graph, rt_inputs.items);
+}
+
+pub const SpanStartComponentDebug = struct {
+    positive_row: usize,
+    positive_entity: usize,
+    schema_row: usize,
+    start_hidden_norm: f64,
+    end_hidden_norm: f64,
+    projected_span_norm: f64,
+    schema_hidden_norm: f64,
+    schema_projection_norm: f64,
+    projected_schema_dot: f64,
+    projected_span_mean: f64,
+    schema_projection_mean: f64,
+};
+
+pub fn spanStartComponentDebugForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    span_targets: []const f32,
+    span_targets_shape: Shape,
+    batch: u32,
+    seq_len: u32,
+    entity_types: usize,
+) !SpanStartComponentDebug {
+    if (entity_types == 0) return error.InvalidEntityTypes;
+    if (ctx.config.objective != .span_start) return error.InvalidGlinerObjective;
+    if (span_targets_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
+    const span_rows: usize = @intCast(span_targets_shape.dim(0));
+    const target_width: usize = @intCast(span_targets_shape.dim(1));
+    if (span_rows == 0 or span_targets.len != span_rows * target_width) return error.InvalidGlinerSpanTargetShape;
+    if (target_width < 2 * entity_types + 2) return error.InvalidGlinerSpanTargetShape;
+
+    var positive_row: usize = 0;
+    var positive_entity: usize = 0;
+    var found_positive = false;
+    for (0..span_rows) |row_idx| {
+        const row = row_idx * target_width;
+        for (0..entity_types) |entity_idx| {
+            if (span_targets[row + entity_idx] > 0.0) {
+                positive_row = row_idx;
+                positive_entity = entity_idx;
+                found_positive = true;
+                break;
+            }
+        }
+        if (found_positive) break;
+    }
+    if (!found_positive) return error.MissingPositiveSpanLabel;
+
+    const batch_usize: usize = @intCast(batch);
+    if (batch_usize == 0 or @mod(span_rows, batch_usize) != 0) return error.InvalidGlinerSpanTargetShape;
+    const max_spans_per_sample = span_rows / batch_usize;
+    const sample_idx = positive_row / max_spans_per_sample;
+    const schema_row = sample_idx * entity_types + positive_entity;
+    const H: usize = @intCast(ctx.config.graph_config.hidden_size);
+
+    const start_hidden = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_start_hidden orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(start_hidden);
+    const end_hidden = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_end_hidden orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(end_hidden);
+    const projected_span = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_projected_span orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(projected_span);
+    const schema_hidden = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_schema_hidden orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(schema_hidden);
+    const schema_projection = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_schema_projection orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(schema_projection);
+
+    const span_offset = positive_row * H;
+    const schema_offset = schema_row * H;
+    if (start_hidden.len < span_offset + H or end_hidden.len < span_offset + H or projected_span.len < span_offset + H) return error.InvalidTensorShape;
+    if (schema_hidden.len < schema_offset + H or schema_projection.len < schema_offset + H) return error.InvalidTensorShape;
+
+    return .{
+        .positive_row = positive_row,
+        .positive_entity = positive_entity,
+        .schema_row = schema_row,
+        .start_hidden_norm = vectorNorm(start_hidden[span_offset .. span_offset + H]),
+        .end_hidden_norm = vectorNorm(end_hidden[span_offset .. span_offset + H]),
+        .projected_span_norm = vectorNorm(projected_span[span_offset .. span_offset + H]),
+        .schema_hidden_norm = vectorNorm(schema_hidden[schema_offset .. schema_offset + H]),
+        .schema_projection_norm = vectorNorm(schema_projection[schema_offset .. schema_offset + H]),
+        .projected_schema_dot = vectorDot(projected_span[span_offset .. span_offset + H], schema_projection[schema_offset .. schema_offset + H]),
+        .projected_span_mean = vectorMean(projected_span[span_offset .. span_offset + H]),
+        .schema_projection_mean = vectorMean(schema_projection[schema_offset .. schema_offset + H]),
+    };
+}
+
+fn evalSpanStartNodeForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    span_targets: []const f32,
+    span_targets_shape: Shape,
+    batch: u32,
+    seq_len: u32,
+    output_node: NodeId,
+) ![]f32 {
+    const rows: usize = @intCast(batch * seq_len);
+    if (input_ids.len != rows or attention_mask.len != rows) return error.InvalidGlinerBatchShape;
+
+    const trainer_input = makeTrainerInput(
+        ctx,
+        input_ids,
+        attention_mask,
+        span_targets,
+        span_targets_shape,
+        batch,
+        seq_len,
+    );
+    try trainer.ensureGraphBuilt(trainer_input);
+    var gs = &trainer.graph_state.?;
+
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    defer {
+        var it = rt.iterator();
+        while (it.next()) |entry| trainer.compute_backend.free(entry.value_ptr.*);
+        rt.deinit(allocator);
+    }
+
+    const input_placeholder = graph_input_binder.PlaceholderInfo{
+        .node_id = gs.input_ids_node,
+        .name = "__input_ids",
+        .shape = gs.graph.node(gs.input_ids_node).output_shape,
+    };
+    const mask_placeholder = graph_input_binder.PlaceholderInfo{
+        .node_id = gs.attention_mask_node,
+        .name = "__attention_mask",
+        .shape = gs.graph.node(gs.attention_mask_node).output_shape,
+    };
+    const targets_placeholder = graph_input_binder.PlaceholderInfo{
+        .node_id = gs.targets_node,
+        .name = "__targets",
+        .shape = gs.graph.node(gs.targets_node).output_shape,
+    };
+
+    try rt.put(allocator, gs.input_ids_node, try graph_input_binder.bindI64(trainer.compute_backend, allocator, input_placeholder, input_ids));
+    try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
+    try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, span_targets));
+
+    for (trainer.lora_params.items) |slot| {
+        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
+        try rt.put(allocator, slot.node_id, ct);
+    }
+    for (trainer.regular_params.items) |slot| {
+        const ct = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
+        try rt.put(allocator, slot.node_id, ct);
+    }
+    if (trainer_input.bind_arch_inputs) |bind_fn| {
+        try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
+    }
+    try bindEvalLoraDropoutMasks(allocator, trainer, gs, &rt);
+
+    const saved_outputs = try allocator.dupe(NodeId, gs.graph.outputs.items);
+    defer {
+        gs.graph.outputs.clearRetainingCapacity();
+        for (saved_outputs) |node_id| gs.graph.outputs.append(allocator, node_id) catch {};
+        allocator.free(saved_outputs);
+    }
+    gs.graph.outputs.clearRetainingCapacity();
+    try gs.graph.markOutput(output_node);
+
+    var rt_inputs = std.ArrayList(interpreter.RuntimeInput).empty;
+    defer rt_inputs.deinit(allocator);
+    {
+        var it = rt.iterator();
+        while (it.next()) |entry| {
+            try rt_inputs.append(allocator, .{
+                .node_id = entry.key_ptr.*,
+                .value = entry.value_ptr.*,
+            });
+        }
+    }
+
+    return executeEvalGraphOutputToFloat32(allocator, trainer, &gs.graph, rt_inputs.items);
+}
+
+fn vectorNorm(values: []const f32) f64 {
+    var sum_sq: f64 = 0.0;
+    for (values) |value| {
+        const v: f64 = @floatCast(value);
+        sum_sq += v * v;
+    }
+    return std.math.sqrt(sum_sq);
+}
+
+fn vectorDot(a: []const f32, b: []const f32) f64 {
+    var out: f64 = 0.0;
+    for (a, b) |av, bv| out += @as(f64, @floatCast(av)) * @as(f64, @floatCast(bv));
+    return out;
+}
+
+fn vectorMean(values: []const f32) f64 {
+    if (values.len == 0) return 0.0;
+    var sum: f64 = 0.0;
+    for (values) |value| sum += @floatCast(value);
+    return sum / @as(f64, @floatFromInt(values.len));
+}
+
+fn bindEvalLoraDropoutMasks(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    gs: *real_autodiff.RealAutodiffTrainer.GraphState,
+    rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+) !void {
+    if (trainer.config.lora.dropout <= 0.0) return;
+    for (gs.lora_adapter.adapters.items) |info| {
+        if (info.dropout_mask_id == ml.graph.null_node) continue;
+        const mask_node = gs.graph.node(info.dropout_mask_id);
+        var mask_len: usize = 1;
+        for (mask_node.output_shape.dims[0..mask_node.output_shape.rank()]) |dim| {
+            if (dim <= 0) return error.InvalidTensorShape;
+            mask_len *= @intCast(dim);
+        }
+        const mask = try allocator.alloc(f32, mask_len);
+        defer allocator.free(mask);
+        @memset(mask, 1.0);
+        const placeholder = graph_input_binder.PlaceholderInfo{
+            .node_id = info.dropout_mask_id,
+            .name = gs.graph.parameterName(mask_node),
+            .shape = mask_node.output_shape,
+        };
+        try rt.put(allocator, info.dropout_mask_id, try graph_input_binder.bindF32(trainer.compute_backend, allocator, placeholder, mask));
+    }
 }
 
 fn executeEvalGraphOutputToFloat32(
@@ -1314,6 +1611,20 @@ pub fn fillSpanStartTargetsFromEncodedBatchWithOptions(
         for (0..batch.max_spans) |span_idx| {
             const flat_span_idx = sample_idx * batch.max_spans + span_idx;
             const row = flat_span_idx * width;
+            const schema_idx_offset = if (has_positive_weights) 3 * E else 2 * E;
+            const row_idx_offset = schema_idx_offset + E;
+            const count_idx_offset = row_idx_offset + E;
+            for (0..E) |entity_type_idx| {
+                const label_token_pos_raw = batch.e_token_positions[sample_idx * E + entity_type_idx];
+                if (label_token_pos_raw < 0) return error.InvalidTokenPosition;
+                const label_token_pos: usize = @intCast(label_token_pos_raw);
+                if (label_token_pos >= batch.max_length) return error.InvalidTokenPosition;
+                out[row + schema_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(sample_idx * batch.max_length + label_token_pos));
+                out[row + row_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(flat_span_idx));
+                const compact_schema_row_idx = sample_idx * E + entity_type_idx;
+                const state_idx = count_index * batch.batch_size * E + compact_schema_row_idx;
+                out[row + count_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(state_idx));
+            }
 
             if (batch.span_mask[flat_span_idx] <= 0.0) {
                 stats.ignored_span_count += 1;
@@ -1359,20 +1670,6 @@ pub fn fillSpanStartTargetsFromEncodedBatchWithOptions(
                     stats.positive_span_label_count += 1;
                     stats.positive_counts_by_entity_type[entity_type_idx] += 1;
                 }
-            }
-            const schema_idx_offset = if (has_positive_weights) 3 * E else 2 * E;
-            const row_idx_offset = schema_idx_offset + E;
-            const count_idx_offset = row_idx_offset + E;
-            for (0..E) |entity_type_idx| {
-                const label_token_pos_raw = batch.e_token_positions[sample_idx * E + entity_type_idx];
-                if (label_token_pos_raw < 0) return error.InvalidTokenPosition;
-                const label_token_pos: usize = @intCast(label_token_pos_raw);
-                if (label_token_pos >= batch.max_length) return error.InvalidTokenPosition;
-                out[row + schema_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(sample_idx * batch.max_length + label_token_pos));
-                out[row + row_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(flat_span_idx));
-                const schema_row_idx = flat_span_idx * E + entity_type_idx;
-                const state_idx = count_index * rows * E + schema_row_idx;
-                out[row + count_idx_offset + entity_type_idx] = @as(f32, @floatFromInt(state_idx));
             }
             const start_idx_offset = count_idx_offset + E;
             out[row + start_idx_offset] = @as(f32, @floatFromInt(sample_idx * batch.max_length + token_pos));

@@ -99,12 +99,14 @@ const Options = struct {
     span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: f32 = 1.0,
     span_hard_negative_weight: f32 = 1.0,
+    span_negative_mask_rate: f32 = 0.0,
     max_examples: usize = 0,
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
     seed: u64 = 42,
     backend: Gliner2TrainBackend = .auto,
     compiled_required: bool = false,
+    dump_span_parity: bool = false,
 };
 
 const Gliner2TrainBackend = enum {
@@ -147,12 +149,14 @@ pub fn main(init: std.process.Init) !void {
     var span_label_positive_weights: ?[]const u8 = null;
     var span_negative_weight: f32 = 1.0;
     var span_hard_negative_weight: f32 = 1.0;
+    var span_negative_mask_rate: f32 = 0.0;
     var max_examples: usize = 0;
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
     var seed: u64 = 42;
     var backend: Gliner2TrainBackend = .auto;
     var compiled_required: bool = false;
+    var dump_span_parity: bool = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -215,6 +219,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--span-hard-negative-weight")) {
             const val = args.next() orelse return error.MissingSpanHardNegativeWeight;
             span_hard_negative_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--span-negative-mask-rate")) {
+            const val = args.next() orelse return error.MissingSpanNegativeMaskRate;
+            span_negative_mask_rate = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
             const val = args.next() orelse return error.MissingMaxExamples;
             max_examples = try std.fmt.parseUnsigned(usize, val, 10);
@@ -232,6 +239,8 @@ pub fn main(init: std.process.Init) !void {
             backend = parseBackend(val) orelse return error.InvalidBackend;
         } else if (std.mem.eql(u8, arg, "--compiled-required")) {
             compiled_required = true;
+        } else if (std.mem.eql(u8, arg, "--dump-span-parity")) {
+            dump_span_parity = true;
         } else {
             print("error: unknown argument: {s}\n", .{arg});
             printUsage();
@@ -273,12 +282,14 @@ pub fn main(init: std.process.Init) !void {
         .span_label_positive_weights = span_label_positive_weights,
         .span_negative_weight = span_negative_weight,
         .span_hard_negative_weight = span_hard_negative_weight,
+        .span_negative_mask_rate = span_negative_mask_rate,
         .max_examples = max_examples,
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
         .seed = seed,
         .backend = backend,
         .compiled_required = compiled_required,
+        .dump_span_parity = dump_span_parity,
     };
 
     try runTraining(allocator, opts);
@@ -333,6 +344,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     if (!std.math.isFinite(opts.span_positive_weight) or opts.span_positive_weight <= 0.0) return error.InvalidSpanPositiveWeight;
     if (!std.math.isFinite(opts.span_negative_weight) or opts.span_negative_weight <= 0.0) return error.InvalidSpanNegativeWeight;
     if (!std.math.isFinite(opts.span_hard_negative_weight) or opts.span_hard_negative_weight <= 0.0) return error.InvalidSpanHardNegativeWeight;
+    if (!std.math.isFinite(opts.span_negative_mask_rate) or opts.span_negative_mask_rate < 0.0 or opts.span_negative_mask_rate > 1.0) return error.InvalidSpanNegativeMaskRate;
 
     // ------------------------------------------------------------------
     // 2. Load DeBERTa config — GLiNER2 stores the encoder config under
@@ -831,6 +843,16 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         },
                         targets_buf[0..target_len],
                     );
+                    if (opts.span_negative_mask_rate > 0.0) {
+                        applySpanNegativeMask(
+                            targets_buf[0..target_len],
+                            encoded.max_spans,
+                            encoded.num_entity_types,
+                            use_label_positive_weights,
+                            opts.span_negative_mask_rate,
+                            opts.seed ^ total_steps,
+                        );
+                    }
                     target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
                     targets_shape = if (use_label_positive_weights)
                         gliner2_autodiff.weightedSpanStartTargetsShape(
@@ -845,6 +867,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                             @intCast(encoded.num_entity_types),
                         );
                     target_slice = targets_buf[0..target_len];
+                    if (opts.dump_span_parity and total_steps == 0) {
+                        printSpanPreprocessDebug(&encoded);
+                    }
                 },
             }
             const target_built_ns = monotonicNowNs();
@@ -859,6 +884,35 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 actual_batch,
                 opts.seq_len,
             );
+
+            if (opts.dump_span_parity and opts.objective == .span_start and total_steps == 0) {
+                const logits = try gliner2_autodiff.spanStartLogitsForBatch(
+                    allocator,
+                    &trainer,
+                    &gliner_ctx,
+                    input_ids[0 .. ab * sl],
+                    attention_mask[0 .. ab * sl],
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    opts.seq_len,
+                );
+                defer allocator.free(logits);
+                try printSpanParityDebug(logits, target_slice, targets_shape, entity_types.len, use_label_positive_weights, opts);
+                const components = try gliner2_autodiff.spanStartComponentDebugForBatch(
+                    allocator,
+                    &trainer,
+                    &gliner_ctx,
+                    input_ids[0 .. ab * sl],
+                    attention_mask[0 .. ab * sl],
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    opts.seq_len,
+                    entity_types.len,
+                );
+                printSpanComponentDebug(components);
+            }
 
             const result = try trainer.step(trainer_input);
             const step_finished_ns = monotonicNowNs();
@@ -1858,6 +1912,243 @@ fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *Metal
     }
 }
 
+const SpanParityDebugStats = struct {
+    rows: usize = 0,
+    entity_types: usize = 0,
+    logits_count: usize = 0,
+    valid_weight_count: usize = 0,
+    positive_count: usize = 0,
+    mask_weight_sum: f64 = 0.0,
+    weighted_mask_sum: f64 = 0.0,
+    logits_min: f64 = 0.0,
+    logits_max: f64 = 0.0,
+    logits_mean: f64 = 0.0,
+    positive_logits_mean: f64 = 0.0,
+    negative_logits_mean: f64 = 0.0,
+    bce_unweighted_sum: f64 = 0.0,
+    bce_masked_sum: f64 = 0.0,
+    bce_masked_positive_sum: f64 = 0.0,
+    bce_masked_negative_sum: f64 = 0.0,
+    bce_weighted_sum: f64 = 0.0,
+    bce_weighted_positive_sum: f64 = 0.0,
+    bce_weighted_negative_sum: f64 = 0.0,
+    bce_weighted_mean: f64 = 0.0,
+};
+
+fn printSpanParityDebug(
+    logits: []const f32,
+    targets: []const f32,
+    targets_shape: ml.graph.Shape,
+    entity_types: usize,
+    has_label_positive_weights: bool,
+    opts: Options,
+) !void {
+    if (entity_types == 0) return error.InvalidEntityTypes;
+    const rows: usize = @intCast(targets_shape.dims[0]);
+    const width: usize = @intCast(targets_shape.dims[1]);
+    const expected_width = if (has_label_positive_weights)
+        gliner2_autodiff.weightedSpanStartTargetWidth(entity_types)
+    else
+        gliner2_autodiff.spanStartTargetWidth(entity_types);
+    if (width != expected_width) return error.InvalidGlinerSpanTargetShape;
+    if (targets.len != rows * width) return error.InvalidGlinerSpanTargetShape;
+    if (logits.len != rows * entity_types) return error.InvalidGlinerSpanLogitsShape;
+
+    var stats = SpanParityDebugStats{
+        .rows = rows,
+        .entity_types = entity_types,
+        .logits_count = logits.len,
+        .logits_min = 1.0e300,
+        .logits_max = -1.0e300,
+    };
+    var logits_sum: f64 = 0.0;
+    var pos_logits_sum: f64 = 0.0;
+    var neg_logits_sum: f64 = 0.0;
+    var neg_count: usize = 0;
+
+    for (0..rows) |row_idx| {
+        const target_row = row_idx * width;
+        const logit_row = row_idx * entity_types;
+        for (0..entity_types) |entity_idx| {
+            const label = targets[target_row + entity_idx];
+            const mask_weight = targets[target_row + entity_types + entity_idx];
+            const logit = @as(f64, @floatCast(logits[logit_row + entity_idx]));
+            stats.logits_min = @min(stats.logits_min, logit);
+            stats.logits_max = @max(stats.logits_max, logit);
+            logits_sum += logit;
+
+            const is_positive = label > 0.0;
+            if (is_positive) {
+                stats.positive_count += 1;
+                pos_logits_sum += logit;
+            } else {
+                neg_count += 1;
+                neg_logits_sum += logit;
+            }
+
+            const bce = stableBceWithLogits(logit, if (is_positive) 1.0 else 0.0);
+            stats.bce_unweighted_sum += bce;
+            if (mask_weight > 0.0) {
+                stats.valid_weight_count += 1;
+                const mask_weight64 = @as(f64, @floatCast(mask_weight));
+                const label_weight: f64 = if (is_positive) blk: {
+                    if (has_label_positive_weights) {
+                        const positive_weights_offset = 2 * entity_types;
+                        break :blk @as(f64, @floatCast(targets[target_row + positive_weights_offset + entity_idx]));
+                    }
+                    break :blk @as(f64, @floatCast(opts.span_positive_weight));
+                } else @as(f64, @floatCast(opts.span_negative_weight));
+                stats.mask_weight_sum += mask_weight64;
+                stats.weighted_mask_sum += mask_weight64 * label_weight;
+                stats.bce_masked_sum += bce * mask_weight64;
+                stats.bce_weighted_sum += bce * mask_weight64 * label_weight;
+                if (is_positive) {
+                    stats.bce_masked_positive_sum += bce * mask_weight64;
+                    stats.bce_weighted_positive_sum += bce * mask_weight64 * label_weight;
+                } else {
+                    stats.bce_masked_negative_sum += bce * mask_weight64;
+                    stats.bce_weighted_negative_sum += bce * mask_weight64 * label_weight;
+                }
+            }
+        }
+    }
+
+    if (logits.len > 0) stats.logits_mean = logits_sum / @as(f64, @floatFromInt(logits.len));
+    if (stats.positive_count > 0) stats.positive_logits_mean = pos_logits_sum / @as(f64, @floatFromInt(stats.positive_count));
+    if (neg_count > 0) stats.negative_logits_mean = neg_logits_sum / @as(f64, @floatFromInt(neg_count));
+    if (stats.weighted_mask_sum > 0.0) stats.bce_weighted_mean = stats.bce_weighted_sum / stats.weighted_mask_sum;
+
+    print(
+        "SPAN_PARITY_DEBUG {{\"rows\":{d},\"entity_types\":{d},\"logits_count\":{d},\"valid_weight_count\":{d},\"positive_count\":{d},\"mask_weight_sum\":{d:.9},\"weighted_mask_sum\":{d:.9},\"logits_min\":{d:.9},\"logits_max\":{d:.9},\"logits_mean\":{d:.9},\"positive_logits_mean\":{d:.9},\"negative_logits_mean\":{d:.9},\"bce_unweighted_sum\":{d:.9},\"bce_masked_sum\":{d:.9},\"bce_masked_positive_sum\":{d:.9},\"bce_masked_negative_sum\":{d:.9},\"bce_weighted_sum\":{d:.9},\"bce_weighted_positive_sum\":{d:.9},\"bce_weighted_negative_sum\":{d:.9},\"bce_weighted_mean\":{d:.9},\"reduction\":\"{s}\"}}\n",
+        .{
+            stats.rows,
+            stats.entity_types,
+            stats.logits_count,
+            stats.valid_weight_count,
+            stats.positive_count,
+            stats.mask_weight_sum,
+            stats.weighted_mask_sum,
+            stats.logits_min,
+            stats.logits_max,
+            stats.logits_mean,
+            stats.positive_logits_mean,
+            stats.negative_logits_mean,
+            stats.bce_unweighted_sum,
+            stats.bce_masked_sum,
+            stats.bce_masked_positive_sum,
+            stats.bce_masked_negative_sum,
+            stats.bce_weighted_sum,
+            stats.bce_weighted_positive_sum,
+            stats.bce_weighted_negative_sum,
+            stats.bce_weighted_mean,
+            spanLossReductionName(opts.span_loss_reduction),
+        },
+    );
+}
+
+fn printSpanComponentDebug(components: gliner2_autodiff.SpanStartComponentDebug) void {
+    print(
+        "SPAN_COMPONENT_DEBUG {{\"positive_row\":{d},\"positive_entity\":{d},\"schema_row\":{d},\"start_hidden_norm\":{d:.9},\"end_hidden_norm\":{d:.9},\"projected_span_norm\":{d:.9},\"schema_hidden_norm\":{d:.9},\"schema_projection_norm\":{d:.9},\"projected_schema_dot\":{d:.9},\"projected_span_mean\":{d:.9},\"schema_projection_mean\":{d:.9}}}\n",
+        .{
+            components.positive_row,
+            components.positive_entity,
+            components.schema_row,
+            components.start_hidden_norm,
+            components.end_hidden_norm,
+            components.projected_span_norm,
+            components.schema_hidden_norm,
+            components.schema_projection_norm,
+            components.projected_schema_dot,
+            components.projected_span_mean,
+            components.schema_projection_mean,
+        },
+    );
+}
+
+fn printSpanPreprocessDebug(batch: *const gliner2_data.EncodedBatch) void {
+    const input_ids = batch.input_ids[0..batch.max_length];
+    const attention_mask = batch.attention_mask[0..batch.max_length];
+    const first_positions = batch.first_token_positions[0..batch.max_words_per_sample];
+    const span_mask = batch.span_mask[0..batch.max_spans];
+    const span_indices = batch.span_indices[0 .. batch.max_spans * 2];
+    const span_labels = batch.span_labels[0 .. batch.max_spans * batch.num_entity_types];
+    print("SPAN_PREPROCESS_DEBUG {{\"batch_size\":{d},\"max_length\":{d},\"max_words_per_sample\":{d},\"max_spans\":{d},\"num_entity_types\":{d},\"input_ids\":", .{
+        batch.batch_size,
+        batch.max_length,
+        batch.max_words_per_sample,
+        batch.max_spans,
+        batch.num_entity_types,
+    });
+    printI32JsonArray(input_ids);
+    print(",\"attention_mask\":", .{});
+    printI32JsonArray(attention_mask);
+    print(",\"first_token_positions\":", .{});
+    printI32JsonArray(first_positions);
+    print(",\"e_token_positions\":", .{});
+    printI32JsonArray(batch.e_token_positions[0..batch.num_entity_types]);
+    print(",\"e_token_end_positions\":", .{});
+    printI32JsonArray(batch.e_token_end_positions[0..batch.num_entity_types]);
+    print(",\"span_indices\":", .{});
+    printI32JsonArray(span_indices);
+    print(",\"span_mask\":", .{});
+    printF32JsonArray(span_mask);
+    print(",\"span_labels\":", .{});
+    printF32JsonArray(span_labels);
+    print("}}\n", .{});
+}
+
+fn applySpanNegativeMask(
+    targets: []f32,
+    max_spans: usize,
+    entity_types: usize,
+    has_label_positive_weights: bool,
+    mask_rate: f32,
+    seed: u64,
+) void {
+    if (entity_types == 0) return;
+    const width = if (has_label_positive_weights)
+        gliner2_autodiff.weightedSpanStartTargetWidth(entity_types)
+    else
+        gliner2_autodiff.spanStartTargetWidth(entity_types);
+    if (width == 0 or targets.len % width != 0) return;
+    const rows = targets.len / width;
+    _ = max_spans;
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rng = prng.random();
+    for (0..rows) |row_idx| {
+        const row = row_idx * width;
+        for (0..entity_types) |entity_idx| {
+            const label = targets[row + entity_idx];
+            const mask_idx = row + entity_types + entity_idx;
+            if (label <= 0.0 and targets[mask_idx] > 0.0 and rng.float(f32) < mask_rate) {
+                targets[mask_idx] = 0.0;
+            }
+        }
+    }
+}
+
+fn printI32JsonArray(values: []const i32) void {
+    print("[", .{});
+    for (values, 0..) |value, idx| {
+        if (idx != 0) print(",", .{});
+        print("{d}", .{value});
+    }
+    print("]", .{});
+}
+
+fn printF32JsonArray(values: []const f32) void {
+    print("[", .{});
+    for (values, 0..) |value, idx| {
+        if (idx != 0) print(",", .{});
+        print("{d:.6}", .{value});
+    }
+    print("]", .{});
+}
+
+fn stableBceWithLogits(logit: f64, label: f64) f64 {
+    return @max(logit, 0.0) - logit * label + @log(1.0 + @exp(-@abs(logit)));
+}
+
 fn printUsage() void {
     // Zig 0.16: std.debug.print requires a format tuple. For plain string
     // output, use a no-arg format with the text inlined.
@@ -1888,12 +2179,14 @@ fn printUsage() void {
         \\  --span-label-positive-weights <csv> Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight <f> Negative span-label loss weight (default: 1)
         \\  --span-hard-negative-weight <f> Extra negative weight for spans overlapping gold entities (default: 1)
+        \\  --span-negative-mask-rate <f> Randomly mask this fraction of negative span labels (default: 0)
         \\  --max-examples <n>        Cap on training examples (default: 0 = all)
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --seed <n>                RNG seed (default: 42)
         \\  --backend <name>          auto, metal, mlx, or native (default: auto)
         \\  --compiled-required       Fail if the requested compiled backend cannot run
+        \\  --dump-span-parity        Print first span-start batch logits/label/mask BCE stats as JSON
         \\
         \\notes:
         \\  Tokenization uses gliner2_data.Tokenizer.initGLiNER2HF and the

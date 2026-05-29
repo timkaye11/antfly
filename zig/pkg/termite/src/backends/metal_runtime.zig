@@ -3891,6 +3891,39 @@ pub fn decoderRuntimeDotGeneralBatchedF32Device(
     return output_device;
 }
 
+pub fn decoderRuntimeScatterAddAxis0F32Device(
+    self: anytype,
+    values: MetalTensor,
+    indices: MetalTensor,
+    out_rows: usize,
+    value_rows: usize,
+    dim: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!values.isDevice() or !indices.isDevice()) return null;
+    if (out_rows == 0 or value_rows == 0 or dim == 0) return null;
+    if (value_rows > std.math.maxInt(usize) / dim or out_rows > std.math.maxInt(usize) / dim) return null;
+    if (values.elemCount() != value_rows * dim or indices.elemCount() < value_rows) return null;
+    const out_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, out_rows * dim * @sizeOf(f32), .private, &out_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_scatter_add_axis0_f32_device(
+        runtime,
+        values.deviceHandle(),
+        values.deviceByteOffset(),
+        indices.deviceHandle(),
+        indices.deviceByteOffset(),
+        out_rows,
+        value_rows,
+        dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
 pub fn decoderRuntimeConv1dF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7775,6 +7808,18 @@ pub extern fn termite_metal_decode_runtime_dot_general_batched_f32_device(
     n: usize,
     k: usize,
     rhs_contract_axis: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_scatter_add_axis0_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    values_handle: ?*anyopaque,
+    values_offset: usize,
+    indices_handle: ?*anyopaque,
+    indices_offset: usize,
+    out_rows: usize,
+    value_rows: usize,
+    dim: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

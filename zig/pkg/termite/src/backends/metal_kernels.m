@@ -397,6 +397,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> transpose_f32_pipeline;
     id<MTLComputePipelineState> dot_general_2d_f32_pipeline;
     id<MTLComputePipelineState> dot_general_batched_f32_pipeline;
+    id<MTLComputePipelineState> scatter_add_axis0_f32_pipeline;
     id<MTLComputePipelineState> conv1d_f32_pipeline;
     id<MTLComputePipelineState> conv2d_f32_pipeline;
     id<MTLComputePipelineState> layer_norm_pipeline;
@@ -1890,6 +1891,13 @@ typedef struct termite_metal_dot_general_batched_f32_params {
     uint32_t reserved2;
 } termite_metal_dot_general_batched_f32_params;
 
+typedef struct termite_metal_scatter_add_axis0_f32_params {
+    uint32_t out_rows;
+    uint32_t value_rows;
+    uint32_t dim;
+    uint32_t reserved0;
+} termite_metal_scatter_add_axis0_f32_params;
+
 typedef struct termite_metal_conv1d_f32_params {
     uint32_t batch;
     uint32_t in_channels;
@@ -1982,6 +1990,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
            "struct termite_metal_dot_general_2d_f32_params { uint m; uint n; uint k; uint rhs_contract_axis; };\n"
            "struct termite_metal_dot_general_batched_f32_params { uint batch_count; uint m; uint n; uint k; uint rhs_contract_axis; uint reserved0; uint reserved1; uint reserved2; };\n"
+           "struct termite_metal_scatter_add_axis0_f32_params { uint out_rows; uint value_rows; uint dim; uint reserved0; };\n"
            "struct termite_metal_conv1d_f32_params { uint batch; uint in_channels; uint out_channels; uint time_steps; uint kernel_size; uint stride; uint padding; uint out_time; uint has_bias; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_conv2d_f32_params { uint batch; uint in_channels; uint out_channels; uint height; uint width; uint kernel_h; uint kernel_w; uint stride_h; uint stride_w; uint padding_h; uint padding_w; uint groups; uint out_h; uint out_w; uint has_bias; uint reserved0; };\n"
            "inline float termite_erf_approx(float x) {\n"
@@ -2044,7 +2053,12 @@ static NSString *termite_metal_shader_source(void) {
            "        case 10u: return log(x);\n"
            "        case 11u: return sin(x);\n"
            "        case 12u: return cos(x);\n"
-           "        case 13u: return tanh(x);\n"
+           "        case 13u: {\n"
+           "            if (!isfinite(x)) return 0.0f;\n"
+           "            if (x > 10.0f) return 1.0f;\n"
+           "            if (x < -10.0f) return -1.0f;\n"
+           "            return tanh(x);\n"
+           "        }\n"
            "        case 14u: return termite_erf_approx(x);\n"
            "        case 15u: return fabs(x);\n"
            "        case 16u: return 1.0f / (1.0f + exp(-x));\n"
@@ -3838,6 +3852,11 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_dot_general_batched_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_batched_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint per_batch = p.m * p.n; uint total = p.batch_count * per_batch; if (gid >= total || p.k == 0u || per_batch == 0u) return; uint batch = gid / per_batch; uint inner = gid - batch * per_batch; uint row = inner / p.n; uint col = inner - row * p.n; uint lhs_base = batch * p.m * p.k; uint rhs_base = batch * p.n * p.k; float acc = 0.0f;\n"
            "    for (uint kk = 0u; kk < p.k; ++kk) { float r = p.rhs_contract_axis == 0u ? rhs[rhs_base + kk * p.n + col] : rhs[rhs_base + col * p.k + kk]; acc += lhs[lhs_base + row * p.k + kk] * r; }\n"
+           "    output[gid] = acc;\n"
+           "}\n"
+           "kernel void termite_scatter_add_axis0_f32(device const float *values [[buffer(0)]], device const float *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_scatter_add_axis0_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total = p.out_rows * p.dim; if (gid >= total || p.dim == 0u) return; uint out_row = gid / p.dim; uint col = gid - out_row * p.dim; float acc = 0.0f;\n"
+           "    for (uint row = 0u; row < p.value_rows; ++row) { uint target = uint(rint(indices[row])); if (target == out_row) acc += values[row * p.dim + col]; }\n"
            "    output[gid] = acc;\n"
            "}\n"
            "kernel void termite_conv1d_f32(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_conv1d_f32_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -11058,6 +11077,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->transpose_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_transpose_f32");
         runtime->dot_general_2d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_2d_f32");
         runtime->dot_general_batched_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_batched_f32");
+        runtime->scatter_add_axis0_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_scatter_add_axis0_f32");
         runtime->conv1d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv1d_f32");
         runtime->conv2d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv2d_f32");
         runtime->layer_norm_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_layer_norm_1x");
@@ -11204,7 +11224,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->turbo3_attention_span_pipeline = termite_metal_make_pipeline(device, library, @"termite_turbo3_attention_span");
         BOOL missing_quant_reduce_pipeline = runtime->q4_1_reduce_pipeline == nil || runtime->q5_1_reduce_pipeline == nil || runtime->q8_1_reduce_pipeline == nil || runtime->q8_k_reduce_pipeline == nil || runtime->iq4_nl_reduce_pipeline == nil || runtime->iq4_xs_reduce_pipeline == nil || runtime->mxfp4_reduce_pipeline == nil;
         BOOL missing_dense_multi_row_reduce_pipeline = runtime->linear_bf16_multi_row_reduce_pipeline == nil || runtime->linear_multi_row_reduce_pipeline == nil;
-        if (missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
+        if (missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->scatter_add_axis0_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
             fprintf(stderr, "metal-runtime-create: pipeline=nil");
             if (runtime->embed_absolute_position_pipeline == nil) fprintf(stderr, " embed_absolute_position");
             if (runtime->embedding_lookup_pipeline == nil) fprintf(stderr, " embedding_lookup");
@@ -11256,6 +11276,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             if (runtime->transpose_f32_pipeline == nil) fprintf(stderr, " transpose_f32");
             if (runtime->dot_general_2d_f32_pipeline == nil) fprintf(stderr, " dot_general_2d_f32");
             if (runtime->dot_general_batched_f32_pipeline == nil) fprintf(stderr, " dot_general_batched_f32");
+            if (runtime->scatter_add_axis0_f32_pipeline == nil) fprintf(stderr, " scatter_add_axis0_f32");
             if (runtime->conv1d_f32_pipeline == nil) fprintf(stderr, " conv1d_f32");
             if (runtime->conv2d_f32_pipeline == nil) fprintf(stderr, " conv2d_f32");
             if (runtime->layer_norm_pipeline == nil) fprintf(stderr, " layer_norm");
@@ -11453,6 +11474,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->transpose_f32_pipeline = nil;
     runtime->dot_general_2d_f32_pipeline = nil;
     runtime->dot_general_batched_f32_pipeline = nil;
+    runtime->scatter_add_axis0_f32_pipeline = nil;
     runtime->conv1d_f32_pipeline = nil;
     runtime->conv2d_f32_pipeline = nil;
     runtime->layer_norm_pipeline = nil;
@@ -22430,7 +22452,20 @@ int termite_metal_decode_runtime_transpose_f32_device(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -6;
-        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(
+                runtime,
+                input_buffer,
+                input_offset,
+                bytes,
+                output_buffer,
+                output_offset,
+                bytes,
+                -7) != 0)
+        {
+            return -7;
+        }
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL, &encoder_owned);
         if (encoder == nil) return -7;
         [encoder setComputePipelineState:runtime->transpose_f32_pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
@@ -22438,7 +22473,7 @@ int termite_metal_decode_runtime_transpose_f32_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->transpose_f32_pipeline, total), 1, 1)];
-        [encoder endEncoding];
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
     }
 }
@@ -22560,6 +22595,64 @@ int termite_metal_decode_runtime_dot_general_batched_f32_device(
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dot_general_batched_f32_pipeline, total), 1, 1)];
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+    }
+}
+
+int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
+    termite_metal_decode_runtime *runtime,
+    void *values_handle,
+    size_t values_offset,
+    void *indices_handle,
+    size_t indices_offset,
+    size_t out_rows,
+    size_t value_rows,
+    size_t dim,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || values_handle == NULL || indices_handle == NULL || output_handle == NULL) return -1;
+    if (runtime->scatter_add_axis0_f32_pipeline == nil) return -2;
+    if (out_rows == 0 || value_rows == 0 || dim == 0 || out_rows > UINT32_MAX || value_rows > UINT32_MAX || dim > UINT32_MAX) return -3;
+    if (value_rows > SIZE_MAX / dim || out_rows > SIZE_MAX / dim) return -4;
+    @autoreleasepool {
+        id<MTLBuffer> values_buffer = (__bridge id<MTLBuffer>)values_handle;
+        id<MTLBuffer> indices_buffer = (__bridge id<MTLBuffer>)indices_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        const size_t values_bytes = value_rows * dim * sizeof(float);
+        const size_t indices_bytes = value_rows * sizeof(float);
+        const size_t total = out_rows * dim;
+        const size_t output_bytes = total * sizeof(float);
+        if (total > UINT32_MAX) return -5;
+        if (values_offset + values_bytes > values_buffer.length || indices_offset + indices_bytes > indices_buffer.length || output_offset + output_bytes > output_buffer.length) return -6;
+        termite_metal_scatter_add_axis0_f32_params params = {
+            .out_rows = (uint32_t)out_rows,
+            .value_rows = (uint32_t)value_rows,
+            .dim = (uint32_t)dim,
+            .reserved0 = 0,
+        };
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -7;
+        termite_metal_planned_encoder_range accesses[3];
+        if (termite_metal_planned_range_make(values_buffer, values_offset, values_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -8) != 0 ||
+            termite_metal_planned_range_make(indices_buffer, indices_offset, indices_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -8) != 0 ||
+            termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -8) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -8) != 0)
+        {
+            return -8;
+        }
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL, &encoder_owned);
+        if (encoder == nil) return -8;
+        [encoder setComputePipelineState:runtime->scatter_add_axis0_f32_pipeline];
+        [encoder setBuffer:values_buffer offset:values_offset atIndex:0];
+        [encoder setBuffer:indices_buffer offset:indices_offset atIndex:1];
+        [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->scatter_add_axis0_f32_pipeline, total), 1, 1)];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }

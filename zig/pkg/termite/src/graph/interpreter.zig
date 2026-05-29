@@ -239,11 +239,66 @@ fn graphOpProfileEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_OP_PROFILE", false);
 }
 
+fn graphFiniteTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_GRAPH_FINITE_TRACE", false);
+}
+
+fn graphFiniteTraceMaxElems() usize {
+    const value = platform.env.getenv("TERMITE_GRAPH_FINITE_TRACE_MAX_ELEMS") orelse return 200_000;
+    return std.fmt.parseUnsigned(usize, value, 10) catch 200_000;
+}
+
 fn graphOpSlowThresholdNs() u64 {
     const value = platform.env.getenv("TERMITE_GRAPH_OP_SLOW_MS") orelse return 0;
     const ms = std.fmt.parseFloat(f64, value) catch return 0;
     if (ms <= 0) return 0;
     return @intFromFloat(ms * 1_000_000.0);
+}
+
+fn checkNodeFinite(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    node_id: NodeId,
+    ct: CT,
+    max_elems: usize,
+) !void {
+    const shape = cb.tensorShape(ct, allocator) catch return;
+    defer allocator.free(shape);
+    var elem_count: usize = 1;
+    for (shape) |dim| {
+        if (dim <= 0) return;
+        const dim_usize: usize = @intCast(dim);
+        elem_count = std.math.mul(usize, elem_count, dim_usize) catch return;
+    }
+    if (max_elems > 0 and elem_count > max_elems) return;
+    const data = cb.toFloat32(ct, allocator) catch return;
+    defer allocator.free(data);
+    for (data, 0..) |value, idx| {
+        if (!std.math.isFinite(value)) {
+            const node = graph.node(node_id);
+            std.debug.print(
+                "[graph-finite] first_nonfinite node={} op={s} idx={} value={d} shape={any} declared_shape={any}\n",
+                .{
+                    node_id,
+                    @tagName(std.meta.activeTag(node.op)),
+                    idx,
+                    value,
+                    shape,
+                    node.output_shape,
+                },
+            );
+            for (node.getInputs(), 0..) |input_id, input_idx| {
+                if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+                const input_node = graph.node(input_id);
+                std.debug.print(
+                    "[graph-finite] input{} id={} op={s} shape={any}\n",
+                    .{ input_idx, input_id, @tagName(std.meta.activeTag(input_node.op)), input_node.output_shape },
+                );
+            }
+            return error.NonFiniteGraphNode;
+        }
+    }
 }
 
 fn graphExecDiag(comptime fmt: []const u8, args: anytype) void {
@@ -361,6 +416,8 @@ pub fn execute(
     const count = graph.nodeCount();
     const trace_nodes = graphExecTraceEnabled();
     const profile_ops = graphOpProfileEnabled();
+    const finite_trace = graphFiniteTraceEnabled();
+    const finite_trace_max_elems = graphFiniteTraceMaxElems();
     const slow_op_threshold_ns = graphOpSlowThresholdNs();
     var op_profiler = OpProfiler{ .allocator = allocator };
     defer op_profiler.deinit();
@@ -381,17 +438,21 @@ pub fn execute(
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
 
-    // 3. Build runtime input lookup + donation set
-    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-    defer rt_map.deinit(allocator);
-    var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-    defer donated.deinit(allocator);
+    // 3. Build runtime input lookup + donation set. Dense indexed arrays
+    // avoid a hash lookup for every graph node during compiled training.
+    const rt_values = try allocator.alloc(?CT, count);
+    defer allocator.free(rt_values);
+    @memset(rt_values, null);
+    const donated_values = try allocator.alloc(bool, count);
+    defer allocator.free(donated_values);
+    @memset(donated_values, false);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
-            try rt_map.put(allocator, ri.node_id, ri.value);
+            if (ri.node_id >= count) continue;
+            rt_values[@intCast(ri.node_id)] = ri.value;
             if (options.donate) |d| {
                 if (idx < d.len and d[idx]) {
-                    try donated.put(allocator, ri.node_id, {});
+                    donated_values[@intCast(ri.node_id)] = true;
                 }
             }
         }
@@ -432,7 +493,7 @@ pub fn execute(
         const node_id: NodeId = @intCast(i);
 
         // Check for runtime input override
-        if (rt_map.get(node_id)) |rt_val| {
+        if (rt_values[i]) |rt_val| {
             if (trace_nodes) {
                 const node = graph.node(node_id);
                 graphExecDiag("node runtime id={} op={s} shape={any} rss={}", .{
@@ -515,16 +576,26 @@ pub fn execute(
             });
         }
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
+        if (finite_trace) {
+            try checkNodeFinite(
+                allocator,
+                graph,
+                cb,
+                node_id,
+                values[i].?,
+                finite_trace_max_elems,
+            );
+        }
         try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, values[i].?);
-        try cloneOutputIfAliasedInputWouldBeFreed(
+        try cloneOutputIfAliasedInputWouldBeFreedFast(
             allocator,
             graph,
             cb,
             values,
             node_id,
             last_use,
-            rt_map,
-            donated,
+            rt_values,
+            donated_values,
         );
 
         // Free inputs whose last consumer is this node
@@ -534,7 +605,8 @@ pub fn execute(
             if (last_use[input_id] == i) {
                 // Don't free non-donated runtime inputs (caller owns them).
                 // Donated inputs are owned by the interpreter now.
-                if (rt_map.contains(input_id) and !donated.contains(input_id)) continue;
+                const input_idx: usize = @intCast(input_id);
+                if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
@@ -562,7 +634,7 @@ pub fn execute(
         var aliases_rt = false;
         if (options.runtime_inputs) |inputs| {
             for (inputs) |ri| {
-                if (!donated.contains(ri.node_id) and ri.value == ct) {
+                if (ri.node_id < donated_values.len and !donated_values[@intCast(ri.node_id)] and ri.value == ct) {
                     aliases_rt = true;
                     break;
                 }
@@ -601,7 +673,7 @@ pub fn execute(
         if (is_output) continue;
         // Skip non-donated runtime inputs — caller owns them.
         // Donated inputs are interpreter-owned; free if still live.
-        if (rt_map.contains(@intCast(i)) and !donated.contains(@intCast(i))) continue;
+        if (rt_values[i] != null and !donated_values[i]) continue;
         // Free any remaining handles (parameters, donated inputs, or
         // intermediates that weren't caught by liveness-based freeing)
         cb.free(values[i].?);
@@ -631,16 +703,19 @@ pub fn captureNodeValues(
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
 
-    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-    defer rt_map.deinit(allocator);
-    var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-    defer donated.deinit(allocator);
+    const rt_values = try allocator.alloc(?CT, count);
+    defer allocator.free(rt_values);
+    @memset(rt_values, null);
+    const donated_values = try allocator.alloc(bool, count);
+    defer allocator.free(donated_values);
+    @memset(donated_values, false);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
-            try rt_map.put(allocator, ri.node_id, ri.value);
+            if (ri.node_id >= count) continue;
+            rt_values[@intCast(ri.node_id)] = ri.value;
             if (options.donate) |d| {
                 if (idx < d.len and d[idx]) {
-                    try donated.put(allocator, ri.node_id, {});
+                    donated_values[@intCast(ri.node_id)] = true;
                 }
             }
         }
@@ -688,7 +763,7 @@ pub fn captureNodeValues(
 
         const node_id: NodeId = @intCast(i);
 
-        if (rt_map.get(node_id)) |rt_val| {
+        if (rt_values[i]) |rt_val| {
             values[i] = rt_val;
             logNodeRuntimeShape(graph, cb, node_id, rt_val);
             try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, rt_val);
@@ -710,22 +785,23 @@ pub fn captureNodeValues(
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
         try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, values[i].?);
         try maybeCaptureNodeValue(allocator, graph, cb, capture_node_ids, captured, node_id, values[i].?);
-        try cloneOutputIfAliasedInputWouldBeFreed(
+        try cloneOutputIfAliasedInputWouldBeFreedFast(
             allocator,
             graph,
             cb,
             values,
             node_id,
             last_use,
-            rt_map,
-            donated,
+            rt_values,
+            donated_values,
         );
 
         const n = graph.node(node_id);
         for (n.getInputs()) |input_id| {
             if (input_id == null_node or input_id >= count) continue;
             if (last_use[input_id] == i) {
-                if (rt_map.contains(input_id) and !donated.contains(input_id)) continue;
+                const input_idx: usize = @intCast(input_id);
+                if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
@@ -787,6 +863,40 @@ pub fn cloneOutputIfAliasedInputWouldBeFreed(
 
         const input_is_non_donated_runtime = rt_map.contains(input_id) and !donated.contains(input_id);
         const input_dies_now = last_use[@intCast(input_id)] == out_idx;
+        if (canKeepAliasedOutput(n.op) and input_dies_now and !input_is_non_donated_runtime) {
+            // Last-use consume paths transfer ownership from the input slot to
+            // the output slot later in execute() by nulling the input instead
+            // of freeing it. Keep the aliased output in that specific case.
+            return;
+        }
+
+        values[out_idx] = try cloneTensorForShape(allocator, cb, output_ct, n.output_shape);
+        return;
+    }
+}
+
+fn cloneOutputIfAliasedInputWouldBeFreedFast(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    node_id: NodeId,
+    last_use: []const u32,
+    rt_values: []const ?CT,
+    donated_values: []const bool,
+) !void {
+    const out_idx: usize = @intCast(node_id);
+    const output_ct = values[out_idx] orelse return;
+    const n = graph.node(node_id);
+
+    for (n.getInputs()) |input_id| {
+        if (input_id == null_node or input_id >= values.len) continue;
+        const input_ct = values[@intCast(input_id)] orelse continue;
+        if (input_ct != output_ct) continue;
+
+        const input_idx: usize = @intCast(input_id);
+        const input_is_non_donated_runtime = input_idx < rt_values.len and rt_values[input_idx] != null and !donated_values[input_idx];
+        const input_dies_now = last_use[input_idx] == out_idx;
         if (canKeepAliasedOutput(n.op) and input_dies_now and !input_is_non_donated_runtime) {
             // Last-use consume paths transfer ownership from the input slot to
             // the output slot later in execute() by nulling the input instead
@@ -2582,6 +2692,19 @@ pub fn executeNode(
                     dest_buf[axis] = dim;
                     dims_i32[axis] = @intCast(dim);
                 }
+                scatter_values = V.get(ins[0]);
+                indices = V.get(ins[1]);
+                dest_shape = dest_buf[0..rank];
+                values_shape = fillShapeDims(graph, ins[0], &values_buf);
+                indices_shape = fillShapeDims(graph, ins[1], &indices_buf);
+
+                if (cb.primScatterAdd(scatter_values, indices, values_shape, dest_shape, attrs.axis)) |result| {
+                    return result;
+                } else |err| switch (err) {
+                    error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape => {},
+                    else => return err,
+                }
+
                 const elem_count_i64 = out_shape.numElements() orelse return error.UnsupportedShape;
                 if (elem_count_i64 < 0) return error.UnsupportedShape;
                 const elem_count: usize = @intCast(elem_count_i64);
@@ -2589,13 +2712,7 @@ pub fn executeNode(
                 defer std.heap.page_allocator.free(zeros);
                 @memset(zeros, 0.0);
                 generated_dest = try cb.fromFloat32Shape(zeros, dims_i32[0..rank]);
-
                 dest = generated_dest.?;
-                scatter_values = V.get(ins[0]);
-                indices = V.get(ins[1]);
-                dest_shape = dest_buf[0..rank];
-                values_shape = fillShapeDims(graph, ins[0], &values_buf);
-                indices_shape = fillShapeDims(graph, ins[1], &indices_buf);
             } else {
                 dest = V.get(ins[0]);
                 scatter_values = V.get(ins[1]);

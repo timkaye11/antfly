@@ -37370,8 +37370,10 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_data = getData(a);
     const b_data = getData(b);
-    const effective_a_shape = storedOrDeclaredShape(a, a_shape);
-    const effective_b_shape = storedOrDeclaredShape(b, b_shape);
+    const effective_a_shape_raw = storedOrDeclaredShape(a, a_shape);
+    const effective_b_shape_raw = storedOrDeclaredShape(b, b_shape);
+    const effective_a_shape = if (effective_a_shape_raw.len != effective_b_shape_raw.len and a_shape.len == b_shape.len) a_shape else effective_a_shape_raw;
+    const effective_b_shape = if (effective_a_shape_raw.len != effective_b_shape_raw.len and a_shape.len == b_shape.len) b_shape else effective_b_shape_raw;
     var resolved_a_shape_buf: [8]i64 = undefined;
     var resolved_b_shape_buf: [8]i64 = undefined;
     const resolved_a_shape = if (resolveShapeFromTensorMetadata(a, effective_a_shape, a_data.len)) |resolved| blk: {

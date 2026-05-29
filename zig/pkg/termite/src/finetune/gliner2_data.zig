@@ -249,32 +249,34 @@ pub const Tokenizer = struct {
         const max_length = input_ids.len;
         var pos: usize = 0;
         if (self.use_gliner2_hf_prompt) {
+            pos = self.encodeHFFragmentIntoAllocating(allocator, "(", input_ids, attention_mask, pos, max_length) catch pos;
             if (pos < max_length) {
                 input_ids[pos] = self.p_token_id;
                 attention_mask[pos] = 1;
                 pos += 1;
             }
+            pos = self.encodeHFFragmentIntoAllocating(allocator, "entities", input_ids, attention_mask, pos, max_length) catch pos;
+            pos = self.encodeHFFragmentIntoAllocating(allocator, "(", input_ids, attention_mask, pos, max_length) catch pos;
 
             for (entity_types, 0..) |entity_type, i| {
-                if (pos >= max_length - 1) break;
-                const label_start = pos;
-                const new_pos = self.encodeHFFragmentIntoAllocating(allocator, entity_type, input_ids, attention_mask, pos, max_length - 1) catch pos;
-                if (new_pos >= max_length - 1) {
-                    // Partial encode: zero out any tokens already written so the sequence
-                    // boundary is clean and the model doesn't see a truncated entity label.
-                    @memset(input_ids[label_start..new_pos], 0);
-                    @memset(attention_mask[label_start..new_pos], 0);
+                if (pos >= max_length) break;
+                input_ids[pos] = self.ent_id;
+                attention_mask[pos] = 1;
+                pos += 1;
+                if (pos >= max_length) break;
+                const label_start = pos - 1;
+                const new_pos = self.encodeHFFragmentIntoAllocating(allocator, entity_type, input_ids, attention_mask, pos, max_length) catch pos;
+                if (new_pos >= max_length and i + 1 < entity_types.len) {
                     break;
                 }
                 pos = new_pos;
                 e_token_positions[i] = @intCast(label_start);
                 e_token_end_positions[i] = @intCast(pos);
-                input_ids[pos] = self.ent_id;
-                attention_mask[pos] = 1;
-                pos += 1;
             }
+            pos = self.encodeHFFragmentIntoAllocating(allocator, ")", input_ids, attention_mask, pos, max_length) catch pos;
+            pos = self.encodeHFFragmentIntoAllocating(allocator, ")", input_ids, attention_mask, pos, max_length) catch pos;
 
-            if (pos < max_length - 1) {
+            if (pos < max_length) {
                 input_ids[pos] = self.sep_text_token_id;
                 attention_mask[pos] = 1;
                 pos += 1;
@@ -284,13 +286,26 @@ pub const Tokenizer = struct {
             var words_hf = std.mem.tokenizeAny(u8, text, " \t\r\n");
             while (words_hf.next()) |word| {
                 if (num_words_hf >= first_token_positions.len) break;
-                if (pos >= max_length - 1) break;
+                if (pos >= max_length) break;
                 first_token_positions[num_words_hf] = @intCast(pos);
-                const next_pos = self.encodeHFFragmentIntoAllocating(allocator, word, input_ids, attention_mask, pos, max_length - 1) catch pos;
+                const lower_word = std.ascii.allocLowerString(allocator, word) catch break;
+                defer allocator.free(lower_word);
+                const next_pos = self.encodeHFFragmentIntoAllocating(allocator, lower_word, input_ids, attention_mask, pos, max_length) catch pos;
                 if (next_pos == pos) break;
                 for (pos..next_pos) |token_pos| words_mask[token_pos] = @intCast(num_words_hf + 1);
                 pos = next_pos;
                 num_words_hf += 1;
+            }
+            const trimmed_text = std.mem.trim(u8, text, " \t\r\n");
+            const needs_period = trimmed_text.len == 0 or !(trimmed_text[trimmed_text.len - 1] == '.' or trimmed_text[trimmed_text.len - 1] == '!' or trimmed_text[trimmed_text.len - 1] == '?');
+            if (needs_period and num_words_hf < first_token_positions.len and pos < max_length) {
+                first_token_positions[num_words_hf] = @intCast(pos);
+                const next_pos = self.encodeHFFragmentIntoAllocating(allocator, ".", input_ids, attention_mask, pos, max_length) catch pos;
+                if (next_pos != pos) {
+                    for (pos..next_pos) |token_pos| words_mask[token_pos] = @intCast(num_words_hf + 1);
+                    pos = next_pos;
+                    num_words_hf += 1;
+                }
             }
             return .{ .num_words = num_words_hf };
         }
@@ -421,7 +436,7 @@ pub const Tokenizer = struct {
         limit: usize,
     ) !usize {
         var pos = start_pos;
-        const pieces = try self.metaspacePreTokenizeWithScheme(allocator, text, .never);
+        const pieces = try self.metaspacePreTokenizeWithScheme(allocator, text, .always);
         defer {
             for (pieces) |piece| allocator.free(piece);
             allocator.free(pieces);

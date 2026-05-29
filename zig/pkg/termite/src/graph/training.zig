@@ -97,12 +97,30 @@ pub const TrainStepOptions = struct {
     emit_checkpoint_analysis: bool = false,
 };
 
+fn beginOwnedExecutionFrame(cb: *const ComputeBackend) !bool {
+    if (cb.decoderRuntimeHasActiveFrame()) return false;
+    return try cb.decoderRuntimeBeginFrame();
+}
+
+fn cancelOwnedExecutionFrame(cb: *const ComputeBackend, active: *bool) void {
+    if (!active.*) return;
+    cb.decoderRuntimeCancelFrame() catch {};
+    active.* = false;
+}
+
+fn submitOwnedExecutionFrame(cb: *const ComputeBackend, active: *bool) !void {
+    if (!active.*) return;
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    active.* = false;
+}
+
 pub const CompiledTrainSession = struct {
     allocator: std.mem.Allocator,
     graph: Graph,
     id_map: []NodeId,
     wrt_names: [][]const u8,
     param_grads: []NodeId,
+    analysis: interpreter.CachedAnalysis,
     loss_output_index: usize = 0,
     build_profile: TrainStepProfile = .{},
 
@@ -182,6 +200,11 @@ pub const CompiledTrainSession = struct {
         const compiled_graph = grad_result.graph;
         grad_result.graph = Graph.init(allocator);
         grad_result.deinit();
+        const analysis = try interpreter.CachedAnalysis.compute(allocator, &compiled_graph);
+        errdefer {
+            var mutable_analysis = analysis;
+            mutable_analysis.deinit(allocator);
+        }
         profile.total_ns = profile.autodiff_ns + profile.checkpoint_ns;
         compiledDiag(
             "init done compiled_nodes={} outputs={} total_ms={d:.3} peak_rss={}",
@@ -199,11 +222,13 @@ pub const CompiledTrainSession = struct {
             .id_map = id_map,
             .wrt_names = wrt_names,
             .param_grads = param_grads,
+            .analysis = analysis,
             .build_profile = profile,
         };
     }
 
     pub fn deinit(self: *CompiledTrainSession) void {
+        self.analysis.deinit(self.allocator);
         self.graph.deinit();
         self.allocator.free(self.id_map);
         for (self.wrt_names) |name| self.allocator.free(name);
@@ -264,12 +289,15 @@ pub const CompiledTrainSession = struct {
                 currentResidentBytes(),
             },
         );
+        var owned_execution_frame = try beginOwnedExecutionFrame(cb);
+        errdefer cancelOwnedExecutionFrame(cb, &owned_execution_frame);
         var exec_result = try interpreter.execute(
             self.allocator,
             &self.graph,
             cb,
-            .{ .runtime_inputs = rt_slice },
+            .{ .runtime_inputs = rt_slice, .cached_analysis = self.analysis },
         );
+        try submitOwnedExecutionFrame(cb, &owned_execution_frame);
         profile.execute_ns = elapsedNs(execute_start);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         compiledDiag("execute done execute_ms={d:.3} rss={}", .{ nsToMs(profile.execute_ns), profile.peak_resident_bytes });
@@ -436,12 +464,15 @@ pub fn trainStep(
 
     // Execute the gradient graph.
     const execute_start = nowNs();
+    var owned_execution_frame = try beginOwnedExecutionFrame(cb);
+    errdefer cancelOwnedExecutionFrame(cb, &owned_execution_frame);
     var exec_result = try interpreter.execute(
         allocator,
         &grad_result.graph,
         cb,
         .{ .runtime_inputs = rt_slice },
     );
+    try submitOwnedExecutionFrame(cb, &owned_execution_frame);
     profile.execute_ns = elapsedNs(execute_start);
     profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
     defer exec_result.deinit(cb);
