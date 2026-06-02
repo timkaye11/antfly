@@ -39,6 +39,7 @@ const metal_runtime_mod = if (build_options.enable_metal) @import("../backends/m
 const Graph = ml.graph.Graph;
 const NodeId = ml.graph.NodeId;
 const null_node = ml.graph.null_node;
+const Shape = ml.graph.Shape;
 
 const CT = contracts.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
@@ -423,12 +424,18 @@ pub const MetalPartitionExecutor = struct {
         const buffer_plan = exec_ctx.buffer_plan orelse return error.MissingPartitionExecutionContext;
         const partition_plan = exec_ctx.partition_plan orelse return error.MissingPartitionExecutionContext;
         const trace_nodes = traceMetalGraphNodesEnabled();
+        const progress_interval = metalGraphProgressInterval();
+        const progress_start = metalGraphProgressStart();
+        const progress_end = metalGraphProgressEnd();
+        const trace_progress = progress_interval != 0 or progress_start != std.math.maxInt(usize) or progress_end != std.math.maxInt(usize);
         const partition_index = try partitionIndexForNodes(buffer_plan, node_ids);
         if (trace_nodes) std.debug.print("graph_executor_node_trace: executor_begin partition={d} nodes={d}\n", .{ partition_index, node_ids.len });
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_begin partition={d} nodes={d}\n", .{ partition_index, node_ids.len });
 
         var partition_view = try buffer_plan.partitionView(allocator, partition_plan, partition_index);
         defer partition_view.deinit(allocator);
         try validatePartitionView(partition_view, node_ids);
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=partition_view_ready partition={d} slots={d} transfers_in={d} transfers_out={d}\n", .{ partition_index, partition_view.slots.len, partition_view.transfers_in.len, partition_view.transfers_out.len });
         if (trace_nodes) {
             std.debug.print(
                 "graph_executor_node_trace: partition_view partition={d} slots={d} transfers_in={d} transfers_out={d}\n",
@@ -439,7 +446,9 @@ pub const MetalPartitionExecutor = struct {
         var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
         defer metal_graph_plan.deinit(allocator);
         if (trace_nodes) printMetalGraphPlanTrace(partition_index, metal_graph_plan);
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_begin partition={d} slots={d}\n", .{ partition_index, metal_graph_plan.slots.len });
         _ = try cb.reserveGraphPlanSlots(metal_graph_plan.slots);
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: graph_plan_reserved partition={d}\n", .{partition_index});
         if (exec_ctx.stats) |stats| {
             stats.graph_plan_slots_reserved += metal_graph_plan.slots.len;
@@ -472,6 +481,7 @@ pub const MetalPartitionExecutor = struct {
         }
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
         try materializePartitionRuntimeInputs(
             allocator,
             values,
@@ -482,9 +492,11 @@ pub const MetalPartitionExecutor = struct {
             cb,
             rt_map,
         );
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_end partition={d}\n", .{partition_index});
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_begin partition={d}\n", .{partition_index});
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_begin partition={d}\n", .{partition_index});
         try materializePartitionConstants(
             graph,
             cb,
@@ -494,12 +506,20 @@ pub const MetalPartitionExecutor = struct {
             reachable,
             device_id,
         );
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_end partition={d}\n", .{partition_index});
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
-        var frame_active = try cb.decoderRuntimeBeginFrame();
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_begin partition={d}\n", .{partition_index});
+        var frame_active = if (metalPartitionFrameDisabled()) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
+        const planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
+            try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
+        else
+            metal_compute_mod.MetalCompute.PlannedGraphScope{};
+        errdefer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
 
         var exec_state = interpreter.ExecState{
             .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
@@ -525,6 +545,7 @@ pub const MetalPartitionExecutor = struct {
             exec_ctx.stats,
             &transient_runtime_region_plan,
         );
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=runtime_region_plan_ready partition={d} regions={d}\n", .{ partition_index, runtime_region_plan.region_count });
         if (exec_ctx.stats) |stats| {
             recordRuntimeFrameEligibilityStats(stats, analyzeRuntimeFrameEligibility(runtime_region_plan));
             if (runtimeFrameMetadataFromPlan(graph, runtime_region_plan) != null) {
@@ -561,11 +582,16 @@ pub const MetalPartitionExecutor = struct {
                 }
             }
 
+            const trace_node_progress = traceMetalGraphProgressNode(node_pos, progress_interval, progress_start, progress_end);
+            if (trace_node_progress) {
+                printMetalProgressNode("node_begin", graph, partition_index, node_pos, node_ids.len, node_id);
+            }
             if (trace_nodes) printMetalNodeTraceBegin(graph, node_id);
             if (trace_nodes) printMetalNodeTraceInputs(graph, cb, values, node_id);
 
             const op_plan = partition_plan.operatorPlanForNode(node_id);
             var execution_kind: ?MetalExecutionKind = null;
+            if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
             if (try tryExecutePlannedRuntimeRegion(
                 runtime_region_plan.regionAt(node_pos, node_id, node_ids),
                 runtime_region_plan.preparedPtrAt(node_pos, node_id, node_ids),
@@ -585,31 +611,49 @@ pub const MetalPartitionExecutor = struct {
                 rt_map,
                 donated,
             )) {
+                if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                 execution_kind = .command;
                 if (exec_ctx.stats) |stats| stats.runtime_region_plan_dispatches += 1;
-            } else if (try tryExecuteFusedMetalGraphPattern(
-                allocator,
-                graph,
-                cb,
-                values,
-                value_device,
-                node_ids,
-                node_pos,
-                reachable,
-                device_id,
-                effective_exec_ctx,
-                &exec_state,
-                skipped_nodes,
-                last_use,
-                rt_map,
-                donated,
-            )) {
-                execution_kind = .command;
-            } else if (try tryExecuteMetalCommand(graph, cb, values, node_id, op_plan, &exec_state)) |command_output| {
-                values[i] = command_output;
-                execution_kind = classifyMetalExecutionKind(graph, cb, values, node_id);
             } else {
-                values[i] = try interpreter.executeNode(graph, cb, values, node_id, &exec_state);
+                if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                if (try tryExecuteFusedMetalGraphPattern(
+                    allocator,
+                    graph,
+                    cb,
+                    values,
+                    value_device,
+                    node_ids,
+                    node_pos,
+                    reachable,
+                    device_id,
+                    effective_exec_ctx,
+                    &exec_state,
+                    skipped_nodes,
+                    last_use,
+                    rt_map,
+                    donated,
+                )) {
+                    if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                    execution_kind = .command;
+                } else {
+                    if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                    if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                    const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
+                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state)
+                    else
+                        null;
+                    if (command_output_opt) |command_output| {
+                        if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                        values[i] = command_output;
+                        execution_kind = classifyMetalExecutionKind(graph, cb, values, node_id);
+                    } else {
+                        if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                        if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                        values[i] = try interpreter.executeNode(graph, cb, values, node_id, &exec_state);
+                        if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_end partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                    }
+                }
             }
             if (graph.node(node_id).op == .constant) {
                 if (values[i]) |current| {
@@ -677,27 +721,113 @@ pub const MetalPartitionExecutor = struct {
             if (i < skipped_nodes.len and skipped_nodes[i]) {
                 values[i] = null;
             }
+            if (trace_node_progress) {
+                printMetalProgressNode("node_end", graph, partition_index, node_pos, node_ids.len, node_id);
+            }
         }
 
         if (frame_active) {
+            try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=submit_frame_begin partition={d}\n", .{partition_index});
             try cb.decoderRuntimeSubmitAndWaitFrame();
             frame_active = false;
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=submit_frame_end partition={d}\n", .{partition_index});
+        } else {
+            try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
         }
 
         if (exec_ctx.materialize_boundary_outputs) {
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_boundary_outputs_begin partition={d}\n", .{partition_index});
             if (exec_ctx.stats) |stats| {
                 stats.boundary_output_materializations += countPartitionBoundaryOutputs(partition_view);
             }
             try evalPartitionBoundaryOutputs(cb, values, partition_view);
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_boundary_outputs_end partition={d}\n", .{partition_index});
         }
 
         if (exec_ctx.attention_layer) |layer| layer.* = exec_state.attention_layer;
         if (exec_ctx.pair_second) |pair| pair.* = exec_state.pair_second;
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_end partition={d}\n", .{partition_index});
     }
 };
 
 fn traceMetalGraphNodesEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_NODES", false);
+}
+
+fn metalGraphProgressInterval() usize {
+    return platform.env.getenvUsize("TERMITE_METAL_PARTITION_PROGRESS_INTERVAL") orelse 0;
+}
+
+fn metalGraphProgressStart() usize {
+    return platform.env.getenvUsize("TERMITE_METAL_PARTITION_PROGRESS_START") orelse std.math.maxInt(usize);
+}
+
+fn metalGraphProgressEnd() usize {
+    return platform.env.getenvUsize("TERMITE_METAL_PARTITION_PROGRESS_END") orelse std.math.maxInt(usize);
+}
+
+fn metalPartitionFrameDisabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_FRAME", false);
+}
+
+fn metalPartitionPlannedScopeDisabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_PLANNED_SCOPE", false);
+}
+
+fn metalPartitionFusedPatternsDisabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_FUSED_PATTERNS", false);
+}
+
+fn metalPartitionRuntimeCommandsDisabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_RUNTIME_COMMANDS", false);
+}
+
+fn fusedPatternProbingDisabled(exec_ctx: PartitionExecutor.ExecutionContext) bool {
+    if (metalPartitionFusedPatternsDisabled()) return true;
+    if (exec_ctx.options) |options| return options.skip_metal_fused_patterns;
+    return false;
+}
+
+fn traceMetalGraphProgressNode(node_pos: usize, interval: usize, start: usize, end: usize) bool {
+    if (start != std.math.maxInt(usize) and node_pos >= start and node_pos <= end) return true;
+    return interval != 0 and (node_pos == 0 or node_pos % interval == 0);
+}
+
+fn printMetalProgressNode(
+    phase: []const u8,
+    graph: *const Graph,
+    partition_index: usize,
+    node_pos: usize,
+    node_count: usize,
+    node_id: NodeId,
+) void {
+    const n = graph.node(node_id);
+    const inputs = n.getInputs();
+    const in0 = if (inputs.len > 0) inputs[0] else null_node;
+    const in1 = if (inputs.len > 1) inputs[1] else null_node;
+    const in2 = if (inputs.len > 2) inputs[2] else null_node;
+    std.debug.print(
+        "metal_partition_progress: phase={s} partition={d} pos={d}/{d} node={} op={s} out_shape={any} in0={} in0_op={s} in0_shape={any} in1={} in1_op={s} in1_shape={any} in2={} in2_op={s} in2_shape={any}\n",
+        .{
+            phase,
+            partition_index,
+            node_pos,
+            node_count,
+            node_id,
+            @tagName(n.op),
+            n.output_shape,
+            in0,
+            if (in0 != null_node) @tagName(graph.node(in0).op) else "none",
+            if (in0 != null_node) graph.node(in0).output_shape else Shape.scalar(.f32),
+            in1,
+            if (in1 != null_node) @tagName(graph.node(in1).op) else "none",
+            if (in1 != null_node) graph.node(in1).output_shape else Shape.scalar(.f32),
+            in2,
+            if (in2 != null_node) @tagName(graph.node(in2).op) else "none",
+            if (in2 != null_node) graph.node(in2).output_shape else Shape.scalar(.f32),
+        },
+    );
 }
 
 fn traceMetalGraphFusionsEnabled() bool {
@@ -1411,6 +1541,7 @@ fn tryExecuteFusedMetalGraphPattern(
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
+    if (fusedPatternProbingDisabled(exec_ctx)) return false;
     if (try tryExecuteRmsNormGroupedLinearQkvSlicePattern(
         allocator,
         graph,
@@ -4588,6 +4719,7 @@ fn executeRuntimeUnary(
 }
 
 fn tryExecuteMetalCommand(
+    allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
@@ -4609,7 +4741,26 @@ fn tryExecuteMetalCommand(
             };
         },
         .transpose => |attrs| blk: {
-            const input = valueFor(values, inputs[0]) orelse break :blk null;
+            var host_input_to_free: ?CT = null;
+            defer if (host_input_to_free) |ct| cb.free(ct);
+            const input_source = valueFor(values, inputs[0]) orelse break :blk null;
+            const input_source_resident = isMetalDeviceResident(cb, input_source);
+            const preserve_host_view = (!input_source_resident) or (n.output_shape.rank() == 3 and transposeFeedsReshapeConsumer(graph, node_id));
+            const input = if (preserve_host_view and input_source_resident) host_input: {
+                var host_shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
+                const source_shape = graph.node(inputs[0]).output_shape;
+                if (source_shape.rank() > host_shape_buf.len) break :host_input input_source;
+                for (0..source_shape.rank()) |axis| {
+                    const dim = source_shape.dim(@intCast(axis));
+                    if (dim <= 0) break :host_input input_source;
+                    host_shape_buf[axis] = @intCast(dim);
+                }
+                const host_data = cb.toFloat32(input_source, allocator) catch break :host_input input_source;
+                defer allocator.free(host_data);
+                const host_ct = cb.fromFloat32Shape(host_data, host_shape_buf[0..source_shape.rank()]) catch break :host_input input_source;
+                host_input_to_free = host_ct;
+                break :host_input host_ct;
+            } else input_source;
             var in_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
             const in_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &in_shape_buf);
             var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
@@ -4619,7 +4770,7 @@ fn tryExecuteMetalCommand(
                 else => return err,
             };
             if (transposed) |ct| {
-                if (!isMetalDeviceResident(cb, ct)) {
+                if (!preserve_host_view and !isMetalDeviceResident(cb, ct)) {
                     if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
                         cb.free(ct);
                         break :blk device_ct;
@@ -4648,7 +4799,8 @@ fn tryExecuteMetalCommand(
         .fused_quick_gelu => try executeRuntimeActivation(cb, values, inputs, .quick_gelu, n.output_shape),
         .fused_sigmoid => try executeRuntimeFusedUnary(cb, values, inputs, .sigmoid),
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
-        .fused_elem_add, .add => try executeRuntimeAdd(cb, values, inputs, n.output_shape),
+        .fused_elem_add => try executeRuntimeAdd(cb, values, inputs, n.output_shape),
+        .add => try executeRuntimePlainAdd(cb, values, inputs),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply),
         .sub => try executeRuntimeBinary(cb, values, inputs, .subtract),
         .div => try executeRuntimeBinary(cb, values, inputs, .divide),
@@ -5049,8 +5201,26 @@ fn executeRuntimeBinary(
     inputs: []const NodeId,
     op: RuntimeBinaryOp,
 ) !?CT {
-    const lhs = valueFor(values, inputs[0]) orelse return null;
-    const rhs = valueFor(values, inputs[1]) orelse return null;
+    var lhs = valueFor(values, inputs[0]) orelse return null;
+    var rhs = valueFor(values, inputs[1]) orelse return null;
+    var owned_lhs: ?CT = null;
+    defer if (owned_lhs) |ct| cb.free(ct);
+    var owned_rhs: ?CT = null;
+    defer if (owned_rhs) |ct| cb.free(ct);
+    if (cb.kind() == .metal) {
+        if (!isMetalDeviceResident(cb, lhs)) {
+            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
+                if (device_lhs != lhs) owned_lhs = device_lhs;
+                lhs = device_lhs;
+            }
+        }
+        if (!isMetalDeviceResident(cb, rhs)) {
+            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
+                if (device_rhs != rhs) owned_rhs = device_rhs;
+                rhs = device_rhs;
+            }
+        }
+    }
     return switch (op) {
         .multiply => cb.multiply(lhs, rhs),
         .subtract => cb.primSubtract(lhs, rhs),
@@ -5582,6 +5752,19 @@ fn executeRuntimeAdd(
     };
 }
 
+fn executeRuntimePlainAdd(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+) !?CT {
+    const lhs = valueFor(values, inputs[0]) orelse return null;
+    const rhs = valueFor(values, inputs[1]) orelse return null;
+    return cb.add(lhs, rhs) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        else => return err,
+    };
+}
+
 fn executeRuntimeSoftmax(
     cb: *const ComputeBackend,
     values: []?CT,
@@ -5636,6 +5819,18 @@ fn positiveI64ToUsize(dim: i64) ?usize {
 fn shapeDimUsize(shape: ml.graph.Shape, axis: usize) ?usize {
     if (axis >= shape.rank()) return null;
     return positiveI64ToUsize(shape.dim(@intCast(axis)));
+}
+
+fn transposeFeedsReshapeConsumer(graph: *const Graph, node_id: NodeId) bool {
+    var candidate: NodeId = 0;
+    while (candidate < graph.nodeCount()) : (candidate += 1) {
+        const node = graph.node(candidate);
+        if (node.op != .reshape) continue;
+        for (node.getInputs()) |input_id| {
+            if (input_id == node_id) return true;
+        }
+    }
+    return false;
 }
 
 fn buildMetalGraphPlan(
@@ -5737,7 +5932,9 @@ fn materializePartitionRuntimeInputs(
         } else {
             values[i] = rt_val;
         }
-        if (values[i]) |current| {
+        const preserve_runtime_input_residency = if (exec_ctx.options) |options| options.preserve_runtime_input_residency else false;
+        if (!preserve_runtime_input_residency and values[i] != null) {
+            const current = values[i].?;
             if (!isMetalDeviceResident(cb, current)) {
                 if (trace_nodes) std.debug.print(
                     "graph_executor_node_trace: materialize_runtime_input_make_resident node={d}\n",
@@ -7558,7 +7755,7 @@ test "metal partition executor runtime add keeps resident input device backed" {
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(&g, &cb, values, sum, null, &exec_state)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 
@@ -7608,7 +7805,7 @@ test "metal partition executor runtime rms norm supports row-wise resident shape
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(&g, &cb, values, normed, null, &exec_state)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 

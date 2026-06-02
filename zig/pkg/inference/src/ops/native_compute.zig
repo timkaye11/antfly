@@ -4374,6 +4374,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .exportTensorData = &exportTensorDataOp,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
+    .tensorShapeMatches = &tensorShapeMatchesOp,
     .evalTensor = &evalTensorOp,
     .argmaxLastRow = &argmaxLastRowOp,
     .sliceLastDim = &sliceLastDimOp,
@@ -37862,6 +37863,23 @@ fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
         }
     }
     return error.UnsupportedShape;
+}
+
+fn tensorShapeMatchesOp(_: *anyopaque, tensor: CT, shape: []const i64) anyerror!?bool {
+    const buf = toBuf(tensor);
+    const actual = if (buf.logical_shape) |logical|
+        logical
+    else if (buf.quantized_storage) |storage|
+        storage.shape
+    else if (buf.source_tensor) |source|
+        source.shape
+    else
+        return null;
+    if (actual.len != shape.len) return false;
+    for (actual, shape) |actual_dim, expected_dim| {
+        if (actual_dim != expected_dim) return false;
+    }
+    return true;
 }
 
 fn sliceLastDimOp(_: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {

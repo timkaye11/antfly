@@ -3486,6 +3486,42 @@ pub fn decoderRuntimeGatherAxis0F32_2DDevice(
     return output_device;
 }
 
+pub fn decoderRuntimeGatherAxis0AddBiasF32_2DDevice(
+    self: anytype,
+    input: MetalTensor,
+    bias: MetalTensor,
+    indices: MetalTensor,
+    rows: usize,
+    cols: usize,
+    index_count: usize,
+    output_shape: []const i32,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or !bias.isDevice() or !indices.isDevice()) return null;
+    if (rows == 0 or cols == 0 or index_count == 0) return null;
+    if (rows > std.math.maxInt(usize) / cols or index_count > std.math.maxInt(usize) / cols) return null;
+    if (input.elemCount() != rows * cols or bias.elemCount() != cols or indices.elemCount() != index_count) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, index_count * cols * @sizeOf(f32), .private, output_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gather_axis0_add_bias_f32_2d_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        bias.deviceHandle(),
+        bias.deviceByteOffset(),
+        indices.deviceHandle(),
+        indices.deviceByteOffset(),
+        rows,
+        cols,
+        index_count,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
 pub fn decoderRuntimeGlinerWordEmbeddingsF32Device(
     self: anytype,
     hidden: MetalTensor,
@@ -4092,6 +4128,30 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
     if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.dim) };
     return MetalTensor.owned(output, &shape);
+}
+
+pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!lhs.isDevice() or !rhs.isDevice()) return null;
+    const lhs_count = lhs.elemCount();
+    const rhs_count = rhs.elemCount();
+    if (lhs_count == 0 or rhs_count == 0 or lhs_count % rhs_count != 0) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, lhs_count * @sizeOf(f32), .private, lhs.shape());
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_apply_add_device_rhs_repeat(
+        runtime,
+        lhs.deviceHandle(),
+        lhs.deviceByteOffset(),
+        rhs.deviceHandle(),
+        rhs.deviceByteOffset(),
+        lhs_count,
+        rhs_count,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
 }
 
 pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -7669,6 +7729,20 @@ pub extern fn termite_metal_decode_runtime_gather_axis0_f32_2d_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_gather_axis0_add_bias_f32_2d_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    bias_handle: ?*anyopaque,
+    bias_offset: usize,
+    indices_handle: ?*anyopaque,
+    indices_offset: usize,
+    rows: usize,
+    cols: usize,
+    index_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_gliner_word_embeddings_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     hidden_handle: ?*anyopaque,
@@ -7893,6 +7967,17 @@ pub extern fn termite_metal_decode_runtime_apply_add_device(
     rhs_handle: ?*anyopaque,
     rhs_offset: usize,
     dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_add_device_rhs_repeat(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs_handle: ?*anyopaque,
+    lhs_offset: usize,
+    rhs_handle: ?*anyopaque,
+    rhs_offset: usize,
+    dim: usize,
+    rhs_period: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

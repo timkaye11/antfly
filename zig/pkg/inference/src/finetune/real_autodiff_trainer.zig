@@ -699,59 +699,72 @@ pub const RealAutodiffTrainer = struct {
                 // 5. Accumulate gradients (mean over the accumulation window).
                 const accum_steps: u32 = @max(self.config.grad_accum_steps, 1);
                 const scale: f32 = 1.0 / @as(f32, @floatFromInt(accum_steps));
-                for (self.lora_params.items) |*slot| {
-                    if (use_device_optimizer) {
-                        const g_ct = step_result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-                        try self.accumulateDeviceGradientCt(slot, g_ct, scale, self.accum_count == 0);
-                        continue;
+                const direct_device_step = use_device_optimizer and
+                    self.compute_backend.kind() == .metal and
+                    accum_steps == 1 and
+                    self.config.reduce_device_grads == null and
+                    self.config.reduce_grads == null;
+                if (!direct_device_step) {
+                    for (self.lora_params.items) |*slot| {
+                        if (use_device_optimizer) {
+                            const g_ct = step_result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+                            try self.accumulateDeviceGradientCt(slot, g_ct, scale, self.accum_count == 0);
+                            continue;
+                        }
+                        const g = step_result.gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+                        if (g.len != slot.grad_accum.len) return error.GradientShapeMismatch;
+                        if (self.accum_count == 0) {
+                            for (slot.grad_accum, g) |*a, v| a.* = v * scale;
+                        } else {
+                            for (slot.grad_accum, g) |*a, v| a.* += v * scale;
+                        }
                     }
-                    const g = step_result.gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-                    if (g.len != slot.grad_accum.len) return error.GradientShapeMismatch;
-                    if (self.accum_count == 0) {
-                        for (slot.grad_accum, g) |*a, v| a.* = v * scale;
-                    } else {
-                        for (slot.grad_accum, g) |*a, v| a.* += v * scale;
+                    for (self.regular_params.items) |*slot| {
+                        if (use_device_optimizer) {
+                            const g_ct = step_result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+                            try self.accumulateDeviceGradientCt(slot, g_ct, scale, self.accum_count == 0);
+                            continue;
+                        }
+                        const g = step_result.gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+                        if (g.len != slot.grad_accum.len) return error.GradientShapeMismatch;
+                        if (self.accum_count == 0) {
+                            for (slot.grad_accum, g) |*a, v| a.* = v * scale;
+                        } else {
+                            for (slot.grad_accum, g) |*a, v| a.* += v * scale;
+                        }
                     }
+                    self.accum_count += 1;
+                } else {
+                    self.accum_count = accum_steps;
                 }
-                for (self.regular_params.items) |*slot| {
-                    if (use_device_optimizer) {
-                        const g_ct = step_result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-                        try self.accumulateDeviceGradientCt(slot, g_ct, scale, self.accum_count == 0);
-                        continue;
-                    }
-                    const g = step_result.gradients.get(slot.name) orelse return error.MissingTrainableGradient;
-                    if (g.len != slot.grad_accum.len) return error.GradientShapeMismatch;
-                    if (self.accum_count == 0) {
-                        for (slot.grad_accum, g) |*a, v| a.* = v * scale;
-                    } else {
-                        for (slot.grad_accum, g) |*a, v| a.* += v * scale;
-                    }
-                }
-                self.accum_count += 1;
 
                 // 6. If the accumulation window is full, clip + step the optimizer.
                 if (self.accum_count >= accum_steps) {
-                    if (use_device_optimizer and self.config.reduce_device_grads != null) {
+                    if (!direct_device_step and use_device_optimizer and self.config.reduce_device_grads != null) {
                         try self.reduceDeviceGradAccum();
-                    } else if (self.config.reduce_grads) |reduce_fn| {
-                        if (use_device_optimizer) try self.syncDeviceGradAccumToHost();
-                        var blocks = try self.allocator.alloc(GradBlock, self.lora_params.items.len + self.regular_params.items.len);
-                        defer self.allocator.free(blocks);
-                        var block_idx: usize = 0;
-                        for (self.lora_params.items) |*slot| {
-                            blocks[block_idx] = .{ .name = slot.name, .data = slot.grad_accum };
-                            block_idx += 1;
+                    } else if (!direct_device_step) {
+                        if (self.config.reduce_grads) |reduce_fn| {
+                            if (use_device_optimizer) try self.syncDeviceGradAccumToHost();
+                            var blocks = try self.allocator.alloc(GradBlock, self.lora_params.items.len + self.regular_params.items.len);
+                            defer self.allocator.free(blocks);
+                            var block_idx: usize = 0;
+                            for (self.lora_params.items) |*slot| {
+                                blocks[block_idx] = .{ .name = slot.name, .data = slot.grad_accum };
+                                block_idx += 1;
+                            }
+                            for (self.regular_params.items) |*slot| {
+                                blocks[block_idx] = .{ .name = slot.name, .data = slot.grad_accum };
+                                block_idx += 1;
+                            }
+                            const ctx = self.config.reduce_grads_ctx orelse @as(*anyopaque, @ptrFromInt(@alignOf(usize)));
+                            try reduce_fn(ctx, blocks);
+                            if (use_device_optimizer) try self.replaceDeviceGradAccumFromHost();
                         }
-                        for (self.regular_params.items) |*slot| {
-                            blocks[block_idx] = .{ .name = slot.name, .data = slot.grad_accum };
-                            block_idx += 1;
-                        }
-                        const ctx = self.config.reduce_grads_ctx orelse @as(*anyopaque, @ptrFromInt(@alignOf(usize)));
-                        try reduce_fn(ctx, blocks);
-                        if (use_device_optimizer) try self.replaceDeviceGradAccumFromHost();
                     }
 
-                    grad_norm = if (use_device_optimizer)
+                    grad_norm = if (direct_device_step)
+                        try self.deviceGlobalGradNormFromResult(&step_result)
+                    else if (use_device_optimizer)
                         try self.deviceGlobalGradNorm()
                     else
                         self.globalGradNorm();
@@ -766,7 +779,16 @@ pub const RealAutodiffTrainer = struct {
                     }
 
                     const lr = self.config.lr_schedule.lr(@intCast(self.step_count));
-                    if (use_device_optimizer) {
+                    if (direct_device_step) {
+                        const device_opt_start_ns = monotonicNowNs();
+                        const clip_scale = if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm)
+                            self.config.max_grad_norm / (grad_norm + 1e-6)
+                        else
+                            1.0;
+                        try self.stepDeviceAdamWFromResult(&step_result, lr, clip_scale);
+                        profile.device_optimizer_ns = elapsedNs(device_opt_start_ns, monotonicNowNs());
+                        profile.optimizer_backend = self.deviceOptimizerBackend();
+                    } else if (use_device_optimizer) {
                         const device_opt_start_ns = monotonicNowNs();
                         const clip_scale = if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm)
                             self.config.max_grad_norm / (grad_norm + 1e-6)
@@ -1212,6 +1234,21 @@ pub const RealAutodiffTrainer = struct {
         return @floatCast(@sqrt(total));
     }
 
+    fn deviceGlobalGradNormFromResult(self: *RealAutodiffTrainer, result: *const training.TrainStepResult) !f32 {
+        var total: f64 = 0.0;
+        for (self.lora_params.items) |*slot| {
+            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+            const sumsq = try self.deviceSumSquares(grad, slot.weights.len);
+            total += @as(f64, sumsq);
+        }
+        for (self.regular_params.items) |*slot| {
+            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+            const sumsq = try self.deviceSumSquares(grad, slot.weights.len);
+            total += @as(f64, sumsq);
+        }
+        return @floatCast(@sqrt(total));
+    }
+
     fn deviceSumSquares(self: *RealAutodiffTrainer, input: CT, elem_count: usize) !f32 {
         return switch (self.compute_backend.kind()) {
             .metal => blk: {
@@ -1241,9 +1278,42 @@ pub const RealAutodiffTrainer = struct {
         }
     }
 
+    fn stepDeviceAdamWFromResult(
+        self: *RealAutodiffTrainer,
+        result: *const training.TrainStepResult,
+        lr: f32,
+        grad_scale: f32,
+    ) !void {
+        const opt = self.config.optimizer;
+        const t: f32 = @floatFromInt(self.optimizer_state.step_count);
+        const bias_correction1 = 1.0 - std.math.pow(f32, opt.beta1, t);
+        const bias_correction2 = 1.0 - std.math.pow(f32, opt.beta2, t);
+        for (self.lora_params.items) |*slot| {
+            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+            try self.stepDeviceAdamWSlotWithGrad(slot, grad, lr, grad_scale, bias_correction1, bias_correction2);
+        }
+        for (self.regular_params.items) |*slot| {
+            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+            try self.stepDeviceAdamWSlotWithGrad(slot, grad, lr, grad_scale, bias_correction1, bias_correction2);
+        }
+    }
+
     fn stepDeviceAdamWSlot(
         self: *RealAutodiffTrainer,
         slot: *ParamSlot,
+        lr: f32,
+        grad_scale: f32,
+        bias_correction1: f32,
+        bias_correction2: f32,
+    ) !void {
+        const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+        try self.stepDeviceAdamWSlotWithGrad(slot, device.grad_accum, lr, grad_scale, bias_correction1, bias_correction2);
+    }
+
+    fn stepDeviceAdamWSlotWithGrad(
+        self: *RealAutodiffTrainer,
+        slot: *ParamSlot,
+        grad: CT,
         lr: f32,
         grad_scale: f32,
         bias_correction1: f32,
@@ -1255,7 +1325,7 @@ pub const RealAutodiffTrainer = struct {
             .metal => {
                 if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
                 const metal = try self.metalCompute();
-                try metal.trainingAdamWF32(device.weight, device.grad_accum, device.m, device.v, slot.weights.len, .{
+                try metal.trainingAdamWF32(device.weight, grad, device.m, device.v, slot.weights.len, .{
                     .lr = lr,
                     .beta1 = opt.beta1,
                     .beta2 = opt.beta2,
@@ -1269,7 +1339,7 @@ pub const RealAutodiffTrainer = struct {
             .mlx => {
                 if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
                 const mlx = try self.mlxCompute();
-                const next = try mlx.trainingAdamWF32Replace(device.weight, device.grad_accum, device.m, device.v, .{
+                const next = try mlx.trainingAdamWF32Replace(device.weight, grad, device.m, device.v, .{
                     .lr = lr,
                     .beta1 = opt.beta1,
                     .beta2 = opt.beta2,
@@ -1280,12 +1350,12 @@ pub const RealAutodiffTrainer = struct {
                     .grad_scale = grad_scale,
                 });
                 self.compute_backend.free(device.weight);
-                self.compute_backend.free(device.grad_accum);
+                if (grad != device.grad_accum) self.compute_backend.free(device.grad_accum);
                 self.compute_backend.free(device.m);
                 self.compute_backend.free(device.v);
                 slot.device = .{
                     .weight = next.weight,
-                    .grad_accum = next.grad_accum,
+                    .grad_accum = if (grad == device.grad_accum) next.grad_accum else try mlx.trainingZeroF32(slot.weights.len, slot.dims),
                     .m = next.m,
                     .v = next.v,
                 };

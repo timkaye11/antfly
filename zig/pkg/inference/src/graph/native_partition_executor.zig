@@ -565,6 +565,7 @@ fn executeNativePlannedNode(
             break :blk try cb.primConcatPrim(valueAt(values, inputs[0]), valueAt(values, inputs[1]), attrs.axis, a_shape, b_shape);
         },
         .scatter_add => |attrs| blk: {
+            if (inputs.len < 3) break :blk null;
             var dest_shape_buf: [8]i64 = undefined;
             var values_shape_buf: [8]i64 = undefined;
             var indices_shape_buf: [8]i64 = undefined;

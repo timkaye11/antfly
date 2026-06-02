@@ -64,13 +64,24 @@ pub const RuntimeInput = struct {
 pub const CachedAnalysis = struct {
     reachable: []const bool,
     last_use: []const u32,
+    runtime_shape_capture: []const bool,
+    gather_add_bias_preserve: []const bool,
 
     /// Compute and allocate a CachedAnalysis for the given graph.
     pub fn compute(allocator: std.mem.Allocator, graph: *const Graph) !CachedAnalysis {
         const reachable = try computeReachable(allocator, graph);
         errdefer allocator.free(reachable);
         const last_use = try computeLastUse(allocator, graph, reachable);
-        return .{ .reachable = reachable, .last_use = last_use };
+        errdefer allocator.free(last_use);
+        const runtime_shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
+        errdefer allocator.free(runtime_shape_capture);
+        const gather_add_bias_preserve = try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
+        return .{
+            .reachable = reachable,
+            .last_use = last_use,
+            .runtime_shape_capture = runtime_shape_capture,
+            .gather_add_bias_preserve = gather_add_bias_preserve,
+        };
     }
 
     /// Compute analysis for a bounded capture. This executes only the
@@ -84,15 +95,28 @@ pub const CachedAnalysis = struct {
         const reachable = try computeReachableFromNodes(allocator, graph, target_node_ids);
         errdefer allocator.free(reachable);
         const last_use = try computeLastUse(allocator, graph, reachable);
-        return .{ .reachable = reachable, .last_use = last_use };
+        errdefer allocator.free(last_use);
+        const runtime_shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
+        errdefer allocator.free(runtime_shape_capture);
+        const gather_add_bias_preserve = try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
+        return .{
+            .reachable = reachable,
+            .last_use = last_use,
+            .runtime_shape_capture = runtime_shape_capture,
+            .gather_add_bias_preserve = gather_add_bias_preserve,
+        };
     }
 
     /// Free the backing arrays.
     pub fn deinit(self: *CachedAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.reachable);
         allocator.free(self.last_use);
+        allocator.free(self.runtime_shape_capture);
+        allocator.free(self.gather_add_bias_preserve);
         self.reachable = &.{};
         self.last_use = &.{};
+        self.runtime_shape_capture = &.{};
+        self.gather_add_bias_preserve = &.{};
     }
 };
 
@@ -135,6 +159,21 @@ pub const ExecuteOptions = struct {
     /// provided, execute() skips recomputing these per-call — a win
     /// for the decode loop where the graph never changes.
     cached_analysis: ?CachedAnalysis = null,
+
+    /// Skip Metal graph-fusion probes for graphs whose hot path is already
+    /// covered by backend primitive/runtime commands.
+    skip_metal_fused_patterns: bool = false,
+
+    /// Collect detailed partition-executor counters. Training uses the graph
+    /// executor as a single-device fast path and can skip this unless stats
+    /// tracing is explicitly enabled.
+    collect_partition_stats: bool = true,
+
+    /// Preserve runtime input residency instead of eagerly materializing them
+    /// on the partition backend. This keeps graph-exec training semantically
+    /// aligned with the direct interpreter, where labels, masks, and borrowed
+    /// weights stay in the representation supplied by the caller.
+    preserve_runtime_input_residency: bool = false,
 };
 
 /// Result of graph execution. Caller owns the output tensors and must
@@ -395,6 +434,47 @@ pub fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, reachab
     return last_use;
 }
 
+fn computeGatherAddBiasPreserveSet(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]bool {
+    const count = graph.nodeCount();
+    const preserve = try allocator.alloc(bool, count);
+    @memset(preserve, false);
+
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const gather_node = graph.node(@intCast(i));
+        if (gather_node.op != .gather) continue;
+        const gather_attrs = switch (gather_node.op) {
+            .gather => |attrs| attrs,
+            else => unreachable,
+        };
+        if (gather_attrs.axis != 0) continue;
+
+        const gather_inputs = gather_node.getInputs();
+        if (gather_inputs.len < 2 or gather_inputs[0] == null_node or gather_inputs[0] >= count) continue;
+        const add_id = gather_inputs[0];
+        const add_node = graph.node(add_id);
+        if (add_node.op != .add) continue;
+        const add_inputs = add_node.getInputs();
+        if (add_inputs.len != 2) continue;
+
+        const lhs = add_inputs[0];
+        const rhs = add_inputs[1];
+        if (lhs == null_node or rhs == null_node or lhs >= count or rhs >= count) continue;
+        var lhs_buf: [8]i64 = undefined;
+        var rhs_buf: [8]i64 = undefined;
+        const lhs_shape = fillShapeDims(graph, lhs, &lhs_buf);
+        const rhs_shape = fillShapeDims(graph, rhs, &rhs_buf);
+        const can_fuse =
+            (lhs_shape.len == 2 and rhs_shape.len == 1 and lhs_shape[1] == rhs_shape[0]) or
+            (rhs_shape.len == 2 and lhs_shape.len == 1 and rhs_shape[1] == lhs_shape[0]);
+        if (!can_fuse) continue;
+        preserve[lhs] = true;
+        preserve[rhs] = true;
+    }
+
+    return preserve;
+}
+
 /// Execute a graph through a real backend.
 pub fn execute(
     allocator: std.mem.Allocator,
@@ -426,6 +506,8 @@ pub fn execute(
     defer if (!have_cache) allocator.free(reachable);
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
+    const gather_add_bias_preserve = if (options.cached_analysis) |ca| ca.gather_add_bias_preserve else try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
+    defer if (!have_cache) allocator.free(gather_add_bias_preserve);
 
     // 3. Build runtime input lookup + donation set. Dense indexed arrays
     // avoid a hash lookup for every graph node during compiled training.
@@ -452,8 +534,8 @@ pub fn execute(
     defer allocator.free(values);
     @memset(values, null);
 
-    const shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
-    defer allocator.free(shape_capture);
+    const shape_capture = if (options.cached_analysis) |ca| ca.runtime_shape_capture else try computeRuntimeShapeCaptureSet(allocator, graph);
+    defer if (!have_cache) allocator.free(shape_capture);
 
     var runtime_shapes: ?[]?[]i64 = null;
     if (shapeCaptureSetHasAny(shape_capture)) {
@@ -592,6 +674,7 @@ pub fn execute(
         for (n.getInputs()) |input_id| {
             if (input_id == null_node or input_id >= count) continue;
             if (last_use[input_id] == i) {
+                if (gather_add_bias_preserve[input_id]) continue;
                 // Don't free non-donated runtime inputs (caller owns them).
                 // Donated inputs are owned by the interpreter now.
                 const input_idx: usize = @intCast(input_id);
@@ -714,8 +797,8 @@ pub fn captureNodeValues(
     defer allocator.free(values);
     @memset(values, null);
 
-    const shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
-    defer allocator.free(shape_capture);
+    const shape_capture = if (options.cached_analysis) |ca| ca.runtime_shape_capture else try computeRuntimeShapeCaptureSet(allocator, graph);
+    defer if (!have_cache) allocator.free(shape_capture);
 
     var runtime_shapes: ?[]?[]i64 = null;
     if (shapeCaptureSetHasAny(shape_capture)) {
@@ -1275,6 +1358,9 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
     for (0..rank) |d| {
         dims[d] = declared.dim(@intCast(d));
         if (dims[d] <= 0) return null;
+    }
+    if (cb.tensorShapeMatches(val, dims[0..rank]) catch null) |matches| {
+        return if (matches) null else cb.primReshape(val, dims[0..rank]) catch null;
     }
     const actual = cb.tensorShape(val, std.heap.page_allocator) catch {
         return cb.primReshape(val, dims[0..rank]) catch null;
@@ -2456,7 +2542,7 @@ pub fn executeNode(
             const rank = attrs.new_shape.rank();
             var dims: [8]i64 = undefined;
             for (0..rank) |d| dims[d] = attrs.new_shape.dim(@intCast(d));
-            const reshaped_input = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
+            var reshaped_input = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (reshaped_input) |v| cb.free(v);
             const input_value = reshaped_input orelse V.get(ins[0]);
             var resolved_dims: [8]i64 = undefined;
@@ -2469,6 +2555,12 @@ pub fn executeNode(
                 }
                 break :blk resolveRuntimeReshapeDims(actual, graph.node(ins[0]).output_shape, attrs.new_shape, &resolved_dims) orelse dims[0..rank];
             };
+            if (cb.tensorShapeMatches(input_value, runtime_dims) catch null) |matches| {
+                if (matches) {
+                    if (reshaped_input != null) reshaped_input = null;
+                    return input_value;
+                }
+            }
             const result = cb.primReshape(input_value, runtime_dims) catch |err| {
                 std.log.warn("reshape execution failed node_id={d} input_id={d} target_shape={any} declared_shape={any} err={s}", .{
                     node_id,
@@ -2725,6 +2817,42 @@ pub fn executeNode(
         .gather => |attrs| {
             var sbuf: [8]i64 = undefined;
             const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            if (attrs.axis == 0) gather_add_bias: {
+                const input_node = graph.node(ins[0]);
+                if (input_node.op != .add) break :gather_add_bias;
+                const add_inputs = input_node.getInputs();
+                if (add_inputs.len != 2) break :gather_add_bias;
+                const lhs = add_inputs[0];
+                const rhs = add_inputs[1];
+                var lhs_buf: [8]i64 = undefined;
+                var rhs_buf: [8]i64 = undefined;
+                const lhs_shape = fillShapeDims(graph, lhs, &lhs_buf);
+                const rhs_shape = fillShapeDims(graph, rhs, &rhs_buf);
+
+                var matrix_id: NodeId = null_node;
+                var bias_id: NodeId = null_node;
+                var matrix_shape_buf: [8]i64 = undefined;
+                var matrix_shape: []const i64 = &.{};
+                if (lhs_shape.len == 2 and rhs_shape.len == 1 and lhs_shape[1] == rhs_shape[0]) {
+                    matrix_id = lhs;
+                    bias_id = rhs;
+                    @memcpy(matrix_shape_buf[0..lhs_shape.len], lhs_shape);
+                    matrix_shape = matrix_shape_buf[0..lhs_shape.len];
+                } else if (rhs_shape.len == 2 and lhs_shape.len == 1 and rhs_shape[1] == lhs_shape[0]) {
+                    matrix_id = rhs;
+                    bias_id = lhs;
+                    @memcpy(matrix_shape_buf[0..rhs_shape.len], rhs_shape);
+                    matrix_shape = matrix_shape_buf[0..rhs_shape.len];
+                } else {
+                    break :gather_add_bias;
+                }
+
+                const matrix = V.getOpt(matrix_id) orelse break :gather_add_bias;
+                const bias = V.getOpt(bias_id) orelse break :gather_add_bias;
+                if (try cb.primGatherAddBiasAxis0(matrix, bias, V.get(ins[1]), matrix_shape)) |fused| {
+                    return fused;
+                }
+            }
             const result = try cb.primGather(V.get(ins[0]), V.get(ins[1]), attrs.axis, in_shape);
             return result;
         },

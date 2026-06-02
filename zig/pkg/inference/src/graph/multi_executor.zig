@@ -249,12 +249,13 @@ pub fn executeMultiDevice(
     var attention_layer: usize = 0;
     var pair_second: ?CT = null;
     var exec_attention = options.attention;
+    const collect_stats = options.collect_partition_stats or executor_stats.enabled();
     var exec_stats: ExecutionStats = .{};
     const trace_partitions = tracePartitionsEnabled();
 
     // Execute each partition in order.
     for (plan.base.partitions, 0..) |part, part_idx| {
-        exec_stats.partitions_executed += 1;
+        if (collect_stats) exec_stats.partitions_executed += 1;
         const dev_id = plan.device_assignment[part_idx];
         const dev_entry = mesh.device(dev_id) orelse return error.DeviceNotFound;
         const cb = dev_entry.backend;
@@ -287,8 +288,8 @@ pub fn executeMultiDevice(
                 var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
                 const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
                 const transferred = try transferTensorWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
-                exec_stats.cross_device_transfers += 1;
-                if (cb.kind() == .metal and metal_partition_executor.isMetalDeviceResident(cb, transferred)) {
+                if (collect_stats) exec_stats.cross_device_transfers += 1;
+                if (collect_stats and cb.kind() == .metal and metal_partition_executor.isMetalDeviceResident(cb, transferred)) {
                     exec_stats.device_resident_transfers += 1;
                 }
                 const source_is_borrowed_runtime_input = isBorrowedRuntimeInputValue(
@@ -323,7 +324,7 @@ pub fn executeMultiDevice(
             .buffer_plan = &graph_buffer_plan,
             .owned_runtime_transfers = &owned_runtime_transfers,
             .materialize_boundary_outputs = part.backend != .metal,
-            .stats = &exec_stats,
+            .stats = if (collect_stats) &exec_stats else null,
             .attention = if (exec_attention) |*attn| attn else null,
             .attention_layer = &attention_layer,
             .pair_second = &pair_second,
@@ -487,7 +488,7 @@ pub fn executeMultiDevice(
         }
     }
 
-    executor_stats.record(exec_stats);
+    if (collect_stats) executor_stats.record(exec_stats);
     if (executor_stats.enabled()) executor_stats.print(exec_stats);
 
     return .{

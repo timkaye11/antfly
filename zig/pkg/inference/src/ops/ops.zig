@@ -1274,6 +1274,10 @@ pub const ComputeBackend = struct {
         /// Return a caller-owned logical tensor shape when the backend can report one.
         tensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]i64 = null,
 
+        /// Return whether the tensor's logical shape matches the provided
+        /// shape without requiring a caller-owned shape allocation.
+        tensorShapeMatches: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i64) anyerror!?bool = null,
+
         /// Force backend completion for work producing this tensor.
         /// Backends may leave this null if they do not support explicit sync.
         evalTensor: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!void = null,
@@ -1595,6 +1599,9 @@ pub const ComputeBackend = struct {
         dotGeneralOp: ?*const fn (ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT = null,
         /// Scatter-add: accumulate updates into a zeroed output using indices.
         scatterAddOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT = null,
+        /// Gather rows from `input + bias` without materializing the full
+        /// bias-added table. Bias is applied along the last dimension.
+        gatherAddBiasAxis0Op: ?*const fn (ctx: *anyopaque, input: CT, bias: CT, indices: CT, input_shape: []const i64) anyerror!?CT = null,
         /// Gather elements along an axis using indices.
         gatherOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT = null,
         /// Slice a tensor with starts/limits/strides per axis.
@@ -2521,6 +2528,13 @@ pub const ComputeBackend = struct {
         return error.UnsupportedShape;
     }
 
+    pub fn tensorShapeMatches(self: *const ComputeBackend, tensor: CT, shape: []const i64) !?bool {
+        if (self.vtable.tensorShapeMatches) |tensor_shape_matches| {
+            return tensor_shape_matches(self.ptr, tensor, shape);
+        }
+        return null;
+    }
+
     pub fn evalTensor(self: *const ComputeBackend, tensor: CT) !void {
         if (self.vtable.evalTensor) |eval_tensor| {
             return eval_tensor(self.ptr, tensor);
@@ -3112,6 +3126,10 @@ pub const ComputeBackend = struct {
     pub fn primGather(self: *const ComputeBackend, input: CT, indices: CT, axis: u8, input_shape: []const i64) !CT {
         if (self.vtable.gatherOp) |f| return f(self.ptr, input, indices, axis, input_shape);
         return error.UnsupportedPrimitiveOp;
+    }
+    pub fn primGatherAddBiasAxis0(self: *const ComputeBackend, input: CT, bias: CT, indices: CT, input_shape: []const i64) !?CT {
+        if (self.vtable.gatherAddBiasAxis0Op) |f| return f(self.ptr, input, bias, indices, input_shape);
+        return null;
     }
     pub fn primSlice(self: *const ComputeBackend, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) !CT {
         if (self.vtable.sliceOp) |f| return f(self.ptr, input, starts, limits, strides, input_shape);

@@ -39,11 +39,17 @@ const Shape = ml.graph.Shape;
 const autodiff = ml.graph.autodiff;
 const checkpoint = ml.graph.checkpoint;
 const ops_mod = @import("../ops/ops.zig");
+const metal_compute_mod = @import("../ops/metal_compute.zig");
+const native_compute = @import("../ops/native_compute.zig");
 const contracts = @import("backend_contracts.zig");
 const CT = contracts.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
 const interpreter = @import("interpreter.zig");
 const RuntimeInput = interpreter.RuntimeInput;
+const partition_mod = @import("partition.zig");
+const metal_capabilities = @import("metal_capabilities.zig");
+const device_mesh = @import("device_mesh.zig");
+const multi_executor = @import("multi_executor.zig");
 
 pub const TrainStepResult = struct {
     loss: f32,
@@ -112,6 +118,16 @@ fn submitOwnedExecutionFrame(cb: *const ComputeBackend, active: *bool) !void {
     if (!active.*) return;
     try cb.decoderRuntimeSubmitAndWaitFrame();
     active.* = false;
+}
+
+fn beginTrainingPlannedScope(cb: *const ComputeBackend) !metal_compute_mod.MetalCompute.PlannedGraphScope {
+    return metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn);
+}
+
+fn endTrainingPlannedScope(cb: *const ComputeBackend, scope: *metal_compute_mod.MetalCompute.PlannedGraphScope) !void {
+    if (!scope.active and !scope.owns_frame) return;
+    try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, scope.*);
+    scope.* = .{};
 }
 
 pub const CompiledTrainSession = struct {
@@ -289,14 +305,197 @@ pub const CompiledTrainSession = struct {
                 currentResidentBytes(),
             },
         );
+        if (trainingGraphExecutorParityNodeIds()) |node_ids_raw| {
+            if (!try self.runSelectedNodeParityDiagnostic(cb, rt_slice, node_ids_raw)) {
+                return error.TrainingGraphExecutorParityMismatch;
+            }
+        }
+
+        if (trainingGraphExecutorParityCheckEnabled() and cb.kind() == .metal and platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) {
+            var direct_result = try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, nowNs());
+            errdefer direct_result.deinit();
+            const graph_result_opt = try self.executeWithSingleMetalGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile);
+            var graph_result = graph_result_opt orelse return error.TrainingGraphExecutorUnavailable;
+            errdefer graph_result.deinit();
+            const report = try self.compareTrainStepResults(cb, &direct_result, &graph_result);
+            printTrainingGraphExecutorParityReport(report);
+            if (!report.passed) return error.TrainingGraphExecutorParityMismatch;
+            direct_result.deinit();
+            return graph_result;
+        }
+
+        if (try self.executeWithSingleMetalGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile)) |result| {
+            return result;
+        }
+
+        return try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, total_start);
+    }
+
+    fn runSelectedNodeParityDiagnostic(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?[]const RuntimeInput,
+        node_ids_raw: []const u8,
+    ) !bool {
+        if (cb.kind() != .metal) return error.TrainingGraphExecutorParityDiagnosticRequiresMetal;
+        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return error.TrainingGraphExecutorUnavailable;
+
+        const selected = try parseParityNodeIds(self.allocator, node_ids_raw, self.graph.nodeCount());
+        defer self.allocator.free(selected);
+        if (selected.len == 0) return error.TrainingGraphExecutorParityNoNodes;
+
+        const saved_outputs = try self.allocator.dupe(NodeId, self.graph.outputs.items);
+        defer self.allocator.free(saved_outputs);
+        self.graph.outputs.clearRetainingCapacity();
+        for (selected) |node_id| try self.graph.markOutput(node_id);
+        defer {
+            self.graph.outputs.clearRetainingCapacity();
+            self.graph.outputs.appendSlice(self.allocator, saved_outputs) catch {};
+        }
+
         var owned_execution_frame = try beginOwnedExecutionFrame(cb);
         errdefer cancelOwnedExecutionFrame(cb, &owned_execution_frame);
+        var planned_scope = try beginTrainingPlannedScope(cb);
+        errdefer endTrainingPlannedScope(cb, &planned_scope) catch {};
+        var direct_result = try interpreter.execute(
+            self.allocator,
+            &self.graph,
+            cb,
+            .{ .runtime_inputs = runtime_inputs },
+        );
+        try endTrainingPlannedScope(cb, &planned_scope);
+        try submitOwnedExecutionFrame(cb, &owned_execution_frame);
+        defer direct_result.deinit(cb);
+
+        var diagnostics = partition_mod.CapabilityDiagnostics{};
+        var base_plan = if (platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARTITIONED", false))
+            try self.buildPartitionedMetalGraphExecutorPlan(&diagnostics)
+        else
+            try self.buildSingleMetalGraphExecutorPlan();
+        defer base_plan.deinit();
+
+        const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
+        defer self.allocator.free(assignments);
+        for (base_plan.partitions, 0..) |part, idx| {
+            assignments[idx] = if (part.backend == .native) 1 else 0;
+        }
+        var dpp = multi_executor.DevicePartitionPlan{
+            .base = base_plan,
+            .device_assignment = assignments,
+            .allocator = self.allocator,
+        };
+
+        var fallback_native = try FallbackNativeBackend.init(self.allocator);
+        defer fallback_native.deinit(self.allocator);
+        var devices_buf = [_]device_mesh.DeviceEntry{
+            .{ .id = 0, .backend = cb, .kind = .metal },
+            .{ .id = 1, .backend = &fallback_native.backend, .kind = .native },
+        };
+        var mesh = try device_mesh.DeviceMesh.init(self.allocator, devices_buf[0..]);
+        defer mesh.deinit();
+
+        var graph_result = try multi_executor.executeMultiDevice(
+            self.allocator,
+            &self.graph,
+            &dpp,
+            &mesh,
+            .{
+                .runtime_inputs = runtime_inputs,
+                .skip_metal_fused_patterns = true,
+                .collect_partition_stats = false,
+                .preserve_runtime_input_residency = true,
+            },
+        );
+        defer graph_result.deinit(&mesh);
+
+        var passed = true;
+        for (selected, 0..) |node_id, idx| {
+            const direct_data = try cb.toFloat32(direct_result.outputs[idx], self.allocator);
+            defer self.allocator.free(direct_data);
+            const graph_device = mesh.device(graph_result.output_devices[idx]) orelse return error.DeviceNotFound;
+            const graph_data = try graph_device.backend.toFloat32(graph_result.outputs[idx], self.allocator);
+            defer self.allocator.free(graph_data);
+            const diff = compareFloatSlices(direct_data, graph_data);
+            if (diff.len_mismatch or (diff.max_abs > trainingGraphExecutorParityGradAbsTolerance() and diff.max_rel > trainingGraphExecutorParityGradRelTolerance())) {
+                passed = false;
+            }
+            const node_passed = !diff.len_mismatch and (diff.max_abs <= trainingGraphExecutorParityGradAbsTolerance() or diff.max_rel <= trainingGraphExecutorParityGradRelTolerance());
+            std.debug.print(
+                "training_graph_executor_node_parity: node={} op={s} passed={} direct_len={} graph_len={} max_abs_diff={d:.9} max_rel_diff={d:.9} first_diff_index={}\n",
+                .{
+                    node_id,
+                    @tagName(std.meta.activeTag(self.graph.node(node_id).op)),
+                    node_passed,
+                    direct_data.len,
+                    graph_data.len,
+                    diff.max_abs,
+                    diff.max_rel,
+                    diff.first_diff_index,
+                },
+            );
+            if (platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_PRINT_VALUES", false) and graph_data.len > 0 and direct_data.len > 0) {
+                const start = if (diff.first_diff_index != std.math.maxInt(usize)) diff.first_diff_index else 0;
+                const limit = @min(@min(direct_data.len, graph_data.len), start + 8);
+                var sample_idx = start;
+                while (sample_idx < limit) : (sample_idx += 1) {
+                    std.debug.print(
+                        "training_graph_executor_node_parity_value: node={} index={} direct={d:.9} graph={d:.9} abs_diff={d:.9}\n",
+                        .{
+                            node_id,
+                            sample_idx,
+                            direct_data[sample_idx],
+                            graph_data[sample_idx],
+                            @abs(direct_data[sample_idx] - graph_data[sample_idx]),
+                        },
+                    );
+                }
+            }
+            if (platform.env.getenv("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_SAMPLE_INDICES")) |sample_raw| {
+                var parts = std.mem.splitScalar(u8, sample_raw, ',');
+                while (parts.next()) |part_raw| {
+                    const part = std.mem.trim(u8, part_raw, " \t\r\n");
+                    if (part.len == 0) continue;
+                    const sample_idx = std.fmt.parseInt(usize, part, 10) catch continue;
+                    if (sample_idx >= direct_data.len or sample_idx >= graph_data.len) continue;
+                    std.debug.print(
+                        "training_graph_executor_node_parity_sample: node={} index={} direct={d:.9} graph={d:.9} abs_diff={d:.9}\n",
+                        .{
+                            node_id,
+                            sample_idx,
+                            direct_data[sample_idx],
+                            graph_data[sample_idx],
+                            @abs(direct_data[sample_idx] - graph_data[sample_idx]),
+                        },
+                    );
+                }
+            }
+        }
+        std.debug.print("training_graph_executor_node_parity_summary: passed={} nodes={}\n", .{ passed, selected.len });
+        return passed;
+    }
+
+    fn executeWithDirectInterpreter(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?[]const RuntimeInput,
+        retain_device_gradients: bool,
+        total_start: u64,
+    ) !TrainStepResult {
+        var profile: TrainStepProfile = .{};
+        profile.peak_resident_bytes = currentResidentBytes();
+        const execute_start = nowNs();
+
+        var owned_execution_frame = try beginOwnedExecutionFrame(cb);
+        errdefer cancelOwnedExecutionFrame(cb, &owned_execution_frame);
+        var planned_scope = try beginTrainingPlannedScope(cb);
+        errdefer endTrainingPlannedScope(cb, &planned_scope) catch {};
         var exec_result = try interpreter.execute(
             self.allocator,
             &self.graph,
             cb,
-            .{ .runtime_inputs = rt_slice, .cached_analysis = self.analysis },
+            .{ .runtime_inputs = runtime_inputs, .cached_analysis = self.analysis },
         );
+        try endTrainingPlannedScope(cb, &planned_scope);
         try submitOwnedExecutionFrame(cb, &owned_execution_frame);
         profile.execute_ns = elapsedNs(execute_start);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
@@ -366,6 +565,498 @@ pub const CompiledTrainSession = struct {
             .allocator = self.allocator,
             .compute_backend = if (retain_device_gradients) cb else null,
         };
+    }
+
+    fn executeWithSingleMetalGraphExecutor(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?[]const RuntimeInput,
+        retain_device_gradients: bool,
+        total_start: u64,
+        execute_start: u64,
+        profile: *TrainStepProfile,
+    ) !?TrainStepResult {
+        if (cb.kind() != .metal) return null;
+        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+        if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+
+        var diagnostics = partition_mod.CapabilityDiagnostics{};
+        var base_plan = if (platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARTITIONED", false))
+            try self.buildPartitionedMetalGraphExecutorPlan(&diagnostics)
+        else
+            try self.buildSingleMetalGraphExecutorPlan();
+        var owns_base_plan = true;
+        errdefer if (owns_base_plan) base_plan.deinit();
+
+        if (retain_device_gradients and !self.planKeepsGradientOutputsOnMetal(&base_plan)) {
+            compiledDiag("graph executor fallback gradient output assigned to native partition unsupported_ops={}", .{diagnostics.count(.unsupported_op)});
+            base_plan.deinit();
+            owns_base_plan = false;
+            return null;
+        }
+
+        const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
+        var owns_assignments = true;
+        errdefer if (owns_assignments) self.allocator.free(assignments);
+        for (base_plan.partitions, 0..) |part, idx| {
+            assignments[idx] = if (part.backend == .native) 1 else 0;
+        }
+
+        var dpp = multi_executor.DevicePartitionPlan{
+            .base = base_plan,
+            .device_assignment = assignments,
+            .allocator = self.allocator,
+        };
+        owns_base_plan = false;
+        owns_assignments = false;
+        defer dpp.deinit();
+
+        var fallback_native = try FallbackNativeBackend.init(self.allocator);
+        defer fallback_native.deinit(self.allocator);
+
+        var devices_buf = [_]device_mesh.DeviceEntry{
+            .{ .id = 0, .backend = cb, .kind = .metal },
+            .{ .id = 1, .backend = &fallback_native.backend, .kind = .native },
+        };
+        var mesh = try device_mesh.DeviceMesh.init(self.allocator, devices_buf[0..]);
+        defer mesh.deinit();
+
+        var multi_result = try multi_executor.executeMultiDevice(
+            self.allocator,
+            &self.graph,
+            &dpp,
+            &mesh,
+            .{
+                .runtime_inputs = runtime_inputs,
+                .cached_analysis = self.analysis,
+                .skip_metal_fused_patterns = true,
+                .collect_partition_stats = false,
+                .preserve_runtime_input_residency = true,
+            },
+        );
+        defer multi_result.deinit(&mesh);
+
+        profile.execute_ns = elapsedNs(execute_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        compiledDiag(
+            "graph executor execute done partitions={} execute_ms={d:.3} rss={}",
+            .{ dpp.base.partitions.len, nsToMs(profile.execute_ns), profile.peak_resident_bytes },
+        );
+
+        return try self.extractTrainStepResultFromGraphOutputs(
+            cb,
+            &mesh,
+            &multi_result,
+            retain_device_gradients,
+            total_start,
+            profile,
+        );
+    }
+
+    fn buildSingleMetalGraphExecutorPlan(self: *CompiledTrainSession) !partition_mod.PartitionPlan {
+        const count: usize = @intCast(self.graph.nodeCount());
+        const partitions = try self.allocator.alloc(partition_mod.Partition, 1);
+        errdefer self.allocator.free(partitions);
+        const node_ids = try self.allocator.alloc(NodeId, count);
+        errdefer self.allocator.free(node_ids);
+        const node_assignment = try self.allocator.alloc(u32, count);
+        errdefer self.allocator.free(node_assignment);
+        const node_operator_plans = try self.allocator.alloc(?@import("operator_plan.zig").OperatorPlan, count);
+        errdefer self.allocator.free(node_operator_plans);
+        const external_inputs = try self.allocator.alloc(partition_mod.ExternalInput, 0);
+        errdefer self.allocator.free(external_inputs);
+
+        for (0..count) |i| {
+            node_ids[i] = @intCast(i);
+            node_assignment[i] = 0;
+            node_operator_plans[i] = null;
+        }
+
+        partitions[0] = .{
+            .backend = .metal,
+            .device_id = 0,
+            .node_ids = node_ids,
+            .external_inputs = external_inputs,
+        };
+
+        return .{
+            .partitions = partitions,
+            .node_assignment = node_assignment,
+            .node_operator_plans = node_operator_plans,
+            .allocator = self.allocator,
+        };
+    }
+
+    fn buildPartitionedMetalGraphExecutorPlan(
+        self: *CompiledTrainSession,
+        diagnostics: *partition_mod.CapabilityDiagnostics,
+    ) !partition_mod.PartitionPlan {
+        const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(self.allocator, &self.graph);
+        defer self.allocator.free(descriptor_seeds);
+        try partition_mod.seedAllUploadableResidency(descriptor_seeds, &self.graph, .metal, 0);
+
+        const capabilities = [_]partition_mod.Capability{
+            .{
+                .backend = .metal,
+                .priority = 10,
+                .supports = &metal_capabilities.supportsMetalEagerGraph,
+                .decide = &metal_capabilities.decideMetalEagerGraph,
+            },
+            .{
+                .backend = .native,
+                .priority = 0,
+                .supports = &partition_mod.supportsAll,
+                .decide = &partition_mod.decideNative,
+            },
+        };
+
+        return partition_mod.partitionWithOptions(self.allocator, &self.graph, &capabilities, .{
+            .tensor_descs = descriptor_seeds,
+            .diagnostics = diagnostics,
+        });
+    }
+
+    fn planKeepsGradientOutputsOnMetal(
+        self: *const CompiledTrainSession,
+        plan: *const partition_mod.PartitionPlan,
+    ) bool {
+        var grad_output_idx: usize = self.loss_output_index + 1;
+        for (self.param_grads) |grad_id| {
+            if (grad_id == null_node) continue;
+            const output_node = self.graph.outputs.items[grad_output_idx];
+            grad_output_idx += 1;
+            const part_idx = plan.node_assignment[@intCast(output_node)];
+            if (plan.partitions[@intCast(part_idx)].backend != .metal) return false;
+        }
+        return true;
+    }
+
+    fn extractTrainStepResultFromGraphOutputs(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        mesh: *const device_mesh.DeviceMesh,
+        multi_result: *const multi_executor.MultiExecutionResult,
+        retain_device_gradients: bool,
+        total_start: u64,
+        profile: *TrainStepProfile,
+    ) !TrainStepResult {
+        const extract_start = nowNs();
+        const outputs = multi_result.outputs;
+        compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ outputs.len, retain_device_gradients, currentResidentBytes() });
+        const loss_device = mesh.device(multi_result.output_devices[self.loss_output_index]) orelse return error.DeviceNotFound;
+        const loss_data = try loss_device.backend.toFloat32(outputs[self.loss_output_index], self.allocator);
+        defer self.allocator.free(loss_data);
+        const loss_value: f32 = if (loss_data.len > 0) loss_data[0] else 0.0;
+
+        var gradients = std.StringHashMapUnmanaged([]f32){};
+        var device_gradients = std.StringHashMapUnmanaged(CT){};
+        errdefer {
+            var it = gradients.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            gradients.deinit(self.allocator);
+            var device_it = device_gradients.iterator();
+            while (device_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                cb.free(entry.value_ptr.*);
+            }
+            device_gradients.deinit(self.allocator);
+        }
+
+        var grad_output_idx: usize = self.loss_output_index + 1;
+        for (self.wrt_names, 0..) |name, i| {
+            if (self.param_grads[i] == null_node) continue;
+            const grad_ct = outputs[grad_output_idx];
+            const grad_output_node = self.graph.outputs.items[grad_output_idx];
+            const grad_device = mesh.device(multi_result.output_devices[grad_output_idx]) orelse return error.DeviceNotFound;
+            grad_output_idx += 1;
+            const owned_name = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(owned_name);
+            if (retain_device_gradients) {
+                if (grad_device.backend != cb) return error.UnexpectedGradientDevice;
+                const retained = try cloneTensorForOutputShape(self.allocator, &self.graph, cb, grad_ct, grad_output_node);
+                errdefer cb.free(retained);
+                try device_gradients.put(self.allocator, owned_name, retained);
+            } else {
+                const grad_data = try grad_device.backend.toFloat32(grad_ct, self.allocator);
+                try gradients.put(self.allocator, owned_name, grad_data);
+            }
+        }
+
+        profile.extract_ns = elapsedNs(extract_start);
+        profile.total_ns = elapsedNs(total_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        compiledDiag(
+            "extract done gradients={} device_gradients={} extract_ms={d:.3} total_ms={d:.3} rss={}",
+            .{
+                gradients.count(),
+                device_gradients.count(),
+                nsToMs(profile.extract_ns),
+                nsToMs(profile.total_ns),
+                profile.peak_resident_bytes,
+            },
+        );
+
+        return .{
+            .loss = loss_value,
+            .gradients = gradients,
+            .device_gradients = device_gradients,
+            .profile = profile.*,
+            .allocator = self.allocator,
+            .compute_backend = if (retain_device_gradients) cb else null,
+        };
+    }
+
+    const ParityReport = struct {
+        passed: bool = true,
+        loss_abs_diff: f32 = 0,
+        loss_rel_diff: f32 = 0,
+        max_grad_abs_diff: f32 = 0,
+        max_grad_rel_diff: f32 = 0,
+        compared_gradients: usize = 0,
+        compared_gradient_values: usize = 0,
+        missing_gradients: usize = 0,
+        direct_loss: f32 = 0,
+        graph_loss: f32 = 0,
+    };
+
+    fn compareTrainStepResults(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        direct: *const TrainStepResult,
+        graph_exec: *const TrainStepResult,
+    ) !ParityReport {
+        var report = ParityReport{
+            .direct_loss = direct.loss,
+            .graph_loss = graph_exec.loss,
+            .loss_abs_diff = absF32(direct.loss - graph_exec.loss),
+            .loss_rel_diff = relativeDiffF32(direct.loss, graph_exec.loss),
+        };
+
+        const loss_abs_tol = trainingGraphExecutorParityLossAbsTolerance();
+        const loss_rel_tol = trainingGraphExecutorParityLossRelTolerance();
+        const grad_abs_tol = trainingGraphExecutorParityGradAbsTolerance();
+        const grad_rel_tol = trainingGraphExecutorParityGradRelTolerance();
+        var remaining_values = trainingGraphExecutorParityMaxGradientValues();
+
+        if (report.loss_abs_diff > loss_abs_tol and report.loss_rel_diff > loss_rel_tol) {
+            report.passed = false;
+        }
+
+        if (direct.device_gradients.count() > 0 or graph_exec.device_gradients.count() > 0) {
+            var it = direct.device_gradients.iterator();
+            while (it.next()) |entry| {
+                if (remaining_values == 0) break;
+                const name = entry.key_ptr.*;
+                const graph_ct = graph_exec.device_gradients.get(name) orelse {
+                    report.missing_gradients += 1;
+                    report.passed = false;
+                    continue;
+                };
+                const direct_data = try cb.toFloat32(entry.value_ptr.*, self.allocator);
+                defer self.allocator.free(direct_data);
+                const graph_data = try cb.toFloat32(graph_ct, self.allocator);
+                defer self.allocator.free(graph_data);
+                self.compareGradientData(
+                    direct_data,
+                    graph_data,
+                    grad_abs_tol,
+                    grad_rel_tol,
+                    &remaining_values,
+                    &report,
+                );
+            }
+            if (graph_exec.device_gradients.count() != direct.device_gradients.count()) {
+                report.missing_gradients += graph_exec.device_gradients.count() -| direct.device_gradients.count();
+                report.passed = false;
+            }
+            return report;
+        }
+
+        var it = direct.gradients.iterator();
+        while (it.next()) |entry| {
+            if (remaining_values == 0) break;
+            const name = entry.key_ptr.*;
+            const graph_data = graph_exec.gradients.get(name) orelse {
+                report.missing_gradients += 1;
+                report.passed = false;
+                continue;
+            };
+            self.compareGradientData(
+                entry.value_ptr.*,
+                graph_data,
+                grad_abs_tol,
+                grad_rel_tol,
+                &remaining_values,
+                &report,
+            );
+        }
+        if (graph_exec.gradients.count() != direct.gradients.count()) {
+            report.missing_gradients += graph_exec.gradients.count() -| direct.gradients.count();
+            report.passed = false;
+        }
+        return report;
+    }
+
+    fn compareGradientData(
+        self: *CompiledTrainSession,
+        direct: []const f32,
+        graph_exec: []const f32,
+        grad_abs_tol: f32,
+        grad_rel_tol: f32,
+        remaining_values: *usize,
+        report: *ParityReport,
+    ) void {
+        _ = self;
+        report.compared_gradients += 1;
+        if (direct.len != graph_exec.len) {
+            report.missing_gradients += 1;
+            report.passed = false;
+        }
+        const n = @min(@min(direct.len, graph_exec.len), remaining_values.*);
+        for (0..n) |i| {
+            const abs_diff = absF32(direct[i] - graph_exec[i]);
+            const rel_diff = relativeDiffF32(direct[i], graph_exec[i]);
+            report.max_grad_abs_diff = @max(report.max_grad_abs_diff, abs_diff);
+            report.max_grad_rel_diff = @max(report.max_grad_rel_diff, rel_diff);
+            if (abs_diff > grad_abs_tol and rel_diff > grad_rel_tol) {
+                report.passed = false;
+            }
+        }
+        report.compared_gradient_values += n;
+        remaining_values.* -= n;
+    }
+};
+
+fn trainingGraphExecutorParityCheckEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_CHECK", false);
+}
+
+fn trainingGraphExecutorParityNodeIds() ?[]const u8 {
+    return platform.env.getenv("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_NODE_IDS");
+}
+
+fn trainingGraphExecutorParityMaxGradientValues() usize {
+    return platform.env.getenvUsize("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_MAX_GRAD_VALUES") orelse 4096;
+}
+
+fn trainingGraphExecutorParityLossAbsTolerance() f32 {
+    return getenvF32("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_LOSS_ATOL", 1e-5);
+}
+
+fn trainingGraphExecutorParityLossRelTolerance() f32 {
+    return getenvF32("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_LOSS_RTOL", 1e-4);
+}
+
+fn trainingGraphExecutorParityGradAbsTolerance() f32 {
+    return getenvF32("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_GRAD_ATOL", 1e-4);
+}
+
+fn trainingGraphExecutorParityGradRelTolerance() f32 {
+    return getenvF32("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_GRAD_RTOL", 1e-3);
+}
+
+fn getenvF32(comptime name: [*:0]const u8, default: f32) f32 {
+    const value = platform.env.getenv(name) orelse return default;
+    return std.fmt.parseFloat(f32, value) catch default;
+}
+
+fn absF32(value: f32) f32 {
+    return if (value < 0) -value else value;
+}
+
+fn relativeDiffF32(lhs: f32, rhs: f32) f32 {
+    const denom = @max(@max(absF32(lhs), absF32(rhs)), 1e-12);
+    return absF32(lhs - rhs) / denom;
+}
+
+const FloatSliceDiff = struct {
+    max_abs: f32 = 0,
+    max_rel: f32 = 0,
+    first_diff_index: usize = std.math.maxInt(usize),
+    len_mismatch: bool = false,
+};
+
+fn compareFloatSlices(lhs: []const f32, rhs: []const f32) FloatSliceDiff {
+    var diff = FloatSliceDiff{ .len_mismatch = lhs.len != rhs.len };
+    const n = @min(lhs.len, rhs.len);
+    for (0..n) |i| {
+        const abs_diff = absF32(lhs[i] - rhs[i]);
+        const rel_diff = relativeDiffF32(lhs[i], rhs[i]);
+        if (abs_diff > diff.max_abs) diff.max_abs = abs_diff;
+        if (rel_diff > diff.max_rel) diff.max_rel = rel_diff;
+        if (diff.first_diff_index == std.math.maxInt(usize) and abs_diff != 0) {
+            diff.first_diff_index = i;
+        }
+    }
+    return diff;
+}
+
+fn parseParityNodeIds(allocator: std.mem.Allocator, raw: []const u8, node_count: u32) ![]NodeId {
+    var ids = std.ArrayListUnmanaged(NodeId).empty;
+    errdefer ids.deinit(allocator);
+    var split = std.mem.splitScalar(u8, raw, ',');
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        const node_id = try std.fmt.parseUnsigned(NodeId, part, 10);
+        if (node_id >= node_count) return error.TrainingGraphExecutorParityInvalidNode;
+        try ids.append(allocator, node_id);
+    }
+    return ids.toOwnedSlice(allocator);
+}
+
+fn printTrainingGraphExecutorParityReport(report: CompiledTrainSession.ParityReport) void {
+    std.debug.print(
+        "training_graph_executor_parity: passed={} direct_loss={d:.9} graph_loss={d:.9} loss_abs_diff={d:.9} loss_rel_diff={d:.9} max_grad_abs_diff={d:.9} max_grad_rel_diff={d:.9} compared_gradients={} compared_gradient_values={} missing_gradients={}\n",
+        .{
+            report.passed,
+            report.direct_loss,
+            report.graph_loss,
+            report.loss_abs_diff,
+            report.loss_rel_diff,
+            report.max_grad_abs_diff,
+            report.max_grad_rel_diff,
+            report.compared_gradients,
+            report.compared_gradient_values,
+            report.missing_gradients,
+        },
+    );
+}
+
+const FallbackNativeBackend = struct {
+    weight_store: *native_compute.WeightStore,
+    compute: *native_compute.NativeCompute,
+    backend: ComputeBackend,
+
+    fn init(allocator: std.mem.Allocator) !FallbackNativeBackend {
+        const weight_store = try allocator.create(native_compute.WeightStore);
+        errdefer allocator.destroy(weight_store);
+        weight_store.* = .{
+            .allocator = allocator,
+            .resident_weights = .{},
+            .lazy_weights = .empty,
+        };
+
+        const compute = try allocator.create(native_compute.NativeCompute);
+        errdefer allocator.destroy(compute);
+        compute.* = native_compute.NativeCompute.init(allocator, weight_store, null);
+
+        return .{
+            .weight_store = weight_store,
+            .compute = compute,
+            .backend = compute.computeBackend(),
+        };
+    }
+
+    fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
+        self.backend.deinit();
+        native_compute.deinitPrefetchQueue(self.weight_store);
+        self.weight_store.resident_weights.deinit(allocator);
+        self.weight_store.lazy_weights.deinit(allocator);
+        allocator.destroy(self.weight_store);
     }
 };
 
@@ -466,12 +1157,15 @@ pub fn trainStep(
     const execute_start = nowNs();
     var owned_execution_frame = try beginOwnedExecutionFrame(cb);
     errdefer cancelOwnedExecutionFrame(cb, &owned_execution_frame);
+    var planned_scope = try beginTrainingPlannedScope(cb);
+    errdefer endTrainingPlannedScope(cb, &planned_scope) catch {};
     var exec_result = try interpreter.execute(
         allocator,
         &grad_result.graph,
         cb,
         .{ .runtime_inputs = rt_slice },
     );
+    try endTrainingPlannedScope(cb, &planned_scope);
     try submitOwnedExecutionFrame(cb, &owned_execution_frame);
     profile.execute_ns = elapsedNs(execute_start);
     profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
