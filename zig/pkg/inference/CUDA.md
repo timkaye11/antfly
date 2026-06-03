@@ -208,6 +208,18 @@ Build flags:
 Add a developer-only regeneration step for CUDA artifacts. CUDA-enabled CI may
 verify checked-in artifact freshness, but normal CI should not need CUDA.
 
+Developer regeneration command on a CUDA toolkit host:
+
+```bash
+cd zig/pkg/inference
+scripts/regen_cuda_artifacts.sh
+```
+
+The script compiles
+`src/ops/cuda/artifacts/inference_cuda_kernels.cu` into the checked-in portable
+PTX artifact. Set `CUDA_PTX_ARCH=compute_80` (or another virtual architecture)
+only when intentionally changing the portability floor.
+
 ## Inference Surface
 
 The first CUDA execution surface should be:

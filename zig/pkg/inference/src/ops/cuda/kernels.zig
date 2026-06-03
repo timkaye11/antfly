@@ -45,6 +45,9 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    rope_f32: driver_mod.CUfunction = null,
+    rope_per_item_f32: driver_mod.CUfunction = null,
+    gqa_attention_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
     split_last_dim3_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32: driver_mod.CUfunction = null,
@@ -118,6 +121,9 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
+        const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
+        const gqa_attention_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_f32");
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
         var split_last_dim3_f32: driver_mod.CUfunction = null;
@@ -194,6 +200,9 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .rope_f32 = rope_f32,
+            .rope_per_item_f32 = rope_per_item_f32,
+            .gqa_attention_f32 = gqa_attention_f32,
             .deberta_attention_f32 = deberta_attention_f32,
             .split_last_dim3_f32 = split_last_dim3_f32,
             .linear_q8_0_f32 = linear_q8_0_f32,
@@ -245,6 +254,9 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.rope_f32 = null;
+            self.rope_per_item_f32 = null;
+            self.gqa_attention_f32 = null;
             self.deberta_attention_f32 = null;
             self.split_last_dim3_f32 = null;
             self.linear_q8_0_f32 = null;
@@ -1130,6 +1142,184 @@ pub const KernelModule = struct {
         }
     }
 
+    pub fn launchRopeF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        position_offset: usize,
+        seq_len: usize,
+        chunks_per_position: usize,
+        consecutive_pairs: bool,
+    ) driver_mod.Error!void {
+        const function = self.rope_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var head_dim_u32 = try toU32(head_dim);
+        var rope_dim_u32 = try toU32(rope_dim);
+        var theta_f32 = theta;
+        var freq_scale_f32 = freq_scale;
+        var position_offset_u32 = try toU32(position_offset);
+        var seq_len_u32 = try toU32(seq_len);
+        var chunks_per_position_u32 = try toU32(chunks_per_position);
+        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&rope_dim_u32),
+            @ptrCast(&theta_f32),
+            @ptrCast(&freq_scale_f32),
+            @ptrCast(&position_offset_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&chunks_per_position_u32),
+            @ptrCast(&consecutive_pairs_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchRopePerItemF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        query_lengths: buffer_mod.DeviceBuffer,
+        position_offsets: buffer_mod.DeviceBuffer,
+        batch: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        consecutive_pairs: bool,
+    ) driver_mod.Error!void {
+        const function = self.rope_per_item_f32 orelse return error.CudaKernelUnavailable;
+        const total_chunks = try checkedTensorElements(try checkedTensorElements(batch, max_seq_len), num_heads);
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(query_lengths, batch * @sizeOf(u32));
+        try checkRawBytes(position_offsets, batch * @sizeOf(u32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var query_lengths_ptr = query_lengths.ptr;
+        var position_offsets_ptr = position_offsets.ptr;
+        var batch_u32 = try toU32(batch);
+        var max_seq_len_u32 = try toU32(max_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var rope_dim_u32 = try toU32(rope_dim);
+        var theta_f32 = theta;
+        var freq_scale_f32 = freq_scale;
+        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&query_lengths_ptr),
+            @ptrCast(&position_offsets_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&max_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&rope_dim_u32),
+            @ptrCast(&theta_f32),
+            @ptrCast(&freq_scale_f32),
+            @ptrCast(&consecutive_pairs_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchGqaAttentionF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        attn_or_mask: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        batch: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        mask_len: usize,
+        bias_mode: u32,
+    ) driver_mod.Error!void {
+        const function = self.gqa_attention_f32 orelse return error.CudaKernelUnavailable;
+        const q_hidden = try checkedTensorElements(num_heads, head_dim);
+        const kv_hidden = try checkedTensorElements(num_kv_heads, head_dim);
+        const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
+        const kv_count = try checkedTensorElements(try checkedTensorElements(batch, kv_seq_len), kv_hidden);
+        try checkBytes(dst, q_count);
+        try checkBytes(q, q_count);
+        try checkBytes(k, kv_count);
+        try checkBytes(v, kv_count);
+        if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
+        if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
+        if (q_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = attn_or_mask.ptr;
+        var bias_ptr = bias.ptr;
+        var batch_u32 = try toU32(batch);
+        var q_seq_len_u32 = try toU32(q_seq_len);
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var total_sequence_len_u32 = try toU32(total_sequence_len);
+        var mask_len_u32 = try toU32(mask_len);
+        var bias_mode_u32 = bias_mode;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&q_seq_len_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&total_sequence_len_u32),
+            @ptrCast(&mask_len_u32),
+            @ptrCast(&bias_mode_u32),
+        };
+        try launch1d(function, ctx, q_count, &params);
+    }
+
     pub fn launchDebertaAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -1975,6 +2165,13 @@ fn launchRows(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, ro
         params,
         null,
     ));
+}
+
+fn loadOptionalFunction(ctx: *context_mod.CudaContext, module: driver_mod.CUmodule, name: [*:0]const u8) driver_mod.CUfunction {
+    var function: driver_mod.CUfunction = null;
+    const result = ctx.driver.fns.cuModuleGetFunction(&function, module, name);
+    if (result != driver_mod.CUDA_SUCCESS) return null;
+    return function;
 }
 
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {

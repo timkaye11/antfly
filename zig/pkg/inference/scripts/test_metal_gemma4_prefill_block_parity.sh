@@ -18,7 +18,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PKG_DIR="$ROOT_DIR/pkg/inference"
 
-ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly}"
+if [[ -z "${ANTFLY_BIN:-}" ]]; then
+  if [[ -x "$PKG_DIR/zig-out/bin/antfly" ]]; then
+    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly"
+  else
+    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly-inference"
+  fi
+fi
 MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_MODEL:-$HOME/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf}"
 PROMPT="${ANTFLY_INFERENCE_GEMMA4_PREFILL_PROMPT:-hi}"
 MAX_TOKENS="${ANTFLY_INFERENCE_GEMMA4_PREFILL_MAX_TOKENS:-4}"
@@ -27,9 +33,14 @@ COMPARE_LAYER="${ANTFLY_INFERENCE_GEMMA4_PREFILL_BLOCK_COMPARE_LAYER:-0}"
 OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-prefill-block-parity}"
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
-  echo "antfly binary not executable: $ANTFLY_BIN" >&2
+  echo "Antfly inference binary not executable: $ANTFLY_BIN" >&2
   echo "build it first, for example: cd pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
   exit 2
+fi
+
+ANTFLY_CMD=("$ANTFLY_BIN")
+if [[ "$(basename "$ANTFLY_BIN")" != "antfly-inference" ]]; then
+  ANTFLY_CMD+=("inference")
 fi
 
 if [[ ! -d "$MODEL_DIR" ]]; then
@@ -48,7 +59,7 @@ run_generate() {
   set +e
   (
     cd "$ROOT_DIR"
-    "$@" "$ANTFLY_BIN" inference generate "$MODEL_DIR" "$PROMPT" \
+    "$@" "${ANTFLY_CMD[@]}" generate "$MODEL_DIR" "$PROMPT" \
       --backend metal \
       --max-tokens "$MAX_TOKENS" \
       --print-token-ids \

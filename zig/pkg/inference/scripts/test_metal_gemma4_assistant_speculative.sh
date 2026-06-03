@@ -18,7 +18,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PKG_DIR="$ROOT_DIR/pkg/inference"
 
-ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly}"
+if [[ -z "${ANTFLY_BIN:-}" ]]; then
+  if [[ -x "$PKG_DIR/zig-out/bin/antfly" ]]; then
+    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly"
+  else
+    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly-inference"
+  fi
+fi
 TARGET_MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_TARGET_MODEL:-$HOME/.antfly/inference/models/google/gemma-4-E2B-it}"
 DRAFT_MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL:-$HOME/.antfly/inference/models/google/gemma-4-E2B-it-assistant}"
 PROMPT="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_PROMPT:-hi}"
@@ -32,9 +38,14 @@ OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-assistant-speculative}"
 DEBUG_METAL_SCRIPT="$PKG_DIR/scripts/debug_metal_command.sh"
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
-  echo "antfly binary not executable: $ANTFLY_BIN" >&2
+  echo "Antfly inference binary not executable: $ANTFLY_BIN" >&2
   echo "build it first, for example: cd pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
   exit 2
+fi
+
+ANTFLY_CMD=("$ANTFLY_BIN")
+if [[ "$(basename "$ANTFLY_BIN")" != "antfly-inference" ]]; then
+  ANTFLY_CMD+=("inference")
 fi
 
 if [[ ! -d "$TARGET_MODEL_DIR" ]]; then
@@ -61,7 +72,7 @@ bash "$DEBUG_METAL_SCRIPT" command \
   --timeout "${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_TIMEOUT_SECS:-60}" \
   --api-validate \
   --cwd "$ROOT_DIR" \
-  -- "$ANTFLY_BIN" inference generate "$TARGET_MODEL_DIR" "$PROMPT" \
+  -- "${ANTFLY_CMD[@]}" generate "$TARGET_MODEL_DIR" "$PROMPT" \
   --backend "$BACKEND" \
   --draft-model "$DRAFT_MODEL_DIR" \
   --speculative-k "$SPECULATIVE_K" \

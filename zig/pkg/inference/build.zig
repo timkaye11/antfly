@@ -440,6 +440,7 @@ pub fn build(b: *std.Build) void {
     });
     clipclap_bench_exe.root_module.addImport("build_options", build_options_mod);
     clipclap_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_bench_exe.root_module.addImport("antfly_platform", platform_mod);
     if (enable_system_blas) {
         configureSystemBlas(b, clipclap_bench_exe.root_module, target, blas_root);
     }

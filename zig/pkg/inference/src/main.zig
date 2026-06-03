@@ -123,6 +123,10 @@ pub fn runFromArgs(
         try inference.finetune_cli.main(init, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
         try inference.native_smoke.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        try inference.cuda_info.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "bench-cuda")) {
+        try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "list")) {
         try listModels(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "pull")) {
@@ -168,12 +172,13 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     }
 
     print("antfly inference v{s}\n", .{build_options.inference_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_mlx,
+        build_options.enable_cuda,
     });
     print("models: {s}\n", .{models_dir});
     print("listening on {s}:{d}\n", .{ host, port });
@@ -295,6 +300,8 @@ fn printUsage(usage_name: []const u8) void {
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
+        \\  cuda-info Probe CUDA availability and optionally run CUDA smoke checks
+        \\  bench-cuda Run CUDA Q4_K kernel and optional ClipClap embedding benchmarks
         \\  list      List available models
         \\  pull      Download a model from HuggingFace Hub
         \\

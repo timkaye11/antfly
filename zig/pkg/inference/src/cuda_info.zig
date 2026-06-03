@@ -88,7 +88,7 @@ fn printUsage() void {
     print(
         \\usage: antfly inference cuda-info [--smoke]
         \\
-        \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, and Q4_0.
+        \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, Q4_0, and Q4_K.
         \\
     , .{});
 }

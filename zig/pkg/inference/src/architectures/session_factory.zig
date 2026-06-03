@@ -1296,8 +1296,14 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
     return switch (arch_config) {
         .deberta, .gliner, .clip, .clap => true,
+        .gpt => |cfg| cfg.family == .gemma,
         else => false,
     };
+}
+
+test "cuda support gate admits Gemma-family GPT only after decoder primitives exist" {
+    try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
 }
 
 fn eagerLoadResidentsFromStore(

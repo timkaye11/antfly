@@ -33,6 +33,7 @@ pub const Error = error{
     CudaUnavailable,
     CudaSymbolMissing,
     CudaDriverError,
+    CudaKernelUnavailable,
     NoCudaDevices,
     InvalidCudaState,
 };
