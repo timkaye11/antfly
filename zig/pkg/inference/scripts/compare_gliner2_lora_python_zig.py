@@ -102,6 +102,33 @@ def prepare_python_model_dir(model_dir: Path, out_dir: Path) -> Path:
     """
     dst = out_dir / "python_model"
     dst.mkdir(parents=True, exist_ok=True)
+    root_config = dst / "config.json"
+    if not (model_dir / "config.json").exists() and not root_config.exists():
+        root_config.write_text(
+            json.dumps(
+                {
+                    "model_name": "microsoft/deberta-v3-base",
+                    "model_type": "extractor",
+                    "counting_layer": "count_lstm_v2",
+                    "token_pooling": "first",
+                    "max_width": 8,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    tokenizer_config = dst / "tokenizer_config.json"
+    if not (model_dir / "tokenizer_config.json").exists() and not tokenizer_config.exists():
+        tokenizer_config.write_text(
+            json.dumps(
+                {
+                    "tokenizer_class": "DebertaV2TokenizerFast",
+                    "model_max_length": 512,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     for src in model_dir.iterdir():
         target = dst / src.name
         if src.name == "encoder_config":
@@ -111,6 +138,14 @@ def prepare_python_model_dir(model_dir: Path, out_dir: Path) -> Path:
                 if child.name == "config.json":
                     cfg = json.loads(child.read_text(encoding="utf-8"))
                     cfg.setdefault("model_type", "deberta-v2")
+                    cfg.setdefault("relative_attention", True)
+                    cfg.setdefault("position_biased_input", False)
+                    cfg.setdefault("pos_att_type", ["p2c", "c2p"])
+                    cfg.setdefault("max_relative_positions", -1)
+                    cfg.setdefault("norm_rel_ebd", "layer_norm")
+                    cfg.setdefault("share_att_key", True)
+                    cfg.setdefault("type_vocab_size", 0)
+                    cfg.setdefault("layer_norm_eps", 1e-7)
                     child_target.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
                 elif not child_target.exists():
                     child_target.symlink_to(child)
@@ -119,8 +154,11 @@ def prepare_python_model_dir(model_dir: Path, out_dir: Path) -> Path:
     return dst
 
 
-def run_command(cmd: list[str], cwd: Path, timeout: int | None = None) -> dict[str, Any]:
+def run_command(cmd: list[str], cwd: Path, timeout: int | None = None, env: dict[str, str] | None = None) -> dict[str, Any]:
     started = time.time()
+    run_env = {**os.environ, "TOKENIZERS_PARALLELISM": "false"}
+    if env:
+        run_env.update(env)
     proc = subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -128,7 +166,7 @@ def run_command(cmd: list[str], cwd: Path, timeout: int | None = None) -> dict[s
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=timeout,
-        env={**os.environ, "TOKENIZERS_PARALLELISM": "false"},
+        env=run_env,
     )
     return {
         "argv": cmd,
@@ -184,11 +222,13 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def python_training_script() -> str:
     return r'''
-import argparse, json, math, pathlib, time, types
+import argparse, json, math, os, pathlib, time, types
 import torch
 import torch.nn.functional as F
+import gliner2.model as gliner2_model
 from gliner2.model import Extractor
 from gliner2.training.trainer import ExtractorCollator, TrainingConfig, GLiNER2Trainer
+from transformers import AutoConfig
 
 p = argparse.ArgumentParser()
 p.add_argument("--model-dir", required=True)
@@ -211,6 +251,21 @@ args = p.parse_args()
 
 out = pathlib.Path(args.out_dir)
 out.mkdir(parents=True, exist_ok=True)
+
+_extractor_config_from_pretrained = Extractor.config_class.from_pretrained
+def _local_file_aware_extractor_config(cls, path_or_repo_id, *cfg_args, **cfg_kwargs):
+    if isinstance(path_or_repo_id, (str, os.PathLike)) and os.path.isfile(path_or_repo_id):
+        return cls.from_json_file(os.fspath(path_or_repo_id))
+    return _extractor_config_from_pretrained(path_or_repo_id, *cfg_args, **cfg_kwargs)
+Extractor.config_class.from_pretrained = classmethod(_local_file_aware_extractor_config)
+
+_auto_config_from_pretrained = AutoConfig.from_pretrained
+def _local_file_aware_auto_config(path_or_repo_id, *cfg_args, **cfg_kwargs):
+    if isinstance(path_or_repo_id, (str, os.PathLike)) and os.path.isfile(path_or_repo_id):
+        return _auto_config_from_pretrained(os.path.dirname(os.fspath(path_or_repo_id)), *cfg_args, **cfg_kwargs)
+    return _auto_config_from_pretrained(path_or_repo_id, *cfg_args, **cfg_kwargs)
+AutoConfig.from_pretrained = _local_file_aware_auto_config
+gliner2_model.AutoConfig.from_pretrained = _local_file_aware_auto_config
 
 started = time.time()
 model = Extractor.from_pretrained(args.model_dir, map_location="cpu")
@@ -526,7 +581,7 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "--seq-len", str(args.seq_len),
         "--learning-rate", str(args.learning_rate),
         "--backend", args.zig_backend,
-        "--objective", "span-start",
+        "--objective", args.zig_objective,
         "--entity-types", args.entity_types,
         "--num-classes", str(len([x for x in args.entity_types.split(",") if x]) + 1),
         "--max-span-width", str(args.max_span_width),
@@ -542,9 +597,14 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "--lora-targets", args.lora_targets,
         "--seed", str(args.seed),
     ])
+    if args.zig_lora_only_trainables:
+        cmd.append("--lora-only-trainables")
     if args.dump_parity:
         cmd.append("--dump-span-parity")
-    result = run_command(cmd, inference_dir(), timeout=args.timeout_seconds)
+    zig_env: dict[str, str] = {}
+    if args.zig_backend == "metal" and args.zig_training_graph_executor:
+        zig_env["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
+    result = run_command(cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env)
     result["metrics"] = parse_zig_output(result["output"])
     result["training_metrics"] = load_jsonl(out_dir / "zig" / "training_metrics.jsonl")
     return result
@@ -582,6 +642,19 @@ def main() -> int:
     p.add_argument("--lora-targets", default=LORA_TARGETS)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--zig-backend", default="native", choices=["native", "metal", "mlx", "auto"])
+    p.add_argument(
+        "--zig-training-graph-executor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR for Zig Metal runs",
+    )
+    p.add_argument("--zig-objective", default="span-start", choices=["token", "span-start"])
+    p.add_argument(
+        "--zig-lora-only-trainables",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match upstream GLiNER2 LoRA training by freezing regular task-head params and optimizing only LoRA params",
+    )
     p.add_argument("--zig-build-metal", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--zig-build-mlx", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--zig-optimize", choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"], default=None)
@@ -625,6 +698,9 @@ def main() -> int:
             "lora_targets": args.lora_targets,
             "seed": args.seed,
             "zig_backend": args.zig_backend,
+            "zig_training_graph_executor": args.zig_training_graph_executor,
+            "zig_objective": args.zig_objective,
+            "zig_lora_only_trainables": args.zig_lora_only_trainables,
             "zig_build_metal": args.zig_build_metal,
             "zig_build_mlx": args.zig_build_mlx,
             "zig_optimize": args.zig_optimize,
@@ -649,6 +725,32 @@ def main() -> int:
     zig_total_trainer_ms = sum(float(row.get("trainer_total_ms") or 0.0) for row in zig_step_rows) if zig_step_rows else None
     zig_avg_trainer_ms = (zig_total_trainer_ms / len(zig_step_rows)) if zig_total_trainer_ms is not None and zig_step_rows else None
     zig_epoch_metrics = next((row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "epoch"), {})
+    def zig_step_sum(key: str) -> float | None:
+        if not zig_step_rows:
+            return None
+        return sum(float(row.get(key) or 0.0) for row in zig_step_rows)
+
+    def zig_step_avg(key: str) -> float | None:
+        total = zig_step_sum(key)
+        return (total / len(zig_step_rows)) if total is not None and zig_step_rows else None
+
+    trainable_parity_warning = None if args.zig_lora_only_trainables else "Zig is training regular task-head params in addition to LoRA params; upstream GLiNER2 LoRA freezes non-LoRA params"
+    entity_only_structure_parity = (
+        args.zig_objective == "span-start"
+        and args.span_loss_reduction == "sum"
+        and args.span_positive_weight == 1.0
+        and args.span_negative_weight == 1.0
+        and args.span_hard_negative_weight == 1.0
+    )
+    if entity_only_structure_parity:
+        objective_parity_warning = "Current objective parity is scoped to upstream entity-only structure_loss with gold_count=1; GLiNER2 classification, count_loss, relations, and multi-structure count>1 losses are not covered by this benchmark"
+        zig_objective_semantics = "entity-only structure_loss-compatible flattened span/start-width BCE"
+    elif args.zig_objective == "span-start":
+        objective_parity_warning = "Zig span-start settings differ from upstream entity-only structure_loss settings; use sum reduction and unit positive/negative/hard-negative weights for the closest current parity run"
+        zig_objective_semantics = "span-start BCE surrogate"
+    else:
+        objective_parity_warning = "Zig token-classification objective does not match upstream GLiNER2Trainer structure_loss training"
+        zig_objective_semantics = "token classification"
     report["summary"] = {
         "python_returncode": report.get("python", {}).get("returncode"),
         "zig_returncode": report.get("zig", {}).get("returncode"),
@@ -663,6 +765,19 @@ def main() -> int:
         "zig_avg_trainer_ms": zig_avg_trainer_ms,
         "zig_epoch_wall_ms": zig_epoch_metrics.get("epoch_wall_ms"),
         "zig_epoch_supervised_tokens_per_second": zig_epoch_metrics.get("supervised_tokens_per_second"),
+        "zig_graph_executor_partitions_avg": zig_step_avg("graph_executor_partitions"),
+        "zig_graph_executor_command_dispatches_avg": zig_step_avg("graph_executor_command_dispatches"),
+        "zig_graph_executor_planned_dispatches_avg": zig_step_avg("graph_executor_planned_dispatches"),
+        "zig_graph_executor_interpreter_fallbacks_avg": zig_step_avg("graph_executor_interpreter_fallbacks"),
+        "zig_graph_executor_host_outputs_avg": zig_step_avg("graph_executor_host_outputs"),
+        "zig_graph_executor_regions_avg": zig_step_avg("graph_executor_regions"),
+        "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg("graph_executor_runtime_region_dispatches"),
+        "python_cpu_step_gate_ms": python_avg_step_ms,
+        "zig_beats_python_cpu_step_time": (
+            zig_avg_trainer_ms < python_avg_step_ms
+            if zig_avg_trainer_ms is not None and python_avg_step_ms is not None
+            else None
+        ),
         "trainer_speedup_python_over_zig": (
             python_trainer_elapsed / (zig_total_trainer_ms / 1000.0)
             if python_trainer_elapsed is not None and zig_total_trainer_ms not in (None, 0)
@@ -681,6 +796,12 @@ def main() -> int:
         "python_last_loss": py_loss,
         "zig_final_avg_loss": zig_loss,
         "loss_delta_zig_minus_python": (zig_loss - py_loss) if zig_loss is not None and py_loss is not None else None,
+        "python_objective_semantics": "upstream GLiNER2Trainer total_loss = classification_loss + structure_loss + count_loss; LoRA mode freezes non-LoRA params",
+        "zig_objective_semantics": zig_objective_semantics,
+        "entity_only_structure_parity": entity_only_structure_parity,
+        "trainable_parity_warning": trainable_parity_warning,
+        "objective_parity_warning": objective_parity_warning,
+        "semantic_parity_warning": objective_parity_warning if trainable_parity_warning is None else f"{trainable_parity_warning}; {objective_parity_warning}",
     }
 
     report_path = args.out_dir / "comparison_report.json"

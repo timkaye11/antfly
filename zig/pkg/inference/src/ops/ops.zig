@@ -79,6 +79,24 @@ pub const LinearNoBiasTripleResult = struct {
     third: CT,
 };
 
+pub const LoraLinearBranchResult = struct {
+    after_a: CT,
+    after_b: CT,
+    output: CT,
+};
+
+pub const LoraLinearBranchRequest = struct {
+    input: CT,
+    base: CT,
+    lora_a: CT,
+    lora_b: CT,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+};
+
 pub const LinearPlannedRequest = struct {
     input: CT,
     weight: CT,
@@ -947,6 +965,15 @@ pub const ComputeBackend = struct {
             in_dim: usize,
             out_dim: usize,
         ) anyerror!CT = null,
+
+        /// Training LoRA branch:
+        /// after_a = input @ lora_a^T
+        /// after_b = after_a @ lora_b^T
+        /// output = base + after_b * scale
+        ///
+        /// Returns all intermediates because the autodiff graph may consume
+        /// them later when accumulating adapter gradients.
+        loraLinearBranch: ?*const fn (ctx: *anyopaque, request: *const LoraLinearBranchRequest) anyerror!?LoraLinearBranchResult = null,
 
         /// Split a rank-2 [rows, 3*dim] tensor into three [rows, dim] tensors
         /// along the last dimension. Backends may implement this without a host
@@ -1823,6 +1850,11 @@ pub const ComputeBackend = struct {
             return op(self.ptr, input, base_weight, bias, lora_a, lora_b, alpha, rank, rows, in_dim, out_dim);
         }
         return fallbackLinearLoRA(self, input, base_weight, bias, lora_a, lora_b, alpha, rank, rows, in_dim, out_dim);
+    }
+
+    pub fn loraLinearBranch(self: *const ComputeBackend, request: *const LoraLinearBranchRequest) !?LoraLinearBranchResult {
+        const op = self.vtable.loraLinearBranch orelse return null;
+        return op(self.ptr, request);
     }
 
     pub fn zeroTensor(self: *const ComputeBackend, rows: usize, dim: usize) !?CT {

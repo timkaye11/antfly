@@ -2963,6 +2963,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var shape_i32_buf: [metal_tensor_mod.max_dims]i32 = undefined;
         if (shape_i64.len > shape_i32_buf.len) return error.UnsupportedShape;
         for (shape_i64, 0..) |dim, i| shape_i32_buf[i] = @intCast(dim);
+        const logical_numel = try shapeNumel(shape_i64);
+        if (logical_numel != buf.data.len) {
+            if (buf.data.len == 0 or logical_numel == 0 or logical_numel % buf.data.len != 0) {
+                return error.InvalidTensorShape;
+            }
+            const expanded = try std.heap.c_allocator.alloc(f32, logical_numel);
+            errdefer std.heap.c_allocator.free(expanded);
+            for (0..logical_numel) |i| {
+                expanded[i] = buf.data[wrapRepeatedBufferIndex(i, buf.data.len)];
+            }
+            return MetalTensor.owned(expanded, shape_i32_buf[0..shape_i64.len]);
+        }
         return MetalTensor.borrowed(buf.data.ptr, buf.data.len, shape_i32_buf[0..shape_i64.len]);
     }
 
@@ -3195,6 +3207,55 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const host = try self.computeBackend().toFloat32(output, self.allocator);
         defer self.allocator.free(host);
         return if (host.len > 0) host[0] else 0.0;
+    }
+
+    pub const TrainingSumSquaresInput = struct {
+        tensor: CT,
+        elem_count: usize,
+    };
+
+    pub fn trainingSumSquaresManyF32(
+        self: *MetalCompute,
+        inputs: []const TrainingSumSquaresInput,
+    ) !f32 {
+        if (inputs.len == 0) return 0.0;
+        if (inputs.len > 256) return error.TooManyTrainingSumSquaresInputs;
+
+        const output_shape = [_]i32{@intCast(inputs.len)};
+        const output = try self.trainingZeroF32(inputs.len, &output_shape);
+        defer self.computeBackend().free(output);
+
+        var input_mts = try self.allocator.alloc(MetalTensor, inputs.len);
+        defer self.allocator.free(input_mts);
+        var initialized: usize = 0;
+        defer {
+            for (input_mts[0..initialized]) |*mt| mt.deinit();
+        }
+
+        var elem_counts = try self.allocator.alloc(usize, inputs.len);
+        defer self.allocator.free(elem_counts);
+
+        for (inputs, 0..) |item, idx| {
+            input_mts[idx] = try self.ownedDeviceMetalTensorFromCt(item.tensor);
+            initialized += 1;
+            elem_counts[idx] = item.elem_count;
+        }
+
+        var output_mt = try self.ownedDeviceMetalTensorFromCt(output);
+        defer output_mt.deinit();
+        const ok = try metal_runtime.decoderRuntimeTrainingSumSquaresManyF32(
+            self.provider_impl,
+            input_mts,
+            elem_counts,
+            output_mt,
+        );
+        if (!ok) return error.MetalTrainingSumSquaresUnavailable;
+
+        const host = try self.computeBackend().toFloat32(output, self.allocator);
+        defer self.allocator.free(host);
+        var total: f64 = 0.0;
+        for (host) |value| total += @as(f64, value);
+        return @floatCast(total);
     }
 
     fn nextPow2AtLeast(value: usize) usize {
@@ -4616,10 +4677,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !?CT {
         if (disableRuntimeElementwise()) return null;
         if (primary_len == 0 or primary_len != secondary_len) return null;
-        const primary_metal = toBuf(primary).metal_tensor;
-        const secondary_metal = toBuf(secondary).metal_tensor;
-        const primary_is_device = if (primary_metal) |metal| metal.isDevice() else false;
-        const secondary_is_device = if (secondary_metal) |metal| metal.isDevice() else false;
+        const primary_buf = toBuf(primary);
+        const secondary_buf = toBuf(secondary);
+        const primary_metal = primary_buf.metal_tensor;
+        const secondary_metal = secondary_buf.metal_tensor;
+        const primary_is_device = primary_buf.lazy_multiply != null or if (primary_metal) |metal| metal.isDevice() else false;
+        const secondary_is_device = secondary_buf.lazy_multiply != null or if (secondary_metal) |metal| metal.isDevice() else false;
         if (!primary_is_device and !secondary_is_device) return null;
 
         var lhs = blk: {
@@ -4969,11 +5032,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (disableRuntimeElementwise()) return null;
         const input_buf = toBuf(a);
         if (input_buf.quantized_storage != null) return null;
-        const input_metal = input_buf.metal_tensor orelse return null;
-        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
-
-        var input = try input_metal.retainedCopy();
+        var input = if (input_buf.lazy_multiply != null)
+            try self.ownedDeviceMetalTensorFromCt(a)
+        else blk: {
+            const input_metal = input_buf.metal_tensor orelse return null;
+            break :blk try input_metal.retainedCopy();
+        };
         defer input.deinit();
+        if (!input.isDevice() or input.elemCount() == 0) return null;
         if (try metal_runtime.decoderRuntimeApplyPrimitiveUnary(
             self.provider_impl,
             input,
@@ -5009,23 +5075,48 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn tryDeviceReduceLastDim(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !?CT {
-        if (axes.len != 1) return null;
+        const trace = getenvBool("TERMITE_METAL_TRACE_REDUCE_PRIM");
+        if (axes.len != 1) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_axes op={s} axes={any} input_shape={any}\n", .{ @tagName(op_kind), axes, input_shape });
+            return null;
+        }
         const input_buf = toBuf(input);
         if (comptime op_kind == .sum) {
             if (try self.tryDeviceLazyMultiplyReduceLastDim(input_buf, axes, input_shape)) |result| return result;
         }
-        if (input_buf.quantized_storage != null) return null;
-        const input_metal = input_buf.metal_tensor orelse return null;
-        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+        if (input_buf.quantized_storage != null) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_quantized op={s} axes={any} input_shape={any}\n", .{ @tagName(op_kind), axes, input_shape });
+            return null;
+        }
+        const input_metal = input_buf.metal_tensor orelse {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_no_metal op={s} axes={any} input_shape={any} logical_shape={any}\n", .{ @tagName(op_kind), axes, input_shape, input_buf.logical_shape });
+            return null;
+        };
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_not_device op={s} is_device={} elems={d} metal_shape={any}\n", .{ @tagName(op_kind), input_metal.isDevice(), input_metal.elemCount(), input_metal.shape() });
+            return null;
+        }
 
         const declared_shape = input_buf.logical_shape orelse input_shape;
-        if (declared_shape.len == 0 or axes[0] != declared_shape.len - 1) return null;
-        const resolved = resolveShapeFromDataLen(declared_shape, input_metal.elemCount()) orelse return null;
+        if (declared_shape.len == 0 or axes[0] != declared_shape.len - 1) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_not_last op={s} axis={d} declared_shape={any} elems={d} metal_shape={any}\n", .{ @tagName(op_kind), axes[0], declared_shape, input_metal.elemCount(), input_metal.shape() });
+            return null;
+        }
+        const resolved = resolveShapeFromDataLen(declared_shape, input_metal.elemCount()) orelse {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_shape op={s} declared_shape={any} elems={d} metal_shape={any}\n", .{ @tagName(op_kind), declared_shape, input_metal.elemCount(), input_metal.shape() });
+            return null;
+        };
         const resolved_shape = resolved[0..declared_shape.len];
         const dim_i64 = resolved_shape[resolved_shape.len - 1];
-        if (dim_i64 <= 0) return null;
+        if (dim_i64 <= 0) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_bad_dim op={s} resolved_shape={any}\n", .{ @tagName(op_kind), resolved_shape });
+            return null;
+        }
         const dim: usize = @intCast(dim_i64);
-        if (input_metal.elemCount() % dim != 0) return null;
+        if (input_metal.elemCount() % dim != 0) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_elem_mismatch op={s} elems={d} dim={d} resolved_shape={any}\n", .{ @tagName(op_kind), input_metal.elemCount(), dim, resolved_shape });
+            return null;
+        }
         const rows = input_metal.elemCount() / dim;
 
         var output_shape_i64_buf: [metal_tensor_mod.max_dims]i64 = undefined;
@@ -5044,19 +5135,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             reduceKindId(op_kind),
             output_shape_i32,
         )) |tensor| {
+            if (trace) std.debug.print("metal_reduce_prim: path=last_dim_device op={s} rows={d} dim={d} output_shape={any}\n", .{ @tagName(op_kind), rows, dim, output_shape_i64_buf[0..resolved_shape.len] });
             return self.ctFromOwnedMetalTensor(tensor);
         }
+        if (trace) std.debug.print("metal_reduce_prim: decline=last_dim_runtime_null op={s} rows={d} dim={d}\n", .{ @tagName(op_kind), rows, dim });
         return null;
     }
 
     fn tryDeviceReduceAxisF32(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !?CT {
+        const trace = getenvBool("TERMITE_METAL_TRACE_REDUCE_PRIM");
         if (comptime (op_kind != .sum and op_kind != .mean)) return null;
-        if (axes.len != 1 or input_shape.len == 0 or input_shape.len > metal_tensor_mod.max_dims) return null;
+        if (axes.len != 1 or input_shape.len == 0 or input_shape.len > metal_tensor_mod.max_dims) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_shape op={s} axes={any} input_shape={any}\n", .{ @tagName(op_kind), axes, input_shape });
+            return null;
+        }
         const axis: usize = axes[0];
-        if (axis >= input_shape.len or axis == input_shape.len - 1) return null;
+        if (axis >= input_shape.len or axis == input_shape.len - 1) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_unsupported_axis op={s} axis={d} input_shape={any}\n", .{ @tagName(op_kind), axis, input_shape });
+            return null;
+        }
         const input_buf = toBuf(input);
         if (input_buf.lazy_multiply) |*lazy| {
-            if (lazy.lhs.elemCount() == 0 or lazy.lhs.elemCount() != lazy.rhs.elemCount()) return null;
+            if (lazy.lhs.elemCount() == 0 or lazy.lhs.elemCount() != lazy.rhs.elemCount()) {
+                if (trace) std.debug.print("metal_reduce_prim: decline=axis_lazy_mismatch op={s} lhs={d} rhs={d} input_shape={any}\n", .{ @tagName(op_kind), lazy.lhs.elemCount(), lazy.rhs.elemCount(), input_shape });
+                return null;
+            }
             var lhs = try lazy.lhs.retainedCopy();
             defer lhs.deinit();
             var rhs = try lazy.rhs.retainedCopy();
@@ -5067,16 +5170,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 _ = try self.withLogicalShape(product, input_shape);
                 return try self.tryDeviceReduceAxisF32(product, axes, input_shape, op_kind);
             }
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_lazy_runtime_null op={s} elems={d}\n", .{ @tagName(op_kind), lazy.lhs.elemCount() });
             return null;
         }
-        if (input_buf.quantized_storage != null) return null;
-        const input_metal = input_buf.metal_tensor orelse return null;
-        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+        if (input_buf.quantized_storage != null) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_quantized op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
+            return null;
+        }
+        const input_metal = input_buf.metal_tensor orelse {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_no_metal op={s} input_shape={any} logical_shape={any}\n", .{ @tagName(op_kind), input_shape, input_buf.logical_shape });
+            return null;
+        };
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_not_device op={s} is_device={} elems={d} metal_shape={any}\n", .{ @tagName(op_kind), input_metal.isDevice(), input_metal.elemCount(), input_metal.shape() });
+            return null;
+        }
 
         const input_elems = try shapeNumel(input_shape);
-        if (input_metal.elemCount() != input_elems or input_elems > std.math.maxInt(u32)) return null;
+        if (input_metal.elemCount() != input_elems or input_elems > std.math.maxInt(u32)) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_elem_mismatch op={s} elems={d} expected={d} input_shape={any} metal_shape={any}\n", .{ @tagName(op_kind), input_metal.elemCount(), input_elems, input_shape, input_metal.shape() });
+            return null;
+        }
         const reduce_dim_i64 = input_shape[axis];
-        if (reduce_dim_i64 <= 0) return null;
+        if (reduce_dim_i64 <= 0) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_bad_dim op={s} axis={d} input_shape={any}\n", .{ @tagName(op_kind), axis, input_shape });
+            return null;
+        }
         const reduce_dim: usize = @intCast(reduce_dim_i64);
 
         var input_strides_usize: [metal_tensor_mod.max_dims]usize = undefined;
@@ -5087,13 +5206,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         output_shape_i64_buf[axis] = 1;
         const output_shape_i64 = output_shape_i64_buf[0..input_shape.len];
         const output_elems = try shapeNumel(output_shape_i64);
-        if (output_elems > std.math.maxInt(u32) or input_strides_usize[axis] > std.math.maxInt(u32)) return null;
+        if (output_elems > std.math.maxInt(u32) or input_strides_usize[axis] > std.math.maxInt(u32)) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=axis_size_limit op={s} output_elems={d} stride={d}\n", .{ @tagName(op_kind), output_elems, input_strides_usize[axis] });
+            return null;
+        }
         computeStrides(output_shape_i64, output_strides_usize[0..output_shape_i64.len]);
 
         var out_strides = [_]u32{0} ** metal_tensor_mod.max_dims;
         var input_strides_for_out = [_]u32{0} ** metal_tensor_mod.max_dims;
         for (output_shape_i64, 0..) |_, i| {
-            if (output_strides_usize[i] > std.math.maxInt(u32) or input_strides_usize[i] > std.math.maxInt(u32)) return null;
+            if (output_strides_usize[i] > std.math.maxInt(u32) or input_strides_usize[i] > std.math.maxInt(u32)) {
+                if (trace) std.debug.print("metal_reduce_prim: decline=axis_stride_limit op={s} dim={d} out_stride={d} in_stride={d}\n", .{ @tagName(op_kind), i, output_strides_usize[i], input_strides_usize[i] });
+                return null;
+            }
             out_strides[i] = @intCast(output_strides_usize[i]);
             input_strides_for_out[i] = if (i == axis) 0 else @intCast(input_strides_usize[i]);
         }
@@ -5116,9 +5241,60 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             kind,
             output_shape_i32,
         )) |tensor| {
+            if (trace) std.debug.print("metal_reduce_prim: path=axis_device op={s} axis={d} input_shape={any} output_shape={any}\n", .{ @tagName(op_kind), axis, input_shape, output_shape_i64 });
             return self.ctFromOwnedMetalTensor(tensor);
         }
+        if (trace) std.debug.print("metal_reduce_prim: decline=axis_runtime_null op={s} axis={d} input_shape={any}\n", .{ @tagName(op_kind), axis, input_shape });
         return null;
+    }
+
+    fn tryDeviceReduceFull2D(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !?CT {
+        const trace = getenvBool("TERMITE_METAL_TRACE_REDUCE_PRIM");
+        if (comptime (op_kind != .sum and op_kind != .mean)) return null;
+        if (axes.len != 2 or input_shape.len != 2) return null;
+        if (!((axes[0] == 0 and axes[1] == 1) or (axes[0] == 1 and axes[1] == 0))) return null;
+        if (input_shape[0] <= 0 or input_shape[1] <= 0) return null;
+
+        var input_tensor = self.ownedDeviceMetalTensorFromCt(input) catch |err| switch (err) {
+            error.UnsupportedTensorType, error.InvalidTensorShape => {
+                if (trace) std.debug.print("metal_reduce_prim: decline=full2d_convert op={s} err={s} input_shape={any}\n", .{ @tagName(op_kind), @errorName(err), input_shape });
+                return null;
+            },
+            else => return err,
+        };
+        errdefer input_tensor.deinit();
+        if (!input_tensor.isDevice()) {
+            input_tensor.deinit();
+            if (trace) std.debug.print("metal_reduce_prim: decline=full2d_not_device op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
+            return null;
+        }
+        const expected_elems = try shapeNumel(input_shape);
+        if (input_tensor.elemCount() != expected_elems) {
+            if (trace) std.debug.print("metal_reduce_prim: decline=full2d_elem_mismatch op={s} elems={d} expected={d} input_shape={any} metal_shape={any}\n", .{ @tagName(op_kind), input_tensor.elemCount(), expected_elems, input_shape, input_tensor.shape() });
+            input_tensor.deinit();
+            return null;
+        }
+
+        const input_ct = try self.ctFromOwnedMetalTensor(input_tensor);
+        defer freeOp(self, input_ct);
+        _ = try self.withLogicalShape(input_ct, input_shape);
+
+        const last_axis = [_]u8{1};
+        const row_reduced = (try self.tryDeviceReduceLastDim(input_ct, &last_axis, input_shape, op_kind)) orelse {
+            if (trace) std.debug.print("metal_reduce_prim: decline=full2d_last_dim op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
+            return null;
+        };
+        defer freeOp(self, row_reduced);
+
+        const row_reduced_shape = [_]i64{ input_shape[0], 1 };
+        _ = try self.withLogicalShape(row_reduced, &row_reduced_shape);
+        const first_axis = [_]u8{0};
+        const result = (try self.tryDeviceReduceAxisF32(row_reduced, &first_axis, &row_reduced_shape, op_kind)) orelse {
+            if (trace) std.debug.print("metal_reduce_prim: decline=full2d_axis0 op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
+            return null;
+        };
+        if (trace) std.debug.print("metal_reduce_prim: path=full2d_device op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
+        return result;
     }
 
     fn tryDeviceLazyMultiplyReduceLastDim(self: *MetalCompute, input_buf: *Buf, axes: []const u8, input_shape: []const i64) !?CT {
@@ -5163,28 +5339,56 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         out_shape: []const i64,
         broadcast_axes: []const u8,
     ) !?CT {
-        if (in_shape.len == 0 or in_shape.len != out_shape.len or broadcast_axes.len != in_shape.len) return null;
+        const trace = getenvBool("TERMITE_METAL_TRACE_BROADCAST_PRIM");
+        if (in_shape.len == 0 or in_shape.len != out_shape.len or broadcast_axes.len != in_shape.len) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_rank in_shape={any} out_shape={any} axes={any}\n", .{ in_shape, out_shape, broadcast_axes });
+            return null;
+        }
         for (broadcast_axes, 0..) |axis, i| {
-            if (axis != i) return null;
+            if (axis != i) {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_non_identity_axis in_shape={any} out_shape={any} axes={any}\n", .{ in_shape, out_shape, broadcast_axes });
+                return null;
+            }
         }
 
         const input_buf = toBuf(input);
-        if (input_buf.quantized_storage != null) return null;
-        const input_metal = input_buf.metal_tensor orelse return null;
-        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+        if (input_buf.quantized_storage != null) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_quantized in_shape={any} out_shape={any}\n", .{ in_shape, out_shape });
+            return null;
+        }
+        const input_metal = input_buf.metal_tensor orelse {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_no_metal in_shape={any} out_shape={any} logical_shape={any}\n", .{ in_shape, out_shape, input_buf.logical_shape });
+            return null;
+        };
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_not_device is_device={} elems={d} in_shape={any} out_shape={any} metal_shape={any}\n", .{ input_metal.isDevice(), input_metal.elemCount(), in_shape, out_shape, input_metal.shape() });
+            return null;
+        }
 
         var rows: usize = 1;
         for (0..in_shape.len - 1) |axis| {
-            if (in_shape[axis] <= 0 or out_shape[axis] <= 0 or in_shape[axis] != out_shape[axis]) return null;
+            if (in_shape[axis] <= 0 or out_shape[axis] <= 0 or in_shape[axis] != out_shape[axis]) {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_prefix_mismatch axis={d} in_shape={any} out_shape={any}\n", .{ axis, in_shape, out_shape });
+                return null;
+            }
             rows = std.math.mul(usize, rows, @intCast(in_shape[axis])) catch return null;
         }
         const in_dim_i64 = in_shape[in_shape.len - 1];
         const out_dim_i64 = out_shape[out_shape.len - 1];
-        if (in_dim_i64 <= 0 or out_dim_i64 <= 0) return null;
+        if (in_dim_i64 <= 0 or out_dim_i64 <= 0) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_bad_dim in_shape={any} out_shape={any}\n", .{ in_shape, out_shape });
+            return null;
+        }
         const in_dim: usize = @intCast(in_dim_i64);
         const out_dim: usize = @intCast(out_dim_i64);
-        if (in_dim != 1 and in_dim != out_dim) return null;
-        if (input_metal.elemCount() != rows * in_dim) return null;
+        if (in_dim != 1 and in_dim != out_dim) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_width in_dim={d} out_dim={d} in_shape={any} out_shape={any}\n", .{ in_dim, out_dim, in_shape, out_shape });
+            return null;
+        }
+        if (input_metal.elemCount() != rows * in_dim) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_elem_mismatch elems={d} expected={d} in_shape={any} out_shape={any} metal_shape={any}\n", .{ input_metal.elemCount(), rows * in_dim, in_shape, out_shape, input_metal.shape() });
+            return null;
+        }
 
         const output_shape_i32 = try self.i32ShapeFromI64(out_shape);
         defer self.allocator.free(output_shape_i32);
@@ -5198,8 +5402,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             out_dim,
             output_shape_i32,
         )) |tensor| {
+            if (trace) std.debug.print("metal_broadcast_prim: path=last_dim_device rows={d} in_dim={d} out_dim={d} out_shape={any}\n", .{ rows, in_dim, out_dim, out_shape });
             return self.ctFromOwnedMetalTensor(tensor);
         }
+        if (trace) std.debug.print("metal_broadcast_prim: decline=last_dim_runtime_null rows={d} in_dim={d} out_dim={d}\n", .{ rows, in_dim, out_dim });
         return null;
     }
 
@@ -5210,20 +5416,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         out_shape: []const i64,
         broadcast_axes: []const u8,
     ) !?CT {
-        if (in_shape.len == 0 or out_shape.len == 0 or in_shape.len > metal_tensor_mod.max_dims or out_shape.len > metal_tensor_mod.max_dims) return null;
-        if (broadcast_axes.len != in_shape.len) return null;
+        const trace = getenvBool("TERMITE_METAL_TRACE_BROADCAST_PRIM");
+        if (in_shape.len == 0 or out_shape.len == 0 or in_shape.len > metal_tensor_mod.max_dims or out_shape.len > metal_tensor_mod.max_dims) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=general_rank in_shape={any} out_shape={any} axes={any}\n", .{ in_shape, out_shape, broadcast_axes });
+            return null;
+        }
+        if (broadcast_axes.len != in_shape.len) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=general_axis_count in_shape={any} out_shape={any} axes={any}\n", .{ in_shape, out_shape, broadcast_axes });
+            return null;
+        }
 
         const input_buf = toBuf(input);
-        if (input_buf.quantized_storage != null) return null;
+        if (input_buf.quantized_storage != null) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=general_quantized in_shape={any} out_shape={any}\n", .{ in_shape, out_shape });
+            return null;
+        }
 
         const input_elems = try shapeNumel(in_shape);
         const output_elems = try shapeNumel(out_shape);
-        if (input_elems > std.math.maxInt(u32) or output_elems > std.math.maxInt(u32)) return null;
+        if (input_elems > std.math.maxInt(u32) or output_elems > std.math.maxInt(u32)) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=general_size_limit input_elems={d} output_elems={d}\n", .{ input_elems, output_elems });
+            return null;
+        }
         const input_is_device = if (input_buf.metal_tensor) |metal_tensor| metal_tensor.isDevice() else false;
         if (!input_is_device) {
             const min_device_broadcast_elems: usize = 4096;
             const max_host_upload_elems: usize = 1024 * 1024;
-            if (output_elems < min_device_broadcast_elems or input_elems > max_host_upload_elems) return null;
+            if (output_elems < min_device_broadcast_elems or input_elems > max_host_upload_elems) {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=general_host_threshold input_elems={d} output_elems={d} in_shape={any} out_shape={any} axes={any}\n", .{ input_elems, output_elems, in_shape, out_shape, broadcast_axes });
+                return null;
+            }
         }
 
         var in_strides_usize: [metal_tensor_mod.max_dims]usize = undefined;
@@ -5235,33 +5457,55 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var out_strides = [_]u32{0} ** metal_tensor_mod.max_dims;
         var input_strides_for_out = [_]u32{0} ** metal_tensor_mod.max_dims;
         for (out_shape, 0..) |_, axis| {
-            if (out_strides_usize[axis] > std.math.maxInt(u32)) return null;
+            if (out_strides_usize[axis] > std.math.maxInt(u32)) {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=general_out_stride axis={d} stride={d}\n", .{ axis, out_strides_usize[axis] });
+                return null;
+            }
             out_strides[axis] = @intCast(out_strides_usize[axis]);
         }
 
         for (broadcast_axes, 0..) |out_axis_u8, in_axis| {
             const out_axis: usize = out_axis_u8;
-            if (out_axis >= out_shape.len or mapped_out_axes[out_axis]) return null;
+            if (out_axis >= out_shape.len or mapped_out_axes[out_axis]) {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=general_bad_axis out_axis={d} in_shape={any} out_shape={any} axes={any}\n", .{ out_axis, in_shape, out_shape, broadcast_axes });
+                return null;
+            }
             mapped_out_axes[out_axis] = true;
 
             const in_dim = in_shape[in_axis];
             const out_dim = out_shape[out_axis];
-            if (in_dim <= 0 or out_dim <= 0) return null;
+            if (in_dim <= 0 or out_dim <= 0) {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=general_bad_dim in_dim={d} out_dim={d} in_shape={any} out_shape={any}\n", .{ in_dim, out_dim, in_shape, out_shape });
+                return null;
+            }
             if (in_dim == out_dim) {
-                if (in_strides_usize[in_axis] > std.math.maxInt(u32)) return null;
+                if (in_strides_usize[in_axis] > std.math.maxInt(u32)) {
+                    if (trace) std.debug.print("metal_broadcast_prim: decline=general_in_stride in_axis={d} stride={d}\n", .{ in_axis, in_strides_usize[in_axis] });
+                    return null;
+                }
                 input_strides_for_out[out_axis] = @intCast(in_strides_usize[in_axis]);
             } else if (in_dim == 1) {
                 input_strides_for_out[out_axis] = 0;
             } else {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=general_dim_mismatch in_axis={d} out_axis={d} in_dim={d} out_dim={d} in_shape={any} out_shape={any}\n", .{ in_axis, out_axis, in_dim, out_dim, in_shape, out_shape });
                 return null;
             }
         }
 
         const output_shape_i32 = try self.i32ShapeFromI64(out_shape);
         defer self.allocator.free(output_shape_i32);
-        var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch |err| switch (err) {
+            error.UnsupportedTensorType, error.InvalidTensorShape => {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=general_convert err={s} in_shape={any} out_shape={any}\n", .{ @errorName(err), in_shape, out_shape });
+                return null;
+            },
+            else => return err,
+        };
         defer input_mt.deinit();
-        if (!input_mt.isDevice() or input_mt.elemCount() != input_elems) return null;
+        if (!input_mt.isDevice() or input_mt.elemCount() != input_elems) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=general_elem_mismatch is_device={} elems={d} expected={d} metal_shape={any} in_shape={any} out_shape={any}\n", .{ input_mt.isDevice(), input_mt.elemCount(), input_elems, input_mt.shape(), in_shape, out_shape });
+            return null;
+        }
         if (try metal_runtime.decoderRuntimeBroadcastF32Device(
             self.provider_impl,
             input_mt,
@@ -5272,8 +5516,50 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             output_elems,
             output_shape_i32,
         )) |tensor| {
+            if (trace) std.debug.print("metal_broadcast_prim: path=general_device input_elems={d} output_elems={d} in_shape={any} out_shape={any} axes={any}\n", .{ input_elems, output_elems, in_shape, out_shape, broadcast_axes });
             return self.ctFromOwnedMetalTensor(tensor);
         }
+        if (trace) std.debug.print("metal_broadcast_prim: decline=general_runtime_null input_elems={d} output_elems={d} in_shape={any} out_shape={any}\n", .{ input_elems, output_elems, in_shape, out_shape });
+        return null;
+    }
+
+    fn tryDeviceBroadcastScalar(
+        self: *MetalCompute,
+        input: CT,
+        out_shape: []const i64,
+    ) !?CT {
+        const trace = getenvBool("TERMITE_METAL_TRACE_BROADCAST_PRIM");
+        if (out_shape.len == 0 or out_shape.len > metal_tensor_mod.max_dims) return null;
+        const output_elems = try shapeNumel(out_shape);
+        if (output_elems == 0) return null;
+
+        var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch |err| switch (err) {
+            error.UnsupportedTensorType, error.InvalidTensorShape => {
+                if (trace) std.debug.print("metal_broadcast_prim: decline=scalar_convert err={s} out_shape={any}\n", .{ @errorName(err), out_shape });
+                return null;
+            },
+            else => return err,
+        };
+        defer input_mt.deinit();
+        if (!input_mt.isDevice() or input_mt.elemCount() != 1) {
+            if (trace) std.debug.print("metal_broadcast_prim: decline=scalar_not_single is_device={} elems={d} metal_shape={any} out_shape={any}\n", .{ input_mt.isDevice(), input_mt.elemCount(), input_mt.shape(), out_shape });
+            return null;
+        }
+
+        const output_shape_i32 = try self.i32ShapeFromI64(out_shape);
+        defer self.allocator.free(output_shape_i32);
+        if (try metal_runtime.decoderRuntimeBroadcastLastDimDevice(
+            self.provider_impl,
+            input_mt,
+            1,
+            1,
+            output_elems,
+            output_shape_i32,
+        )) |tensor| {
+            if (trace) std.debug.print("metal_broadcast_prim: path=scalar_device output_elems={d} out_shape={any}\n", .{ output_elems, out_shape });
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        if (trace) std.debug.print("metal_broadcast_prim: decline=scalar_runtime_null output_elems={d} out_shape={any}\n", .{ output_elems, out_shape });
         return null;
     }
 
@@ -6061,6 +6347,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const out_shape = resolved_target[0..target_shape.len];
         const out_numel = try shapeNumel(out_shape);
+        if (input_shape.len == 0) {
+            if (try self.tryDeviceBroadcastScalar(input, out_shape)) |result| return result;
+        }
         if (input_buf.metal_tensor) |*metal_tensor| {
             if (metal_tensor.isDevice() and broadcastInDimIsMetadataOnly(in_shape, out_shape, broadcast_axes)) {
                 const out_shape_i32 = try self.i32ShapeFromI64(out_shape);
@@ -6240,10 +6529,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (axis == 0 and in_shape.len == 2) {
             const rows: usize = @intCast(in_shape[0]);
             const cols: usize = @intCast(in_shape[1]);
-            if (input_buf.metal_tensor) |*input_metal| {
-                if (indices_buf.metal_tensor) |*indices_metal| {
-                    if (input_metal.isDevice() and indices_metal.isDevice()) {
-                        const index_count = indices_metal.elemCount();
+            var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch |err| switch (err) {
+                error.UnsupportedTensorType, error.UnsupportedShape, error.InvalidTensorShape => null,
+                else => return err,
+            };
+            if (input_mt) |*input_device| {
+                defer input_device.deinit();
+                var indices_mt = self.ownedDeviceMetalTensorFromCt(indices) catch |err| switch (err) {
+                    error.UnsupportedTensorType, error.UnsupportedShape, error.InvalidTensorShape => null,
+                    else => return err,
+                };
+                if (indices_mt) |*indices_device| {
+                    defer indices_device.deinit();
+                    if (input_device.isDevice() and indices_device.isDevice()) {
+                        const index_count = indices_device.elemCount();
                         if (index_count > 0) {
                             var out_shape_buf: [metal_tensor_mod.max_dims]i64 = undefined;
                             var out_rank: usize = 0;
@@ -6263,14 +6562,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
                             const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
                             defer self.allocator.free(out_shape_i32);
-                            var input_mt = try input_metal.retainedCopy();
-                            defer input_mt.deinit();
-                            var indices_mt = try indices_metal.retainedCopy();
-                            defer indices_mt.deinit();
                             if (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDevice(
                                 self.provider_impl,
-                                input_mt,
-                                indices_mt,
+                                input_device.*,
+                                indices_device.*,
                                 rows,
                                 cols,
                                 index_count,
@@ -6601,6 +6896,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn reduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceReduceFull2D(input, axes, input_shape, .sum)) |result| return result;
         if (try self.tryDeviceReduceLastDim(input, axes, input_shape, .sum)) |result| return result;
         if (try self.tryDeviceReduceAxisF32(input, axes, input_shape, .sum)) |result| return result;
         return self.hostFallbackReduce(input, axes, input_shape, .sum);
@@ -6614,6 +6910,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn reduceMeanOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryDeviceReduceFull2D(input, axes, input_shape, .mean)) |result| return result;
         if (try self.tryDeviceReduceLastDim(input, axes, input_shape, .mean)) |result| return result;
         if (try self.tryDeviceReduceAxisF32(input, axes, input_shape, .mean)) |result| return result;
         return self.hostFallbackReduce(input, axes, input_shape, .mean);
@@ -7143,26 +7440,48 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn deviceConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
-        if (a_shape.len == 0 or a_shape.len != b_shape.len or a_shape.len > metal_tensor_mod.max_dims) return null;
-        if (axis >= a_shape.len) return null;
+        const trace = getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM");
+        if (a_shape.len == 0 or a_shape.len != b_shape.len or a_shape.len > metal_tensor_mod.max_dims) {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=rank a_rank={d} b_rank={d}\n", .{ a_shape.len, b_shape.len });
+            return null;
+        }
+        if (axis >= a_shape.len) {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=axis axis={d} rank={d}\n", .{ axis, a_shape.len });
+            return null;
+        }
         const axis_index: usize = @intCast(axis);
 
         var a_tensor = self.ownedDeviceMetalTensorFromCt(a) catch |err| switch (err) {
-            error.UnsupportedTensorType => return null,
+            error.UnsupportedTensorType => {
+                if (trace) std.debug.print("metal_concat_prim: device_decline=a_convert err={s}\n", .{@errorName(err)});
+                return null;
+            },
             else => return err,
         };
         defer a_tensor.deinit();
         var b_tensor = self.ownedDeviceMetalTensorFromCt(b) catch |err| switch (err) {
-            error.UnsupportedTensorType => return null,
+            error.UnsupportedTensorType => {
+                if (trace) std.debug.print("metal_concat_prim: device_decline=b_convert err={s}\n", .{@errorName(err)});
+                return null;
+            },
             else => return err,
         };
         defer b_tensor.deinit();
-        if (!a_tensor.isDevice() or !b_tensor.isDevice()) return null;
+        if (!a_tensor.isDevice() or !b_tensor.isDevice()) {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=not_device a={} b={}\n", .{ a_tensor.isDevice(), b_tensor.isDevice() });
+            return null;
+        }
 
         var resolved_a_buf: [metal_tensor_mod.max_dims]i64 = undefined;
         var resolved_b_buf: [metal_tensor_mod.max_dims]i64 = undefined;
-        const resolved_a = resolveConcatDeviceShape(a_shape, &a_tensor, &resolved_a_buf) orelse return null;
-        const resolved_b = resolveConcatDeviceShape(b_shape, &b_tensor, &resolved_b_buf) orelse return null;
+        const resolved_a = resolveConcatDeviceShape(a_shape, &a_tensor, &resolved_a_buf) orelse {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=a_shape declared={any} elems={d} metal_shape={any}\n", .{ a_shape, a_tensor.elemCount(), a_tensor.shape() });
+            return null;
+        };
+        const resolved_b = resolveConcatDeviceShape(b_shape, &b_tensor, &resolved_b_buf) orelse {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=b_shape declared={any} elems={d} metal_shape={any}\n", .{ b_shape, b_tensor.elemCount(), b_tensor.shape() });
+            return null;
+        };
         const rank = resolved_a.len;
 
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
@@ -7172,20 +7491,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             } else if (resolved_a[dim] == resolved_b[dim]) {
                 out_shape[dim] = resolved_a[dim];
             } else {
+                if (trace) std.debug.print("metal_concat_prim: device_decline=dim_mismatch dim={d} a={d} b={d}\n", .{ dim, resolved_a[dim], resolved_b[dim] });
                 return null;
             }
         }
 
-        const inner = safeShapeNumel(resolved_a[axis_index + 1 ..]) orelse return null;
+        const inner = safeShapeNumel(resolved_a[axis_index + 1 ..]) orelse {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=inner_numel shape={any}\n", .{resolved_a[axis_index + 1 ..]});
+            return null;
+        };
         const a_axis: usize = @intCast(resolved_a[axis_index]);
         const b_axis: usize = @intCast(resolved_b[axis_index]);
-        const outer = safeShapeNumel(resolved_a[0..axis_index]) orelse return null;
-        if (inner == 0 or a_axis == 0 or b_axis == 0) return null;
+        const outer = safeShapeNumel(resolved_a[0..axis_index]) orelse {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=outer_numel shape={any}\n", .{resolved_a[0..axis_index]});
+            return null;
+        };
+        if (inner == 0 or a_axis == 0 or b_axis == 0) {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=zero_dim inner={d} a_axis={d} b_axis={d}\n", .{ inner, a_axis, b_axis });
+            return null;
+        }
         const a_chunk = a_axis * inner;
         const b_chunk = b_axis * inner;
         const out_chunk = (a_axis + b_axis) * inner;
         const out_numel = outer * out_chunk;
-        if (a_tensor.elemCount() != outer * a_chunk or b_tensor.elemCount() != outer * b_chunk) return null;
+        if (a_tensor.elemCount() != outer * a_chunk or b_tensor.elemCount() != outer * b_chunk) {
+            if (trace) std.debug.print("metal_concat_prim: device_decline=elem_mismatch a_elems={d} a_expected={d} b_elems={d} b_expected={d}\n", .{ a_tensor.elemCount(), outer * a_chunk, b_tensor.elemCount(), outer * b_chunk });
+            return null;
+        }
 
         var out_shape_i32: [metal_tensor_mod.max_dims]i32 = undefined;
         for (out_shape[0..rank], 0..) |dim, idx| out_shape_i32[idx] = @intCast(dim);
@@ -7992,6 +8324,42 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         out_dim: usize,
     ) anyerror!CT {
         return linearNoBiasOpWithPlannedDispatch(ctx, input, weight, rows, in_dim, out_dim, null);
+    }
+
+    fn loraLinearBranchOp(ctx: *anyopaque, request: *const ops.LoraLinearBranchRequest) anyerror!?ops.LoraLinearBranchResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var base = try self.ownedDeviceMetalTensorFromCt(request.base);
+        defer base.deinit();
+        var lora_a = try self.ownedDeviceMetalTensorFromCt(request.lora_a);
+        defer lora_a.deinit();
+        var lora_b = try self.ownedDeviceMetalTensorFromCt(request.lora_b);
+        defer lora_b.deinit();
+        const result = (try metal_runtime.decoderRuntimeLoraLinearF32Device(
+            self.provider_impl,
+            input,
+            base,
+            lora_a,
+            lora_b,
+            request.rows,
+            request.in_dim,
+            request.rank,
+            request.out_dim,
+            request.scale,
+        )) orelse return null;
+
+        const after_a = try self.ctFromOwnedMetalTensor(result.after_a);
+        errdefer freeOp(ctx, after_a);
+        const after_b = try self.ctFromOwnedMetalTensor(result.after_b);
+        errdefer freeOp(ctx, after_b);
+        const output = try self.ctFromOwnedMetalTensor(result.output);
+        errdefer freeOp(ctx, output);
+        return .{
+            .after_a = after_a,
+            .after_b = after_b,
+            .output = output,
+        };
     }
 
     fn deviceTensorMatchesLinearRows(input: *const MetalTensor, rows: usize, in_dim: usize) bool {
@@ -14803,6 +15171,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        if (a_buf.lazy_multiply != null or b_buf.lazy_multiply != null) {
+            var materialized_a: ?CT = null;
+            var materialized_b: ?CT = null;
+            defer if (materialized_a) |tensor| freeOp(self, tensor);
+            defer if (materialized_b) |tensor| freeOp(self, tensor);
+            if (a_buf.lazy_multiply != null) {
+                var tensor = try self.ownedDeviceMetalTensorFromCt(a);
+                errdefer tensor.deinit();
+                materialized_a = try self.ctFromOwnedMetalTensor(tensor);
+            }
+            if (b_buf.lazy_multiply != null) {
+                var tensor = try self.ownedDeviceMetalTensorFromCt(b);
+                errdefer tensor.deinit();
+                materialized_b = try self.ctFromOwnedMetalTensor(tensor);
+            }
+            return addOp(ctx, materialized_a orelse a, materialized_b orelse b);
+        }
         const a_data = try hostSliceForBuf(a_buf);
         const b_data = try hostSliceForBuf(b_buf);
         if (!canFlatElementwise(a_buf.logical_shape, b_buf.logical_shape, a_data.len, b_data.len)) {
@@ -19620,6 +20005,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearPlanned = linearPlannedOp;
         vt.linearNoBias = linearNoBiasOp;
         vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
+        vt.loraLinearBranch = loraLinearBranchOp;
         vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
         vt.splitLastDim3 = splitLastDim3Op;
@@ -23075,6 +23461,10 @@ test "metal_compute: training AdamW updates device-resident weights" {
     try metal_compute.trainingAccumulateF32(grad_accum, grad_a_ct, initial.len, 0.5, true);
     try metal_compute.trainingAccumulateF32(grad_accum, grad_b_ct, initial.len, 0.5, false);
     const sumsq = try metal_compute.trainingSumSquaresF32(grad_accum, initial.len);
+    const batched_sumsq = try metal_compute.trainingSumSquaresManyF32(&.{
+        .{ .tensor = grad_accum, .elem_count = initial.len },
+        .{ .tensor = grad_b_ct, .elem_count = initial.len },
+    });
 
     const cfg = ml.graph.optimizers.AdamWConfig{ .weight_decay = 0.01 };
     try metal_compute.trainingAdamWF32(weight, grad_accum, m, v, initial.len, .{
@@ -23093,7 +23483,10 @@ test "metal_compute: training AdamW updates device-resident weights" {
     for (&expected_grad, grad_a, grad_b) |*dst, a, b| dst.* = (a + b) * 0.5;
     var expected_sumsq: f32 = 0.0;
     for (expected_grad) |value| expected_sumsq += value * value;
+    var expected_grad_b_sumsq: f32 = 0.0;
+    for (grad_b) |value| expected_grad_b_sumsq += value * value;
     try std.testing.expectApproxEqAbs(expected_sumsq, sumsq, 1e-6);
+    try std.testing.expectApproxEqAbs(expected_sumsq + expected_grad_b_sumsq, batched_sumsq, 1e-6);
     var expected_m = [_]f32{0.0} ** initial.len;
     var expected_v = [_]f32{0.0} ** initial.len;
     ml.graph.optimizers.stepSlices(.{ .adamw = cfg }, 1, 0.001, &expected, &expected_grad, &expected_m, &expected_v);

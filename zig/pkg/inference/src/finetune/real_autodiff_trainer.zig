@@ -55,7 +55,12 @@ const CT = ops_mod.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
 const build_options = @import("build_options");
 const metal_compute = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {
-    pub const MetalCompute = opaque {};
+    pub const MetalCompute = struct {
+        pub const TrainingSumSquaresInput = struct {
+            tensor: CT,
+            elem_count: usize,
+        };
+    };
 };
 const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {
     pub const MlxCompute = opaque {};
@@ -287,6 +292,18 @@ pub const StepProfile = struct {
     optimizer_backend: OptimizerBackend = .host,
     device_resident_transfer_count: u64 = 0,
     device_trainable_bytes: usize = 0,
+    graph_executor_partitions: u64 = 0,
+    graph_executor_command_dispatches: u64 = 0,
+    graph_executor_planned_dispatches: u64 = 0,
+    graph_executor_interpreter_fallbacks: u64 = 0,
+    graph_executor_host_outputs: u64 = 0,
+    graph_executor_device_outputs: u64 = 0,
+    graph_executor_regions: u64 = 0,
+    graph_executor_region_ops: u64 = 0,
+    graph_executor_runtime_region_dispatches: u64 = 0,
+    graph_executor_runtime_region_fallbacks: u64 = 0,
+    graph_executor_runtime_frame_candidates: u64 = 0,
+    graph_executor_runtime_frame_eligible: u64 = 0,
 };
 
 pub const OptimizerBackend = enum { host, metal, mlx };
@@ -687,6 +704,18 @@ pub const RealAutodiffTrainer = struct {
         profile.execute_ns = step_result.profile.execute_ns;
         profile.extract_ns = step_result.profile.extract_ns;
         profile.peak_resident_bytes = step_result.profile.peak_resident_bytes;
+        profile.graph_executor_partitions = step_result.profile.graph_executor_partitions;
+        profile.graph_executor_command_dispatches = step_result.profile.graph_executor_command_dispatches;
+        profile.graph_executor_planned_dispatches = step_result.profile.graph_executor_planned_dispatches;
+        profile.graph_executor_interpreter_fallbacks = step_result.profile.graph_executor_interpreter_fallbacks;
+        profile.graph_executor_host_outputs = step_result.profile.graph_executor_host_outputs;
+        profile.graph_executor_device_outputs = step_result.profile.graph_executor_device_outputs;
+        profile.graph_executor_regions = step_result.profile.graph_executor_regions;
+        profile.graph_executor_region_ops = step_result.profile.graph_executor_region_ops;
+        profile.graph_executor_runtime_region_dispatches = step_result.profile.graph_executor_runtime_region_dispatches;
+        profile.graph_executor_runtime_region_fallbacks = step_result.profile.graph_executor_runtime_region_fallbacks;
+        profile.graph_executor_runtime_frame_candidates = step_result.profile.graph_executor_runtime_frame_candidates;
+        profile.graph_executor_runtime_frame_eligible = step_result.profile.graph_executor_runtime_frame_eligible;
         defer step_result.deinit();
 
         const loss_value = step_result.loss;
@@ -1220,6 +1249,7 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn deviceGlobalGradNorm(self: *RealAutodiffTrainer) !f32 {
+        if (self.compute_backend.kind() == .metal) return try self.metalDeviceGlobalGradNorm();
         var total: f64 = 0.0;
         for (self.lora_params.items) |*slot| {
             const device = slot.device orelse continue;
@@ -1235,6 +1265,7 @@ pub const RealAutodiffTrainer = struct {
     }
 
     fn deviceGlobalGradNormFromResult(self: *RealAutodiffTrainer, result: *const training.TrainStepResult) !f32 {
+        if (self.compute_backend.kind() == .metal) return try self.metalDeviceGlobalGradNormFromResult(result);
         var total: f64 = 0.0;
         for (self.lora_params.items) |*slot| {
             const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
@@ -1247,6 +1278,40 @@ pub const RealAutodiffTrainer = struct {
             total += @as(f64, sumsq);
         }
         return @floatCast(@sqrt(total));
+    }
+
+    fn metalDeviceGlobalGradNorm(self: *RealAutodiffTrainer) !f32 {
+        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+        const metal = try self.metalCompute();
+        var inputs = try std.ArrayList(metal_compute.MetalCompute.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
+        defer inputs.deinit(self.allocator);
+        for (self.lora_params.items) |*slot| {
+            const device = slot.device orelse continue;
+            try inputs.append(self.allocator, .{ .tensor = device.grad_accum, .elem_count = slot.weights.len });
+        }
+        for (self.regular_params.items) |*slot| {
+            const device = slot.device orelse continue;
+            try inputs.append(self.allocator, .{ .tensor = device.grad_accum, .elem_count = slot.weights.len });
+        }
+        const sumsq = try metal.trainingSumSquaresManyF32(inputs.items);
+        return @sqrt(sumsq);
+    }
+
+    fn metalDeviceGlobalGradNormFromResult(self: *RealAutodiffTrainer, result: *const training.TrainStepResult) !f32 {
+        if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+        const metal = try self.metalCompute();
+        var inputs = try std.ArrayList(metal_compute.MetalCompute.TrainingSumSquaresInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
+        defer inputs.deinit(self.allocator);
+        for (self.lora_params.items) |*slot| {
+            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+            try inputs.append(self.allocator, .{ .tensor = grad, .elem_count = slot.weights.len });
+        }
+        for (self.regular_params.items) |*slot| {
+            const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+            try inputs.append(self.allocator, .{ .tensor = grad, .elem_count = slot.weights.len });
+        }
+        const sumsq = try metal.trainingSumSquaresManyF32(inputs.items);
+        return @sqrt(sumsq);
     }
 
     fn deviceSumSquares(self: *RealAutodiffTrainer, input: CT, elem_count: usize) !f32 {

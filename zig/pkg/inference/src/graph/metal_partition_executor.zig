@@ -58,8 +58,37 @@ const MetalExecutionKind = enum {
     constant_materialization,
 };
 
+const OpExecutionCount = struct {
+    name: []const u8 = "",
+    count: usize = 0,
+    total_ns: u64 = 0,
+};
+
+const OpExecutionStats = struct {
+    command_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
+    command_used: usize = 0,
+    fallback_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
+    fallback_used: usize = 0,
+    host_output_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
+    host_output_used: usize = 0,
+
+    fn recordCommand(self: *OpExecutionStats, name: []const u8, elapsed_ns: u64) void {
+        recordOpCount(&self.command_counts, &self.command_used, name, elapsed_ns);
+    }
+
+    fn recordFallback(self: *OpExecutionStats, name: []const u8, elapsed_ns: u64) void {
+        recordOpCount(&self.fallback_counts, &self.fallback_used, name, elapsed_ns);
+    }
+
+    fn recordHostOutput(self: *OpExecutionStats, name: []const u8, elapsed_ns: u64) void {
+        recordOpCount(&self.host_output_counts, &self.host_output_used, name, elapsed_ns);
+    }
+};
+
 const RuntimeRegionKind = enum(u8) {
     none = 0,
+    raw_linear_dot,
+    lora_linear,
     q_linear,
     linear_qkv,
     grouped_linear_qkv_slice,
@@ -72,6 +101,8 @@ const RuntimeRegionKind = enum(u8) {
 
 const RuntimeRegion = union(RuntimeRegionKind) {
     none: void,
+    raw_linear_dot: RawLinearDotPattern,
+    lora_linear: LoraLinearPattern,
     q_linear: QLinearPattern,
     linear_qkv: LinearNoBiasQkvPattern,
     grouped_linear_qkv_slice: GroupedLinearQkvSlicePattern,
@@ -123,6 +154,8 @@ const PreparedPleResidualRegion = struct {
 
 const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     none: void,
+    raw_linear_dot: PreparedLinearRegion,
+    lora_linear: void,
     q_linear: PreparedLinearRegion,
     linear_qkv: PreparedQkvRegion,
     grouped_linear_qkv_slice: PreparedQkvRegion,
@@ -286,6 +319,16 @@ pub fn makeMetalDeviceResident(cb: *const ComputeBackend, tensor: CT) !?CT {
     return metal_compute_mod.MetalCompute.makeDeviceResident(cb, tensor);
 }
 
+fn promoteMetalOutputIfNeeded(cb: *const ComputeBackend, output: ?CT) !?CT {
+    const ct = output orelse return null;
+    if (isMetalDeviceResident(cb, ct)) return ct;
+    if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
+        if (device_ct != ct) cb.free(ct);
+        return device_ct;
+    }
+    return ct;
+}
+
 pub const MetalGraphPlanAllocation = struct {
     allocation: buffer_plan_mod.AllocationId,
     graph_slot: usize,
@@ -428,6 +471,8 @@ pub const MetalPartitionExecutor = struct {
         const progress_start = metalGraphProgressStart();
         const progress_end = metalGraphProgressEnd();
         const trace_progress = progress_interval != 0 or progress_start != std.math.maxInt(usize) or progress_end != std.math.maxInt(usize);
+        const collect_op_stats = metalPartitionOpStatsEnabled();
+        var op_execution_stats = OpExecutionStats{};
         const partition_index = try partitionIndexForNodes(buffer_plan, node_ids);
         if (trace_nodes) std.debug.print("graph_executor_node_trace: executor_begin partition={d} nodes={d}\n", .{ partition_index, node_ids.len });
         if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_begin partition={d} nodes={d}\n", .{ partition_index, node_ids.len });
@@ -495,6 +540,22 @@ pub const MetalPartitionExecutor = struct {
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_end partition={d}\n", .{partition_index});
 
+        if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_parameters_begin partition={d}\n", .{partition_index});
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_parameters_begin partition={d}\n", .{partition_index});
+        try materializePartitionParameters(
+            graph,
+            cb,
+            values,
+            value_device,
+            node_ids,
+            reachable,
+            device_id,
+            rt_map,
+            exec_ctx.stats,
+        );
+        if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_parameters_end partition={d}\n", .{partition_index});
+        if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_parameters_end partition={d}\n", .{partition_index});
+
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_begin partition={d}\n", .{partition_index});
         try materializePartitionConstants(
@@ -546,6 +607,7 @@ pub const MetalPartitionExecutor = struct {
             &transient_runtime_region_plan,
         );
         if (trace_progress) std.debug.print("metal_partition_progress: phase=runtime_region_plan_ready partition={d} regions={d}\n", .{ partition_index, runtime_region_plan.region_count });
+        if (metalPartitionOpRunsEnabled()) printMetalPartitionOpRuns(graph, node_ids, reachable, last_use, partition_index);
         if (exec_ctx.stats) |stats| {
             recordRuntimeFrameEligibilityStats(stats, analyzeRuntimeFrameEligibility(runtime_region_plan));
             if (runtimeFrameMetadataFromPlan(graph, runtime_region_plan) != null) {
@@ -565,7 +627,17 @@ pub const MetalPartitionExecutor = struct {
                 continue;
             }
 
+            if (graph.node(node_id).op == .parameter and values[i] != null) {
+                value_device[i] = device_id;
+                continue;
+            }
+
             if (graph.node(node_id).op == .fused_from_float32) continue;
+
+            if (shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
+                skipped_nodes[i] = true;
+                continue;
+            }
 
             if (isPreMaterializedConstantOp(graph.node(node_id).op)) {
                 if (values[i] != null) {
@@ -582,12 +654,18 @@ pub const MetalPartitionExecutor = struct {
                 }
             }
 
+            if (shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use)) {
+                skipped_nodes[i] = true;
+                continue;
+            }
+
             const trace_node_progress = traceMetalGraphProgressNode(node_pos, progress_interval, progress_start, progress_end);
             if (trace_node_progress) {
                 printMetalProgressNode("node_begin", graph, partition_index, node_pos, node_ids.len, node_id);
             }
             if (trace_nodes) printMetalNodeTraceBegin(graph, node_id);
             if (trace_nodes) printMetalNodeTraceInputs(graph, cb, values, node_id);
+            const op_start_ns = if (collect_op_stats) metalPartitionNowNs() else 0;
 
             const op_plan = partition_plan.operatorPlanForNode(node_id);
             var execution_kind: ?MetalExecutionKind = null;
@@ -650,6 +728,7 @@ pub const MetalPartitionExecutor = struct {
                     } else {
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                        if (trace_nodes or collect_op_stats) printInterpreterFallbackNullInputs(graph, values, node_id, partition_index, node_pos);
                         values[i] = try interpreter.executeNode(graph, cb, values, node_id, &exec_state);
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_end partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     }
@@ -668,11 +747,14 @@ pub const MetalPartitionExecutor = struct {
                 }
             }
             if (exec_ctx.stats) |stats| {
+                const op_name = @tagName(graph.node(node_id).op);
+                const elapsed_ns = if (collect_op_stats) metalPartitionElapsedNs(op_start_ns, metalPartitionNowNs()) else 0;
                 if (execution_kind) |kind| {
                     switch (kind) {
                         .command => {
                             stats.backend_command_dispatches += 1;
                             if (op_plan != null) stats.planned_operator_dispatches += 1;
+                            if (collect_op_stats) op_execution_stats.recordCommand(op_name, elapsed_ns);
                         },
                         .metadata_alias => stats.metadata_aliases += 1,
                         .descriptor_materialization => stats.descriptor_materializations += 1,
@@ -680,12 +762,14 @@ pub const MetalPartitionExecutor = struct {
                     }
                 } else {
                     stats.interpreter_fallbacks += 1;
+                    if (collect_op_stats) op_execution_stats.recordFallback(op_name, elapsed_ns);
                 }
                 const output_resident = isMetalResidentOrQuantizedDescriptor(cb, values[i].?);
                 if (output_resident) {
                     stats.device_resident_outputs += 1;
                 } else {
                     stats.host_materialized_outputs += 1;
+                    if (collect_op_stats) op_execution_stats.recordHostOutput(op_name, elapsed_ns);
                 }
                 recordGemmaRuntimeResidency(stats, graph, node_id, output_resident);
             }
@@ -747,9 +831,374 @@ pub const MetalPartitionExecutor = struct {
 
         if (exec_ctx.attention_layer) |layer| layer.* = exec_state.attention_layer;
         if (exec_ctx.pair_second) |pair| pair.* = exec_state.pair_second;
+        if (collect_op_stats) {
+            printOpExecutionStats("metal_partition_command_ops", &op_execution_stats.command_counts, op_execution_stats.command_used);
+            printOpExecutionStats("metal_partition_fallback_ops", &op_execution_stats.fallback_counts, op_execution_stats.fallback_used);
+            printOpExecutionStats("metal_partition_host_output_ops", &op_execution_stats.host_output_counts, op_execution_stats.host_output_used);
+        }
         if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_end partition={d}\n", .{partition_index});
     }
 };
+
+fn recordOpCount(counts: []OpExecutionCount, used: *usize, name: []const u8, elapsed_ns: u64) void {
+    for (counts[0..used.*]) |*entry| {
+        if (std.mem.eql(u8, entry.name, name)) {
+            entry.count += 1;
+            entry.total_ns += elapsed_ns;
+            return;
+        }
+    }
+    if (used.* >= counts.len) return;
+    counts[used.*] = .{ .name = name, .count = 1, .total_ns = elapsed_ns };
+    used.* += 1;
+}
+
+fn sortOpExecutionCounts(counts: []OpExecutionCount) void {
+    std.mem.sort(OpExecutionCount, counts, {}, struct {
+        fn lessThan(_: void, a: OpExecutionCount, b: OpExecutionCount) bool {
+            if (a.total_ns == b.total_ns) {
+                if (a.count == b.count) return std.mem.lessThan(u8, a.name, b.name);
+                return a.count > b.count;
+            }
+            return a.total_ns > b.total_ns;
+        }
+    }.lessThan);
+}
+
+fn printOpExecutionStats(label: []const u8, counts: []OpExecutionCount, used: usize) void {
+    var sorted_buf = [_]OpExecutionCount{.{}} ** 96;
+    const n = @min(used, sorted_buf.len);
+    @memcpy(sorted_buf[0..n], counts[0..n]);
+    sortOpExecutionCounts(sorted_buf[0..n]);
+    std.debug.print("{s}: ", .{label});
+    if (n == 0) {
+        std.debug.print("none\n", .{});
+        return;
+    }
+    const limit = @min(n, 16);
+    for (sorted_buf[0..limit], 0..) |entry, idx| {
+        if (idx > 0) std.debug.print(",", .{});
+        const avg_ms = if (entry.count == 0) 0.0 else nsToMs(entry.total_ns) / @as(f64, @floatFromInt(entry.count));
+        std.debug.print("{s}:count={d}:total_ms={d:.3}:avg_ms={d:.3}", .{ entry.name, entry.count, nsToMs(entry.total_ns), avg_ms });
+    }
+    if (n > limit) std.debug.print(",...", .{});
+    std.debug.print("\n", .{});
+}
+
+fn printInterpreterFallbackNullInputs(
+    graph: *const Graph,
+    values: []?CT,
+    node_id: NodeId,
+    partition_index: usize,
+    node_pos: usize,
+) void {
+    const node = graph.node(node_id);
+    var missing = false;
+    for (node.getInputs()) |input_id| {
+        const input_index: usize = @intCast(input_id);
+        if (input_index >= values.len or values[input_index] == null) {
+            missing = true;
+            break;
+        }
+    }
+    if (!missing) return;
+    std.debug.print("metal_partition_interpreter_null_inputs: partition={d} pos={d} node={} op={s} inputs=", .{
+        partition_index,
+        node_pos,
+        node_id,
+        @tagName(node.op),
+    });
+    for (node.getInputs(), 0..) |input_id, idx| {
+        if (idx > 0) std.debug.print(",", .{});
+        const input_index: usize = @intCast(input_id);
+        const input_op = if (input_id < graph.nodeCount()) @tagName(graph.node(input_id).op) else "invalid";
+        const state = if (input_index < values.len and values[input_index] != null) "set" else "null";
+        std.debug.print("{}:{s}:{s}", .{ input_id, input_op, state });
+    }
+    std.debug.print("\n", .{});
+}
+
+fn metalPartitionOpStatsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_OP_STATS", false);
+}
+
+fn metalPartitionOpRunsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_OP_RUNS", false);
+}
+
+const OpRunSummary = struct {
+    name: []const u8 = "",
+    count: usize = 0,
+};
+
+const LongOpRun = struct {
+    name: []const u8 = "",
+    start_pos: usize = 0,
+    end_pos: usize = 0,
+    count: usize = 0,
+};
+
+const DotShapeRunSummary = struct {
+    lhs0: i64 = 0,
+    lhs1: i64 = 0,
+    rhs0: i64 = 0,
+    rhs1: i64 = 0,
+    out0: i64 = 0,
+    out1: i64 = 0,
+    rhs_transpose: bool = false,
+    rhs_parameter: bool = false,
+    rhs_lora: bool = false,
+    raw_linear_match: bool = false,
+    count: usize = 0,
+};
+
+fn recordOpRunCount(counts: *[96]OpRunSummary, used: *usize, name: []const u8) void {
+    for (counts[0..used.*]) |*entry| {
+        if (std.mem.eql(u8, entry.name, name)) {
+            entry.count += 1;
+            return;
+        }
+    }
+    if (used.* >= counts.len) return;
+    counts[used.*] = .{ .name = name, .count = 1 };
+    used.* += 1;
+}
+
+fn insertLongOpRun(runs: *[12]LongOpRun, run: LongOpRun) void {
+    if (run.count == 0) return;
+    var insert_at: ?usize = null;
+    for (runs, 0..) |entry, idx| {
+        if (run.count > entry.count) {
+            insert_at = idx;
+            break;
+        }
+    }
+    const idx = insert_at orelse return;
+    var move_idx = runs.len - 1;
+    while (move_idx > idx) : (move_idx -= 1) {
+        runs[move_idx] = runs[move_idx - 1];
+    }
+    runs[idx] = run;
+}
+
+fn lessOpRunCount(_: void, a: OpRunSummary, b: OpRunSummary) bool {
+    if (a.count == b.count) return std.mem.lessThan(u8, a.name, b.name);
+    return a.count > b.count;
+}
+
+fn sameDotShapeRunSummary(a: DotShapeRunSummary, b: DotShapeRunSummary) bool {
+    return a.lhs0 == b.lhs0 and
+        a.lhs1 == b.lhs1 and
+        a.rhs0 == b.rhs0 and
+        a.rhs1 == b.rhs1 and
+        a.out0 == b.out0 and
+        a.out1 == b.out1 and
+        a.rhs_transpose == b.rhs_transpose and
+        a.rhs_parameter == b.rhs_parameter and
+        a.rhs_lora == b.rhs_lora and
+        a.raw_linear_match == b.raw_linear_match;
+}
+
+fn recordDotShapeRunSummary(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    last_use: []const u32,
+    summaries: *[96]DotShapeRunSummary,
+    used: *usize,
+) void {
+    const node_id = node_ids[node_pos];
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .dot_general => {},
+        else => return,
+    }
+    if (node.num_inputs < 2) return;
+    const lhs_id = node.inputs[0];
+    const rhs_id = node.inputs[1];
+    if (lhs_id == null_node or rhs_id == null_node) return;
+    const lhs_shape = graph.node(lhs_id).output_shape;
+    const rhs_shape = graph.node(rhs_id).output_shape;
+    const out_shape = node.output_shape;
+    if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2 or out_shape.rank() != 2) return;
+
+    var rhs_transpose = false;
+    var rhs_parameter = false;
+    var rhs_lora = false;
+    switch (graph.node(rhs_id).op) {
+        .transpose => {
+            rhs_transpose = true;
+            const transpose = graph.node(rhs_id);
+            if (transpose.num_inputs > 0 and transpose.inputs[0] != null_node) {
+                const source = graph.node(transpose.inputs[0]);
+                if (std.meta.activeTag(source.op) == .parameter) {
+                    rhs_parameter = true;
+                    rhs_lora = isLoRAAdapterParameterName(graph.parameterName(source));
+                }
+            }
+        },
+        .parameter => {
+            rhs_parameter = true;
+            rhs_lora = isLoRAAdapterParameterName(graph.parameterName(graph.node(rhs_id)));
+        },
+        else => {},
+    }
+
+    var summary = DotShapeRunSummary{
+        .lhs0 = lhs_shape.dims[0],
+        .lhs1 = lhs_shape.dims[1],
+        .rhs0 = rhs_shape.dims[0],
+        .rhs1 = rhs_shape.dims[1],
+        .out0 = out_shape.dims[0],
+        .out1 = out_shape.dims[1],
+        .rhs_transpose = rhs_transpose,
+        .rhs_parameter = rhs_parameter,
+        .rhs_lora = rhs_lora,
+        .raw_linear_match = matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use) != null,
+    };
+
+    for (summaries[0..used.*]) |*entry| {
+        if (sameDotShapeRunSummary(entry.*, summary)) {
+            entry.count += 1;
+            return;
+        }
+    }
+    if (used.* >= summaries.len) return;
+    summary.count = 1;
+    summaries[used.*] = summary;
+    used.* += 1;
+}
+
+fn lessDotShapeRunSummary(_: void, a: DotShapeRunSummary, b: DotShapeRunSummary) bool {
+    if (a.count == b.count) {
+        if (a.lhs0 != b.lhs0) return a.lhs0 < b.lhs0;
+        if (a.lhs1 != b.lhs1) return a.lhs1 < b.lhs1;
+        if (a.rhs0 != b.rhs0) return a.rhs0 < b.rhs0;
+        return a.rhs1 < b.rhs1;
+    }
+    return a.count > b.count;
+}
+
+fn printMetalPartitionOpRuns(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    reachable: []const bool,
+    last_use: []const u32,
+    partition_index: usize,
+) void {
+    var counts = [_]OpRunSummary{.{}} ** 96;
+    var counts_used: usize = 0;
+    var longest = [_]LongOpRun{.{}} ** 12;
+    var dot_shapes = [_]DotShapeRunSummary{.{}} ** 96;
+    var dot_shapes_used: usize = 0;
+
+    var reachable_nodes: usize = 0;
+    var current_name: []const u8 = "";
+    var current_start: usize = 0;
+    var current_count: usize = 0;
+
+    for (node_ids, 0..) |node_id, node_pos| {
+        const i: usize = @intCast(node_id);
+        if (i >= reachable.len or !reachable[i]) continue;
+        const name = @tagName(graph.node(node_id).op);
+        reachable_nodes += 1;
+        recordOpRunCount(&counts, &counts_used, name);
+        recordDotShapeRunSummary(graph, node_ids, node_pos, reachable, last_use, &dot_shapes, &dot_shapes_used);
+
+        if (current_count == 0) {
+            current_name = name;
+            current_start = node_pos;
+            current_count = 1;
+            continue;
+        }
+        if (std.mem.eql(u8, current_name, name)) {
+            current_count += 1;
+            continue;
+        }
+        insertLongOpRun(&longest, .{
+            .name = current_name,
+            .start_pos = current_start,
+            .end_pos = node_pos - 1,
+            .count = current_count,
+        });
+        current_name = name;
+        current_start = node_pos;
+        current_count = 1;
+    }
+    if (current_count != 0) {
+        insertLongOpRun(&longest, .{
+            .name = current_name,
+            .start_pos = current_start,
+            .end_pos = if (node_ids.len == 0) 0 else node_ids.len - 1,
+            .count = current_count,
+        });
+    }
+
+    std.sort.pdq(OpRunSummary, counts[0..counts_used], {}, lessOpRunCount);
+    std.sort.pdq(DotShapeRunSummary, dot_shapes[0..dot_shapes_used], {}, lessDotShapeRunSummary);
+
+    std.debug.print("metal_partition_op_runs: partition={d} reachable_nodes={d} distinct_ops={d} top=", .{ partition_index, reachable_nodes, counts_used });
+    const top_limit = @min(counts_used, 16);
+    if (top_limit == 0) {
+        std.debug.print("none", .{});
+    } else {
+        for (counts[0..top_limit], 0..) |entry, idx| {
+            if (idx > 0) std.debug.print(",", .{});
+            std.debug.print("{s}:{d}", .{ entry.name, entry.count });
+        }
+    }
+    std.debug.print(" long_runs=", .{});
+    var printed_runs: usize = 0;
+    for (longest) |run| {
+        if (run.count == 0) continue;
+        if (printed_runs > 0) std.debug.print(",", .{});
+        std.debug.print("{s}:{d}@{d}-{d}", .{ run.name, run.count, run.start_pos, run.end_pos });
+        printed_runs += 1;
+    }
+    if (printed_runs == 0) std.debug.print("none", .{});
+    std.debug.print("\n", .{});
+
+    std.debug.print("metal_partition_dot_shapes: partition={d} distinct_shapes={d} top=", .{ partition_index, dot_shapes_used });
+    const dot_limit = @min(dot_shapes_used, 16);
+    if (dot_limit == 0) {
+        std.debug.print("none", .{});
+    } else {
+        for (dot_shapes[0..dot_limit], 0..) |entry, idx| {
+            if (idx > 0) std.debug.print(",", .{});
+            std.debug.print(
+                "{d}x{d}*{d}x{d}->{d}x{d}:count={d}:rhs_transpose={}:rhs_parameter={}:rhs_lora={}:raw_linear={}",
+                .{
+                    entry.lhs0,
+                    entry.lhs1,
+                    entry.rhs0,
+                    entry.rhs1,
+                    entry.out0,
+                    entry.out1,
+                    entry.count,
+                    entry.rhs_transpose,
+                    entry.rhs_parameter,
+                    entry.rhs_lora,
+                    entry.raw_linear_match,
+                },
+            );
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+fn metalPartitionNowNs() u64 {
+    return platform.time.monotonicNs();
+}
+
+fn metalPartitionElapsedNs(start_ns: u64, end_ns: u64) u64 {
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
 
 fn traceMetalGraphNodesEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_NODES", false);
@@ -883,6 +1332,18 @@ fn buildRuntimeRegionPlan(
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
+
+        if (matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use)) |pattern| {
+            regions[node_pos] = .{ .raw_linear_dot = pattern };
+            region_count += 1;
+            continue;
+        }
+        if (matchLoraLinearPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+            regions[node_pos] = .{ .lora_linear = pattern };
+            markLoraLinearSkipped(skipped, pattern);
+            region_count += 1;
+            continue;
+        }
 
         if (matchRmsNormGroupedLinearQkvSlicePattern(graph, null_values, node_ids, node_pos, reachable, skipped)) |pattern| {
             regions[node_pos] = .{ .rms_norm_grouped_linear_qkv_slice = pattern };
@@ -1126,7 +1587,7 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none => continue,
+            .none, .raw_linear_dot, .lora_linear => continue,
             .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice => {
                 if (phase != .qkv) {
                     traceRuntimeFrameMetadataDeclined("qkv_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
@@ -1241,7 +1702,7 @@ fn analyzeRuntimeFrameEligibility(plan: RuntimeRegionPlan) RuntimeFrameEligibili
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none => continue,
+            .none, .raw_linear_dot, .lora_linear => continue,
             .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice => {
                 if (phase != .qkv) return .{ .layers = layers, .reason = .non_layer_order };
                 layer_shape = runtimeFrameLayerShapeFromQkv(region) orelse return .{ .layers = layers, .reason = .non_layer_order };
@@ -1329,6 +1790,13 @@ fn markSkipped(skipped: []bool, node_id: NodeId) void {
 fn markLinearNoBiasQkvSkipped(skipped: []bool, pattern: LinearNoBiasQkvPattern) void {
     markSkipped(skipped, pattern.k_id);
     markSkipped(skipped, pattern.v_id);
+}
+
+fn markLoraLinearSkipped(skipped: []bool, pattern: LoraLinearPattern) void {
+    if (pattern.dropout_mul_id) |dropout_mul_id| markSkipped(skipped, dropout_mul_id);
+    markSkipped(skipped, pattern.after_a_id);
+    markSkipped(skipped, pattern.after_b_id);
+    markSkipped(skipped, pattern.scaled_id);
 }
 
 fn markGroupedLinearQkvSkipped(skipped: []bool, pattern: GroupedLinearQkvSlicePattern) void {
@@ -1667,6 +2135,8 @@ fn preparedRuntimeRegionMatches(region: RuntimeRegion, prepared: PreparedRuntime
 fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
     return switch (prepared) {
         .none => 0,
+        .raw_linear_dot => 1,
+        .lora_linear => 0,
         .q_linear => 1,
         .linear_qkv, .grouped_linear_qkv_slice => 3,
         .rms_norm_grouped_linear_qkv_slice => 4,
@@ -1982,6 +2452,10 @@ fn prepareRuntimeRegion(
 
     const prepared: PreparedRuntimeRegion = switch (region) {
         .none => return null,
+        .raw_linear_dot => |pattern| .{
+            .raw_linear_dot = (try prepareRawLinearDotRegion(cb, values, pattern, stats)) orelse return null,
+        },
+        .lora_linear => .{ .lora_linear = {} },
         .q_linear => |pattern| .{
             .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
         },
@@ -2041,6 +2515,28 @@ fn tryExecutePlannedRuntimeRegion(
     };
     return switch (region) {
         .none => false,
+        .raw_linear_dot => |pattern| executeRawLinearDotPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .raw_linear_dot => |slots| slots,
+                else => return false,
+            },
+        ),
+        .lora_linear => |pattern| executeLoraLinearPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+        ),
         .q_linear => |pattern| executeQLinearPattern(
             graph,
             cb,
@@ -3443,6 +3939,523 @@ fn recordMetalGraphRegion(
     }
 }
 
+const RawLinearDotPattern = struct {
+    id: NodeId,
+    input_id: NodeId,
+    transpose_id: NodeId,
+    weight_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+const LoraLinearPattern = struct {
+    add_id: NodeId,
+    base_linear_id: NodeId,
+    input_id: NodeId,
+    dropout_mul_id: ?NodeId = null,
+    dropout_mask_id: ?NodeId = null,
+    lora_input_id: NodeId,
+    lora_a_id: NodeId,
+    lora_b_id: NodeId,
+    after_a_id: NodeId,
+    after_b_id: NodeId,
+    scaled_id: NodeId,
+    scale_id: NodeId,
+    populate_scaled: bool = false,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    rank: usize,
+};
+
+fn executeLoraLinearPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: LoraLinearPattern,
+) !bool {
+    const base = valueFor(values, pattern.base_linear_id) orelse return false;
+    const lora_input = if (pattern.dropout_mul_id) |dropout_mul_id| blk: {
+        const input = valueFor(values, pattern.input_id) orelse return false;
+        const mask = valueFor(values, pattern.dropout_mask_id orelse return false) orelse return false;
+        const masked = cb.multiply(input, mask) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+            else => return err,
+        };
+        values[@intCast(dropout_mul_id)] = masked;
+        value_device[@intCast(dropout_mul_id)] = device_id;
+        break :blk masked;
+    } else valueFor(values, pattern.lora_input_id) orelse return false;
+    const lora_a = valueFor(values, pattern.lora_a_id) orelse return false;
+    const lora_b = valueFor(values, pattern.lora_b_id) orelse return false;
+    const scale = valueFor(values, pattern.scale_id) orelse return false;
+    const scale_value = scalarConstantF32(graph, pattern.scale_id);
+
+    if (scale_value) |scale_f32| {
+        if (try cb.loraLinearBranch(&.{
+            .input = lora_input,
+            .base = base,
+            .lora_a = lora_a,
+            .lora_b = lora_b,
+            .rows = pattern.rows,
+            .in_dim = pattern.in_dim,
+            .rank = pattern.rank,
+            .out_dim = pattern.out_dim,
+            .scale = scale_f32,
+        })) |fused| {
+            values[@intCast(pattern.after_a_id)] = fused.after_a;
+            value_device[@intCast(pattern.after_a_id)] = device_id;
+            values[@intCast(pattern.after_b_id)] = fused.after_b;
+            value_device[@intCast(pattern.after_b_id)] = device_id;
+            if (pattern.populate_scaled) {
+                const scaled = cb.multiply(fused.after_b, scale) catch |err| switch (err) {
+                    error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+                    else => return err,
+                };
+                if (scaled) |scaled_tensor| {
+                    values[@intCast(pattern.scaled_id)] = scaled_tensor;
+                    value_device[@intCast(pattern.scaled_id)] = device_id;
+                }
+            }
+            values[@intCast(pattern.add_id)] = fused.output;
+            value_device[@intCast(pattern.add_id)] = device_id;
+
+            if (stats) |s| {
+                recordMetalGraphRegion(s, .ffn, 4);
+                s.fused_graph_pattern_dispatches += 1;
+                s.fused_graph_nodes_elided += 3 + @as(u64, if (pattern.dropout_mul_id != null) 1 else 0);
+                recordGemmaRuntimeResidency(s, graph, pattern.add_id, isMetalResidentOrQuantizedDescriptor(cb, fused.output));
+            }
+            if (traceMetalGraphFusionsEnabled()) {
+                std.debug.print(
+                    "metal_graph_fusion_trace: lora_linear_region fused add={d} base={d} after_a={d} after_b={d} rows={d} in={d} rank={d} out={d}\n",
+                    .{ pattern.add_id, pattern.base_linear_id, pattern.after_a_id, pattern.after_b_id, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+                );
+            }
+            return true;
+        }
+    }
+
+    const after_a = cb.linearNoBias(lora_input, lora_a, pattern.rows, pattern.in_dim, pattern.rank) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+        else => return err,
+    };
+    values[@intCast(pattern.after_a_id)] = after_a;
+    value_device[@intCast(pattern.after_a_id)] = device_id;
+
+    const after_b = cb.linearNoBias(after_a, lora_b, pattern.rows, pattern.rank, pattern.out_dim) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+        else => return err,
+    };
+    values[@intCast(pattern.after_b_id)] = after_b;
+    value_device[@intCast(pattern.after_b_id)] = device_id;
+
+    const output = scaled_add: {
+        if (try cb.decoderRuntimeApplyScaledAddScale(&.{
+            .lhs = after_b,
+            .rhs = base,
+            .dim = pattern.rows * pattern.out_dim,
+            .lhs_scale = scale_value orelse break :scaled_add null,
+            .output_scale = 1.0,
+        })) |out| {
+            if (pattern.populate_scaled) {
+                const scaled = cb.multiply(after_b, scale) catch |err| switch (err) {
+                    error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => break :scaled_add out,
+                    else => return err,
+                };
+                values[@intCast(pattern.scaled_id)] = scaled;
+                value_device[@intCast(pattern.scaled_id)] = device_id;
+            }
+            break :scaled_add out;
+        }
+        break :scaled_add null;
+    } orelse fallback: {
+        const scaled = cb.multiply(after_b, scale) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+            else => return err,
+        };
+        values[@intCast(pattern.scaled_id)] = scaled;
+        value_device[@intCast(pattern.scaled_id)] = device_id;
+
+        const out = cb.add(base, scaled) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+            else => return err,
+        };
+        break :fallback out;
+    };
+    values[@intCast(pattern.add_id)] = output;
+    value_device[@intCast(pattern.add_id)] = device_id;
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 4);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 3 + @as(u64, if (pattern.dropout_mul_id != null) 1 else 0);
+        recordGemmaRuntimeResidency(s, graph, pattern.add_id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: lora_linear_region executed add={d} base={d} after_a={d} after_b={d} rows={d} in={d} rank={d} out={d}\n",
+            .{ pattern.add_id, pattern.base_linear_id, pattern.after_a_id, pattern.after_b_id, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+        );
+    }
+    return true;
+}
+
+fn matchLoraLinearPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LoraLinearPattern {
+    const add_id = node_ids[node_pos];
+    const add_index: usize = @intCast(add_id);
+    if (add_index < skipped_nodes.len and skipped_nodes[add_index]) return null;
+    const add = graph.node(add_id);
+    switch (add.op) {
+        .add, .fused_elem_add => {},
+        else => return null,
+    }
+    if (add.num_inputs < 2) return null;
+    return matchLoraLinearPatternWithOrder(graph, add_id, add.inputs[0], add.inputs[1], reachable, skipped_nodes) orelse
+        matchLoraLinearPatternWithOrder(graph, add_id, add.inputs[1], add.inputs[0], reachable, skipped_nodes);
+}
+
+fn matchLoraLinearPatternWithOrder(
+    graph: *const Graph,
+    add_id: NodeId,
+    base_linear_id: NodeId,
+    scaled_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LoraLinearPattern {
+    if (matchLoweredLoraLinearPatternWithOrder(graph, add_id, base_linear_id, scaled_id, reachable, skipped_nodes)) |pattern| {
+        return pattern;
+    }
+    if (base_linear_id == null_node or scaled_id == null_node) return null;
+    const scaled_index: usize = @intCast(scaled_id);
+    if (scaled_index >= reachable.len or !reachable[scaled_index]) return null;
+    if (scaled_index < skipped_nodes.len and skipped_nodes[scaled_index]) return null;
+    const base = graph.node(base_linear_id);
+    const base_attrs = switch (base.op) {
+        .fused_linear => |attrs| attrs,
+        .fused_linear_no_bias => |attrs| attrs,
+        else => return null,
+    };
+    if (base.num_inputs < 2 or base.inputs[0] == null_node) return null;
+
+    const scaled = graph.node(scaled_id);
+    switch (scaled.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return null,
+    }
+    if (scaled.num_inputs < 2) return null;
+
+    const after_b_id, const scale_id = blk: {
+        if (isScalarF32Node(graph, scaled.inputs[0])) break :blk .{ scaled.inputs[1], scaled.inputs[0] };
+        if (isScalarF32Node(graph, scaled.inputs[1])) break :blk .{ scaled.inputs[0], scaled.inputs[1] };
+        return null;
+    };
+    if (after_b_id == null_node or scale_id == null_node) return null;
+
+    const after_b = graph.node(after_b_id);
+    const after_b_attrs = switch (after_b.op) {
+        .fused_linear_no_bias => |attrs| attrs,
+        else => return null,
+    };
+    if (after_b.num_inputs < 2) return null;
+    const after_a_id = after_b.inputs[0];
+    const lora_b_id = after_b.inputs[1];
+    if (after_a_id == null_node or lora_b_id == null_node) return null;
+    if (!isLoraParameter(graph, lora_b_id, ".lora_B")) return null;
+
+    const after_a = graph.node(after_a_id);
+    const after_a_attrs = switch (after_a.op) {
+        .fused_linear_no_bias => |attrs| attrs,
+        else => return null,
+    };
+    if (after_a.num_inputs < 2) return null;
+    const lora_input_id = after_a.inputs[0];
+    const lora_a_id = after_a.inputs[1];
+    if (lora_input_id == null_node or lora_a_id == null_node) return null;
+    if (!isLoraParameter(graph, lora_a_id, ".lora_A")) return null;
+
+    var dropout_mask_id: ?NodeId = null;
+    const dropout_mul_id: ?NodeId = if (lora_input_id != base.inputs[0]) blk: {
+        const maybe_mul = graph.node(lora_input_id);
+        switch (maybe_mul.op) {
+            .mul, .fused_elem_multiply => {},
+            else => return null,
+        }
+        if (maybe_mul.num_inputs < 2) return null;
+        const matches_base_input =
+            maybe_mul.inputs[0] == base.inputs[0] or maybe_mul.inputs[1] == base.inputs[0];
+        if (!matches_base_input) return null;
+        const other = if (maybe_mul.inputs[0] == base.inputs[0]) maybe_mul.inputs[1] else maybe_mul.inputs[0];
+        if (!isLoraParameter(graph, other, ".lora_dropout_mask")) return null;
+        dropout_mask_id = other;
+        break :blk lora_input_id;
+    } else null;
+
+    const rows: usize = @intCast(base_attrs.rows);
+    const in_dim: usize = @intCast(base_attrs.in_dim);
+    const out_dim: usize = @intCast(base_attrs.out_dim);
+    const rank: usize = @intCast(after_a_attrs.out_dim);
+    if (rows == 0 or in_dim == 0 or out_dim == 0 or rank == 0) return null;
+    if (after_a_attrs.rows != base_attrs.rows or after_a_attrs.in_dim != base_attrs.in_dim) return null;
+    if (after_b_attrs.rows != base_attrs.rows or after_b_attrs.in_dim != after_a_attrs.out_dim or after_b_attrs.out_dim != base_attrs.out_dim) return null;
+    const a_shape = graph.node(lora_a_id).output_shape;
+    const b_shape = graph.node(lora_b_id).output_shape;
+    if (shapeDimUsize(a_shape, 0) != rank or shapeDimUsize(a_shape, 1) != in_dim) return null;
+    if (shapeDimUsize(b_shape, 0) != out_dim or shapeDimUsize(b_shape, 1) != rank) return null;
+
+    return .{
+        .add_id = add_id,
+        .base_linear_id = base_linear_id,
+        .input_id = base.inputs[0],
+        .dropout_mul_id = dropout_mul_id,
+        .dropout_mask_id = dropout_mask_id,
+        .lora_input_id = lora_input_id,
+        .lora_a_id = lora_a_id,
+        .lora_b_id = lora_b_id,
+        .after_a_id = after_a_id,
+        .after_b_id = after_b_id,
+        .scaled_id = scaled_id,
+        .scale_id = scale_id,
+        .populate_scaled = reachableUseCount(graph, scaled_id, reachable, 2) > 1,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+}
+
+fn matchLoweredLoraLinearPatternWithOrder(
+    graph: *const Graph,
+    add_id: NodeId,
+    base_id: NodeId,
+    scaled_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LoraLinearPattern {
+    if (base_id == null_node or scaled_id == null_node) return null;
+    const scaled_index: usize = @intCast(scaled_id);
+    if (scaled_index >= reachable.len or !reachable[scaled_index]) return null;
+    if (scaled_index < skipped_nodes.len and skipped_nodes[scaled_index]) return null;
+    const scaled = graph.node(scaled_id);
+    switch (scaled.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return null,
+    }
+    if (scaled.num_inputs < 2) return null;
+
+    const after_b_id, const scale_id = blk: {
+        if (isScalarF32Node(graph, scaled.inputs[0])) break :blk .{ scaled.inputs[1], scaled.inputs[0] };
+        if (isScalarF32Node(graph, scaled.inputs[1])) break :blk .{ scaled.inputs[0], scaled.inputs[1] };
+        return null;
+    };
+    if (after_b_id == null_node or scale_id == null_node) return null;
+    const after_b = graph.node(after_b_id);
+    const after_b_attrs = switch (after_b.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(after_b_attrs)) return null;
+    if (after_b.num_inputs < 2) return null;
+    const after_a_id = after_b.inputs[0];
+    const lora_b_id = sourceParameterFromSimpleTranspose(graph, after_b.inputs[1]) orelse return null;
+    if (!isLoraParameter(graph, lora_b_id, ".lora_B")) return null;
+
+    const after_a = graph.node(after_a_id);
+    const after_a_attrs = switch (after_a.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(after_a_attrs)) return null;
+    if (after_a.num_inputs < 2) return null;
+    const lora_input_id = after_a.inputs[0];
+    const lora_a_id = sourceParameterFromSimpleTranspose(graph, after_a.inputs[1]) orelse return null;
+    if (!isLoraParameter(graph, lora_a_id, ".lora_A")) return null;
+
+    const lora_input_shape = graph.node(lora_input_id).output_shape;
+    const after_a_shape = after_a.output_shape;
+    const after_b_shape = after_b.output_shape;
+    const base_shape = graph.node(base_id).output_shape;
+    if (lora_input_shape.rank() != 2 or after_a_shape.rank() != 2 or after_b_shape.rank() != 2 or base_shape.rank() != 2) return null;
+    if (!shapesEqual(after_b_shape, base_shape) or !shapesEqual(after_b_shape, graph.node(add_id).output_shape)) return null;
+    const rows = shapeDimUsize(lora_input_shape, 0) orelse return null;
+    const in_dim = shapeDimUsize(lora_input_shape, 1) orelse return null;
+    const rank = shapeDimUsize(after_a_shape, 1) orelse return null;
+    const out_dim = shapeDimUsize(after_b_shape, 1) orelse return null;
+    if (shapeDimUsize(after_a_shape, 0) != rows or shapeDimUsize(after_b_shape, 0) != rows) return null;
+    const a_shape = graph.node(lora_a_id).output_shape;
+    const b_shape = graph.node(lora_b_id).output_shape;
+    if (shapeDimUsize(a_shape, 0) != rank or shapeDimUsize(a_shape, 1) != in_dim) return null;
+    if (shapeDimUsize(b_shape, 0) != out_dim or shapeDimUsize(b_shape, 1) != rank) return null;
+
+    return .{
+        .add_id = add_id,
+        .base_linear_id = base_id,
+        .input_id = lora_input_id,
+        .lora_input_id = lora_input_id,
+        .lora_a_id = lora_a_id,
+        .lora_b_id = lora_b_id,
+        .after_a_id = after_a_id,
+        .after_b_id = after_b_id,
+        .scaled_id = scaled_id,
+        .scale_id = scale_id,
+        .populate_scaled = reachableUseCount(graph, scaled_id, reachable, 2) > 1,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+}
+
+fn isLinearDotAttrs(attrs: anytype) bool {
+    return attrs.num_contracting == 1 and
+        attrs.num_batch == 0 and
+        attrs.lhs_contracting[0] == 1 and
+        attrs.rhs_contracting[0] == 0;
+}
+
+fn sourceParameterFromSimpleTranspose(graph: *const Graph, node_id: NodeId) ?NodeId {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .transpose => |transpose_attrs| transpose_attrs,
+        else => return null,
+    };
+    if (node.num_inputs == 0 or node.inputs[0] == null_node) return null;
+    if (!transposeIsSimple2D(attrs, graph.node(node.inputs[0]).output_shape)) return null;
+    const source_id = node.inputs[0];
+    if (std.meta.activeTag(graph.node(source_id).op) != .parameter) return null;
+    return source_id;
+}
+
+fn isScalarF32Node(graph: *const Graph, node_id: NodeId) bool {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
+    return graph.node(node_id).output_shape.dtype == .f32 and graph.node(node_id).output_shape.rank() == 0;
+}
+
+fn isLoraParameter(graph: *const Graph, node_id: NodeId, needle: []const u8) bool {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) != .parameter) return false;
+    return std.mem.indexOf(u8, graph.parameterName(node), needle) != null;
+}
+
+fn executeRawLinearDotPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: RawLinearDotPattern,
+    prepared: PreparedLinearRegion,
+) !bool {
+    const input = valueFor(values, pattern.input_id) orelse return false;
+    const output = (try cb.decoderRuntimeApplyLinear(&.{
+        .slot = prepared.linear_slot,
+        .input = input,
+        .in_dim = pattern.in_dim,
+        .out_dim = pattern.out_dim,
+    })) orelse return false;
+
+    values[@intCast(pattern.id)] = output;
+    value_device[@intCast(pattern.id)] = device_id;
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .qkv, 1);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 1;
+        recordGemmaRuntimeResidency(s, graph, pattern.id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        const weight_name = graph.parameterName(graph.node(pattern.weight_id));
+        std.debug.print(
+            "metal_graph_fusion_trace: raw_linear_dot executed dot={d} transpose={d} weight={s} rows={d} in={d} out={d}\n",
+            .{ pattern.id, pattern.transpose_id, weight_name, pattern.rows, pattern.in_dim, pattern.out_dim },
+        );
+    }
+    return true;
+}
+
+fn matchRawLinearDotPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    last_use: []const u32,
+) ?RawLinearDotPattern {
+    const dot_id = node_ids[node_pos];
+    const dot = graph.node(dot_id);
+    const attrs = switch (dot.op) {
+        .dot_general => |dot_attrs| dot_attrs,
+        else => return null,
+    };
+    if (dot.num_inputs < 2) return null;
+    if (attrs.num_contracting != 1 or attrs.num_batch != 0) return null;
+    if (attrs.lhs_contracting[0] != 1 or attrs.rhs_contracting[0] != 0) return null;
+    const lhs_id = dot.inputs[0];
+    const transpose_id = dot.inputs[1];
+    if (lhs_id == null_node or transpose_id == null_node) return null;
+    if (!shouldDeferTransposeForLinearDot(graph, transpose_id, reachable, last_use)) return null;
+    const transpose = graph.node(transpose_id);
+    if (transpose.num_inputs == 0 or transpose.inputs[0] == null_node) return null;
+    const weight_id = transpose.inputs[0];
+    const weight_node = graph.node(weight_id);
+    if (std.meta.activeTag(weight_node.op) != .parameter) return null;
+    const weight_name = graph.parameterName(weight_node);
+    if (isLoRAAdapterParameterName(weight_name)) return null;
+    const lhs_shape = graph.node(lhs_id).output_shape;
+    const rhs_shape = graph.node(transpose_id).output_shape;
+    if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2) return null;
+    const rows = shapeDimUsize(lhs_shape, 0) orelse return null;
+    const in_dim = shapeDimUsize(lhs_shape, 1) orelse return null;
+    const out_dim = shapeDimUsize(rhs_shape, 1) orelse return null;
+    const weight_shape = graph.node(weight_id).output_shape;
+    const weight_out_dim = shapeDimUsize(weight_shape, 0) orelse return null;
+    const weight_in_dim = shapeDimUsize(weight_shape, 1) orelse return null;
+    if (weight_out_dim != out_dim or weight_in_dim != in_dim) return null;
+    return .{
+        .id = dot_id,
+        .input_id = lhs_id,
+        .transpose_id = transpose_id,
+        .weight_id = weight_id,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    };
+}
+
+fn isLoRAAdapterParameterName(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, ".lora_A") != null or
+        std.mem.indexOf(u8, name, ".lora_B") != null or
+        std.mem.indexOf(u8, name, ".lora_dropout_mask") != null;
+}
+
+fn prepareRawLinearDotRegion(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    pattern: RawLinearDotPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedLinearRegion {
+    const linear_slot = (try ensurePreparedLinearSlot(
+        cb,
+        values,
+        pattern.weight_id,
+        pattern.in_dim,
+        pattern.out_dim,
+        stats,
+    )) orelse return null;
+    return .{ .linear_slot = linear_slot };
+}
+
 const QLinearPattern = struct {
     id: NodeId,
     input_id: NodeId,
@@ -4745,7 +5758,7 @@ fn tryExecuteMetalCommand(
             defer if (host_input_to_free) |ct| cb.free(ct);
             const input_source = valueFor(values, inputs[0]) orelse break :blk null;
             const input_source_resident = isMetalDeviceResident(cb, input_source);
-            const preserve_host_view = (!input_source_resident) or (n.output_shape.rank() == 3 and transposeFeedsReshapeConsumer(graph, node_id));
+            const preserve_host_view = !input_source_resident;
             const input = if (preserve_host_view and input_source_resident) host_input: {
                 var host_shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
                 const source_shape = graph.node(inputs[0]).output_shape;
@@ -4791,6 +5804,7 @@ fn tryExecuteMetalCommand(
         .erf => try executeRuntimeUnary(cb, values, inputs, .erf),
         .abs => try executeRuntimeUnary(cb, values, inputs, .abs),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
+        .gather => |attrs| try executeRuntimeGather(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
         .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, inputs, attrs),
         .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape),
@@ -4799,8 +5813,7 @@ fn tryExecuteMetalCommand(
         .fused_quick_gelu => try executeRuntimeActivation(cb, values, inputs, .quick_gelu, n.output_shape),
         .fused_sigmoid => try executeRuntimeFusedUnary(cb, values, inputs, .sigmoid),
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
-        .fused_elem_add => try executeRuntimeAdd(cb, values, inputs, n.output_shape),
-        .add => try executeRuntimePlainAdd(cb, values, inputs),
+        .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply),
         .sub => try executeRuntimeBinary(cb, values, inputs, .subtract),
         .div => try executeRuntimeBinary(cb, values, inputs, .divide),
@@ -4840,6 +5853,30 @@ fn tryExecuteMetalCommand(
         .fused_rms_norm => |attrs| try executeRuntimeRmsNorm(cb, values, inputs, attrs.dim, attrs.eps, n.output_shape),
         else => null,
     };
+}
+
+fn executeRuntimeGather(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    attrs: anytype,
+) !?CT {
+    if (inputs.len < 2) return null;
+    var shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+    const input_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &shape_buf);
+    const input = valueFor(values, inputs[0]) orelse return null;
+    const indices = valueFor(values, inputs[1]) orelse return null;
+    const gathered = cb.primGather(input, indices, attrs.axis, input_shape) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    if (isMetalDeviceResident(cb, gathered)) return gathered;
+    if (try makeMetalDeviceResident(cb, gathered)) |device_ct| {
+        if (device_ct != gathered) cb.free(gathered);
+        return device_ct;
+    }
+    return gathered;
 }
 
 fn executeRuntimeZeroTensor(
@@ -5296,15 +6333,17 @@ fn executeRuntimeLinear(
     try validatePlannedLinearOp(cb, weight, rows, in_dim, out_dim, op_plan);
     if (has_bias) {
         const bias = valueFor(values, inputs[2]) orelse return null;
-        return cb.linearWithPlan(input, weight, bias, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
+        const output = cb.linearWithPlan(input, weight, bias, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
+        return try promoteMetalOutputIfNeeded(cb, output);
     } else {
-        return cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
+        const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
+        return try promoteMetalOutputIfNeeded(cb, output);
     }
 }
 
@@ -5339,7 +6378,6 @@ fn executeRuntimeDotGeneral(
     op_plan: ?OperatorPlan,
 ) !?CT {
     const lhs = valueFor(values, inputs[0]) orelse return null;
-    const rhs = valueFor(values, inputs[1]) orelse return null;
     var lhs_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
     var rhs_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
     const lhs_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &lhs_shape_buf);
@@ -5348,6 +6386,10 @@ fn executeRuntimeDotGeneral(
     const rhs_contracting = attrs.rhs_contracting[0..attrs.num_contracting];
     const lhs_batch = attrs.lhs_batch[0..attrs.num_batch];
     const rhs_batch = attrs.rhs_batch[0..attrs.num_batch];
+    if (try executeRuntimeLinearDotFromDeferredTranspose(graph, cb, values, inputs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch, op_plan)) |linear_output| {
+        return linear_output;
+    }
+    const rhs = valueFor(values, inputs[1]) orelse return null;
     if (op_plan != null and attrs.num_contracting == 1 and attrs.num_batch == 0 and lhs_shape.len == 2 and rhs_shape.len == 2 and lhs_contracting[0] == 1 and rhs_contracting[0] == 1) {
         const rows = positiveI64ToUsize(lhs_shape[0]) orelse return null;
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
@@ -5360,15 +6402,119 @@ fn executeRuntimeDotGeneral(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
-    if (output) |ct| {
-        if (!isMetalDeviceResident(cb, ct)) {
-            if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
-                cb.free(ct);
-                return device_ct;
+    return try promoteMetalOutputIfNeeded(cb, output);
+}
+
+fn executeRuntimeLinearDotFromDeferredTranspose(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    lhs_shape: []const i64,
+    rhs_shape: []const i64,
+    lhs_contracting: []const u8,
+    rhs_contracting: []const u8,
+    lhs_batch: []const u8,
+    rhs_batch: []const u8,
+    op_plan: ?OperatorPlan,
+) !?CT {
+    if (inputs.len < 2) return null;
+    if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
+    if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
+    if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
+    if (lhs_contracting[0] != 1 or rhs_contracting[0] != 0) return null;
+
+    const rhs_id = inputs[1];
+    if (rhs_id == null_node) return null;
+    const rhs_node = graph.node(rhs_id);
+    const transpose_attrs = switch (rhs_node.op) {
+        .transpose => |attrs| attrs,
+        else => return null,
+    };
+    if (rhs_node.num_inputs == 0 or rhs_node.inputs[0] == null_node) return null;
+    if (!transposeIsSimple2D(transpose_attrs, graph.node(rhs_node.inputs[0]).output_shape)) return null;
+
+    const source_weight_id = rhs_node.inputs[0];
+    const input = valueFor(values, inputs[0]) orelse return null;
+    const weight = valueFor(values, source_weight_id) orelse return null;
+    const rows = positiveI64ToUsize(lhs_shape[0]) orelse return null;
+    const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
+    const out_dim = positiveI64ToUsize(rhs_shape[1]) orelse return null;
+    const weight_shape = graph.node(source_weight_id).output_shape;
+    const weight_out_dim = shapeDimUsize(weight_shape, 0) orelse return null;
+    const weight_in_dim = shapeDimUsize(weight_shape, 1) orelse return null;
+    if (weight_out_dim != out_dim or weight_in_dim != in_dim) return null;
+    const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        else => return err,
+    };
+    return try promoteMetalOutputIfNeeded(cb, output);
+}
+
+fn shouldDeferTransposeForLinearDot(
+    graph: *const Graph,
+    node_id: NodeId,
+    reachable: []const bool,
+    last_use: []const u32,
+) bool {
+    _ = last_use;
+    const node_index: usize = @intCast(node_id);
+    if (node_index >= reachable.len or !reachable[node_index]) return false;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .transpose => |transpose_attrs| transpose_attrs,
+        else => return false,
+    };
+    if (node.num_inputs == 0 or node.inputs[0] == null_node) return false;
+    if (!transposeIsSimple2D(attrs, graph.node(node.inputs[0]).output_shape)) return false;
+    var compatible_consumers: usize = 0;
+    var consumer_id: NodeId = 0;
+    while (consumer_id < graph.nodeCount()) : (consumer_id += 1) {
+        const consumer_index: usize = @intCast(consumer_id);
+        if (consumer_index >= reachable.len or !reachable[consumer_index]) continue;
+        const consumer = graph.node(consumer_id);
+        var consumes_transpose = false;
+        for (consumer.getInputs()) |input_id| {
+            if (input_id == node_id) {
+                consumes_transpose = true;
+                break;
             }
         }
+        if (!consumes_transpose) continue;
+        if (!linearDotConsumesTranspose(graph, consumer_id, node_id)) return false;
+        compatible_consumers += 1;
     }
-    return output;
+    return compatible_consumers > 0;
+}
+
+fn linearDotConsumesTranspose(graph: *const Graph, consumer_id: NodeId, transpose_id: NodeId) bool {
+    if (consumer_id >= graph.nodeCount()) return false;
+    const consumer = graph.node(consumer_id);
+    const dot_attrs = switch (consumer.op) {
+        .dot_general => |dot_general_attrs| dot_general_attrs,
+        else => return false,
+    };
+    if (consumer.num_inputs < 2 or consumer.inputs[1] != transpose_id) return false;
+    if (dot_attrs.num_contracting != 1 or dot_attrs.num_batch != 0) return false;
+    if (dot_attrs.lhs_contracting[0] != 1 or dot_attrs.rhs_contracting[0] != 0) return false;
+    const transpose = graph.node(transpose_id);
+    if (transpose.num_inputs == 0 or transpose.inputs[0] == null_node) return false;
+    const lhs_shape = graph.node(consumer.inputs[0]).output_shape;
+    if (lhs_shape.rank() != 2 or consumer.output_shape.rank() != 2) return false;
+    const weight_shape = graph.node(transpose.inputs[0]).output_shape;
+    const in_dim = shapeDimUsize(lhs_shape, 1) orelse return false;
+    const out_dim = shapeDimUsize(weight_shape, 0) orelse return false;
+    const weight_in_dim = shapeDimUsize(weight_shape, 1) orelse return false;
+    const output_out_dim = shapeDimUsize(consumer.output_shape, 1) orelse return false;
+    if (weight_in_dim != in_dim or output_out_dim != out_dim) return false;
+    return true;
+}
+
+fn transposeIsSimple2D(attrs: ml.graph.node.TransposeAttrs, input_shape: Shape) bool {
+    if (input_shape.rank() != 2) return false;
+    var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
+    const perm = transpose_utils.effectivePerm(attrs, input_shape.rank(), &perm_buf);
+    return perm.len == 2 and perm[0] == 1 and perm[1] == 0;
 }
 
 fn executeRuntimeConv1d(
@@ -5731,14 +6877,16 @@ fn executeRuntimeActivation(
 }
 
 fn executeRuntimeAdd(
+    graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
 ) !?CT {
+    const dim = tensorElementCount(output_shape) orelse return null;
+    if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     const lhs = valueFor(values, inputs[0]) orelse return null;
     const rhs = valueFor(values, inputs[1]) orelse return null;
-    const dim = tensorElementCount(output_shape) orelse return null;
     if (isMetalDeviceResident(cb, lhs) or isMetalDeviceResident(cb, rhs)) {
         return cb.add(lhs, rhs) catch |err| switch (err) {
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
@@ -5750,6 +6898,204 @@ fn executeRuntimeAdd(
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+const DeferredScaleMul = struct {
+    source_id: NodeId,
+    scalar_id: NodeId,
+    scale: f32,
+};
+
+fn executeRuntimeScaledAddFromDeferredMul(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    output_shape: ml.graph.Shape,
+    dim: usize,
+) !?CT {
+    if (inputs.len < 2) return null;
+    if (deferredScaleMul(graph, inputs[0], output_shape)) |lhs_scaled| {
+        if (deferredScaleMul(graph, inputs[1], output_shape)) |rhs_scaled| {
+            const lhs = (try executeDeferredScaleMulValue(cb, values, lhs_scaled)) orelse return null;
+            defer cb.free(lhs);
+            const rhs = (try executeDeferredScaleMulValue(cb, values, rhs_scaled)) orelse return null;
+            defer cb.free(rhs);
+            const output = cb.add(lhs, rhs) catch |err| switch (err) {
+                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+                else => return err,
+            };
+            return try promoteMetalOutputIfNeeded(cb, output);
+        }
+    }
+    if (deferredScaleMul(graph, inputs[0], output_shape)) |scaled| {
+        const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
+        const residual = valueFor(values, inputs[1]) orelse return null;
+        const output = cb.decoderRuntimeApplyScaledAddScale(&.{
+            .lhs = scaled_lhs,
+            .rhs = residual,
+            .dim = dim,
+            .lhs_scale = scaled.scale,
+            .output_scale = 1.0,
+        }) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        };
+        if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+        return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
+    }
+    if (deferredScaleMul(graph, inputs[1], output_shape)) |scaled| {
+        const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
+        const residual = valueFor(values, inputs[0]) orelse return null;
+        const output = cb.decoderRuntimeApplyScaledAddScale(&.{
+            .lhs = scaled_lhs,
+            .rhs = residual,
+            .dim = dim,
+            .lhs_scale = scaled.scale,
+            .output_scale = 1.0,
+        }) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        };
+        if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+        return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
+    }
+    return null;
+}
+
+fn executeDeferredScaleMulValue(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    scaled: DeferredScaleMul,
+) !?CT {
+    var lhs = valueFor(values, scaled.source_id) orelse return null;
+    var scalar = valueFor(values, scaled.scalar_id) orelse return null;
+    var owned_lhs: ?CT = null;
+    defer if (owned_lhs) |ct| cb.free(ct);
+    var owned_scalar: ?CT = null;
+    defer if (owned_scalar) |ct| cb.free(ct);
+    if (cb.kind() == .metal) {
+        if (!isMetalDeviceResident(cb, lhs)) {
+            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
+                if (device_lhs != lhs) owned_lhs = device_lhs;
+                lhs = device_lhs;
+            }
+        }
+        if (!isMetalDeviceResident(cb, scalar)) {
+            if (try makeMetalDeviceResident(cb, scalar)) |device_scalar| {
+                if (device_scalar != scalar) owned_scalar = device_scalar;
+                scalar = device_scalar;
+            }
+        }
+    }
+    return cb.multiply(lhs, scalar) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        else => return err,
+    };
+}
+
+fn executeDeferredScaleAddFallback(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    scaled: DeferredScaleMul,
+    residual: CT,
+) !?CT {
+    var rhs = residual;
+    var owned_rhs: ?CT = null;
+    defer if (owned_rhs) |ct| cb.free(ct);
+    if (cb.kind() == .metal) {
+        if (!isMetalDeviceResident(cb, rhs)) {
+            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
+                if (device_rhs != rhs) owned_rhs = device_rhs;
+                rhs = device_rhs;
+            }
+        }
+    }
+    const multiplied_ct = (try executeDeferredScaleMulValue(cb, values, scaled)) orelse return null;
+    defer cb.free(multiplied_ct);
+    const output = cb.add(multiplied_ct, rhs) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        else => return err,
+    };
+    return try promoteMetalOutputIfNeeded(cb, output);
+}
+
+fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return null,
+    }
+    if (!shapesEqual(node.output_shape, output_shape)) return null;
+    if (node.num_inputs < 2) return null;
+    if (scalarConstantF32(graph, node.inputs[0])) |scale| {
+        return .{ .source_id = node.inputs[1], .scalar_id = node.inputs[0], .scale = scale };
+    }
+    if (scalarConstantF32(graph, node.inputs[1])) |scale| {
+        return .{ .source_id = node.inputs[0], .scalar_id = node.inputs[1], .scale = scale };
+    }
+    return null;
+}
+
+fn shouldDeferScaleMulForAdd(
+    graph: *const Graph,
+    node_id: NodeId,
+    reachable: []const bool,
+    last_use: []const u32,
+) bool {
+    const node_index: usize = @intCast(node_id);
+    if (node_index >= reachable.len or !reachable[node_index]) return false;
+    if (node_index >= last_use.len) return false;
+    const consumer_id: NodeId = @intCast(last_use[node_index]);
+    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
+    const consumer_index: usize = @intCast(consumer_id);
+    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
+    const consumer = graph.node(consumer_id);
+    switch (consumer.op) {
+        .add, .fused_elem_add => {},
+        else => return false,
+    }
+    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
+    if (reachableUseCount(graph, node_id, reachable, 2) != 1) return false;
+    return deferredScaleMul(graph, node_id, consumer.output_shape) != null;
+}
+
+fn reachableUseCount(graph: *const Graph, node_id: NodeId, reachable: []const bool, stop_after: usize) usize {
+    var count: usize = 0;
+    var candidate: NodeId = 0;
+    while (candidate < graph.nodeCount()) : (candidate += 1) {
+        const candidate_index: usize = @intCast(candidate);
+        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
+        const node = graph.node(candidate);
+        for (node.getInputs()) |input_id| {
+            if (input_id != node_id) continue;
+            count += 1;
+            if (count >= stop_after) return count;
+        }
+    }
+    return count;
+}
+
+fn scalarConstantF32(graph: *const Graph, node_id: NodeId) ?f32 {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .constant => |constant_attrs| constant_attrs,
+        else => return null,
+    };
+    if (node.output_shape.dtype != .f32 or node.output_shape.rank() != 0 or attrs.data_len != 1) return null;
+    const values = graph.constantDataAs(f32, attrs.data_offset, attrs.data_len);
+    if (values.len != 1) return null;
+    return values[0];
+}
+
+fn shapesEqual(lhs: ml.graph.Shape, rhs: ml.graph.Shape) bool {
+    if (lhs.dtype != rhs.dtype or lhs.rank() != rhs.rank()) return false;
+    for (0..lhs.rank()) |idx| {
+        if (lhs.dims[idx] != rhs.dims[idx]) return false;
+    }
+    return true;
 }
 
 fn executeRuntimePlainAdd(
@@ -5819,18 +7165,6 @@ fn positiveI64ToUsize(dim: i64) ?usize {
 fn shapeDimUsize(shape: ml.graph.Shape, axis: usize) ?usize {
     if (axis >= shape.rank()) return null;
     return positiveI64ToUsize(shape.dim(@intCast(axis)));
-}
-
-fn transposeFeedsReshapeConsumer(graph: *const Graph, node_id: NodeId) bool {
-    var candidate: NodeId = 0;
-    while (candidate < graph.nodeCount()) : (candidate += 1) {
-        const node = graph.node(candidate);
-        if (node.op != .reshape) continue;
-        for (node.getInputs()) |input_id| {
-            if (input_id == node_id) return true;
-        }
-    }
-    return false;
 }
 
 fn buildMetalGraphPlan(
@@ -5962,6 +7296,38 @@ fn isPreMaterializedConstantOp(op: ml.graph.OpCode) bool {
         .constant, .fused_zero_tensor => true,
         else => false,
     };
+}
+
+fn materializePartitionParameters(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    reachable: []const bool,
+    device_id: DeviceId,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !void {
+    for (node_ids) |node_id| {
+        const i: usize = @intCast(node_id);
+        if (i >= reachable.len or !reachable[i]) continue;
+        if (values[i] != null) continue;
+        if (rt_map.contains(node_id)) continue;
+        const node = graph.node(node_id);
+        if (node.op != .parameter) continue;
+        const materialized = try cb.getWeight(graph.parameterName(node));
+        values[i] = materialized;
+        value_device[i] = device_id;
+        if (stats) |s| {
+            s.descriptor_materializations += 1;
+            if (isMetalResidentOrQuantizedDescriptor(cb, materialized)) {
+                s.device_resident_outputs += 1;
+            } else {
+                s.host_materialized_outputs += 1;
+            }
+        }
+    }
 }
 
 fn materializePartitionConstants(
@@ -6987,6 +8353,202 @@ test "metal partition executor recognizes gemma q-only linear through attention 
         .q_linear => |planned| try std.testing.expectEqual(q, planned.id),
         else => return error.ExpectedPlannedQLinearRegion,
     }
+}
+
+test "metal partition executor recognizes raw transposed linear dot graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const dot = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+
+    var plan = try buildRuntimeRegionPlan(allocator, &g, node_ids, @intCast(g.nodeCount()), reachable, last_use);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.region_count);
+    switch (plan.regionAt(@intCast(dot), dot, node_ids)) {
+        .raw_linear_dot => |pattern| {
+            try std.testing.expectEqual(dot, pattern.id);
+            try std.testing.expectEqual(x, pattern.input_id);
+            try std.testing.expectEqual(weight_t, pattern.transpose_id);
+            try std.testing.expectEqual(weight, pattern.weight_id);
+            try std.testing.expectEqual(@as(usize, rows), pattern.rows);
+            try std.testing.expectEqual(@as(usize, in_dim), pattern.in_dim);
+            try std.testing.expectEqual(@as(usize, out_dim), pattern.out_dim);
+        },
+        else => return error.ExpectedRawLinearDotRegion,
+    }
+}
+
+test "metal partition executor defers scalar scale mul only for single add consumer" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const scale = try b.scalarConst(.f32, 0.5);
+    const scaled = try b.mul(x, scale);
+    const first = try b.add(scaled, y);
+    const second = try b.add(scaled, z);
+    try g.markOutput(first);
+    try g.markOutput(second);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 2), reachableUseCount(&g, scaled, reachable, 2));
+    try std.testing.expect(!shouldDeferScaleMulForAdd(&g, scaled, reachable, last_use));
+}
+
+test "metal partition executor defers two independent scalar scale mul add inputs" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const scale = try b.scalarConst(.f32, 0.5);
+    const lhs_scaled = try b.mul(x, scale);
+    const rhs_scaled = try b.mul(y, scale);
+    const out = try b.add(lhs_scaled, rhs_scaled);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, lhs_scaled, reachable, 2));
+    try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, rhs_scaled, reachable, 2));
+    try std.testing.expect(shouldDeferScaleMulForAdd(&g, lhs_scaled, reachable, last_use));
+    try std.testing.expect(shouldDeferScaleMulForAdd(&g, rhs_scaled, reachable, last_use));
+    try std.testing.expect(deferredScaleMul(&g, lhs_scaled, g.node(out).output_shape) != null);
+    try std.testing.expect(deferredScaleMul(&g, rhs_scaled, g.node(out).output_shape) != null);
+}
+
+test "metal partition executor does not defer transpose when it escapes non-linear-dot consumers" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const residual = try b.parameter("residual", ml.graph.Shape.init(.f32, &.{ in_dim, out_dim }));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const dot = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const escaped = try b.add(weight_t, residual);
+    try g.markOutput(dot);
+    try g.markOutput(escaped);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 2), reachableUseCount(&g, weight_t, reachable, 2));
+    try std.testing.expect(!shouldDeferTransposeForLinearDot(&g, weight_t, reachable, last_use));
+}
+
+test "metal partition executor defers transpose shared by compatible linear dots" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const y = try b.parameter("y", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const first = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const second = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ y, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(first);
+    try g.markOutput(second);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 2), reachableUseCount(&g, weight_t, reachable, 2));
+    try std.testing.expect(shouldDeferTransposeForLinearDot(&g, weight_t, reachable, last_use));
 }
 
 test "metal partition executor recognizes grouped qkv linear slice graph region" {

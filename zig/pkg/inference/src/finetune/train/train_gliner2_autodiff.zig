@@ -41,6 +41,7 @@
 //   --max-grad-norm <f>          Gradient clipping norm (default: 1.0)
 //   --grad-accum <n>             Gradient accumulation steps (default: 1)
 //   --seed <n>                   RNG seed (default: 42)
+//   --lora-only-trainables       Freeze regular task-head params; train LoRA only
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -107,6 +108,7 @@ const Options = struct {
     backend: Gliner2TrainBackend = .auto,
     compiled_required: bool = false,
     dump_span_parity: bool = false,
+    lora_only_trainables: bool = false,
 };
 
 const Gliner2TrainBackend = enum {
@@ -157,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
     var backend: Gliner2TrainBackend = .auto;
     var compiled_required: bool = false;
     var dump_span_parity: bool = false;
+    var lora_only_trainables: bool = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -241,6 +244,8 @@ pub fn main(init: std.process.Init) !void {
             compiled_required = true;
         } else if (std.mem.eql(u8, arg, "--dump-span-parity")) {
             dump_span_parity = true;
+        } else if (std.mem.eql(u8, arg, "--lora-only-trainables")) {
+            lora_only_trainables = true;
         } else {
             print("error: unknown argument: {s}\n", .{arg});
             printUsage();
@@ -290,6 +295,7 @@ pub fn main(init: std.process.Init) !void {
         .backend = backend,
         .compiled_required = compiled_required,
         .dump_span_parity = dump_span_parity,
+        .lora_only_trainables = lora_only_trainables,
     };
 
     try runTraining(allocator, opts);
@@ -697,10 +703,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     };
     const regular_trainable_params_with_classifier = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
     const regular_trainable_params_bias_only = [_][]const u8{"task_classifier.bias"};
-    const regular_trainable_params = if (stringSliceContains(resolved_target_patterns, "classifier"))
+    const no_regular_trainable_params = [_][]const u8{};
+    const regular_trainable_params = if (opts.lora_only_trainables)
+        no_regular_trainable_params[0..]
+    else if (stringSliceContains(resolved_target_patterns, "classifier"))
         regular_trainable_params_bias_only[0..]
     else
         regular_trainable_params_with_classifier[0..];
+    print("  trainable mode: LoRA{s} regular_trainable_params={d}\n", .{
+        if (opts.lora_only_trainables) " only" else " + regular head",
+        regular_trainable_params.len,
+    });
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
@@ -1001,7 +1014,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, resolved_target_patterns, run_target_stats);
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, regular_trainable_params, resolved_target_patterns, run_target_stats);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -1046,6 +1059,18 @@ fn writeStepMetric(
         .device_trainable_transfer_count = timing.profile.device_resident_transfer_count,
         .device_resident_transfer_count = timing.profile.device_resident_transfer_count,
         .device_trainable_bytes = timing.profile.device_trainable_bytes,
+        .graph_executor_partitions = timing.profile.graph_executor_partitions,
+        .graph_executor_command_dispatches = timing.profile.graph_executor_command_dispatches,
+        .graph_executor_planned_dispatches = timing.profile.graph_executor_planned_dispatches,
+        .graph_executor_interpreter_fallbacks = timing.profile.graph_executor_interpreter_fallbacks,
+        .graph_executor_host_outputs = timing.profile.graph_executor_host_outputs,
+        .graph_executor_device_outputs = timing.profile.graph_executor_device_outputs,
+        .graph_executor_regions = timing.profile.graph_executor_regions,
+        .graph_executor_region_ops = timing.profile.graph_executor_region_ops,
+        .graph_executor_runtime_region_dispatches = timing.profile.graph_executor_runtime_region_dispatches,
+        .graph_executor_runtime_region_fallbacks = timing.profile.graph_executor_runtime_region_fallbacks,
+        .graph_executor_runtime_frame_candidates = timing.profile.graph_executor_runtime_frame_candidates,
+        .graph_executor_runtime_frame_eligible = timing.profile.graph_executor_runtime_frame_eligible,
         .trainer_total_ms = nsToMillis(timing.profile.total_ns),
         .peak_resident_bytes = timing.profile.peak_resident_bytes,
         .supervised_tokens_per_second = timing.supervisedTokensPerSecond(target_stats),
@@ -1094,6 +1119,7 @@ fn writeTrainingManifest(
     adapter_parameter_file_count: usize,
     peft_adapter_tensor_count: usize,
     regular_trainable_tensor_count: usize,
+    regular_trainable_params: []const []const u8,
     resolved_lora_targets: []const []const u8,
     target_stats: BatchTargetStats,
 ) !void {
@@ -1118,7 +1144,8 @@ fn writeTrainingManifest(
         .peft_adapter_tensor_count = peft_adapter_tensor_count,
         .regular_trainable_checkpoint = gliner2_bundle.task_head_checkpoint_file_name,
         .regular_trainable_tensor_count = regular_trainable_tensor_count,
-        .regular_trainable_params = .{ "classifier.weight", "classifier.bias" },
+        .regular_trainable_params = regular_trainable_params,
+        .lora_only_trainables = opts.lora_only_trainables,
         .epochs = opts.epochs,
         .batch_size = opts.batch_size,
         .seq_len = opts.seq_len,
@@ -2186,6 +2213,7 @@ fn printUsage() void {
         \\  --seed <n>                RNG seed (default: 42)
         \\  --backend <name>          auto, metal, mlx, or native (default: auto)
         \\  --compiled-required       Fail if the requested compiled backend cannot run
+        \\  --lora-only-trainables    Freeze regular task-head params; train LoRA params only
         \\  --dump-span-parity        Print first span-start batch logits/label/mask BCE stats as JSON
         \\
         \\notes:

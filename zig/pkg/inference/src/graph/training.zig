@@ -85,6 +85,18 @@ pub const TrainStepProfile = struct {
     extract_ns: u64 = 0,
     total_ns: u64 = 0,
     peak_resident_bytes: usize = 0,
+    graph_executor_partitions: u64 = 0,
+    graph_executor_command_dispatches: u64 = 0,
+    graph_executor_planned_dispatches: u64 = 0,
+    graph_executor_interpreter_fallbacks: u64 = 0,
+    graph_executor_host_outputs: u64 = 0,
+    graph_executor_device_outputs: u64 = 0,
+    graph_executor_regions: u64 = 0,
+    graph_executor_region_ops: u64 = 0,
+    graph_executor_runtime_region_dispatches: u64 = 0,
+    graph_executor_runtime_region_fallbacks: u64 = 0,
+    graph_executor_runtime_frame_candidates: u64 = 0,
+    graph_executor_runtime_frame_eligible: u64 = 0,
 };
 
 pub const CheckpointSummary = struct {
@@ -630,7 +642,7 @@ pub const CompiledTrainSession = struct {
                 .runtime_inputs = runtime_inputs,
                 .cached_analysis = self.analysis,
                 .skip_metal_fused_patterns = true,
-                .collect_partition_stats = false,
+                .collect_partition_stats = true,
                 .preserve_runtime_input_residency = true,
             },
         );
@@ -638,9 +650,21 @@ pub const CompiledTrainSession = struct {
 
         profile.execute_ns = elapsedNs(execute_start);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        profile.graph_executor_partitions = multi_result.stats.partitions_executed;
+        profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
+        profile.graph_executor_planned_dispatches = multi_result.stats.planned_operator_dispatches;
+        profile.graph_executor_interpreter_fallbacks = multi_result.stats.interpreter_fallbacks;
+        profile.graph_executor_host_outputs = multi_result.stats.host_materialized_outputs;
+        profile.graph_executor_device_outputs = multi_result.stats.device_resident_outputs;
+        profile.graph_executor_regions = multi_result.stats.graph_regions;
+        profile.graph_executor_region_ops = multi_result.stats.graph_region_ops;
+        profile.graph_executor_runtime_region_dispatches = multi_result.stats.runtime_region_plan_dispatches;
+        profile.graph_executor_runtime_region_fallbacks = multi_result.stats.runtime_region_fallbacks;
+        profile.graph_executor_runtime_frame_candidates = multi_result.stats.runtime_frame_candidates;
+        profile.graph_executor_runtime_frame_eligible = multi_result.stats.runtime_frame_eligible;
         compiledDiag(
-            "graph executor execute done partitions={} execute_ms={d:.3} rss={}",
-            .{ dpp.base.partitions.len, nsToMs(profile.execute_ns), profile.peak_resident_bytes },
+            "graph executor execute done partitions={} commands={} planned={} fallbacks={} execute_ms={d:.3} rss={}",
+            .{ dpp.base.partitions.len, profile.graph_executor_command_dispatches, profile.graph_executor_planned_dispatches, profile.graph_executor_interpreter_fallbacks, nsToMs(profile.execute_ns), profile.peak_resident_bytes },
         );
 
         return try self.extractTrainStepResultFromGraphOutputs(

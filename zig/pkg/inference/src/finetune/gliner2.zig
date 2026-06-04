@@ -572,13 +572,19 @@ pub fn resolveArtifactPaths(allocator: std.mem.Allocator, model_input: []const u
         try allocator.dupe(u8, model_input);
     errdefer allocator.free(checkpoint_path);
 
-    const config_path = try std.fs.path.join(allocator, &.{ model_dir, config_file_name });
-    errdefer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ model_dir, encoder_config_file_name });
     errdefer allocator.free(encoder_config_path);
+    const root_config_path = try std.fs.path.join(allocator, &.{ model_dir, config_file_name });
+    const config_path = if (isRegularFilePath(root_config_path)) root_config_path else if (isRegularFilePath(encoder_config_path)) blk: {
+        allocator.free(root_config_path);
+        break :blk try allocator.dupe(u8, encoder_config_path);
+    } else {
+        allocator.free(root_config_path);
+        return error.MissingModelConfig;
+    };
+    errdefer allocator.free(config_path);
 
     if (!isRegularFilePath(checkpoint_path)) return error.MissingModelCheckpoint;
-    if (!isRegularFilePath(config_path)) return error.MissingModelConfig;
     if (!isRegularFilePath(encoder_config_path)) return error.MissingEncoderConfig;
 
     return .{

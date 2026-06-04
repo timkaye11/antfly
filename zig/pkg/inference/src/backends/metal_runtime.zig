@@ -3885,6 +3885,68 @@ pub fn decoderRuntimeDotGeneral2DF32Device(
     return output_device;
 }
 
+pub const LoraLinearF32DeviceResult = struct {
+    after_a: MetalTensor,
+    after_b: MetalTensor,
+    output: MetalTensor,
+};
+
+pub fn decoderRuntimeLoraLinearF32Device(
+    self: anytype,
+    input: MetalTensor,
+    base: MetalTensor,
+    lora_a: MetalTensor,
+    lora_b: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+) !?LoraLinearF32DeviceResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or !base.isDevice() or !lora_a.isDevice() or !lora_b.isDevice()) return null;
+    if (rows == 0 or in_dim == 0 or rank == 0 or out_dim == 0) return null;
+    if (input.elemCount() != rows * in_dim or base.elemCount() != rows * out_dim) return null;
+    if (lora_a.elemCount() != rank * in_dim or lora_b.elemCount() != out_dim * rank) return null;
+    const after_a_shape = [_]i32{ @intCast(rows), @intCast(rank) };
+    const after_b_shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+    var after_a = try MetalTensor.deviceAllocate(runtime, rows * rank * @sizeOf(f32), .private, &after_a_shape);
+    errdefer after_a.deinit();
+    var after_b = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &after_b_shape);
+    errdefer after_b.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &after_b_shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_lora_linear_f32_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        base.deviceHandle(),
+        base.deviceByteOffset(),
+        lora_a.deviceHandle(),
+        lora_a.deviceByteOffset(),
+        lora_b.deviceHandle(),
+        lora_b.deviceByteOffset(),
+        rows,
+        in_dim,
+        rank,
+        out_dim,
+        scale,
+        after_a.deviceHandle(),
+        after_a.deviceByteOffset(),
+        after_b.deviceHandle(),
+        after_b.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return .{
+        .after_a = after_a,
+        .after_b = after_b,
+        .output = output,
+    };
+}
+
 pub fn decoderRuntimeDotGeneralBatchedF32Device(
     self: anytype,
     lhs: MetalTensor,
@@ -4568,6 +4630,43 @@ pub fn decoderRuntimeTrainingSumSquaresF32(
         input.deviceHandle(),
         input.deviceByteOffset(),
         elem_count,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return error.MetalTrainingSumSquaresFailed;
+    return true;
+}
+
+pub fn decoderRuntimeTrainingSumSquaresManyF32(
+    self: anytype,
+    inputs: []const MetalTensor,
+    elem_counts: []const usize,
+    output: MetalTensor,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (inputs.len == 0 or inputs.len != elem_counts.len) return false;
+    if (!output.isDevice() or output.elemCount() < inputs.len) return false;
+
+    var handles_buf: [256]?*anyopaque = undefined;
+    var offsets_buf: [256]usize = undefined;
+    var counts_buf: [256]usize = undefined;
+    if (inputs.len > handles_buf.len) return false;
+
+    for (inputs, elem_counts, 0..) |input, elem_count, idx| {
+        if (!input.isDevice()) return false;
+        if (elem_count == 0 or elem_count > input.elemCount()) return false;
+        handles_buf[idx] = input.deviceHandle() orelse return false;
+        offsets_buf[idx] = input.deviceByteOffset();
+        counts_buf[idx] = elem_count;
+    }
+
+    const rc = termite_metal_decode_runtime_training_sumsq_many_f32(
+        runtime,
+        handles_buf[0..inputs.len].ptr,
+        offsets_buf[0..inputs.len].ptr,
+        counts_buf[0..inputs.len].ptr,
+        inputs.len,
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
@@ -7869,6 +7968,28 @@ pub extern fn termite_metal_decode_runtime_dot_general_2d_f32_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_lora_linear_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    base_handle: ?*anyopaque,
+    base_offset: usize,
+    lora_a_handle: ?*anyopaque,
+    lora_a_offset: usize,
+    lora_b_handle: ?*anyopaque,
+    lora_b_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+    after_a_handle: ?*anyopaque,
+    after_a_offset: usize,
+    after_b_handle: ?*anyopaque,
+    after_b_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_dot_general_batched_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     lhs_handle: ?*anyopaque,
@@ -8016,6 +8137,15 @@ pub extern fn termite_metal_decode_runtime_training_sumsq_f32(
     input_handle: ?*anyopaque,
     input_offset: usize,
     elem_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_training_sumsq_many_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handles: [*]const ?*anyopaque,
+    input_offsets: [*]const usize,
+    elem_counts: [*]const usize,
+    input_count: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
