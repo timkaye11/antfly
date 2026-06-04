@@ -70,6 +70,7 @@ const gliner2_bundle = inference.finetune.gliner2;
 const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
 const real_autodiff = inference.finetune.real_autodiff_trainer;
 const run_validation = inference.finetune.gliner2_run_validation;
+const deberta_arch = inference.architectures.deberta;
 const deberta_graph = inference.architectures.deberta_graph;
 
 const print = std.debug.print;
@@ -679,7 +680,23 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .intermediate_size = deberta_config.intermediate_size,
         .max_position_embeddings = deberta_config.max_position_embeddings,
         .position_buckets = deberta_config.position_buckets,
+        .layer_norm_eps = deberta_config.layer_norm_eps,
     };
+
+    if (selected_backend == .metal) {
+        const preplan_config = debertaArchConfigFromJson(deberta_config);
+        const preplanned = deberta_arch.preplanMetalDebertaEncoderFrame(
+            &cb,
+            allocator,
+            preplan_config,
+            opts.batch_size,
+            opts.seq_len,
+        ) catch |err| blk: {
+            print("warning: Metal DeBERTa encoder frame preplan failed: {s}; continuing with graph runtime fallback\n", .{@errorName(err)});
+            break :blk false;
+        };
+        print("  metal deberta encoder frame preplan: {s}\n", .{if (preplanned) "ready" else "not-ready"});
+    }
 
     var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
         .graph_config = graph_config,
@@ -1333,7 +1350,21 @@ const DebertaJsonConfig = struct {
     intermediate_size: u32 = 3072,
     max_position_embeddings: u32 = 512,
     position_buckets: u32 = 256,
+    layer_norm_eps: f32 = 1e-7,
 };
+
+fn debertaArchConfigFromJson(config: DebertaJsonConfig) deberta_arch.Config {
+    return .{
+        .vocab_size = config.vocab_size,
+        .hidden_size = config.hidden_size,
+        .num_hidden_layers = config.num_hidden_layers,
+        .num_attention_heads = config.num_attention_heads,
+        .intermediate_size = config.intermediate_size,
+        .max_position_embeddings = config.max_position_embeddings,
+        .position_buckets = config.position_buckets,
+        .layer_norm_eps = config.layer_norm_eps,
+    };
+}
 
 fn parseDebertaConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !DebertaJsonConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
@@ -1349,6 +1380,7 @@ fn parseDebertaConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Deb
     if (obj.get("intermediate_size")) |v| config.intermediate_size = jsonU32(v) orelse config.intermediate_size;
     if (obj.get("max_position_embeddings")) |v| config.max_position_embeddings = jsonU32(v) orelse config.max_position_embeddings;
     if (obj.get("position_buckets")) |v| config.position_buckets = jsonU32(v) orelse config.position_buckets;
+    if (obj.get("layer_norm_eps")) |v| config.layer_norm_eps = jsonF32(v) orelse config.layer_norm_eps;
 
     return config;
 }
@@ -1356,6 +1388,14 @@ fn parseDebertaConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Deb
 fn jsonU32(val: std.json.Value) ?u32 {
     return switch (val) {
         .integer => |i| @intCast(i),
+        else => null,
+    };
+}
+
+fn jsonF32(val: std.json.Value) ?f32 {
+    return switch (val) {
+        .float => |f| @floatCast(f),
+        .integer => |i| @floatFromInt(i),
         else => null,
     };
 }

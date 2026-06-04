@@ -88,7 +88,11 @@ const OpExecutionStats = struct {
 const RuntimeRegionKind = enum(u8) {
     none = 0,
     raw_linear_dot,
+    raw_linear_pair,
+    raw_linear_bias,
+    raw_linear_bias_pair,
     lora_linear,
+    lora_backward,
     q_linear,
     linear_qkv,
     grouped_linear_qkv_slice,
@@ -102,7 +106,11 @@ const RuntimeRegionKind = enum(u8) {
 const RuntimeRegion = union(RuntimeRegionKind) {
     none: void,
     raw_linear_dot: RawLinearDotPattern,
+    raw_linear_pair: RawLinearPairPattern,
+    raw_linear_bias: RawLinearBiasPattern,
+    raw_linear_bias_pair: RawLinearBiasPairPattern,
     lora_linear: LoraLinearPattern,
+    lora_backward: LoraBackwardPattern,
     q_linear: QLinearPattern,
     linear_qkv: LinearNoBiasQkvPattern,
     grouped_linear_qkv_slice: GroupedLinearQkvSlicePattern,
@@ -121,6 +129,11 @@ const PreparedQkvRegion = struct {
 
 const PreparedLinearRegion = struct {
     linear_slot: usize,
+};
+
+const PreparedLinearPairRegion = struct {
+    first_slot: usize,
+    second_slot: usize,
 };
 
 const PreparedRmsNormGroupedQkvRegion = struct {
@@ -155,7 +168,11 @@ const PreparedPleResidualRegion = struct {
 const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     none: void,
     raw_linear_dot: PreparedLinearRegion,
+    raw_linear_pair: PreparedLinearPairRegion,
+    raw_linear_bias: PreparedLinearRegion,
+    raw_linear_bias_pair: PreparedLinearPairRegion,
     lora_linear: void,
+    lora_backward: void,
     q_linear: PreparedLinearRegion,
     linear_qkv: PreparedQkvRegion,
     grouped_linear_qkv_slice: PreparedQkvRegion,
@@ -1287,6 +1304,16 @@ fn runtimeRegionPlanDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RUNTIME_REGION_PLAN", false);
 }
 
+fn loraBackwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LORA_BACKWARD_RUNTIME_REGION", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_LORA_BACKWARD_RUNTIME_REGION", true);
+}
+
+fn rawLinearBiasPairRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RAW_LINEAR_BIAS_PAIR_RUNTIME_REGION", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RAW_LINEAR_BIAS_PAIR_RUNTIME_REGION", true);
+}
+
 fn gatedFfnGraphFusionDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION", false);
 }
@@ -1333,6 +1360,26 @@ fn buildRuntimeRegionPlan(
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
 
+        if (rawLinearBiasPairRuntimeRegionEnabled()) {
+            if (matchRawLinearBiasPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
+                regions[node_pos] = .{ .raw_linear_bias_pair = pattern };
+                markRawLinearBiasPairSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (matchRawLinearBiasPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
+            regions[node_pos] = .{ .raw_linear_bias = pattern };
+            markRawLinearBiasSkipped(skipped, pattern);
+            region_count += 1;
+            continue;
+        }
+        if (matchRawLinearPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
+            regions[node_pos] = .{ .raw_linear_pair = pattern };
+            markRawLinearPairSkipped(skipped, pattern);
+            region_count += 1;
+            continue;
+        }
         if (matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use)) |pattern| {
             regions[node_pos] = .{ .raw_linear_dot = pattern };
             region_count += 1;
@@ -1343,6 +1390,14 @@ fn buildRuntimeRegionPlan(
             markLoraLinearSkipped(skipped, pattern);
             region_count += 1;
             continue;
+        }
+        if (loraBackwardRuntimeRegionEnabled()) {
+            if (matchLoraBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .lora_backward = pattern };
+                markLoraBackwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
         }
 
         if (matchRmsNormGroupedLinearQkvSlicePattern(graph, null_values, node_ids, node_pos, reachable, skipped)) |pattern| {
@@ -1587,7 +1642,7 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none, .raw_linear_dot, .lora_linear => continue,
+            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .lora_backward => continue,
             .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice => {
                 if (phase != .qkv) {
                     traceRuntimeFrameMetadataDeclined("qkv_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
@@ -1702,7 +1757,7 @@ fn analyzeRuntimeFrameEligibility(plan: RuntimeRegionPlan) RuntimeFrameEligibili
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none, .raw_linear_dot, .lora_linear => continue,
+            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .lora_backward => continue,
             .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice => {
                 if (phase != .qkv) return .{ .layers = layers, .reason = .non_layer_order };
                 layer_shape = runtimeFrameLayerShapeFromQkv(region) orelse return .{ .layers = layers, .reason = .non_layer_order };
@@ -2136,7 +2191,11 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
     return switch (prepared) {
         .none => 0,
         .raw_linear_dot => 1,
+        .raw_linear_pair => 2,
+        .raw_linear_bias => 1,
+        .raw_linear_bias_pair => 2,
         .lora_linear => 0,
+        .lora_backward => 0,
         .q_linear => 1,
         .linear_qkv, .grouped_linear_qkv_slice => 3,
         .rms_norm_grouped_linear_qkv_slice => 4,
@@ -2162,6 +2221,26 @@ fn ensurePreparedLinearSlot(
     return try cb.decoderRuntimeEnsureLinearSlot(&.{
         .weight = weight,
         .bias = null,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    });
+}
+
+fn ensurePreparedLinearSlotWithOptionalBias(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    weight_id: NodeId,
+    bias_id: ?NodeId,
+    in_dim: usize,
+    out_dim: usize,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?usize {
+    const weight = valueFor(values, weight_id) orelse return null;
+    const bias = if (bias_id) |id| valueFor(values, id) orelse return null else null;
+    if (stats) |s| s.runtime_prepare_slot_calls += 1;
+    return try cb.decoderRuntimeEnsureLinearSlot(&.{
+        .weight = weight,
+        .bias = bias,
         .in_dim = in_dim,
         .out_dim = out_dim,
     });
@@ -2455,7 +2534,17 @@ fn prepareRuntimeRegion(
         .raw_linear_dot => |pattern| .{
             .raw_linear_dot = (try prepareRawLinearDotRegion(cb, values, pattern, stats)) orelse return null,
         },
+        .raw_linear_pair => |pattern| .{
+            .raw_linear_pair = (try prepareRawLinearPairRegion(cb, values, pattern, stats)) orelse return null,
+        },
+        .raw_linear_bias => |pattern| .{
+            .raw_linear_bias = (try prepareRawLinearBiasRegion(cb, values, pattern, stats)) orelse return null,
+        },
+        .raw_linear_bias_pair => |pattern| .{
+            .raw_linear_bias_pair = (try prepareRawLinearBiasPairRegion(cb, values, pattern, stats)) orelse return null,
+        },
         .lora_linear => .{ .lora_linear = {} },
+        .lora_backward => .{ .lora_backward = {} },
         .q_linear => |pattern| .{
             .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
         },
@@ -2528,6 +2617,48 @@ fn tryExecutePlannedRuntimeRegion(
                 else => return false,
             },
         ),
+        .raw_linear_pair => |pattern| executeRawLinearPairPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .raw_linear_pair => |slots| slots,
+                else => return false,
+            },
+            skipped_nodes,
+        ),
+        .raw_linear_bias => |pattern| executeRawLinearBiasPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .raw_linear_bias => |slots| slots,
+                else => return false,
+            },
+            skipped_nodes,
+        ),
+        .raw_linear_bias_pair => |pattern| executeRawLinearBiasPairPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .raw_linear_bias_pair => |slots| slots,
+                else => return false,
+            },
+            skipped_nodes,
+        ),
         .lora_linear => |pattern| executeLoraLinearPattern(
             graph,
             cb,
@@ -2536,6 +2667,16 @@ fn tryExecutePlannedRuntimeRegion(
             device_id,
             exec_ctx.stats,
             pattern,
+        ),
+        .lora_backward => |pattern| executeLoraBackwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
         ),
         .q_linear => |pattern| executeQLinearPattern(
             graph,
@@ -3949,6 +4090,22 @@ const RawLinearDotPattern = struct {
     out_dim: usize,
 };
 
+const RawLinearBiasPattern = struct {
+    dot: RawLinearDotPattern,
+    add_id: NodeId,
+    bias_id: NodeId,
+};
+
+const RawLinearPairPattern = struct {
+    first: RawLinearDotPattern,
+    second: RawLinearDotPattern,
+};
+
+const RawLinearBiasPairPattern = struct {
+    first: RawLinearBiasPattern,
+    second: RawLinearBiasPattern,
+};
+
 const LoraLinearPattern = struct {
     add_id: NodeId,
     base_linear_id: NodeId,
@@ -3963,6 +4120,25 @@ const LoraLinearPattern = struct {
     scaled_id: NodeId,
     scale_id: NodeId,
     populate_scaled: bool = false,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    rank: usize,
+};
+
+const LoraBackwardPattern = struct {
+    d_after_a_id: NodeId,
+    grad_a_dot_id: NodeId,
+    grad_a_id: NodeId,
+    grad_b_dot_id: NodeId,
+    grad_b_id: NodeId,
+    input_transpose_id: NodeId,
+    after_a_transpose_id: NodeId,
+    b_transpose_id: NodeId,
+    input_id: NodeId,
+    after_a_id: NodeId,
+    lora_b_id: NodeId,
+    output_grad_id: NodeId,
     rows: usize,
     in_dim: usize,
     out_dim: usize,
@@ -4103,6 +4279,264 @@ fn executeLoraLinearPattern(
         );
     }
     return true;
+}
+
+fn executeLoraBackwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: LoraBackwardPattern,
+    skipped_nodes: []bool,
+) !bool {
+    const input = valueFor(values, pattern.input_id) orelse return false;
+    const after_a = valueFor(values, pattern.after_a_id) orelse return false;
+    const lora_b = valueFor(values, pattern.lora_b_id) orelse return false;
+    const output_grad = valueFor(values, pattern.output_grad_id) orelse return false;
+    const fused = (try cb.loraLinearBackward(&.{
+        .input = input,
+        .after_a = after_a,
+        .lora_b = lora_b,
+        .output_grad = output_grad,
+        .rows = pattern.rows,
+        .in_dim = pattern.in_dim,
+        .rank = pattern.rank,
+        .out_dim = pattern.out_dim,
+        .scale = 1.0,
+    })) orelse return false;
+
+    values[@intCast(pattern.d_after_a_id)] = fused.grad_after_a;
+    value_device[@intCast(pattern.d_after_a_id)] = device_id;
+    values[@intCast(pattern.grad_a_id)] = fused.grad_a;
+    value_device[@intCast(pattern.grad_a_id)] = device_id;
+    values[@intCast(pattern.grad_b_id)] = fused.grad_b;
+    value_device[@intCast(pattern.grad_b_id)] = device_id;
+    markLoraBackwardSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 5);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 4;
+        recordGemmaRuntimeResidency(s, graph, pattern.grad_a_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_a));
+        recordGemmaRuntimeResidency(s, graph, pattern.grad_b_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_b));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: lora_backward_region executed d_after_a={d} grad_a={d} grad_b={d} input={d} after_a={d} lora_b={d} rows={d} in={d} rank={d} out={d}\n",
+            .{ pattern.d_after_a_id, pattern.grad_a_id, pattern.grad_b_id, pattern.input_id, pattern.after_a_id, pattern.lora_b_id, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+        );
+    }
+    return true;
+}
+
+fn matchLoraBackwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LoraBackwardPattern {
+    const d_after_a_id = node_ids[node_pos];
+    const d_after_a = graph.node(d_after_a_id);
+    const d_after_attrs = switch (d_after_a.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(d_after_attrs) or d_after_a.num_inputs < 2) return null;
+    const output_grad_id = d_after_a.inputs[0];
+    const b_transpose_id = d_after_a.inputs[1];
+    if (output_grad_id == null_node or b_transpose_id == null_node) return null;
+    const lora_b_id = loraBParameterFromBackwardTranspose(graph, b_transpose_id) orelse return null;
+
+    const output_grad_shape = graph.node(output_grad_id).output_shape;
+    const d_after_shape = d_after_a.output_shape;
+    const lora_b_shape = graph.node(lora_b_id).output_shape;
+    if (output_grad_shape.rank() != 2 or d_after_shape.rank() != 2 or lora_b_shape.rank() != 2) return null;
+    const rows = shapeDimUsize(output_grad_shape, 0) orelse return null;
+    const out_dim = shapeDimUsize(output_grad_shape, 1) orelse return null;
+    const rank = shapeDimUsize(d_after_shape, 1) orelse return null;
+    if (shapeDimUsize(d_after_shape, 0) != rows) return null;
+    if (shapeDimUsize(lora_b_shape, 0) != out_dim or shapeDimUsize(lora_b_shape, 1) != rank) return null;
+
+    const grad_b_match = findLoraBackwardGradB(graph, reachable, skipped_nodes, d_after_a_id, output_grad_id, rows, out_dim, rank) orelse return null;
+    const grad_a_match = findLoraBackwardGradA(graph, reachable, skipped_nodes, d_after_a_id, rows, rank) orelse return null;
+    const input_shape = graph.node(grad_a_match.input_id).output_shape;
+    const after_a_shape = graph.node(grad_b_match.after_a_id).output_shape;
+    if (input_shape.rank() != 2 or after_a_shape.rank() != 2) return null;
+    const in_dim = shapeDimUsize(input_shape, 1) orelse return null;
+    if (shapeDimUsize(input_shape, 0) != rows) return null;
+    if (shapeDimUsize(after_a_shape, 0) != rows or shapeDimUsize(after_a_shape, 1) != rank) return null;
+    if (shapeDimUsize(graph.node(grad_a_match.grad_a_id).output_shape, 0) != rank) return null;
+    if (shapeDimUsize(graph.node(grad_a_match.grad_a_id).output_shape, 1) != in_dim) return null;
+
+    return .{
+        .d_after_a_id = d_after_a_id,
+        .grad_a_dot_id = grad_a_match.dot_id,
+        .grad_a_id = grad_a_match.grad_a_id,
+        .grad_b_dot_id = grad_b_match.dot_id,
+        .grad_b_id = grad_b_match.grad_b_id,
+        .input_transpose_id = grad_a_match.input_transpose_id,
+        .after_a_transpose_id = grad_b_match.after_a_transpose_id,
+        .b_transpose_id = b_transpose_id,
+        .input_id = grad_a_match.input_id,
+        .after_a_id = grad_b_match.after_a_id,
+        .lora_b_id = lora_b_id,
+        .output_grad_id = output_grad_id,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+}
+
+const LoraBackwardGradBMatch = struct {
+    dot_id: NodeId,
+    grad_b_id: NodeId,
+    after_a_transpose_id: NodeId,
+    after_a_id: NodeId,
+};
+
+const LoraBackwardGradAMatch = struct {
+    dot_id: NodeId,
+    grad_a_id: NodeId,
+    input_transpose_id: NodeId,
+    input_id: NodeId,
+};
+
+fn findLoraBackwardGradB(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    d_after_a_id: NodeId,
+    output_grad_id: NodeId,
+    rows: usize,
+    out_dim: usize,
+    rank: usize,
+) ?LoraBackwardGradBMatch {
+    _ = d_after_a_id;
+    var dot_id: NodeId = 0;
+    while (dot_id < graph.nodeCount()) : (dot_id += 1) {
+        const dot_index: usize = @intCast(dot_id);
+        if (dot_index >= reachable.len or !reachable[dot_index]) continue;
+        if (dot_index < skipped_nodes.len and skipped_nodes[dot_index]) continue;
+        const dot = graph.node(dot_id);
+        const attrs = switch (dot.op) {
+            .dot_general => |a| a,
+            else => continue,
+        };
+        if (!isLinearDotAttrs(attrs) or dot.num_inputs < 2 or dot.inputs[1] != output_grad_id) continue;
+        if (shapeDimUsize(dot.output_shape, 0) != rank or shapeDimUsize(dot.output_shape, 1) != out_dim) continue;
+        const after_a_id = sourceFromSimpleTranspose(graph, dot.inputs[0]) orelse continue;
+        const after_a_shape = graph.node(after_a_id).output_shape;
+        if (shapeDimUsize(after_a_shape, 0) != rows or shapeDimUsize(after_a_shape, 1) != rank) continue;
+        const grad_b_id = findSimpleTransposeConsumer(graph, reachable, skipped_nodes, dot_id, out_dim, rank) orelse continue;
+        return .{
+            .dot_id = dot_id,
+            .grad_b_id = grad_b_id,
+            .after_a_transpose_id = dot.inputs[0],
+            .after_a_id = after_a_id,
+        };
+    }
+    return null;
+}
+
+fn findLoraBackwardGradA(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    d_after_a_id: NodeId,
+    rows: usize,
+    rank: usize,
+) ?LoraBackwardGradAMatch {
+    var dot_id: NodeId = 0;
+    while (dot_id < graph.nodeCount()) : (dot_id += 1) {
+        const dot_index: usize = @intCast(dot_id);
+        if (dot_index >= reachable.len or !reachable[dot_index]) continue;
+        if (dot_index < skipped_nodes.len and skipped_nodes[dot_index]) continue;
+        const dot = graph.node(dot_id);
+        const attrs = switch (dot.op) {
+            .dot_general => |a| a,
+            else => continue,
+        };
+        if (!isLinearDotAttrs(attrs) or dot.num_inputs < 2 or dot.inputs[1] != d_after_a_id) continue;
+        if (shapeDimUsize(dot.output_shape, 1) != rank) continue;
+        const input_id = sourceFromSimpleTranspose(graph, dot.inputs[0]) orelse continue;
+        const input_shape = graph.node(input_id).output_shape;
+        const in_dim = shapeDimUsize(input_shape, 1) orelse continue;
+        if (shapeDimUsize(input_shape, 0) != rows) continue;
+        if (shapeDimUsize(dot.output_shape, 0) != in_dim) continue;
+        const grad_a_id = findSimpleTransposeConsumer(graph, reachable, skipped_nodes, dot_id, rank, in_dim) orelse continue;
+        return .{
+            .dot_id = dot_id,
+            .grad_a_id = grad_a_id,
+            .input_transpose_id = dot.inputs[0],
+            .input_id = input_id,
+        };
+    }
+    return null;
+}
+
+fn findSimpleTransposeConsumer(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    input_id: NodeId,
+    rows: usize,
+    cols: usize,
+) ?NodeId {
+    var consumer_id: NodeId = 0;
+    while (consumer_id < graph.nodeCount()) : (consumer_id += 1) {
+        const consumer_index: usize = @intCast(consumer_id);
+        if (consumer_index >= reachable.len or !reachable[consumer_index]) continue;
+        if (consumer_index < skipped_nodes.len and skipped_nodes[consumer_index]) continue;
+        const consumer = graph.node(consumer_id);
+        const attrs = switch (consumer.op) {
+            .transpose => |a| a,
+            else => continue,
+        };
+        if (consumer.num_inputs == 0 or consumer.inputs[0] != input_id) continue;
+        if (!transposeIsSimple2D(attrs, graph.node(input_id).output_shape)) continue;
+        if (shapeDimUsize(consumer.output_shape, 0) != rows or shapeDimUsize(consumer.output_shape, 1) != cols) continue;
+        return consumer_id;
+    }
+    return null;
+}
+
+fn sourceFromSimpleTranspose(graph: *const Graph, node_id: NodeId) ?NodeId {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .transpose => |a| a,
+        else => return null,
+    };
+    if (node.num_inputs == 0 or node.inputs[0] == null_node) return null;
+    if (!transposeIsSimple2D(attrs, graph.node(node.inputs[0]).output_shape)) return null;
+    return node.inputs[0];
+}
+
+fn loraBParameterFromBackwardTranspose(graph: *const Graph, node_id: NodeId) ?NodeId {
+    const source_id = sourceFromSimpleTranspose(graph, node_id) orelse return null;
+    if (isLoraParameter(graph, source_id, ".lora_B")) return source_id;
+    const param_id = sourceFromSimpleTranspose(graph, source_id) orelse return null;
+    if (isLoraParameter(graph, param_id, ".lora_B")) return param_id;
+    return null;
+}
+
+fn markLoraBackwardSkipped(skipped: []bool, pattern: LoraBackwardPattern) void {
+    const ids = [_]NodeId{
+        pattern.grad_a_dot_id,
+        pattern.grad_a_id,
+        pattern.grad_b_dot_id,
+        pattern.grad_b_id,
+        pattern.input_transpose_id,
+        pattern.after_a_transpose_id,
+    };
+    for (ids) |node_id| {
+        const index: usize = @intCast(node_id);
+        if (index < skipped.len) skipped[index] = true;
+    }
 }
 
 fn matchLoraLinearPattern(
@@ -4385,6 +4819,163 @@ fn executeRawLinearDotPattern(
     return true;
 }
 
+fn executeRawLinearPairPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: RawLinearPairPattern,
+    prepared: PreparedLinearPairRegion,
+    skipped_nodes: []bool,
+) !bool {
+    const input = valueFor(values, pattern.first.input_id) orelse return false;
+    const pair = (try cb.decoderRuntimeApplyLinearPair(&.{
+        .slot_a = prepared.first_slot,
+        .slot_b = prepared.second_slot,
+        .input = input,
+        .in_dim = pattern.first.in_dim,
+        .out_dim = pattern.first.out_dim,
+    })) orelse return false;
+
+    values[@intCast(pattern.first.id)] = pair.first;
+    value_device[@intCast(pattern.first.id)] = device_id;
+    values[@intCast(pattern.second.id)] = pair.second;
+    value_device[@intCast(pattern.second.id)] = device_id;
+    const second_index: usize = @intCast(pattern.second.id);
+    if (second_index < skipped_nodes.len) skipped_nodes[second_index] = true;
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .qkv, 2);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 1;
+        recordGemmaRuntimeResidency(s, graph, pattern.first.id, isMetalResidentOrQuantizedDescriptor(cb, pair.first));
+        recordGemmaRuntimeResidency(s, graph, pattern.second.id, isMetalResidentOrQuantizedDescriptor(cb, pair.second));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        const first_weight_name = graph.parameterName(graph.node(pattern.first.weight_id));
+        const second_weight_name = graph.parameterName(graph.node(pattern.second.weight_id));
+        std.debug.print(
+            "metal_graph_fusion_trace: raw_linear_pair executed first={d} second={d} first_weight={s} second_weight={s} rows={d} in={d} out={d}\n",
+            .{ pattern.first.id, pattern.second.id, first_weight_name, second_weight_name, pattern.first.rows, pattern.first.in_dim, pattern.first.out_dim },
+        );
+    }
+    return true;
+}
+
+fn executeRawLinearBiasPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: RawLinearBiasPattern,
+    prepared: PreparedLinearRegion,
+    skipped_nodes: []bool,
+) !bool {
+    const input = valueFor(values, pattern.dot.input_id) orelse return false;
+    const output = (try cb.decoderRuntimeApplyLinear(&.{
+        .slot = prepared.linear_slot,
+        .input = input,
+        .in_dim = pattern.dot.in_dim,
+        .out_dim = pattern.dot.out_dim,
+    })) orelse return false;
+
+    var dot_shape = [_]i32{
+        @intCast(pattern.dot.rows),
+        @intCast(pattern.dot.out_dim),
+    };
+    const dot_output = (try cb.cloneTensorShape(output, &dot_shape)) orelse return false;
+    values[@intCast(pattern.dot.id)] = dot_output;
+    value_device[@intCast(pattern.dot.id)] = device_id;
+    values[@intCast(pattern.add_id)] = output;
+    value_device[@intCast(pattern.add_id)] = device_id;
+    const add_index: usize = @intCast(pattern.add_id);
+    if (add_index < skipped_nodes.len) skipped_nodes[add_index] = true;
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .qkv, 1);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 2;
+        recordGemmaRuntimeResidency(s, graph, pattern.add_id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        const weight_name = graph.parameterName(graph.node(pattern.dot.weight_id));
+        const bias_name = graph.parameterName(graph.node(pattern.bias_id));
+        std.debug.print(
+            "metal_graph_fusion_trace: raw_linear_bias executed dot={d} add={d} transpose={d} weight={s} bias={s} rows={d} in={d} out={d}\n",
+            .{ pattern.dot.id, pattern.add_id, pattern.dot.transpose_id, weight_name, bias_name, pattern.dot.rows, pattern.dot.in_dim, pattern.dot.out_dim },
+        );
+    }
+    return true;
+}
+
+fn executeRawLinearBiasPairPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: RawLinearBiasPairPattern,
+    prepared: PreparedLinearPairRegion,
+    skipped_nodes: []bool,
+) !bool {
+    const input = valueFor(values, pattern.first.dot.input_id) orelse return false;
+    const pair = (try cb.decoderRuntimeApplyLinearPair(&.{
+        .slot_a = prepared.first_slot,
+        .slot_b = prepared.second_slot,
+        .input = input,
+        .in_dim = pattern.first.dot.in_dim,
+        .out_dim = pattern.first.dot.out_dim,
+    })) orelse return false;
+
+    var first_dot_shape = [_]i32{
+        @intCast(pattern.first.dot.rows),
+        @intCast(pattern.first.dot.out_dim),
+    };
+    const first_dot_output = (try cb.cloneTensorShape(pair.first, &first_dot_shape)) orelse return false;
+    values[@intCast(pattern.first.dot.id)] = first_dot_output;
+    value_device[@intCast(pattern.first.dot.id)] = device_id;
+    values[@intCast(pattern.first.add_id)] = pair.first;
+    value_device[@intCast(pattern.first.add_id)] = device_id;
+    values[@intCast(pattern.second.add_id)] = pair.second;
+    value_device[@intCast(pattern.second.add_id)] = device_id;
+    markRawLinearBiasPairSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .qkv, 4);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 3;
+        recordGemmaRuntimeResidency(s, graph, pattern.first.add_id, isMetalResidentOrQuantizedDescriptor(cb, pair.first));
+        recordGemmaRuntimeResidency(s, graph, pattern.second.add_id, isMetalResidentOrQuantizedDescriptor(cb, pair.second));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        const first_weight_name = graph.parameterName(graph.node(pattern.first.dot.weight_id));
+        const second_weight_name = graph.parameterName(graph.node(pattern.second.dot.weight_id));
+        const first_bias_name = graph.parameterName(graph.node(pattern.first.bias_id));
+        const second_bias_name = graph.parameterName(graph.node(pattern.second.bias_id));
+        std.debug.print(
+            "metal_graph_fusion_trace: raw_linear_bias_pair executed first_dot={d} first_add={d} second_dot={d} second_add={d} first_weight={s} second_weight={s} first_bias={s} second_bias={s} rows={d} in={d} out={d}\n",
+            .{
+                pattern.first.dot.id,
+                pattern.first.add_id,
+                pattern.second.dot.id,
+                pattern.second.add_id,
+                first_weight_name,
+                second_weight_name,
+                first_bias_name,
+                second_bias_name,
+                pattern.first.dot.rows,
+                pattern.first.dot.in_dim,
+                pattern.first.dot.out_dim,
+            },
+        );
+    }
+    return true;
+}
+
 fn matchRawLinearDotPattern(
     graph: *const Graph,
     node_ids: []const NodeId,
@@ -4433,6 +5024,122 @@ fn matchRawLinearDotPattern(
     };
 }
 
+fn matchRawLinearBiasPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    last_use: []const u32,
+    skipped_nodes: []const bool,
+) ?RawLinearBiasPattern {
+    const dot = matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use) orelse return null;
+    if (reachableUseCount(graph, dot.id, reachable, 2) != 1) return null;
+
+    var consumer_id: NodeId = 0;
+    while (consumer_id < graph.nodeCount()) : (consumer_id += 1) {
+        const consumer_index: usize = @intCast(consumer_id);
+        if (consumer_index >= reachable.len or !reachable[consumer_index]) continue;
+        if (consumer_index < skipped_nodes.len and skipped_nodes[consumer_index]) continue;
+        const consumer = graph.node(consumer_id);
+        switch (consumer.op) {
+            .add, .fused_elem_add => {},
+            else => continue,
+        }
+        if (consumer.num_inputs < 2) continue;
+        if (consumer.inputs[0] != dot.id and consumer.inputs[1] != dot.id) continue;
+        const bias_id = if (consumer.inputs[0] == dot.id) consumer.inputs[1] else consumer.inputs[0];
+        if (bias_id == null_node) return null;
+        const bias_node = graph.node(bias_id);
+        if (std.meta.activeTag(bias_node.op) != .parameter) return null;
+        const bias_name = graph.parameterName(bias_node);
+        if (isLoRAAdapterParameterName(bias_name)) return null;
+        const bias_shape = bias_node.output_shape;
+        if (bias_shape.rank() != 1) return null;
+        if (shapeDimUsize(bias_shape, 0) != dot.out_dim) return null;
+        if (consumer.output_shape.rank() != 2) return null;
+        if (shapeDimUsize(consumer.output_shape, 0) != dot.rows) return null;
+        if (shapeDimUsize(consumer.output_shape, 1) != dot.out_dim) return null;
+        return .{
+            .dot = dot,
+            .add_id = consumer_id,
+            .bias_id = bias_id,
+        };
+    }
+    return null;
+}
+
+fn matchRawLinearPairPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    last_use: []const u32,
+    skipped_nodes: []const bool,
+) ?RawLinearPairPattern {
+    const first = matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use) orelse return null;
+    var candidate_pos = node_pos + 1;
+    while (candidate_pos < node_ids.len) : (candidate_pos += 1) {
+        const candidate_id = node_ids[candidate_pos];
+        const candidate_index: usize = @intCast(candidate_id);
+        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
+        if (candidate_index < skipped_nodes.len and skipped_nodes[candidate_index]) continue;
+        const second = matchRawLinearDotPattern(graph, node_ids, candidate_pos, reachable, last_use) orelse return null;
+        if (second.input_id != first.input_id) return null;
+        if (second.rows != first.rows or second.in_dim != first.in_dim or second.out_dim != first.out_dim) return null;
+        if (second.weight_id == first.weight_id) return null;
+        return .{
+            .first = first,
+            .second = second,
+        };
+    }
+    return null;
+}
+
+fn matchRawLinearBiasPairPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    last_use: []const u32,
+    skipped_nodes: []const bool,
+) ?RawLinearBiasPairPattern {
+    const first = matchRawLinearBiasPattern(graph, node_ids, node_pos, reachable, last_use, skipped_nodes) orelse return null;
+    var candidate_pos = node_pos + 1;
+    while (candidate_pos < node_ids.len) : (candidate_pos += 1) {
+        const candidate_id = node_ids[candidate_pos];
+        const candidate_index: usize = @intCast(candidate_id);
+        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
+        if (candidate_index < skipped_nodes.len and skipped_nodes[candidate_index]) continue;
+        const second = matchRawLinearBiasPattern(graph, node_ids, candidate_pos, reachable, last_use, skipped_nodes) orelse return null;
+        if (second.dot.input_id != first.dot.input_id) return null;
+        if (second.dot.rows != first.dot.rows or second.dot.in_dim != first.dot.in_dim or second.dot.out_dim != first.dot.out_dim) return null;
+        if (second.dot.weight_id == first.dot.weight_id) return null;
+        if (second.bias_id == first.bias_id) return null;
+        return .{
+            .first = first,
+            .second = second,
+        };
+    }
+    return null;
+}
+
+fn markRawLinearBiasSkipped(skipped_nodes: []bool, pattern: RawLinearBiasPattern) void {
+    const add_index: usize = @intCast(pattern.add_id);
+    if (add_index < skipped_nodes.len) skipped_nodes[add_index] = true;
+}
+
+fn markRawLinearBiasPairSkipped(skipped_nodes: []bool, pattern: RawLinearBiasPairPattern) void {
+    markRawLinearBiasSkipped(skipped_nodes, pattern.first);
+    markRawLinearBiasSkipped(skipped_nodes, pattern.second);
+    const second_dot_index: usize = @intCast(pattern.second.dot.id);
+    if (second_dot_index < skipped_nodes.len) skipped_nodes[second_dot_index] = true;
+}
+
+fn markRawLinearPairSkipped(skipped_nodes: []bool, pattern: RawLinearPairPattern) void {
+    const second_index: usize = @intCast(pattern.second.id);
+    if (second_index < skipped_nodes.len) skipped_nodes[second_index] = true;
+}
+
 fn isLoRAAdapterParameterName(name: []const u8) bool {
     return std.mem.indexOf(u8, name, ".lora_A") != null or
         std.mem.indexOf(u8, name, ".lora_B") != null or
@@ -4454,6 +5161,82 @@ fn prepareRawLinearDotRegion(
         stats,
     )) orelse return null;
     return .{ .linear_slot = linear_slot };
+}
+
+fn prepareRawLinearPairRegion(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    pattern: RawLinearPairPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedLinearPairRegion {
+    const first_slot = (try ensurePreparedLinearSlot(
+        cb,
+        values,
+        pattern.first.weight_id,
+        pattern.first.in_dim,
+        pattern.first.out_dim,
+        stats,
+    )) orelse return null;
+    const second_slot = (try ensurePreparedLinearSlot(
+        cb,
+        values,
+        pattern.second.weight_id,
+        pattern.second.in_dim,
+        pattern.second.out_dim,
+        stats,
+    )) orelse return null;
+    return .{
+        .first_slot = first_slot,
+        .second_slot = second_slot,
+    };
+}
+
+fn prepareRawLinearBiasRegion(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    pattern: RawLinearBiasPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedLinearRegion {
+    const linear_slot = (try ensurePreparedLinearSlotWithOptionalBias(
+        cb,
+        values,
+        pattern.dot.weight_id,
+        pattern.bias_id,
+        pattern.dot.in_dim,
+        pattern.dot.out_dim,
+        stats,
+    )) orelse return null;
+    return .{ .linear_slot = linear_slot };
+}
+
+fn prepareRawLinearBiasPairRegion(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    pattern: RawLinearBiasPairPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedLinearPairRegion {
+    const first_slot = (try ensurePreparedLinearSlotWithOptionalBias(
+        cb,
+        values,
+        pattern.first.dot.weight_id,
+        pattern.first.bias_id,
+        pattern.first.dot.in_dim,
+        pattern.first.dot.out_dim,
+        stats,
+    )) orelse return null;
+    const second_slot = (try ensurePreparedLinearSlotWithOptionalBias(
+        cb,
+        values,
+        pattern.second.dot.weight_id,
+        pattern.second.bias_id,
+        pattern.second.dot.in_dim,
+        pattern.second.dot.out_dim,
+        stats,
+    )) orelse return null;
+    return .{
+        .first_slot = first_slot,
+        .second_slot = second_slot,
+    };
 }
 
 const QLinearPattern = struct {
@@ -5804,7 +6587,6 @@ fn tryExecuteMetalCommand(
         .erf => try executeRuntimeUnary(cb, values, inputs, .erf),
         .abs => try executeRuntimeUnary(cb, values, inputs, .abs),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
-        .gather => |attrs| try executeRuntimeGather(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
         .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, inputs, attrs),
         .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape),
@@ -5853,30 +6635,6 @@ fn tryExecuteMetalCommand(
         .fused_rms_norm => |attrs| try executeRuntimeRmsNorm(cb, values, inputs, attrs.dim, attrs.eps, n.output_shape),
         else => null,
     };
-}
-
-fn executeRuntimeGather(
-    graph: *const Graph,
-    cb: *const ComputeBackend,
-    values: []?CT,
-    inputs: []const NodeId,
-    attrs: anytype,
-) !?CT {
-    if (inputs.len < 2) return null;
-    var shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
-    const input_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &shape_buf);
-    const input = valueFor(values, inputs[0]) orelse return null;
-    const indices = valueFor(values, inputs[1]) orelse return null;
-    const gathered = cb.primGather(input, indices, attrs.axis, input_shape) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch => return null,
-        else => return err,
-    };
-    if (isMetalDeviceResident(cb, gathered)) return gathered;
-    if (try makeMetalDeviceResident(cb, gathered)) |device_ct| {
-        if (device_ct != gathered) cb.free(gathered);
-        return device_ct;
-    }
-    return gathered;
 }
 
 fn executeRuntimeZeroTensor(
@@ -8405,6 +9163,63 @@ test "metal partition executor recognizes raw transposed linear dot graph region
         },
         else => return error.ExpectedRawLinearDotRegion,
     }
+}
+
+test "metal partition executor recognizes raw transposed linear dot plus bias graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const bias = try b.parameter("encoder.layer.0.attention.self.query_proj.bias", ml.graph.Shape.init(.f32, &.{out_dim}));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const dot = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const biased = try b.add(dot, bias);
+    try g.markOutput(biased);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+
+    var plan = try buildRuntimeRegionPlan(allocator, &g, node_ids, @intCast(g.nodeCount()), reachable, last_use);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.region_count);
+    switch (plan.regionAt(@intCast(dot), dot, node_ids)) {
+        .raw_linear_bias => |pattern| {
+            try std.testing.expectEqual(dot, pattern.dot.id);
+            try std.testing.expectEqual(biased, pattern.add_id);
+            try std.testing.expectEqual(bias, pattern.bias_id);
+            try std.testing.expectEqual(x, pattern.dot.input_id);
+            try std.testing.expectEqual(weight_t, pattern.dot.transpose_id);
+            try std.testing.expectEqual(weight, pattern.dot.weight_id);
+            try std.testing.expectEqual(@as(usize, rows), pattern.dot.rows);
+            try std.testing.expectEqual(@as(usize, in_dim), pattern.dot.in_dim);
+            try std.testing.expectEqual(@as(usize, out_dim), pattern.dot.out_dim);
+        },
+        else => return error.ExpectedRawLinearBiasRegion,
+    }
+    try std.testing.expectEqual(RuntimeRegion{ .none = {} }, plan.regionAt(@intCast(biased), biased, node_ids));
 }
 
 test "metal partition executor defers scalar scale mul only for single add consumer" {

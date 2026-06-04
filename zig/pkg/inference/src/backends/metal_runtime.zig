@@ -3891,6 +3891,12 @@ pub const LoraLinearF32DeviceResult = struct {
     output: MetalTensor,
 };
 
+pub const LoraLinearBackwardF32DeviceResult = struct {
+    grad_after_a: MetalTensor,
+    grad_a: MetalTensor,
+    grad_b: MetalTensor,
+};
+
 pub fn decoderRuntimeLoraLinearF32Device(
     self: anytype,
     input: MetalTensor,
@@ -3944,6 +3950,86 @@ pub fn decoderRuntimeLoraLinearF32Device(
         .after_a = after_a,
         .after_b = after_b,
         .output = output,
+    };
+}
+
+pub fn decoderRuntimeLoraLinearBackwardF32Device(
+    self: anytype,
+    input: MetalTensor,
+    after_a: MetalTensor,
+    lora_b: MetalTensor,
+    output_grad: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+) !?LoraLinearBackwardF32DeviceResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or !after_a.isDevice() or !lora_b.isDevice() or !output_grad.isDevice()) return null;
+    if (rows == 0 or in_dim == 0 or rank == 0 or out_dim == 0) return null;
+    if (input.elemCount() != rows * in_dim or after_a.elemCount() != rows * rank) return null;
+    if (lora_b.elemCount() != out_dim * rank or output_grad.elemCount() != rows * out_dim) return null;
+    const grad_a_shape = [_]i32{ @intCast(rank), @intCast(in_dim) };
+    const grad_b_shape = [_]i32{ @intCast(out_dim), @intCast(rank) };
+    const grad_after_a_shape = [_]i32{ @intCast(rows), @intCast(rank) };
+    var grad_after_a = try MetalTensor.deviceAllocate(runtime, rows * rank * @sizeOf(f32), .private, &grad_after_a_shape);
+    errdefer grad_after_a.deinit();
+    var grad_a = try MetalTensor.deviceAllocate(runtime, rank * in_dim * @sizeOf(f32), .private, &grad_a_shape);
+    errdefer grad_a.deinit();
+    var grad_b = try MetalTensor.deviceAllocate(runtime, out_dim * rank * @sizeOf(f32), .private, &grad_b_shape);
+    errdefer grad_b.deinit();
+    const rc = if (rank == 1 and !getenvBool("TERMITE_METAL_DISABLE_LORA_BACKWARD_RANK1_FUSED"))
+        termite_metal_decode_runtime_lora_backward_rank1_f32_device(
+            runtime,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            after_a.deviceHandle(),
+            after_a.deviceByteOffset(),
+            lora_b.deviceHandle(),
+            lora_b.deviceByteOffset(),
+            output_grad.deviceHandle(),
+            output_grad.deviceByteOffset(),
+            rows,
+            in_dim,
+            out_dim,
+            scale,
+            grad_after_a.deviceHandle(),
+            grad_after_a.deviceByteOffset(),
+            grad_a.deviceHandle(),
+            grad_a.deviceByteOffset(),
+            grad_b.deviceHandle(),
+            grad_b.deviceByteOffset(),
+        )
+    else
+        termite_metal_decode_runtime_lora_backward_f32_device(
+            runtime,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            after_a.deviceHandle(),
+            after_a.deviceByteOffset(),
+            lora_b.deviceHandle(),
+            lora_b.deviceByteOffset(),
+            output_grad.deviceHandle(),
+            output_grad.deviceByteOffset(),
+            rows,
+            in_dim,
+            rank,
+            out_dim,
+            scale,
+            grad_after_a.deviceHandle(),
+            grad_after_a.deviceByteOffset(),
+            grad_a.deviceHandle(),
+            grad_a.deviceByteOffset(),
+            grad_b.deviceHandle(),
+            grad_b.deviceByteOffset(),
+        );
+    if (rc != 0) return null;
+    return .{
+        .grad_after_a = grad_after_a,
+        .grad_a = grad_a,
+        .grad_b = grad_b,
     };
 }
 
@@ -7989,6 +8075,49 @@ pub extern fn termite_metal_decode_runtime_lora_linear_f32_device(
     after_b_offset: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_lora_backward_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    after_a_handle: ?*anyopaque,
+    after_a_offset: usize,
+    lora_b_handle: ?*anyopaque,
+    lora_b_offset: usize,
+    output_grad_handle: ?*anyopaque,
+    output_grad_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+    grad_after_a_handle: ?*anyopaque,
+    grad_after_a_offset: usize,
+    grad_a_handle: ?*anyopaque,
+    grad_a_offset: usize,
+    grad_b_handle: ?*anyopaque,
+    grad_b_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_lora_backward_rank1_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    after_a_handle: ?*anyopaque,
+    after_a_offset: usize,
+    lora_b_handle: ?*anyopaque,
+    lora_b_offset: usize,
+    output_grad_handle: ?*anyopaque,
+    output_grad_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    scale: f32,
+    grad_after_a_handle: ?*anyopaque,
+    grad_after_a_offset: usize,
+    grad_a_handle: ?*anyopaque,
+    grad_a_offset: usize,
+    grad_b_handle: ?*anyopaque,
+    grad_b_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_dot_general_batched_f32_device(
     runtime: ?*RawMetalDecodeRuntime,

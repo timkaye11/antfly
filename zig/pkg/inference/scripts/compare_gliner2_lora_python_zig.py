@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PYTHON = "/private/tmp/gliner2-parity-py311/bin/python"
+DEFAULT_PYTHON = "/private/tmp/gliner2-parity-venv/bin/python"
 DEFAULT_MODEL_DIR = "/private/tmp/termite-models/gliner2"
 DEFAULT_PYTHON_MODEL = "fastino/gliner2-base-v1"
 DEFAULT_OUT_DIR = "/private/tmp/termite-gliner2-apples-to-apples"
@@ -193,6 +193,95 @@ def parse_zig_output(output: str) -> dict[str, Any]:
         "span_parity_debug": parity_debug[-1] if parity_debug else None,
         "span_preprocess_debug": preprocess_debug[-1] if preprocess_debug else None,
         "span_component_debug": component_debug[-1] if component_debug else None,
+    }
+
+
+def parse_op_stat_items(payload: str) -> dict[str, dict[str, float]]:
+    stats: dict[str, dict[str, float]] = {}
+    for item in payload.split(","):
+        item = item.strip()
+        if not item or ":count=" not in item:
+            continue
+        parts = item.split(":")
+        name = parts[0]
+        values: dict[str, float] = {}
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            key, raw_value = part.split("=", 1)
+            try:
+                values[key] = float(raw_value)
+            except ValueError:
+                pass
+        if values:
+            stats[name] = values
+    return stats
+
+
+def parse_zig_op_stats(output: str) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    prefixes = {
+        "metal_partition_command_ops:": "command_ops",
+        "metal_partition_fallback_ops:": "fallback_ops",
+        "metal_partition_host_output_ops:": "host_output_ops",
+    }
+    for line in output.splitlines():
+        for prefix, key in prefixes.items():
+            if line.startswith(prefix):
+                parsed[key] = parse_op_stat_items(line[len(prefix):].strip())
+    return parsed
+
+
+def parse_bool_token(value: str) -> bool | None:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return None
+
+
+def parse_dot_shape_items(payload: str) -> list[dict[str, Any]]:
+    shapes: list[dict[str, Any]] = []
+    shape_re = re.compile(
+        r"(?P<lhs0>-?\d+)x(?P<lhs1>-?\d+)\*(?P<rhs0>-?\d+)x(?P<rhs1>-?\d+)->(?P<out0>-?\d+)x(?P<out1>-?\d+)"
+        r":count=(?P<count>\d+):rhs_transpose=(?P<rhs_transpose>true|false)"
+        r":rhs_parameter=(?P<rhs_parameter>true|false):rhs_lora=(?P<rhs_lora>true|false):raw_linear=(?P<raw_linear>true|false)"
+    )
+    for item in payload.split(","):
+        item = item.strip()
+        if not item or item == "none":
+            continue
+        match = shape_re.fullmatch(item)
+        if not match:
+            continue
+        groups = match.groupdict()
+        shapes.append({
+            "lhs": [int(groups["lhs0"]), int(groups["lhs1"])],
+            "rhs": [int(groups["rhs0"]), int(groups["rhs1"])],
+            "out": [int(groups["out0"]), int(groups["out1"])],
+            "count": int(groups["count"]),
+            "rhs_transpose": parse_bool_token(groups["rhs_transpose"]),
+            "rhs_parameter": parse_bool_token(groups["rhs_parameter"]),
+            "rhs_lora": parse_bool_token(groups["rhs_lora"]),
+            "raw_linear": parse_bool_token(groups["raw_linear"]),
+        })
+    return shapes
+
+
+def parse_zig_op_runs(output: str) -> dict[str, Any]:
+    dot_shapes: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        prefix = "metal_partition_dot_shapes:"
+        if not line.startswith(prefix):
+            continue
+        top_index = line.find(" top=")
+        if top_index < 0:
+            continue
+        dot_shapes.extend(parse_dot_shape_items(line[top_index + len(" top="):]))
+    dot_shapes.sort(key=lambda item: item["count"], reverse=True)
+    return {
+        "dot_shapes": dot_shapes,
+        "top_dot_shapes": dot_shapes[:16],
     }
 
 
@@ -659,6 +748,17 @@ def main() -> int:
     p.add_argument("--zig-build-mlx", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--zig-optimize", choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"], default=None)
     p.add_argument("--dump-parity", action="store_true", help="Collect first-batch span objective logits/label/mask stats from both implementations")
+    p.add_argument(
+        "--loss-parity-tolerance",
+        type=float,
+        default=1e-4,
+        help="Maximum absolute Python/Zig loss delta for valid loss parity when both sides run",
+    )
+    p.add_argument(
+        "--perf-target-only-python",
+        action="store_true",
+        help="Treat Python as a timing target only; report Python/Zig loss delta but mark loss parity invalid",
+    )
     p.add_argument("--timeout-seconds", type=int, default=900)
     p.add_argument("--skip-python", action="store_true")
     p.add_argument("--skip-zig", action="store_true")
@@ -705,6 +805,8 @@ def main() -> int:
             "zig_build_mlx": args.zig_build_mlx,
             "zig_optimize": args.zig_optimize,
             "dump_parity": args.dump_parity,
+            "loss_parity_tolerance": args.loss_parity_tolerance,
+            "perf_target_only_python": args.perf_target_only_python,
         },
     }
 
@@ -718,6 +820,8 @@ def main() -> int:
         py_loss = report["python"]["metrics"]["train_metrics_history"][-1].get("loss")
     zig_loss = report.get("zig", {}).get("metrics", {}).get("final_avg_loss")
     zig_step_rows = [row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "step"]
+    zig_op_stats = parse_zig_op_stats(report.get("zig", {}).get("output", ""))
+    zig_op_runs = parse_zig_op_runs(report.get("zig", {}).get("output", ""))
     python_trainer_elapsed = report.get("python", {}).get("metrics", {}).get("elapsed_seconds")
     python_step_timings = report.get("python", {}).get("metrics", {}).get("step_timings", [])
     python_total_step_ms = report.get("python", {}).get("metrics", {}).get("total_step_wall_ms")
@@ -751,6 +855,21 @@ def main() -> int:
     else:
         objective_parity_warning = "Zig token-classification objective does not match upstream GLiNER2Trainer structure_loss training"
         zig_objective_semantics = "token classification"
+    loss_delta = (zig_loss - py_loss) if zig_loss is not None and py_loss is not None else None
+    valid_loss_parity = (
+        not args.perf_target_only_python
+        and trainable_parity_warning is None
+        and entity_only_structure_parity
+        and loss_delta is not None
+        and abs(loss_delta) <= args.loss_parity_tolerance
+    )
+    loss_parity_warning = None
+    if args.perf_target_only_python:
+        loss_parity_warning = "Python is being used as a timing target only; Python/Zig loss parity is intentionally not asserted"
+    elif loss_delta is None:
+        loss_parity_warning = "Python/Zig loss parity was not evaluated because one side did not report loss"
+    elif not valid_loss_parity:
+        loss_parity_warning = f"Python/Zig loss delta {loss_delta:.9g} exceeds tolerance {args.loss_parity_tolerance:.9g} or objective/trainable parity is incomplete"
     report["summary"] = {
         "python_returncode": report.get("python", {}).get("returncode"),
         "zig_returncode": report.get("zig", {}).get("returncode"),
@@ -772,6 +891,14 @@ def main() -> int:
         "zig_graph_executor_host_outputs_avg": zig_step_avg("graph_executor_host_outputs"),
         "zig_graph_executor_regions_avg": zig_step_avg("graph_executor_regions"),
         "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg("graph_executor_runtime_region_dispatches"),
+        "zig_dot_general_command_count": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("count"),
+        "zig_dot_general_command_total_ms": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("total_ms"),
+        "zig_dot_general_command_avg_ms": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("avg_ms"),
+        "zig_gather_fallback_count": zig_op_stats.get("fallback_ops", {}).get("gather", {}).get("count"),
+        "zig_gather_fallback_total_ms": zig_op_stats.get("fallback_ops", {}).get("gather", {}).get("total_ms"),
+        "zig_gather_host_output_count": zig_op_stats.get("host_output_ops", {}).get("gather", {}).get("count"),
+        "zig_gather_host_output_total_ms": zig_op_stats.get("host_output_ops", {}).get("gather", {}).get("total_ms"),
+        "zig_top_dot_shapes": zig_op_runs.get("top_dot_shapes", []),
         "python_cpu_step_gate_ms": python_avg_step_ms,
         "zig_beats_python_cpu_step_time": (
             zig_avg_trainer_ms < python_avg_step_ms
@@ -795,7 +922,11 @@ def main() -> int:
         ),
         "python_last_loss": py_loss,
         "zig_final_avg_loss": zig_loss,
-        "loss_delta_zig_minus_python": (zig_loss - py_loss) if zig_loss is not None and py_loss is not None else None,
+        "loss_delta_zig_minus_python": loss_delta,
+        "loss_parity_tolerance": args.loss_parity_tolerance,
+        "valid_loss_parity": valid_loss_parity,
+        "loss_parity_warning": loss_parity_warning,
+        "perf_target_only_python": args.perf_target_only_python,
         "python_objective_semantics": "upstream GLiNER2Trainer total_loss = classification_loss + structure_loss + count_loss; LoRA mode freezes non-LoRA params",
         "zig_objective_semantics": zig_objective_semantics,
         "entity_only_structure_parity": entity_only_structure_parity,
