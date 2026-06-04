@@ -87,6 +87,10 @@ pub const CudaCompute = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    pub fn hasGemma4DecoderPrimitives(self: *const CudaCompute) bool {
+        return self.kernels.hasGemma4DecoderPrimitives();
+    }
+
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
         if (loaded.quantized_storage) |storage| {
             if (cudaDequantizeQuantWeightsOnUpload()) {

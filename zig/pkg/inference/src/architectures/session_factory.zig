@@ -1273,6 +1273,9 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
     errdefer cuda_compute.deinit();
+    if (cudaRequiresGemma4DecoderPrimitives(native_impl.arch_config) and !cuda_compute.hasGemma4DecoderPrimitives()) {
+        return error.CudaKernelUnavailable;
+    }
     var it = native_impl.backend_data.native.resident_weights.iterator();
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
@@ -1301,9 +1304,19 @@ fn cudaSupportsArch(arch_config: ArchConfig) bool {
     };
 }
 
+fn cudaRequiresGemma4DecoderPrimitives(arch_config: ArchConfig) bool {
+    return switch (arch_config) {
+        .gpt => |cfg| cfg.family == .gemma,
+        else => false,
+    };
+}
+
 test "cuda support gate admits Gemma-family GPT only after decoder primitives exist" {
     try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
     try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
+    try std.testing.expect(cudaRequiresGemma4DecoderPrimitives(.{ .gpt = .{ .family = .gemma } }));
+    try std.testing.expect(!cudaRequiresGemma4DecoderPrimitives(.{ .clip = .{} }));
+    try std.testing.expect(!cudaRequiresGemma4DecoderPrimitives(.{ .gliner = .{} }));
 }
 
 fn eagerLoadResidentsFromStore(

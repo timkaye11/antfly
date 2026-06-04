@@ -280,6 +280,16 @@ pub const KernelModule = struct {
         }
     }
 
+    pub fn hasGemma4DecoderPrimitives(self: *const KernelModule) bool {
+        return self.rope_f32 != null and
+            self.rope_per_item_f32 != null and
+            self.gqa_attention_f32 != null;
+    }
+
+    pub fn requireGemma4DecoderPrimitives(self: *const KernelModule) driver_mod.Error!void {
+        if (!self.hasGemma4DecoderPrimitives()) return error.CudaKernelUnavailable;
+    }
+
     pub fn launchFillF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -2243,6 +2253,18 @@ pub fn smokeDenseF32(allocator: std.mem.Allocator) !void {
     try smokeAttentionF32(allocator, &ctx, &module);
 }
 
+pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    try module.requireGemma4DecoderPrimitives();
+    try smokeRopeF32(allocator, &ctx, &module);
+    try smokeRopePerItemF32(allocator, &ctx, &module);
+    try smokeGqaAttentionF32(allocator, &ctx, &module);
+}
+
 fn smokeLinearF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
     const rows: usize = 2;
     const in_dim: usize = 3;
@@ -2503,6 +2525,110 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     try expectApproxSlice(out, &expected_sdpa, 0.001);
 }
 
+fn smokeRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const head_dim: usize = 4;
+    const rope_dim: usize = 4;
+    const theta: f32 = 10000.0;
+    const freq_scale: f32 = 1.0;
+    const input_data = [_]f32{
+        1, 0, 0, 1,
+        1, 0, 0, 1,
+    };
+    var expected: [input_data.len]f32 = undefined;
+    fillRopeSmokeExpected(expected[0..4], 0, theta, freq_scale);
+    fillRopeSmokeExpected(expected[4..8], 1, theta, freq_scale);
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try module.launchRopeF32(ctx, output, input, 2, head_dim, rope_dim, theta, freq_scale, 0, 2, 1, false);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+}
+
+fn smokeRopePerItemF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 2;
+    const max_seq_len: usize = 2;
+    const num_heads: usize = 1;
+    const head_dim: usize = 4;
+    const rope_dim: usize = 4;
+    const theta: f32 = 10000.0;
+    const freq_scale: f32 = 1.0;
+    const input_data = [_]f32{
+        1, 0, 0, 1,
+        1, 0, 0, 1,
+        1, 0, 0, 1,
+        1, 0, 0, 1,
+    };
+    const query_lengths = [_]u32{ 1, 2 };
+    const position_offsets = [_]u32{ 2, 5 };
+    var expected: [input_data.len]f32 = undefined;
+    fillRopeSmokeExpected(expected[0..4], 2, theta, freq_scale);
+    fillRopeSmokeExpected(expected[4..8], 0, theta, freq_scale);
+    fillRopeSmokeExpected(expected[8..12], 5, theta, freq_scale);
+    fillRopeSmokeExpected(expected[12..16], 6, theta, freq_scale);
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var lengths = try buffer_mod.DeviceBuffer.alloc(ctx, query_lengths.len * @sizeOf(u32));
+    defer lengths.free(ctx);
+    var offsets = try buffer_mod.DeviceBuffer.alloc(ctx, position_offsets.len * @sizeOf(u32));
+    defer offsets.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try lengths.copyFromHost(ctx, std.mem.sliceAsBytes(&query_lengths));
+    try offsets.copyFromHost(ctx, std.mem.sliceAsBytes(&position_offsets));
+    try module.launchRopePerItemF32(ctx, output, input, lengths, offsets, batch, max_seq_len, num_heads, head_dim, rope_dim, theta, freq_scale, false);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+}
+
+fn smokeGqaAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 1;
+    const q_seq_len: usize = 2;
+    const kv_seq_len: usize = 2;
+    const num_heads: usize = 2;
+    const num_kv_heads: usize = 1;
+    const head_dim: usize = 1;
+    const q_data = [_]f32{ 1, 1, 1, 1 };
+    const k_data = [_]f32{ 0, 0 };
+    const v_data = [_]f32{ 10, 20 };
+    const expected = [_]f32{ 10, 10, 15, 15 };
+
+    var q = try buffer_mod.DeviceBuffer.alloc(ctx, q_data.len * @sizeOf(f32));
+    defer q.free(ctx);
+    var k = try buffer_mod.DeviceBuffer.alloc(ctx, k_data.len * @sizeOf(f32));
+    defer k.free(ctx);
+    var v = try buffer_mod.DeviceBuffer.alloc(ctx, v_data.len * @sizeOf(f32));
+    defer v.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, q_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try q.copyFromHost(ctx, std.mem.sliceAsBytes(&q_data));
+    try k.copyFromHost(ctx, std.mem.sliceAsBytes(&k_data));
+    try v.copyFromHost(ctx, std.mem.sliceAsBytes(&v_data));
+    try module.launchGqaAttentionF32(ctx, output, q, k, v, .{}, .{}, batch, q_seq_len, kv_seq_len, num_heads, num_kv_heads, head_dim, 0, 0, 0, kv_seq_len, 0, 0);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, q_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+}
+
 pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
     var ctx = try context_mod.CudaContext.initDefault();
     defer ctx.deinit();
@@ -2743,6 +2869,17 @@ fn writeQ4_KSmokeRow(dst: []u8, scale: f32, value: u4) void {
     dst[15] = 1;
     const packed_byte = @as(u8, value) | (@as(u8, value) << 4);
     for (0..128) |i| dst[16 + i] = packed_byte;
+}
+
+fn fillRopeSmokeExpected(dst: []f32, position: usize, theta: f32, freq_scale: f32) void {
+    std.debug.assert(dst.len == 4);
+    const pos: f32 = @floatFromInt(position);
+    const angle0 = pos * freq_scale;
+    const angle1 = angle0 / std.math.sqrt(theta);
+    dst[0] = std.math.cos(angle0);
+    dst[1] = -std.math.sin(angle1);
+    dst[2] = std.math.sin(angle0);
+    dst[3] = std.math.cos(angle1);
 }
 
 fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32) !void {

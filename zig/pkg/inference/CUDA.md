@@ -193,7 +193,7 @@ Use this layout:
 | `pkg/inference/src/ops/cuda/kernels.zig` | Embedded PTX module loading and JIT diagnostics |
 | `pkg/inference/src/ops/cuda/quant.zig` | GGUF format descriptors for CUDA |
 | `pkg/inference/src/ops/cuda/cuda_compute.zig` | `ComputeBackend` implementation |
-| `pkg/inference/src/ops/cuda/kernels/*.cu` | Developer kernel sources |
+| `pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu` | Developer kernel source |
 | `pkg/inference/src/ops/cuda/artifacts/*.ptx` | Checked-in portable PTX |
 | `pkg/inference/src/ops/cuda/artifacts/*.fatbin` | Optional checked-in fatbins |
 
@@ -219,6 +219,12 @@ The script compiles
 `src/ops/cuda/artifacts/inference_cuda_kernels.cu` into the checked-in portable
 PTX artifact. Set `CUDA_PTX_ARCH=compute_80` (or another virtual architecture)
 only when intentionally changing the portability floor.
+
+Artifact freshness is part of CUDA production readiness. Any change to
+`inference_cuda_kernels.cu` must be followed by PTX regeneration on a CUDA
+toolkit host and a runtime smoke on an NVIDIA GPU. Mac builds can verify Zig
+integration and embedded-artifact wiring, but they do not prove the checked-in
+PTX was regenerated or executes correctly.
 
 ## Inference Surface
 
@@ -247,6 +253,22 @@ Route every CUDA quantized linear through `graph/quant_matmul.zig`:
   `mul_mv`, `mul_mv_ext`, `mul_mm`, and `fallback`.
 - Do not add public per-format APIs such as `cudaQ4KMatmul`; keep one internal
   descriptor-driven dispatch.
+
+The current CUDA backend also exposes the common dense/model primitives needed
+by ClipClap, GLiNER2, and Gemma-family decoder sessions:
+
+- dense f32 linear/bias, activation, normalization, embedding, concat,
+  convolution, and attention helpers
+- GGUF `Q8_0`, `Q4_0`, and `Q4_K` linear kernels
+- GLiNER-oriented DeBERTa attention/head helper kernels
+- Gemma-family RoPE, per-item RoPE, and dense GQA attention kernels
+
+Required common kernels are loaded eagerly when the PTX module is loaded.
+Gemma-family decoder kernels are loaded as optional symbols for artifact
+compatibility, then promoted to a required capability before a Gemma CUDA
+session is created. If a stale PTX bundle is missing RoPE, per-item RoPE, or
+GQA attention, session creation must fail with `CudaKernelUnavailable` instead
+of silently falling back to an incomplete GPU path.
 
 ## Quantization Priorities
 
@@ -408,14 +430,19 @@ portable `compute_75` PTX.
 - Add CPU fallback per unsupported format/operator, not per whole model when
   possible.
 - Validate fixed-token generation on L4 and T4.
+- Keep Gemma-family decoder support gated on the RoPE, per-item RoPE, and GQA
+  CUDA primitives being present in the loaded artifact.
 
 ### Phase 6: Broader Format And Operator Coverage
 
 - Add `Q5_K`, `Q6_K`, `Q8_K`.
 - Add `mul_mv_ext` for small batches.
 - Add `mul_mm` for prefill.
-- Add RMSNorm, RoPE, softmax, and attention only after quantized linears are
-  stable and measured.
+- Broaden the decoder primitive set after the current RoPE/GQA path is
+  validated on NVIDIA hardware:
+  - fused/optimized RMSNorm and softmax
+  - paged/flash-style attention that avoids host KV gathering
+  - architecture-specific quantized matmul accelerators
 
 ### Phase 7: XLA/PJRT NVIDIA Lane
 
@@ -439,11 +466,30 @@ portable `compute_75` PTX.
 - Validate that `libcuda.so.1` comes from the NVIDIA driver mount.
 - Run:
   - no-CUDA startup fallback
-  - CUDA smoke probe
+  - CUDA smoke probe with `zig-out/bin/antfly-inference cuda-info --smoke`
   - dense linear parity smoke
   - `Q8_0`, `Q4_0`, `Q4_K` synthetic parity
+  - Gemma-family decoder primitive smoke for RoPE, per-item RoPE, and GQA
   - real GGUF generation with CUDA counters
 - Repeat on T4, then A100/H100.
+
+On the CUDA host, use this first-pass runbook:
+
+```bash
+cd zig/pkg/inference
+scripts/regen_cuda_artifacts.sh
+zig build -Dskip-openapi=true -Donnx=false -Dmlx=false -Dmetal=false -Dcuda=true
+zig-out/bin/antfly-inference cuda-info --smoke
+```
+
+In a packaged Antfly CLI environment, the same probe is exposed as
+`antfly inference cuda-info --smoke`.
+
+The smoke must print successful lines for `fill_f32`, `dense_f32`, `q8_0_f32`,
+`q4_0_f32`, `q4_k_f32`, and `gemma4_primitives`. A
+`gemma4_primitives` failure usually means the PTX is stale, the new symbols did
+not JIT/load on the target driver, or a primitive has drifted from its CPU/Metal
+reference behavior.
 
 ## XLA/PJRT Capability Plan
 
@@ -480,6 +526,8 @@ Most tests should run without NVIDIA hardware:
 - quant row-dequant tests against `quant_codec.zig`
 - quant matmul planner tests in `graph/quant_matmul.zig`
 - CUDA artifact presence/currentness test that does not execute GPU code
+- Zig compile/unit slices with `-Dcuda=true` to catch API drift on non-CUDA
+  developer machines
 
 CUDA-present tests:
 
@@ -487,6 +535,7 @@ CUDA-present tests:
 - vector fill/add launch
 - dense f32 linear parity
 - `Q8_0`, `Q4_0`, `Q4_K` matmul parity
+- RoPE, per-item RoPE, and GQA primitive parity for Gemma-family decoders
 - fallback-on-unsupported-format test
 - real GGUF generation with fixed prompt/settings and CUDA counters
 - GKE L4 container smoke
@@ -496,6 +545,9 @@ Correctness rules:
 - Dense f32 matmul: tight absolute/relative tolerance.
 - Quantized matmul: compare against CPU dequantized or native quant reference
   with explicit per-format tolerance.
+- Gemma decoder primitives: compare RoPE/per-item RoPE/GQA outputs against the
+  shared CPU semantics, including mixed per-item position offsets and GQA head
+  grouping.
 - Generation smoke: stable token IDs for fixed seed/settings where sampling is
   deterministic.
 - No-CUDA startup behavior: byte-for-byte same CLI behavior where practical,
@@ -522,12 +574,16 @@ prove GPU execution instead of just proving successful text generation.
 
 CUDA is minimally useful when:
 
-- `termite` starts on machines without CUDA and behaves as before.
+- Antfly inference starts on machines without CUDA and behaves as before.
 - The same binary starts on a GKE L4 node and reports CUDA availability when
   requested.
 - The container image contains no CUDA runtime, cuBLAS, cuDNN, TensorRT, ONNX
   Runtime, or XLA libraries for the native CUDA path.
 - `Q8_0`, `Q4_0`, and `Q4_K` GGUF linears run on the GPU.
+- Gemma-family CUDA sessions refuse stale artifacts that do not contain RoPE,
+  per-item RoPE, and GQA attention.
+- `zig-out/bin/antfly-inference cuda-info --smoke` passes all embedded PTX
+  smoke checks on a CUDA host after artifact regeneration.
 - A real GGUF generation smoke shows CUDA quantized matmul counters.
 - CPU fallback remains available for unsupported formats and devices.
 - XLA/PJRT remains independently usable for dense compiled graph inference when
