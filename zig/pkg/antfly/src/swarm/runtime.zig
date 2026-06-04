@@ -25,6 +25,7 @@ const platform_time = @import("../platform/time.zig");
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http.http_common;
 const public_api_max_requests_per_connection: u32 = 64;
+const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 const default_public_port: u16 = 8080;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
@@ -1102,12 +1103,7 @@ fn serveUnifiedInner(
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
 
-    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), .{
-        .host = bind_host,
-        .port = bind_port,
-        .request_timeout_ms = 300_000,
-        .max_requests_per_connection = public_api_max_requests_per_connection,
-    });
+    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
 
     // Register antfly routes under /ai/v1
@@ -1141,6 +1137,16 @@ fn serveUnifiedInner(
     }
 
     try server.listen();
+}
+
+fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
+    return .{
+        .host = bind_host,
+        .port = bind_port,
+        .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        .request_timeout_ms = 300_000,
+        .max_requests_per_connection = public_api_max_requests_per_connection,
+    };
 }
 
 fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
@@ -2009,6 +2015,11 @@ test "swarm runtime defaults public listener to antfarm port" {
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
+test "swarm public HTTP server uses public API request body limit" {
+    const cfg = publicHttpServerConfig("127.0.0.1", 8080);
+    try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
+}
+
 test "antfly config uses cli override before common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
@@ -2034,6 +2045,10 @@ test "antfly config uses cli override before common config" {
 test "swarm public api caps keep alive request reuse" {
     try std.testing.expect(public_api_max_requests_per_connection > 0);
     try std.testing.expect(public_api_max_requests_per_connection < 1000);
+}
+
+test "swarm public api body limit matches common http listener" {
+    try std.testing.expectEqual(antfly.common.http.default_max_request_bytes, public_api_max_body_size);
 }
 
 test "parse cli accepts inference budget overrides" {

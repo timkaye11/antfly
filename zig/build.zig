@@ -2572,6 +2572,9 @@ pub fn build(b: *std.Build) void {
     const lib_unit_default_filters = [_][]const u8{
         ".test_0",
         "module compiles",
+        "batch parser preserves oversized value errors",
+        "batch parser accepts raw payload value under public request cap",
+        "linear merge request parser accepts raw payload value under public request cap",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
     };
@@ -2742,6 +2745,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
     };
@@ -3213,6 +3217,7 @@ pub fn build(b: *std.Build) void {
         "api http server lists cluster backups through public route",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "public API request body limit matches Go linear merge contract",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
@@ -3446,6 +3451,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache reserves retirement slots when pruning multiple leased generations",
+            "provisioned table write source coalesces same-group waiters",
+            "provisioned table write coalescer isolates failed waiters",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3895,6 +3902,8 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts canonical host port and models dir flags",
             "termite config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
+            "swarm public api body limit matches common http listener",
+            "swarm public HTTP server uses public API request body limit",
             "parse cli accepts termite budget overrides",
             "termite config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
