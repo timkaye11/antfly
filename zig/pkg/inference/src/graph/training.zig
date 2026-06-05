@@ -97,6 +97,29 @@ pub const TrainStepProfile = struct {
     graph_executor_runtime_region_fallbacks: u64 = 0,
     graph_executor_runtime_frame_candidates: u64 = 0,
     graph_executor_runtime_frame_eligible: u64 = 0,
+    metal_frame_wait_ns: u64 = 0,
+    metal_frame_gpu_ns: u64 = 0,
+    metal_last_frame_compute_encoders: u64 = 0,
+    metal_last_frame_blit_encoders: u64 = 0,
+    metal_last_frame_planned_scopes: u64 = 0,
+    metal_last_frame_planned_barriers: u64 = 0,
+    metal_last_frame_planned_command_ops: u64 = 0,
+    metal_deberta_encoder_plan_attempts: u64 = 0,
+    metal_deberta_encoder_plan_successes: u64 = 0,
+    metal_deberta_encoder_plan_reuses: u64 = 0,
+    metal_deberta_encoder_plan_failures: u64 = 0,
+    metal_deberta_encoder_layer_attempts: u64 = 0,
+    metal_deberta_encoder_layer_successes: u64 = 0,
+    metal_deberta_encoder_layer_fallbacks: u64 = 0,
+    metal_deberta_relative_qk_pair_calls: u64 = 0,
+    metal_deberta_relative_qk_pair_fallbacks: u64 = 0,
+    metal_deberta_ffn_fused_calls: u64 = 0,
+    metal_deberta_ffn_fused_mps_matmuls: u64 = 0,
+    metal_deberta_ffn_fused_fallbacks: u64 = 0,
+    metal_deberta_attention_flash_calls: u64 = 0,
+    metal_deberta_attention_gemm_calls: u64 = 0,
+    metal_deberta_attention_gemm_fallbacks: u64 = 0,
+    metal_deberta_attention_legacy_calls: u64 = 0,
 };
 
 pub const CheckpointSummary = struct {
@@ -118,6 +141,45 @@ pub const TrainStepOptions = struct {
 fn beginOwnedExecutionFrame(cb: *const ComputeBackend) !bool {
     if (cb.decoderRuntimeHasActiveFrame()) return false;
     return try cb.decoderRuntimeBeginFrame();
+}
+
+fn deltaU64(before: u64, after: u64) u64 {
+    return if (after >= before) after - before else 0;
+}
+
+fn deltaU128ToU64(before: u128, after: u128) u64 {
+    const delta = if (after >= before) after - before else 0;
+    return if (delta > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(delta);
+}
+
+fn recordMetalDebugProfile(
+    profile: *TrainStepProfile,
+    before: ops_mod.NativeQuantTimingStats,
+    after: ops_mod.NativeQuantTimingStats,
+) void {
+    profile.metal_frame_wait_ns = deltaU128ToU64(before.decoder_runtime_frame_wait_nanos, after.decoder_runtime_frame_wait_nanos);
+    profile.metal_frame_gpu_ns = deltaU128ToU64(before.decoder_runtime_frame_gpu_nanos, after.decoder_runtime_frame_gpu_nanos);
+    profile.metal_last_frame_compute_encoders = after.metal_runtime_last_frame_compute_encoder_count;
+    profile.metal_last_frame_blit_encoders = after.metal_runtime_last_frame_blit_encoder_count;
+    profile.metal_last_frame_planned_scopes = after.metal_runtime_last_frame_planned_compute_scope_count;
+    profile.metal_last_frame_planned_barriers = after.metal_runtime_last_frame_planned_barrier_count;
+    profile.metal_last_frame_planned_command_ops = after.metal_runtime_last_frame_planned_command_op_count;
+    profile.metal_deberta_encoder_plan_attempts = deltaU64(before.metal_runtime_deberta_encoder_frame_plan_attempts, after.metal_runtime_deberta_encoder_frame_plan_attempts);
+    profile.metal_deberta_encoder_plan_successes = deltaU64(before.metal_runtime_deberta_encoder_frame_plan_successes, after.metal_runtime_deberta_encoder_frame_plan_successes);
+    profile.metal_deberta_encoder_plan_reuses = deltaU64(before.metal_runtime_deberta_encoder_frame_plan_reuses, after.metal_runtime_deberta_encoder_frame_plan_reuses);
+    profile.metal_deberta_encoder_plan_failures = deltaU64(before.metal_runtime_deberta_encoder_frame_plan_failures, after.metal_runtime_deberta_encoder_frame_plan_failures);
+    profile.metal_deberta_encoder_layer_attempts = deltaU64(before.metal_runtime_deberta_encoder_layer_attempts, after.metal_runtime_deberta_encoder_layer_attempts);
+    profile.metal_deberta_encoder_layer_successes = deltaU64(before.metal_runtime_deberta_encoder_layer_successes, after.metal_runtime_deberta_encoder_layer_successes);
+    profile.metal_deberta_encoder_layer_fallbacks = deltaU64(before.metal_runtime_deberta_encoder_layer_fallbacks, after.metal_runtime_deberta_encoder_layer_fallbacks);
+    profile.metal_deberta_relative_qk_pair_calls = deltaU64(before.metal_runtime_deberta_relative_qk_pair_calls, after.metal_runtime_deberta_relative_qk_pair_calls);
+    profile.metal_deberta_relative_qk_pair_fallbacks = deltaU64(before.metal_runtime_deberta_relative_qk_pair_fallbacks, after.metal_runtime_deberta_relative_qk_pair_fallbacks);
+    profile.metal_deberta_ffn_fused_calls = deltaU64(before.metal_runtime_deberta_ffn_fused_calls, after.metal_runtime_deberta_ffn_fused_calls);
+    profile.metal_deberta_ffn_fused_mps_matmuls = deltaU64(before.metal_runtime_deberta_ffn_fused_mps_matmuls, after.metal_runtime_deberta_ffn_fused_mps_matmuls);
+    profile.metal_deberta_ffn_fused_fallbacks = deltaU64(before.metal_runtime_deberta_ffn_fused_fallbacks, after.metal_runtime_deberta_ffn_fused_fallbacks);
+    profile.metal_deberta_attention_flash_calls = deltaU64(before.metal_runtime_deberta_attention_flash_calls, after.metal_runtime_deberta_attention_flash_calls);
+    profile.metal_deberta_attention_gemm_calls = deltaU64(before.metal_runtime_deberta_attention_gemm_calls, after.metal_runtime_deberta_attention_gemm_calls);
+    profile.metal_deberta_attention_gemm_fallbacks = deltaU64(before.metal_runtime_deberta_attention_gemm_fallbacks, after.metal_runtime_deberta_attention_gemm_fallbacks);
+    profile.metal_deberta_attention_legacy_calls = deltaU64(before.metal_runtime_deberta_attention_legacy_calls, after.metal_runtime_deberta_attention_legacy_calls);
 }
 
 fn cancelOwnedExecutionFrame(cb: *const ComputeBackend, active: *bool) void {
@@ -413,7 +475,7 @@ pub const CompiledTrainSession = struct {
             &mesh,
             .{
                 .runtime_inputs = runtime_inputs,
-                .skip_metal_fused_patterns = true,
+                .skip_metal_fused_patterns = trainingGraphExecutorSkipMetalFusedPatterns(),
                 .collect_partition_stats = false,
                 .preserve_runtime_input_residency = true,
             },
@@ -633,6 +695,7 @@ pub const CompiledTrainSession = struct {
         var mesh = try device_mesh.DeviceMesh.init(self.allocator, devices_buf[0..]);
         defer mesh.deinit();
 
+        const metal_debug_before = cb.debugTimingSnapshot().provider;
         var multi_result = try multi_executor.executeMultiDevice(
             self.allocator,
             &self.graph,
@@ -641,7 +704,7 @@ pub const CompiledTrainSession = struct {
             .{
                 .runtime_inputs = runtime_inputs,
                 .cached_analysis = self.analysis,
-                .skip_metal_fused_patterns = true,
+                .skip_metal_fused_patterns = trainingGraphExecutorSkipMetalFusedPatterns(),
                 .collect_partition_stats = true,
                 .preserve_runtime_input_residency = true,
             },
@@ -649,6 +712,7 @@ pub const CompiledTrainSession = struct {
         defer multi_result.deinit(&mesh);
 
         profile.execute_ns = elapsedNs(execute_start);
+        recordMetalDebugProfile(profile, metal_debug_before, cb.debugTimingSnapshot().provider);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         profile.graph_executor_partitions = multi_result.stats.partitions_executed;
         profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
@@ -958,6 +1022,10 @@ fn trainingGraphExecutorParityCheckEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_CHECK", false);
 }
 
+fn trainingGraphExecutorSkipMetalFusedPatterns() bool {
+    return platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_SKIP_METAL_FUSED_PATTERNS", false);
+}
+
 fn trainingGraphExecutorParityNodeIds() ?[]const u8 {
     return platform.env.getenv("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_NODE_IDS");
 }
@@ -1179,6 +1247,7 @@ pub fn trainStep(
 
     // Execute the gradient graph.
     const execute_start = nowNs();
+    const metal_debug_before = cb.debugTimingSnapshot().provider;
     var owned_execution_frame = try beginOwnedExecutionFrame(cb);
     errdefer cancelOwnedExecutionFrame(cb, &owned_execution_frame);
     var planned_scope = try beginTrainingPlannedScope(cb);
@@ -1192,6 +1261,7 @@ pub fn trainStep(
     try endTrainingPlannedScope(cb, &planned_scope);
     try submitOwnedExecutionFrame(cb, &owned_execution_frame);
     profile.execute_ns = elapsedNs(execute_start);
+    recordMetalDebugProfile(&profile, metal_debug_before, cb.debugTimingSnapshot().provider);
     profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
     defer exec_result.deinit(cb);
 

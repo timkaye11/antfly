@@ -320,6 +320,8 @@ pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntim
 pub const DecoderRuntimeApplyAddRequest = backend_contracts.DecoderRuntimeApplyAddRequest;
 pub const DecoderRuntimeApplyAddScaleRequest = backend_contracts.DecoderRuntimeApplyAddScaleRequest;
 pub const DecoderRuntimeApplyScaledAddScaleRequest = backend_contracts.DecoderRuntimeApplyScaledAddScaleRequest;
+pub const DecoderRuntimeApplyMultiplyAddRequest = backend_contracts.DecoderRuntimeApplyMultiplyAddRequest;
+pub const DecoderRuntimeApplyMultiplyAdd2Request = backend_contracts.DecoderRuntimeApplyMultiplyAdd2Request;
 pub const RunDenseFfnResidualRequest = backend_contracts.RunDenseFfnResidualRequest;
 pub const RunGatedFfnResidualRequest = backend_contracts.RunGatedFfnResidualRequest;
 pub const RunAttentionRequest = backend_contracts.RunAttentionRequest;
@@ -1542,6 +1544,12 @@ pub const ComputeBackend = struct {
 
         /// Apply `(lhs * lhs_scale + rhs) * output_scale` inside the backend runtime.
         decoderRuntimeApplyScaledAddScale: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT = null,
+
+        /// Apply `lhs * rhs + addend` inside the backend runtime.
+        decoderRuntimeApplyMultiplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT = null,
+
+        /// Apply `lhs0 * rhs0 + lhs1 * rhs1` inside the backend runtime.
+        decoderRuntimeApplyMultiplyAdd2: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT = null,
 
         /// Apply a two-linear FFN strip (`linear -> activation -> linear ->
         /// residual add`) inside one backend-owned whole-token submission and
@@ -2971,6 +2979,20 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyScaledAddScale(self: *const ComputeBackend, request: *const DecoderRuntimeApplyScaledAddScaleRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyScaledAddScale) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyMultiplyAdd(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAddRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyMultiplyAdd) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyMultiplyAdd2(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAdd2Request) !?CT {
+        if (self.vtable.decoderRuntimeApplyMultiplyAdd2) |op| {
             return op(self.ptr, request);
         }
         return null;

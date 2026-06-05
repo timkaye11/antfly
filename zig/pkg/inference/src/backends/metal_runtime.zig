@@ -3885,6 +3885,42 @@ pub fn decoderRuntimeDotGeneral2DF32Device(
     return output_device;
 }
 
+pub fn decoderRuntimeDotGeneralRank1F32Device(
+    self: anytype,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!lhs.isDevice() or !rhs.isDevice()) return null;
+    if (m == 0 or n == 0 or k == 0 or rhs_contract_axis > 1) return null;
+    if (k != 1 and n != 1) return null;
+    if (m > std.math.maxInt(usize) / k or m > std.math.maxInt(usize) / n or n > std.math.maxInt(usize) / k) return null;
+    if (lhs.elemCount() != m * k or rhs.elemCount() != n * k) return null;
+    const out_shape = [_]i32{ @intCast(m), @intCast(n) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_dot_general_rank1_f32_device(
+        runtime,
+        lhs.deviceHandle(),
+        lhs.deviceByteOffset(),
+        rhs.deviceHandle(),
+        rhs.deviceByteOffset(),
+        m,
+        n,
+        k,
+        rhs_contract_axis,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
 pub const LoraLinearF32DeviceResult = struct {
     after_a: MetalTensor,
     after_b: MetalTensor,
@@ -4374,6 +4410,66 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
         .dim = request.dim,
         .scale = request.output_scale,
     }, stats);
+}
+
+pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.dim == 0) return null;
+    if (!request.lhs.isDevice() or !request.rhs.isDevice() or !request.addend.isDevice()) return null;
+    if (request.lhs.elemCount() != request.dim or request.rhs.elemCount() != request.dim or request.addend.elemCount() != request.dim) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, request.dim * @sizeOf(f32), .private, request.addend.shape());
+    errdefer output_device.deinit();
+    stats.decoder_runtime_apply_add_calls += 1;
+    const device_rc = termite_metal_decode_runtime_apply_multiply_add_device(
+        runtime,
+        request.lhs.deviceHandle(),
+        request.lhs.deviceByteOffset(),
+        request.rhs.deviceHandle(),
+        request.rhs.deviceByteOffset(),
+        request.addend.deviceHandle(),
+        request.addend.deviceByteOffset(),
+        request.dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (device_rc == 0) return output_device;
+    output_device.deinit();
+    return null;
+}
+
+pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.dim == 0) return null;
+    if (!request.lhs0.isDevice() or !request.rhs0.isDevice() or !request.lhs1.isDevice() or !request.rhs1.isDevice()) return null;
+    if (request.lhs0.elemCount() != request.dim or
+        request.rhs0.elemCount() != request.dim or
+        request.lhs1.elemCount() != request.dim or
+        request.rhs1.elemCount() != request.dim)
+    {
+        return null;
+    }
+    var output_device = try MetalTensor.deviceAllocate(runtime, request.dim * @sizeOf(f32), .private, request.lhs0.shape());
+    errdefer output_device.deinit();
+    stats.decoder_runtime_apply_add_calls += 1;
+    const device_rc = termite_metal_decode_runtime_apply_multiply_add2_device(
+        runtime,
+        request.lhs0.deviceHandle(),
+        request.lhs0.deviceByteOffset(),
+        request.rhs0.deviceHandle(),
+        request.rhs0.deviceByteOffset(),
+        request.lhs1.deviceHandle(),
+        request.lhs1.deviceByteOffset(),
+        request.rhs1.deviceHandle(),
+        request.rhs1.deviceByteOffset(),
+        request.dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (device_rc == 0) return output_device;
+    output_device.deinit();
+    return null;
 }
 
 pub fn decoderRuntimeApplyRmsNormAdd(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -8054,6 +8150,19 @@ pub extern fn termite_metal_decode_runtime_dot_general_2d_f32_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_dot_general_rank1_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs_handle: ?*anyopaque,
+    lhs_offset: usize,
+    rhs_handle: ?*anyopaque,
+    rhs_offset: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_lora_linear_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
@@ -8311,6 +8420,32 @@ pub extern fn termite_metal_decode_runtime_apply_scaled_add_scale_device(
     dim: usize,
     lhs_scale: f32,
     output_scale: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_multiply_add_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs_handle: ?*anyopaque,
+    lhs_offset: usize,
+    rhs_handle: ?*anyopaque,
+    rhs_offset: usize,
+    addend_handle: ?*anyopaque,
+    addend_offset: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_multiply_add2_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs0_handle: ?*anyopaque,
+    lhs0_offset: usize,
+    rhs0_handle: ?*anyopaque,
+    rhs0_offset: usize,
+    lhs1_handle: ?*anyopaque,
+    lhs1_offset: usize,
+    rhs1_handle: ?*anyopaque,
+    rhs1_offset: usize,
+    dim: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

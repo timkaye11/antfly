@@ -92,6 +92,8 @@ const RuntimeRegionKind = enum(u8) {
     raw_linear_bias,
     raw_linear_bias_pair,
     lora_linear,
+    lora_linear_qkv,
+    deberta_attention,
     lora_backward,
     q_linear,
     linear_qkv,
@@ -110,6 +112,8 @@ const RuntimeRegion = union(RuntimeRegionKind) {
     raw_linear_bias: RawLinearBiasPattern,
     raw_linear_bias_pair: RawLinearBiasPairPattern,
     lora_linear: LoraLinearPattern,
+    lora_linear_qkv: LoraLinearQkvPattern,
+    deberta_attention: DebertaAttentionPattern,
     lora_backward: LoraBackwardPattern,
     q_linear: QLinearPattern,
     linear_qkv: LinearNoBiasQkvPattern,
@@ -172,6 +176,8 @@ const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     raw_linear_bias: PreparedLinearRegion,
     raw_linear_bias_pair: PreparedLinearPairRegion,
     lora_linear: void,
+    lora_linear_qkv: void,
+    deberta_attention: void,
     lora_backward: void,
     q_linear: PreparedLinearRegion,
     linear_qkv: PreparedQkvRegion,
@@ -624,6 +630,7 @@ pub const MetalPartitionExecutor = struct {
             &transient_runtime_region_plan,
         );
         if (trace_progress) std.debug.print("metal_partition_progress: phase=runtime_region_plan_ready partition={d} regions={d}\n", .{ partition_index, runtime_region_plan.region_count });
+        if (traceRuntimeRegionsEnabled()) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
         if (metalPartitionOpRunsEnabled()) printMetalPartitionOpRuns(graph, node_ids, reachable, last_use, partition_index);
         if (exec_ctx.stats) |stats| {
             recordRuntimeFrameEligibilityStats(stats, analyzeRuntimeFrameEligibility(runtime_region_plan));
@@ -652,6 +659,10 @@ pub const MetalPartitionExecutor = struct {
             if (graph.node(node_id).op == .fused_from_float32) continue;
 
             if (shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
+                skipped_nodes[i] = true;
+                continue;
+            }
+            if (shouldDeferElementwiseMulForAdd(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -814,6 +825,7 @@ pub const MetalPartitionExecutor = struct {
                 node_id,
                 device_id,
                 last_use,
+                runtime_region_plan,
                 rt_map,
                 donated,
                 effective_exec_ctx,
@@ -1300,6 +1312,22 @@ fn traceMetalGraphFusionsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_GRAPH_FUSIONS", false);
 }
 
+fn traceRuntimeRegionsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_RUNTIME_REGIONS", false);
+}
+
+fn traceLoraQkvMatchingEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_LORA_QKV_MATCH", false);
+}
+
+fn traceDebertaAttentionMatchingEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_ATTENTION_MATCH", false);
+}
+
+fn debertaAttentionRuntimeRegionEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_DEBERTA_ATTENTION_RUNTIME_REGION", false);
+}
+
 fn runtimeRegionPlanDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RUNTIME_REGION_PLAN", false);
 }
@@ -1385,11 +1413,25 @@ fn buildRuntimeRegionPlan(
             region_count += 1;
             continue;
         }
+        if (matchLoraLinearQkvPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+            regions[node_pos] = .{ .lora_linear_qkv = pattern };
+            markLoraLinearQkvSkipped(skipped, pattern);
+            region_count += 1;
+            continue;
+        }
         if (matchLoraLinearPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
             regions[node_pos] = .{ .lora_linear = pattern };
             markLoraLinearSkipped(skipped, pattern);
             region_count += 1;
             continue;
+        }
+        if (debertaAttentionRuntimeRegionEnabled()) {
+            if (matchDebertaAttentionPattern(graph, node_ids, node_pos, reachable, skipped, regions)) |pattern| {
+                regions[node_pos] = .{ .deberta_attention = pattern };
+                markDebertaAttentionSkipped(graph, skipped, pattern);
+                region_count += 1;
+                continue;
+            }
         }
         if (loraBackwardRuntimeRegionEnabled()) {
             if (matchLoraBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
@@ -1467,12 +1509,66 @@ fn buildRuntimeRegionPlan(
     };
 }
 
+const RuntimeRegionSummary = struct {
+    kind: RuntimeRegionKind = .none,
+    count: usize = 0,
+    first_pos: usize = 0,
+    last_pos: usize = 0,
+};
+
+fn recordRuntimeRegionSummary(summaries: *[32]RuntimeRegionSummary, used: *usize, kind: RuntimeRegionKind, pos: usize) void {
+    if (kind == .none) return;
+    for (summaries[0..used.*]) |*summary| {
+        if (summary.kind != kind) continue;
+        summary.count += 1;
+        summary.last_pos = pos;
+        return;
+    }
+    if (used.* >= summaries.len) return;
+    summaries[used.*] = .{
+        .kind = kind,
+        .count = 1,
+        .first_pos = pos,
+        .last_pos = pos,
+    };
+    used.* += 1;
+}
+
+fn printRuntimeRegionPlanSummary(graph: *const Graph, plan: RuntimeRegionPlan, partition_index: usize) void {
+    var summaries = [_]RuntimeRegionSummary{.{}} ** 32;
+    var used: usize = 0;
+    for (plan.regions_by_pos, 0..) |region, pos| {
+        recordRuntimeRegionSummary(&summaries, &used, std.meta.activeTag(region), pos);
+    }
+    const eligibility = analyzeRuntimeFrameEligibility(plan);
+    const metadata_ready = runtimeFrameMetadataFromPlan(graph, plan) != null;
+    std.debug.print(
+        "runtime_region_plan_summary: partition={d} regions={d} frame_reason={s} frame_layers={d} metadata_ready={} kinds=",
+        .{ partition_index, plan.region_count, @tagName(eligibility.reason), eligibility.layers, metadata_ready },
+    );
+    if (used == 0) {
+        std.debug.print("none", .{});
+    } else {
+        for (summaries[0..used], 0..) |summary, idx| {
+            if (idx > 0) std.debug.print(",", .{});
+            std.debug.print("{s}:{d}@{d}-{d}", .{
+                @tagName(summary.kind),
+                summary.count,
+                summary.first_pos,
+                summary.last_pos,
+            });
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 fn runtimeFrameLayerShapeFromQkv(region: RuntimeRegion) ?RuntimeFrameLayerShape {
     return switch (region) {
         .q_linear => |pattern| .{ .rows = pattern.rows, .hidden_size = pattern.in_dim, .attention_input_size = pattern.out_dim },
         .linear_qkv => |pattern| .{ .rows = pattern.rows, .hidden_size = pattern.in_dim, .attention_input_size = pattern.q_out_dim },
         .grouped_linear_qkv_slice => |pattern| .{ .rows = pattern.rows, .hidden_size = pattern.in_dim, .attention_input_size = pattern.q_out_dim },
         .rms_norm_grouped_linear_qkv_slice => |pattern| .{ .rows = pattern.qkv.rows, .hidden_size = pattern.qkv.in_dim, .attention_input_size = pattern.qkv.q_out_dim },
+        .lora_linear_qkv => |pattern| .{ .rows = pattern.rows, .hidden_size = pattern.in_dim, .attention_input_size = pattern.q_out_dim },
         else => null,
     };
 }
@@ -1538,6 +1634,16 @@ fn runtimeFrameQkvMetadataFromRegion(graph: *const Graph, region: RuntimeRegion)
             .q_weight_id = pattern.qkv.q_weight_id,
             .k_weight_id = pattern.qkv.k_weight_id,
             .v_weight_id = pattern.qkv.v_weight_id,
+        },
+        .lora_linear_qkv => |pattern| .{
+            .layer_index = layerIndexForWeight(graph, pattern.q_base_weight_id) orelse return null,
+            .rows = pattern.rows,
+            .hidden_size = pattern.in_dim,
+            .q_dim = pattern.q_out_dim,
+            .kv_dim = pattern.kv_out_dim,
+            .q_weight_id = pattern.q_base_weight_id,
+            .k_weight_id = pattern.k_base_weight_id,
+            .v_weight_id = pattern.v_base_weight_id,
         },
         else => null,
     };
@@ -1643,7 +1749,15 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
     for (plan.regions_by_pos) |region| {
         switch (region) {
             .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .lora_backward => continue,
-            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice => {
+            .deberta_attention => {
+                if (phase != .attention or pending_qkv == null) {
+                    traceRuntimeFrameMetadataDeclined("attention_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
+                    return null;
+                }
+                phase = .ffn;
+                pending_attention = null;
+            },
+            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice, .lora_linear_qkv => {
                 if (phase != .qkv) {
                     traceRuntimeFrameMetadataDeclined("qkv_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
                     return null;
@@ -1758,7 +1872,11 @@ fn analyzeRuntimeFrameEligibility(plan: RuntimeRegionPlan) RuntimeFrameEligibili
     for (plan.regions_by_pos) |region| {
         switch (region) {
             .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .lora_backward => continue,
-            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice => {
+            .deberta_attention => {
+                if (phase != .attention) return .{ .layers = layers, .reason = .non_layer_order };
+                phase = .ffn;
+            },
+            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice, .lora_linear_qkv => {
                 if (phase != .qkv) return .{ .layers = layers, .reason = .non_layer_order };
                 layer_shape = runtimeFrameLayerShapeFromQkv(region) orelse return .{ .layers = layers, .reason = .non_layer_order };
                 phase = .attention;
@@ -1852,6 +1970,61 @@ fn markLoraLinearSkipped(skipped: []bool, pattern: LoraLinearPattern) void {
     markSkipped(skipped, pattern.after_a_id);
     markSkipped(skipped, pattern.after_b_id);
     markSkipped(skipped, pattern.scaled_id);
+}
+
+fn markLoraLinearQkvSkipped(skipped: []bool, pattern: LoraLinearQkvPattern) void {
+    markLoraLinearSkipped(skipped, pattern.q);
+    markLoraLinearSkipped(skipped, pattern.k);
+    markLoraLinearSkipped(skipped, pattern.v);
+    markSkipped(skipped, pattern.k.add_id);
+    markSkipped(skipped, pattern.v.add_id);
+}
+
+fn markDebertaAttentionSkipped(graph: *const Graph, skipped: []bool, pattern: DebertaAttentionPattern) void {
+    var node_id = pattern.first_node_id;
+    while (node_id <= pattern.output_id) : (node_id += 1) {
+        if (debertaAttentionNodeFeedsOutsideConsumer(
+            graph,
+            node_id,
+            pattern.first_node_id,
+            pattern.output_id,
+            pattern.output_id,
+            @intCast(pattern.output_id - pattern.first_node_id + 1),
+        )) continue;
+        markSkipped(skipped, node_id);
+        if (node_id == std.math.maxInt(NodeId)) break;
+    }
+}
+
+fn debertaAttentionNodeFeedsOutsideConsumer(
+    graph: *const Graph,
+    node_id: NodeId,
+    first_id: NodeId,
+    last_id: NodeId,
+    output_id: NodeId,
+    depth_remaining: usize,
+) bool {
+    if (node_id == output_id) return false;
+    if (depth_remaining == 0) return false;
+
+    var candidate_id: NodeId = 0;
+    while (candidate_id < graph.nodeCount()) : (candidate_id += 1) {
+        const candidate = graph.node(candidate_id);
+        for (candidate.getInputs()) |input_id| {
+            if (input_id != node_id) continue;
+            if (candidate_id < first_id or candidate_id > last_id) return true;
+            if (candidate_id == output_id) continue;
+            if (debertaAttentionNodeFeedsOutsideConsumer(
+                graph,
+                candidate_id,
+                first_id,
+                last_id,
+                output_id,
+                depth_remaining - 1,
+            )) return true;
+        }
+    }
+    return false;
 }
 
 fn markGroupedLinearQkvSkipped(skipped: []bool, pattern: GroupedLinearQkvSlicePattern) void {
@@ -2195,6 +2368,8 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .raw_linear_bias => 1,
         .raw_linear_bias_pair => 2,
         .lora_linear => 0,
+        .lora_linear_qkv => 0,
+        .deberta_attention => 0,
         .lora_backward => 0,
         .q_linear => 1,
         .linear_qkv, .grouped_linear_qkv_slice => 3,
@@ -2544,6 +2719,8 @@ fn prepareRuntimeRegion(
             .raw_linear_bias_pair = (try prepareRawLinearBiasPairRegion(cb, values, pattern, stats)) orelse return null,
         },
         .lora_linear => .{ .lora_linear = {} },
+        .lora_linear_qkv => .{ .lora_linear_qkv = {} },
+        .deberta_attention => .{ .deberta_attention = {} },
         .lora_backward => .{ .lora_backward = {} },
         .q_linear => |pattern| .{
             .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
@@ -2667,6 +2844,27 @@ fn tryExecutePlannedRuntimeRegion(
             device_id,
             exec_ctx.stats,
             pattern,
+        ),
+        .lora_linear_qkv => |pattern| executeLoraLinearQkvPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
+        ),
+        .deberta_attention => |pattern| executeDebertaAttentionPattern(
+            graph,
+            cb,
+            allocator,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
         ),
         .lora_backward => |pattern| executeLoraBackwardPattern(
             graph,
@@ -4126,6 +4324,36 @@ const LoraLinearPattern = struct {
     rank: usize,
 };
 
+const LoraLinearQkvPattern = struct {
+    q: LoraLinearPattern,
+    k: LoraLinearPattern,
+    v: LoraLinearPattern,
+    q_base_weight_id: NodeId,
+    k_base_weight_id: NodeId,
+    v_base_weight_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+};
+
+const DebertaAttentionPattern = struct {
+    first_node_id: NodeId,
+    output_id: NodeId,
+    q_id: NodeId,
+    k_id: NodeId,
+    v_id: NodeId,
+    q_r_id: NodeId,
+    k_r_id: NodeId,
+    attn_bias_id: NodeId,
+    layer_index: usize,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+};
+
 const LoraBackwardPattern = struct {
     d_after_a_id: NodeId,
     grad_a_dot_id: NodeId,
@@ -4279,6 +4507,157 @@ fn executeLoraLinearPattern(
         );
     }
     return true;
+}
+
+fn executeLoraLinearQkvPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: LoraLinearQkvPattern,
+    skipped_nodes: []bool,
+) !bool {
+    if (!try executeLoraLinearPattern(graph, cb, values, value_device, device_id, stats, pattern.q)) return false;
+    if (!try executeLoraLinearPattern(graph, cb, values, value_device, device_id, stats, pattern.k)) return false;
+    if (!try executeLoraLinearPattern(graph, cb, values, value_device, device_id, stats, pattern.v)) return false;
+    markLoraLinearQkvSkipped(skipped_nodes, pattern);
+    if (stats) |s| {
+        s.gemma_qkv_hits += 3;
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: lora_qkv_region executed q={d} k={d} v={d} rows={d} in={d} q_out={d} kv_out={d}\n",
+            .{ pattern.q.add_id, pattern.k.add_id, pattern.v.add_id, pattern.rows, pattern.in_dim, pattern.q_out_dim, pattern.kv_out_dim },
+        );
+    }
+    return true;
+}
+
+fn executeDebertaAttentionPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: DebertaAttentionPattern,
+    skipped_nodes: []bool,
+) !bool {
+    const q = valueFor(values, pattern.q_id) orelse {
+        traceDebertaAttentionExecutionDecline("missing_q", pattern);
+        return false;
+    };
+    const k = valueFor(values, pattern.k_id) orelse {
+        traceDebertaAttentionExecutionDecline("missing_k", pattern);
+        return false;
+    };
+    const v = valueFor(values, pattern.v_id) orelse {
+        traceDebertaAttentionExecutionDecline("missing_v", pattern);
+        return false;
+    };
+    const q_r = valueFor(values, pattern.q_r_id) orelse {
+        traceDebertaAttentionExecutionDecline("missing_q_r", pattern);
+        return false;
+    };
+    const k_r = valueFor(values, pattern.k_r_id) orelse {
+        traceDebertaAttentionExecutionDecline("missing_k_r", pattern);
+        return false;
+    };
+    const attn_bias = valueFor(values, pattern.attn_bias_id) orelse {
+        traceDebertaAttentionExecutionDecline("missing_bias", pattern);
+        return false;
+    };
+
+    const mask = try attentionMaskFromBias(allocator, cb, attn_bias, pattern.batch, pattern.seq_len, pattern.num_heads);
+    defer allocator.free(mask);
+
+    const output = cb.disentangledRelativeAttention(
+        q,
+        k,
+        v,
+        q_r,
+        k_r,
+        mask,
+        pattern.batch,
+        pattern.seq_len,
+        pattern.num_heads,
+        pattern.head_dim,
+    ) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => {
+            traceDebertaAttentionExecutionDecline(@errorName(err), pattern);
+            return false;
+        },
+        else => return err,
+    };
+    errdefer cb.free(output);
+
+    const output_shape = graph.node(pattern.output_id).output_shape;
+    var output_shape_buf: [8]i32 = undefined;
+    const output_rank = output_shape.rank();
+    if (output_rank > output_shape_buf.len) return error.UnsupportedShape;
+    for (0..output_rank) |dim_index| {
+        output_shape_buf[dim_index] = @intCast(output_shape.dims[dim_index]);
+    }
+    const output_alias = (try cb.cloneTensorShape(output, output_shape_buf[0..output_rank])) orelse {
+        traceDebertaAttentionExecutionDecline("output_alias", pattern);
+        return false;
+    };
+    errdefer cb.free(output_alias);
+
+    values[@intCast(pattern.first_node_id)] = output;
+    value_device[@intCast(pattern.first_node_id)] = device_id;
+    values[@intCast(pattern.output_id)] = output_alias;
+    value_device[@intCast(pattern.output_id)] = device_id;
+    markDebertaAttentionSkipped(graph, skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .attention, 1);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += @as(u64, pattern.output_id - pattern.first_node_id + 1);
+        s.gemma_attention_matmul_hits += 1;
+        recordGemmaRuntimeResidency(s, graph, pattern.output_id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: deberta_attention_region executed first={d} output={d} q={d} k={d} v={d} qr={d} kr={d} bias={d} layer={d} batch={d} seq={d} heads={d} head_dim={d}\n",
+            .{ pattern.first_node_id, pattern.output_id, pattern.q_id, pattern.k_id, pattern.v_id, pattern.q_r_id, pattern.k_r_id, pattern.attn_bias_id, pattern.layer_index, pattern.batch, pattern.seq_len, pattern.num_heads, pattern.head_dim },
+        );
+    }
+    return true;
+}
+
+fn traceDebertaAttentionExecutionDecline(reason: []const u8, pattern: DebertaAttentionPattern) void {
+    if (!traceMetalGraphFusionsEnabled()) return;
+    std.debug.print(
+        "metal_graph_fusion_trace: deberta_attention_region declined reason={s} first={d} output={d} q={d} k={d} v={d} qr={d} kr={d} bias={d} layer={d}\n",
+        .{ reason, pattern.first_node_id, pattern.output_id, pattern.q_id, pattern.k_id, pattern.v_id, pattern.q_r_id, pattern.k_r_id, pattern.attn_bias_id, pattern.layer_index },
+    );
+}
+
+fn attentionMaskFromBias(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    attn_bias: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+) ![]i64 {
+    const bias = try cb.toFloat32(attn_bias, allocator);
+    defer allocator.free(bias);
+    if (bias.len < batch * num_heads * seq_len * seq_len) return error.InvalidAttentionShape;
+
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    errdefer allocator.free(mask);
+    for (0..batch) |b| {
+        for (0..seq_len) |k| {
+            const idx = ((b * num_heads) * seq_len + 0) * seq_len + k;
+            mask[b * seq_len + k] = if (bias[idx] < -1.0e8) 0 else 1;
+        }
+    }
+    return mask;
 }
 
 fn executeLoraBackwardPattern(
@@ -4537,6 +4916,407 @@ fn markLoraBackwardSkipped(skipped: []bool, pattern: LoraBackwardPattern) void {
         const index: usize = @intCast(node_id);
         if (index < skipped.len) skipped[index] = true;
     }
+}
+
+fn matchLoraLinearQkvPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LoraLinearQkvPattern {
+    const current = matchLoraLinearPattern(graph, node_ids, node_pos, reachable, skipped_nodes) orelse return null;
+    const current_weight_name = loraBaseWeightParameterName(graph, current) orelse {
+        traceLoraQkvMatchDecline("no_base_weight", current, null);
+        return null;
+    };
+    traceLoraQkvMatchCandidate("candidate", current, current_weight_name);
+    const q = if (isQueryProjectionWeightName(current_weight_name))
+        current
+    else
+        findLoraQkvSibling(graph, node_ids, 0, reachable, skipped_nodes, current, &isQueryProjectionWeightName) orelse {
+            traceLoraQkvMatchDecline("missing_q", current, current_weight_name);
+            return null;
+        };
+    const k = if (isKeyProjectionWeightName(current_weight_name))
+        current
+    else
+        findLoraQkvSibling(graph, node_ids, 0, reachable, skipped_nodes, current, &isKeyProjectionWeightName) orelse {
+            traceLoraQkvMatchDecline("missing_k", current, current_weight_name);
+            return null;
+        };
+    const v = if (isValueProjectionWeightName(current_weight_name))
+        current
+    else
+        findLoraQkvSibling(graph, node_ids, 0, reachable, skipped_nodes, current, &isValueProjectionWeightName) orelse {
+            traceLoraQkvMatchDecline("missing_v", current, current_weight_name);
+            return null;
+        };
+    const q_pos = findNodePos(node_ids, q.add_id) orelse return null;
+    const k_pos = findNodePos(node_ids, k.add_id) orelse return null;
+    const v_pos = findNodePos(node_ids, v.add_id) orelse return null;
+    if (node_pos != @min(q_pos, @min(k_pos, v_pos))) {
+        traceLoraQkvMatchDecline("not_earliest", current, current_weight_name);
+        return null;
+    }
+    const q_base_weight_id = loraBaseWeightId(graph, q) orelse return null;
+    const k_base_weight_id = loraBaseWeightId(graph, k) orelse return null;
+    const v_base_weight_id = loraBaseWeightId(graph, v) orelse return null;
+    if (k.out_dim != v.out_dim) {
+        traceLoraQkvMatchDecline("kv_dim_mismatch", current, current_weight_name);
+        return null;
+    }
+    if (traceLoraQkvMatchingEnabled()) {
+        std.debug.print(
+            "lora_qkv_match: matched q={d} k={d} v={d} q_pos={d} k_pos={d} v_pos={d} rows={d} in={d} q_out={d} kv_out={d}\n",
+            .{ q.add_id, k.add_id, v.add_id, q_pos, k_pos, v_pos, q.rows, q.in_dim, q.out_dim, k.out_dim },
+        );
+    }
+    return .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .q_base_weight_id = q_base_weight_id,
+        .k_base_weight_id = k_base_weight_id,
+        .v_base_weight_id = v_base_weight_id,
+        .rows = q.rows,
+        .in_dim = q.in_dim,
+        .q_out_dim = q.out_dim,
+        .kv_out_dim = k.out_dim,
+    };
+}
+
+fn matchDebertaAttentionPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    regions: []const RuntimeRegion,
+) ?DebertaAttentionPattern {
+    const first_node_id = node_ids[node_pos];
+    const first_node = graph.node(first_node_id);
+    const first_shape = first_node.output_shape;
+    if (std.meta.activeTag(first_node.op) != .reshape) return null;
+    if (previousDebertaAttentionRegionCovers(regions, node_pos, first_node_id)) {
+        traceDebertaAttentionMatchDecline("overlapping_region", first_node_id, first_shape, null, null);
+        return null;
+    }
+    if (first_shape.rank() != 4) {
+        traceDebertaAttentionMatchDecline("rank", first_node_id, first_shape, null, null);
+        return null;
+    }
+    const num_heads = shapeDimUsize(first_shape, 0) orelse {
+        traceDebertaAttentionMatchDecline("num_heads_dim", first_node_id, first_shape, null, null);
+        return null;
+    };
+    const seq_len = shapeDimUsize(first_shape, 1) orelse {
+        traceDebertaAttentionMatchDecline("seq_dim", first_node_id, first_shape, null, null);
+        return null;
+    };
+    const seq_len_2 = shapeDimUsize(first_shape, 2) orelse {
+        traceDebertaAttentionMatchDecline("seq2_dim", first_node_id, first_shape, null, null);
+        return null;
+    };
+    const head_dim = shapeDimUsize(first_shape, 3) orelse {
+        traceDebertaAttentionMatchDecline("head_dim", first_node_id, first_shape, null, null);
+        return null;
+    };
+    traceDebertaAttentionMatchCandidate(first_node_id, first_shape, num_heads, seq_len, seq_len_2, head_dim);
+    if (num_heads == 0 or seq_len == 0 or seq_len_2 != seq_len or head_dim == 0) {
+        traceDebertaAttentionMatchDecline("shape", first_node_id, first_shape, null, null);
+        return null;
+    }
+    const hidden_size = num_heads * head_dim;
+    const rel_len = seq_len * 2 - 1;
+
+    const qkv = previousLoraQkvRegion(regions, node_pos) orelse {
+        traceDebertaAttentionMatchDecline("missing_qkv", first_node_id, first_shape, null, null);
+        return null;
+    };
+    if (qkv.rows != seq_len or qkv.q_out_dim != hidden_size or qkv.kv_out_dim != hidden_size) {
+        traceDebertaAttentionMatchDecline("qkv_shape", first_node_id, first_shape, qkv.q.add_id, null);
+        return null;
+    }
+    const layer_index = layerIndexForWeight(graph, qkv.q_base_weight_id) orelse {
+        traceDebertaAttentionMatchDecline("qkv_layer", first_node_id, first_shape, qkv.q.add_id, null);
+        return null;
+    };
+
+    const q_r_id = findCompactDebertaRelativeProjection(graph, node_ids, node_pos, reachable, layer_index, rel_len, hidden_size, &isQueryProjectionWeightName) orelse {
+        traceDebertaAttentionMatchDecline("missing_q_r", first_node_id, first_shape, qkv.q.add_id, null);
+        return null;
+    };
+    const k_r_id = findCompactDebertaRelativeProjection(graph, node_ids, node_pos, reachable, layer_index, rel_len, hidden_size, &isKeyProjectionWeightName) orelse {
+        traceDebertaAttentionMatchDecline("missing_k_r", first_node_id, first_shape, qkv.q.add_id, q_r_id);
+        return null;
+    };
+    if (q_r_id == k_r_id) {
+        traceDebertaAttentionMatchDecline("same_relative_projection", first_node_id, first_shape, q_r_id, k_r_id);
+        return null;
+    }
+
+    const attn_bias_id = findDebertaAttentionBiasInput(graph, node_ids, node_pos, reachable, skipped_nodes, num_heads, seq_len) orelse {
+        traceDebertaAttentionMatchDecline("missing_bias", first_node_id, first_shape, q_r_id, k_r_id);
+        return null;
+    };
+    const output_id = findDebertaAttentionMergedOutput(graph, node_ids, node_pos, reachable, skipped_nodes, seq_len, hidden_size) orelse {
+        traceDebertaAttentionMatchDecline("missing_output", first_node_id, first_shape, attn_bias_id, null);
+        return null;
+    };
+    if (output_id <= first_node_id) {
+        traceDebertaAttentionMatchDecline("output_before_start", first_node_id, first_shape, output_id, null);
+        return null;
+    }
+
+    return .{
+        .first_node_id = first_node_id,
+        .output_id = output_id,
+        .q_id = qkv.q.add_id,
+        .k_id = qkv.k.add_id,
+        .v_id = qkv.v.add_id,
+        .q_r_id = q_r_id,
+        .k_r_id = k_r_id,
+        .attn_bias_id = attn_bias_id,
+        .layer_index = layer_index,
+        .batch = 1,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .hidden_size = hidden_size,
+    };
+}
+
+fn previousDebertaAttentionRegionCovers(regions: []const RuntimeRegion, node_pos: usize, node_id: NodeId) bool {
+    var pos = node_pos;
+    while (pos > 0) {
+        pos -= 1;
+        switch (regions[pos]) {
+            .deberta_attention => |pattern| {
+                if (node_id >= pattern.first_node_id and node_id <= pattern.output_id) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn previousLoraQkvRegion(regions: []const RuntimeRegion, node_pos: usize) ?LoraLinearQkvPattern {
+    var pos = node_pos;
+    while (pos > 0) {
+        pos -= 1;
+        switch (regions[pos]) {
+            .lora_linear_qkv => |pattern| return pattern,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn findCompactDebertaRelativeProjection(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    end_pos: usize,
+    reachable: []const bool,
+    layer_index: usize,
+    rel_len: usize,
+    hidden_size: usize,
+    weight_name_predicate: *const fn ([]const u8) bool,
+) ?NodeId {
+    var pos = end_pos;
+    while (pos > 0) {
+        pos -= 1;
+        const node_id = node_ids[pos];
+        const node_index: usize = @intCast(node_id);
+        if (node_index >= reachable.len or !reachable[node_index]) continue;
+        const node = graph.node(node_id);
+        const shape = node.output_shape;
+        if (shape.rank() != 2) continue;
+        if (shapeDimUsize(shape, 0) != rel_len or shapeDimUsize(shape, 1) != hidden_size) continue;
+        const weight_id = projectionWeightParameterFromNode(graph, node_id, 8) orelse continue;
+        const weight = graph.node(weight_id);
+        if (std.meta.activeTag(weight.op) != .parameter) continue;
+        if (layerIndexForWeight(graph, weight_id) != layer_index) continue;
+        const weight_name = graph.parameterName(weight);
+        if (!weight_name_predicate(weight_name)) continue;
+        return node_id;
+    }
+    return null;
+}
+
+fn findDebertaAttentionBiasInput(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    num_heads: usize,
+    seq_len: usize,
+) ?NodeId {
+    for (node_ids[start_pos..], start_pos..) |node_id, pos| {
+        if (pos > start_pos + 160) break;
+        const node_index: usize = @intCast(node_id);
+        if (node_index >= reachable.len or !reachable[node_index]) continue;
+        if (node_index < skipped_nodes.len and skipped_nodes[node_index]) continue;
+        const node = graph.node(node_id);
+        switch (node.op) {
+            .add, .fused_elem_add => {},
+            else => continue,
+        }
+        const shape = node.output_shape;
+        if (shape.rank() != 3) continue;
+        if (shapeDimUsize(shape, 0) != num_heads or shapeDimUsize(shape, 1) != seq_len or shapeDimUsize(shape, 2) != seq_len) continue;
+        for (node.getInputs()) |input_id| {
+            if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+            const input = graph.node(input_id);
+            if (std.meta.activeTag(input.op) != .parameter) continue;
+            const input_shape = input.output_shape;
+            if (input_shape.rank() != 3) continue;
+            if (shapeDimUsize(input_shape, 0) != num_heads or shapeDimUsize(input_shape, 1) != seq_len or shapeDimUsize(input_shape, 2) != seq_len) continue;
+            if (std.mem.indexOf(u8, graph.parameterName(input), "attn_bias") == null) continue;
+            return input_id;
+        }
+    }
+    return null;
+}
+
+fn findDebertaAttentionMergedOutput(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    seq_len: usize,
+    hidden_size: usize,
+) ?NodeId {
+    for (node_ids[start_pos..], start_pos..) |node_id, pos| {
+        if (pos > start_pos + 180) break;
+        const node_index: usize = @intCast(node_id);
+        if (node_index >= reachable.len or !reachable[node_index]) continue;
+        if (node_index < skipped_nodes.len and skipped_nodes[node_index]) continue;
+        const pattern = matchLoraLinearPattern(graph, node_ids, pos, reachable, skipped_nodes) orelse continue;
+        const weight_name = loraBaseWeightParameterName(graph, pattern) orelse {
+            traceDebertaAttentionOutputCandidate("no_weight", node_id, pattern, null);
+            continue;
+        };
+        traceDebertaAttentionOutputCandidate("candidate", node_id, pattern, weight_name);
+        if (!isDebertaAttentionOutputDenseName(weight_name)) continue;
+        if (pattern.rows != seq_len or pattern.in_dim != hidden_size or pattern.out_dim != hidden_size) {
+            traceDebertaAttentionOutputCandidate("shape_mismatch", node_id, pattern, weight_name);
+            return null;
+        }
+        return pattern.input_id;
+    }
+    return null;
+}
+
+fn traceLoraQkvMatchCandidate(label: []const u8, pattern: LoraLinearPattern, weight_name: []const u8) void {
+    if (!traceLoraQkvMatchingEnabled()) return;
+    std.debug.print(
+        "lora_qkv_match: {s} add={d} base={d} input={d} weight={s} rows={d} in={d} out={d} rank={d}\n",
+        .{ label, pattern.add_id, pattern.base_linear_id, pattern.input_id, weight_name, pattern.rows, pattern.in_dim, pattern.out_dim, pattern.rank },
+    );
+}
+
+fn traceLoraQkvMatchDecline(reason: []const u8, pattern: LoraLinearPattern, weight_name: ?[]const u8) void {
+    if (!traceLoraQkvMatchingEnabled()) return;
+    std.debug.print(
+        "lora_qkv_match: declined reason={s} add={d} base={d} input={d} weight={s} rows={d} in={d} out={d} rank={d}\n",
+        .{ reason, pattern.add_id, pattern.base_linear_id, pattern.input_id, weight_name orelse "none", pattern.rows, pattern.in_dim, pattern.out_dim, pattern.rank },
+    );
+}
+
+fn traceDebertaAttentionMatchCandidate(node_id: NodeId, shape: ml.graph.Shape, dim0: usize, dim1: usize, dim2: usize, dim3: usize) void {
+    if (!traceDebertaAttentionMatchingEnabled()) return;
+    std.debug.print(
+        "deberta_attention_match: candidate node={d} rank={d} dims={d},{d},{d},{d}\n",
+        .{ node_id, shape.rank(), dim0, dim1, dim2, dim3 },
+    );
+}
+
+fn traceDebertaAttentionMatchDecline(reason: []const u8, node_id: NodeId, shape: ml.graph.Shape, id0: ?NodeId, id1: ?NodeId) void {
+    if (!traceDebertaAttentionMatchingEnabled()) return;
+    std.debug.print(
+        "deberta_attention_match: declined reason={s} node={d} rank={d} id0={d} id1={d}\n",
+        .{ reason, node_id, shape.rank(), id0 orelse null_node, id1 orelse null_node },
+    );
+}
+
+fn traceDebertaAttentionOutputCandidate(label: []const u8, node_id: NodeId, pattern: LoraLinearPattern, weight_name: ?[]const u8) void {
+    if (!traceDebertaAttentionMatchingEnabled()) return;
+    std.debug.print(
+        "deberta_attention_output_match: {s} node={d} add={d} input={d} base={d} weight={s} rows={d} in={d} out={d}\n",
+        .{ label, node_id, pattern.add_id, pattern.input_id, pattern.base_linear_id, weight_name orelse "none", pattern.rows, pattern.in_dim, pattern.out_dim },
+    );
+}
+
+fn findLoraQkvSibling(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    q: LoraLinearPattern,
+    weight_name_predicate: *const fn ([]const u8) bool,
+) ?LoraLinearPattern {
+    for (node_ids[start_pos..], start_pos..) |candidate_id, candidate_pos| {
+        const candidate_index: usize = @intCast(candidate_id);
+        if (candidate_index >= reachable.len or !reachable[candidate_index]) continue;
+        if (candidate_index < skipped_nodes.len and skipped_nodes[candidate_index]) continue;
+        const candidate = matchLoraLinearPattern(graph, node_ids, candidate_pos, reachable, skipped_nodes) orelse continue;
+        if (candidate.input_id != q.input_id or candidate.rows != q.rows or candidate.in_dim != q.in_dim) continue;
+        const weight_name = loraBaseWeightParameterName(graph, candidate) orelse continue;
+        if (!weight_name_predicate(weight_name)) continue;
+        return candidate;
+    }
+    return null;
+}
+
+fn loraBaseWeightId(graph: *const Graph, pattern: LoraLinearPattern) ?NodeId {
+    if (projectionWeightParameterFromNode(graph, pattern.base_linear_id, 6)) |weight_id| return weight_id;
+    const base = graph.node(pattern.base_linear_id);
+    if (base.num_inputs < 2) return null;
+    const weight_id = base.inputs[1];
+    if (weight_id == null_node) return null;
+    if (graph.node(weight_id).op == .parameter) return weight_id;
+    return sourceParameterFromSimpleTranspose(graph, weight_id);
+}
+
+fn projectionWeightParameterFromNode(graph: *const Graph, node_id: NodeId, depth: usize) ?NodeId {
+    if (node_id == null_node or node_id >= graph.nodeCount() or depth == 0) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .parameter => {
+            const name = graph.parameterName(node);
+            if (isQueryProjectionWeightName(name) or isKeyProjectionWeightName(name) or isValueProjectionWeightName(name)) return node_id;
+            return null;
+        },
+        .transpose => {
+            if (node.num_inputs < 1) return null;
+            return projectionWeightParameterFromNode(graph, node.inputs[0], depth - 1);
+        },
+        .dot_general, .fused_linear, .fused_linear_no_bias => {
+            if (node.num_inputs >= 2) {
+                if (projectionWeightParameterFromNode(graph, node.inputs[1], depth - 1)) |weight_id| return weight_id;
+            }
+            if (node.num_inputs >= 1) return projectionWeightParameterFromNode(graph, node.inputs[0], depth - 1);
+            return null;
+        },
+        .add, .fused_elem_add => {
+            for (node.getInputs()) |input_id| {
+                if (projectionWeightParameterFromNode(graph, input_id, depth - 1)) |weight_id| return weight_id;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn loraBaseWeightParameterName(graph: *const Graph, pattern: LoraLinearPattern) ?[]const u8 {
+    const weight_id = loraBaseWeightId(graph, pattern) orelse return null;
+    const weight = graph.node(weight_id);
+    if (weight.op != .parameter) return null;
+    return graph.parameterName(weight);
 }
 
 fn matchLoraLinearPattern(
@@ -5479,6 +6259,7 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
         pattern.norm_id,
         device_id,
         last_use,
+        null,
         rt_map,
         donated,
         exec_ctx,
@@ -5492,6 +6273,7 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
         pattern.qkv.linear_id,
         device_id,
         last_use,
+        null,
         rt_map,
         donated,
         exec_ctx,
@@ -5686,6 +6468,7 @@ fn executeGroupedLinearQkvSlicePattern(
         pattern.linear_id,
         device_id,
         last_use,
+        null,
         rt_map,
         donated,
         exec_ctx,
@@ -5953,6 +6736,7 @@ fn executeLinearNoBiasQkvPattern(
         pattern.k_id,
         device_id,
         last_use,
+        null,
         rt_map,
         donated,
         exec_ctx,
@@ -5966,6 +6750,7 @@ fn executeLinearNoBiasQkvPattern(
         pattern.v_id,
         device_id,
         last_use,
+        null,
         rt_map,
         donated,
         exec_ctx,
@@ -6087,6 +6872,22 @@ fn isGemmaVWeightName(name: []const u8) bool {
     return std.mem.indexOf(u8, name, ".self_attn.v_proj.weight") != null;
 }
 
+fn isQueryProjectionWeightName(name: []const u8) bool {
+    return isGemmaQWeightName(name) or std.mem.indexOf(u8, name, ".attention.self.query_proj.weight") != null;
+}
+
+fn isKeyProjectionWeightName(name: []const u8) bool {
+    return isGemmaKWeightName(name) or std.mem.indexOf(u8, name, ".attention.self.key_proj.weight") != null;
+}
+
+fn isValueProjectionWeightName(name: []const u8) bool {
+    return isGemmaVWeightName(name) or std.mem.indexOf(u8, name, ".attention.self.value_proj.weight") != null;
+}
+
+fn isDebertaAttentionOutputDenseName(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, ".attention.output.dense.") != null;
+}
+
 fn tryExecuteLinearNoBiasPairPattern(
     allocator: std.mem.Allocator,
     graph: *const Graph,
@@ -6182,6 +6983,7 @@ fn tryExecuteLinearNoBiasPairPattern(
         second_id,
         device_id,
         last_use,
+        null,
         rt_map,
         donated,
         exec_ctx,
@@ -6274,7 +7076,9 @@ fn layerIndexForWeightDepth(graph: *const Graph, weight_id: NodeId, depth: usize
     if (weight_id == null_node) return null;
     const weight = graph.node(weight_id);
     if (std.meta.activeTag(weight.op) == .parameter) {
-        return parseGemmaLayerIndex(graph.parameterName(weight));
+        const name = graph.parameterName(weight);
+        if (parseGemmaLayerIndex(name)) |layer_index| return layer_index;
+        return parseDebertaLayerIndex(name);
     }
     if (depth == 0) return null;
     for (weight.getInputs()) |input_id| {
@@ -6285,6 +7089,16 @@ fn layerIndexForWeightDepth(graph: *const Graph, weight_id: NodeId, depth: usize
 
 fn parseGemmaLayerIndex(name: []const u8) ?usize {
     const prefix = "model.layers.";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const rest = name[prefix.len..];
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseUnsigned(usize, rest[0..end], 10) catch null;
+}
+
+fn parseDebertaLayerIndex(name: []const u8) ?usize {
+    const prefix = "encoder.layer.";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
     const rest = name[prefix.len..];
     var end: usize = 0;
@@ -7643,6 +8457,7 @@ fn executeRuntimeAdd(
 ) !?CT {
     const dim = tensorElementCount(output_shape) orelse return null;
     if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
+    if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     const lhs = valueFor(values, inputs[0]) orelse return null;
     const rhs = valueFor(values, inputs[1]) orelse return null;
     if (isMetalDeviceResident(cb, lhs) or isMetalDeviceResident(cb, rhs)) {
@@ -7662,6 +8477,11 @@ const DeferredScaleMul = struct {
     source_id: NodeId,
     scalar_id: NodeId,
     scale: f32,
+};
+
+const DeferredElementwiseMul = struct {
+    lhs_id: NodeId,
+    rhs_id: NodeId,
 };
 
 fn executeRuntimeScaledAddFromDeferredMul(
@@ -7719,6 +8539,162 @@ fn executeRuntimeScaledAddFromDeferredMul(
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
     return null;
+}
+
+fn executeRuntimeMultiplyAddFromDeferredMul(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    output_shape: ml.graph.Shape,
+    dim: usize,
+) !?CT {
+    if (inputs.len < 2) return null;
+    if (deferredElementwiseMul(graph, inputs[0], output_shape)) |mul| {
+        if (deferredElementwiseMul(graph, inputs[1], output_shape)) |rhs_mul| {
+            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim);
+        }
+        const addend = valueFor(values, inputs[1]) orelse return null;
+        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
+    }
+    if (deferredElementwiseMul(graph, inputs[1], output_shape)) |mul| {
+        const addend = valueFor(values, inputs[0]) orelse return null;
+        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
+    }
+    return null;
+}
+
+fn executeDeferredElementwiseMultiplyAdd2(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    lhs_mul: DeferredElementwiseMul,
+    rhs_mul: DeferredElementwiseMul,
+    dim: usize,
+) !?CT {
+    var lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
+    var rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
+    var lhs1 = valueFor(values, rhs_mul.lhs_id) orelse return null;
+    var rhs1 = valueFor(values, rhs_mul.rhs_id) orelse return null;
+    var owned_lhs0: ?CT = null;
+    defer if (owned_lhs0) |ct| cb.free(ct);
+    var owned_rhs0: ?CT = null;
+    defer if (owned_rhs0) |ct| cb.free(ct);
+    var owned_lhs1: ?CT = null;
+    defer if (owned_lhs1) |ct| cb.free(ct);
+    var owned_rhs1: ?CT = null;
+    defer if (owned_rhs1) |ct| cb.free(ct);
+    if (cb.kind() == .metal) {
+        if (!isMetalDeviceResident(cb, lhs0)) {
+            if (try makeMetalDeviceResident(cb, lhs0)) |device_lhs0| {
+                if (device_lhs0 != lhs0) owned_lhs0 = device_lhs0;
+                lhs0 = device_lhs0;
+            }
+        }
+        if (!isMetalDeviceResident(cb, rhs0)) {
+            if (try makeMetalDeviceResident(cb, rhs0)) |device_rhs0| {
+                if (device_rhs0 != rhs0) owned_rhs0 = device_rhs0;
+                rhs0 = device_rhs0;
+            }
+        }
+        if (!isMetalDeviceResident(cb, lhs1)) {
+            if (try makeMetalDeviceResident(cb, lhs1)) |device_lhs1| {
+                if (device_lhs1 != lhs1) owned_lhs1 = device_lhs1;
+                lhs1 = device_lhs1;
+            }
+        }
+        if (!isMetalDeviceResident(cb, rhs1)) {
+            if (try makeMetalDeviceResident(cb, rhs1)) |device_rhs1| {
+                if (device_rhs1 != rhs1) owned_rhs1 = device_rhs1;
+                rhs1 = device_rhs1;
+            }
+        }
+    }
+    const output = cb.decoderRuntimeApplyMultiplyAdd2(&.{
+        .lhs0 = lhs0,
+        .rhs0 = rhs0,
+        .lhs1 = lhs1,
+        .rhs1 = rhs1,
+        .dim = dim,
+    }) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        else => return err,
+    };
+    if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+
+    const lhs_product = cb.multiply(lhs0, rhs0) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    defer cb.free(lhs_product);
+    const rhs_product = cb.multiply(lhs1, rhs1) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    defer cb.free(rhs_product);
+    const fallback = cb.add(lhs_product, rhs_product) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    return try promoteMetalOutputIfNeeded(cb, fallback);
+}
+
+fn executeDeferredElementwiseMultiplyAdd(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    mul: DeferredElementwiseMul,
+    addend: CT,
+    dim: usize,
+) !?CT {
+    var lhs = valueFor(values, mul.lhs_id) orelse return null;
+    var rhs = valueFor(values, mul.rhs_id) orelse return null;
+    var residual = addend;
+    var owned_lhs: ?CT = null;
+    defer if (owned_lhs) |ct| cb.free(ct);
+    var owned_rhs: ?CT = null;
+    defer if (owned_rhs) |ct| cb.free(ct);
+    var owned_residual: ?CT = null;
+    defer if (owned_residual) |ct| cb.free(ct);
+    if (cb.kind() == .metal) {
+        if (!isMetalDeviceResident(cb, lhs)) {
+            if (try makeMetalDeviceResident(cb, lhs)) |device_lhs| {
+                if (device_lhs != lhs) owned_lhs = device_lhs;
+                lhs = device_lhs;
+            }
+        }
+        if (!isMetalDeviceResident(cb, rhs)) {
+            if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
+                if (device_rhs != rhs) owned_rhs = device_rhs;
+                rhs = device_rhs;
+            }
+        }
+        if (!isMetalDeviceResident(cb, residual)) {
+            if (try makeMetalDeviceResident(cb, residual)) |device_residual| {
+                if (device_residual != residual) owned_residual = device_residual;
+                residual = device_residual;
+            }
+        }
+    }
+    const output = cb.decoderRuntimeApplyMultiplyAdd(&.{
+        .lhs = lhs,
+        .rhs = rhs,
+        .addend = residual,
+        .dim = dim,
+    }) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        else => return err,
+    };
+    if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
+
+    const multiplied = cb.multiply(lhs, rhs) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    defer cb.free(multiplied);
+    const fallback = cb.add(multiplied, residual) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    return try promoteMetalOutputIfNeeded(cb, fallback);
 }
 
 fn executeDeferredScaleMulValue(
@@ -7796,6 +8772,36 @@ fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph
     return null;
 }
 
+fn deferredElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseMul {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return null,
+    }
+    if (!shapesEqual(node.output_shape, output_shape)) return null;
+    if (node.output_shape.dtype != .f32 or node.num_inputs < 2) return null;
+    if (deferredScaleMul(graph, node_id, output_shape) != null) return null;
+    const lhs_id = node.inputs[0];
+    const rhs_id = node.inputs[1];
+    if (lhs_id == null_node or rhs_id == null_node or lhs_id >= graph.nodeCount() or rhs_id >= graph.nodeCount()) return null;
+    if (!shapesEqual(graph.node(lhs_id).output_shape, output_shape)) return null;
+    if (!shapesEqual(graph.node(rhs_id).output_shape, output_shape)) return null;
+    if (isSameShapeElementwiseMul(graph, lhs_id, output_shape)) return null;
+    if (isSameShapeElementwiseMul(graph, rhs_id, output_shape)) return null;
+    return .{ .lhs_id = lhs_id, .rhs_id = rhs_id };
+}
+
+fn isSameShapeElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) bool {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .mul, .fused_elem_multiply => {},
+        else => return false,
+    }
+    return shapesEqual(node.output_shape, output_shape);
+}
+
 fn shouldDeferScaleMulForAdd(
     graph: *const Graph,
     node_id: NodeId,
@@ -7817,6 +8823,30 @@ fn shouldDeferScaleMulForAdd(
     if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
     if (reachableUseCount(graph, node_id, reachable, 2) != 1) return false;
     return deferredScaleMul(graph, node_id, consumer.output_shape) != null;
+}
+
+fn shouldDeferElementwiseMulForAdd(
+    graph: *const Graph,
+    node_id: NodeId,
+    reachable: []const bool,
+    last_use: []const u32,
+) bool {
+    const node_index: usize = @intCast(node_id);
+    if (node_index >= reachable.len or !reachable[node_index]) return false;
+    if (node_index >= last_use.len) return false;
+    const consumer_id: NodeId = @intCast(last_use[node_index]);
+    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
+    const consumer_index: usize = @intCast(consumer_id);
+    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
+    const consumer = graph.node(consumer_id);
+    switch (consumer.op) {
+        .add, .fused_elem_add => {},
+        else => return false,
+    }
+    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
+    if (reachableUseCount(graph, node_id, reachable, 2) != 1) return false;
+    if (deferredElementwiseMul(graph, node_id, consumer.output_shape) == null) return false;
+    return true;
 }
 
 fn reachableUseCount(graph: *const Graph, node_id: NodeId, reachable: []const bool, stop_after: usize) usize {
@@ -8121,6 +9151,7 @@ fn freeExpiredInputs(
     node_id: NodeId,
     device_id: DeviceId,
     last_use: []const u32,
+    runtime_region_plan: ?RuntimeRegionPlan,
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
     exec_ctx: PartitionExecutor.ExecutionContext,
@@ -8133,6 +9164,7 @@ fn freeExpiredInputs(
         if (input_id == null_node or input_id >= values.len) continue;
         const input_index: usize = @intCast(input_id);
         if (last_use[input_index] != node_index) continue;
+        if (runtimeRegionNeedsInputAfterNode(runtime_region_plan, input_id, node_id)) continue;
         if (rt_map.contains(input_id) and
             !donated.contains(input_id) and
             !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
@@ -8163,6 +9195,28 @@ fn freeExpiredInputs(
         }
         values[input_index] = null;
     }
+}
+
+fn runtimeRegionNeedsInputAfterNode(plan_opt: ?RuntimeRegionPlan, input_id: NodeId, node_id: NodeId) bool {
+    const plan = plan_opt orelse return false;
+    for (plan.regions_by_pos) |region| {
+        switch (region) {
+            .deberta_attention => |pattern| {
+                if (pattern.first_node_id <= node_id) continue;
+                if (input_id == pattern.q_id or
+                    input_id == pattern.k_id or
+                    input_id == pattern.v_id or
+                    input_id == pattern.q_r_id or
+                    input_id == pattern.k_r_id or
+                    input_id == pattern.attn_bias_id)
+                {
+                    return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn evalPartitionBoundaryOutputs(
@@ -9274,6 +10328,85 @@ test "metal partition executor defers two independent scalar scale mul add input
     try std.testing.expect(shouldDeferScaleMulForAdd(&g, rhs_scaled, reachable, last_use));
     try std.testing.expect(deferredScaleMul(&g, lhs_scaled, g.node(out).output_shape) != null);
     try std.testing.expect(deferredScaleMul(&g, rhs_scaled, g.node(out).output_shape) != null);
+}
+
+test "metal partition executor defers same shape multiply for multiply-add" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const multiplied = try b.mul(x, y);
+    const out = try b.add(multiplied, z);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, multiplied, reachable, 2));
+    try std.testing.expect(deferredElementwiseMul(&g, multiplied, g.node(out).output_shape) != null);
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use));
+}
+
+test "metal partition executor defers both same shape multiply add inputs" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const w = try b.parameter("w", shape);
+    const lhs = try b.mul(x, y);
+    const rhs = try b.mul(z, w);
+    const out = try b.add(lhs, rhs);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, lhs, reachable, 2));
+    try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, rhs, reachable, 2));
+    try std.testing.expect(deferredElementwiseMul(&g, lhs, g.node(out).output_shape) != null);
+    try std.testing.expect(deferredElementwiseMul(&g, rhs, g.node(out).output_shape) != null);
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, lhs, reachable, last_use));
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, rhs, reachable, last_use));
+}
+
+test "metal partition executor does not defer nested same shape multiply add input" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const residual = try b.parameter("residual", shape);
+    const inner = try b.mul(x, y);
+    const outer = try b.mul(inner, z);
+    const out = try b.add(outer, residual);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expect(deferredElementwiseMul(&g, inner, g.node(out).output_shape) != null);
+    try std.testing.expect(deferredElementwiseMul(&g, outer, g.node(out).output_shape) == null);
+    try std.testing.expect(!shouldDeferElementwiseMulForAdd(&g, outer, reachable, last_use));
 }
 
 test "metal partition executor does not defer transpose when it escapes non-linear-dot consumers" {

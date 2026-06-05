@@ -475,6 +475,21 @@ pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
     output_scale: f32,
 };
 
+pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
+    lhs: CT,
+    rhs: CT,
+    addend: CT,
+    dim: usize,
+};
+
+pub const DecoderRuntimeApplyMultiplyAdd2Request = struct {
+    lhs0: CT,
+    rhs0: CT,
+    lhs1: CT,
+    rhs1: CT,
+    dim: usize,
+};
+
 pub const AttentionMode = enum {
     dense_causal,
     paged_prefill,

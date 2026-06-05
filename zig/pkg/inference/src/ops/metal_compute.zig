@@ -140,6 +140,10 @@ fn traceGatedDeviceRequested() bool {
     return getenvBool("TERMITE_METAL_TRACE_GATED_DEVICE");
 }
 
+fn enableRank1DotSpecialization() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_RANK1_DOT_SPECIALIZATION");
+}
+
 fn disableRuntimeEmbeddingLookup() bool {
     return getenvBool("TERMITE_METAL_DISABLE_RUNTIME_EMBEDDING_LOOKUP");
 }
@@ -7634,6 +7638,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!lhs_mt.isDevice() or !rhs_mt.isDevice()) return null;
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
+        if (enableRank1DotSpecialization() and (k == 1 or n == 1)) {
+            if (try metal_runtime.decoderRuntimeDotGeneralRank1F32Device(
+                self.provider_impl,
+                lhs_mt,
+                rhs_mt,
+                m,
+                n,
+                k,
+                rhs_contracting[0],
+            )) |tensor| return try self.ctFromOwnedMetalTensor(tensor);
+        }
         if (try metal_runtime.decoderRuntimeDotGeneral2DF32Device(
             self.provider_impl,
             lhs_mt,
@@ -19940,6 +19955,43 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
+    fn decoderRuntimeApplyMultiplyAddOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var lhs = try self.ownedDeviceMetalTensorFromCt(request.lhs);
+        defer lhs.deinit();
+        var rhs = try self.ownedDeviceMetalTensorFromCt(request.rhs);
+        defer rhs.deinit();
+        var addend = try self.ownedDeviceMetalTensorFromCt(request.addend);
+        defer addend.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd(self.provider_impl, .{
+            .lhs = lhs,
+            .rhs = rhs,
+            .addend = addend,
+            .dim = request.dim,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyMultiplyAdd2Op(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var lhs0 = try self.ownedDeviceMetalTensorFromCt(request.lhs0);
+        defer lhs0.deinit();
+        var rhs0 = try self.ownedDeviceMetalTensorFromCt(request.rhs0);
+        defer rhs0.deinit();
+        var lhs1 = try self.ownedDeviceMetalTensorFromCt(request.lhs1);
+        defer lhs1.deinit();
+        var rhs1 = try self.ownedDeviceMetalTensorFromCt(request.rhs1);
+        defer rhs1.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.provider_impl, .{
+            .lhs0 = lhs0,
+            .rhs0 = rhs0,
+            .lhs1 = lhs1,
+            .rhs1 = rhs1,
+            .dim = request.dim,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
     const vtable_impl = blk: {
         var vt = native_compute_mod.vtable_impl;
         vt.backendKind = backendKindOp;
@@ -20104,6 +20156,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeApplyAdd = decoderRuntimeApplyAddOp;
         vt.decoderRuntimeApplyAddScale = decoderRuntimeApplyAddScaleOp;
         vt.decoderRuntimeApplyScaledAddScale = decoderRuntimeApplyScaledAddScaleOp;
+        vt.decoderRuntimeApplyMultiplyAdd = decoderRuntimeApplyMultiplyAddOp;
+        vt.decoderRuntimeApplyMultiplyAdd2 = decoderRuntimeApplyMultiplyAdd2Op;
         break :blk vt;
     };
 } else struct {
