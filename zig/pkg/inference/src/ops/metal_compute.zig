@@ -19908,6 +19908,115 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
+    fn decoderRuntimeApplyGeluBackwardOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var upstream_grad = try self.ownedDeviceMetalTensorFromCt(request.upstream_grad);
+        defer upstream_grad.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyGeluBackward(self.provider_impl, .{
+            .input = input,
+            .upstream_grad = upstream_grad,
+            .dim = request.dim,
+        }, &self.timing_stats)) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeFfnGeluBackwardChainOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?ops.DecoderRuntimeFfnGeluBackwardChainResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var first_lhs = try self.ownedDeviceMetalTensorFromCt(request.first_lhs);
+        defer first_lhs.deinit();
+        var first_rhs = try self.ownedDeviceMetalTensorFromCt(request.first_rhs);
+        defer first_rhs.deinit();
+        var second_lhs = try self.ownedDeviceMetalTensorFromCt(request.second_lhs);
+        defer second_lhs.deinit();
+        var second_rhs = try self.ownedDeviceMetalTensorFromCt(request.second_rhs);
+        defer second_rhs.deinit();
+        var gelu_input = try self.ownedDeviceMetalTensorFromCt(request.gelu_input);
+        defer gelu_input.deinit();
+        var output_rhs = try self.ownedDeviceMetalTensorFromCt(request.output_rhs);
+        defer output_rhs.deinit();
+
+        const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(scope);
+        const chain = (try metal_runtime.decoderRuntimeFfnGeluBackwardChainF32Device(self.provider_impl, .{
+            .first_lhs = first_lhs,
+            .first_rhs = first_rhs,
+            .first_rhs_contract_axis = request.first_rhs_contract_axis,
+            .second_lhs = second_lhs,
+            .second_rhs = second_rhs,
+            .second_rhs_contract_axis = request.second_rhs_contract_axis,
+            .gelu_input = gelu_input,
+            .output_rhs = output_rhs,
+            .output_rhs_contract_axis = request.output_rhs_contract_axis,
+            .rows = request.rows,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .first_k = request.first_k,
+            .second_k = request.second_k,
+        }, &self.timing_stats)) orelse return null;
+
+        const first = try self.ctFromOwnedMetalTensor(chain.first);
+        errdefer freeOp(ctx, first);
+        const second_branch = try self.ctFromOwnedMetalTensor(chain.second_branch);
+        errdefer freeOp(ctx, second_branch);
+        const upstream = try self.ctFromOwnedMetalTensor(chain.upstream);
+        errdefer freeOp(ctx, upstream);
+        const gelu = try self.ctFromOwnedMetalTensor(chain.gelu);
+        errdefer freeOp(ctx, gelu);
+        const output = try self.ctFromOwnedMetalTensor(chain.output);
+        return .{
+            .first = first,
+            .second_branch = second_branch,
+            .upstream = upstream,
+            .gelu = gelu,
+            .output = output,
+        };
+    }
+
+    fn decoderRuntimeFfnGeluBackwardOutputOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?ops.DecoderRuntimeFfnGeluBackwardOutputResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var first_lhs = try self.ownedDeviceMetalTensorFromCt(request.first_lhs);
+        defer first_lhs.deinit();
+        var first_rhs = try self.ownedDeviceMetalTensorFromCt(request.first_rhs);
+        defer first_rhs.deinit();
+        var second_lhs = try self.ownedDeviceMetalTensorFromCt(request.second_lhs);
+        defer second_lhs.deinit();
+        var second_rhs = try self.ownedDeviceMetalTensorFromCt(request.second_rhs);
+        defer second_rhs.deinit();
+        var gelu_input = try self.ownedDeviceMetalTensorFromCt(request.gelu_input);
+        defer gelu_input.deinit();
+        var output_rhs = try self.ownedDeviceMetalTensorFromCt(request.output_rhs);
+        defer output_rhs.deinit();
+
+        const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(scope);
+        const result = (try metal_runtime.decoderRuntimeFfnGeluBackwardOutputF32Device(self.provider_impl, .{
+            .first_lhs = first_lhs,
+            .first_rhs = first_rhs,
+            .first_rhs_contract_axis = request.first_rhs_contract_axis,
+            .second_lhs = second_lhs,
+            .second_rhs = second_rhs,
+            .second_rhs_contract_axis = request.second_rhs_contract_axis,
+            .gelu_input = gelu_input,
+            .output_rhs = output_rhs,
+            .output_rhs_contract_axis = request.output_rhs_contract_axis,
+            .rows = request.rows,
+            .hidden_size = request.hidden_size,
+            .intermediate_size = request.intermediate_size,
+            .first_k = request.first_k,
+            .second_k = request.second_k,
+        }, &self.timing_stats)) orelse return null;
+
+        const first = try self.ctFromOwnedMetalTensor(result.first);
+        errdefer freeOp(ctx, first);
+        const output = try self.ctFromOwnedMetalTensor(result.output);
+        return .{
+            .first = first,
+            .output = output,
+        };
+    }
+
     fn decoderRuntimeApplyAddOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyAddRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
@@ -20153,6 +20262,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
         vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;
         vt.decoderRuntimeApplyActivation = decoderRuntimeApplyActivationOp;
+        vt.decoderRuntimeApplyGeluBackward = decoderRuntimeApplyGeluBackwardOp;
+        vt.decoderRuntimeFfnGeluBackwardChain = decoderRuntimeFfnGeluBackwardChainOp;
+        vt.decoderRuntimeFfnGeluBackwardOutput = decoderRuntimeFfnGeluBackwardOutputOp;
         vt.decoderRuntimeApplyAdd = decoderRuntimeApplyAddOp;
         vt.decoderRuntimeApplyAddScale = decoderRuntimeApplyAddScaleOp;
         vt.decoderRuntimeApplyScaledAddScale = decoderRuntimeApplyScaledAddScaleOp;

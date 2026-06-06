@@ -302,8 +302,14 @@ pub const StepProfile = struct {
     graph_executor_region_ops: u64 = 0,
     graph_executor_runtime_region_dispatches: u64 = 0,
     graph_executor_runtime_region_fallbacks: u64 = 0,
+    graph_executor_runtime_region_plan_compiles: u64 = 0,
+    graph_executor_runtime_region_plan_reuses: u64 = 0,
     graph_executor_runtime_frame_candidates: u64 = 0,
     graph_executor_runtime_frame_eligible: u64 = 0,
+    graph_executor_plan_build_ns: u64 = 0,
+    graph_executor_buffer_plan_build_ns: u64 = 0,
+    graph_executor_plan_cache_hits: u64 = 0,
+    graph_executor_plan_cache_misses: u64 = 0,
     metal_frame_wait_ns: u64 = 0,
     metal_frame_gpu_ns: u64 = 0,
     metal_last_frame_compute_encoders: u64 = 0,
@@ -695,6 +701,7 @@ pub const RealAutodiffTrainer = struct {
         }
 
         const train_step_start_ns = monotonicNowNs();
+        const had_compiled_session = self.compiled_session != null;
         const use_compiled = try self.ensureCompiledSessionBuilt(trainable);
         if (use_compiled) {
             compiledDiag(
@@ -723,7 +730,7 @@ pub const RealAutodiffTrainer = struct {
             );
         }
         profile.autodiff_ns = if (use_compiled) 0 else step_result.profile.autodiff_ns;
-        profile.compile_ns = if (use_compiled) self.compiled_session.?.build_profile.total_ns else 0;
+        profile.compile_ns = if (use_compiled and !had_compiled_session) self.compiled_session.?.build_profile.total_ns else 0;
         profile.execute_ns = step_result.profile.execute_ns;
         profile.extract_ns = step_result.profile.extract_ns;
         profile.peak_resident_bytes = step_result.profile.peak_resident_bytes;
@@ -737,8 +744,14 @@ pub const RealAutodiffTrainer = struct {
         profile.graph_executor_region_ops = step_result.profile.graph_executor_region_ops;
         profile.graph_executor_runtime_region_dispatches = step_result.profile.graph_executor_runtime_region_dispatches;
         profile.graph_executor_runtime_region_fallbacks = step_result.profile.graph_executor_runtime_region_fallbacks;
+        profile.graph_executor_runtime_region_plan_compiles = step_result.profile.graph_executor_runtime_region_plan_compiles;
+        profile.graph_executor_runtime_region_plan_reuses = step_result.profile.graph_executor_runtime_region_plan_reuses;
         profile.graph_executor_runtime_frame_candidates = step_result.profile.graph_executor_runtime_frame_candidates;
         profile.graph_executor_runtime_frame_eligible = step_result.profile.graph_executor_runtime_frame_eligible;
+        profile.graph_executor_plan_build_ns = step_result.profile.graph_executor_plan_build_ns;
+        profile.graph_executor_buffer_plan_build_ns = step_result.profile.graph_executor_buffer_plan_build_ns;
+        profile.graph_executor_plan_cache_hits = step_result.profile.graph_executor_plan_cache_hits;
+        profile.graph_executor_plan_cache_misses = step_result.profile.graph_executor_plan_cache_misses;
         profile.metal_frame_wait_ns = step_result.profile.metal_frame_wait_ns;
         profile.metal_frame_gpu_ns = step_result.profile.metal_frame_gpu_ns;
         profile.metal_last_frame_compute_encoders = step_result.profile.metal_last_frame_compute_encoders;

@@ -31,6 +31,7 @@ const ml = @import("ml");
 const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
+const buffer_plan_mod = @import("buffer_plan.zig");
 
 const Graph = ml.graph.Graph;
 const Node = ml.graph.Node;
@@ -159,6 +160,11 @@ pub const ExecuteOptions = struct {
     /// provided, execute() skips recomputing these per-call — a win
     /// for the decode loop where the graph never changes.
     cached_analysis: ?CachedAnalysis = null,
+
+    /// Pre-computed graph buffer/lifetime plan. This is invariant for a fixed
+    /// graph and partition plan, so compiled training sessions can borrow it
+    /// across repeated steps.
+    cached_buffer_plan: ?*const buffer_plan_mod.BufferPlan = null,
 
     /// Skip Metal graph-fusion probes for graphs whose hot path is already
     /// covered by backend primitive/runtime commands.
@@ -1372,6 +1378,53 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
     return cb.primReshape(val, dims[0..rank]) catch null;
 }
 
+fn executeGeluBackwardFallback(
+    allocator: std.mem.Allocator,
+    output_shape: Shape,
+    cb: *const ComputeBackend,
+    input: CT,
+    upstream_grad: CT,
+) !CT {
+    const input_data = try cb.toFloat32(input, allocator);
+    defer allocator.free(input_data);
+    const upstream_data = try cb.toFloat32(upstream_grad, allocator);
+    defer allocator.free(upstream_data);
+    if (input_data.len != upstream_data.len) return error.ShapeMismatch;
+
+    const output = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(output);
+    for (input_data, upstream_data, output) |x, upstream, *dst| {
+        if (!std.math.isFinite(x)) {
+            dst.* = 0.0;
+            continue;
+        }
+        const x2 = x * x;
+        const inner = 0.7978845608028654 * (x + 0.044715 * x * x2);
+        if (inner > 10.0) {
+            dst.* = upstream;
+            continue;
+        }
+        if (inner < -10.0) {
+            dst.* = 0.0;
+            continue;
+        }
+        const t = std.math.tanh(inner);
+        const sech2 = 1.0 - t * t;
+        const derivative = 0.5 * (1.0 + t) + 0.5 * x * sech2 * 0.7978845608028654 * (1.0 + 0.134145 * x2);
+        dst.* = if (std.math.isFinite(derivative)) upstream * derivative else 0.0;
+    }
+
+    var shape_buf: [8]i32 = undefined;
+    const rank = output_shape.rank();
+    if (rank > shape_buf.len) return error.UnsupportedShape;
+    for (0..rank) |axis| {
+        const dim = output_shape.dim(@intCast(axis));
+        if (dim <= 0) return error.UnsupportedShape;
+        shape_buf[axis] = @intCast(dim);
+    }
+    return cb.fromFloat32Shape(output, shape_buf[0..rank]);
+}
+
 fn graphTraceShapesEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_TRACE_SHAPES", false);
 }
@@ -1761,6 +1814,17 @@ pub fn executeNode(
                 if (try cb.unaryConsume(.gelu, V.get(ins[0]))) |consumed| return consumed;
             }
             return cb.gelu(V.get(ins[0]));
+        },
+
+        .fused_gelu_backward => {
+            const elem_count_i64 = n.output_shape.numElements() orelse return error.UnsupportedShape;
+            if (elem_count_i64 <= 0) return error.UnsupportedShape;
+            if (try cb.decoderRuntimeApplyGeluBackward(&.{
+                .input = V.get(ins[0]),
+                .upstream_grad = V.get(ins[1]),
+                .dim = @intCast(elem_count_i64),
+            })) |fused| return fused;
+            return executeGeluBackwardFallback(graph.allocator, graph.node(ins[0]).output_shape, cb, V.get(ins[0]), V.get(ins[1]));
         },
 
         .fused_relu => {
@@ -3769,6 +3833,66 @@ test "primitive elementwise ops broadcast scalar constants in interpreter" {
     try std.testing.expectEqual(@as(usize, expected.len), actual.len);
     for (expected, actual) |e, a| {
         try std.testing.expectApproxEqAbs(e, a, 1e-6);
+    }
+}
+
+test "interpreter fused gelu backward fallback matches tanh derivative" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const upstream = try builder.parameter("upstream", Shape.init(.f32, &.{ 2, 4 }));
+    const out = try g.addNode(.{
+        .op = .{ .fused_gelu_backward = {} },
+        .output_shape = Shape.init(.f32, &.{ 2, 4 }),
+        .inputs = .{ x, upstream, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    var cb = tc_backend.backend();
+
+    const x_data = [_]f32{ -4.0, -1.0, -0.25, 0.0, 0.25, 1.0, 4.0, 12.0 };
+    const upstream_data = [_]f32{ 0.5, 1.25, -2.0, 3.0, -0.75, 0.8, 1.1, -1.2 };
+    const x_ct = try cb.fromFloat32(&x_data);
+    const upstream_ct = try cb.fromFloat32(&upstream_data);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+        .{ .node_id = upstream, .value = upstream_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb);
+
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    cb.free(x_ct);
+    cb.free(upstream_ct);
+
+    const sqrt_2_over_pi: f32 = 0.7978845608028654;
+    try std.testing.expectEqual(@as(usize, x_data.len), actual.len);
+    for (x_data, upstream_data, actual) |xv, up, got| {
+        const x2 = xv * xv;
+        const inner = sqrt_2_over_pi * (xv + 0.044715 * xv * x2);
+        const expected = if (inner > 10.0)
+            up
+        else if (inner < -10.0)
+            0.0
+        else blk: {
+            const t = std.math.tanh(inner);
+            const sech2 = 1.0 - t * t;
+            const derivative = 0.5 * (1.0 + t) + 0.5 * xv * sech2 * sqrt_2_over_pi * (1.0 + 0.134145 * x2);
+            break :blk up * derivative;
+        };
+        try std.testing.expectApproxEqAbs(expected, got, 1e-6);
     }
 }
 

@@ -454,6 +454,42 @@ pub const DecoderRuntimeApplyActivationRequest = struct {
     dim: usize,
 };
 
+pub const DecoderRuntimeApplyGeluBackwardRequest = struct {
+    input: CT,
+    upstream_grad: CT,
+    dim: usize,
+};
+
+pub const DecoderRuntimeFfnGeluBackwardChainRequest = struct {
+    first_lhs: CT,
+    first_rhs: CT,
+    first_rhs_contract_axis: u32,
+    second_lhs: CT,
+    second_rhs: CT,
+    second_rhs_contract_axis: u32,
+    gelu_input: CT,
+    output_rhs: CT,
+    output_rhs_contract_axis: u32,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    first_k: usize,
+    second_k: usize,
+};
+
+pub const DecoderRuntimeFfnGeluBackwardChainResult = struct {
+    first: CT,
+    second_branch: CT,
+    upstream: CT,
+    gelu: CT,
+    output: CT,
+};
+
+pub const DecoderRuntimeFfnGeluBackwardOutputResult = struct {
+    first: CT,
+    output: CT,
+};
+
 pub const DecoderRuntimeApplyAddRequest = struct {
     lhs: CT,
     rhs: CT,

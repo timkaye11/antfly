@@ -3263,6 +3263,188 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
     return MetalTensor.owned(output, &shape);
 }
 
+pub fn decoderRuntimeApplyGeluBackward(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.dim == 0) return null;
+    if (!request.input.isDevice() or !request.upstream_grad.isDevice()) return null;
+    if (request.input.elemCount() != request.dim or request.upstream_grad.elemCount() != request.dim) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, request.dim * @sizeOf(f32), .private, request.input.shape());
+    errdefer output_device.deinit();
+    stats.decoder_runtime_apply_activation_calls += 1;
+    const device_rc = termite_metal_decode_runtime_apply_gelu_backward_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.upstream_grad.deviceHandle(),
+        request.upstream_grad.deviceByteOffset(),
+        request.dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (device_rc == 0) return output_device;
+    output_device.deinit();
+    return null;
+}
+
+pub const DecoderRuntimeFfnGeluBackwardChainResult = struct {
+    first: MetalTensor,
+    second_branch: MetalTensor,
+    upstream: MetalTensor,
+    gelu: MetalTensor,
+    output: MetalTensor,
+
+    pub fn deinit(self: *DecoderRuntimeFfnGeluBackwardChainResult) void {
+        self.first.deinit();
+        self.second_branch.deinit();
+        self.upstream.deinit();
+        self.gelu.deinit();
+        self.output.deinit();
+    }
+};
+
+pub fn decoderRuntimeFfnGeluBackwardChainF32Device(
+    self: anytype,
+    request: anytype,
+    stats: anytype,
+) !?DecoderRuntimeFfnGeluBackwardChainResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.rows == 0 or request.hidden_size == 0 or request.intermediate_size == 0) return null;
+    if (request.first_k == 0 or request.second_k == 0) return null;
+    if (request.first_rhs_contract_axis > 1 or request.second_rhs_contract_axis > 1 or request.output_rhs_contract_axis > 1) return null;
+    if (!request.first_lhs.isDevice() or !request.first_rhs.isDevice() or
+        !request.second_lhs.isDevice() or !request.second_rhs.isDevice() or
+        !request.gelu_input.isDevice() or !request.output_rhs.isDevice()) return null;
+    if (request.first_lhs.elemCount() != request.rows * request.first_k) return null;
+    if (request.first_rhs.elemCount() != request.intermediate_size * request.first_k) return null;
+    if (request.second_lhs.elemCount() != request.rows * request.second_k) return null;
+    if (request.second_rhs.elemCount() != request.intermediate_size * request.second_k) return null;
+    if (request.gelu_input.elemCount() != request.rows * request.intermediate_size) return null;
+    if (request.output_rhs.elemCount() != request.hidden_size * request.intermediate_size) return null;
+
+    const intermediate_shape = [_]i32{ @intCast(request.rows), @intCast(request.intermediate_size) };
+    const output_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
+    var first = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
+    errdefer first.deinit();
+    var second_branch = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
+    errdefer second_branch.deinit();
+    var upstream = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
+    errdefer upstream.deinit();
+    var gelu = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
+    errdefer gelu.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, request.rows * request.hidden_size * @sizeOf(f32), .private, &output_shape);
+    errdefer output.deinit();
+
+    stats.decoder_runtime_apply_activation_calls += 1;
+    const rc = termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
+        runtime,
+        request.first_lhs.deviceHandle(),
+        request.first_lhs.deviceByteOffset(),
+        request.first_rhs.deviceHandle(),
+        request.first_rhs.deviceByteOffset(),
+        request.first_rhs_contract_axis,
+        request.second_lhs.deviceHandle(),
+        request.second_lhs.deviceByteOffset(),
+        request.second_rhs.deviceHandle(),
+        request.second_rhs.deviceByteOffset(),
+        request.second_rhs_contract_axis,
+        request.gelu_input.deviceHandle(),
+        request.gelu_input.deviceByteOffset(),
+        request.output_rhs.deviceHandle(),
+        request.output_rhs.deviceByteOffset(),
+        request.output_rhs_contract_axis,
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        request.first_k,
+        request.second_k,
+        first.deviceHandle(),
+        first.deviceByteOffset(),
+        second_branch.deviceHandle(),
+        second_branch.deviceByteOffset(),
+        upstream.deviceHandle(),
+        upstream.deviceByteOffset(),
+        gelu.deviceHandle(),
+        gelu.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return .{
+        .first = first,
+        .second_branch = second_branch,
+        .upstream = upstream,
+        .gelu = gelu,
+        .output = output,
+    };
+}
+
+pub const DecoderRuntimeFfnGeluBackwardOutputResult = struct {
+    first: MetalTensor,
+    output: MetalTensor,
+
+    pub fn deinit(self: *DecoderRuntimeFfnGeluBackwardOutputResult) void {
+        self.first.deinit();
+        self.output.deinit();
+    }
+};
+
+pub fn decoderRuntimeFfnGeluBackwardOutputF32Device(
+    self: anytype,
+    request: anytype,
+    stats: anytype,
+) !?DecoderRuntimeFfnGeluBackwardOutputResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.rows == 0 or request.hidden_size == 0 or request.intermediate_size == 0) return null;
+    if (request.first_k != 1 or request.second_k == 0) return null;
+    if (request.first_rhs_contract_axis > 1 or request.second_rhs_contract_axis > 1 or request.output_rhs_contract_axis > 1) return null;
+    if (!request.first_lhs.isDevice() or !request.first_rhs.isDevice() or
+        !request.second_lhs.isDevice() or !request.second_rhs.isDevice() or
+        !request.gelu_input.isDevice() or !request.output_rhs.isDevice()) return null;
+    if (request.first_lhs.elemCount() != request.rows or request.first_rhs.elemCount() != request.intermediate_size) return null;
+    if (request.second_lhs.elemCount() != request.rows * request.second_k or request.second_rhs.elemCount() != request.intermediate_size * request.second_k) return null;
+    if (request.gelu_input.elemCount() != request.rows * request.intermediate_size) return null;
+    if (request.output_rhs.elemCount() != request.hidden_size * request.intermediate_size) return null;
+
+    const intermediate_shape = [_]i32{ @intCast(request.rows), @intCast(request.intermediate_size) };
+    const output_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
+    var first = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
+    errdefer first.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, request.rows * request.hidden_size * @sizeOf(f32), .private, &output_shape);
+    errdefer output.deinit();
+
+    stats.decoder_runtime_apply_activation_calls += 1;
+    const rc = termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
+        runtime,
+        request.first_lhs.deviceHandle(),
+        request.first_lhs.deviceByteOffset(),
+        request.first_rhs.deviceHandle(),
+        request.first_rhs.deviceByteOffset(),
+        request.second_lhs.deviceHandle(),
+        request.second_lhs.deviceByteOffset(),
+        request.second_rhs.deviceHandle(),
+        request.second_rhs.deviceByteOffset(),
+        request.second_rhs_contract_axis,
+        request.gelu_input.deviceHandle(),
+        request.gelu_input.deviceByteOffset(),
+        request.output_rhs.deviceHandle(),
+        request.output_rhs.deviceByteOffset(),
+        request.output_rhs_contract_axis,
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        request.second_k,
+        first.deviceHandle(),
+        first.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return .{ .first = first, .output = output };
+}
+
 pub fn decoderRuntimeApplyPrimitiveUnary(self: anytype, input: MetalTensor, activation_kind: u32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7927,6 +8109,75 @@ pub extern fn termite_metal_decode_runtime_apply_activation_device(
     input_offset: usize,
     rows: usize,
     dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_gelu_backward_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    upstream_grad_handle: ?*anyopaque,
+    upstream_grad_offset: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    first_lhs_handle: ?*anyopaque,
+    first_lhs_offset: usize,
+    first_rhs_handle: ?*anyopaque,
+    first_rhs_offset: usize,
+    first_rhs_contract_axis: u32,
+    second_lhs_handle: ?*anyopaque,
+    second_lhs_offset: usize,
+    second_rhs_handle: ?*anyopaque,
+    second_rhs_offset: usize,
+    second_rhs_contract_axis: u32,
+    gelu_input_handle: ?*anyopaque,
+    gelu_input_offset: usize,
+    output_rhs_handle: ?*anyopaque,
+    output_rhs_offset: usize,
+    output_rhs_contract_axis: u32,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    first_k: usize,
+    second_k: usize,
+    first_output_handle: ?*anyopaque,
+    first_output_offset: usize,
+    second_output_handle: ?*anyopaque,
+    second_output_offset: usize,
+    upstream_output_handle: ?*anyopaque,
+    upstream_output_offset: usize,
+    gelu_output_handle: ?*anyopaque,
+    gelu_output_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+
+pub extern fn termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    first_lhs_handle: ?*anyopaque,
+    first_lhs_offset: usize,
+    first_rhs_handle: ?*anyopaque,
+    first_rhs_offset: usize,
+    second_lhs_handle: ?*anyopaque,
+    second_lhs_offset: usize,
+    second_rhs_handle: ?*anyopaque,
+    second_rhs_offset: usize,
+    second_rhs_contract_axis: u32,
+    gelu_input_handle: ?*anyopaque,
+    gelu_input_offset: usize,
+    output_rhs_handle: ?*anyopaque,
+    output_rhs_offset: usize,
+    output_rhs_contract_axis: u32,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    second_k: usize,
+    first_output_handle: ?*anyopaque,
+    first_output_offset: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

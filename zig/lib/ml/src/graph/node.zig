@@ -398,6 +398,7 @@ pub const OpCode = union(enum) {
     fused_layer_norm: NormAttrs,
     fused_rms_norm: NormAttrs,
     fused_gelu: void,
+    fused_gelu_backward: void,
     fused_relu: void,
     fused_silu: void,
     fused_quick_gelu: void,

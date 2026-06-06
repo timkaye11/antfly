@@ -18,10 +18,10 @@
 // of the loss with respect to requested parameter nodes by walking the
 // graph backward and applying VJP (vector-Jacobian product) rules.
 //
-// Fused ops are lowered to primitives first (via lower.zig), so VJPs
-// only need to be defined for ~25 primitive ops. This follows GoMLX's
-// pattern: fused ops carry a vjp_alternate decomposed subgraph, and
-// differentiation operates on the primitive form.
+// Most fused ops are lowered to primitives first (via lower.zig), so VJPs
+// can be defined against a compact primitive surface. Some hot training
+// ops stay fused and carry hand-written VJPs when preserving fused semantics
+// avoids expensive decomposed backward graphs.
 //
 // Usage:
 //   var result = try gradient(allocator, &graph, loss_id, &.{param_a, param_b});
@@ -72,7 +72,7 @@ pub const GradientResult = struct {
 
 /// Compute gradients of a scalar loss with respect to parameter nodes.
 ///
-/// 1. Lowers fused ops to primitives via vjp_alternate.
+/// 1. Lowers most fused ops to primitives via vjp_alternate.
 /// 2. Walks backward from loss, applying VJP rules to accumulate adjoints.
 /// 3. Returns gradient NodeIds for each requested parameter.
 ///
@@ -237,6 +237,16 @@ fn applyVjp(
             // Put tensor-shaped operand first for correct output shape.
             const grad = try b.mul(exp_val, two_over_sqrt_pi);
             try accumulate(b, adjoints, ins[0], try b.mul(adj, grad));
+        },
+
+        .fused_gelu => {
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_gelu_backward = {} },
+                .output_shape = n.output_shape,
+                .inputs = .{ ins[0], adj, null_node, null_node },
+                .num_inputs = 2,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
         },
 
         .abs => {
@@ -872,6 +882,25 @@ test "gradient of mul" {
     // dL/dx should involve w, dL/dw should involve x
     try std.testing.expect(result.param_grads[0] != null_node);
     try std.testing.expect(result.param_grads[1] != null_node);
+}
+
+test "gradient of fused gelu emits fused backward op" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 3 }));
+    const activated = try bld.gelu(x);
+    const loss = try bld.reduceSum(activated, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    const grad = result.param_grads[0];
+    try std.testing.expect(grad != null_node);
+    try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .fused_gelu_backward), std.meta.activeTag(result.graph.node(grad).op));
 }
 
 test "gradient of 2d slice pads adjoint to input shape" {

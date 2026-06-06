@@ -244,41 +244,62 @@ def parse_dot_shape_items(payload: str) -> list[dict[str, Any]]:
     shapes: list[dict[str, Any]] = []
     shape_re = re.compile(
         r"(?P<lhs0>-?\d+)x(?P<lhs1>-?\d+)\*(?P<rhs0>-?\d+)x(?P<rhs1>-?\d+)->(?P<out0>-?\d+)x(?P<out1>-?\d+)"
-        r":count=(?P<count>\d+):rhs_transpose=(?P<rhs_transpose>true|false)"
-        r":rhs_parameter=(?P<rhs_parameter>true|false):rhs_lora=(?P<rhs_lora>true|false):raw_linear=(?P<raw_linear>true|false)"
     )
     for item in payload.split(","):
         item = item.strip()
         if not item or item == "none":
             continue
-        match = shape_re.fullmatch(item)
+        shape_part, _, stat_payload = item.partition(":")
+        match = shape_re.fullmatch(shape_part)
         if not match:
             continue
         groups = match.groupdict()
-        shapes.append({
+        values: dict[str, str] = {}
+        for part in stat_payload.split(":"):
+            if "=" not in part:
+                continue
+            key, raw_value = part.split("=", 1)
+            values[key] = raw_value
+        shape: dict[str, Any] = {
             "lhs": [int(groups["lhs0"]), int(groups["lhs1"])],
             "rhs": [int(groups["rhs0"]), int(groups["rhs1"])],
             "out": [int(groups["out0"]), int(groups["out1"])],
-            "count": int(groups["count"]),
-            "rhs_transpose": parse_bool_token(groups["rhs_transpose"]),
-            "rhs_parameter": parse_bool_token(groups["rhs_parameter"]),
-            "rhs_lora": parse_bool_token(groups["rhs_lora"]),
-            "raw_linear": parse_bool_token(groups["raw_linear"]),
-        })
+        }
+        for key in ("count",):
+            if key in values:
+                shape[key] = int(values[key])
+        for key in ("total_ms", "avg_ms"):
+            if key in values:
+                shape[key] = float(values[key])
+        for key in ("phase", "family", "pos", "node"):
+            if key in values:
+                shape[key] = values[key]
+        if "lhs" in values:
+            shape["lhs_op"] = values["lhs"]
+        if "rhs" in values:
+            shape["rhs_op"] = values["rhs"]
+        for key in ("rhs_transpose", "rhs_parameter", "rhs_lora", "raw_linear"):
+            if key in values:
+                shape[key] = parse_bool_token(values[key])
+        shapes.append(shape)
     return shapes
 
 
 def parse_zig_op_runs(output: str) -> dict[str, Any]:
     dot_shapes: list[dict[str, Any]] = []
     for line in output.splitlines():
-        prefix = "metal_partition_dot_shapes:"
-        if not line.startswith(prefix):
+        prefixes = ("metal_partition_command_dot_shapes:", "metal_partition_dot_shapes:")
+        prefix = next((p for p in prefixes if line.startswith(p)), None)
+        if prefix is None:
+            continue
+        if prefix == "metal_partition_command_dot_shapes:":
+            dot_shapes.extend(parse_dot_shape_items(line[len(prefix):].strip()))
             continue
         top_index = line.find(" top=")
         if top_index < 0:
             continue
         dot_shapes.extend(parse_dot_shape_items(line[top_index + len(" top="):]))
-    dot_shapes.sort(key=lambda item: item["count"], reverse=True)
+    dot_shapes.sort(key=lambda item: (item.get("total_ms", 0), item.get("count", 0)), reverse=True)
     return {
         "dot_shapes": dot_shapes,
         "top_dot_shapes": dot_shapes[:16],
@@ -891,6 +912,12 @@ def main() -> int:
         "zig_graph_executor_host_outputs_avg": zig_step_avg("graph_executor_host_outputs"),
         "zig_graph_executor_regions_avg": zig_step_avg("graph_executor_regions"),
         "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg("graph_executor_runtime_region_dispatches"),
+        "zig_graph_executor_runtime_region_plan_compiles_avg": zig_step_avg("graph_executor_runtime_region_plan_compiles"),
+        "zig_graph_executor_runtime_region_plan_reuses_avg": zig_step_avg("graph_executor_runtime_region_plan_reuses"),
+        "zig_graph_executor_plan_build_ms_avg": zig_step_avg("graph_executor_plan_build_ms"),
+        "zig_graph_executor_buffer_plan_build_ms_avg": zig_step_avg("graph_executor_buffer_plan_build_ms"),
+        "zig_graph_executor_plan_cache_hits_avg": zig_step_avg("graph_executor_plan_cache_hits"),
+        "zig_graph_executor_plan_cache_misses_avg": zig_step_avg("graph_executor_plan_cache_misses"),
         "zig_metal_frame_wait_ms_avg": zig_step_avg("metal_frame_wait_ms"),
         "zig_metal_frame_gpu_ms_avg": zig_step_avg("metal_frame_gpu_ms"),
         "zig_metal_last_frame_compute_encoders_avg": zig_step_avg("metal_last_frame_compute_encoders"),

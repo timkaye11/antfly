@@ -47,7 +47,9 @@ const ComputeBackend = ops_mod.ComputeBackend;
 const interpreter = @import("interpreter.zig");
 const RuntimeInput = interpreter.RuntimeInput;
 const partition_mod = @import("partition.zig");
+const buffer_plan_mod = @import("buffer_plan.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
+const metal_partition_executor = @import("metal_partition_executor.zig");
 const device_mesh = @import("device_mesh.zig");
 const multi_executor = @import("multi_executor.zig");
 
@@ -95,8 +97,14 @@ pub const TrainStepProfile = struct {
     graph_executor_region_ops: u64 = 0,
     graph_executor_runtime_region_dispatches: u64 = 0,
     graph_executor_runtime_region_fallbacks: u64 = 0,
+    graph_executor_runtime_region_plan_compiles: u64 = 0,
+    graph_executor_runtime_region_plan_reuses: u64 = 0,
     graph_executor_runtime_frame_candidates: u64 = 0,
     graph_executor_runtime_frame_eligible: u64 = 0,
+    graph_executor_plan_build_ns: u64 = 0,
+    graph_executor_buffer_plan_build_ns: u64 = 0,
+    graph_executor_plan_cache_hits: u64 = 0,
+    graph_executor_plan_cache_misses: u64 = 0,
     metal_frame_wait_ns: u64 = 0,
     metal_frame_gpu_ns: u64 = 0,
     metal_last_frame_compute_encoders: u64 = 0,
@@ -213,6 +221,7 @@ pub const CompiledTrainSession = struct {
     analysis: interpreter.CachedAnalysis,
     loss_output_index: usize = 0,
     build_profile: TrainStepProfile = .{},
+    cached_metal_graph_executor_plan: ?CachedMetalGraphExecutorPlan = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -318,6 +327,7 @@ pub const CompiledTrainSession = struct {
     }
 
     pub fn deinit(self: *CompiledTrainSession) void {
+        if (self.cached_metal_graph_executor_plan) |*cached| cached.deinit();
         self.analysis.deinit(self.allocator);
         self.graph.deinit();
         self.allocator.free(self.id_map);
@@ -326,6 +336,21 @@ pub const CompiledTrainSession = struct {
         self.allocator.free(self.param_grads);
         self.* = undefined;
     }
+
+    const CachedMetalGraphExecutorPlan = struct {
+        base_plan: partition_mod.PartitionPlan,
+        buffer_plan: buffer_plan_mod.BufferPlan,
+        assignments: []device_mesh.DeviceId,
+        partitioned: bool,
+        unsupported_ops: usize = 0,
+
+        fn deinit(self: *CachedMetalGraphExecutorPlan) void {
+            self.buffer_plan.deinit();
+            self.base_plan.deinit();
+            self.base_plan.allocator.free(self.assignments);
+            self.* = undefined;
+        }
+    };
 
     pub fn execute(
         self: *CompiledTrainSession,
@@ -654,36 +679,17 @@ pub const CompiledTrainSession = struct {
         if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
         if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
 
-        var diagnostics = partition_mod.CapabilityDiagnostics{};
-        var base_plan = if (platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARTITIONED", false))
-            try self.buildPartitionedMetalGraphExecutorPlan(&diagnostics)
-        else
-            try self.buildSingleMetalGraphExecutorPlan();
-        var owns_base_plan = true;
-        errdefer if (owns_base_plan) base_plan.deinit();
-
-        if (retain_device_gradients and !self.planKeepsGradientOutputsOnMetal(&base_plan)) {
-            compiledDiag("graph executor fallback gradient output assigned to native partition unsupported_ops={}", .{diagnostics.count(.unsupported_op)});
-            base_plan.deinit();
-            owns_base_plan = false;
+        const cached = try self.cachedMetalGraphExecutorPlan(cb, profile);
+        if (retain_device_gradients and !self.planKeepsGradientOutputsOnMetal(&cached.base_plan)) {
+            compiledDiag("graph executor fallback gradient output assigned to native partition unsupported_ops={}", .{cached.unsupported_ops});
             return null;
         }
 
-        const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
-        var owns_assignments = true;
-        errdefer if (owns_assignments) self.allocator.free(assignments);
-        for (base_plan.partitions, 0..) |part, idx| {
-            assignments[idx] = if (part.backend == .native) 1 else 0;
-        }
-
         var dpp = multi_executor.DevicePartitionPlan{
-            .base = base_plan,
-            .device_assignment = assignments,
+            .base = cached.base_plan,
+            .device_assignment = cached.assignments,
             .allocator = self.allocator,
         };
-        owns_base_plan = false;
-        owns_assignments = false;
-        defer dpp.deinit();
 
         var fallback_native = try FallbackNativeBackend.init(self.allocator);
         defer fallback_native.deinit(self.allocator);
@@ -704,6 +710,7 @@ pub const CompiledTrainSession = struct {
             .{
                 .runtime_inputs = runtime_inputs,
                 .cached_analysis = self.analysis,
+                .cached_buffer_plan = &cached.buffer_plan,
                 .skip_metal_fused_patterns = trainingGraphExecutorSkipMetalFusedPatterns(),
                 .collect_partition_stats = true,
                 .preserve_runtime_input_residency = true,
@@ -724,11 +731,23 @@ pub const CompiledTrainSession = struct {
         profile.graph_executor_region_ops = multi_result.stats.graph_region_ops;
         profile.graph_executor_runtime_region_dispatches = multi_result.stats.runtime_region_plan_dispatches;
         profile.graph_executor_runtime_region_fallbacks = multi_result.stats.runtime_region_fallbacks;
+        profile.graph_executor_runtime_region_plan_compiles = multi_result.stats.runtime_region_plan_compiles;
+        profile.graph_executor_runtime_region_plan_reuses = multi_result.stats.runtime_region_plan_reuses;
         profile.graph_executor_runtime_frame_candidates = multi_result.stats.runtime_frame_candidates;
         profile.graph_executor_runtime_frame_eligible = multi_result.stats.runtime_frame_eligible;
         compiledDiag(
-            "graph executor execute done partitions={} commands={} planned={} fallbacks={} execute_ms={d:.3} rss={}",
-            .{ dpp.base.partitions.len, profile.graph_executor_command_dispatches, profile.graph_executor_planned_dispatches, profile.graph_executor_interpreter_fallbacks, nsToMs(profile.execute_ns), profile.peak_resident_bytes },
+            "graph executor execute done partitions={} commands={} planned={} fallbacks={} plan_cache_hits={} plan_cache_misses={} plan_build_ms={d:.3} execute_ms={d:.3} rss={}",
+            .{
+                dpp.base.partitions.len,
+                profile.graph_executor_command_dispatches,
+                profile.graph_executor_planned_dispatches,
+                profile.graph_executor_interpreter_fallbacks,
+                profile.graph_executor_plan_cache_hits,
+                profile.graph_executor_plan_cache_misses,
+                nsToMs(profile.graph_executor_plan_build_ns),
+                nsToMs(profile.execute_ns),
+                profile.peak_resident_bytes,
+            },
         );
 
         return try self.extractTrainStepResultFromGraphOutputs(
@@ -739,6 +758,66 @@ pub const CompiledTrainSession = struct {
             total_start,
             profile,
         );
+    }
+
+    fn cachedMetalGraphExecutorPlan(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        profile: *TrainStepProfile,
+    ) !*const CachedMetalGraphExecutorPlan {
+        const partitioned = platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARTITIONED", false);
+        if (self.cached_metal_graph_executor_plan) |*cached| {
+            if (cached.partitioned == partitioned) {
+                profile.graph_executor_plan_cache_hits += 1;
+                return cached;
+            }
+            cached.deinit();
+            self.cached_metal_graph_executor_plan = null;
+        }
+
+        profile.graph_executor_plan_cache_misses += 1;
+        const plan_start = nowNs();
+        var diagnostics = partition_mod.CapabilityDiagnostics{};
+        var base_plan = if (partitioned)
+            try self.buildPartitionedMetalGraphExecutorPlan(&diagnostics)
+        else
+            try self.buildSingleMetalGraphExecutorPlan();
+        errdefer base_plan.deinit();
+        try self.attachCachedMetalExecutors(cb, &base_plan);
+
+        const buffer_plan_start = nowNs();
+        var graph_buffer_plan = try buffer_plan_mod.build(self.allocator, &self.graph, &base_plan, .{});
+        errdefer graph_buffer_plan.deinit();
+        try graph_buffer_plan.validate(&self.graph, &base_plan);
+        profile.graph_executor_buffer_plan_build_ns += elapsedNs(buffer_plan_start);
+
+        const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
+        errdefer self.allocator.free(assignments);
+        for (base_plan.partitions, 0..) |part, idx| {
+            assignments[idx] = if (part.backend == .native) 1 else 0;
+        }
+
+        self.cached_metal_graph_executor_plan = .{
+            .base_plan = base_plan,
+            .buffer_plan = graph_buffer_plan,
+            .assignments = assignments,
+            .partitioned = partitioned,
+            .unsupported_ops = diagnostics.count(.unsupported_op),
+        };
+        profile.graph_executor_plan_build_ns += elapsedNs(plan_start);
+        return &self.cached_metal_graph_executor_plan.?;
+    }
+
+    fn attachCachedMetalExecutors(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        plan: *partition_mod.PartitionPlan,
+    ) !void {
+        for (plan.partitions) |*part| {
+            if (part.backend != .metal or part.executor != null) continue;
+            const exec = try metal_partition_executor.MetalPartitionExecutor.create(self.allocator, &self.graph, cb);
+            part.executor = exec.partitionExecutor();
+        }
     }
 
     fn buildSingleMetalGraphExecutorPlan(self: *CompiledTrainSession) !partition_mod.PartitionPlan {

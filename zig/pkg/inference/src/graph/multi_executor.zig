@@ -241,8 +241,14 @@ pub fn executeMultiDevice(
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try interpreter.computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
 
-    var graph_buffer_plan = try buffer_plan_mod.build(allocator, graph, &plan.base, .{});
-    defer graph_buffer_plan.deinit();
+    var owned_graph_buffer_plan: ?buffer_plan_mod.BufferPlan = null;
+    defer if (owned_graph_buffer_plan) |*buffer_plan| buffer_plan.deinit();
+    const graph_buffer_plan = if (options.cached_buffer_plan) |buffer_plan|
+        buffer_plan
+    else blk: {
+        owned_graph_buffer_plan = try buffer_plan_mod.build(allocator, graph, &plan.base, .{});
+        break :blk &owned_graph_buffer_plan.?;
+    };
     try graph_buffer_plan.validate(graph, &plan.base);
 
     // Track attention layer counter across partitions.
@@ -321,7 +327,7 @@ pub fn executeMultiDevice(
             .reachable = reachable,
             .last_use = last_use,
             .partition_plan = &plan.base,
-            .buffer_plan = &graph_buffer_plan,
+            .buffer_plan = graph_buffer_plan,
             .owned_runtime_transfers = &owned_runtime_transfers,
             .materialize_boundary_outputs = part.backend != .metal,
             .stats = if (collect_stats) &exec_stats else null,

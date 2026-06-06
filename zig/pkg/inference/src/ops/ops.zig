@@ -317,6 +317,10 @@ pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntim
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
 pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivationKind;
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
+pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
+pub const DecoderRuntimeFfnGeluBackwardChainRequest = backend_contracts.DecoderRuntimeFfnGeluBackwardChainRequest;
+pub const DecoderRuntimeFfnGeluBackwardChainResult = backend_contracts.DecoderRuntimeFfnGeluBackwardChainResult;
+pub const DecoderRuntimeFfnGeluBackwardOutputResult = backend_contracts.DecoderRuntimeFfnGeluBackwardOutputResult;
 pub const DecoderRuntimeApplyAddRequest = backend_contracts.DecoderRuntimeApplyAddRequest;
 pub const DecoderRuntimeApplyAddScaleRequest = backend_contracts.DecoderRuntimeApplyAddScaleRequest;
 pub const DecoderRuntimeApplyScaledAddScaleRequest = backend_contracts.DecoderRuntimeApplyScaledAddScaleRequest;
@@ -1535,6 +1539,18 @@ pub const ComputeBackend = struct {
 
         /// Apply an activation inside the backend-owned decoder runtime.
         decoderRuntimeApplyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
+
+        /// Apply tanh-approx GELU backward inside the backend runtime:
+        /// output = upstream_grad * d/dx(gelu(input)).
+        decoderRuntimeApplyGeluBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT = null,
+
+        /// Execute the hot DeBERTa FFN backward strip as one backend runtime
+        /// unit while returning each graph-visible intermediate.
+        decoderRuntimeFfnGeluBackwardChain: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardChainResult = null,
+
+        /// Execute the rank-1 DeBERTa FFN backward strip while returning only
+        /// the first branch and final output nodes that remain graph-visible.
+        decoderRuntimeFfnGeluBackwardOutput: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardOutputResult = null,
 
         /// Apply elementwise add inside the backend-owned decoder runtime.
         decoderRuntimeApplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddRequest) anyerror!?CT = null,
@@ -2958,6 +2974,27 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyActivation(self: *const ComputeBackend, request: *const DecoderRuntimeApplyActivationRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyActivation) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyGeluBackward(self: *const ComputeBackend, request: *const DecoderRuntimeApplyGeluBackwardRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyGeluBackward) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeFfnGeluBackwardChain(self: *const ComputeBackend, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) !?DecoderRuntimeFfnGeluBackwardChainResult {
+        if (self.vtable.decoderRuntimeFfnGeluBackwardChain) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeFfnGeluBackwardOutput(self: *const ComputeBackend, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) !?DecoderRuntimeFfnGeluBackwardOutputResult {
+        if (self.vtable.decoderRuntimeFfnGeluBackwardOutput) |op| {
             return op(self.ptr, request);
         }
         return null;
