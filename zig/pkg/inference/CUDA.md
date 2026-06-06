@@ -270,6 +270,18 @@ session is created. If a stale PTX bundle is missing RoPE, per-item RoPE, or
 GQA attention, session creation must fail with `CudaKernelUnavailable` instead
 of silently falling back to an incomplete GPU path.
 
+CUDA session creation now uses explicit capability profiles:
+
+| Profile | Model families | Required capability group |
+|---|---|---|
+| `clipclap` | CLIP, CLAP, ClipCLAP embedding paths | dense linears, bias/activation fusions, embedding lookup, layer/RMS norm, concat, conv2d, SDPA |
+| `gliner2` | GLiNER2 and DeBERTa-backed recognition | `clipclap` primitives plus take-rows, GLiNER word embeddings, label GRU combine, DeBERTa attention, split-last-dim |
+| `gemma4` | Gemma-family GPT/GGUF decode | quantized matmul MVP (`Q8_0`, `Q4_0`, `Q4_K`) plus RoPE, per-item RoPE, and GQA attention |
+
+`antfly inference cuda-info --smoke` prints the loaded artifact's profile
+capability booleans before running kernel smokes. Production validation should
+require the relevant profile to be `true` before running real model fixtures.
+
 ## Quantization Priorities
 
 The minimum useful GGUF set is:
@@ -559,6 +571,7 @@ Add counters early:
 
 - device name and compute capability
 - selected artifact kind: PTX or cubin/fatbin
+- loaded capability profiles: `clipclap`, `gliner2`, `gemma4`
 - planned quant operator
 - actual CUDA operator
 - fallback reason
@@ -569,6 +582,16 @@ Add counters early:
 
 Expose these in existing smoke/generate timing output so acceptance tests can
 prove GPU execution instead of just proving successful text generation.
+
+Fallback defaults are intentionally strict:
+
+- Planned quant matmul fallback is rejected unless
+  `ANTFLY_CUDA_ALLOW_PLANNED_FALLBACK=1` is set.
+- RoPE/GQA host fallback remains debug-only behind
+  `ANTFLY_CUDA_ALLOW_HOST_ATTENTION_FALLBACK=1`.
+- Any production smoke that enables either flag must report fallback counters
+  and should not be used as a release gate unless the fallback is the behavior
+  being tested.
 
 ## Acceptance Criteria
 

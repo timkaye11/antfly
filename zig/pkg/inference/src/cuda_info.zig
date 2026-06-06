@@ -18,6 +18,7 @@ const build_options = @import("build_options");
 const print = std.debug.print;
 
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
+const cuda_compute = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
 const cuda_kernels = if (build_options.enable_cuda) @import("ops/cuda/kernels.zig") else struct {};
 
 pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !void {
@@ -53,6 +54,14 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         print("device_name: {s}\n", .{info.nameSlice()});
         print("compute_capability: sm_{d}{d}\n", .{ info.compute_major, info.compute_minor });
         print("artifacts: {s}\n", .{build_options.cuda_artifacts});
+        var compute = cuda_compute.CudaCompute.init(allocator) catch |err| {
+            print("capabilities: unavailable\nreason: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer compute.deinit();
+        print("capability_clipclap: {}\n", .{compute.supportsProfile(.clipclap)});
+        print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
+        print("capability_gemma4: {}\n", .{compute.supportsProfile(.gemma4)});
 
         if (smoke) {
             cuda_kernels.smokeFill(allocator) catch |err| {

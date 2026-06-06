@@ -22,6 +22,8 @@ const scratch_mod = @import("scratch.zig");
 const weight_source_mod = @import("../../models/weight_source.zig");
 const gguf_tensor_types = @import("../../gguf/tensor_types.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
+const quant_matmul = @import("../../graph/quant_matmul.zig");
+const operator_plan = @import("../../graph/operator_plan.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
 
@@ -38,6 +40,21 @@ pub const CudaTensor = struct {
     owned_by_tensor: bool = true,
 };
 
+pub const CapabilityProfile = enum {
+    clipclap,
+    gliner2,
+    gemma4,
+};
+
+pub const RuntimeStats = struct {
+    quant_ops: operator_plan.Stats = .{},
+    h2d_bytes: usize = 0,
+    d2h_bytes: usize = 0,
+    resident_weight_bytes: usize = 0,
+    device_allocated_bytes: usize = 0,
+    host_attention_fallbacks: usize = 0,
+};
+
 pub const CudaCompute = struct {
     allocator: std.mem.Allocator,
     ctx: context_mod.CudaContext,
@@ -45,6 +62,7 @@ pub const CudaCompute = struct {
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
+    stats: RuntimeStats = .{},
     owned_by_backend: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !CudaCompute {
@@ -91,9 +109,29 @@ pub const CudaCompute = struct {
         return self.kernels.hasGemma4DecoderPrimitives();
     }
 
+    pub fn supportsProfile(self: *const CudaCompute, profile: CapabilityProfile) bool {
+        return switch (profile) {
+            .clipclap => self.kernels.hasClipClapPrimitives(),
+            .gliner2 => self.kernels.hasGliner2Primitives(),
+            .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and self.kernels.hasGemma4DecoderPrimitives(),
+        };
+    }
+
+    pub fn requireProfile(self: *const CudaCompute, profile: CapabilityProfile) !void {
+        if (!self.supportsProfile(profile)) return error.CudaKernelUnavailable;
+    }
+
+    pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
+        return self.stats;
+    }
+
+    fn noteDeviceBytes(self: *CudaCompute, bytes: usize) void {
+        self.stats.device_allocated_bytes += bytes;
+    }
+
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
         if (loaded.quantized_storage) |storage| {
-            if (cudaDequantizeQuantWeightsOnUpload()) {
+            if (cudaDequantizeQuantWeightsOnUpload() or cudaShouldDequantizeWeightOnUpload(owned_key, storage)) {
                 const elem_count = try elementCountFromShape(storage.shape);
                 const data = try self.allocator.alloc(f32, elem_count);
                 defer self.allocator.free(data);
@@ -103,8 +141,9 @@ pub const CudaCompute = struct {
                 errdefer self.allocator.free(shape);
                 var device = try allocDeviceBuffer(self, data.len * @sizeOf(f32));
                 errdefer device.free(&self.ctx);
-                try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
+                try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
                 try self.ctx.synchronize();
+                self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
                 errdefer self.allocator.free(owned_key);
                 try self.resident_weights.put(self.allocator, owned_key, .{
                     .buffer = device,
@@ -123,8 +162,9 @@ pub const CudaCompute = struct {
             errdefer self.allocator.free(shape);
             var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
             errdefer device.free(&self.ctx);
-            try device.copyFromHost(&self.ctx, storage.raw_bytes);
+            try copyFromHostTracked(self, device, storage.raw_bytes);
             try self.ctx.synchronize();
+            self.stats.resident_weight_bytes += storage.raw_bytes.len;
             errdefer self.allocator.free(owned_key);
             try self.resident_weights.put(self.allocator, owned_key, .{
                 .buffer = device,
@@ -149,8 +189,9 @@ pub const CudaCompute = struct {
         errdefer self.allocator.free(shape);
         var device = try allocDeviceBuffer(self, data.len * @sizeOf(f32));
         errdefer device.free(&self.ctx);
-        try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
+        try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
         try self.ctx.synchronize();
+        self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
         errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
@@ -167,6 +208,19 @@ pub const CudaCompute = struct {
 
 fn cudaDequantizeQuantWeightsOnUpload() bool {
     return platform.env.getenvBoolDefault("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS", false);
+}
+
+fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    // Matrix weights stay quantized for CUDA matmul kernels. Small affine
+    // parameters are consumed by f32 norm/elementwise kernels, so upload them
+    // as f32 even if the bundle stored them in a quantized GGUF block.
+    if (storage.shape.len < 2) return true;
+    if (std.mem.endsWith(u8, name, ".bias")) return true;
+    if (std.mem.eql(u8, name, "count_embed.pos_embedding.weight")) return true;
+    if (std.mem.eql(u8, name, "encoder.rel_embeddings.weight")) return true;
+    if (std.mem.indexOf(u8, name, ".norm") != null) return true;
+    if (std.mem.indexOf(u8, name, "layer_norm") != null) return true;
+    return false;
 }
 
 fn tensorFromCt(tensor: CT) *CudaTensor {
@@ -195,6 +249,20 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
 }
 
+fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
+    try device.copyFromHost(&self.ctx, bytes);
+    self.stats.h2d_bytes += bytes.len;
+}
+
+fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
+    try device.copyToHost(&self.ctx, bytes);
+    self.stats.d2h_bytes += bytes.len;
+}
+
+fn copyFromDeviceTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, src: buffer_mod.DeviceBuffer, len: usize) !void {
+    try device.copyFromDevice(&self.ctx, src, len);
+}
+
 const max_temp_buffers = 256;
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
@@ -211,7 +279,9 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
         const buffer = self.temp_buffers.swapRemove(i);
         return buffer;
     }
-    return buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
+    const buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
+    self.noteDeviceBytes(len);
+    return buffer;
 }
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
@@ -263,7 +333,7 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
 
     var device = try allocDeviceBuffer(self, data.len * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
+    try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     try self.ctx.synchronize();
 
     const tensor = try self.allocator.create(CudaTensor);
@@ -282,7 +352,7 @@ fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
     if (cuda_tensor.dtype != .f32) return error.UnsupportedTensorType;
     const out = try allocator.alloc(f32, cuda_tensor.elem_count);
     errdefer allocator.free(out);
-    try cuda_tensor.buffer.copyToHost(&self.ctx, std.mem.sliceAsBytes(out));
+    try copyToHostTracked(self, cuda_tensor.buffer, std.mem.sliceAsBytes(out));
     try self.ctx.synchronize();
     return out;
 }
@@ -323,17 +393,87 @@ fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT 
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
+    try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     try self.ctx.synchronize();
     self.allocator.free(data);
     return createTensor(self, device, shape, elem_count);
+}
+
+fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+
+    var elem_count: usize = 1;
+    for (new_shape) |dim| {
+        if (dim < 0) return error.InvalidShape;
+        elem_count = try std.math.mul(usize, elem_count, @as(usize, @intCast(dim)));
+    }
+    if (elem_count != input_tensor.elem_count) return error.InvalidShape;
+
+    const shape = try self.allocator.dupe(i64, new_shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try copyFromDeviceTracked(self, device, input_tensor.buffer, input_tensor.elem_count * @sizeOf(f32));
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (input_shape.len == 0 or input_shape.len > 8 or perm.len != input_shape.len) return error.UnsupportedShape;
+
+    var numel: usize = 1;
+    var resolved_shape: [8]usize = undefined;
+    for (input_shape, 0..) |dim, i| {
+        if (dim <= 0) return error.UnsupportedShape;
+        const value: usize = @intCast(dim);
+        resolved_shape[i] = value;
+        numel = try checkedMul(numel, value);
+    }
+    if (numel != input_tensor.elem_count) return error.InvalidShape;
+
+    var seen = [_]bool{false} ** 8;
+    var out_shape_usize: [8]usize = undefined;
+    var out_shape_i64: [8]i64 = undefined;
+    for (perm, 0..) |axis, i| {
+        if (axis >= input_shape.len or seen[axis]) return error.InvalidShape;
+        seen[axis] = true;
+        out_shape_usize[i] = resolved_shape[axis];
+        out_shape_i64[i] = @intCast(out_shape_usize[i]);
+    }
+
+    var in_strides: [8]usize = undefined;
+    var out_strides: [8]usize = undefined;
+    computeStridesUsize(resolved_shape[0..input_shape.len], in_strides[0..input_shape.len]);
+    computeStridesUsize(out_shape_usize[0..input_shape.len], out_strides[0..input_shape.len]);
+
+    const in_host = try downloadAlloc(self, input_tensor);
+    defer self.allocator.free(in_host);
+    var out_host = try self.allocator.alloc(f32, numel);
+    errdefer self.allocator.free(out_host);
+
+    for (0..numel) |flat_out| {
+        var remaining = flat_out;
+        var flat_in: usize = 0;
+        for (0..input_shape.len) |d| {
+            const coord = remaining / out_strides[d];
+            remaining %= out_strides[d];
+            flat_in += coord * in_strides[perm[d]];
+        }
+        out_host[flat_out] = in_host[flat_in];
+    }
+
+    return uploadOwnedHost(self, out_host, out_shape_i64[0..input_shape.len]);
 }
 
 fn downloadAlloc(self: *CudaCompute, tensor: *const CudaTensor) ![]f32 {
     try ensureF32(tensor);
     const out = try self.allocator.alloc(f32, tensor.elem_count);
     errdefer self.allocator.free(out);
-    try tensor.buffer.copyToHost(&self.ctx, std.mem.sliceAsBytes(out));
+    try copyToHostTracked(self, tensor.buffer, std.mem.sliceAsBytes(out));
     try self.ctx.synchronize();
     return out;
 }
@@ -366,12 +506,53 @@ fn isKnownQuant(tensor: *const CudaTensor, known: gguf_tensor_types.KnownTensorT
     };
 }
 
+fn quantPlanFormatForTensor(tensor: *const CudaTensor) quant_matmul.Format {
+    const quant_type = tensor.quant_type orelse return .f32;
+    return switch (quant_type) {
+        .known => |known| switch (known) {
+            .Q8_0 => .q8_0,
+            .Q4_0 => .q4_0,
+            .Q4_K => .q4_k,
+            .Q5_K => .q5_k,
+            .Q6_K => .q6_k,
+            .Q8_K => .q8_k,
+            else => .unknown,
+        },
+        else => .unknown,
+    };
+}
+
+fn cudaAllowPlannedFallback() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_ALLOW_PLANNED_FALLBACK", false);
+}
+
+fn recordQuantMatmulPlan(self: *CudaCompute, weight_tensor: *const CudaTensor, op_plan: operator_plan.OperatorPlan) !void {
+    switch (op_plan) {
+        .quant_matmul => |plan| {
+            self.stats.quant_ops.add(plan.operator);
+            if (plan.format != quantPlanFormatForTensor(weight_tensor)) return error.CudaPlanFormatMismatch;
+            if (plan.operator == .fallback and !cudaAllowPlannedFallback()) return error.CudaPlannedFallbackDisabled;
+        },
+        else => {},
+    }
+}
+
 fn ensureCount(tensor: *const CudaTensor, expected: usize) !void {
     if (tensor.elem_count != expected) return error.InvalidShape;
 }
 
 fn checkedMul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.InvalidShape;
+}
+
+fn computeStridesUsize(shape: []const usize, out: []usize) void {
+    var stride: usize = 1;
+    var i = shape.len;
+    while (i > 0) {
+        i -= 1;
+        out[i] = stride;
+        stride *= shape[i];
+    }
 }
 
 fn checkedAdd(a: usize, b: usize) !usize {
@@ -397,19 +578,19 @@ fn sameShape(a: []const i64, b: []const i64) bool {
 
 fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len * @sizeOf(i64));
-    try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
+    try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     return device;
 }
 
 fn uploadTempU32(self: *CudaCompute, data: []const u32) !buffer_mod.DeviceBuffer {
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len * @sizeOf(u32));
-    try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
+    try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     return device;
 }
 
 fn uploadTempU8(self: *CudaCompute, data: []const u8) !buffer_mod.DeviceBuffer {
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len);
-    try device.copyFromHost(&self.ctx, data);
+    try copyFromHostTracked(self, device, data);
     return device;
 }
 
@@ -590,6 +771,13 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     return createTensor(self, device, shape, out_count);
 }
 
+fn linearPlanned(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight_tensor = tensorFromCt(request.weight);
+    try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan);
+    return linear(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim);
+}
+
 fn linearQuickGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -725,6 +913,13 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
         try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
     }
     return createTensor(self, device, shape, out_count);
+}
+
+fn linearNoBiasPlanned(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedRequest) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight_tensor = tensorFromCt(request.weight);
+    try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan);
+    return linearNoBias(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
 }
 
 fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, weight_c: CT, bias_c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
@@ -1156,6 +1351,7 @@ fn ropeHostFallback(
     position_offset: usize,
     consecutive_pairs: bool,
 ) !CT {
+    self.stats.host_attention_fallbacks += 1;
     const data = try downloadAlloc(self, input_tensor);
     var data_owned = true;
     errdefer if (data_owned) self.allocator.free(data);
@@ -1184,6 +1380,7 @@ fn ropePerItemHostFallback(
     position_offsets: []const usize,
     consecutive_pairs: bool,
 ) !CT {
+    self.stats.host_attention_fallbacks += 1;
     const data = try downloadAlloc(self, input_tensor);
     var data_owned = true;
     errdefer if (data_owned) self.allocator.free(data);
@@ -1234,6 +1431,7 @@ fn gqaDenseAttentionHostFallback(
     num_kv_heads: usize,
     head_dim: usize,
 ) !CT {
+    self.stats.host_attention_fallbacks += 1;
     const q_host = try downloadAlloc(self, q_tensor);
     defer self.allocator.free(q_host);
     const k_host = try downloadAlloc(self, k_tensor);
@@ -1394,6 +1592,7 @@ fn gqaPagedAttentionWithHostKv(
     head_dim: usize,
 ) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.stats.host_attention_fallbacks += 1;
     if (batch != 1 or attention.kv_batch != null) return error.CudaPagedKvBatchUnsupported;
     const manager = attention.kv_manager orelse return error.CudaPagedKvUnsupported;
     const kv = attention.kv_cache orelse return error.CudaPagedKvUnsupported;
@@ -1677,7 +1876,9 @@ const vtable = ops.ComputeBackend.VTable{
     .linearRelu = &linearRelu,
     .linearGelu = &linearGelu,
     .linearAdd = &linearAdd,
+    .linearPlanned = &linearPlanned,
     .linearNoBias = &linearNoBias,
+    .linearNoBiasPlanned = &linearNoBiasPlanned,
     .linearPair = &linearPair,
     .linearTriple = &linearTriple,
     .layerNorm = &layerNorm,
@@ -1689,6 +1890,8 @@ const vtable = ops.ComputeBackend.VTable{
     .quickGelu = &quickGelu,
     .sigmoid = &sigmoid,
     .tanh_act = &tanhAct,
+    .reshapeOp = &reshapeOp,
+    .transposeOp = &transposeOp,
     .splitLastDim3 = &splitLastDim3,
     .concat = &concat,
     .add = &add,

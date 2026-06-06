@@ -67,6 +67,11 @@ const runtime = @import("../runtime/root.zig");
 const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 const MlxCompute = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
+    clipclap,
+    gliner2,
+    gemma4,
+};
 const MlxQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const mlx_mod = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {};
 const mlx_quant_mod = if (build_options.enable_mlx) @import("../backends/mlx_quant.zig") else struct {
@@ -1269,13 +1274,11 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     defer native_session.close();
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
-    if (!cudaSupportsArch(native_impl.arch_config)) return error.UnsupportedCudaArchitecture;
+    const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
 
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
     errdefer cuda_compute.deinit();
-    if (cudaRequiresGemma4DecoderPrimitives(native_impl.arch_config) and !cuda_compute.hasGemma4DecoderPrimitives()) {
-        return error.CudaKernelUnavailable;
-    }
+    try cuda_compute.requireProfile(cuda_profile);
     var it = native_impl.backend_data.native.resident_weights.iterator();
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
@@ -1297,11 +1300,7 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 }
 
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
-    return switch (arch_config) {
-        .deberta, .gliner, .clip, .clap => true,
-        .gpt => |cfg| cfg.family == .gemma,
-        else => false,
-    };
+    return cudaProfileForArch(arch_config) != null;
 }
 
 fn cudaRequiresGemma4DecoderPrimitives(arch_config: ArchConfig) bool {
@@ -1311,12 +1310,26 @@ fn cudaRequiresGemma4DecoderPrimitives(arch_config: ArchConfig) bool {
     };
 }
 
+fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
+    return switch (arch_config) {
+        .clip, .clap => .clipclap,
+        .deberta, .gliner => .gliner2,
+        .gpt => |cfg| if (cfg.family == .gemma) .gemma4 else null,
+        else => null,
+    };
+}
+
 test "cuda support gate admits Gemma-family GPT only after decoder primitives exist" {
     try std.testing.expect(cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
     try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
     try std.testing.expect(cudaRequiresGemma4DecoderPrimitives(.{ .gpt = .{ .family = .gemma } }));
     try std.testing.expect(!cudaRequiresGemma4DecoderPrimitives(.{ .clip = .{} }));
     try std.testing.expect(!cudaRequiresGemma4DecoderPrimitives(.{ .gliner = .{} }));
+    if (comptime build_options.enable_cuda) {
+        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
+    }
 }
 
 fn eagerLoadResidentsFromStore(

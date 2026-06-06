@@ -553,9 +553,20 @@ fn spanMarkerForwardFromWordCt(
         }
     }
 
-    const gathered_start = try cb.embeddingLookup(start_proj, start_ids, total_spans, H);
+    const start_rows = try allocator.alloc(u32, total_spans);
+    defer allocator.free(start_rows);
+    const end_rows = try allocator.alloc(u32, total_spans);
+    defer allocator.free(end_rows);
+    for (0..total_spans) |i| {
+        start_rows[i] = @intCast(start_ids[i]);
+        end_rows[i] = @intCast(end_ids[i]);
+    }
+
+    const gathered_start = (try cb.takeRows(start_proj, start_rows, total_spans, H)) orelse
+        try cb.embeddingLookup(start_proj, start_ids, total_spans, H);
     defer cb.free(gathered_start);
-    const gathered_end = try cb.embeddingLookup(end_proj, end_ids, total_spans, H);
+    const gathered_end = (try cb.takeRows(end_proj, end_rows, total_spans, H)) orelse
+        try cb.embeddingLookup(end_proj, end_ids, total_spans, H);
     defer cb.free(gathered_end);
 
     const concat_ct = try cb.concat(gathered_start, gathered_end, total_spans, H, H);

@@ -286,6 +286,47 @@ pub const KernelModule = struct {
             self.gqa_attention_f32 != null;
     }
 
+    pub fn hasClipClapPrimitives(self: *const KernelModule) bool {
+        return self.linear_f32 != null and
+            self.linear_bias_f32 != null and
+            self.linear_bias_f32_tile4_r2 != null and
+            self.linear_bias_relu_f32_tile4_r2 != null and
+            self.linear_bias_gelu_f32_tile4_r2 != null and
+            self.rms_norm_f32 != null and
+            self.layer_norm_f32 != null and
+            self.elementwise_f32 != null and
+            self.embedding_lookup_f32 != null and
+            self.concat_lastdim_f32 != null and
+            self.conv2d_f32 != null and
+            self.attention_f32 != null and
+            self.attention_f32_block != null;
+    }
+
+    pub fn hasGliner2Primitives(self: *const KernelModule) bool {
+        return self.hasClipClapPrimitives() and
+            self.take_rows_f32 != null and
+            self.gliner_word_embeddings_f32 != null and
+            self.repeat_first_row_f32 != null and
+            self.gliner_gru_combine_f32 != null and
+            self.deberta_attention_f32 != null and
+            self.split_last_dim3_f32 != null;
+    }
+
+    pub fn hasQuantMatmulMvpPrimitives(self: *const KernelModule) bool {
+        return self.linear_q8_0_f32 != null and
+            self.linear_q4_0_f32 != null and
+            self.linear_q4_k_f32 != null and
+            self.linear_q4_k_bias_f32 != null and
+            self.linear_q4_k_f32_tiled != null and
+            self.linear_q4_k_bias_f32_tiled != null and
+            self.linear_q4_k_f32_tile4 != null and
+            self.linear_q4_k_bias_f32_tile4 != null and
+            self.linear_q4_k_bias_f32_tile4_r2 != null and
+            self.linear_q4_k_pair_bias_f32_tiled != null and
+            self.linear_q4_k_triple_bias_f32_tiled != null and
+            self.embedding_lookup_q4_k_f32 != null;
+    }
+
     pub fn requireGemma4DecoderPrimitives(self: *const KernelModule) driver_mod.Error!void {
         if (!self.hasGemma4DecoderPrimitives()) return error.CudaKernelUnavailable;
     }
