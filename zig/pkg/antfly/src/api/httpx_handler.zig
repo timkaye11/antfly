@@ -34,6 +34,7 @@ const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
 const table_reads = @import("table_reads.zig");
+const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -203,9 +204,15 @@ pub const AntflyApiHandler = struct {
                 return error.UnsupportedMethod;
             },
         };
+        const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(http_server_mod.trusted_principal_header)) |trusted_principal| blk: {
+            const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
+            headers[0] = .{ .name = http_server_mod.trusted_principal_header, .value = trusted_principal };
+            break :blk headers;
+        } else &.{};
         return .{
             .method = method,
             .uri = ctx.request.uri.raw,
+            .headers = trusted_principal_headers,
             .authorization = ctx.header("authorization"),
             .content_type = ctx.header("content-type"),
             .body = body_data,
@@ -217,9 +224,11 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
-        if (!self.api_server.cfg.auth_enabled) return null;
-        const auth_header = ctx.header("authorization");
-        return self.api_server.authenticateRequest(auth_header) catch |err| switch (err) {
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+        return self.api_server.authenticateRequest(.{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }) catch |err| switch (err) {
             error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
                 return null;
             },
@@ -228,7 +237,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn requireAuth(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
-        if (!self.api_server.cfg.auth_enabled) return null;
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
         const identity = (try self.authenticate(ctx)) orelse {
             return error.Unauthorized;
         };
@@ -266,11 +275,14 @@ pub const AntflyApiHandler = struct {
 
     fn authorizeRequest(self: *AntflyApiHandler, ctx: *httpx.Context, identity: *?AuthenticatedIdentity) !?httpx.Response {
         identity.* = null;
-        if (!self.api_server.cfg.auth_enabled) return null;
-        if (self.api_server.cfg.user_manager == null) return null;
+        if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
+        if (self.api_server.cfg.user_manager == null and self.api_server.cfg.trusted_principal_secret == null) return null;
 
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        identity.* = self.api_server.authenticateRequest(ctx.header("authorization")) catch |err| switch (err) {
+        identity.* = self.api_server.authenticateRequest(.{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }) catch |err| switch (err) {
             error.Unauthorized, error.InvalidPassword, error.UserNotFound, error.ApiKeyInvalid, error.ApiKeyNotFound, error.ApiKeyExpired => {
                 return try unauthorizedResponse(ctx);
             },
@@ -1471,6 +1483,28 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         defer create_req.deinit(alloc);
+        const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+            alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.api_server.antfly_provider,
+                .secret_store = self.api_server.cfg.secret_store,
+                .remote_content = self.api_server.cfg.remote_content,
+                .inference_api_key = self.api_server.cfg.inference_api_key,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported table index configuration");
+            },
+            error.EmbeddingProbeUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("table index validation probe unavailable");
+            },
+            else => return err,
+        };
+        if (create_req.indexes_json) |old_indexes_json| alloc.free(old_indexes_json);
+        create_req.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
             _ = ctx.status(400);
             return ctx.text("unsupported table index configuration");
@@ -1506,6 +1540,10 @@ pub const AntflyApiHandler = struct {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
                     _ = ctx.status(400);
                     return ctx.text("unsupported table index configuration");
+                },
+                error.EmbeddingProbeUnavailable => {
+                    _ = ctx.status(503);
+                    return ctx.text("table index validation probe unavailable");
                 },
                 else => {
                     std.log.err("public create table local create failed table={s} err={}", .{ table_name, err });
@@ -1893,7 +1931,7 @@ pub const AntflyApiHandler = struct {
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
-            if (!(try self.api_server.docMatchesRowFilter(source, table_name, decoded_key, value))) {
+            if (!(try self.api_server.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             }

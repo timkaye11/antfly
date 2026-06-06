@@ -325,6 +325,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
     return switch (err) {
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
+        error.ModelNotFound,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
@@ -339,6 +340,10 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "enrichment treats missing local model as retryable" {
+    try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
 }
 
 fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
@@ -369,6 +374,66 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
+}
+
+fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_state.RuntimeStatus) void {
+    runtime.error_count = persisted_status.error_count;
+    runtime.retryable_error_count = persisted_status.retryable_error_count;
+    runtime.fatal_error_count = persisted_status.fatal_error_count;
+    runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
+    runtime.worker_failed = persisted_status.worker_failed;
+    runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
+}
+
+test "enrichment runtime restore preserves retry target across restart" {
+    var runtime = struct {
+        applied_sequence: u64 = 3,
+        target_sequence: u64 = 0,
+        error_count: u64 = 0,
+        retryable_error_count: u64 = 0,
+        fatal_error_count: u64 = 0,
+        retrying: bool = false,
+        worker_failed: bool = false,
+    }{};
+
+    restorePersistedRuntimeStatus(&runtime, .{
+        .target_sequence = 9,
+        .error_count = 2,
+        .retryable_error_count = 2,
+        .fatal_error_count = 0,
+        .retrying = true,
+        .worker_failed = false,
+    });
+
+    try std.testing.expectEqual(@as(u64, 9), runtime.target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), runtime.error_count);
+    try std.testing.expectEqual(@as(u64, 2), runtime.retryable_error_count);
+    try std.testing.expect(runtime.retrying);
+    try std.testing.expect(!runtime.worker_failed);
+}
+
+test "enrichment runtime restore does not resume persisted fatal failure" {
+    var runtime = struct {
+        applied_sequence: u64 = 7,
+        target_sequence: u64 = 0,
+        error_count: u64 = 0,
+        retryable_error_count: u64 = 0,
+        fatal_error_count: u64 = 0,
+        retrying: bool = false,
+        worker_failed: bool = false,
+    }{};
+
+    restorePersistedRuntimeStatus(&runtime, .{
+        .target_sequence = 4,
+        .error_count = 1,
+        .fatal_error_count = 1,
+        .retrying = true,
+        .worker_failed = true,
+    });
+
+    try std.testing.expectEqual(@as(u64, 7), runtime.target_sequence);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expect(runtime.worker_failed);
 }
 
 fn clearPublishedGeneratedArtifacts(runtime: *EnrichmentRuntime) void {
@@ -792,7 +857,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        runtime.target_sequence = runtime.applied_sequence;
+        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 
@@ -1013,7 +1079,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             }),
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        runtime.target_sequence = runtime.applied_sequence;
+        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 
@@ -1540,12 +1607,15 @@ fn materializeGraphAssetForRuntime(
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
         } else {
+            const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
             defer runtime.alloc.free(prefix);
             const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
             defer backend_scan.freeResults(runtime.alloc, existing);
             for (existing) |entry| {
                 if (runtimeContainsKVKey(writes.items, entry.key)) continue;
+                if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
             }
@@ -1593,11 +1663,14 @@ fn materializeGraphAssetDeleteForRuntime(
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             }
         } else {
+            const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
             defer runtime.alloc.free(prefix);
             const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
             defer backend_scan.freeResults(runtime.alloc, existing);
             for (existing) |entry| {
+                if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
                 try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
                 try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
             }
@@ -1615,6 +1688,13 @@ fn materializeGraphAssetDeleteForRuntime(
 fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+fn runtimeContainsConstKey(items: []const []const u8, key: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, key)) return true;
     }
     return false;
 }
@@ -3252,6 +3332,42 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
     return try list.toOwnedSlice(alloc);
 }
 
+fn runtimeMentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![][]const u8 {
+    if (source.mention_edge_type.len == 0) return try runtime.alloc.alloc([]const u8, 0);
+
+    var protected = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (protected.items) |key| runtime.alloc.free(@constCast(key));
+        protected.deinit(runtime.alloc);
+    }
+
+    for (runtime.index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+
+        const state_name = try runtimeMentionGraphStateNameAlloc(runtime.alloc, source.artifact_name, cfg.resolution_artifact);
+        defer runtime.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, doc_key, index_name, state_name);
+        defer runtime.alloc.free(state_key);
+
+        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key) orelse continue;
+        defer freeOwnedConstKeySlice(runtime.alloc, state_keys);
+        for (state_keys) |key| {
+            try protected.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
+        }
+    }
+
+    return try protected.toOwnedSlice(runtime.alloc);
+}
+
 fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -3488,6 +3604,15 @@ fn derivedEmbeddingBelongsToDesiredChunk(key: []const u8, desired_chunk_keys: []
     return false;
 }
 
+fn assetSourceIndexKeyForArtifactAlloc(alloc: Allocator, artifact_key: []const u8) !?[]u8 {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return null;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+    return try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+}
+
 fn storePutWithRetry(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
@@ -3619,18 +3744,40 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     try txn.put(key, value);
+    if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
+        defer runtime.alloc.free(marker_key);
+        try txn.put(marker_key, key);
+    }
     try txn.commit();
 }
 
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     var batch = try runtime.store.beginBatch();
     errdefer batch.abort();
-    for (writes) |write| try batch.put(write.key, write.value);
+    var marker_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (marker_keys.items) |key| runtime.alloc.free(key);
+        marker_keys.deinit(runtime.alloc);
+    }
+    for (writes) |write| {
+        try batch.put(write.key, write.value);
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, write.key)) |marker_key| {
+            try marker_keys.append(runtime.alloc, marker_key);
+            try batch.put(marker_key, write.key);
+        }
+    }
     for (deletes) |key| {
         batch.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
+            try marker_keys.append(runtime.alloc, marker_key);
+            batch.delete(marker_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
     }
     try batch.commit();
 }

@@ -423,16 +423,21 @@ pub const IndexStatus = struct {
     status: antfly_indexes_openapi.IndexStats,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
+/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
+pub const LsmStorageStatus = struct {
+    run_count: ?i64 = null,
+    run_bytes: ?i64 = null,
+    l0_run_count: ?i64 = null,
+    l0_bytes: ?i64 = null,
+    wal_retained_bytes: ?i64 = null,
+    compaction_backlog_bytes: ?i64 = null,
+    active_readers: ?i64 = null,
 };
 
 /// MongoDB-style update operator
 pub const TransformOpType = enum {
     @"$set",
+    @"$set_on_insert",
     @"$unset",
     @"$inc",
     @"$push",
@@ -448,6 +453,7 @@ pub const TransformOpType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .@"$set" => "$set",
+            .@"$set_on_insert" => "$setOnInsert",
             .@"$unset" => "$unset",
             .@"$inc" => "$inc",
             .@"$push" => "$push",
@@ -470,6 +476,7 @@ pub const TransformOpType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "$set", .@"$set" },
+            .{ "$setOnInsert", .@"$set_on_insert" },
             .{ "$unset", .@"$unset" },
             .{ "$inc", .@"$inc" },
             .{ "$push", .@"$push" },
@@ -1450,11 +1457,19 @@ pub const AggregationRequest = struct {
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
 };
 
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
+};
+
 pub const TransformOp = struct {
     op: TransformOpType,
     /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
     path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.)
+    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
     value: ?std.json.Value = null,
 };
 

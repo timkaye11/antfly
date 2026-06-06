@@ -44,6 +44,11 @@ pub const PoolingStrategy = enum {
     last,
 };
 
+pub const ImagePreprocessProfile = enum {
+    default,
+    clip,
+};
+
 pub const EmbeddingConfig = struct {
     normalize: bool = true,
     pooling: PoolingStrategy = .mean,
@@ -64,6 +69,8 @@ pub const EmbeddingConfig = struct {
     resident_qwen3_embedding: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
+    /// Model-selected image preprocessing contract.
+    image_preprocess_profile: ImagePreprocessProfile = .default,
     /// For CLAP audio models: mel spectrogram configuration.
     audio_config: audio.AudioConfig = audio.CLAP_CONFIG,
 };
@@ -192,6 +199,9 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
+        if (self.session.backend() == .onnx and texts.len > 1) {
+            return try self.embedSerial(texts);
+        }
 
         const alloc = self.allocator;
         const max_len = self.config.max_length;
@@ -301,6 +311,28 @@ pub const EmbeddingPipeline = struct {
 
         if (self.text_projection) |proj| {
             try self.projectEmbeddings(embeddings, proj);
+        }
+
+        return embeddings;
+    }
+
+    fn embedSerial(self: *EmbeddingPipeline, texts: []const []const u8) anyerror![][]f32 {
+        const embeddings = try self.allocator.alloc([]f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(embeddings);
+        }
+
+        for (texts, 0..) |_, idx| {
+            const single = try self.embed(texts[idx .. idx + 1]);
+            if (single.len != 1) {
+                freeEmbeddingSlices(self.allocator, single);
+                return error.UnexpectedOutputShape;
+            }
+            embeddings[idx] = single[0];
+            self.allocator.free(single);
+            initialized += 1;
         }
 
         return embeddings;
@@ -439,13 +471,22 @@ pub const EmbeddingPipeline = struct {
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
-        const pixel_values = try image.preprocessBatch(
-            alloc,
-            images,
-            img_size,
-            image.IMAGENET_MEAN,
-            image.IMAGENET_STD,
-        );
+        const pixel_values = switch (self.config.image_preprocess_profile) {
+            .default => try image.preprocessBatch(
+                alloc,
+                images,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+            ),
+            .clip => try image.preprocessClipBatch(
+                alloc,
+                images,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+            ),
+        };
         defer alloc.free(pixel_values);
         logEmbedTiming("image.preprocess", batch, preprocess_start);
 

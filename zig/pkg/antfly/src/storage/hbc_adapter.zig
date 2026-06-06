@@ -84,6 +84,7 @@ pub const StorageBackend = vectorindex_types.StorageBackend;
 pub const BulkBuildAlgo = vectorindex_types.BulkBuildAlgo;
 pub const LsmWriteStats = lsm_backend.Backend.WriteStats;
 pub const LsmMaintenanceStats = lsm_backend.Backend.MaintenanceStats;
+pub const LsmOpenStats = lsm_backend.Backend.OpenStats;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) {
@@ -118,6 +119,12 @@ fn defaultRetainedVectorCacheEnabled() bool {
         return !envBoolEnabled(raw);
     }
     return true;
+}
+
+fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?bool) vectorindex_store.BatchMode {
+    if (!in_bulk_session) return .default;
+    const direct_bulk_ingest_enabled = lsm_direct_bulk_ingest_enabled orelse return .default;
+    return if (direct_bulk_ingest_enabled) .default else .bulk_ingest;
 }
 
 // ============================================================================
@@ -1475,6 +1482,20 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
+        return switch (self.env_owner) {
+            .lsm => |handle| handle.backend.snapshotOpenStats(),
+            .lmdb => null,
+        };
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
+        switch (self.env_owner) {
+            .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+            .lmdb => {},
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
@@ -1601,8 +1622,15 @@ pub const HBCIndex = struct {
                 });
             };
         }
+        var finish_options = options;
+        if (finishing_outermost) {
+            // HBC publishes deferred roots and metadata through normal mutable
+            // batches so repeated rewrites coalesce. Make the final published
+            // state durable before exposing the completed bulk session.
+            finish_options.flush = true;
+        }
         switch (self.env_owner) {
-            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(options),
+            .lsm => |handle| try handle.backend.finishBulkIngestSessionWithOptions(finish_options),
             .lmdb => {},
         }
         if (self.bulk_ingest_session_depth > 0) self.bulk_ingest_session_depth -= 1;
@@ -2674,14 +2702,24 @@ pub const HBCIndex = struct {
             self.apply_workspace_split_bytes = 0;
             self.observeApplyWorkspaceBytes();
         }
+        const in_bulk_session = self.bulk_ingest_session_depth > 0;
         // HBC mutation batches rewrite nodes, ranges, and quantized payloads
-        // heavily. The outer bulk-ingest session still defers manifests and
-        // compaction, but each mutation batch must use normal mutable-state
-        // coalescing instead of direct sorted-run ingestion. Otherwise every
-        // stale internal rewrite becomes durable table bytes during large loads.
+        // heavily. Keep mutable-state coalescing, but preserve bulk transaction
+        // mode when the LSM profile disables direct bulk ingest so LSM defers
+        // batch-exit maintenance until the session boundary. Direct-bulk LSM
+        // profiles and non-LSM backends stay in default mode; otherwise stale
+        // internal rewrites can become durable table bytes during large loads.
         return try self.store.beginBatchWithOptions(.{
-            .mode = .default,
+            .mode = self.runtimeBatchMode(in_bulk_session),
+            .defer_commit_flush = in_bulk_session,
         });
+    }
+
+    fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
+        return switch (self.env_owner) {
+            .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
+            .lmdb => hbcRuntimeBatchMode(in_bulk_session, null),
+        };
     }
 
     fn commitTxn(txn: anytype) !void {
@@ -4501,6 +4539,57 @@ pub const HBCIndex = struct {
         return true;
     }
 
+    pub fn scoreExternalVectorsSortedWithScratch(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+    ) !bool {
+        const loader = self.external_vector_batch_distance_loader orelse return false;
+        const ctx = self.external_vector_ctx orelse return false;
+        if (distances.len < vector_ids.len) return error.InvalidArgument;
+        if (metadata_storage.len < vector_ids.len) return error.InvalidArgument;
+        if (vector_ids.len == 0) return true;
+
+        for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
+        const metadata = metadata_storage[0..vector_ids.len];
+        try self.getMetadataManySortedInTxnWithScratch(
+            txn,
+            vector_ids,
+            metadata,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+        );
+        loader(
+            ctx,
+            vector_ids,
+            metadata,
+            query,
+            query_measure,
+            self.config.metric,
+            distances[0..vector_ids.len],
+            batch_scratch,
+            @intCast(self.config.dims),
+            .{
+                .artifact_keys = key_views_storage,
+                .raw_values = values_storage,
+            },
+            null,
+        ) catch |err| switch (err) {
+            error.Unsupported => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn getVectorScratch(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
         return vectorindex_hbc_index.getVectorScratch(self, txn, vector_id, scratch) catch |err| {
             if (!isNotFound(err)) return err;
@@ -5291,7 +5380,34 @@ pub const HBCIndex = struct {
             }
         }
 
-        if (best_child == 0) return node_id;
+        if (best_child == 0) {
+            self.invalidateNodeCache(node_id);
+            var fresh_node = self.loadNodeFromStorage(txn, node_id) catch |err| {
+                if (isNotFound(err)) return error.Corrupted;
+                return err;
+            };
+            defer fresh_node.deinit(self.alloc);
+            if (fresh_node.is_leaf) return node_id;
+            if (fresh_node.children.len == 0) return error.Corrupted;
+
+            try scratch.ensureCapacity(self.alloc, fresh_node.children.len);
+            @memcpy(scratch.child_ids[0..fresh_node.children.len], fresh_node.children);
+            const fresh_child_ids = scratch.child_ids[0..fresh_node.children.len];
+
+            for (fresh_child_ids) |child_id| {
+                var child = self.loadNodeFromStorage(txn, child_id) catch |err| {
+                    if (isNotFound(err)) continue;
+                    return err;
+                };
+                defer child.deinit(self.alloc);
+                const dist = vec.distanceToQuery(query, query_measure, child.centroid, self.config.metric);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_child = child_id;
+                }
+            }
+            if (best_child == 0) return error.Corrupted;
+        }
         return self.findLeafWithOptionsScratch(txn, best_child, query, false, scratch);
     }
 
@@ -10555,6 +10671,55 @@ test "findLeafWithOptions does not use-after-free when cache evicts mid-traversa
     try std.testing.expect(results.getHits().len > 0);
 }
 
+test "findLeafWithOptions fails closed when cached internal children are stale" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .max_cached_nodes = 2,
+    });
+    defer idx.close();
+
+    var centroid = [_]f32{ 0.0, 0.0 };
+    var children = [_]u64{999};
+    const root = Node{
+        .id = 1,
+        .is_leaf = false,
+        .level = 1,
+        .parent = 0,
+        .centroid = centroid[0..],
+        .children = children[0..],
+        .members = &.{},
+    };
+
+    var write_txn = try idx.beginWriteTxn();
+    errdefer write_txn.abort();
+    const centroid_bytes = std.mem.sliceAsBytes(root.centroid);
+    const ids_bytes = std.mem.sliceAsBytes(root.children);
+    const packed_len = vectorindex_hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
+    const packed_buf = try alloc.alloc(u8, packed_len);
+    defer alloc.free(packed_buf);
+    const header = NodeHeader{ .is_leaf = false, .level = 1, .parent = 0 };
+    const encoded = try vectorindex_hbc.encodePackedNodeValue(packed_buf, header, centroid_bytes, ids_bytes);
+    var key_buf: [12]u8 = undefined;
+    try idx.putNamespaced(&write_txn, .nodes, encodeNodeKey(&key_buf, root.id, .packed_node), encoded);
+    try idx.cacheNode(&root);
+    try idx.finishWriteTxn(&write_txn);
+
+    var read_txn = try idx.beginRuntimeReadTxn();
+    defer read_txn.abort();
+    try std.testing.expectError(
+        error.Corrupted,
+        idx.findLeafWithOptions(&read_txn, idx.metadata.root_node, &.{ 1.0, 0.0 }, true),
+    );
+}
+
 test "insert routes while search cache admission is disabled" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -10640,6 +10805,16 @@ test "scoreLeafMembers does not use-after-free when cache evicts during member s
     defer results.deinit();
     try std.testing.expect(ctx.fired);
     try std.testing.expect(results.getHits().len > 0);
+}
+
+test "HBC runtime batch mode preserves bulk only for non-direct LSM bulk sessions" {
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, false));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, true));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, null));
+
+    try std.testing.expectEqual(vectorindex_store.BatchMode.bulk_ingest, hbcRuntimeBatchMode(true, false));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(true, true));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(true, null));
 }
 
 // ============================================================================
