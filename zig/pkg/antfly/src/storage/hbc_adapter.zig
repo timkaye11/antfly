@@ -121,6 +121,12 @@ fn defaultRetainedVectorCacheEnabled() bool {
     return true;
 }
 
+fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?bool) vectorindex_store.BatchMode {
+    if (!in_bulk_session) return .default;
+    const direct_bulk_ingest_enabled = lsm_direct_bulk_ingest_enabled orelse return .default;
+    return if (direct_bulk_ingest_enabled) .default else .bulk_ingest;
+}
+
 // ============================================================================
 // Index metadata (serialized to LMDB)
 // ============================================================================
@@ -2696,15 +2702,24 @@ pub const HBCIndex = struct {
             self.apply_workspace_split_bytes = 0;
             self.observeApplyWorkspaceBytes();
         }
+        const in_bulk_session = self.bulk_ingest_session_depth > 0;
         // HBC mutation batches rewrite nodes, ranges, and quantized payloads
-        // heavily. The outer bulk-ingest session still defers manifests and
-        // compaction, but each mutation batch must use normal mutable-state
-        // coalescing instead of direct sorted-run ingestion. Otherwise every
-        // stale internal rewrite becomes durable table bytes during large loads.
+        // heavily. Keep mutable-state coalescing, but preserve bulk transaction
+        // mode when the LSM profile disables direct bulk ingest so LSM defers
+        // batch-exit maintenance until the session boundary. Direct-bulk LSM
+        // profiles and non-LSM backends stay in default mode; otherwise stale
+        // internal rewrites can become durable table bytes during large loads.
         return try self.store.beginBatchWithOptions(.{
-            .mode = .default,
-            .defer_commit_flush = self.bulk_ingest_session_depth > 0,
+            .mode = self.runtimeBatchMode(in_bulk_session),
+            .defer_commit_flush = in_bulk_session,
         });
+    }
+
+    fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
+        return switch (self.env_owner) {
+            .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
+            .lmdb => hbcRuntimeBatchMode(in_bulk_session, null),
+        };
     }
 
     fn commitTxn(txn: anytype) !void {
@@ -5365,7 +5380,34 @@ pub const HBCIndex = struct {
             }
         }
 
-        if (best_child == 0) return node_id;
+        if (best_child == 0) {
+            self.invalidateNodeCache(node_id);
+            var fresh_node = self.loadNodeFromStorage(txn, node_id) catch |err| {
+                if (isNotFound(err)) return error.Corrupted;
+                return err;
+            };
+            defer fresh_node.deinit(self.alloc);
+            if (fresh_node.is_leaf) return node_id;
+            if (fresh_node.children.len == 0) return error.Corrupted;
+
+            try scratch.ensureCapacity(self.alloc, fresh_node.children.len);
+            @memcpy(scratch.child_ids[0..fresh_node.children.len], fresh_node.children);
+            const fresh_child_ids = scratch.child_ids[0..fresh_node.children.len];
+
+            for (fresh_child_ids) |child_id| {
+                var child = self.loadNodeFromStorage(txn, child_id) catch |err| {
+                    if (isNotFound(err)) continue;
+                    return err;
+                };
+                defer child.deinit(self.alloc);
+                const dist = vec.distanceToQuery(query, query_measure, child.centroid, self.config.metric);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_child = child_id;
+                }
+            }
+            if (best_child == 0) return error.Corrupted;
+        }
         return self.findLeafWithOptionsScratch(txn, best_child, query, false, scratch);
     }
 
@@ -10629,6 +10671,55 @@ test "findLeafWithOptions does not use-after-free when cache evicts mid-traversa
     try std.testing.expect(results.getHits().len > 0);
 }
 
+test "findLeafWithOptions fails closed when cached internal children are stale" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .max_cached_nodes = 2,
+    });
+    defer idx.close();
+
+    var centroid = [_]f32{ 0.0, 0.0 };
+    var children = [_]u64{999};
+    const root = Node{
+        .id = 1,
+        .is_leaf = false,
+        .level = 1,
+        .parent = 0,
+        .centroid = centroid[0..],
+        .children = children[0..],
+        .members = &.{},
+    };
+
+    var write_txn = try idx.beginWriteTxn();
+    errdefer write_txn.abort();
+    const centroid_bytes = std.mem.sliceAsBytes(root.centroid);
+    const ids_bytes = std.mem.sliceAsBytes(root.children);
+    const packed_len = vectorindex_hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
+    const packed_buf = try alloc.alloc(u8, packed_len);
+    defer alloc.free(packed_buf);
+    const header = NodeHeader{ .is_leaf = false, .level = 1, .parent = 0 };
+    const encoded = try vectorindex_hbc.encodePackedNodeValue(packed_buf, header, centroid_bytes, ids_bytes);
+    var key_buf: [12]u8 = undefined;
+    try idx.putNamespaced(&write_txn, .nodes, encodeNodeKey(&key_buf, root.id, .packed_node), encoded);
+    try idx.cacheNode(&root);
+    try idx.finishWriteTxn(&write_txn);
+
+    var read_txn = try idx.beginRuntimeReadTxn();
+    defer read_txn.abort();
+    try std.testing.expectError(
+        error.Corrupted,
+        idx.findLeafWithOptions(&read_txn, idx.metadata.root_node, &.{ 1.0, 0.0 }, true),
+    );
+}
+
 test "insert routes while search cache admission is disabled" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -10714,6 +10805,16 @@ test "scoreLeafMembers does not use-after-free when cache evicts during member s
     defer results.deinit();
     try std.testing.expect(ctx.fired);
     try std.testing.expect(results.getHits().len > 0);
+}
+
+test "HBC runtime batch mode preserves bulk only for non-direct LSM bulk sessions" {
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, false));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, true));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(false, null));
+
+    try std.testing.expectEqual(vectorindex_store.BatchMode.bulk_ingest, hbcRuntimeBatchMode(true, false));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(true, true));
+    try std.testing.expectEqual(vectorindex_store.BatchMode.default, hbcRuntimeBatchMode(true, null));
 }
 
 // ============================================================================

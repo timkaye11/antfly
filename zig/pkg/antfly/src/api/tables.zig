@@ -888,6 +888,10 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
     var first = true;
     var it = root.iterator();
     while (it.next()) |entry| {
+        // `resolvers` is a reserved entity-resolution section, not an index
+        // config; the provisioner reads it from the stored indexes_json. Skip it
+        // here so the typed IndexConfig validation/projection ignores it.
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -1629,7 +1633,7 @@ fn extractCanonicalObjectField(alloc: std.mem.Allocator, schema_json: []const u8
     return try stringifyJsonValue(alloc, value);
 }
 
-fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
+pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
     defer parsed.deinit();

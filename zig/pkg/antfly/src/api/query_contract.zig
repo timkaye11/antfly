@@ -2226,6 +2226,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     return .{
         ._id = hit.id,
         ._score = hit.score orelse 0,
+        ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._source = if (hit.stored_data) |stored_data|
             if (req.defer_stored_projection)
                 try document_query.projectLookupJsonValue(alloc, stored_data, .{
@@ -2237,6 +2238,35 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         else
             null,
     };
+}
+
+fn indexScoresJsonValue(alloc: std.mem.Allocator, scores: []const fusion_mod.IndexScore) !?std.json.Value {
+    if (scores.len == 0) return null;
+    var obj = std.json.ObjectMap.empty;
+    errdefer obj.deinit(alloc);
+    for (scores) |score| {
+        try obj.put(alloc, score.index_name, .{ .float = score.score });
+    }
+    return .{ .object = obj };
+}
+
+test "api query contract serializes fused index scores" {
+    const alloc = std.testing.allocator;
+    const scores = [_]fusion_mod.IndexScore{
+        .{ .index_name = "text_idx", .score = 0.75 },
+        .{ .index_name = "semantic_idx", .score = 0.25 },
+    };
+
+    var value = (try indexScoresJsonValue(alloc, &scores)).?;
+    defer switch (value) {
+        .object => |*obj| obj.deinit(alloc),
+        else => {},
+    };
+
+    const object = value.object;
+    try std.testing.expectEqual(@as(usize, 2), object.count());
+    try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?.float);
+    try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
 }
 
 fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !std.json.Value {
@@ -2753,18 +2783,6 @@ fn buildGraphQueryResults(
 
     for (result.graph_results) |graph_result| {
         const query_type = findGraphQueryType(req.graph_queries, graph_result.name) orelse continue;
-        std.log.info(
-            "encode graph result name={s} type={s} total={d} nodes={d} paths={d} matches={d} hits={d}",
-            .{
-                graph_result.name,
-                @tagName(query_type),
-                graph_result.total_hits,
-                graph_result.nodes.len,
-                graph_result.paths.len,
-                graph_result.matches.len,
-                graph_result.hits.len,
-            },
-        );
         try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(alloc, query_type, meta, graph_result));
     }
     return out;
