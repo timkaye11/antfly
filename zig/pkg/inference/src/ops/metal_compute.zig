@@ -141,7 +141,15 @@ fn traceGatedDeviceRequested() bool {
 }
 
 fn enableRank1DotSpecialization() bool {
-    return getenvBool("TERMITE_METAL_ENABLE_RANK1_DOT_SPECIALIZATION");
+    if (getenvBool("TERMITE_METAL_DISABLE_RANK1_DOT_SPECIALIZATION")) return false;
+    if (getenvBool("TERMITE_METAL_ENABLE_RANK1_DOT_SPECIALIZATION")) return true;
+    return getenvBool("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR") and !getenvBool("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR");
+}
+
+fn enableDenseDeviceDotGeneral() bool {
+    if (getenvBool("TERMITE_METAL_DISABLE_DENSE_DEVICE_DOT_GENERAL")) return false;
+    if (getenvBool("TERMITE_METAL_ENABLE_DENSE_DEVICE_DOT_GENERAL")) return true;
+    return getenvBool("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR") and !getenvBool("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR");
 }
 
 fn disableRuntimeEmbeddingLookup() bool {
@@ -3160,6 +3168,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub const TrainingAdamWOptions = metal_runtime.TrainingAdamWOptions;
 
+    pub const TrainingAdamWBatchInput = struct {
+        weight: CT,
+        grad: CT,
+        m: CT,
+        v: CT,
+        elem_count: usize,
+    };
+
     pub fn trainingAdamWF32(
         self: *MetalCompute,
         weight: CT,
@@ -3184,6 +3200,44 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             m_mt,
             v_mt,
             elem_count,
+            opts,
+        );
+        if (!ok) return error.MetalTrainingAdamWUnavailable;
+    }
+
+    pub fn trainingAdamWManyF32(
+        self: *MetalCompute,
+        inputs: []const TrainingAdamWBatchInput,
+        opts: TrainingAdamWOptions,
+    ) !void {
+        if (inputs.len == 0) return;
+        var batch = try self.allocator.alloc(metal_runtime.TrainingAdamWBatch, inputs.len);
+        defer self.allocator.free(batch);
+        var initialized: usize = 0;
+        defer {
+            for (batch[0..initialized]) |*item| {
+                item.weight.deinit();
+                item.grad.deinit();
+                item.m.deinit();
+                item.v.deinit();
+            }
+        }
+        for (inputs, 0..) |input, idx| {
+            batch[idx] = .{
+                .weight = try self.ownedDeviceMetalTensorFromCt(input.weight),
+                .grad = undefined,
+                .m = undefined,
+                .v = undefined,
+                .elem_count = input.elem_count,
+            };
+            batch[idx].grad = try self.ownedDeviceMetalTensorFromCt(input.grad);
+            batch[idx].m = try self.ownedDeviceMetalTensorFromCt(input.m);
+            batch[idx].v = try self.ownedDeviceMetalTensorFromCt(input.v);
+            initialized += 1;
+        }
+        const ok = try metal_runtime.decoderRuntimeTrainingAdamWManyF32(
+            self.provider_impl,
+            batch,
             opts,
         );
         if (!ok) return error.MetalTrainingAdamWUnavailable;
@@ -8459,7 +8513,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (input_buf.metal_tensor) |*input_metal| {
             if (weight_buf.metal_tensor) |*weight_metal| {
-                if (out_dim <= 64 and
+                if (enableDenseDeviceDotGeneral() and
                     deviceTensorMatchesLinearRows(input_metal, rows, in_dim) and
                     weight_metal.isDevice() and
                     weight_metal.elemCount() == out_dim * in_dim and
@@ -20010,9 +20064,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const first = try self.ctFromOwnedMetalTensor(result.first);
         errdefer freeOp(ctx, first);
+        const gelu = try self.ctFromOwnedMetalTensor(result.gelu);
+        errdefer freeOp(ctx, gelu);
         const output = try self.ctFromOwnedMetalTensor(result.output);
         return .{
             .first = first,
+            .gelu = gelu,
             .output = output,
         };
     }

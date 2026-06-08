@@ -3382,10 +3382,12 @@ pub fn decoderRuntimeFfnGeluBackwardChainF32Device(
 
 pub const DecoderRuntimeFfnGeluBackwardOutputResult = struct {
     first: MetalTensor,
+    gelu: MetalTensor,
     output: MetalTensor,
 
     pub fn deinit(self: *DecoderRuntimeFfnGeluBackwardOutputResult) void {
         self.first.deinit();
+        self.gelu.deinit();
         self.output.deinit();
     }
 };
@@ -3412,6 +3414,8 @@ pub fn decoderRuntimeFfnGeluBackwardOutputF32Device(
     const output_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
     var first = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
     errdefer first.deinit();
+    var gelu = try MetalTensor.deviceAllocate(runtime, request.rows * request.intermediate_size * @sizeOf(f32), .private, &intermediate_shape);
+    errdefer gelu.deinit();
     var output = try MetalTensor.deviceAllocate(runtime, request.rows * request.hidden_size * @sizeOf(f32), .private, &output_shape);
     errdefer output.deinit();
 
@@ -3438,11 +3442,13 @@ pub fn decoderRuntimeFfnGeluBackwardOutputF32Device(
         request.second_k,
         first.deviceHandle(),
         first.deviceByteOffset(),
+        gelu.deviceHandle(),
+        gelu.deviceByteOffset(),
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
     if (rc != 0) return null;
-    return .{ .first = first, .output = output };
+    return .{ .first = first, .gelu = gelu, .output = output };
 }
 
 pub fn decoderRuntimeApplyPrimitiveUnary(self: anytype, input: MetalTensor, activation_kind: u32) !?MetalTensor {
@@ -4966,6 +4972,81 @@ pub fn decoderRuntimeTrainingAdamWF32(
         v.deviceHandle(),
         v.deviceByteOffset(),
         elem_count,
+        opts.lr,
+        opts.beta1,
+        opts.beta2,
+        opts.eps,
+        opts.weight_decay,
+        opts.bias_correction1,
+        opts.bias_correction2,
+        opts.grad_scale,
+    );
+    if (rc != 0) return error.MetalTrainingAdamWFailed;
+    return true;
+}
+
+pub const TrainingAdamWBatch = struct {
+    weight: MetalTensor,
+    grad: MetalTensor,
+    m: MetalTensor,
+    v: MetalTensor,
+    elem_count: usize,
+};
+
+pub fn decoderRuntimeTrainingAdamWManyF32(
+    self: anytype,
+    batch: []const TrainingAdamWBatch,
+    opts: TrainingAdamWOptions,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (batch.len == 0) return true;
+
+    var weight_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
+    defer std.heap.page_allocator.free(weight_handles);
+    var weight_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
+    defer std.heap.page_allocator.free(weight_offsets);
+    var grad_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
+    defer std.heap.page_allocator.free(grad_handles);
+    var grad_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
+    defer std.heap.page_allocator.free(grad_offsets);
+    var m_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
+    defer std.heap.page_allocator.free(m_handles);
+    var m_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
+    defer std.heap.page_allocator.free(m_offsets);
+    var v_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
+    defer std.heap.page_allocator.free(v_handles);
+    var v_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
+    defer std.heap.page_allocator.free(v_offsets);
+    var elem_counts = try std.heap.page_allocator.alloc(usize, batch.len);
+    defer std.heap.page_allocator.free(elem_counts);
+
+    for (batch, 0..) |item, idx| {
+        if (!item.weight.isDevice() or !item.grad.isDevice() or !item.m.isDevice() or !item.v.isDevice()) return false;
+        if (item.elem_count == 0 or item.elem_count > item.weight.elemCount() or item.elem_count > item.grad.elemCount() or item.elem_count > item.m.elemCount() or item.elem_count > item.v.elemCount()) return false;
+        weight_handles[idx] = item.weight.deviceHandle();
+        weight_offsets[idx] = item.weight.deviceByteOffset();
+        grad_handles[idx] = item.grad.deviceHandle();
+        grad_offsets[idx] = item.grad.deviceByteOffset();
+        m_handles[idx] = item.m.deviceHandle();
+        m_offsets[idx] = item.m.deviceByteOffset();
+        v_handles[idx] = item.v.deviceHandle();
+        v_offsets[idx] = item.v.deviceByteOffset();
+        elem_counts[idx] = item.elem_count;
+    }
+
+    const rc = termite_metal_decode_runtime_training_adamw_many_f32(
+        runtime,
+        weight_handles.ptr,
+        weight_offsets.ptr,
+        grad_handles.ptr,
+        grad_offsets.ptr,
+        m_handles.ptr,
+        m_offsets.ptr,
+        v_handles.ptr,
+        v_offsets.ptr,
+        elem_counts.ptr,
+        batch.len,
         opts.lr,
         opts.beta1,
         opts.beta2,
@@ -8178,6 +8259,8 @@ pub extern fn termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
     second_k: usize,
     first_output_handle: ?*anyopaque,
     first_output_offset: usize,
+    gelu_output_handle: ?*anyopaque,
+    gelu_output_offset: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -8612,6 +8695,27 @@ pub extern fn termite_metal_decode_runtime_training_adamw_f32(
     v_handle: ?*anyopaque,
     v_offset: usize,
     elem_count: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+    grad_scale: f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_training_adamw_many_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    weight_handles: [*]const ?*anyopaque,
+    weight_offsets: [*]const usize,
+    grad_handles: [*]const ?*anyopaque,
+    grad_offsets: [*]const usize,
+    m_handles: [*]const ?*anyopaque,
+    m_offsets: [*]const usize,
+    v_handles: [*]const ?*anyopaque,
+    v_offsets: [*]const usize,
+    elem_counts: [*]const usize,
+    input_count: usize,
     lr: f32,
     beta1: f32,
     beta2: f32,

@@ -22767,7 +22767,7 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
             [encoder dispatchThreadgroups:MTLSizeMake((n + 15u) / 16u, (m + 3u) / 4u, 1)
                    threadsPerThreadgroup:MTLSizeMake(tile_width, 1, 1)];
         } else if (use_small_m_rows4_cols8) {
-            NSUInteger tile_width = 16u;
+            NSUInteger tile_width = 32u;
             const char *tile_width_env = getenv("TERMITE_METAL_DOT_GENERAL_SMALL_M_ROWS4_COLS8_WIDTH");
             if (tile_width_env != NULL) {
                 char *end = NULL;
@@ -23701,6 +23701,94 @@ int termite_metal_decode_runtime_training_adamw_f32(
     }
 }
 
+int termite_metal_decode_runtime_training_adamw_many_f32(
+    termite_metal_decode_runtime *runtime,
+    const void **weight_handles,
+    const size_t *weight_offsets,
+    const void **grad_handles,
+    const size_t *grad_offsets,
+    const void **m_handles,
+    const size_t *m_offsets,
+    const void **v_handles,
+    const size_t *v_offsets,
+    const size_t *elem_counts,
+    size_t input_count,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2,
+    float grad_scale
+) {
+    if (runtime == NULL || weight_handles == NULL || weight_offsets == NULL ||
+        grad_handles == NULL || grad_offsets == NULL || m_handles == NULL ||
+        m_offsets == NULL || v_handles == NULL || v_offsets == NULL ||
+        elem_counts == NULL)
+    {
+        return -1;
+    }
+    if (runtime->training_adamw_pipeline == nil) return -2;
+    if (input_count == 0 || input_count > UINT32_MAX) return -3;
+    if (bias_correction1 == 0.0f || bias_correction2 == 0.0f) return -4;
+    @autoreleasepool {
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -5;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -6;
+        [encoder setComputePipelineState:runtime->training_adamw_pipeline];
+        for (size_t idx = 0; idx < input_count; idx += 1) {
+            if (weight_handles[idx] == NULL || grad_handles[idx] == NULL || m_handles[idx] == NULL || v_handles[idx] == NULL) {
+                [encoder endEncoding];
+                return -7;
+            }
+            const size_t elem_count = elem_counts[idx];
+            if (elem_count == 0 || elem_count > UINT32_MAX) {
+                [encoder endEncoding];
+                return -8;
+            }
+            id<MTLBuffer> weight_buffer = (__bridge id<MTLBuffer>)weight_handles[idx];
+            id<MTLBuffer> grad_buffer = (__bridge id<MTLBuffer>)grad_handles[idx];
+            id<MTLBuffer> m_buffer = (__bridge id<MTLBuffer>)m_handles[idx];
+            id<MTLBuffer> v_buffer = (__bridge id<MTLBuffer>)v_handles[idx];
+            const size_t bytes = elem_count * sizeof(float);
+            if (weight_offsets[idx] + bytes > weight_buffer.length ||
+                grad_offsets[idx] + bytes > grad_buffer.length ||
+                m_offsets[idx] + bytes > m_buffer.length ||
+                v_offsets[idx] + bytes > v_buffer.length)
+            {
+                [encoder endEncoding];
+                return -9;
+            }
+            termite_metal_training_adamw_params params = {
+                .elem_count = (uint32_t)elem_count,
+                .lr = lr,
+                .beta1 = beta1,
+                .beta2 = beta2,
+                .eps = eps,
+                .weight_decay = weight_decay,
+                .bias_correction1 = bias_correction1,
+                .bias_correction2 = bias_correction2,
+                .grad_scale = grad_scale,
+                .reserved0 = 0u,
+                .reserved1 = 0u,
+                .reserved2 = 0u,
+            };
+            [encoder setBuffer:weight_buffer offset:weight_offsets[idx] atIndex:0];
+            [encoder setBuffer:grad_buffer offset:grad_offsets[idx] atIndex:1];
+            [encoder setBuffer:m_buffer offset:m_offsets[idx] atIndex:2];
+            [encoder setBuffer:v_buffer offset:v_offsets[idx] atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_pipeline, elem_count), 1, 1)];
+        }
+        [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
 int termite_metal_decode_runtime_training_sumsq_f32(
     termite_metal_decode_runtime *runtime,
     void *input_handle,
@@ -24071,12 +24159,14 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
     size_t second_k,
     void *first_output_handle,
     size_t first_output_offset,
+    void *gelu_output_handle,
+    size_t gelu_output_offset,
     void *output_handle,
     size_t output_offset
 ) {
     if (runtime == NULL || first_lhs_handle == NULL || first_rhs_handle == NULL ||
         second_lhs_handle == NULL || second_rhs_handle == NULL || gelu_input_handle == NULL ||
-        output_rhs_handle == NULL || first_output_handle == NULL || output_handle == NULL)
+        output_rhs_handle == NULL || first_output_handle == NULL || gelu_output_handle == NULL || output_handle == NULL)
     {
         return -1;
     }
@@ -24094,6 +24184,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
         id<MTLBuffer> gelu_input_buffer = (__bridge id<MTLBuffer>)gelu_input_handle;
         id<MTLBuffer> output_rhs_buffer = (__bridge id<MTLBuffer>)output_rhs_handle;
         id<MTLBuffer> first_output_buffer = (__bridge id<MTLBuffer>)first_output_handle;
+        id<MTLBuffer> gelu_output_buffer = (__bridge id<MTLBuffer>)gelu_output_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
         const size_t first_lhs_bytes = rows * sizeof(float);
         const size_t first_rhs_bytes = intermediate_size * sizeof(float);
@@ -24110,11 +24201,10 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
         if (gelu_input_offset + intermediate_bytes > gelu_input_buffer.length) return -10;
         if (output_rhs_offset + output_rhs_bytes > output_rhs_buffer.length) return -11;
         if (first_output_offset + intermediate_bytes > first_output_buffer.length) return -12;
+        if (gelu_output_offset + intermediate_bytes > gelu_output_buffer.length) return -13;
         if (output_offset + output_bytes > output_buffer.length) return -13;
         if (intermediate_elems > UINT32_MAX) return -14;
 
-        id<MTLBuffer> gelu_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        if (gelu_output_buffer == nil) return -15;
         id<MTLBuffer> second_output_buffer = nil;
         if (second_k != 1) {
             second_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
@@ -24148,7 +24238,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
             termite_metal_planned_range_make(second_k == 1 ? second_rhs_buffer : nil, second_k == 1 ? second_rhs_offset : 0, second_k == 1 ? first_rhs_bytes : 0, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -17) != 0 ||
             termite_metal_planned_range_make(gelu_input_buffer, gelu_input_offset, intermediate_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[4], -17) != 0 ||
             termite_metal_planned_range_make(first_output_buffer, first_output_offset, intermediate_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -17) != 0 ||
-            termite_metal_planned_range_make(gelu_output_buffer, 0, intermediate_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[6], -17) != 0 ||
+            termite_metal_planned_range_make(gelu_output_buffer, gelu_output_offset, intermediate_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[6], -17) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 7, -17) != 0)
         {
             return -17;
@@ -24170,13 +24260,13 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
             [encoder setBuffer:second_rhs_buffer offset:second_rhs_offset atIndex:3];
             [encoder setBuffer:gelu_input_buffer offset:gelu_input_offset atIndex:4];
             [encoder setBuffer:first_output_buffer offset:first_output_offset atIndex:5];
-            [encoder setBuffer:gelu_output_buffer offset:0 atIndex:6];
+            [encoder setBuffer:gelu_output_buffer offset:gelu_output_offset atIndex:6];
             [encoder setBytes:&params length:sizeof(params) atIndex:7];
         } else {
             [encoder setBuffer:second_output_buffer offset:0 atIndex:2];
             [encoder setBuffer:gelu_input_buffer offset:gelu_input_offset atIndex:3];
             [encoder setBuffer:first_output_buffer offset:first_output_offset atIndex:4];
-            [encoder setBuffer:gelu_output_buffer offset:0 atIndex:5];
+            [encoder setBuffer:gelu_output_buffer offset:gelu_output_offset atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
         }
         [encoder dispatchThreads:MTLSizeMake(intermediate_elems, 1, 1)
@@ -24188,7 +24278,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
         const int dot_rc = termite_metal_decode_runtime_dot_general_2d_f32_device(
             runtime,
             (__bridge void *)gelu_output_buffer,
-            0,
+            gelu_output_offset,
             output_rhs_handle,
             output_rhs_offset,
             rows,

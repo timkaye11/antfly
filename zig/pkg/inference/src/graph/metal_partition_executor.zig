@@ -67,6 +67,8 @@ const OpExecutionCount = struct {
 const OpExecutionStats = struct {
     command_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
     command_used: usize = 0,
+    command_class_counts: [160]CommandExecutionSummary = [_]CommandExecutionSummary{.{}} ** 160,
+    command_class_used: usize = 0,
     fallback_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
     fallback_used: usize = 0,
     host_output_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
@@ -80,6 +82,10 @@ const OpExecutionStats = struct {
 
     fn recordCommand(self: *OpExecutionStats, name: []const u8, elapsed_ns: u64) void {
         recordOpCount(&self.command_counts, &self.command_used, name, elapsed_ns);
+    }
+
+    fn recordCommandClass(self: *OpExecutionStats, graph: *const Graph, node_id: NodeId, node_pos: usize, elapsed_ns: u64) void {
+        recordCommandExecutionSummary(graph, node_id, node_pos, &self.command_class_counts, &self.command_class_used, elapsed_ns);
     }
 
     fn recordFallback(self: *OpExecutionStats, name: []const u8, elapsed_ns: u64) void {
@@ -100,6 +106,61 @@ const OpExecutionStats = struct {
 
     fn recordDotCommand(self: *OpExecutionStats, graph: *const Graph, node_id: NodeId, node_pos: usize, elapsed_ns: u64) void {
         recordDotShapeExecutionSummary(graph, node_id, node_pos, &self.dot_command_shapes, &self.dot_command_shape_used, elapsed_ns);
+    }
+};
+
+const ExecutorLoopProfile = struct {
+    nodes: usize = 0,
+    executed_nodes: usize = 0,
+    partition_view_ns: u64 = 0,
+    graph_plan_ns: u64 = 0,
+    materialize_runtime_inputs_ns: u64 = 0,
+    materialize_parameters_ns: u64 = 0,
+    materialize_constants_ns: u64 = 0,
+    begin_frame_ns: u64 = 0,
+    runtime_region_plan_ns: u64 = 0,
+    execution_ns: u64 = 0,
+    stats_ns: u64 = 0,
+    alias_clone_ns: u64 = 0,
+    free_expired_ns: u64 = 0,
+    submit_frame_ns: u64 = 0,
+    boundary_outputs_ns: u64 = 0,
+
+    fn print(self: ExecutorLoopProfile, label: []const u8) void {
+        std.debug.print(
+            "{s}: nodes={d}:executed={d}:partition_view_ms={d:.3}:graph_plan_ms={d:.3}:runtime_inputs_ms={d:.3}:parameters_ms={d:.3}:constants_ms={d:.3}:begin_frame_ms={d:.3}:runtime_plan_ms={d:.3}:execution_ms={d:.3}:stats_ms={d:.3}:alias_clone_ms={d:.3}:free_expired_ms={d:.3}:submit_frame_ms={d:.3}:boundary_outputs_ms={d:.3}:accounted_ms={d:.3}\n",
+            .{
+                label,
+                self.nodes,
+                self.executed_nodes,
+                nsToMs(self.partition_view_ns),
+                nsToMs(self.graph_plan_ns),
+                nsToMs(self.materialize_runtime_inputs_ns),
+                nsToMs(self.materialize_parameters_ns),
+                nsToMs(self.materialize_constants_ns),
+                nsToMs(self.begin_frame_ns),
+                nsToMs(self.runtime_region_plan_ns),
+                nsToMs(self.execution_ns),
+                nsToMs(self.stats_ns),
+                nsToMs(self.alias_clone_ns),
+                nsToMs(self.free_expired_ns),
+                nsToMs(self.submit_frame_ns),
+                nsToMs(self.boundary_outputs_ns),
+                nsToMs(self.partition_view_ns +
+                    self.graph_plan_ns +
+                    self.materialize_runtime_inputs_ns +
+                    self.materialize_parameters_ns +
+                    self.materialize_constants_ns +
+                    self.begin_frame_ns +
+                    self.runtime_region_plan_ns +
+                    self.execution_ns +
+                    self.stats_ns +
+                    self.alias_clone_ns +
+                    self.free_expired_ns +
+                    self.submit_frame_ns +
+                    self.boundary_outputs_ns),
+            },
+        );
     }
 };
 
@@ -217,17 +278,22 @@ const RuntimeRegionPlan = struct {
     last_node: NodeId = null_node,
     regions_by_pos: []RuntimeRegion = &.{},
     prepared_by_pos: []PreparedRuntimeRegion = &.{},
+    attention_input_max_first_node: []NodeId = &.{},
     region_count: usize = 0,
+    covered_node_count: usize = 0,
+    elided_node_count: usize = 0,
 
     fn deinit(self: *RuntimeRegionPlan, allocator: std.mem.Allocator) void {
         allocator.free(self.regions_by_pos);
         allocator.free(self.prepared_by_pos);
+        allocator.free(self.attention_input_max_first_node);
         self.* = .{};
     }
 
     fn matches(self: RuntimeRegionPlan, node_ids: []const NodeId, value_count: usize) bool {
         if (self.regions_by_pos.len != node_ids.len) return false;
         if (self.prepared_by_pos.len != node_ids.len) return false;
+        if (self.attention_input_max_first_node.len != value_count) return false;
         if (self.node_count != node_ids.len or self.value_count != value_count) return false;
         if (node_ids.len == 0) return self.first_node == null_node and self.last_node == null_node;
         return self.first_node == node_ids[0] and self.last_node == node_ids[node_ids.len - 1];
@@ -244,6 +310,101 @@ const RuntimeRegionPlan = struct {
         if (node_ids[node_pos] != node_id) return null;
         return &self.prepared_by_pos[node_pos];
     }
+
+    fn needsAttentionInputAfterNode(self: RuntimeRegionPlan, input_id: NodeId, node_id: NodeId) bool {
+        if (input_id == null_node) return false;
+        const input_index: usize = @intCast(input_id);
+        if (input_index >= self.attention_input_max_first_node.len) return false;
+        const max_first_node = self.attention_input_max_first_node[input_index];
+        return max_first_node != null_node and max_first_node > node_id;
+    }
+};
+
+const CachedPartitionBufferView = struct {
+    partition_index: u32 = 0,
+    partition_count: usize = 0,
+    slot_count: usize = 0,
+    transfer_count: usize = 0,
+    first_slot_node: NodeId = null_node,
+    last_slot_node: NodeId = null_node,
+    backend: contracts.BackendKind = .native,
+    view: buffer_plan_mod.PartitionBufferView,
+
+    fn init(
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        partition_plan: *const partition_mod.PartitionPlan,
+        partition_index: u32,
+        view: buffer_plan_mod.PartitionBufferView,
+    ) CachedPartitionBufferView {
+        return .{
+            .partition_index = partition_index,
+            .partition_count = partition_plan.partitions.len,
+            .slot_count = buffer_plan.slots.len,
+            .transfer_count = buffer_plan.transfers.len,
+            .first_slot_node = if (buffer_plan.slots.len == 0) null_node else buffer_plan.slots[0].node_id,
+            .last_slot_node = if (buffer_plan.slots.len == 0) null_node else buffer_plan.slots[buffer_plan.slots.len - 1].node_id,
+            .backend = view.backend,
+            .view = view,
+        };
+    }
+
+    fn deinit(self: *CachedPartitionBufferView, allocator: std.mem.Allocator) void {
+        self.view.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn matches(
+        self: CachedPartitionBufferView,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        partition_plan: *const partition_mod.PartitionPlan,
+        partition_index: u32,
+    ) bool {
+        if (partition_index >= partition_plan.partitions.len) return false;
+        return self.partition_index == partition_index and
+            self.partition_count == partition_plan.partitions.len and
+            self.slot_count == buffer_plan.slots.len and
+            self.transfer_count == buffer_plan.transfers.len and
+            self.first_slot_node == (if (buffer_plan.slots.len == 0) null_node else buffer_plan.slots[0].node_id) and
+            self.last_slot_node == (if (buffer_plan.slots.len == 0) null_node else buffer_plan.slots[buffer_plan.slots.len - 1].node_id) and
+            self.backend == partition_plan.partitions[@intCast(partition_index)].backend;
+    }
+
+    fn traceMismatch(
+        self: CachedPartitionBufferView,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        partition_plan: *const partition_mod.PartitionPlan,
+        partition_index: u32,
+    ) void {
+        if (!tracePartitionViewCacheEnabled()) return;
+        const current_backend = if (partition_index < partition_plan.partitions.len)
+            partition_plan.partitions[@intCast(partition_index)].backend
+        else
+            .native;
+        std.debug.print(
+            "partition_view_cache_miss: cached_partition={d} current_partition={d} cached_partitions={d} current_partitions={d} cached_slots={d} current_slots={d} cached_transfers={d} current_transfers={d} cached_first={} current_first={} cached_last={} current_last={} cached_backend={s} current_backend={s}\n",
+            .{
+                self.partition_index,
+                partition_index,
+                self.partition_count,
+                partition_plan.partitions.len,
+                self.slot_count,
+                buffer_plan.slots.len,
+                self.transfer_count,
+                buffer_plan.transfers.len,
+                self.first_slot_node,
+                if (buffer_plan.slots.len == 0) null_node else buffer_plan.slots[0].node_id,
+                self.last_slot_node,
+                if (buffer_plan.slots.len == 0) null_node else buffer_plan.slots[buffer_plan.slots.len - 1].node_id,
+                @tagName(self.backend),
+                @tagName(current_backend),
+            },
+        );
+    }
+};
+
+const PartitionBufferViewResult = struct {
+    view: buffer_plan_mod.PartitionBufferView,
+    cache_hit: bool = false,
 };
 
 const RuntimeFrameIneligibleReason = enum {
@@ -412,6 +573,7 @@ pub const MetalPartitionExecutor = struct {
     backend: *const ComputeBackend,
     pe: PartitionExecutor = undefined,
     owned: bool = false,
+    partition_view: ?CachedPartitionBufferView = null,
     runtime_region_plan: ?RuntimeRegionPlan = null,
 
     const vtable = PartitionExecutor.VTable{
@@ -470,7 +632,41 @@ pub const MetalPartitionExecutor = struct {
             plan.deinit(self.allocator);
             self.runtime_region_plan = null;
         }
+        if (self.partition_view) |*view| {
+            view.deinit(self.allocator);
+            self.partition_view = null;
+        }
         if (self.owned) self.allocator.destroy(self);
+    }
+
+    fn partitionBufferView(
+        self: *MetalPartitionExecutor,
+        allocator: std.mem.Allocator,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        partition_plan: *const partition_mod.PartitionPlan,
+        partition_index: u32,
+        transient: *?buffer_plan_mod.PartitionBufferView,
+    ) !PartitionBufferViewResult {
+        if (self.owned and partitionViewCacheEnabled()) {
+            if (self.partition_view) |view| {
+                if (view.matches(buffer_plan, partition_plan, partition_index)) {
+                    if (tracePartitionViewCacheEnabled()) std.debug.print("partition_view_cache_hit: partition={d} slots={d} transfers={d}\n", .{ partition_index, buffer_plan.slots.len, buffer_plan.transfers.len });
+                    return .{ .view = view.view, .cache_hit = true };
+                }
+                view.traceMismatch(buffer_plan, partition_plan, partition_index);
+                var old = self.partition_view.?;
+                old.deinit(self.allocator);
+                self.partition_view = null;
+            }
+            const view = try buffer_plan.partitionView(self.allocator, partition_plan, partition_index);
+            self.partition_view = CachedPartitionBufferView.init(buffer_plan, partition_plan, partition_index, view);
+            if (tracePartitionViewCacheEnabled()) std.debug.print("partition_view_cache_store: partition={d} slots={d} transfers={d}\n", .{ partition_index, buffer_plan.slots.len, buffer_plan.transfers.len });
+            return .{ .view = self.partition_view.?.view };
+        }
+
+        if (tracePartitionViewCacheEnabled()) std.debug.print("partition_view_cache_bypass: owned={} enabled={} partition={d} slots={d} transfers={d}\n", .{ self.owned, partitionViewCacheEnabled(), partition_index, buffer_plan.slots.len, buffer_plan.transfers.len });
+        transient.* = try buffer_plan.partitionView(allocator, partition_plan, partition_index);
+        return .{ .view = transient.*.? };
     }
 
     fn runtimeRegionPlan(
@@ -533,14 +729,27 @@ pub const MetalPartitionExecutor = struct {
         const progress_end = metalGraphProgressEnd();
         const trace_progress = progress_interval != 0 or progress_start != std.math.maxInt(usize) or progress_end != std.math.maxInt(usize);
         const collect_op_stats = metalPartitionOpStatsEnabled();
+        const collect_loop_profile = metalPartitionLoopProfileEnabled();
+        const collect_residency_stats = metalPartitionResidencyStatsEnabled() or collect_op_stats or traceMetalHostOutputsEnabled();
         var op_execution_stats = OpExecutionStats{};
+        var loop_profile = ExecutorLoopProfile{};
         const partition_index = try partitionIndexForNodes(buffer_plan, node_ids);
         if (trace_nodes) std.debug.print("graph_executor_node_trace: executor_begin partition={d} nodes={d}\n", .{ partition_index, node_ids.len });
         if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_begin partition={d} nodes={d}\n", .{ partition_index, node_ids.len });
 
-        var partition_view = try buffer_plan.partitionView(allocator, partition_plan, partition_index);
-        defer partition_view.deinit(allocator);
-        try validatePartitionView(partition_view, node_ids);
+        var transient_partition_view: ?buffer_plan_mod.PartitionBufferView = null;
+        defer if (transient_partition_view) |*view| view.deinit(allocator);
+        const partition_view_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
+        const partition_view_result = try self.partitionBufferView(
+            allocator,
+            buffer_plan,
+            partition_plan,
+            partition_index,
+            &transient_partition_view,
+        );
+        const partition_view = partition_view_result.view;
+        if (!partition_view_result.cache_hit) try validatePartitionView(partition_view, node_ids);
+        if (collect_loop_profile) loop_profile.partition_view_ns += metalPartitionElapsedNs(partition_view_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=partition_view_ready partition={d} slots={d} transfers_in={d} transfers_out={d}\n", .{ partition_index, partition_view.slots.len, partition_view.transfers_in.len, partition_view.transfers_out.len });
         if (trace_nodes) {
             std.debug.print(
@@ -549,6 +758,7 @@ pub const MetalPartitionExecutor = struct {
             );
         }
 
+        const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
         defer metal_graph_plan.deinit(allocator);
         if (trace_nodes) printMetalGraphPlanTrace(partition_index, metal_graph_plan);
@@ -556,6 +766,7 @@ pub const MetalPartitionExecutor = struct {
         _ = try cb.reserveGraphPlanSlots(metal_graph_plan.slots);
         if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: graph_plan_reserved partition={d}\n", .{partition_index});
+        if (collect_loop_profile) loop_profile.graph_plan_ns += metalPartitionElapsedNs(graph_plan_start_ns, metalPartitionNowNs());
         if (exec_ctx.stats) |stats| {
             stats.graph_plan_slots_reserved += metal_graph_plan.slots.len;
             for (metal_graph_plan.slots) |slot| stats.graph_plan_bytes_reserved += slot.bytes;
@@ -588,6 +799,7 @@ pub const MetalPartitionExecutor = struct {
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
+        const runtime_inputs_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         try materializePartitionRuntimeInputs(
             allocator,
             values,
@@ -598,11 +810,13 @@ pub const MetalPartitionExecutor = struct {
             cb,
             rt_map,
         );
+        if (collect_loop_profile) loop_profile.materialize_runtime_inputs_ns += metalPartitionElapsedNs(runtime_inputs_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_runtime_inputs_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_end partition={d}\n", .{partition_index});
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_parameters_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_parameters_begin partition={d}\n", .{partition_index});
+        const parameters_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         try materializePartitionParameters(
             graph,
             cb,
@@ -614,11 +828,13 @@ pub const MetalPartitionExecutor = struct {
             rt_map,
             exec_ctx.stats,
         );
+        if (collect_loop_profile) loop_profile.materialize_parameters_ns += metalPartitionElapsedNs(parameters_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_parameters_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_parameters_end partition={d}\n", .{partition_index});
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_begin partition={d}\n", .{partition_index});
+        const constants_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         try materializePartitionConstants(
             graph,
             cb,
@@ -628,13 +844,16 @@ pub const MetalPartitionExecutor = struct {
             reachable,
             device_id,
         );
+        if (collect_loop_profile) loop_profile.materialize_constants_ns += metalPartitionElapsedNs(constants_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_end partition={d}\n", .{partition_index});
 
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_begin partition={d}\n", .{partition_index});
+        const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         var frame_active = if (metalPartitionFrameDisabled()) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         const planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
@@ -657,6 +876,7 @@ pub const MetalPartitionExecutor = struct {
 
         var transient_runtime_region_plan: ?RuntimeRegionPlan = null;
         defer if (transient_runtime_region_plan) |*plan| plan.deinit(allocator);
+        const runtime_region_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
         const runtime_region_plan = try self.runtimeRegionPlan(
             allocator,
             graph,
@@ -667,10 +887,14 @@ pub const MetalPartitionExecutor = struct {
             exec_ctx.stats,
             &transient_runtime_region_plan,
         );
+        if (collect_loop_profile) loop_profile.runtime_region_plan_ns += metalPartitionElapsedNs(runtime_region_plan_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=runtime_region_plan_ready partition={d} regions={d}\n", .{ partition_index, runtime_region_plan.region_count });
         if (traceRuntimeRegionsEnabled()) printRuntimeRegionPlanSummary(graph, runtime_region_plan, partition_index);
         if (metalPartitionOpRunsEnabled()) printMetalPartitionOpRuns(graph, node_ids, reachable, last_use, partition_index);
         if (exec_ctx.stats) |stats| {
+            stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
+            stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
+            stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
             recordRuntimeFrameEligibilityStats(stats, analyzeRuntimeFrameEligibility(runtime_region_plan));
             if (runtimeFrameMetadataFromPlan(graph, runtime_region_plan) != null) {
                 stats.runtime_frame_metadata_ready += 1;
@@ -680,6 +904,7 @@ pub const MetalPartitionExecutor = struct {
         var node_pos: usize = 0;
         while (node_pos < node_ids.len) : (node_pos += 1) {
             const node_id = node_ids[node_pos];
+            if (collect_loop_profile) loop_profile.nodes += 1;
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
             if (i < skipped_nodes.len and skipped_nodes[i]) continue;
@@ -704,12 +929,13 @@ pub const MetalPartitionExecutor = struct {
                 skipped_nodes[i] = true;
                 continue;
             }
-
             if (isPreMaterializedConstantOp(graph.node(node_id).op)) {
                 if (values[i] != null) {
                     if (exec_ctx.stats) |stats| {
                         stats.constant_materializations += 1;
-                        if (isMetalResidentOrQuantizedDescriptor(cb, values[i].?)) {
+                        if (!collect_residency_stats) {
+                            stats.device_resident_outputs += 1;
+                        } else if (isMetalResidentOrQuantizedDescriptor(cb, values[i].?)) {
                             stats.device_resident_outputs += 1;
                         } else {
                             stats.host_materialized_outputs += 1;
@@ -733,6 +959,7 @@ pub const MetalPartitionExecutor = struct {
             if (trace_nodes) printMetalNodeTraceBegin(graph, node_id);
             if (trace_nodes) printMetalNodeTraceInputs(graph, cb, values, node_id);
             const op_start_ns = if (collect_op_stats) metalPartitionNowNs() else 0;
+            const execution_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
 
             const op_plan = partition_plan.operatorPlanForNode(node_id);
             var execution_kind: ?MetalExecutionKind = null;
@@ -806,6 +1033,11 @@ pub const MetalPartitionExecutor = struct {
                     }
                 }
             }
+            if (collect_loop_profile) {
+                loop_profile.executed_nodes += 1;
+                loop_profile.execution_ns += metalPartitionElapsedNs(execution_start_ns, metalPartitionNowNs());
+            }
+            const stats_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             if (graph.node(node_id).op == .constant) {
                 if (values[i]) |current| {
                     if (!isMetalDeviceResident(cb, current)) {
@@ -828,6 +1060,7 @@ pub const MetalPartitionExecutor = struct {
                             if (op_plan != null) stats.planned_operator_dispatches += 1;
                             if (collect_op_stats) {
                                 op_execution_stats.recordCommand(op_name, elapsed_ns);
+                                op_execution_stats.recordCommandClass(graph, node_id, node_pos, elapsed_ns);
                                 op_execution_stats.recordDotCommand(graph, node_id, node_pos, elapsed_ns);
                             }
                         },
@@ -839,23 +1072,31 @@ pub const MetalPartitionExecutor = struct {
                     stats.interpreter_fallbacks += 1;
                     if (collect_op_stats) op_execution_stats.recordFallback(op_name, elapsed_ns);
                 }
-                const output_resident = isMetalResidentOrQuantizedDescriptor(cb, values[i].?);
-                if (output_resident) {
+                if (collect_residency_stats) {
+                    const output_resident = isMetalResidentOrQuantizedDescriptor(cb, values[i].?);
+                    if (output_resident) {
+                        stats.device_resident_outputs += 1;
+                    } else {
+                        stats.host_materialized_outputs += 1;
+                        if (collect_op_stats) {
+                            op_execution_stats.recordHostOutput(op_name, elapsed_ns);
+                            op_execution_stats.recordHostOutputReason(hostOutputReasonName(execution_kind), elapsed_ns);
+                        }
+                        if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, hostOutputReasonName(execution_kind));
+                    }
+                    recordGemmaRuntimeResidency(stats, graph, node_id, output_resident);
+                } else if (execution_kind != null) {
                     stats.device_resident_outputs += 1;
                 } else {
                     stats.host_materialized_outputs += 1;
-                    if (collect_op_stats) {
-                        op_execution_stats.recordHostOutput(op_name, elapsed_ns);
-                        op_execution_stats.recordHostOutputReason(hostOutputReasonName(execution_kind), elapsed_ns);
-                    }
-                    if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, hostOutputReasonName(execution_kind));
                 }
-                recordGemmaRuntimeResidency(stats, graph, node_id, output_resident);
             }
+            if (collect_loop_profile) loop_profile.stats_ns += metalPartitionElapsedNs(stats_start_ns, metalPartitionNowNs());
             value_device[i] = device_id;
             const traced_command = if (execution_kind) |kind| kind == .command else false;
             if (trace_nodes) printMetalNodeTraceEnd(graph, cb, node_id, values[i].?, traced_command);
 
+            const alias_clone_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
                 allocator,
                 graph,
@@ -866,7 +1107,9 @@ pub const MetalPartitionExecutor = struct {
                 rt_map,
                 donated,
             );
+            if (collect_loop_profile) loop_profile.alias_clone_ns += metalPartitionElapsedNs(alias_clone_start_ns, metalPartitionNowNs());
 
+            const free_expired_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             try freeExpiredInputs(
                 allocator,
                 graph,
@@ -881,6 +1124,7 @@ pub const MetalPartitionExecutor = struct {
                 donated,
                 effective_exec_ctx,
             );
+            if (collect_loop_profile) loop_profile.free_expired_ns += metalPartitionElapsedNs(free_expired_start_ns, metalPartitionNowNs());
 
             if (i < skipped_nodes.len and skipped_nodes[i]) {
                 values[i] = null;
@@ -893,7 +1137,9 @@ pub const MetalPartitionExecutor = struct {
         if (frame_active) {
             try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
             if (trace_progress) std.debug.print("metal_partition_progress: phase=submit_frame_begin partition={d}\n", .{partition_index});
+            const submit_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             try cb.decoderRuntimeSubmitAndWaitFrame();
+            if (collect_loop_profile) loop_profile.submit_frame_ns += metalPartitionElapsedNs(submit_frame_start_ns, metalPartitionNowNs());
             frame_active = false;
             if (trace_progress) std.debug.print("metal_partition_progress: phase=submit_frame_end partition={d}\n", .{partition_index});
         } else {
@@ -905,7 +1151,9 @@ pub const MetalPartitionExecutor = struct {
             if (exec_ctx.stats) |stats| {
                 stats.boundary_output_materializations += countPartitionBoundaryOutputs(partition_view);
             }
+            const boundary_outputs_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             try evalPartitionBoundaryOutputs(cb, values, partition_view);
+            if (collect_loop_profile) loop_profile.boundary_outputs_ns += metalPartitionElapsedNs(boundary_outputs_start_ns, metalPartitionNowNs());
             if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_boundary_outputs_end partition={d}\n", .{partition_index});
         }
 
@@ -913,12 +1161,14 @@ pub const MetalPartitionExecutor = struct {
         if (exec_ctx.pair_second) |pair| pair.* = exec_state.pair_second;
         if (collect_op_stats) {
             printOpExecutionStats("metal_partition_command_ops", &op_execution_stats.command_counts, op_execution_stats.command_used);
+            printCommandExecutionStats("metal_partition_command_classes", &op_execution_stats.command_class_counts, op_execution_stats.command_class_used);
             printOpExecutionStats("metal_partition_runtime_regions", &op_execution_stats.runtime_region_counts, op_execution_stats.runtime_region_used);
             printDotShapeExecutionStats("metal_partition_command_dot_shapes", &op_execution_stats.dot_command_shapes, op_execution_stats.dot_command_shape_used);
             printOpExecutionStats("metal_partition_fallback_ops", &op_execution_stats.fallback_counts, op_execution_stats.fallback_used);
             printOpExecutionStats("metal_partition_host_output_ops", &op_execution_stats.host_output_counts, op_execution_stats.host_output_used);
             printOpExecutionStats("metal_partition_host_output_reasons", &op_execution_stats.host_output_reason_counts, op_execution_stats.host_output_reason_used);
         }
+        if (collect_loop_profile) loop_profile.print("metal_partition_loop_profile");
         if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_end partition={d}\n", .{partition_index});
     }
 };
@@ -963,6 +1213,109 @@ fn printOpExecutionStats(label: []const u8, counts: []OpExecutionCount, used: us
         if (idx > 0) std.debug.print(",", .{});
         const avg_ms = if (entry.count == 0) 0.0 else nsToMs(entry.total_ns) / @as(f64, @floatFromInt(entry.count));
         std.debug.print("{s}:count={d}:total_ms={d:.3}:avg_ms={d:.3}", .{ entry.name, entry.count, nsToMs(entry.total_ns), avg_ms });
+    }
+    if (n > limit) std.debug.print(",...", .{});
+    std.debug.print("\n", .{});
+}
+
+const CommandExecutionSummary = struct {
+    op_name: []const u8 = "",
+    phase: []const u8 = "",
+    family: []const u8 = "",
+    source_op: []const u8 = "",
+    first_node: NodeId = null_node,
+    first_pos: usize = 0,
+    last_node: NodeId = null_node,
+    last_pos: usize = 0,
+    count: usize = 0,
+    total_ns: u64 = 0,
+};
+
+fn sameCommandExecutionSummary(a: CommandExecutionSummary, b: CommandExecutionSummary) bool {
+    return std.mem.eql(u8, a.op_name, b.op_name) and
+        std.mem.eql(u8, a.phase, b.phase) and
+        std.mem.eql(u8, a.family, b.family) and
+        std.mem.eql(u8, a.source_op, b.source_op);
+}
+
+fn recordCommandExecutionSummary(
+    graph: *const Graph,
+    node_id: NodeId,
+    node_pos: usize,
+    summaries: *[160]CommandExecutionSummary,
+    used: *usize,
+    elapsed_ns: u64,
+) void {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return;
+    const node = graph.node(node_id);
+    const classification = commandSourceClassification(graph, node_id, 4);
+    const summary = CommandExecutionSummary{
+        .op_name = @tagName(std.meta.activeTag(node.op)),
+        .phase = classification.phase,
+        .family = classification.family,
+        .source_op = classification.source_op,
+        .first_node = node_id,
+        .first_pos = node_pos,
+        .last_node = node_id,
+        .last_pos = node_pos,
+    };
+    for (summaries[0..used.*]) |*entry| {
+        if (!sameCommandExecutionSummary(entry.*, summary)) continue;
+        entry.count += 1;
+        entry.total_ns += elapsed_ns;
+        entry.last_node = node_id;
+        entry.last_pos = node_pos;
+        return;
+    }
+    if (used.* >= summaries.len) return;
+    summaries[used.*] = summary;
+    summaries[used.*].count = 1;
+    summaries[used.*].total_ns = elapsed_ns;
+    used.* += 1;
+}
+
+fn sortCommandExecutionSummaries(summaries: []CommandExecutionSummary) void {
+    std.mem.sort(CommandExecutionSummary, summaries, {}, struct {
+        fn lessThan(_: void, a: CommandExecutionSummary, b: CommandExecutionSummary) bool {
+            if (a.total_ns == b.total_ns) {
+                if (a.count == b.count) return std.mem.lessThan(u8, a.op_name, b.op_name);
+                return a.count > b.count;
+            }
+            return a.total_ns > b.total_ns;
+        }
+    }.lessThan);
+}
+
+fn printCommandExecutionStats(label: []const u8, summaries: []const CommandExecutionSummary, used: usize) void {
+    var sorted_buf = [_]CommandExecutionSummary{.{}} ** 160;
+    const n = @min(used, sorted_buf.len);
+    @memcpy(sorted_buf[0..n], summaries[0..n]);
+    sortCommandExecutionSummaries(sorted_buf[0..n]);
+    std.debug.print("{s}: ", .{label});
+    if (n == 0) {
+        std.debug.print("none\n", .{});
+        return;
+    }
+    const limit = @min(n, 24);
+    for (sorted_buf[0..limit], 0..) |entry, idx| {
+        if (idx > 0) std.debug.print(",", .{});
+        const avg_ms = if (entry.count == 0) 0.0 else nsToMs(entry.total_ns) / @as(f64, @floatFromInt(entry.count));
+        std.debug.print(
+            "{s}:phase={s}:family={s}:source={s}:count={d}:total_ms={d:.3}:avg_ms={d:.3}:pos={d}-{d}:node={}-{}",
+            .{
+                entry.op_name,
+                entry.phase,
+                entry.family,
+                entry.source_op,
+                entry.count,
+                nsToMs(entry.total_ns),
+                avg_ms,
+                entry.first_pos,
+                entry.last_pos,
+                entry.first_node,
+                entry.last_node,
+            },
+        );
     }
     if (n > limit) std.debug.print(",...", .{});
     std.debug.print("\n", .{});
@@ -1142,6 +1495,14 @@ fn metalPartitionOpStatsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_OP_STATS", false);
 }
 
+fn metalPartitionLoopProfileEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_LOOP_PROFILE", false);
+}
+
+fn metalPartitionResidencyStatsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_RESIDENCY_STATS", false);
+}
+
 fn traceMetalHostOutputsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_HOST_OUTPUTS", false);
 }
@@ -1226,6 +1587,68 @@ const DotSourceInfo = struct {
     is_lora: bool = false,
     parameter_name: ?[]const u8 = null,
 };
+
+const CommandSourceClassification = struct {
+    phase: []const u8 = "activation",
+    family: []const u8 = "activation",
+    source_op: []const u8 = "none",
+};
+
+fn commandSourceClassification(graph: *const Graph, node_id: NodeId, depth: usize) CommandSourceClassification {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return .{};
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) == .dot_general and node.num_inputs >= 2) {
+        const lhs_source = dotSourceInfo(graph, node.inputs[0]);
+        const rhs_source = dotSourceInfo(graph, node.inputs[1]);
+        return .{
+            .phase = classifyDotPhase(lhs_source, rhs_source),
+            .family = classifyDotParameterFamily(rhs_source.parameter_name orelse lhs_source.parameter_name),
+            .source_op = rhs_source.op_name,
+        };
+    }
+    if (commandParameterName(graph, node_id, depth)) |name| {
+        return .{
+            .phase = "parameter_ancestry",
+            .family = classifyDotParameterFamily(name),
+            .source_op = "parameter",
+        };
+    }
+    if (hasTransposedActivationAncestor(graph, node_id, depth)) {
+        return .{
+            .phase = "activation_transpose",
+            .family = "activation",
+            .source_op = "transpose(other)",
+        };
+    }
+    return .{
+        .phase = "activation",
+        .family = "activation",
+        .source_op = @tagName(std.meta.activeTag(node.op)),
+    };
+}
+
+fn commandParameterName(graph: *const Graph, node_id: NodeId, depth: usize) ?[]const u8 {
+    if (depth == 0 or node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) == .parameter) return graph.parameterName(node);
+    for (node.getInputs()) |input_id| {
+        if (commandParameterName(graph, input_id, depth - 1)) |name| return name;
+    }
+    return null;
+}
+
+fn hasTransposedActivationAncestor(graph: *const Graph, node_id: NodeId, depth: usize) bool {
+    if (depth == 0 or node_id == null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) == .transpose) {
+        if (node.num_inputs == 0 or node.inputs[0] == null_node or node.inputs[0] >= graph.nodeCount()) return true;
+        return std.meta.activeTag(graph.node(node.inputs[0]).op) != .parameter;
+    }
+    for (node.getInputs()) |input_id| {
+        if (hasTransposedActivationAncestor(graph, input_id, depth - 1)) return true;
+    }
+    return false;
+}
 
 fn dotSourceInfo(graph: *const Graph, node_id: NodeId) DotSourceInfo {
     if (node_id == null_node or node_id >= graph.nodeCount()) return .{ .op_name = "invalid" };
@@ -1553,6 +1976,17 @@ fn metalPartitionPlannedScopeDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_PLANNED_SCOPE", false);
 }
 
+fn partitionViewCacheEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_VIEW_CACHE", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_PARTITION_VIEW_CACHE", false)) return true;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+}
+
+fn tracePartitionViewCacheEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_PARTITION_VIEW_CACHE", false);
+}
+
 fn metalPartitionFusedPatternsDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_FUSED_PATTERNS", false);
 }
@@ -1639,7 +2073,16 @@ fn loraBackwardRuntimeRegionEnabled() bool {
 
 fn ffnGeluBackwardRuntimeRegionEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FFN_GELU_BACKWARD_RUNTIME_REGION", false)) return false;
-    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FFN_GELU_BACKWARD_RUNTIME_REGION", false);
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FFN_GELU_BACKWARD_RUNTIME_REGION", false)) return true;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+}
+
+fn rank1DotSpecializationEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RANK1_DOT_SPECIALIZATION", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RANK1_DOT_SPECIALIZATION", false)) return true;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
 }
 
 fn rawLinearBiasPairRuntimeRegionEnabled() bool {
@@ -1679,6 +2122,9 @@ fn buildRuntimeRegionPlan(
     const prepared = try allocator.alloc(PreparedRuntimeRegion, node_ids.len);
     errdefer allocator.free(prepared);
     @memset(prepared, .{ .none = {} });
+    const attention_input_max_first_node = try allocator.alloc(NodeId, value_count);
+    errdefer allocator.free(attention_input_max_first_node);
+    @memset(attention_input_max_first_node, null_node);
     const null_values = try allocator.alloc(?CT, value_count);
     defer allocator.free(null_values);
     @memset(null_values, null);
@@ -1734,6 +2180,7 @@ fn buildRuntimeRegionPlan(
             if (matchDebertaAttentionPattern(graph, node_ids, node_pos, reachable, skipped, regions)) |pattern| {
                 regions[node_pos] = .{ .deberta_attention = pattern };
                 markDebertaAttentionSkipped(graph, skipped, pattern);
+                recordAttentionInputMaxFirstNode(attention_input_max_first_node, pattern);
                 region_count += 1;
                 continue;
             }
@@ -1818,8 +2265,52 @@ fn buildRuntimeRegionPlan(
         .last_node = if (node_ids.len == 0) null_node else node_ids[node_ids.len - 1],
         .regions_by_pos = regions,
         .prepared_by_pos = prepared,
+        .attention_input_max_first_node = attention_input_max_first_node,
         .region_count = region_count,
+        .covered_node_count = runtimeRegionCoveredNodeCount(node_ids, regions, skipped),
+        .elided_node_count = runtimeRegionElidedNodeCount(node_ids, regions, skipped),
     };
+}
+
+fn recordAttentionInputMaxFirstNode(max_first_by_input: []NodeId, pattern: DebertaAttentionPattern) void {
+    recordAttentionInputFirstNode(max_first_by_input, pattern.q_id, pattern.first_node_id);
+    recordAttentionInputFirstNode(max_first_by_input, pattern.k_id, pattern.first_node_id);
+    recordAttentionInputFirstNode(max_first_by_input, pattern.v_id, pattern.first_node_id);
+    recordAttentionInputFirstNode(max_first_by_input, pattern.q_r_id, pattern.first_node_id);
+    recordAttentionInputFirstNode(max_first_by_input, pattern.k_r_id, pattern.first_node_id);
+    recordAttentionInputFirstNode(max_first_by_input, pattern.attn_bias_id, pattern.first_node_id);
+}
+
+fn recordAttentionInputFirstNode(max_first_by_input: []NodeId, input_id: NodeId, first_node_id: NodeId) void {
+    if (input_id == null_node) return;
+    const input_index: usize = @intCast(input_id);
+    if (input_index >= max_first_by_input.len) return;
+    if (max_first_by_input[input_index] == null_node or first_node_id > max_first_by_input[input_index]) {
+        max_first_by_input[input_index] = first_node_id;
+    }
+}
+
+fn runtimeRegionCoveredNodeCount(node_ids: []const NodeId, regions: []const RuntimeRegion, skipped: []const bool) usize {
+    var count: usize = 0;
+    for (node_ids, 0..) |node_id, pos| {
+        if (pos < regions.len and std.meta.activeTag(regions[pos]) != .none) {
+            count += 1;
+            continue;
+        }
+        const i: usize = @intCast(node_id);
+        if (i < skipped.len and skipped[i]) count += 1;
+    }
+    return count;
+}
+
+fn runtimeRegionElidedNodeCount(node_ids: []const NodeId, regions: []const RuntimeRegion, skipped: []const bool) usize {
+    var count: usize = 0;
+    for (node_ids, 0..) |node_id, pos| {
+        if (pos < regions.len and std.meta.activeTag(regions[pos]) != .none) continue;
+        const i: usize = @intCast(node_id);
+        if (i < skipped.len and skipped[i]) count += 1;
+    }
+    return count;
 }
 
 const RuntimeRegionSummary = struct {
@@ -4730,6 +5221,11 @@ const RuntimeDot2DRhs = struct {
     k: usize,
 };
 
+const RuntimeDot2DResolvedRhs = struct {
+    rhs: CT,
+    rhs_contract_axis: u32,
+};
+
 fn executeLoraLinearPattern(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -5178,33 +5674,66 @@ fn executeFfnGeluBackwardOutputPattern(
     pattern: FfnGeluBackwardPattern,
     skipped_nodes: []bool,
 ) !bool {
-    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FFN_GELU_BACKWARD_OUTPUT_CHAIN", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FFN_GELU_BACKWARD_OUTPUT_CHAIN", false)) {
+        traceFfnGeluBackwardOutputDecline("disabled", pattern, 0, 0);
+        return false;
+    }
 
     const first_dot_node = graph.node(pattern.first_dot_id);
     const first_attrs = switch (first_dot_node.op) {
         .dot_general => |attrs| attrs,
-        else => return false,
+        else => {
+            traceFfnGeluBackwardOutputDecline("first_not_dot", pattern, 0, 0);
+            return false;
+        },
     };
-    const first = (try runtimeDot2DInputs(graph, values, first_dot_node.getInputs(), first_attrs)) orelse return false;
-    if (first.k != 1) return false;
+    const first = (try runtimeDot2DInputs(graph, values, first_dot_node.getInputs(), first_attrs)) orelse {
+        traceFfnGeluBackwardDot2DDecline(graph, "first_inputs", pattern.first_dot_id, first_dot_node.getInputs(), first_attrs);
+        traceFfnGeluBackwardOutputDecline("first_inputs", pattern, 0, 0);
+        return false;
+    };
+    if (first.k != 1) {
+        traceFfnGeluBackwardOutputDecline("first_k", pattern, first.k, 0);
+        return false;
+    }
 
     const second_branch_node = graph.node(pattern.second_branch_dot_id);
     const second_branch_attrs = switch (second_branch_node.op) {
         .dot_general => |attrs| attrs,
-        else => return false,
+        else => {
+            traceFfnGeluBackwardOutputDecline("second_not_dot", pattern, first.k, 0);
+            return false;
+        },
     };
-    const second_branch = (try runtimeDot2DInputs(graph, values, second_branch_node.getInputs(), second_branch_attrs)) orelse return false;
+    const second_branch = (try runtimeDot2DInputs(graph, values, second_branch_node.getInputs(), second_branch_attrs)) orelse {
+        traceFfnGeluBackwardDot2DDecline(graph, "second_inputs", pattern.second_branch_dot_id, second_branch_node.getInputs(), second_branch_attrs);
+        traceFfnGeluBackwardOutputDecline("second_inputs", pattern, first.k, 0);
+        return false;
+    };
 
     const gelu_node = graph.node(pattern.gelu_backward_id);
-    if (gelu_node.num_inputs < 2) return false;
-    const gelu_input = valueFor(values, gelu_node.inputs[0]) orelse return false;
+    if (gelu_node.num_inputs < 2) {
+        traceFfnGeluBackwardOutputDecline("gelu_arity", pattern, first.k, second_branch.k);
+        return false;
+    }
+    const gelu_input = valueFor(values, gelu_node.inputs[0]) orelse {
+        traceFfnGeluBackwardOutputDecline("gelu_input", pattern, first.k, second_branch.k);
+        return false;
+    };
 
     const output_dot_node = graph.node(pattern.output_dot_id);
     const output_attrs = switch (output_dot_node.op) {
         .dot_general => |attrs| attrs,
-        else => return false,
+        else => {
+            traceFfnGeluBackwardOutputDecline("output_not_dot", pattern, first.k, second_branch.k);
+            return false;
+        },
     };
-    const output_dot = (try runtimeDot2DRhs(graph, values, output_dot_node.getInputs(), output_attrs)) orelse return false;
+    const output_dot = (try runtimeDot2DRhs(graph, values, output_dot_node.getInputs(), output_attrs)) orelse {
+        traceFfnGeluBackwardDot2DDecline(graph, "output_rhs", pattern.output_dot_id, output_dot_node.getInputs(), output_attrs);
+        traceFfnGeluBackwardOutputDecline("output_rhs", pattern, first.k, second_branch.k);
+        return false;
+    };
 
     const result = cb.decoderRuntimeFfnGeluBackwardOutput(&.{
         .first_lhs = first.lhs,
@@ -5224,11 +5753,16 @@ fn executeFfnGeluBackwardOutputPattern(
     }) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
-    } orelse return false;
+    } orelse {
+        traceFfnGeluBackwardOutputDecline("runtime_null", pattern, first.k, second_branch.k);
+        return false;
+    };
 
     values[@intCast(pattern.first_dot_id)] = result.first;
+    values[@intCast(pattern.gelu_backward_id)] = result.gelu;
     values[@intCast(pattern.output_dot_id)] = result.output;
     value_device[@intCast(pattern.first_dot_id)] = device_id;
+    value_device[@intCast(pattern.gelu_backward_id)] = device_id;
     value_device[@intCast(pattern.output_dot_id)] = device_id;
     markFfnGeluBackwardSkipped(skipped_nodes, pattern);
 
@@ -5245,6 +5779,46 @@ fn executeFfnGeluBackwardOutputPattern(
         );
     }
     return true;
+}
+
+fn traceFfnGeluBackwardOutputDecline(reason: []const u8, pattern: FfnGeluBackwardPattern, first_k: usize, second_k: usize) void {
+    if (!traceMetalGraphFusionsEnabled()) return;
+    std.debug.print(
+        "metal_graph_fusion_trace: ffn_gelu_backward_output_chain declined reason={s} first={d} second_branch={d} add={d} gelu={d} output={d} rows={d} hidden={d} intermediate={d} first_k={d} second_k={d}\n",
+        .{ reason, pattern.first_dot_id, pattern.second_branch_dot_id, pattern.upstream_add_id, pattern.gelu_backward_id, pattern.output_dot_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size, first_k, second_k },
+    );
+}
+
+fn traceFfnGeluBackwardDot2DDecline(
+    graph: *const Graph,
+    reason: []const u8,
+    node_id: NodeId,
+    inputs: []const NodeId,
+    attrs: anytype,
+) void {
+    if (!traceMetalGraphFusionsEnabled()) return;
+    const lhs_id = if (inputs.len > 0) inputs[0] else null_node;
+    const rhs_id = if (inputs.len > 1) inputs[1] else null_node;
+    std.debug.print(
+        "metal_graph_fusion_trace: ffn_gelu_backward_dot2d declined reason={s} node={d} inputs={d} lhs={d} rhs={d} num_contracting={d} num_batch={d} lhs_contract0={d} rhs_contract0={d} lhs_rank={d} lhs0={d} lhs1={d} rhs_rank={d} rhs0={d} rhs1={d}\n",
+        .{
+            reason,
+            node_id,
+            inputs.len,
+            lhs_id,
+            rhs_id,
+            attrs.num_contracting,
+            attrs.num_batch,
+            if (attrs.num_contracting > 0) attrs.lhs_contracting[0] else 255,
+            if (attrs.num_contracting > 0) attrs.rhs_contracting[0] else 255,
+            shapeRankForNodeOr(graph, lhs_id, 0),
+            shapeDimForNodeOr(graph, lhs_id, 0, -1),
+            shapeDimForNodeOr(graph, lhs_id, 1, -1),
+            shapeRankForNodeOr(graph, rhs_id, 0),
+            shapeDimForNodeOr(graph, rhs_id, 0, -1),
+            shapeDimForNodeOr(graph, rhs_id, 1, -1),
+        },
+    );
 }
 
 fn operatorPlanForRegionNode(partition_plan: ?*const partition_mod.PartitionPlan, node_id: NodeId) ?OperatorPlan {
@@ -5358,11 +5932,11 @@ fn runtimeDot2DInputs(
     const rhs_k = rhs_shape[rhs_axis];
     if (rhs_k <= 0 or rhs_k != lhs_shape[1]) return null;
     const lhs = valueFor(values, inputs[0]) orelse return null;
-    const rhs = valueFor(values, inputs[1]) orelse return null;
+    const rhs = resolvedRuntimeDot2DRhs(graph, values, inputs[1], rhs_contracting) orelse return null;
     return .{
         .lhs = lhs,
-        .rhs = rhs,
-        .rhs_contract_axis = rhs_contracting,
+        .rhs = rhs.rhs,
+        .rhs_contract_axis = rhs.rhs_contract_axis,
         .k = @intCast(lhs_shape[1]),
     };
 }
@@ -5388,12 +5962,40 @@ fn runtimeDot2DRhs(
     const rhs_axis: usize = @intCast(rhs_contracting);
     const rhs_k = rhs_shape[rhs_axis];
     if (rhs_k <= 0 or rhs_k != lhs_shape[1]) return null;
-    const rhs = valueFor(values, inputs[1]) orelse return null;
+    const rhs = resolvedRuntimeDot2DRhs(graph, values, inputs[1], rhs_contracting) orelse return null;
     return .{
-        .rhs = rhs,
-        .rhs_contract_axis = rhs_contracting,
+        .rhs = rhs.rhs,
+        .rhs_contract_axis = rhs.rhs_contract_axis,
         .k = @intCast(lhs_shape[1]),
     };
+}
+
+fn resolvedRuntimeDot2DRhs(
+    graph: *const Graph,
+    values: []?CT,
+    rhs_id: NodeId,
+    rhs_contracting: u32,
+) ?RuntimeDot2DResolvedRhs {
+    if (valueFor(values, rhs_id)) |rhs| {
+        return .{ .rhs = rhs, .rhs_contract_axis = rhs_contracting };
+    }
+    if (rhs_id == null_node or rhs_id >= graph.nodeCount()) return null;
+    const rhs_node = graph.node(rhs_id);
+    const transpose_attrs = switch (rhs_node.op) {
+        .transpose => |attrs| attrs,
+        else => return null,
+    };
+    if (rhs_node.num_inputs == 0 or rhs_node.inputs[0] == null_node) return null;
+    const source_id = rhs_node.inputs[0];
+    if (source_id >= graph.nodeCount()) return null;
+    if (!transposeIsSimple2D(transpose_attrs, graph.node(source_id).output_shape)) return null;
+    const source = valueFor(values, source_id) orelse return null;
+    const source_contract_axis: u32 = switch (rhs_contracting) {
+        0 => 1,
+        1 => 0,
+        else => return null,
+    };
+    return .{ .rhs = source, .rhs_contract_axis = source_contract_axis };
 }
 
 fn matchFfnGeluBackwardPattern(
@@ -8899,7 +9501,7 @@ fn executeRuntimeLinearDotFromDeferredTranspose(
     const weight_out_dim = shapeDimUsize(weight_shape, 0) orelse return null;
     const weight_in_dim = shapeDimUsize(weight_shape, 1) orelse return null;
     if (weight_out_dim != out_dim or weight_in_dim != in_dim) return null;
-    if (in_dim == 1 and platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RANK1_DOT_SPECIALIZATION", false)) {
+    if (in_dim == 1 and rank1DotSpecializationEnabled()) {
         var weight_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
         const source_weight_shape = try fillShapeDims(weight_shape, &weight_shape_buf);
         const output = cb.primDotGeneral(input, weight, lhs_shape, source_weight_shape, lhs_contracting, &.{1}, lhs_batch, rhs_batch) catch |err| switch (err) {
@@ -9929,6 +10531,18 @@ fn shapeDimUsize(shape: ml.graph.Shape, axis: usize) ?usize {
     return positiveI64ToUsize(shape.dim(@intCast(axis)));
 }
 
+fn shapeRankForNodeOr(graph: *const Graph, node_id: NodeId, fallback: usize) usize {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return fallback;
+    return graph.node(node_id).output_shape.rank();
+}
+
+fn shapeDimForNodeOr(graph: *const Graph, node_id: NodeId, axis: usize, fallback: i64) i64 {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return fallback;
+    const shape = graph.node(node_id).output_shape;
+    if (axis >= shape.rank()) return fallback;
+    return shape.dim(@intCast(axis));
+}
+
 fn buildMetalGraphPlan(
     allocator: std.mem.Allocator,
     buffer_plan: *const buffer_plan_mod.BufferPlan,
@@ -10139,7 +10753,9 @@ fn freeExpiredInputs(
         if (input_id == null_node or input_id >= values.len) continue;
         const input_index: usize = @intCast(input_id);
         if (last_use[input_index] != node_index) continue;
-        if (runtimeRegionNeedsInputAfterNode(runtime_region_plan, input_id, node_id)) continue;
+        if (runtime_region_plan) |plan| {
+            if (plan.needsAttentionInputAfterNode(input_id, node_id)) continue;
+        }
         if (rt_map.contains(input_id) and
             !donated.contains(input_id) and
             !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
@@ -10170,28 +10786,6 @@ fn freeExpiredInputs(
         }
         values[input_index] = null;
     }
-}
-
-fn runtimeRegionNeedsInputAfterNode(plan_opt: ?RuntimeRegionPlan, input_id: NodeId, node_id: NodeId) bool {
-    const plan = plan_opt orelse return false;
-    for (plan.regions_by_pos) |region| {
-        switch (region) {
-            .deberta_attention => |pattern| {
-                if (pattern.first_node_id <= node_id) continue;
-                if (input_id == pattern.q_id or
-                    input_id == pattern.k_id or
-                    input_id == pattern.v_id or
-                    input_id == pattern.q_r_id or
-                    input_id == pattern.k_r_id or
-                    input_id == pattern.attn_bias_id)
-                {
-                    return true;
-                }
-            },
-            else => {},
-        }
-    }
-    return false;
 }
 
 fn evalPartitionBoundaryOutputs(

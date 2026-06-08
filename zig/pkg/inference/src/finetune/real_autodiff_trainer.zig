@@ -302,6 +302,9 @@ pub const StepProfile = struct {
     graph_executor_region_ops: u64 = 0,
     graph_executor_runtime_region_dispatches: u64 = 0,
     graph_executor_runtime_region_fallbacks: u64 = 0,
+    graph_executor_runtime_region_active_regions: u64 = 0,
+    graph_executor_runtime_region_covered_nodes: u64 = 0,
+    graph_executor_runtime_region_elided_nodes: u64 = 0,
     graph_executor_runtime_region_plan_compiles: u64 = 0,
     graph_executor_runtime_region_plan_reuses: u64 = 0,
     graph_executor_runtime_frame_candidates: u64 = 0,
@@ -744,6 +747,9 @@ pub const RealAutodiffTrainer = struct {
         profile.graph_executor_region_ops = step_result.profile.graph_executor_region_ops;
         profile.graph_executor_runtime_region_dispatches = step_result.profile.graph_executor_runtime_region_dispatches;
         profile.graph_executor_runtime_region_fallbacks = step_result.profile.graph_executor_runtime_region_fallbacks;
+        profile.graph_executor_runtime_region_active_regions = step_result.profile.graph_executor_runtime_region_active_regions;
+        profile.graph_executor_runtime_region_covered_nodes = step_result.profile.graph_executor_runtime_region_covered_nodes;
+        profile.graph_executor_runtime_region_elided_nodes = step_result.profile.graph_executor_runtime_region_elided_nodes;
         profile.graph_executor_runtime_region_plan_compiles = step_result.profile.graph_executor_runtime_region_plan_compiles;
         profile.graph_executor_runtime_region_plan_reuses = step_result.profile.graph_executor_runtime_region_plan_reuses;
         profile.graph_executor_runtime_frame_candidates = step_result.profile.graph_executor_runtime_frame_candidates;
@@ -850,6 +856,7 @@ pub const RealAutodiffTrainer = struct {
                         }
                     }
 
+                    const lr = self.config.lr_schedule.lr(@intCast(self.step_count));
                     grad_norm = if (direct_device_step)
                         try self.deviceGlobalGradNormFromResult(&step_result)
                     else if (use_device_optimizer)
@@ -866,7 +873,6 @@ pub const RealAutodiffTrainer = struct {
                         }
                     }
 
-                    const lr = self.config.lr_schedule.lr(@intCast(self.step_count));
                     if (direct_device_step) {
                         const device_opt_start_ns = monotonicNowNs();
                         const clip_scale = if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm)
@@ -1394,11 +1400,58 @@ pub const RealAutodiffTrainer = struct {
         const t: f32 = @floatFromInt(self.optimizer_state.step_count);
         const bias_correction1 = 1.0 - std.math.pow(f32, opt.beta1, t);
         const bias_correction2 = 1.0 - std.math.pow(f32, opt.beta2, t);
+        if (self.compute_backend.kind() == .metal) {
+            if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+            const metal = try self.metalCompute();
+            var batch = try std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
+            defer batch.deinit(self.allocator);
+            for (self.lora_params.items) |*slot| {
+                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+                try batch.append(self.allocator, .{
+                    .weight = device.weight,
+                    .grad = device.grad_accum,
+                    .m = device.m,
+                    .v = device.v,
+                    .elem_count = slot.weights.len,
+                });
+            }
+            for (self.regular_params.items) |*slot| {
+                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+                try batch.append(self.allocator, .{
+                    .weight = device.weight,
+                    .grad = device.grad_accum,
+                    .m = device.m,
+                    .v = device.v,
+                    .elem_count = slot.weights.len,
+                });
+            }
+            var frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
+            errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+            try metal.trainingAdamWManyF32(batch.items, .{
+                .lr = lr,
+                .beta1 = opt.beta1,
+                .beta2 = opt.beta2,
+                .eps = opt.eps,
+                .weight_decay = opt.weight_decay,
+                .bias_correction1 = bias_correction1,
+                .bias_correction2 = bias_correction2,
+                .grad_scale = grad_scale,
+            });
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
+            return;
+        }
+        var frame_active = if (self.compute_backend.kind() == .metal) try self.compute_backend.decoderRuntimeBeginFrame() else false;
+        errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
         for (self.lora_params.items) |*slot| {
             try self.stepDeviceAdamWSlot(slot, lr, grad_scale, bias_correction1, bias_correction2);
         }
         for (self.regular_params.items) |*slot| {
             try self.stepDeviceAdamWSlot(slot, lr, grad_scale, bias_correction1, bias_correction2);
+        }
+        if (frame_active) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
         }
     }
 
@@ -1412,6 +1465,51 @@ pub const RealAutodiffTrainer = struct {
         const t: f32 = @floatFromInt(self.optimizer_state.step_count);
         const bias_correction1 = 1.0 - std.math.pow(f32, opt.beta1, t);
         const bias_correction2 = 1.0 - std.math.pow(f32, opt.beta2, t);
+        if (self.compute_backend.kind() == .metal) {
+            if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
+            const metal = try self.metalCompute();
+            var batch = try std.ArrayList(metal_compute.MetalCompute.TrainingAdamWBatchInput).initCapacity(self.allocator, self.lora_params.items.len + self.regular_params.items.len);
+            defer batch.deinit(self.allocator);
+            for (self.lora_params.items) |*slot| {
+                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+                const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+                try batch.append(self.allocator, .{
+                    .weight = device.weight,
+                    .grad = grad,
+                    .m = device.m,
+                    .v = device.v,
+                    .elem_count = slot.weights.len,
+                });
+            }
+            for (self.regular_params.items) |*slot| {
+                const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+                const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
+                try batch.append(self.allocator, .{
+                    .weight = device.weight,
+                    .grad = grad,
+                    .m = device.m,
+                    .v = device.v,
+                    .elem_count = slot.weights.len,
+                });
+            }
+            var frame_active = try self.compute_backend.decoderRuntimeBeginFrame();
+            errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
+            try metal.trainingAdamWManyF32(batch.items, .{
+                .lr = lr,
+                .beta1 = opt.beta1,
+                .beta2 = opt.beta2,
+                .eps = opt.eps,
+                .weight_decay = opt.weight_decay,
+                .bias_correction1 = bias_correction1,
+                .bias_correction2 = bias_correction2,
+                .grad_scale = grad_scale,
+            });
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
+            return;
+        }
+        var frame_active = if (self.compute_backend.kind() == .metal) try self.compute_backend.decoderRuntimeBeginFrame() else false;
+        errdefer if (frame_active) self.compute_backend.decoderRuntimeCancelFrame() catch {};
         for (self.lora_params.items) |*slot| {
             const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
             try self.stepDeviceAdamWSlotWithGrad(slot, grad, lr, grad_scale, bias_correction1, bias_correction2);
@@ -1419,6 +1517,10 @@ pub const RealAutodiffTrainer = struct {
         for (self.regular_params.items) |*slot| {
             const grad = result.device_gradients.get(slot.name) orelse return error.MissingTrainableGradient;
             try self.stepDeviceAdamWSlotWithGrad(slot, grad, lr, grad_scale, bias_correction1, bias_correction2);
+        }
+        if (frame_active) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            frame_active = false;
         }
     }
 

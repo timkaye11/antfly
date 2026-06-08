@@ -487,6 +487,7 @@ pub const DecoderRuntimeFfnGeluBackwardChainResult = struct {
 
 pub const DecoderRuntimeFfnGeluBackwardOutputResult = struct {
     first: CT,
+    gelu: CT,
     output: CT,
 };
 

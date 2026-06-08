@@ -767,7 +767,12 @@ def main() -> int:
     )
     p.add_argument("--zig-build-metal", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--zig-build-mlx", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--zig-optimize", choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"], default=None)
+    p.add_argument(
+        "--zig-optimize",
+        choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"],
+        default="ReleaseFast",
+        help="Zig optimization mode for the training binary (default: ReleaseFast; pass Debug for instrumentation-heavy debugging)",
+    )
     p.add_argument("--dump-parity", action="store_true", help="Collect first-batch span objective logits/label/mask stats from both implementations")
     p.add_argument(
         "--loss-parity-tolerance",
@@ -849,6 +854,28 @@ def main() -> int:
     python_avg_step_ms = report.get("python", {}).get("metrics", {}).get("avg_step_wall_ms")
     zig_total_trainer_ms = sum(float(row.get("trainer_total_ms") or 0.0) for row in zig_step_rows) if zig_step_rows else None
     zig_avg_trainer_ms = (zig_total_trainer_ms / len(zig_step_rows)) if zig_total_trainer_ms is not None and zig_step_rows else None
+    python_warm_step_timings = python_step_timings[1:] if len(python_step_timings) > 1 else []
+    python_warm_total_step_ms = (
+        sum(float(row.get("step_wall_ms") or 0.0) for row in python_warm_step_timings)
+        if python_warm_step_timings
+        else None
+    )
+    python_warm_avg_step_ms = (
+        python_warm_total_step_ms / len(python_warm_step_timings)
+        if python_warm_total_step_ms is not None and python_warm_step_timings
+        else None
+    )
+    zig_warm_step_rows = zig_step_rows[1:] if len(zig_step_rows) > 1 else []
+    zig_warm_total_trainer_ms = (
+        sum(float(row.get("trainer_total_ms") or 0.0) for row in zig_warm_step_rows)
+        if zig_warm_step_rows
+        else None
+    )
+    zig_warm_avg_trainer_ms = (
+        zig_warm_total_trainer_ms / len(zig_warm_step_rows)
+        if zig_warm_total_trainer_ms is not None and zig_warm_step_rows
+        else None
+    )
     zig_epoch_metrics = next((row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "epoch"), {})
     def zig_step_sum(key: str) -> float | None:
         if not zig_step_rows:
@@ -912,6 +939,9 @@ def main() -> int:
         "zig_graph_executor_host_outputs_avg": zig_step_avg("graph_executor_host_outputs"),
         "zig_graph_executor_regions_avg": zig_step_avg("graph_executor_regions"),
         "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg("graph_executor_runtime_region_dispatches"),
+        "zig_graph_executor_runtime_region_active_regions_avg": zig_step_avg("graph_executor_runtime_region_active_regions"),
+        "zig_graph_executor_runtime_region_covered_nodes_avg": zig_step_avg("graph_executor_runtime_region_covered_nodes"),
+        "zig_graph_executor_runtime_region_elided_nodes_avg": zig_step_avg("graph_executor_runtime_region_elided_nodes"),
         "zig_graph_executor_runtime_region_plan_compiles_avg": zig_step_avg("graph_executor_runtime_region_plan_compiles"),
         "zig_graph_executor_runtime_region_plan_reuses_avg": zig_step_avg("graph_executor_runtime_region_plan_reuses"),
         "zig_graph_executor_plan_build_ms_avg": zig_step_avg("graph_executor_plan_build_ms"),
