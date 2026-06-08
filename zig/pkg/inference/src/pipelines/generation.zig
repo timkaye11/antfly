@@ -398,6 +398,7 @@ pub fn getDecoderRuntimeDebugStats() DecoderRuntimeDebugStats {
 pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
+    kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     pool_id: ?runtime.kv.block.KvPoolId = null,
     total_tokens: usize = 0,
@@ -485,6 +486,10 @@ pub const NativeDecodeState = struct {
         if (!self.isPaged()) return;
         if (self.sequence_id != null) return;
         self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
+        if (self.kv_storage) |storage| {
+            const storage_sequence_id = try storage.attachSequence(storage.poolId());
+            if (storage_sequence_id != self.sequence_id.?) return error.InvalidPagedKvState;
+        }
     }
 
     fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
@@ -529,6 +534,7 @@ pub const NativeDecodeState = struct {
             .token_count = token_count,
             .position_offset = position_offset,
             .logical_blocks = self.kv_block_ids.items,
+            .kv_storage = self.kv_storage,
         };
     }
 
@@ -598,6 +604,7 @@ pub const NativeDecodeState = struct {
         if (self.kv_manager) |manager| {
             if (self.sequence_id) |sequence_id| {
                 manager.releaseSequence(sequence_id) catch {};
+                if (self.kv_storage) |storage| storage.releaseSequence(sequence_id) catch {};
             }
         }
         self.moe_runtime.deinit();
@@ -627,6 +634,7 @@ pub const NativeDecodeState = struct {
         if (self.isPaged()) {
             try self.ensureAttached();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
+            if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             self.kv_compacted = false;
             self.syncPagedKvViewForPrefill();
         }
@@ -644,6 +652,7 @@ pub const NativeDecodeState = struct {
         if (self.isPaged()) {
             try self.ensureAttached();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
+            if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             self.kv_compacted = false;
             self.syncPagedKvViewForPrefill();
         }
@@ -662,6 +671,10 @@ pub const NativeDecodeState = struct {
             try self.ensureAttached();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
+            if (self.kv_storage) |storage| {
+                try storage.appendTokens(self.sequence_id.?, 1);
+                _ = try storage.trimSequenceToSlidingWindow(self.sequence_id.?);
+            }
             self.syncPagedKvViewForDecode();
         }
     }
@@ -681,6 +694,10 @@ pub const NativeDecodeState = struct {
             try self.ensureAttached();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(count));
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
+            if (self.kv_storage) |storage| {
+                try storage.appendTokens(self.sequence_id.?, @intCast(count));
+                _ = try storage.trimSequenceToSlidingWindow(self.sequence_id.?);
+            }
             if (count > 0) {
                 const kv_tokens = if (self.kv_compacted)
                     @min(if (self.kv_view) |view| view.token_count + count else count, self.total_tokens)
@@ -711,6 +728,7 @@ pub const NativeDecodeState = struct {
             const manager = self.kv_manager.?;
             if (self.sequence_id) |seq_id| {
                 const removed = try manager.truncateSequence(seq_id, count);
+                if (self.kv_storage) |storage| _ = try storage.truncateSequence(seq_id, count);
                 const prior_kv_tokens = if (self.kv_view) |view| view.token_count else 0;
                 const kv_tokens = prior_kv_tokens - @min(prior_kv_tokens, removed);
                 self.setPagedKvView(kv_tokens, self.total_tokens - kv_tokens);
@@ -810,6 +828,7 @@ pub const NativeDecodeState = struct {
             .kv_sequence_len = if (self.kvView()) |view| view.token_count else seq_len,
             .kv_position_offset = if (self.kvView()) |view| view.position_offset else 0,
             .kv_manager = self.kv_manager,
+            .kv_storage = self.kv_storage,
             .moe_runtime = &self.moe_runtime,
             .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
             .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
@@ -821,6 +840,7 @@ pub const NativeDecodeState = struct {
                     .tail_tokens = view.tail_tokens,
                     .position_offset = view.position_offset,
                     .logical_blocks = view.logical_blocks,
+                    .kv_storage = view.kv_storage,
                 }
             else
                 null,
@@ -2226,7 +2246,7 @@ pub const NativeGenerationPipeline = struct {
                 break;
             }
 
-            if (next_device_token_tensor == null and self.shouldSeedMlxDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
+            if (next_device_token_tensor == null and self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
                 next_device_token_tensor = try self.makeDeviceTokenTensor(next_token);
             }
             if (device_token_tensor) |tensor| self.cb.free(tensor);
@@ -2289,15 +2309,16 @@ pub const NativeGenerationPipeline = struct {
     ) !?DeviceDecodeOutcome {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         decoder_runtime_debug_stats.forward_attempts += 1;
-        if (self.cb.kind() != .mlx) {
+        const backend_kind = self.cb.kind();
+        if (backend_kind != .mlx and backend_kind != .cuda) {
             decoder_runtime_debug_stats.backend_not_mlx += 1;
             return null;
         }
-        if (!enableMlxGreedyDeviceDecodeDebug() and !enableMlxDeviceTokenHandoffDebug() and !enableMlxRawMetalWholeTokenDebug()) {
+        if (backend_kind == .mlx and !enableMlxGreedyDeviceDecodeDebug() and !enableMlxDeviceTokenHandoffDebug() and !enableMlxRawMetalWholeTokenDebug()) {
             decoder_runtime_debug_stats.flag_disabled += 1;
             return null;
         }
-        if (self.scheduler != null) {
+        if (backend_kind == .mlx and self.scheduler != null) {
             decoder_runtime_debug_stats.scheduler_blocked += 1;
             return null;
         }
@@ -2322,17 +2343,19 @@ pub const NativeGenerationPipeline = struct {
             return null;
         }
 
-        try self.prepareMlxRawMetalWholeTokenDecode(decode_state);
-        if (try self.forwardRawMetalWholeTokenInputSlice(
-            token_ids,
-            seq_len,
-            decode_state,
-        )) |token| {
-            return .{ .token = token };
+        if (backend_kind == .mlx) {
+            try self.prepareMlxRawMetalWholeTokenDecode(decode_state);
+            if (try self.forwardRawMetalWholeTokenInputSlice(
+                token_ids,
+                seq_len,
+                decode_state,
+            )) |token| {
+                return .{ .token = token };
+            }
         }
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-        if (enableMlxDeviceTokenHandoffDebug()) {
+        if (backend_kind == .cuda or (backend_kind == .mlx and enableMlxDeviceTokenHandoffDebug())) {
             if (input_token_tensor) |token_tensor| {
                 if (try gpt_arch.forwardGreedyLastTokenFromTokenTensor(
                     &self.cb,
@@ -2492,7 +2515,7 @@ pub const NativeGenerationPipeline = struct {
         return @intCast(token);
     }
 
-    fn shouldSeedMlxDeviceTokenHandoff(
+    fn shouldSeedDeviceTokenHandoff(
         self: *NativeGenerationPipeline,
         tokens_generated: usize,
         decode_state: *NativeDecodeState,
@@ -2503,8 +2526,9 @@ pub const NativeGenerationPipeline = struct {
     ) bool {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         _ = tokens_generated;
-        if (self.cb.kind() != .mlx) return false;
-        if (!enableMlxDeviceTokenHandoffDebug()) return false;
+        const backend_kind = self.cb.kind();
+        if (backend_kind != .mlx and backend_kind != .cuda) return false;
+        if (backend_kind == .mlx and !enableMlxDeviceTokenHandoffDebug()) return false;
         if (self.scheduler != null) return false;
         if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
         if (decode_runtime.kvView() == null) return false;

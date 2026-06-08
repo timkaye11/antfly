@@ -24,6 +24,7 @@ const gguf_tensor_types = @import("../../gguf/tensor_types.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
 const operator_plan = @import("../../graph/operator_plan.zig");
+const kv_storage_runtime = @import("../../runtime/kv/storage_runtime.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
 
@@ -47,13 +48,141 @@ pub const CapabilityProfile = enum {
 };
 
 pub const RuntimeStats = struct {
+    pub const top_transfer_size_count = 8;
+
     quant_ops: operator_plan.Stats = .{},
     h2d_bytes: usize = 0,
     d2h_bytes: usize = 0,
+    d2d_bytes: usize = 0,
     resident_weight_bytes: usize = 0,
     device_allocated_bytes: usize = 0,
+    device_alloc_calls: usize = 0,
+    device_free_calls: usize = 0,
+    temp_buffer_hits: usize = 0,
+    temp_buffer_misses: usize = 0,
+    temp_buffer_releases: usize = 0,
+    temp_buffer_evictions: usize = 0,
+    temp_buffer_cached_bytes: usize = 0,
+    kernel_launches: usize = 0,
+    stream_syncs: usize = 0,
+    upload_syncs: usize = 0,
+    download_syncs: usize = 0,
+    eval_syncs: usize = 0,
+    from_float32_calls: usize = 0,
+    from_float32_bytes: usize = 0,
+    to_float32_calls: usize = 0,
+    to_float32_bytes: usize = 0,
+    upload_owned_host_calls: usize = 0,
+    upload_owned_host_bytes: usize = 0,
+    download_alloc_calls: usize = 0,
+    download_alloc_bytes: usize = 0,
+    upload_bucket_le_16: usize = 0,
+    upload_bucket_le_1k: usize = 0,
+    upload_bucket_le_8k: usize = 0,
+    upload_bucket_le_32k: usize = 0,
+    upload_bucket_le_256k: usize = 0,
+    upload_bucket_gt_256k: usize = 0,
+    download_bucket_le_16: usize = 0,
+    download_bucket_le_1k: usize = 0,
+    download_bucket_le_8k: usize = 0,
+    download_bucket_le_32k: usize = 0,
+    download_bucket_le_256k: usize = 0,
+    download_bucket_gt_256k: usize = 0,
+    add_scalar_calls: usize = 0,
+    rms_norm_bare_calls: usize = 0,
+    upload_top_sizes: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
+    upload_top_counts: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
+    download_top_sizes: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
+    download_top_counts: [top_transfer_size_count]usize = [_]usize{0} ** top_transfer_size_count,
+    launch_embedding: usize = 0,
+    launch_linear: usize = 0,
+    launch_linear_qkv: usize = 0,
+    launch_norm: usize = 0,
+    launch_rope: usize = 0,
+    launch_attention: usize = 0,
+    launch_elementwise: usize = 0,
+    launch_scalar: usize = 0,
+    launch_scalar_multiply_immediate: usize = 0,
+    launch_scalar_add_immediate: usize = 0,
+    launch_scalar_device_broadcast: usize = 0,
+    launch_argmax: usize = 0,
+    launch_other: usize = 0,
     host_attention_fallbacks: usize = 0,
+    rope_host_fallbacks: usize = 0,
+    rope_per_item_host_fallbacks: usize = 0,
+    gqa_dense_host_fallbacks: usize = 0,
+    paged_attention_host_fallbacks: usize = 0,
+    device_kv_writes: usize = 0,
+    device_kv_reads: usize = 0,
+    device_kv_attempts: usize = 0,
+    device_kv_successes: usize = 0,
+    device_kv_fail_batch: usize = 0,
+    device_kv_fail_no_cache: usize = 0,
+    device_kv_fail_no_storage: usize = 0,
+    device_kv_fail_no_hook: usize = 0,
+    device_kv_fail_write: usize = 0,
+    device_kv_fail_read: usize = 0,
+    device_kv_fail_shape: usize = 0,
+    qkv_fused_q4: usize = 0,
+    qkv_fused_q4_q4_f32: usize = 0,
+    qkv_fused_f32: usize = 0,
+    qkv_fallback_unsupported: usize = 0,
+    qkv_kernel_unavailable: usize = 0,
 };
+
+fn noteTopTransferSize(sizes: *[RuntimeStats.top_transfer_size_count]usize, counts: *[RuntimeStats.top_transfer_size_count]usize, bytes: usize) void {
+    if (bytes == 0) return;
+    for (sizes, counts) |size, *count| {
+        if (size == bytes) {
+            count.* += 1;
+            return;
+        }
+    }
+    var empty_index: ?usize = null;
+    var min_index: usize = 0;
+    for (counts, 0..) |count, i| {
+        if (sizes[i] == 0) {
+            empty_index = i;
+            break;
+        }
+        if (count < counts[min_index]) min_index = i;
+    }
+    const target = empty_index orelse min_index;
+    sizes[target] = bytes;
+    counts[target] = 1;
+}
+
+fn noteUploadBucket(stats: *RuntimeStats, bytes: usize) void {
+    if (bytes <= 16) {
+        stats.upload_bucket_le_16 += 1;
+    } else if (bytes <= 1024) {
+        stats.upload_bucket_le_1k += 1;
+    } else if (bytes <= 8192) {
+        stats.upload_bucket_le_8k += 1;
+    } else if (bytes <= 32768) {
+        stats.upload_bucket_le_32k += 1;
+    } else if (bytes <= 262144) {
+        stats.upload_bucket_le_256k += 1;
+    } else {
+        stats.upload_bucket_gt_256k += 1;
+    }
+}
+
+fn noteDownloadBucket(stats: *RuntimeStats, bytes: usize) void {
+    if (bytes <= 16) {
+        stats.download_bucket_le_16 += 1;
+    } else if (bytes <= 1024) {
+        stats.download_bucket_le_1k += 1;
+    } else if (bytes <= 8192) {
+        stats.download_bucket_le_8k += 1;
+    } else if (bytes <= 32768) {
+        stats.download_bucket_le_32k += 1;
+    } else if (bytes <= 262144) {
+        stats.download_bucket_le_256k += 1;
+    } else {
+        stats.download_bucket_gt_256k += 1;
+    }
+}
 
 pub const CudaCompute = struct {
     allocator: std.mem.Allocator,
@@ -113,7 +242,8 @@ pub const CudaCompute = struct {
         return switch (profile) {
             .clipclap => self.kernels.hasClipClapPrimitives(),
             .gliner2 => self.kernels.hasGliner2Primitives(),
-            .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and self.kernels.hasGemma4DecoderPrimitives(),
+            .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
+                (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
         };
     }
 
@@ -122,7 +252,13 @@ pub const CudaCompute = struct {
     }
 
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
-        return self.stats;
+        var stats = self.stats;
+        stats.kernel_launches = self.ctx.stats.kernel_launches;
+        stats.stream_syncs = self.ctx.stats.stream_syncs;
+        for (self.temp_buffers.items) |buffer| {
+            stats.temp_buffer_cached_bytes += buffer.len;
+        }
+        return stats;
     }
 
     fn noteDeviceBytes(self: *CudaCompute, bytes: usize) void {
@@ -206,6 +342,166 @@ pub const CudaCompute = struct {
     }
 };
 
+const CudaKvLayer = struct {
+    k: buffer_mod.DeviceBuffer = .{},
+    v: buffer_mod.DeviceBuffer = .{},
+    capacity_tokens: usize = 0,
+    token_count: usize = 0,
+    row_width: usize = 0,
+    position_offset: usize = 0,
+
+    fn deinit(self: *CudaKvLayer, compute: *CudaCompute) void {
+        self.k.free(&compute.ctx);
+        self.v.free(&compute.ctx);
+        self.* = .{};
+    }
+};
+
+const CudaKvDeviceStorage = struct {
+    allocator: std.mem.Allocator,
+    compute: *CudaCompute,
+    layers: std.AutoHashMapUnmanaged(u64, CudaKvLayer) = .{},
+
+    fn create(allocator: std.mem.Allocator, compute: *CudaCompute) !*CudaKvDeviceStorage {
+        const self = try allocator.create(CudaKvDeviceStorage);
+        self.* = .{
+            .allocator = allocator,
+            .compute = compute,
+        };
+        return self;
+    }
+
+    fn deinit(self: *CudaKvDeviceStorage) void {
+        var it = self.layers.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.compute);
+        }
+        self.layers.deinit(self.allocator);
+    }
+
+    fn key(sequence_id: kv_storage_runtime.SequenceId, layer_index: usize) !u64 {
+        if (layer_index > std.math.maxInt(u32)) return error.InvalidPagedKvState;
+        return (@as(u64, sequence_id) << 32) | @as(u64, @intCast(layer_index));
+    }
+
+    fn ensureLayer(self: *CudaKvDeviceStorage, write: kv_storage_runtime.KvSuffixWrite) !*CudaKvLayer {
+        const row_width = try checkedMul(@as(usize, write.num_kv_heads), @as(usize, write.head_dim));
+        const layer_key = try key(write.sequence_id, write.layer_index);
+        const gop = try self.layers.getOrPut(self.allocator, layer_key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        const layer = gop.value_ptr;
+        if (layer.row_width != 0 and layer.row_width != row_width) return error.InvalidKvShape;
+        layer.row_width = row_width;
+        layer.position_offset = write.position_offset;
+
+        if (layer.capacity_tokens < write.total_token_count) {
+            const new_capacity = @max(write.total_token_count, @max(@as(usize, 16), layer.capacity_tokens * 2));
+            const bytes = try checkedMul(try checkedMul(new_capacity, row_width), @sizeOf(f32));
+            var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, bytes);
+            errdefer new_k.free(&self.compute.ctx);
+            var new_v = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, bytes);
+            errdefer new_v.free(&self.compute.ctx);
+            self.compute.noteDeviceBytes(bytes * 2);
+            if (layer.token_count != 0) {
+                const old_bytes = try checkedMul(try checkedMul(layer.token_count, row_width), @sizeOf(f32));
+                try new_k.copyFromDevice(&self.compute.ctx, layer.k, old_bytes);
+                try new_v.copyFromDevice(&self.compute.ctx, layer.v, old_bytes);
+            }
+            layer.k.free(&self.compute.ctx);
+            layer.v.free(&self.compute.ctx);
+            layer.k = new_k;
+            layer.v = new_v;
+            layer.capacity_tokens = new_capacity;
+        }
+        return layer;
+    }
+
+    fn writeLayerKvSuffix(
+        ctx: *anyopaque,
+        write: kv_storage_runtime.KvSuffixWrite,
+        k_ref: kv_storage_runtime.DeviceKvRef,
+        v_ref: kv_storage_runtime.DeviceKvRef,
+    ) anyerror!void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (write.suffix_token_count == 0) return;
+        if (write.suffix_token_count > write.total_token_count) return error.InvalidKvShape;
+        const row_width = try checkedMul(@as(usize, write.num_kv_heads), @as(usize, write.head_dim));
+        const suffix_bytes = try checkedMul(try checkedMul(write.suffix_token_count, row_width), @sizeOf(f32));
+        if (k_ref.byte_len < suffix_bytes or v_ref.byte_len < suffix_bytes) return error.InvalidKvShape;
+        const layer = try self.ensureLayer(write);
+        const token_start = write.total_token_count - write.suffix_token_count;
+        const dst_offset = try checkedMul(try checkedMul(token_start, row_width), @sizeOf(f32));
+        const k_src = buffer_mod.DeviceBuffer{ .ptr = @as(@TypeOf(layer.k.ptr), @intCast(@intFromPtr(k_ref.handle) + k_ref.byte_offset)), .len = suffix_bytes };
+        const v_src = buffer_mod.DeviceBuffer{ .ptr = @as(@TypeOf(layer.v.ptr), @intCast(@intFromPtr(v_ref.handle) + v_ref.byte_offset)), .len = suffix_bytes };
+        const k_dst = buffer_mod.DeviceBuffer{ .ptr = layer.k.ptr + dst_offset, .len = layer.k.len - dst_offset };
+        const v_dst = buffer_mod.DeviceBuffer{ .ptr = layer.v.ptr + dst_offset, .len = layer.v.len - dst_offset };
+        try k_dst.copyFromDevice(&self.compute.ctx, k_src, suffix_bytes);
+        try v_dst.copyFromDevice(&self.compute.ctx, v_src, suffix_bytes);
+        layer.token_count = write.total_token_count;
+        layer.position_offset = write.position_offset;
+        self.compute.stats.device_kv_writes += 1;
+    }
+
+    fn gatherLayerKvDevice(
+        ctx: *anyopaque,
+        gather: kv_storage_runtime.DeviceKvLayerGather,
+    ) anyerror!kv_storage_runtime.DeviceKvLayer {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        const layer_key = try key(gather.sequence_id, gather.layer_index);
+        const layer = self.layers.getPtr(layer_key) orelse return error.DeviceReadFallback;
+        const row_width = try checkedMul(@as(usize, gather.num_kv_heads), @as(usize, gather.head_dim));
+        if (layer.row_width != row_width or layer.token_count < gather.token_count) return error.DeviceReadFallback;
+        const bytes = try checkedMul(try checkedMul(gather.token_count, row_width), @sizeOf(f32));
+        self.compute.stats.device_kv_reads += 1;
+        return .{
+            .runtime = self,
+            .k = .{ .handle = @ptrFromInt(layer.k.ptr), .byte_offset = 0, .byte_len = bytes },
+            .v = .{ .handle = @ptrFromInt(layer.v.ptr), .byte_offset = 0, .byte_len = bytes },
+            .token_count = gather.token_count,
+            .row_width = row_width,
+            .position_offset = layer.position_offset,
+            .value_element_bytes = @sizeOf(f32),
+        };
+    }
+
+    fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        var doomed: std.ArrayList(u64) = .empty;
+        defer doomed.deinit(self.allocator);
+        var it = self.layers.iterator();
+        while (it.next()) |entry| {
+            if (@as(u32, @intCast(entry.key_ptr.* >> 32)) == sequence_id) {
+                doomed.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+        }
+        for (doomed.items) |layer_key| {
+            if (self.layers.fetchRemove(layer_key)) |entry| {
+                var layer = entry.value;
+                layer.deinit(self.compute);
+            }
+        }
+    }
+
+    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        self.deinit();
+        allocator.destroy(self);
+    }
+
+    const hook_vtable = kv_storage_runtime.DeviceWriteHook.VTable{
+        .writeLayerKvSuffix = writeLayerKvSuffix,
+        .gatherLayerKvDevice = gatherLayerKvDevice,
+        .releaseSequence = releaseSequence,
+        .deinit = hookDeinit,
+    };
+
+    fn hook(self: *CudaKvDeviceStorage) kv_storage_runtime.DeviceWriteHook {
+        return .{ .ctx = self, .vtable = &hook_vtable };
+    }
+};
+
 fn cudaDequantizeQuantWeightsOnUpload() bool {
     return platform.env.getenvBoolDefault("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS", false);
 }
@@ -214,6 +510,7 @@ fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_m
     // Matrix weights stay quantized for CUDA matmul kernels. Small affine
     // parameters are consumed by f32 norm/elementwise kernels, so upload them
     // as f32 even if the bundle stored them in a quantized GGUF block.
+    if (isKnownQuantStorage(storage, .Q6_K)) return true;
     if (storage.shape.len < 2) return true;
     if (std.mem.endsWith(u8, name, ".bias")) return true;
     if (std.mem.eql(u8, name, "count_embed.pos_embedding.weight")) return true;
@@ -221,6 +518,13 @@ fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_m
     if (std.mem.indexOf(u8, name, ".norm") != null) return true;
     if (std.mem.indexOf(u8, name, "layer_norm") != null) return true;
     return false;
+}
+
+fn isKnownQuantStorage(storage: weight_source_mod.QuantizedStorage, known: gguf_tensor_types.KnownTensorType) bool {
+    return switch (storage.tensor_type) {
+        .known => |actual| actual == known,
+        else => false,
+    };
 }
 
 fn tensorFromCt(tensor: CT) *CudaTensor {
@@ -233,6 +537,20 @@ fn unsupportedCt() anyerror!CT {
 
 fn backendKind(_: *anyopaque) ops.BackendKind {
     return .cuda;
+}
+
+fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvStorageRuntime) anyerror!void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (storage.device_write_hook != null) return;
+    const config = storage.storage.config;
+    if (config.dtype != .f32) return;
+    if (config.num_kv_heads == 0 or config.head_dim == 0) return;
+    const device_storage = try CudaKvDeviceStorage.create(self.allocator, self);
+    errdefer {
+        device_storage.deinit();
+        self.allocator.destroy(device_storage);
+    }
+    storage.setDeviceWriteHook(device_storage.hook());
 }
 
 fn deinitBackend(ctx: *anyopaque) void {
@@ -261,6 +579,7 @@ fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes:
 
 fn copyFromDeviceTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, src: buffer_mod.DeviceBuffer, len: usize) !void {
     try device.copyFromDevice(&self.ctx, src, len);
+    self.stats.d2d_bytes += len;
 }
 
 const max_temp_buffers = 256;
@@ -277,10 +596,13 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     }
     if (best_index) |i| {
         const buffer = self.temp_buffers.swapRemove(i);
+        self.stats.temp_buffer_hits += 1;
         return buffer;
     }
+    self.stats.temp_buffer_misses += 1;
     const buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
     self.noteDeviceBytes(len);
+    self.stats.device_alloc_calls += 1;
     return buffer;
 }
 
@@ -288,12 +610,17 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     if (buffer.ptr == 0) return;
     if (self.temp_buffers.items.len < max_temp_buffers) {
         self.temp_buffers.append(self.allocator, buffer.*) catch {
+            self.stats.temp_buffer_evictions += 1;
+            self.stats.device_free_calls += 1;
             buffer.free(&self.ctx);
             return;
         };
+        self.stats.temp_buffer_releases += 1;
         buffer.* = .{};
         return;
     }
+    self.stats.temp_buffer_evictions += 1;
+    self.stats.device_free_calls += 1;
     buffer.free(&self.ctx);
 }
 
@@ -335,6 +662,12 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     errdefer device.free(&self.ctx);
     try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     try self.ctx.synchronize();
+    self.stats.upload_syncs += 1;
+    self.stats.from_float32_calls += 1;
+    const byte_len = data.len * @sizeOf(f32);
+    self.stats.from_float32_bytes += byte_len;
+    noteUploadBucket(&self.stats, byte_len);
+    noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, byte_len);
 
     const tensor = try self.allocator.create(CudaTensor);
     tensor.* = .{
@@ -346,14 +679,66 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     return tensor;
 }
 
+fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var elem_count: usize = 1;
+    for (shape) |dim| {
+        if (dim < 0) return error.InvalidShape;
+        elem_count = try std.math.mul(usize, elem_count, @intCast(dim));
+    }
+    if (elem_count != data.len) return error.InvalidShape;
+
+    const shape_i64 = try self.allocator.alloc(i64, shape.len);
+    errdefer self.allocator.free(shape_i64);
+    for (shape, 0..) |dim, i| shape_i64[i] = dim;
+
+    var device = try allocDeviceBuffer(self, data.len * @sizeOf(i32));
+    errdefer device.free(&self.ctx);
+    try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
+    try self.ctx.synchronize();
+    self.stats.upload_syncs += 1;
+    self.stats.from_float32_calls += 1;
+    const byte_len = data.len * @sizeOf(i32);
+    self.stats.from_float32_bytes += byte_len;
+    noteUploadBucket(&self.stats, byte_len);
+    noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, byte_len);
+
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = device,
+        .dtype = .i32,
+        .shape = shape_i64,
+        .elem_count = elem_count,
+    };
+    return tensor;
+}
+
 fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const cuda_tensor = tensorFromCt(tensor);
-    if (cuda_tensor.dtype != .f32) return error.UnsupportedTensorType;
     const out = try allocator.alloc(f32, cuda_tensor.elem_count);
     errdefer allocator.free(out);
-    try copyToHostTracked(self, cuda_tensor.buffer, std.mem.sliceAsBytes(out));
-    try self.ctx.synchronize();
+    switch (cuda_tensor.dtype) {
+        .f32 => {
+            try copyToHostTracked(self, cuda_tensor.buffer, std.mem.sliceAsBytes(out));
+            try self.ctx.synchronize();
+            self.stats.download_syncs += 1;
+        },
+        .i32 => {
+            const ints = try allocator.alloc(i32, cuda_tensor.elem_count);
+            defer allocator.free(ints);
+            try copyToHostTracked(self, cuda_tensor.buffer, std.mem.sliceAsBytes(ints));
+            try self.ctx.synchronize();
+            self.stats.download_syncs += 1;
+            for (ints, out) |value, *dst| dst.* = @floatFromInt(value);
+        },
+        else => return error.UnsupportedTensorType,
+    }
+    self.stats.to_float32_calls += 1;
+    const byte_len = cuda_tensor.elem_count * cuda_tensor.dtype.byteSize();
+    self.stats.to_float32_bytes += byte_len;
+    noteDownloadBucket(&self.stats, byte_len);
+    noteTopTransferSize(&self.stats.download_top_sizes, &self.stats.download_top_counts, byte_len);
     return out;
 }
 
@@ -368,6 +753,7 @@ fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
 fn evalTensorOp(ctx: *anyopaque, _: CT) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     try self.ctx.synchronize();
+    self.stats.eval_syncs += 1;
 }
 
 fn createTensor(
@@ -376,10 +762,20 @@ fn createTensor(
     shape: []i64,
     elem_count: usize,
 ) !CT {
+    return createTensorWithDType(self, device, shape, elem_count, .f32);
+}
+
+fn createTensorWithDType(
+    self: *CudaCompute,
+    device: buffer_mod.DeviceBuffer,
+    shape: []i64,
+    elem_count: usize,
+    dtype: tensor_mod.DType,
+) !CT {
     const tensor = try self.allocator.create(CudaTensor);
     tensor.* = .{
         .buffer = device,
-        .dtype = .f32,
+        .dtype = dtype,
         .shape = shape,
         .elem_count = elem_count,
     };
@@ -395,6 +791,12 @@ fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT 
     errdefer device.free(&self.ctx);
     try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     try self.ctx.synchronize();
+    self.stats.upload_syncs += 1;
+    self.stats.upload_owned_host_calls += 1;
+    const byte_len = elem_count * @sizeOf(f32);
+    self.stats.upload_owned_host_bytes += byte_len;
+    noteUploadBucket(&self.stats, byte_len);
+    noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, byte_len);
     self.allocator.free(data);
     return createTensor(self, device, shape, elem_count);
 }
@@ -417,6 +819,44 @@ fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
     errdefer device.free(&self.ctx);
     try copyFromDeviceTracked(self, device, input_tensor.buffer, input_tensor.elem_count * @sizeOf(f32));
     return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn reshape2DOp(
+    ctx: *anyopaque,
+    input: CT,
+    old_rows: usize,
+    old_cols: usize,
+    new_rows: usize,
+    new_cols: usize,
+) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    const new_count = try std.math.mul(usize, new_rows, new_cols);
+    if (new_count != input_tensor.elem_count) return error.InvalidShape;
+    if (old_rows != 0 or old_cols != 0) {
+        const old_count = try std.math.mul(usize, old_rows, old_cols);
+        if (old_count != new_count) return error.InvalidShape;
+    }
+    const shape = try self.allocator.dupe(i64, &[_]i64{ @intCast(new_rows), @intCast(new_cols) });
+    errdefer self.allocator.free(shape);
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = input_tensor.buffer,
+        .dtype = input_tensor.dtype,
+        .shape = shape,
+        .elem_count = input_tensor.elem_count,
+        .quant_type = input_tensor.quant_type,
+        .owns_buffer = false,
+        .owns_shape = true,
+    };
+    return tensor;
+}
+
+fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
+    const input_tensor = tensorFromCt(input);
+    if (try std.math.mul(usize, rows, cols) != input_tensor.elem_count) return error.InvalidShape;
+    return reshape2DOp(ctx, input, input_tensor.elem_count, 1, rows, cols);
 }
 
 fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
@@ -475,6 +915,12 @@ fn downloadAlloc(self: *CudaCompute, tensor: *const CudaTensor) ![]f32 {
     errdefer self.allocator.free(out);
     try copyToHostTracked(self, tensor.buffer, std.mem.sliceAsBytes(out));
     try self.ctx.synchronize();
+    self.stats.download_syncs += 1;
+    self.stats.download_alloc_calls += 1;
+    const byte_len = tensor.elem_count * @sizeOf(f32);
+    self.stats.download_alloc_bytes += byte_len;
+    noteDownloadBucket(&self.stats, byte_len);
+    noteTopTransferSize(&self.stats.download_top_sizes, &self.stats.download_top_counts, byte_len);
     return out;
 }
 
@@ -623,6 +1069,36 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     } else {
         try self.kernels.launchEmbeddingLookupF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim);
     }
+    self.stats.launch_embedding += 1;
+    return createTensor(self, device, shape, out_count);
+}
+
+fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight_tensor = tensorFromCt(weight);
+    const ids_tensor = tensorFromCt(ids);
+    try ensureF32OrQuantized(weight_tensor);
+    if (ids_tensor.dtype != .i32 or ids_tensor.quant_type != null) return null;
+    if (ids_tensor.elem_count != total) return error.InvalidShape;
+    if (dim == 0 or weight_tensor.elem_count % dim != 0) return error.InvalidShape;
+
+    const out_count = try checkedMul(total, dim);
+    const shape = try allocShape2(self.allocator, total, dim);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    if (weight_tensor.quant_type) |quant_type| {
+        switch (quant_type) {
+            .known => |known| switch (known) {
+                .Q4_K => try self.kernels.launchEmbeddingLookupI32Q4KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
+                else => return error.UnsupportedTensorType,
+            },
+            else => return error.UnsupportedTensorType,
+        }
+    } else {
+        try self.kernels.launchEmbeddingLookupI32F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim);
+    }
+    self.stats.launch_embedding += 1;
     return createTensor(self, device, shape, out_count);
 }
 
@@ -644,6 +1120,7 @@ fn takeRows(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchTakeRowsF32(&self.ctx, device, input_tensor.buffer, row_ids_device, source_rows, request.rows, request.dim);
+    self.stats.launch_other += 1;
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -675,6 +1152,7 @@ fn glinerWordEmbeddings(ctx: *anyopaque, request: *const ops.GlinerWordEmbedding
         request.hidden_size,
         request.num_words,
     );
+    self.stats.launch_embedding += 1;
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -700,6 +1178,7 @@ fn glinerLabelGruCombined(ctx: *anyopaque, request: *const ops.GlinerLabelGruCom
     var pos_device_owned = false;
     errdefer if (!pos_device_owned) pos_device.free(&self.ctx);
     try self.kernels.launchRepeatFirstRowF32(&self.ctx, pos_device, pos_tensor.buffer, request.num_labels, request.hidden_size);
+    self.stats.launch_other += 1;
     const pos_ct = try createTensor(self, pos_device, pos_shape, label_count);
     pos_shape_owned = true;
     pos_device_owned = true;
@@ -730,6 +1209,7 @@ fn glinerLabelGruCombined(ctx: *anyopaque, request: *const ops.GlinerLabelGruCom
         request.num_labels,
         request.hidden_size,
     );
+    self.stats.launch_other += 1;
     return try createTensor(self, device, shape, label_count);
 }
 
@@ -768,6 +1248,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
             try self.kernels.launchLinearBiasF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
         }
     }
+    self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
 }
 
@@ -796,6 +1277,7 @@ fn linearQuickGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchLinearQ4KBiasQuickGeluTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+    self.stats.launch_linear += 1;
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -828,6 +1310,7 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     } else {
         try self.kernels.launchLinearBiasReluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
     }
+    self.stats.launch_linear += 1;
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -851,6 +1334,7 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchLinearBiasGeluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+    self.stats.launch_linear += 1;
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -882,6 +1366,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     } else {
         try self.kernels.launchLinearBiasAddTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
     }
+    self.stats.launch_linear += 1;
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -912,6 +1397,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     } else {
         try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
     }
+    self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
 }
 
@@ -920,6 +1406,179 @@ fn linearNoBiasPlanned(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedR
     const weight_tensor = tensorFromCt(request.weight);
     try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan);
     return linearNoBias(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
+}
+
+fn argmaxLastRow(ctx: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!?u32 {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(tensor);
+    try ensureF32(input_tensor);
+    if (rows == 0 or dim == 0) return error.InvalidShape;
+    try ensureCount(input_tensor, try checkedMul(rows, dim));
+
+    var token_device = try allocDeviceBuffer(self, @sizeOf(u32));
+    defer releaseDeviceBuffer(self, &token_device);
+    try self.kernels.launchArgmaxLastRowF32(&self.ctx, token_device, input_tensor.buffer, rows, dim);
+    self.stats.launch_argmax += 1;
+    var token: u32 = 0;
+    try copyToHostTracked(self, token_device, std.mem.asBytes(&token));
+    try self.ctx.synchronize();
+    self.stats.download_syncs += 1;
+    return token;
+}
+
+fn linearNoBiasArgmaxLastRow(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?u32 {
+    const logits = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+    defer freeTensor(ctx, logits);
+    return argmaxLastRow(ctx, logits, rows, out_dim);
+}
+
+fn linearNoBiasArgmaxLastRowTensor(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const logits = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+    defer freeTensor(ctx, logits);
+
+    var token_device = try allocDeviceBuffer(self, @sizeOf(i32));
+    errdefer token_device.free(&self.ctx);
+    try self.kernels.launchArgmaxLastRowF32(&self.ctx, token_device, tensorFromCt(logits).buffer, rows, out_dim);
+    self.stats.launch_argmax += 1;
+    const shape = try self.allocator.alloc(i64, 1);
+    errdefer self.allocator.free(shape);
+    shape[0] = 1;
+    return createTensorWithDType(self, token_device, shape, 1, .i32);
+}
+
+fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_weight: CT, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) anyerror!?ops.LinearNoBiasTripleResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const q_weight_tensor = tensorFromCt(q_weight);
+    const k_weight_tensor = tensorFromCt(k_weight);
+    const v_weight_tensor = tensorFromCt(v_weight);
+    try ensureF32(input_tensor);
+    const use_q4 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and isKnownQuant(v_weight_tensor, .Q4_K);
+    const use_q4_q4_f32 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and v_weight_tensor.quant_type == null;
+    const use_f32 = q_weight_tensor.quant_type == null and k_weight_tensor.quant_type == null and v_weight_tensor.quant_type == null;
+    if (!use_q4 and !use_q4_q4_f32 and !use_f32) {
+        self.stats.qkv_fallback_unsupported += 1;
+        return null;
+    }
+    if (use_f32) {
+        try ensureF32(q_weight_tensor);
+        try ensureF32(k_weight_tensor);
+        try ensureF32(v_weight_tensor);
+    } else if (use_q4_q4_f32) {
+        try ensureF32(v_weight_tensor);
+    }
+    if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0) return null;
+    if ((use_q4 or use_q4_q4_f32) and in_dim % 256 != 0) return null;
+    try ensureCount(input_tensor, try checkedMul(rows, in_dim));
+    try ensureCount(q_weight_tensor, try checkedMul(q_out_dim, in_dim));
+    try ensureCount(k_weight_tensor, try checkedMul(kv_out_dim, in_dim));
+    try ensureCount(v_weight_tensor, try checkedMul(kv_out_dim, in_dim));
+
+    const q_count = try checkedMul(rows, q_out_dim);
+    const kv_count = try checkedMul(rows, kv_out_dim);
+    const q_shape = try allocShape2(self.allocator, rows, q_out_dim);
+    var q_shape_owned = false;
+    errdefer if (!q_shape_owned) self.allocator.free(q_shape);
+    const k_shape = try allocShape2(self.allocator, rows, kv_out_dim);
+    var k_shape_owned = false;
+    errdefer if (!k_shape_owned) self.allocator.free(k_shape);
+    const v_shape = try allocShape2(self.allocator, rows, kv_out_dim);
+    var v_shape_owned = false;
+    errdefer if (!v_shape_owned) self.allocator.free(v_shape);
+    var q_device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
+    var q_device_owned = false;
+    errdefer if (!q_device_owned) q_device.free(&self.ctx);
+    var k_device = try allocDeviceBuffer(self, kv_count * @sizeOf(f32));
+    var k_device_owned = false;
+    errdefer if (!k_device_owned) k_device.free(&self.ctx);
+    var v_device = try allocDeviceBuffer(self, kv_count * @sizeOf(f32));
+    var v_device_owned = false;
+    errdefer if (!v_device_owned) v_device.free(&self.ctx);
+
+    if (use_q4) {
+        self.kernels.launchLinearQ4KQkvNoBiasTiledF32(
+            &self.ctx,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor.buffer,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => {
+                self.stats.qkv_kernel_unavailable += 1;
+                return null;
+            },
+            else => return err,
+        };
+        self.stats.qkv_fused_q4 += 1;
+        self.stats.launch_linear_qkv += 1;
+    } else if (use_q4_q4_f32) {
+        self.kernels.launchLinearQ4KQ4KF32QkvNoBiasTiled(
+            &self.ctx,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor.buffer,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => {
+                self.stats.qkv_kernel_unavailable += 1;
+                return null;
+            },
+            else => return err,
+        };
+        self.stats.qkv_fused_q4_q4_f32 += 1;
+        self.stats.launch_linear_qkv += 1;
+    } else {
+        self.kernels.launchLinearF32QkvNoBiasTiled(
+            &self.ctx,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor.buffer,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => {
+                self.stats.qkv_kernel_unavailable += 1;
+                return null;
+            },
+            else => return err,
+        };
+        self.stats.qkv_fused_f32 += 1;
+        self.stats.launch_linear_qkv += 1;
+    }
+
+    const q = try createTensor(self, q_device, q_shape, q_count);
+    q_shape_owned = true;
+    q_device_owned = true;
+    errdefer freeTensor(ctx, q);
+    const k = try createTensor(self, k_device, k_shape, kv_count);
+    k_shape_owned = true;
+    k_device_owned = true;
+    errdefer freeTensor(ctx, k);
+    const v = try createTensor(self, v_device, v_shape, kv_count);
+    v_shape_owned = true;
+    v_device_owned = true;
+    return .{ .first = q, .second = k, .third = v };
 }
 
 fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, weight_c: CT, bias_c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
@@ -980,6 +1639,7 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
             in_dim,
             out_dim,
         );
+        self.stats.launch_linear += 1;
         const first = try createTensor(self, device_a, shape_a, out_count);
         shape_a_owned = true;
         device_a_owned = true;
@@ -1052,6 +1712,7 @@ fn linearPair(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT
         in_dim,
         out_dim,
     );
+    self.stats.launch_linear += 1;
     const first = try createTensor(self, device_a, shape_a, out_count);
     shape_a_owned = true;
     device_a_owned = true;
@@ -1078,6 +1739,7 @@ fn layerNorm(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchLayerNormF32(&self.ctx, device, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    self.stats.launch_norm += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
@@ -1101,6 +1763,7 @@ fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, 
     var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchAddLayerNormF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, a_tensor.elem_count / dim, dim, eps);
+    self.stats.launch_norm += 1;
     return try createTensor(self, device, shape, a_tensor.elem_count);
 }
 
@@ -1118,6 +1781,23 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchRmsNormF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    self.stats.launch_norm += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn rmsNormBare(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (dim == 0 or input_tensor.elem_count % dim != 0) return error.InvalidShape;
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchRmsNormBareF32(&self.ctx, device, input_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    self.stats.rms_norm_bare_calls += 1;
+    self.stats.launch_norm += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 const UnaryOp = enum { gelu, relu, quick_gelu, sigmoid, tanh };
@@ -1138,6 +1818,7 @@ fn unaryHost(ctx: *anyopaque, input: CT, op: UnaryOp) anyerror!CT {
         .tanh => .tanh,
     };
     try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, kernel_op);
+    self.stats.launch_elementwise += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
@@ -1175,6 +1856,7 @@ fn concat(ctx: *anyopaque, a: CT, b: CT, total: usize, dim_a: usize, dim_b: usiz
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchConcatLastDimF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, total, dim_a, dim_b);
+    self.stats.launch_other += 1;
     return createTensor(self, device, shape, out_count);
 }
 
@@ -1203,6 +1885,7 @@ fn splitLastDim3(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!o
     var third_device_owned = false;
     errdefer if (!third_device_owned) third_device.free(&self.ctx);
     try self.kernels.launchSplitLastDim3F32(&self.ctx, first_device, second_device, third_device, input_tensor.buffer, rows, dim);
+    self.stats.launch_other += 1;
     const first = try createTensor(self, first_device, shape_first, part_count);
     first_device_owned = true;
     shape_first_owned = true;
@@ -1223,6 +1906,23 @@ fn binaryElementwise(ctx: *anyopaque, a: CT, b: CT, op: kernels_mod.ElementwiseO
     const b_tensor = tensorFromCt(b);
     try ensureF32(a_tensor);
     try ensureF32(b_tensor);
+    if (a_tensor.elem_count != b_tensor.elem_count and (op == .add or op == .multiply)) {
+        const input_tensor, const scalar_tensor = if (b_tensor.elem_count == 1 and a_tensor.elem_count != 1)
+            .{ a_tensor, b_tensor }
+        else if (a_tensor.elem_count == 1 and b_tensor.elem_count != 1)
+            .{ b_tensor, a_tensor }
+        else
+            return error.InvalidShape;
+
+        const shape = try dupeShape(self.allocator, input_tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+        errdefer device.free(&self.ctx);
+        try self.kernels.launchBinaryScalarF32(&self.ctx, device, input_tensor.buffer, scalar_tensor.buffer, input_tensor.elem_count, op);
+        self.stats.launch_scalar += 1;
+        self.stats.launch_scalar_device_broadcast += 1;
+        return createTensor(self, device, shape, input_tensor.elem_count);
+    }
     if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) return error.InvalidShape;
 
     const shape = try dupeShape(self.allocator, a_tensor.shape);
@@ -1230,6 +1930,7 @@ fn binaryElementwise(ctx: *anyopaque, a: CT, b: CT, op: kernels_mod.ElementwiseO
     var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchElementwiseF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, a_tensor.elem_count, op);
+    self.stats.launch_elementwise += 1;
     return createTensor(self, device, shape, a_tensor.elem_count);
 }
 
@@ -1239,6 +1940,71 @@ fn add(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn multiply(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     return binaryElementwise(ctx, a, b, .multiply);
+}
+
+fn multiplyScalar(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchScaleF32(&self.ctx, device, input_tensor.buffer, input_tensor.elem_count, scale);
+    self.stats.launch_scalar += 1;
+    self.stats.launch_scalar_multiply_immediate += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn addScalar(ctx: *anyopaque, input: CT, value: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchAddScalarF32(&self.ctx, device, input_tensor.buffer, input_tensor.elem_count, value);
+    self.stats.add_scalar_calls += 1;
+    self.stats.launch_scalar += 1;
+    self.stats.launch_scalar_add_immediate += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn siluMultiply(ctx: *anyopaque, gate: CT, up: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const gate_tensor = tensorFromCt(gate);
+    const up_tensor = tensorFromCt(up);
+    try ensureF32(gate_tensor);
+    try ensureF32(up_tensor);
+    if (gate_tensor.elem_count != up_tensor.elem_count or !sameShape(gate_tensor.shape, up_tensor.shape)) return error.InvalidShape;
+
+    const shape = try dupeShape(self.allocator, gate_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, gate_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchSiluMultiplyF32(&self.ctx, device, gate_tensor.buffer, up_tensor.buffer, gate_tensor.elem_count);
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, gate_tensor.elem_count);
+}
+
+fn activationMultiply(ctx: *anyopaque, gate: CT, up: CT, activation: ops.DecoderRuntimeActivationKind) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const gate_tensor = tensorFromCt(gate);
+    const up_tensor = tensorFromCt(up);
+    try ensureF32(gate_tensor);
+    try ensureF32(up_tensor);
+    if (gate_tensor.elem_count != up_tensor.elem_count or !sameShape(gate_tensor.shape, up_tensor.shape)) return error.InvalidShape;
+
+    const shape = try dupeShape(self.allocator, gate_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, gate_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchActivationMultiplyF32(&self.ctx, device, gate_tensor.buffer, up_tensor.buffer, gate_tensor.elem_count, @intFromEnum(activation));
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, gate_tensor.elem_count);
 }
 
 fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -1251,6 +2017,7 @@ fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, .silu);
+    self.stats.launch_elementwise += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
@@ -1286,6 +2053,7 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode, true);
+    self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
 
@@ -1323,6 +2091,7 @@ fn causalSelfAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, .{}, bias_buffer, batch, seq_len, num_heads, head_dim, true, false, bias_mode, false);
+    self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
 
@@ -1352,6 +2121,7 @@ fn ropeHostFallback(
     consecutive_pairs: bool,
 ) !CT {
     self.stats.host_attention_fallbacks += 1;
+    self.stats.rope_host_fallbacks += 1;
     const data = try downloadAlloc(self, input_tensor);
     var data_owned = true;
     errdefer if (data_owned) self.allocator.free(data);
@@ -1381,6 +2151,7 @@ fn ropePerItemHostFallback(
     consecutive_pairs: bool,
 ) !CT {
     self.stats.host_attention_fallbacks += 1;
+    self.stats.rope_per_item_host_fallbacks += 1;
     const data = try downloadAlloc(self, input_tensor);
     var data_owned = true;
     errdefer if (data_owned) self.allocator.free(data);
@@ -1432,6 +2203,7 @@ fn gqaDenseAttentionHostFallback(
     head_dim: usize,
 ) !CT {
     self.stats.host_attention_fallbacks += 1;
+    self.stats.gqa_dense_host_fallbacks += 1;
     const q_host = try downloadAlloc(self, q_tensor);
     defer self.allocator.free(q_host);
     const k_host = try downloadAlloc(self, k_tensor);
@@ -1554,6 +2326,7 @@ fn gqaDenseAttention(
         }
         return err;
     };
+    self.stats.launch_attention += 1;
     return createTensor(self, device, shape, q_count);
 }
 
@@ -1592,7 +2365,20 @@ fn gqaPagedAttentionWithHostKv(
     head_dim: usize,
 ) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (gqaPagedAttentionWithDeviceKv(self, q_ct, k_ct, v_ct, attn_bias_ct, attention, batch, num_heads, num_kv_heads, head_dim)) |result| {
+        return result;
+    } else |err| switch (err) {
+        error.DeviceReadUnsupported,
+        error.DeviceReadFallback,
+        error.DeviceWriteUnsupported,
+        error.DeviceWriteFormatUnsupported,
+        error.CudaPagedKvUnsupported,
+        => {},
+        else => return err,
+    }
+
     self.stats.host_attention_fallbacks += 1;
+    self.stats.paged_attention_host_fallbacks += 1;
     if (batch != 1 or attention.kv_batch != null) return error.CudaPagedKvBatchUnsupported;
     const manager = attention.kv_manager orelse return error.CudaPagedKvUnsupported;
     const kv = attention.kv_cache orelse return error.CudaPagedKvUnsupported;
@@ -1648,6 +2434,153 @@ fn gqaPagedAttentionWithHostKv(
         attention.sliding_window,
         attention.total_sequence_len,
     );
+}
+
+fn gqaPagedAttentionWithDeviceKv(
+    self: *CudaCompute,
+    q_ct: CT,
+    k_ct: CT,
+    v_ct: CT,
+    attn_bias_ct: ?CT,
+    attention: ops.AttentionContext,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) anyerror!CT {
+    self.stats.device_kv_attempts += 1;
+    if (batch != 1 or attention.kv_batch != null) {
+        self.stats.device_kv_fail_batch += 1;
+        return error.CudaPagedKvBatchUnsupported;
+    }
+    const kv = attention.kv_cache orelse {
+        self.stats.device_kv_fail_no_cache += 1;
+        return error.CudaPagedKvUnsupported;
+    };
+    const storage = attention.kv_storage orelse {
+        self.stats.device_kv_fail_no_storage += 1;
+        return error.CudaPagedKvUnsupported;
+    };
+    const hook = storage.device_write_hook orelse {
+        self.stats.device_kv_fail_no_hook += 1;
+        return error.DeviceWriteUnsupported;
+    };
+    if (attention.total_sequence_len < attention.query_sequence_len) {
+        self.stats.device_kv_fail_shape += 1;
+        return error.InvalidShape;
+    }
+    if (attention.kv_sequence_len == 0) {
+        self.stats.device_kv_fail_shape += 1;
+        return error.InvalidShape;
+    }
+    const h_kv = try checkedMul(num_kv_heads, head_dim);
+
+    if (!attention.skip_kv_write) {
+        const k_tensor = tensorFromCt(k_ct);
+        const v_tensor = tensorFromCt(v_ct);
+        try ensureF32(k_tensor);
+        try ensureF32(v_tensor);
+        const suffix_count = try checkedMul(attention.query_sequence_len, h_kv);
+        try ensureCount(k_tensor, suffix_count);
+        try ensureCount(v_tensor, suffix_count);
+        const suffix_bytes = try checkedMul(suffix_count, @sizeOf(f32));
+        storage.writeLayerKvSuffixDevice(
+            .{
+                .sequence_id = kv.sequence_id,
+                .layer_index = attention.layer_index,
+                .total_token_count = attention.kv_sequence_len,
+                .suffix_token_count = attention.query_sequence_len,
+                .position_offset = attention.kv_position_offset,
+                .num_kv_heads = @intCast(num_kv_heads),
+                .head_dim = @intCast(head_dim),
+            },
+            .{ .handle = @ptrFromInt(k_tensor.buffer.ptr), .byte_offset = 0, .byte_len = suffix_bytes },
+            .{ .handle = @ptrFromInt(v_tensor.buffer.ptr), .byte_offset = 0, .byte_len = suffix_bytes },
+        ) catch |err| {
+            self.stats.device_kv_fail_write += 1;
+            return err;
+        };
+    }
+
+    const gathered = hook.gatherLayerKvDevice(.{
+        .sequence_id = kv.sequence_id,
+        .layer_index = attention.layer_index,
+        .token_count = attention.kv_sequence_len,
+        .num_kv_heads = @intCast(num_kv_heads),
+        .head_dim = @intCast(head_dim),
+    }) catch |err| {
+        self.stats.device_kv_fail_read += 1;
+        return err;
+    };
+    if (gathered.value_element_bytes != @sizeOf(f32) or gathered.row_width < h_kv) {
+        self.stats.device_kv_fail_shape += 1;
+        return error.DeviceReadFallback;
+    }
+    const kv_count = try checkedMul(attention.kv_sequence_len, h_kv);
+    const kv_bytes = try checkedMul(kv_count, @sizeOf(f32));
+    if (gathered.k.byte_len < kv_bytes or gathered.v.byte_len < kv_bytes) {
+        self.stats.device_kv_fail_shape += 1;
+        return error.DeviceReadFallback;
+    }
+
+    const k_shape = try allocShape2(self.allocator, attention.kv_sequence_len, h_kv);
+    var k_shape_owned = false;
+    errdefer if (!k_shape_owned) self.allocator.free(k_shape);
+    const v_shape = try allocShape2(self.allocator, attention.kv_sequence_len, h_kv);
+    var v_shape_owned = false;
+    errdefer if (!v_shape_owned) self.allocator.free(v_shape);
+    const k_tensor = try self.allocator.create(CudaTensor);
+    var k_tensor_owned = false;
+    errdefer if (!k_tensor_owned) self.allocator.destroy(k_tensor);
+    const q_tensor_for_ptr_type = tensorFromCt(q_ct);
+    const k_device_ptr: @TypeOf(q_tensor_for_ptr_type.buffer.ptr) = @intCast(@intFromPtr(gathered.k.handle) + gathered.k.byte_offset);
+    k_tensor.* = .{
+        .buffer = .{ .ptr = k_device_ptr, .len = gathered.k.byte_len },
+        .dtype = .f32,
+        .shape = k_shape,
+        .elem_count = kv_count,
+        .owns_buffer = false,
+    };
+    k_shape_owned = true;
+    const v_tensor = try self.allocator.create(CudaTensor);
+    var v_tensor_owned = false;
+    errdefer if (!v_tensor_owned) self.allocator.destroy(v_tensor);
+    const v_device_ptr: @TypeOf(q_tensor_for_ptr_type.buffer.ptr) = @intCast(@intFromPtr(gathered.v.handle) + gathered.v.byte_offset);
+    v_tensor.* = .{
+        .buffer = .{ .ptr = v_device_ptr, .len = gathered.v.byte_len },
+        .dtype = .f32,
+        .shape = v_shape,
+        .elem_count = kv_count,
+        .owns_buffer = false,
+    };
+    v_shape_owned = true;
+
+    k_tensor_owned = true;
+    v_tensor_owned = true;
+    defer freeTensor(self, k_tensor);
+    defer freeTensor(self, v_tensor);
+
+    const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
+    const result = try gqaDenseAttention(
+        self,
+        q_ct,
+        k_tensor,
+        v_tensor,
+        attn_bias_ct,
+        attention.attn_or_mask,
+        batch,
+        attention.query_sequence_len,
+        attention.kv_sequence_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        query_position_offset,
+        attention.kv_position_offset,
+        attention.sliding_window,
+        attention.total_sequence_len,
+    );
+    self.stats.device_kv_successes += 1;
+    return result;
 }
 fn crossAttention(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
     return unsupportedCt();
@@ -1804,6 +2737,30 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
         }
         return err;
     };
+    self.stats.launch_rope += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn ropeScaled(ctx: *anyopaque, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (seq_len == 0 or head_dim == 0 or rope_dim == 0 or rope_dim > head_dim or rope_dim % 2 != 0) return error.InvalidShape;
+    if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
+    const total_chunks = input_tensor.elem_count / head_dim;
+    if (total_chunks % seq_len != 0) return error.InvalidShape;
+    const chunks_per_position = total_chunks / seq_len;
+    if (chunks_per_position == 0) return error.InvalidShape;
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    self.kernels.launchRopeScaledF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale) catch |err| switch (err) {
+        error.CudaKernelUnavailable => return null,
+        else => return err,
+    };
+    self.stats.launch_rope += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
@@ -1838,6 +2795,7 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
         }
         return err;
     };
+    self.stats.launch_rope += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
@@ -1864,10 +2822,12 @@ const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .deinitBackend = &deinitBackend,
     .freeTensor = &freeTensor,
+    .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
     .getWeight = &getWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .embeddingLookup = &embeddingLookup,
+    .embeddingLookupTensor = &embeddingLookupTensor,
     .takeRows = &takeRows,
     .glinerWordEmbeddings = &glinerWordEmbeddings,
     .glinerLabelGruCombined = &glinerLabelGruCombined,
@@ -1879,11 +2839,20 @@ const vtable = ops.ComputeBackend.VTable{
     .linearPlanned = &linearPlanned,
     .linearNoBias = &linearNoBias,
     .linearNoBiasPlanned = &linearNoBiasPlanned,
+    .argmaxLastRow = &argmaxLastRow,
+    .linearNoBiasArgmaxLastRow = &linearNoBiasArgmaxLastRow,
+    .linearNoBiasArgmaxLastRowTensor = &linearNoBiasArgmaxLastRowTensor,
+    .linearNoBiasQkv = &linearNoBiasQkv,
     .linearPair = &linearPair,
     .linearTriple = &linearTriple,
+    .multiplyScalar = &multiplyScalar,
+    .addScalar = &addScalar,
+    .siluMultiply = &siluMultiply,
+    .activationMultiply = &activationMultiply,
     .layerNorm = &layerNorm,
     .addLayerNorm = &addLayerNorm,
     .rmsNorm = &rmsNorm,
+    .rmsNormBare = &rmsNormBare,
     .gelu = &gelu,
     .relu = &relu,
     .silu = &silu,
@@ -1891,6 +2860,8 @@ const vtable = ops.ComputeBackend.VTable{
     .sigmoid = &sigmoid,
     .tanh_act = &tanhAct,
     .reshapeOp = &reshapeOp,
+    .reshape2D = &reshape2DOp,
+    .reshape2d = &reshape2dOp,
     .transposeOp = &transposeOp,
     .splitLastDim3 = &splitLastDim3,
     .concat = &concat,
@@ -1908,11 +2879,13 @@ const vtable = ops.ComputeBackend.VTable{
     .conv1d = &conv1d,
     .conv2d = &conv2d,
     .rope = &rope,
+    .ropeScaled = &ropeScaled,
     .ropePerItem = &ropePerItem,
     .gqaCausalAttention = &gqaCausalAttention,
     .gqaPagedAttention = &gqaPagedAttention,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
+    .fromInt32Shape = &fromInt32ShapeOp,
     .toFloat32 = &toFloat32Op,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,

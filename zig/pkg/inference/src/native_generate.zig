@@ -565,8 +565,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .head_dim = gpt_config.maxHeadDim(),
         .sliding_window_size = sliding_window_size,
     });
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = backend_kind,
+        .dtype = kv_dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+        .num_kv_heads = gpt_config.maxKvHeads(),
+        .head_dim = gpt_config.maxHeadDim(),
+        .sliding_window_size = sliding_window_size,
+    });
+    defer kv_storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&kv_storage);
 
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+    decode_state.kv_storage = &kv_storage;
     const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
     defer decode_state.deinit();
     var draft_kv_manager: ?runtime.kv.manager.KvManager = null;
@@ -1018,6 +1030,159 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 gpt_stats.gated_block_qkv_successes,
             },
         );
+        if (comptime build_options.enable_cuda) {
+            if (session_factory.getCudaRuntimeStats(model.session)) |cuda_stats| {
+                print(
+                    "cuda_runtime_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} eval_syncs={d} alloc_calls={d} free_calls={d} temp_hits={d} temp_misses={d} temp_releases={d} temp_evictions={d} temp_cached_mb={d}\n",
+                    .{
+                        cuda_stats.kernel_launches,
+                        cuda_stats.stream_syncs,
+                        cuda_stats.upload_syncs,
+                        cuda_stats.download_syncs,
+                        cuda_stats.eval_syncs,
+                        cuda_stats.device_alloc_calls,
+                        cuda_stats.device_free_calls,
+                        cuda_stats.temp_buffer_hits,
+                        cuda_stats.temp_buffer_misses,
+                        cuda_stats.temp_buffer_releases,
+                        cuda_stats.temp_buffer_evictions,
+                        cuda_stats.temp_buffer_cached_bytes / (1024 * 1024),
+                    },
+                );
+                print(
+                    "cuda_runtime_bytes: h2d={d} d2h={d} d2d={d} resident_weights={d} device_allocated={d}\n",
+                    .{
+                        cuda_stats.h2d_bytes,
+                        cuda_stats.d2h_bytes,
+                        cuda_stats.d2d_bytes,
+                        cuda_stats.resident_weight_bytes,
+                        cuda_stats.device_allocated_bytes,
+                    },
+                );
+                const attributed_launches =
+                    cuda_stats.launch_embedding +
+                    cuda_stats.launch_linear +
+                    cuda_stats.launch_linear_qkv +
+                    cuda_stats.launch_norm +
+                    cuda_stats.launch_rope +
+                    cuda_stats.launch_attention +
+                    cuda_stats.launch_elementwise +
+                    cuda_stats.launch_scalar +
+                    cuda_stats.launch_argmax +
+                    cuda_stats.launch_other;
+                const unattributed_launches = if (cuda_stats.kernel_launches >= attributed_launches)
+                    cuda_stats.kernel_launches - attributed_launches
+                else
+                    0;
+                print(
+                    "cuda_launch_breakdown: embedding={d} linear={d} qkv={d} norm={d} rope={d} attention={d} elementwise={d} scalar={d} argmax={d} other={d} unattributed={d}\n",
+                    .{
+                        cuda_stats.launch_embedding,
+                        cuda_stats.launch_linear,
+                        cuda_stats.launch_linear_qkv,
+                        cuda_stats.launch_norm,
+                        cuda_stats.launch_rope,
+                        cuda_stats.launch_attention,
+                        cuda_stats.launch_elementwise,
+                        cuda_stats.launch_scalar,
+                        cuda_stats.launch_argmax,
+                        cuda_stats.launch_other,
+                        unattributed_launches,
+                    },
+                );
+                print(
+                    "cuda_scalar_launch_breakdown: multiply_immediate={d} add_immediate={d} device_broadcast={d}\n",
+                    .{
+                        cuda_stats.launch_scalar_multiply_immediate,
+                        cuda_stats.launch_scalar_add_immediate,
+                        cuda_stats.launch_scalar_device_broadcast,
+                    },
+                );
+                print(
+                    "cuda_transfer_breakdown: from_f32_calls={d} from_f32_bytes={d} to_f32_calls={d} to_f32_bytes={d} upload_owned_calls={d} upload_owned_bytes={d} download_alloc_calls={d} download_alloc_bytes={d}\n",
+                    .{
+                        cuda_stats.from_float32_calls,
+                        cuda_stats.from_float32_bytes,
+                        cuda_stats.to_float32_calls,
+                        cuda_stats.to_float32_bytes,
+                        cuda_stats.upload_owned_host_calls,
+                        cuda_stats.upload_owned_host_bytes,
+                        cuda_stats.download_alloc_calls,
+                        cuda_stats.download_alloc_bytes,
+                    },
+                );
+                print(
+                    "cuda_transfer_buckets: upload_le16={d} upload_le1k={d} upload_le8k={d} upload_le32k={d} upload_le256k={d} upload_gt256k={d} download_le16={d} download_le1k={d} download_le8k={d} download_le32k={d} download_le256k={d} download_gt256k={d}\n",
+                    .{
+                        cuda_stats.upload_bucket_le_16,
+                        cuda_stats.upload_bucket_le_1k,
+                        cuda_stats.upload_bucket_le_8k,
+                        cuda_stats.upload_bucket_le_32k,
+                        cuda_stats.upload_bucket_le_256k,
+                        cuda_stats.upload_bucket_gt_256k,
+                        cuda_stats.download_bucket_le_16,
+                        cuda_stats.download_bucket_le_1k,
+                        cuda_stats.download_bucket_le_8k,
+                        cuda_stats.download_bucket_le_32k,
+                        cuda_stats.download_bucket_le_256k,
+                        cuda_stats.download_bucket_gt_256k,
+                    },
+                );
+                print(
+                    "cuda_device_op_counts: add_scalar={d} rms_norm_bare={d}\n",
+                    .{
+                        cuda_stats.add_scalar_calls,
+                        cuda_stats.rms_norm_bare_calls,
+                    },
+                );
+                print("cuda_upload_top_sizes:", .{});
+                for (cuda_stats.upload_top_sizes, cuda_stats.upload_top_counts) |size, count| {
+                    if (size != 0 and count != 0) print(" {d}x{d}", .{ count, size });
+                }
+                print("\n", .{});
+                print("cuda_download_top_sizes:", .{});
+                for (cuda_stats.download_top_sizes, cuda_stats.download_top_counts) |size, count| {
+                    if (size != 0 and count != 0) print(" {d}x{d}", .{ count, size });
+                }
+                print("\n", .{});
+                print(
+                    "cuda_fallback_counts: host_attention={d} rope={d} rope_per_item={d} gqa_dense={d} paged_attention={d}\n",
+                    .{
+                        cuda_stats.host_attention_fallbacks,
+                        cuda_stats.rope_host_fallbacks,
+                        cuda_stats.rope_per_item_host_fallbacks,
+                        cuda_stats.gqa_dense_host_fallbacks,
+                        cuda_stats.paged_attention_host_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_qkv_counts: fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
+                    .{
+                        cuda_stats.qkv_fused_q4,
+                        cuda_stats.qkv_fused_q4_q4_f32,
+                        cuda_stats.qkv_fused_f32,
+                        cuda_stats.qkv_fallback_unsupported,
+                        cuda_stats.qkv_kernel_unavailable,
+                    },
+                );
+                print(
+                    "cuda_device_kv_counts: attempts={d} successes={d} writes={d} reads={d} fail_batch={d} fail_no_cache={d} fail_no_storage={d} fail_no_hook={d} fail_write={d} fail_read={d} fail_shape={d}\n",
+                    .{
+                        cuda_stats.device_kv_attempts,
+                        cuda_stats.device_kv_successes,
+                        cuda_stats.device_kv_writes,
+                        cuda_stats.device_kv_reads,
+                        cuda_stats.device_kv_fail_batch,
+                        cuda_stats.device_kv_fail_no_cache,
+                        cuda_stats.device_kv_fail_no_storage,
+                        cuda_stats.device_kv_fail_no_hook,
+                        cuda_stats.device_kv_fail_write,
+                        cuda_stats.device_kv_fail_read,
+                        cuda_stats.device_kv_fail_shape,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1688,7 +1853,19 @@ fn runOnnxWholeModelGraphGenerate(
         .head_dim = gpt_config.maxHeadDim(),
         .sliding_window_size = sliding_window_size,
     });
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = backend_kind,
+        .dtype = kv_dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+        .num_kv_heads = gpt_config.maxKvHeads(),
+        .head_dim = gpt_config.maxHeadDim(),
+        .sliding_window_size = sliding_window_size,
+    });
+    defer kv_storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&kv_storage);
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+    decode_state.kv_storage = &kv_storage;
     const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
     defer decode_state.deinit();
 

@@ -877,6 +877,22 @@ pub const ComputeBackend = struct {
         /// bias, and residual add; callers fall back to linear + add.
         linearAdd: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
 
+        /// Y = X * scale. Backends may keep scalar multiplies on device;
+        /// callers fall back to creating a broadcast scalar tensor.
+        multiplyScalar: ?*const fn (ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT = null,
+
+        /// Y = X + value. Backends may keep scalar adds on device; callers
+        /// fall back to host materialization or a broadcast scalar tensor.
+        addScalar: ?*const fn (ctx: *anyopaque, input: CT, value: f32) anyerror!?CT = null,
+
+        /// Y = silu(gate) * up. Backends may fuse the common gated-FFN
+        /// activation/multiply pair; callers fall back to silu + multiply.
+        siluMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT) anyerror!?CT = null,
+
+        /// Y = activation(gate) * up for decoder-runtime activation kinds.
+        /// Backends may fuse the common gated-FFN activation/multiply pair.
+        activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
+
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
@@ -907,6 +923,12 @@ pub const ComputeBackend = struct {
         /// Backends may fuse this path; otherwise the wrapper falls back to
         /// two independent `linearNoBias` calls.
         linearNoBiasPair: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearNoBiasPairResult = null,
+
+        /// Compute asymmetric no-bias Q/K/V projections with one shared input.
+        /// This is used by GQA decoders where Q has a wider output than K/V.
+        /// Backends return null when unsupported and the wrapper falls back to
+        /// Q plus K/V pair projections.
+        linearNoBiasQkv: ?*const fn (ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_weight: CT, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) anyerror!?LinearNoBiasTripleResult = null,
 
         /// Compute two biased linears that share the same input shape.
         /// Backends can apply bias inside their native quantized path;
@@ -1022,6 +1044,11 @@ pub const ComputeBackend = struct {
 
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
+
+        /// RMS normalization without learned weights:
+        /// x * rsqrt(mean(x^2) + eps). Backends may implement this to avoid
+        /// constructing an all-ones weight tensor on hot paths.
+        rmsNormBare: ?*const fn (ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT = null,
 
         /// Optional destructive RMS norm that may reuse the input tensor's
         /// storage when it is uniquely owned. Callers must only use this when
@@ -1228,6 +1255,10 @@ pub const ComputeBackend = struct {
         /// input: [total, dim] where total = batch*seq_len.
         /// Rotates pairs of dimensions using sin/cos of position-dependent angles.
         rope: *const fn (ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT,
+
+        /// Apply scalar multiply and RoPE in one backend op. Used by Gemma
+        /// variants that pre-scale Q before attention.
+        ropeScaled: ?*const fn (ctx: *anyopaque, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!?CT = null,
 
         /// Apply rotary position embeddings with per-item query lengths and
         /// position offsets for mixed prefill+decode batches.
@@ -1843,6 +1874,30 @@ pub const ComputeBackend = struct {
         };
     }
 
+    pub fn linearNoBiasQkv(
+        self: *const ComputeBackend,
+        input: CT,
+        q_weight: CT,
+        k_weight: CT,
+        v_weight: CT,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) !LinearNoBiasTripleResult {
+        if (self.vtable.linearNoBiasQkv) |linear_no_bias_qkv| {
+            if (try linear_no_bias_qkv(self.ptr, input, q_weight, k_weight, v_weight, rows, in_dim, q_out_dim, kv_out_dim)) |result| {
+                return result;
+            }
+        }
+        const q = try self.linearNoBias(input, q_weight, rows, in_dim, q_out_dim);
+        errdefer self.free(q);
+        const kv = try self.linearNoBiasPair(input, k_weight, v_weight, rows, in_dim, kv_out_dim);
+        errdefer self.free(kv.first);
+        errdefer self.free(kv.second);
+        return .{ .first = q, .second = kv.first, .third = kv.second };
+    }
+
     pub fn linearPair(
         self: *const ComputeBackend,
         input: CT,
@@ -2133,6 +2188,11 @@ pub const ComputeBackend = struct {
 
     pub fn rmsNorm(self: *const ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !CT {
         return self.vtable.rmsNorm(self.ptr, input, weight, dim, eps);
+    }
+
+    pub fn rmsNormBare(self: *const ComputeBackend, input: CT, dim: usize, eps: f32) !?CT {
+        if (self.vtable.rmsNormBare) |f| return f(self.ptr, input, dim, eps);
+        return null;
     }
 
     pub fn rmsNormConsumeInput(self: *const ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
@@ -2446,8 +2506,33 @@ pub const ComputeBackend = struct {
         return self.vtable.multiply(self.ptr, a, b);
     }
 
+    pub fn multiplyScalar(self: *const ComputeBackend, input: CT, scale: f32) !?CT {
+        const op = self.vtable.multiplyScalar orelse return null;
+        return op(self.ptr, input, scale);
+    }
+
+    pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {
+        const op = self.vtable.addScalar orelse return null;
+        return op(self.ptr, input, value);
+    }
+
+    pub fn siluMultiply(self: *const ComputeBackend, gate: CT, up: CT) !?CT {
+        const op = self.vtable.siluMultiply orelse return null;
+        return op(self.ptr, gate, up);
+    }
+
+    pub fn activationMultiply(self: *const ComputeBackend, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) !?CT {
+        const op = self.vtable.activationMultiply orelse return null;
+        return op(self.ptr, gate, up, activation);
+    }
+
     pub fn rope(self: *const ComputeBackend, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !CT {
         return self.vtable.rope(self.ptr, input, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+    }
+
+    pub fn ropeScaled(self: *const ComputeBackend, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !?CT {
+        const op = self.vtable.ropeScaled orelse return null;
+        return op(self.ptr, input, scale, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
     }
 
     pub fn ropePerItem(

@@ -67,6 +67,7 @@ const runtime = @import("../runtime/root.zig");
 const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 const MlxCompute = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
     gliner2,
@@ -4573,6 +4574,14 @@ pub fn getGptConfig(session: Session) ?gpt_mod.Config {
     };
 }
 
+pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return null;
+    return self.backend_data.cuda.compute.snapshotStats();
+}
+
 /// Load GPT architecture metadata without opening a runtime session or weight
 /// backend. This is for artifact-backed whole-model runtimes that still need
 /// tokenizer/config shape information but must not keep a duplicate native
@@ -4600,7 +4609,12 @@ pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {
 pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
-        .cuda => .f16,
+        .cuda => blk: {
+            if (getGptConfig(session)) |cfg| {
+                if (cfg.family == .gemma) break :blk .f32;
+            }
+            break :blk .f16;
+        },
         .metal, .mlx => blk: {
             if (getGptConfig(session)) |cfg| {
                 if (cfg.family == .gemma) break :blk .f32;

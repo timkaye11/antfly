@@ -34,12 +34,18 @@ pub const DeviceInfo = struct {
     }
 };
 
+pub const RuntimeStats = struct {
+    kernel_launches: usize = 0,
+    stream_syncs: usize = 0,
+};
+
 pub const CudaContext = struct {
     driver: CudaDriver,
     device: CUdevice,
     ctx: CUcontext,
     stream: CUstream,
     info: DeviceInfo,
+    stats: RuntimeStats = .{},
 
     pub fn initDefault() driver_mod.Error!CudaContext {
         var driver = try CudaDriver.open();
@@ -105,6 +111,11 @@ pub const CudaContext = struct {
     pub fn synchronize(self: *CudaContext) driver_mod.Error!void {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuStreamSynchronize(self.stream));
+        self.stats.stream_syncs += 1;
+    }
+
+    pub fn noteKernelLaunch(self: *CudaContext) void {
+        self.stats.kernel_launches += 1;
     }
 };
 

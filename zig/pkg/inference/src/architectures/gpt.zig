@@ -3318,6 +3318,21 @@ fn decoderBlock(
         break :blk .{ .q = layer0_q_override.?, .k = layer0_k_override.?, .v = layer0_v_override.? };
     } else blk: {
         const q_projection_dim: usize = if (config.family == .qwen3_5 and config.qwen35_attn_output_gate) q_dim * 2 else q_dim;
+        if (cb.kind() == .cuda and config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
+            const q_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer}) catch return error.NameTooLong;
+            const q_w = try getModelWeight(cb, config, q_name);
+            defer cb.free(q_w);
+            var k_name_buf: [256]u8 = undefined;
+            const k_name = std.fmt.bufPrint(&k_name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer}) catch return error.NameTooLong;
+            const k_w = try getModelWeight(cb, config, k_name);
+            defer cb.free(k_w);
+            var v_name_buf: [256]u8 = undefined;
+            const v_name = std.fmt.bufPrint(&v_name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer}) catch return error.NameTooLong;
+            const v_w = try getModelWeight(cb, config, v_name);
+            defer cb.free(v_w);
+            const qkv = try cb.linearNoBiasQkv(normed, q_w, k_w, v_w, total, hidden_size, q_dim, kv_dim);
+            break :blk .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
+        }
         const q_projected = if (attn_q_slot != null)
             (try cb.decoderRuntimeApplyLinear(&.{
                 .slot = attn_q_slot.?,
@@ -3362,6 +3377,9 @@ fn decoderBlock(
                 .out_dim = num_kv_heads * head_dim,
             })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
+        } else if (config.family == .gemma and !config.layerOmitsVProj(layer)) blk_kv: {
+            const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+            break :blk_kv .{ kv.first, false, kv.second };
         } else if (config.family == .bitnet) blk_kv: {
             const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
@@ -3395,6 +3413,15 @@ fn decoderBlock(
     const V_normed = blk: {
         if (config.global_head_dim == 0 or shares_kv) break :blk V; // Not Gemma 4 or shared KV
         const v_dim: usize = head_dim;
+        if (try cb.reshape2d(V, total * num_kv_heads, v_dim)) |reshaped| {
+            defer cb.free(reshaped);
+            if (try cb.rmsNormBare(reshaped, v_dim, config.norm_eps)) |normed_flat| {
+                defer cb.free(normed_flat);
+                const result = (try cb.reshape2d(normed_flat, total, kv_dim)) orelse return error.ReshapeFailed;
+                if (!v_omitted) cb.free(V); // V = K when omitted, don't double-free
+                break :blk result;
+            }
+        }
         // Create ones weight for bare RMS norm.
         const ones = try allocator.alloc(f32, v_dim);
         defer allocator.free(ones);
@@ -3447,7 +3474,9 @@ fn decoderBlock(
     // Pre-scale Q by sqrt(head_dim) to cancel the backend's division.
     const Q_for_attn = blk: {
         if (config.global_head_dim == 0) break :blk Q_attn; // Not Gemma 4
+        if (config.position_encoding == .rope) break :blk Q_attn;
         const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        if (try cb.multiplyScalar(Q_attn, scale)) |scaled| break :blk scaled;
         if (cb.vtable.reshape2d != null) {
             // GPU path: scalar broadcast multiply avoids GPU→CPU sync.
             const scale_shape = [_]i32{1};
@@ -4086,6 +4115,8 @@ pub fn maybeAdjustNormWeight(
     dim: usize,
 ) !CT {
     if (std.math.approxEqAbs(f32, config.norm_weight_offset, 0.0, 1e-6)) return weight;
+
+    if (try cb.addScalar(weight, config.norm_weight_offset)) |adjusted| return adjusted;
 
     if (cb.kind() == .graph) {
         // Graph tracing: use GPU add to avoid toFloat32 which registers spurious outputs.
@@ -4981,7 +5012,20 @@ fn applyAttentionWithSink(
 
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        const Q_rope = if (config.global_head_dim != 0) blk: {
+            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+            if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
+            const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
+                scaled_q
+            else scaled_blk: {
+                const scale_shape = [_]i32{1};
+                const scale_ct = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+                defer cb.free(scale_ct);
+                break :scaled_blk try cb.multiply(Q, scale_ct);
+            };
+            defer cb.free(scaled);
+            break :blk try cb.rope(scaled, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        } else try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(Q_rope);
         const K_rope = try cb.rope(K, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(K_rope);
@@ -5397,15 +5441,24 @@ fn denseFeedForward(
     defer cb.free(gate_w);
     const gate_proj = try cb.linearNoBias(input, gate_w, total, hidden_size, inter_size);
     defer cb.free(gate_proj);
-    const gate_act = try applyActivation(cb, config, gate_proj);
-    defer cb.free(gate_act);
 
     const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
     defer cb.free(up_w);
     const up_proj = try cb.linearNoBias(input, up_w, total, hidden_size, inter_size);
     defer cb.free(up_proj);
 
-    const gated = try cb.multiply(gate_act, up_proj);
+    const gated = if (try cb.activationMultiply(gate_proj, up_proj, decoderRuntimeActivationKind(config.activation))) |fused|
+        fused
+    else if (config.activation == .silu) blk: {
+        if (try cb.siluMultiply(gate_proj, up_proj)) |fused| break :blk fused;
+        const gate_act = try applyActivation(cb, config, gate_proj);
+        defer cb.free(gate_act);
+        break :blk try cb.multiply(gate_act, up_proj);
+    } else blk: {
+        const gate_act = try applyActivation(cb, config, gate_proj);
+        defer cb.free(gate_act);
+        break :blk try cb.multiply(gate_act, up_proj);
+    };
     defer cb.free(gated);
 
     const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
@@ -5470,13 +5523,22 @@ fn feedForward(
             const gate_up = try cb.linearNoBiasPair(input, gate_w, up_w, total, hidden_size, inter_size);
             const gate_proj = gate_up.first;
             defer cb.free(gate_proj);
-            const gate_act = try applyActivation(cb, config, gate_proj);
-            defer cb.free(gate_act);
 
             const up_proj = gate_up.second;
             defer cb.free(up_proj);
 
-            const gated = try cb.multiply(gate_act, up_proj);
+            const gated = if (try cb.activationMultiply(gate_proj, up_proj, decoderRuntimeActivationKind(config.activation))) |fused|
+                fused
+            else if (config.activation == .silu) blk: {
+                if (try cb.siluMultiply(gate_proj, up_proj)) |fused| break :blk fused;
+                const gate_act = try applyActivation(cb, config, gate_proj);
+                defer cb.free(gate_act);
+                break :blk try cb.multiply(gate_act, up_proj);
+            } else blk: {
+                const gate_act = try applyActivation(cb, config, gate_proj);
+                defer cb.free(gate_act);
+                break :blk try cb.multiply(gate_act, up_proj);
+            };
             defer cb.free(gated);
 
             const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
