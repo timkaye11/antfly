@@ -927,9 +927,15 @@ def main() -> int:
         "python_step_count": len(python_step_timings) if python_step_timings else None,
         "python_total_step_wall_ms": python_total_step_ms,
         "python_avg_step_wall_ms": python_avg_step_ms,
+        "python_warm_step_count": len(python_warm_step_timings) if python_warm_step_timings else None,
+        "python_warm_total_step_wall_ms": python_warm_total_step_ms,
+        "python_warm_avg_step_wall_ms": python_warm_avg_step_ms,
         "zig_step_count": len(zig_step_rows) if zig_step_rows else None,
         "zig_total_trainer_ms": zig_total_trainer_ms,
         "zig_avg_trainer_ms": zig_avg_trainer_ms,
+        "zig_warm_step_count": len(zig_warm_step_rows) if zig_warm_step_rows else None,
+        "zig_warm_total_trainer_ms": zig_warm_total_trainer_ms,
+        "zig_warm_avg_trainer_ms": zig_warm_avg_trainer_ms,
         "zig_epoch_wall_ms": zig_epoch_metrics.get("epoch_wall_ms"),
         "zig_epoch_supervised_tokens_per_second": zig_epoch_metrics.get("supervised_tokens_per_second"),
         "zig_graph_executor_partitions_avg": zig_step_avg("graph_executor_partitions"),
@@ -985,9 +991,24 @@ def main() -> int:
             if zig_avg_trainer_ms is not None and python_avg_step_ms is not None
             else None
         ),
+        "zig_beats_python_cpu_warm_step_time": (
+            zig_warm_avg_trainer_ms < python_warm_avg_step_ms
+            if zig_warm_avg_trainer_ms is not None and python_warm_avg_step_ms is not None
+            else None
+        ),
         "trainer_speedup_python_over_zig": (
             python_trainer_elapsed / (zig_total_trainer_ms / 1000.0)
             if python_trainer_elapsed is not None and zig_total_trainer_ms not in (None, 0)
+            else None
+        ),
+        "warm_step_wall_speedup_python_over_zig": (
+            python_warm_total_step_ms / zig_warm_total_trainer_ms
+            if python_warm_total_step_ms not in (None, 0) and zig_warm_total_trainer_ms not in (None, 0)
+            else None
+        ),
+        "zig_warm_step_wall_slowdown_vs_python": (
+            zig_warm_total_trainer_ms / python_warm_total_step_ms
+            if python_warm_total_step_ms not in (None, 0) and zig_warm_total_trainer_ms not in (None, 0)
             else None
         ),
         "step_wall_speedup_python_over_zig": (

@@ -5002,24 +5002,26 @@ pub fn decoderRuntimeTrainingAdamWManyF32(
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (batch.len == 0) return true;
 
-    var weight_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
-    defer std.heap.page_allocator.free(weight_handles);
-    var weight_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
-    defer std.heap.page_allocator.free(weight_offsets);
-    var grad_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
-    defer std.heap.page_allocator.free(grad_handles);
-    var grad_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
-    defer std.heap.page_allocator.free(grad_offsets);
-    var m_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
-    defer std.heap.page_allocator.free(m_handles);
-    var m_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
-    defer std.heap.page_allocator.free(m_offsets);
-    var v_handles = try std.heap.page_allocator.alloc(?*anyopaque, batch.len);
-    defer std.heap.page_allocator.free(v_handles);
-    var v_offsets = try std.heap.page_allocator.alloc(usize, batch.len);
-    defer std.heap.page_allocator.free(v_offsets);
-    var elem_counts = try std.heap.page_allocator.alloc(usize, batch.len);
-    defer std.heap.page_allocator.free(elem_counts);
+    var stack = std.heap.stackFallback(64 * 1024, std.heap.page_allocator);
+    const allocator = stack.get();
+    var weight_handles = try allocator.alloc(?*anyopaque, batch.len);
+    defer allocator.free(weight_handles);
+    var weight_offsets = try allocator.alloc(usize, batch.len);
+    defer allocator.free(weight_offsets);
+    var grad_handles = try allocator.alloc(?*anyopaque, batch.len);
+    defer allocator.free(grad_handles);
+    var grad_offsets = try allocator.alloc(usize, batch.len);
+    defer allocator.free(grad_offsets);
+    var m_handles = try allocator.alloc(?*anyopaque, batch.len);
+    defer allocator.free(m_handles);
+    var m_offsets = try allocator.alloc(usize, batch.len);
+    defer allocator.free(m_offsets);
+    var v_handles = try allocator.alloc(?*anyopaque, batch.len);
+    defer allocator.free(v_handles);
+    var v_offsets = try allocator.alloc(usize, batch.len);
+    defer allocator.free(v_offsets);
+    var elem_counts = try allocator.alloc(usize, batch.len);
+    defer allocator.free(elem_counts);
 
     for (batch, 0..) |item, idx| {
         if (!item.weight.isDevice() or !item.grad.isDevice() or !item.m.isDevice() or !item.v.isDevice()) return false;
