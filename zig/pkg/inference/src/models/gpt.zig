@@ -162,6 +162,7 @@ pub const Config = struct {
     mtp_use_ordered_embeddings: bool = false,
     mtp_kv_sliding_donor_layer: u32 = std.math.maxInt(u32),
     mtp_kv_full_donor_layer: u32 = std.math.maxInt(u32),
+    mtp_kv_donor_base_layer: u32 = std.math.maxInt(u32),
 
     // Architecture choices
     norm_type: NormType = .layer_norm,
@@ -217,6 +218,7 @@ pub const Config = struct {
     // Optional model-specific decode semantics.
     norm_weight_offset: f32 = 0.0,
     final_logit_softcapping: f32 = 0.0,
+    disable_token_embedding_scale: bool = false,
 
     // Weight tying: when true, lm_head reuses embedding weights (no separate lm_head.weight tensor).
     weight_tying: bool = false,
@@ -268,6 +270,7 @@ pub const Config = struct {
     }
 
     pub fn tokenEmbeddingScale(self: Config) f32 {
+        if (self.disable_token_embedding_scale) return 1.0;
         return switch (self.family) {
             .gemma => @sqrt(@as(f32, @floatFromInt(self.hidden_size))),
             else => 1.0,
@@ -371,6 +374,9 @@ pub const Config = struct {
     pub fn kvDonorLayerIndex(self: Config, layer_index: usize) ?usize {
         if (self.gemma4_mtp_assistant) {
             const unset = std.math.maxInt(u32);
+            if (self.mtp_kv_donor_base_layer != unset) {
+                return self.mtp_kv_donor_base_layer + layer_index;
+            }
             if (self.mtp_kv_sliding_donor_layer == unset or self.mtp_kv_full_donor_layer == unset) return layer_index;
             return if (self.layerUsesSlidingAttention(layer_index))
                 self.mtp_kv_sliding_donor_layer
@@ -1046,6 +1052,9 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     var config = Config{
         .family = detectFamily(arch),
+        .gemma4_mtp_assistant = std.mem.eql(u8, arch, "gemma4_assistant") or
+            std.mem.eql(u8, arch, "gemma4_unified_assistant") or
+            std.mem.eql(u8, arch, "gemma4-assistant"),
     };
     applyFamilyDefaults(&config);
     if (config.family == .gemma) {
@@ -1130,6 +1139,16 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     // Gemma 4: Per-Layer Embeddings (PLE).
     if (metaU32(view, &key_buf, arch, "embedding_length_per_layer_input")) |value| config.ple_hidden_size = value;
+    if (config.gemma4_mtp_assistant) {
+        if (metaU32(view, &key_buf, arch, "n_embd_backbone")) |value| config.mtp_backbone_hidden_size = value;
+        if (metaU32(view, &key_buf, arch, "backbone_hidden_size")) |value| config.mtp_backbone_hidden_size = value;
+        if (metaU32(view, &key_buf, arch, "embedding_length_out")) |value| config.mtp_backbone_hidden_size = value;
+        if (metaU32(view, &key_buf, arch, "n_centroids")) |value| config.mtp_num_centroids = value;
+        if (metaU32(view, &key_buf, arch, "num_centroids")) |value| config.mtp_num_centroids = value;
+        if (metaU32(view, &key_buf, arch, "centroid_top_k")) |value| config.mtp_centroid_intermediate_top_k = value;
+        if (metaU32(view, &key_buf, arch, "centroid_intermediate_top_k")) |value| config.mtp_centroid_intermediate_top_k = value;
+        if (metaBool(view, &key_buf, arch, "use_ordered_embeddings")) |value| config.mtp_use_ordered_embeddings = value;
+    }
 
     // Gemma 4: sliding_window_pattern may be a per-layer bool array.
     if (metaSlidingPatternFromBoolArray(view, &key_buf, arch, "attention.sliding_window_pattern")) |value| config.sliding_window_pattern = value;
@@ -1157,6 +1176,11 @@ fn metaU32(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []c
 fn metaF32(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8) ?f32 {
     const key = std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, suffix }) catch return null;
     return view.getF32(key);
+}
+
+fn metaBool(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8) ?bool {
+    const key = std.fmt.bufPrint(buf, "{s}.{s}", .{ arch, suffix }) catch return null;
+    return view.getBool(key);
 }
 
 /// Read element at index from an i32/u32 metadata array.
@@ -1255,6 +1279,7 @@ fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "gemma4_unified_text", ModelFamily.gemma },
         .{ "gemma4_assistant", ModelFamily.gemma },
         .{ "gemma4_unified_assistant", ModelFamily.gemma },
+        .{ "gemma4-assistant", ModelFamily.gemma },
         .{ "bitnet", ModelFamily.bitnet },
         .{ "bitnet-b1.58", ModelFamily.bitnet },
         .{ "falcon", ModelFamily.falcon },
@@ -1273,7 +1298,8 @@ fn isGemma4ModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "gemma4_unified") or
         std.mem.eql(u8, model_type, "gemma4_unified_text") or
         std.mem.eql(u8, model_type, "gemma4_assistant") or
-        std.mem.eql(u8, model_type, "gemma4_unified_assistant");
+        std.mem.eql(u8, model_type, "gemma4_unified_assistant") or
+        std.mem.eql(u8, model_type, "gemma4-assistant");
 }
 
 fn applyFamilyDefaults(config: *Config) void {

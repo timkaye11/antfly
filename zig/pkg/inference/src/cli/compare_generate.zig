@@ -23,6 +23,7 @@ const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const generation = @import("../pipelines/generation.zig");
+const runtime = @import("../runtime/root.zig");
 const gemma3_mm = @import("../pipelines/gemma3_multimodal.zig");
 const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
 const gemma3_vision = @import("../architectures/gemma3_vision.zig");
@@ -34,6 +35,7 @@ const print = std.debug.print;
 const BackendChoice = enum {
     auto,
     native,
+    cuda,
     mlx,
 };
 
@@ -48,6 +50,7 @@ const Options = struct {
     no_chat_template: bool = false,
     image_features_only: bool = false,
     onnx_prompt_embeddings_only: bool = false,
+    runtime_parity: bool = false,
 };
 
 const PreparedMessages = struct {
@@ -173,6 +176,35 @@ const TopLogit = struct {
     logit: f32,
 };
 
+const RuntimeParityCapture = struct {
+    allocator: std.mem.Allocator,
+    backend_name: []const u8,
+    phase: []const u8,
+    total_rows: usize,
+    vocab_size: usize,
+    token_id: i32,
+    token_text: []u8,
+    final_hidden: []f32,
+    pre_norm_hidden: []f32,
+    logits: []f32,
+    top_logits: []TopLogit,
+
+    fn deinit(self: *RuntimeParityCapture) void {
+        self.allocator.free(self.token_text);
+        self.allocator.free(self.final_hidden);
+        self.allocator.free(self.pre_norm_hidden);
+        self.allocator.free(self.logits);
+        self.allocator.free(self.top_logits);
+        self.* = undefined;
+    }
+};
+
+const RuntimeParityDiff = struct {
+    max_abs: f32 = 0,
+    mean_abs: f64 = 0,
+    max_index: usize = 0,
+};
+
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
 
@@ -181,6 +213,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
+
+    if (opts.runtime_parity) {
+        try runRuntimeParity(allocator, &model_manager, opts);
+        return;
+    }
 
     const native_model = try model_manager.loadFromDir(opts.native_model_dir);
     print("native_tokenizer={s}\n", .{
@@ -546,6 +583,382 @@ fn hasOnnxPayload(io: std.Io, model_dir: []const u8) !bool {
         }
     }
     return false;
+}
+
+fn runRuntimeParity(
+    allocator: std.mem.Allocator,
+    model_manager: *model_manager_mod.ModelManager,
+    opts: Options,
+) !void {
+    if (opts.image_count > 0) return error.RuntimeParityTextOnly;
+    const native_pref = [_]backends.BackendType{.native};
+    const cuda_pref = [_]backends.BackendType{.cuda};
+    const native_model = try model_manager.loadFromDirWithPreferredBackends(opts.native_model_dir, native_pref[0..], false);
+    const cuda_model = try model_manager.loadFromDirWithPreferredBackends(opts.native_model_dir, cuda_pref[0..], false);
+    const native_cfg = session_factory.getGptConfig(native_model.session) orelse return error.InvalidModelForGeneration;
+    const cuda_cfg = session_factory.getGptConfig(cuda_model.session) orelse return error.InvalidModelForGeneration;
+    if (native_cfg.vocab_size != cuda_cfg.vocab_size or native_cfg.hidden_size != cuda_cfg.hidden_size) return error.IncompatibleRuntimeParityModels;
+
+    const rendered_prompt = try renderPrompt(allocator, native_model, opts.prompt, opts.no_chat_template);
+    defer allocator.free(rendered_prompt);
+    const rendered_cuda = try renderPrompt(allocator, cuda_model, opts.prompt, opts.no_chat_template);
+    defer allocator.free(rendered_cuda);
+    print("runtime_parity: native_model={s} cuda_model={s}\n", .{ opts.native_model_dir, opts.native_model_dir });
+    print("runtime_parity: native_backend={s} cuda_backend={s}\n", .{ @tagName(native_model.session.backend()), @tagName(cuda_model.session.backend()) });
+    print("runtime_parity: prompt_match={}\n", .{std.mem.eql(u8, rendered_prompt, rendered_cuda)});
+    if (!std.mem.eql(u8, rendered_prompt, rendered_cuda)) return error.RuntimeParityPromptMismatch;
+
+    const token_ids = try encodeRuntimeParityPrompt(allocator, native_model, rendered_prompt);
+    defer allocator.free(token_ids);
+    const cuda_token_ids = try encodeRuntimeParityPrompt(allocator, cuda_model, rendered_cuda);
+    defer allocator.free(cuda_token_ids);
+    try compareTokenIds(token_ids, cuda_token_ids);
+    print("runtime_parity: prompt_tokens={d}\n", .{token_ids.len});
+    print("runtime_parity: prompt_token_ids:", .{});
+    for (token_ids[0..@min(token_ids.len, 32)]) |id| print(" {d}", .{id});
+    print("\n", .{});
+
+    var native_cb = try session_factory.getComputeBackend(native_model.session, allocator);
+    defer native_cb.deinit();
+    var cuda_cb = try session_factory.getComputeBackend(cuda_model.session, allocator);
+    defer cuda_cb.deinit();
+
+    var native_state = try initRuntimeParityDecodeState(allocator, native_model, native_cfg, &native_cb);
+    defer native_state.deinit();
+    var cuda_state = try initRuntimeParityDecodeState(allocator, cuda_model, cuda_cfg, &cuda_cb);
+    defer cuda_state.deinit();
+
+    try native_state.decode_state.notePrefill(token_ids.len);
+    try cuda_state.decode_state.notePrefill(token_ids.len);
+    var native_prefill_ctx = native_state.decode_state.gptDecodeContext(token_ids.len, token_ids.len);
+    var cuda_prefill_ctx = cuda_state.decode_state.gptDecodeContext(token_ids.len, token_ids.len);
+    var native_prefill = try captureRuntimeParityForward(
+        allocator,
+        native_model,
+        &native_cb,
+        native_cfg,
+        token_ids,
+        1,
+        token_ids.len,
+        &native_prefill_ctx,
+        "prefill",
+        opts.top_k,
+    );
+    defer native_prefill.deinit();
+    var cuda_prefill = try captureRuntimeParityForward(
+        allocator,
+        cuda_model,
+        &cuda_cb,
+        cuda_cfg,
+        token_ids,
+        1,
+        token_ids.len,
+        &cuda_prefill_ctx,
+        "prefill",
+        opts.top_k,
+    );
+    defer cuda_prefill.deinit();
+    try compareRuntimeParityCapture(allocator, "prefill", native_model, &native_prefill, &cuda_prefill);
+    print("runtime_parity: prefill ok\n", .{});
+
+    const next_token: i64 = native_prefill.token_id;
+    try native_state.decode_state.appendGeneratedToken();
+    try cuda_state.decode_state.appendGeneratedToken();
+    const decode_seq_len = token_ids.len + 1;
+    const decode_input = [_]i64{next_token};
+    var native_decode_ctx = native_state.decode_state.gptDecodeContext(decode_seq_len, 1);
+    var cuda_decode_ctx = cuda_state.decode_state.gptDecodeContext(decode_seq_len, 1);
+    var native_decode = try captureRuntimeParityForward(
+        allocator,
+        native_model,
+        &native_cb,
+        native_cfg,
+        &decode_input,
+        1,
+        decode_seq_len,
+        &native_decode_ctx,
+        "decode",
+        opts.top_k,
+    );
+    defer native_decode.deinit();
+    var cuda_decode = try captureRuntimeParityForward(
+        allocator,
+        cuda_model,
+        &cuda_cb,
+        cuda_cfg,
+        &decode_input,
+        1,
+        decode_seq_len,
+        &cuda_decode_ctx,
+        "decode",
+        opts.top_k,
+    );
+    defer cuda_decode.deinit();
+    try compareRuntimeParityCapture(allocator, "decode_step", native_model, &native_decode, &cuda_decode);
+    print("runtime_parity: decode_step ok\n", .{});
+    print("runtime_parity: selected_token_match=true prefill={d} decode={d}\n", .{ native_prefill.token_id, native_decode.token_id });
+    printRuntimeParityCudaStats(cuda_model.session);
+}
+
+const RuntimeParityDecodeState = struct {
+    allocator: std.mem.Allocator,
+    kv_manager: *runtime.kv.manager.KvManager,
+    kv_storage: *runtime.kv.storage_runtime.KvStorageRuntime,
+    decode_state: generation.NativeDecodeState,
+
+    fn deinit(self: *RuntimeParityDecodeState) void {
+        self.decode_state.deinit();
+        self.kv_storage.deinit();
+        self.allocator.destroy(self.kv_storage);
+        self.kv_manager.deinit();
+        self.allocator.destroy(self.kv_manager);
+        self.* = undefined;
+    }
+};
+
+fn initRuntimeParityDecodeState(
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+    cfg: gpt_mod.Config,
+    cb: *ops.ComputeBackend,
+) !RuntimeParityDecodeState {
+    const kv_manager = try allocator.create(runtime.kv.manager.KvManager);
+    errdefer allocator.destroy(kv_manager);
+    kv_manager.* = runtime.kv.manager.KvManager.init(allocator);
+    errdefer kv_manager.deinit();
+    const backend_kind = try kvBackendKindFromOps(cb.kind());
+    const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+    const sliding_window_size: ?u32 = if (cfg.position_encoding == .absolute)
+        null
+    else if (cfg.sliding_window > 0)
+        cfg.sliding_window
+    else if (cfg.max_position_embeddings > 0)
+        cfg.max_position_embeddings
+    else
+        null;
+    const pool_config = runtime.kv.pool.KvPoolConfig{
+        .backend = backend_kind,
+        .dtype = kv_dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(cfg.num_hidden_layers),
+        .num_kv_heads = cfg.maxKvHeads(),
+        .head_dim = cfg.maxHeadDim(),
+        .sliding_window_size = sliding_window_size,
+    };
+    const pool_id = try kv_manager.addPool(pool_config);
+    const kv_storage = try allocator.create(runtime.kv.storage_runtime.KvStorageRuntime);
+    errdefer allocator.destroy(kv_storage);
+    kv_storage.* = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
+    errdefer kv_storage.deinit();
+    try cb.provisionKvDeviceWriteHook(kv_storage);
+    var decode_state = generation.NativeDecodeState.initPaged(allocator, kv_manager, pool_id, model.shared_moe_cache);
+    decode_state.kv_storage = kv_storage;
+    return .{
+        .allocator = allocator,
+        .kv_manager = kv_manager,
+        .kv_storage = kv_storage,
+        .decode_state = decode_state,
+    };
+}
+
+fn kvBackendKindFromOps(kind: ops.BackendKind) !runtime.kv.pool.BackendKind {
+    return switch (kind) {
+        .native => .native,
+        .metal => .metal,
+        .mlx => .mlx,
+        .cuda => .cuda,
+        else => error.UnsupportedRuntimeParityBackend,
+    };
+}
+
+fn encodeRuntimeParityPrompt(
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+    rendered_prompt: []const u8,
+) ![]i64 {
+    var encoded = try generation.encodePromptForGeneration(
+        model.getTokenizer(),
+        allocator,
+        rendered_prompt,
+        4096,
+        model.manifest.add_bos_token,
+        model.manifest.bos_token,
+    );
+    defer encoded.deinit();
+    const prompt_tokens = countPromptTokens(encoded.attention_mask);
+    if (prompt_tokens == 0) return error.EmptyPrompt;
+    const token_ids = try allocator.alloc(i64, prompt_tokens);
+    for (0..prompt_tokens) |idx| token_ids[idx] = encoded.ids[idx];
+    return token_ids;
+}
+
+fn compareTokenIds(native: []const i64, cuda: []const i64) !void {
+    if (native.len != cuda.len) {
+        print("runtime_parity: prompt_token_ids_match=false native_count={d} cuda_count={d}\n", .{ native.len, cuda.len });
+        return error.RuntimeParityTokenizationMismatch;
+    }
+    for (native, cuda, 0..) |lhs, rhs, idx| {
+        if (lhs != rhs) {
+            print("runtime_parity: prompt_token_ids_match=false first_mismatch={d} native={d} cuda={d}\n", .{ idx, lhs, rhs });
+            return error.RuntimeParityTokenizationMismatch;
+        }
+    }
+    print("runtime_parity: prompt_token_ids_match=true\n", .{});
+}
+
+fn captureRuntimeParityForward(
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+    cb: *ops.ComputeBackend,
+    cfg: gpt_mod.Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    phase: []const u8,
+    top_k: usize,
+) !RuntimeParityCapture {
+    const query_seq_len = decode_context.query_sequence_len;
+    const total = batch * query_seq_len;
+    const hidden_size: usize = @intCast(cfg.hidden_size);
+    if (input_ids.len != total) return error.InvalidTensorShape;
+
+    const embed_w = try gpt_arch.getEmbeddingWeight(cb, cfg);
+    defer cb.free(embed_w);
+    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+    const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(cb, allocator, cfg, embedded, total, hidden_size);
+
+    const ple_vectors = try gpt_arch.computePleVectors(cb, allocator, cfg, input_ids, hidden_input, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    const hidden_result = try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
+        cb,
+        allocator,
+        cfg,
+        hidden_input,
+        .{},
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+    );
+    defer cb.free(hidden_result.final_hidden);
+    defer cb.free(hidden_result.pre_norm_hidden);
+
+    const lm_w = if (cfg.weight_tying)
+        try gpt_arch.getEmbeddingWeight(cb, cfg)
+    else
+        cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(cb, cfg);
+    defer cb.free(lm_w);
+
+    const logits_ct = try cb.linearNoBias(hidden_result.final_hidden, lm_w, hidden_result.total_rows, cfg.hidden_size, cfg.vocab_size);
+    defer cb.free(logits_ct);
+    const logits_host = try cb.toFloat32(logits_ct, allocator);
+    errdefer allocator.free(logits_host);
+    gpt_arch.applyFinalLogitSoftcapInPlace(cfg, logits_host);
+    const final_hidden = try cb.toFloat32(hidden_result.final_hidden, allocator);
+    errdefer allocator.free(final_hidden);
+    const pre_norm_hidden = try cb.toFloat32(hidden_result.pre_norm_hidden, allocator);
+    errdefer allocator.free(pre_norm_hidden);
+    const vocab_size: usize = @intCast(cfg.vocab_size);
+    const last_logits = logits_host[(hidden_result.total_rows - 1) * vocab_size ..][0..vocab_size];
+    const token_id: i32 = @intCast(activations.argmax(last_logits));
+    const token_arr = [_]i32{token_id};
+    const token_text = try model.getTokenizer().decode(allocator, &token_arr);
+    errdefer allocator.free(token_text);
+    const top_logits = try collectTopLogits(allocator, last_logits, top_k);
+    errdefer allocator.free(top_logits);
+    return .{
+        .allocator = allocator,
+        .backend_name = @tagName(model.session.backend()),
+        .phase = phase,
+        .total_rows = hidden_result.total_rows,
+        .vocab_size = vocab_size,
+        .token_id = token_id,
+        .token_text = token_text,
+        .final_hidden = final_hidden,
+        .pre_norm_hidden = pre_norm_hidden,
+        .logits = logits_host,
+        .top_logits = top_logits,
+    };
+}
+
+fn compareRuntimeParityCapture(
+    allocator: std.mem.Allocator,
+    phase: []const u8,
+    model: *model_manager_mod.LoadedModel,
+    native: *const RuntimeParityCapture,
+    cuda: *const RuntimeParityCapture,
+) !void {
+    print("runtime_parity: {s} native_token={d} cuda_token={d}\n", .{ phase, native.token_id, cuda.token_id });
+    try printSingleToken(allocator, "runtime_parity_native_top1", model.getTokenizer(), native.token_id);
+    try printSingleToken(allocator, "runtime_parity_cuda_top1", model.getTokenizer(), cuda.token_id);
+    if (native.total_rows != cuda.total_rows or native.vocab_size != cuda.vocab_size) return error.RuntimeParityShapeMismatch;
+    try compareRuntimeTensor(phase, "pre_norm_hidden", cuda.pre_norm_hidden, native.pre_norm_hidden, 0.01);
+    try compareRuntimeTensor(phase, "final_hidden", cuda.final_hidden, native.final_hidden, 0.01);
+    try compareRuntimeTensor(phase, "logits", cuda.logits, native.logits, 0.1);
+    compareRuntimeTopLogits(phase, native.top_logits, cuda.top_logits);
+    if (native.token_id != cuda.token_id) {
+        print("runtime_parity: first_divergence phase={s} surface=selected_token native={d} cuda={d}\n", .{ phase, native.token_id, cuda.token_id });
+        return error.RuntimeParityTokenMismatch;
+    }
+}
+
+fn compareRuntimeTensor(phase: []const u8, surface: []const u8, actual: []const f32, expected: []const f32, tolerance: f32) !void {
+    if (actual.len != expected.len) return error.RuntimeParityShapeMismatch;
+    const stats = runtimeDiffStats(actual, expected);
+    print("runtime_parity: {s}.{s} max_abs={d:.6} mean_abs={d:.6} max_index={d}\n", .{ phase, surface, stats.max_abs, stats.mean_abs, stats.max_index });
+    if (stats.max_abs > tolerance) {
+        print(
+            "runtime_parity: first_divergence phase={s} surface={s} native={d:.6} cuda={d:.6}\n",
+            .{ phase, surface, expected[stats.max_index], actual[stats.max_index] },
+        );
+        return error.RuntimeParityTensorMismatch;
+    }
+}
+
+fn runtimeDiffStats(actual: []const f32, expected: []const f32) RuntimeParityDiff {
+    var stats: RuntimeParityDiff = .{};
+    var sum_abs: f64 = 0;
+    for (actual, expected, 0..) |got, want, idx| {
+        const diff = @abs(got - want);
+        sum_abs += diff;
+        if (diff > stats.max_abs) {
+            stats.max_abs = diff;
+            stats.max_index = idx;
+        }
+    }
+    stats.mean_abs = sum_abs / @as(f64, @floatFromInt(actual.len));
+    return stats;
+}
+
+fn compareRuntimeTopLogits(phase: []const u8, native: []const TopLogit, cuda: []const TopLogit) void {
+    const count = @min(native.len, cuda.len);
+    print("runtime_parity: {s}.top_logits\n", .{phase});
+    for (0..count) |idx| {
+        print("  rank={d} native={d}:{d:.6} cuda={d}:{d:.6}\n", .{ idx + 1, native[idx].id, native[idx].logit, cuda[idx].id, cuda[idx].logit });
+    }
+}
+
+fn printRuntimeParityCudaStats(session: backends.Session) void {
+    if (session_factory.getCudaRuntimeStats(session)) |stats| {
+        print(
+            "runtime_parity_cuda_stats: launches={d} syncs={d} upload_syncs={d} download_syncs={d} linear={d} attention={d} h2d={d} d2h={d} device_kv_attempts={d} device_kv_successes={d} host_attention_fallbacks={d}\n",
+            .{
+                stats.kernel_launches,
+                stats.stream_syncs,
+                stats.upload_syncs,
+                stats.download_syncs,
+                stats.launch_linear,
+                stats.launch_attention,
+                stats.h2d_bytes,
+                stats.d2h_bytes,
+                stats.device_kv_attempts,
+                stats.device_kv_successes,
+                stats.host_attention_fallbacks,
+            },
+        );
+    }
 }
 
 fn renderPrompt(
@@ -1451,6 +1864,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.image_features_only = true;
         } else if (std.mem.eql(u8, arg, "--onnx-prompt-embeddings-only")) {
             opts.onnx_prompt_embeddings_only = true;
+        } else if (std.mem.eql(u8, arg, "--runtime-parity")) {
+            opts.runtime_parity = true;
         } else {
             return error.UnknownArgument;
         }
@@ -1461,18 +1876,20 @@ fn parseArgs(args: []const []const u8) !Options {
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
     if (std.mem.eql(u8, value, "mlx")) return .mlx;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => &.{ .onnx, .mlx, .native },
+        .auto => &.{ .onnx, .cuda, .mlx, .native },
         .native => &.{ .native, .onnx, .mlx },
+        .cuda => &.{ .cuda, .native },
         .mlx => &.{ .mlx, .onnx, .native },
     };
 }
 
 fn printUsage() void {
-    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--backend auto|native|mlx] [--top-k N] [--no-chat-template]\n", .{});
+    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--runtime-parity] [--backend auto|native|cuda|mlx] [--top-k N] [--no-chat-template]\n", .{});
 }

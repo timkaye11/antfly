@@ -3453,14 +3453,44 @@ fn decoderBlock(
     try maybeDebugLayerTensor(cb, allocator, layer, "k", K);
     try maybeDebugLayerTensor(cb, allocator, layer, "v", V_normed);
 
-    const Q_attn = if (try maybeApplyQKHeadNorm(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf)) |normed_q|
+    var qk_already_roped = false;
+    var fused_q_rope: ?CT = null;
+    var fused_k_rope: ?CT = null;
+    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and total == 1) fused_blk: {
+        const rope_dim = config.layerRopeActiveDim(layer);
+        const rope_theta = blk: {
+            const base_theta = config.layerRopeTheta(layer);
+            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
+            const active_dim: f32 = @floatFromInt(rope_dim);
+            if (active_dim < freq_dim) break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
+            break :blk base_theta;
+        };
+        const offset = positionOffset(seq_len, total, decode_context);
+        const consecutive_pairs = config.rope_layout == .consecutive_pairs;
+        const q_scale = if (config.global_head_dim != 0) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
+        fused_q_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, q_scale, &name_buf);
+        if (fused_q_rope == null) break :fused_blk;
+        fused_k_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, 1.0, &name_buf);
+        if (fused_k_rope == null) {
+            if (fused_q_rope) |tensor| cb.free(tensor);
+            fused_q_rope = null;
+            break :fused_blk;
+        }
+        qk_already_roped = true;
+    }
+
+    const Q_attn = if (fused_q_rope) |roped_q|
+        roped_q
+    else if (try maybeApplyQKHeadNorm(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf)) |normed_q|
         normed_q
     else
         Q;
     defer if (Q_attn != Q) cb.free(Q_attn);
 
     // Shared KV layers skip K head norm (K is read from the donor layer's cache).
-    const K_attn = if (!shares_kv)
+    const K_attn = if (fused_k_rope) |roped_k|
+        roped_k
+    else if (!shares_kv)
         if (try maybeApplyQKHeadNorm(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf)) |normed_k|
             normed_k
         else
@@ -3586,7 +3616,7 @@ fn decoderBlock(
     }
 
     const attn_res = blk: {
-        if (attn_out_proj_linear_slot != null and config.family != .qwen3_5) {
+        if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_5) {
             const fused_attn_started_at = monotonicNowNs();
             if (try applyAttentionResidual(
                 cb,
@@ -3617,7 +3647,10 @@ fn decoderBlock(
 
         // Attention (with optional RoPE)
         const attn_core_started_at = monotonicNowNs();
-        const attn_out = try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
+        const attn_out = if (qk_already_roped)
+            try applyPreparedAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context)
+        else
+            try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
         defer cb.free(attn_out);
         debug_timing_stats.attention_core_nanos += @intCast(monotonicNowNs() - attn_core_started_at);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
@@ -3710,17 +3743,34 @@ fn decoderBlock(
                 const combined_normed = try applyGemmaFfnPostNorm(cb, allocator, config, combined, layer, &name_buf);
                 defer if (combined_normed != combined) cb.free(combined_normed);
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
-                var layer_result = try cb.add(combined_normed, sa_out);
+
+                var layer_result_output_scaled = false;
+                var layer_result = if (ple_vectors == null) scaled_residual_blk: {
+                    const output_scale = (try getLayerOutputScaleWeight(cb, config, layer)) orelse break :scaled_residual_blk try cb.add(combined_normed, sa_out);
+                    defer cb.free(output_scale);
+                    if (try cb.addMultiplyScalarTensor(combined_normed, sa_out, output_scale)) |fused| {
+                        layer_result_output_scaled = true;
+                        break :scaled_residual_blk fused;
+                    }
+                    const branch_scaled = try cb.multiply(combined_normed, output_scale);
+                    defer cb.free(branch_scaled);
+                    const scaled = try cb.add(branch_scaled, sa_out);
+                    layer_result_output_scaled = true;
+                    break :scaled_residual_blk scaled;
+                } else try cb.add(combined_normed, sa_out);
                 cb.free(sa_out);
 
                 if (config.hasPle()) {
                     if (ple_vectors) |ple| {
-                        const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, &name_buf);
+                        const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+                        defer if (output_scale) |scale| cb.free(scale);
+                        const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, output_scale, &name_buf);
+                        layer_result_output_scaled = output_scale != null;
                         cb.free(layer_result);
                         layer_result = ple_result;
                     }
                 }
-                const scaled = try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+                const scaled = if (layer_result_output_scaled) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
                 try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
                 return scaled;
             }
@@ -3737,24 +3787,58 @@ fn decoderBlock(
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-raw", ffn_out_raw, hidden_size);
             debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
-            const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
-            defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
-            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+            var layer_result_output_scaled = false;
+            const ffn_residual = if (ple_vectors == null) scaled_residual_blk: {
+                if (try getLayerOutputScaleWeight(cb, config, layer)) |output_scale| {
+                    defer cb.free(output_scale);
+                    if (try maybeGetGemmaFfnPostNormWeight(cb, allocator, config, layer, &name_buf)) |post_norm_w| {
+                        defer cb.free(post_norm_w);
+                        if (try cb.rmsNormAddMultiplyScalarTensor(ffn_out_raw, post_norm_w, sa_out, output_scale, hidden_size, config.norm_eps)) |fused| {
+                            layer_result_output_scaled = true;
+                            break :scaled_residual_blk fused;
+                        }
+                    }
 
-            const ffn_residual = try cb.add(ffn_out, sa_out);
+                    const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
+                    defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                    if (try cb.addMultiplyScalarTensor(ffn_out, sa_out, output_scale)) |fused| {
+                        layer_result_output_scaled = true;
+                        break :scaled_residual_blk fused;
+                    }
+                    const branch_scaled = try cb.multiply(ffn_out, output_scale);
+                    defer cb.free(branch_scaled);
+                    const scaled = try cb.add(branch_scaled, sa_out);
+                    layer_result_output_scaled = true;
+                    break :scaled_residual_blk scaled;
+                }
+
+                const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
+                defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                break :scaled_residual_blk try cb.add(ffn_out, sa_out);
+            } else ple_residual_blk: {
+                const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
+                defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                break :ple_residual_blk try cb.add(ffn_out, sa_out);
+            };
             cb.free(sa_out);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
 
             var layer_result = ffn_residual;
             if (config.hasPle()) {
                 if (ple_vectors) |ple| {
-                    const ple_result = try applyPle(cb, allocator, config, ffn_residual, ple, total, layer, &name_buf);
+                    const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+                    defer if (output_scale) |scale| cb.free(scale);
+                    const ple_result = try applyPle(cb, allocator, config, ffn_residual, ple, total, layer, output_scale, &name_buf);
+                    layer_result_output_scaled = output_scale != null;
                     cb.free(ffn_residual);
                     layer_result = ple_result;
                 }
             }
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ple", layer_result, hidden_size);
-            const scaled = try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+            const scaled = if (layer_result_output_scaled) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
             try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
             return scaled;
@@ -4072,6 +4156,57 @@ pub fn maybeApplyQKHeadNorm(
     return try cb.fromFloat32Shape(output, &shape);
 }
 
+pub fn maybeApplyQKHeadNormRope(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    tensor: CT,
+    total_rows: usize,
+    total_dim: u32,
+    layer: usize,
+    proj: []const u8,
+    head_dim: u32,
+    rope_dim: usize,
+    rope_theta: f32,
+    freq_scale: f32,
+    position_offset: usize,
+    seq_len: usize,
+    consecutive_pairs: bool,
+    scale: f32,
+    buf: *[256]u8,
+) !?CT {
+    switch (config.family) {
+        .gemma, .qwen3, .qwen3_5 => {},
+        else => return null,
+    }
+    if (config.position_encoding != .rope) return null;
+
+    const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.{s}_norm.weight", .{ layer, proj }) catch return error.NameTooLong;
+    const base_weight = getModelWeight(cb, config, name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(base_weight);
+    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
+    defer if (adjusted_weight != base_weight) cb.free(adjusted_weight);
+
+    return try cb.rmsNormHeadsRope(
+        tensor,
+        adjusted_weight,
+        total_rows,
+        total_dim,
+        head_dim,
+        rope_dim,
+        config.norm_eps,
+        rope_theta,
+        freq_scale,
+        position_offset,
+        seq_len,
+        consecutive_pairs,
+        scale,
+    );
+}
+
 pub fn maybeScaleTokenEmbeddings(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4083,8 +4218,13 @@ pub fn maybeScaleTokenEmbeddings(
     const scale = config.tokenEmbeddingScale();
     if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) return embeddings;
 
-    if (cb.kind() == .graph or cb.kind() == .metal) {
-        // Graph tracing and Metal decode should avoid materializing device
+    if (try cb.multiplyScalar(embeddings, scale)) |scaled| {
+        cb.free(embeddings);
+        return scaled;
+    }
+
+    if (cb.kind() == .graph or cb.kind() == .metal or cb.kind() == .cuda) {
+        // Graph tracing and device backends should avoid materializing device
         // embeddings just to apply a scalar.
         const scale_data: [1]f32 = .{scale};
         const scale_tensor = try cb.fromFloat32(&scale_data);
@@ -4941,6 +5081,51 @@ pub fn applyAttention(
     return applyAttentionWithSink(cb, config, Q, K, V, null, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, skip_kv_write, decode_context);
 }
 
+pub fn applyPreparedAttention(
+    cb: *const ComputeBackend,
+    config: Config,
+    Q: CT,
+    K: CT,
+    V: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    kv_layer_index: usize,
+    skip_kv_write: bool,
+    decode_context: ?*const DecodeContext,
+) !CT {
+    var attention = attentionContext(seq_len, decode_context);
+    attention.layer_index = kv_layer_index;
+    attention.skip_kv_write = skip_kv_write;
+    attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
+    if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
+    if (attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
+        const gqa_started_at = monotonicNowNs();
+        const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
+        debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+        return result;
+    }
+    if (try cb.runAttention(&.{
+        .q = Q,
+        .k = K,
+        .v = V,
+        .attention = attention,
+        .attention_sink = .{},
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    })) |result| {
+        return result;
+    }
+    const gqa_started_at = monotonicNowNs();
+    const result = try cb.gqaPagedAttention(Q, K, V, null, attention, batch, num_heads, num_kv_heads, head_dim);
+    debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+    return result;
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -5414,7 +5599,7 @@ fn actualQuerySeqLen(seq_len: usize, decode_context: ?*const DecodeContext) usiz
     return dc.query_sequence_len;
 }
 
-fn positionOffset(seq_len: usize, query_seq_len: usize, decode_context: ?*const DecodeContext) usize {
+pub fn positionOffset(seq_len: usize, query_seq_len: usize, decode_context: ?*const DecodeContext) usize {
     const dc = decode_context orelse return 0;
     _ = seq_len;
     return dc.total_sequence_len - query_seq_len;
@@ -6806,6 +6991,24 @@ fn applyGemmaFfnPostNorm(
     })) orelse hidden;
 }
 
+fn maybeGetGemmaFfnPostNormWeight(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    layer: usize,
+    buf: *[256]u8,
+) !?CT {
+    const name = std.fmt.bufPrint(buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong;
+    const base_w = getModelWeight(cb, config, name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    errdefer cb.free(base_w);
+    const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, config.hidden_size);
+    if (w != base_w) cb.free(base_w);
+    return w;
+}
+
 /// Gemma 4: post-norm for the shared expert FFN sublayer (post_ffw_norm_1).
 fn applyGemmaSharedFfnPostNorm(
     cb: *const ComputeBackend,
@@ -7251,6 +7454,25 @@ fn getFFNBias(cb: *const ComputeBackend, config: Config, layer: usize, proj: []c
     }
 }
 
+pub fn getLayerOutputScaleWeight(
+    cb: *const ComputeBackend,
+    config: Config,
+    layer: usize,
+) !?CT {
+    if (config.family == .gemma and config.ple_hidden_size == 0) return null;
+
+    var name_buf: [256]u8 = undefined;
+    const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch return error.NameTooLong;
+    return getModelWeight(cb, config, scale_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => blk: {
+            var fallback_buf: [256]u8 = undefined;
+            const fallback = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer}) catch return error.NameTooLong;
+            break :blk try getModelWeight(cb, config, fallback);
+        },
+        else => return err,
+    };
+}
+
 /// Apply per-layer output scale (HF: self.layer_scalar / skip_scale).
 /// Multiplies hidden by a scalar loaded from layer_output_scale.weight.
 /// Returns the input unchanged if the weight is ~1.0.
@@ -7263,16 +7485,9 @@ pub fn applyLayerOutputScale(
     hidden_size: usize,
     layer: usize,
 ) !CT {
-    var name_buf: [256]u8 = undefined;
-    const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch return hidden;
-    const scale_w = getModelWeight(cb, config, scale_name) catch |err| switch (err) {
-        error.MissingWeight => blk: {
-            var fallback_buf: [256]u8 = undefined;
-            const fallback = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer}) catch return error.NameTooLong;
-            break :blk try getModelWeight(cb, config, fallback);
-        },
-        else => return err,
-    };
+    if (config.family == .gemma) return hidden;
+
+    const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return hidden;
 
     if (cb.kind() == .graph) {
         // Graph tracing: always emit the multiply. Avoid toFloat32 which
@@ -7438,6 +7653,7 @@ pub fn applyPle(
     ple_vectors: CT,
     total: usize,
     layer: usize,
+    output_scale: ?CT,
     buf: *[256]u8,
 ) !CT {
     const ple_dim: usize = config.ple_hidden_size;
@@ -7500,7 +7716,14 @@ pub fn applyPle(
     const normed = try cb.rmsNorm(projected, post_norm_w, hidden_size, config.norm_eps);
     defer cb.free(normed);
 
-    // 6. Residual add.
+    // 6. Residual add, optionally fused with the per-layer output scale.
+    if (output_scale) |scale| {
+        if (try cb.addMultiplyScalarTensor(hidden, normed, scale)) |scaled| return scaled;
+        const branch_scaled = try cb.multiply(normed, scale);
+        defer cb.free(branch_scaled);
+        return try cb.add(hidden, branch_scaled);
+    }
+
     const result = try cb.add(hidden, normed);
     return result;
 }

@@ -51,6 +51,17 @@ extern "C" __global__ void termite_binary_scalar_f32(
     dst[i] = op == 0u ? x + value : x * value;
 }
 
+extern "C" __global__ void termite_add_mul_scalar_f32(
+    float* dst,
+    const float* a,
+    const float* b,
+    const float* scalar,
+    unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = a[i] * scalar[0] + b[i];
+}
+
 extern "C" __global__ void termite_linear_f32(
     float* dst,
     const float* input,
@@ -106,6 +117,117 @@ extern "C" __global__ void termite_argmax_last_row_f32(
         __syncthreads();
     }
     if (tid == 0u) dst[0] = best_indices[0];
+}
+
+extern "C" __global__ void termite_gemma4_mtp_masked_argmax_f32(
+    unsigned int* dst,
+    const float* logits,
+    const float* centroid_logits,
+    const float* token_ordering,
+    unsigned int vocab_size,
+    unsigned int num_centroids,
+    unsigned int top_k,
+    unsigned int use_inverse_ordering
+) {
+    __shared__ float top_scores[128];
+    __shared__ unsigned int top_centroids[128];
+    __shared__ float block_values[256];
+    __shared__ unsigned int block_indices[256];
+
+    if (vocab_size == 0u || num_centroids == 0u || top_k == 0u) {
+        if (threadIdx.x == 0u) dst[0] = 0u;
+        return;
+    }
+    if (top_k > 128u) top_k = 128u;
+    unsigned int cluster_size = vocab_size / num_centroids;
+    if (cluster_size == 0u) {
+        if (threadIdx.x == 0u) dst[0] = 0u;
+        return;
+    }
+
+    if (threadIdx.x == 0u) {
+        for (unsigned int i = 0u; i < top_k; ++i) {
+            top_scores[i] = -3.402823466e+38f;
+            top_centroids[i] = 0u;
+        }
+        for (unsigned int centroid = 0u; centroid < num_centroids; ++centroid) {
+            float score = centroid_logits[centroid];
+            unsigned int insert_at = top_k;
+            for (unsigned int i = 0u; i < top_k; ++i) {
+                if (score > top_scores[i]) {
+                    insert_at = i;
+                    break;
+                }
+            }
+            if (insert_at == top_k) continue;
+            for (unsigned int i = top_k - 1u; i > insert_at; --i) {
+                top_scores[i] = top_scores[i - 1u];
+                top_centroids[i] = top_centroids[i - 1u];
+            }
+            top_scores[insert_at] = score;
+            top_centroids[insert_at] = centroid;
+        }
+    }
+    __syncthreads();
+
+    float best_score = -3.402823466e+38f;
+    unsigned int best_token = 0u;
+    if (use_inverse_ordering != 0u) {
+        for (unsigned int token = threadIdx.x; token < vocab_size; token += blockDim.x) {
+            float ordered_pos_f = token_ordering[token];
+            if (ordered_pos_f < 0.0f) continue;
+            unsigned int ordered_pos = (unsigned int)ordered_pos_f;
+            unsigned int centroid = ordered_pos / cluster_size;
+            bool selected = false;
+            for (unsigned int i = 0u; i < top_k; ++i) {
+                if (top_centroids[i] == centroid) {
+                    selected = true;
+                    break;
+                }
+            }
+            if (!selected) continue;
+            float score = logits[token];
+            if (score > best_score || (score == best_score && token < best_token)) {
+                best_score = score;
+                best_token = token;
+            }
+        }
+    } else {
+        unsigned int candidate_count = top_k * cluster_size;
+        for (unsigned int candidate = threadIdx.x; candidate < candidate_count; candidate += blockDim.x) {
+            unsigned int top_slot = candidate / cluster_size;
+            unsigned int offset = candidate - top_slot * cluster_size;
+            unsigned int ordered_pos = top_centroids[top_slot] * cluster_size + offset;
+            if (ordered_pos >= vocab_size) continue;
+            float token_f = token_ordering[ordered_pos];
+            if (token_f < 0.0f) continue;
+            unsigned int token = (unsigned int)token_f;
+            if (token >= vocab_size) continue;
+            float score = logits[token];
+            if (score > best_score || (score == best_score && token < best_token)) {
+                best_score = score;
+                best_token = token;
+            }
+        }
+    }
+
+    block_values[threadIdx.x] = best_score;
+    block_indices[threadIdx.x] = best_token;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            float rhs_score = block_values[threadIdx.x + stride];
+            unsigned int rhs_token = block_indices[threadIdx.x + stride];
+            float lhs_score = block_values[threadIdx.x];
+            unsigned int lhs_token = block_indices[threadIdx.x];
+            if (rhs_score > lhs_score || (rhs_score == lhs_score && rhs_token < lhs_token)) {
+                block_values[threadIdx.x] = rhs_score;
+                block_indices[threadIdx.x] = rhs_token;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) dst[0] = block_indices[0];
 }
 
 extern "C" __global__ void termite_linear_bias_f32(
@@ -477,6 +599,32 @@ extern "C" __global__ void termite_rms_norm_f32(
     float scale = rsqrtf(sumsq / (float)dim + eps);
     for (unsigned int i = 0; i < dim; ++i) {
         dst[base + i] = input[base + i] * scale * weight[i];
+    }
+}
+
+extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(
+    float* dst,
+    const float* input,
+    const float* weight,
+    const float* residual,
+    const float* scalar,
+    unsigned int rows,
+    unsigned int dim,
+    float eps
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    float sumsq = 0.0f;
+    const unsigned int base = row * dim;
+    for (unsigned int i = 0; i < dim; ++i) {
+        float x = input[base + i];
+        sumsq += x * x;
+    }
+    float norm_scale = rsqrtf(sumsq / (float)dim + eps);
+    float output_scale = scalar[0];
+    for (unsigned int i = 0; i < dim; ++i) {
+        unsigned int idx = base + i;
+        dst[idx] = input[idx] * norm_scale * weight[i] * output_scale + residual[idx];
     }
 }
 
@@ -1134,6 +1282,75 @@ extern "C" __global__ void termite_rope_per_item_f32(
     dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
 }
 
+extern "C" __global__ void termite_rms_norm_heads_rope_f32(
+    float* dst,
+    const float* input,
+    const float* weight,
+    unsigned int total_chunks,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    float eps,
+    float theta,
+    float freq_scale,
+    unsigned int position_offset,
+    unsigned int seq_len,
+    unsigned int chunks_per_position,
+    unsigned int consecutive_pairs,
+    float output_scale
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_chunks * head_dim;
+    if (idx >= total || head_dim == 0u) return;
+    unsigned int chunk = idx / head_dim;
+    unsigned int d = idx - chunk * head_dim;
+    unsigned int base = chunk * head_dim;
+
+    float sumsq = 0.0f;
+    for (unsigned int i = 0u; i < head_dim; ++i) {
+        float x = input[base + i];
+        sumsq += x * x;
+    }
+    float norm_scale = rsqrtf(sumsq / (float)head_dim + eps);
+
+    float value = input[base + d] * norm_scale * weight[d];
+    if (d < rope_dim && rope_dim >= 2u) {
+        unsigned int idx0;
+        unsigned int idx1;
+        unsigned int pair_index;
+        unsigned int second;
+        if (consecutive_pairs) {
+            pair_index = d >> 1u;
+            idx0 = pair_index << 1u;
+            idx1 = idx0 + 1u;
+            second = d & 1u;
+        } else {
+            unsigned int half = rope_dim >> 1u;
+            if (d < half) {
+                pair_index = d;
+                idx0 = d;
+                idx1 = d + half;
+                second = 0u;
+            } else {
+                pair_index = d - half;
+                idx0 = d - half;
+                idx1 = d;
+                second = 1u;
+            }
+        }
+        if (idx1 < head_dim) {
+            unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
+            unsigned int position = position_offset + token_pos;
+            float angle = ((float)position) * freq_scale * termite_rope_frequency(pair_index, rope_dim, theta);
+            float s = sinf(angle);
+            float c = cosf(angle);
+            float x0 = input[base + idx0] * norm_scale * weight[idx0];
+            float x1 = input[base + idx1] * norm_scale * weight[idx1];
+            value = second ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
+        }
+    }
+    dst[idx] = value * output_scale;
+}
+
 extern "C" __global__ void termite_gqa_attention_f32(
     float* dst,
     const float* q,
@@ -1575,6 +1792,17 @@ extern "C" __global__ void termite_linear_q4_k_f32_tile4(
     unsigned int out_dim
 ) {
     termite_q4k_tile_cols<4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_f32_tile8(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_q4k_tile_cols<8u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_f32_tile4(

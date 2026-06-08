@@ -51,31 +51,31 @@ pub const CudaContext = struct {
         var driver = try CudaDriver.open();
         errdefer driver.deinit();
 
-        try driver.check(driver.fns.cuInit(0));
+        checkStep(&driver, "cuInit", driver.fns.cuInit(0)) catch |err| return err;
 
         var info = DeviceInfo{};
-        try driver.check(driver.fns.cuDriverGetVersion(&info.driver_version));
-        try driver.check(driver.fns.cuDeviceGetCount(&info.device_count));
+        checkStep(&driver, "cuDriverGetVersion", driver.fns.cuDriverGetVersion(&info.driver_version)) catch |err| return err;
+        checkStep(&driver, "cuDeviceGetCount", driver.fns.cuDeviceGetCount(&info.device_count)) catch |err| return err;
         if (info.device_count <= 0) return error.NoCudaDevices;
 
         var device: CUdevice = 0;
-        try driver.check(driver.fns.cuDeviceGet(&device, 0));
+        checkStep(&driver, "cuDeviceGet", driver.fns.cuDeviceGet(&device, 0)) catch |err| return err;
         info.selected_device = device;
 
         var name_buf: [256]u8 = .{0} ** 256;
-        try driver.check(driver.fns.cuDeviceGetName(&name_buf, name_buf.len, device));
+        checkStep(&driver, "cuDeviceGetName", driver.fns.cuDeviceGetName(&name_buf, name_buf.len, device)) catch |err| return err;
         info.name = name_buf;
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
 
-        try driver.check(driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device));
+        checkStep(&driver, "cuDeviceComputeCapability", driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device)) catch |err| return err;
 
         var ctx: CUcontext = null;
-        try driver.check(driver.fns.cuDevicePrimaryCtxRetain(&ctx, device));
+        checkStep(&driver, "cuDevicePrimaryCtxRetain", driver.fns.cuDevicePrimaryCtxRetain(&ctx, device)) catch |err| return err;
         errdefer _ = driver.fns.cuDevicePrimaryCtxRelease(device);
-        try driver.check(driver.fns.cuCtxSetCurrent(ctx));
+        checkStep(&driver, "cuCtxSetCurrent", driver.fns.cuCtxSetCurrent(ctx)) catch |err| return err;
 
         var stream: CUstream = null;
-        try driver.check(driver.fns.cuStreamCreate(&stream, 0));
+        checkStep(&driver, "cuStreamCreate", driver.fns.cuStreamCreate(&stream, 0)) catch |err| return err;
         errdefer _ = driver.fns.cuStreamDestroy(stream);
 
         return .{
@@ -118,6 +118,13 @@ pub const CudaContext = struct {
         self.stats.kernel_launches += 1;
     }
 };
+
+fn checkStep(driver: *const CudaDriver, step: []const u8, result: driver_mod.CUresult) driver_mod.Error!void {
+    if (result != driver_mod.CUDA_SUCCESS) {
+        std.log.err("CUDA context init failed at {s}: {s} ({s})", .{ step, driver.errorName(result), driver.errorString(result) });
+        return error.CudaDriverError;
+    }
+}
 
 pub fn probeDefault() driver_mod.Error!DeviceInfo {
     var ctx = try CudaContext.initDefault();

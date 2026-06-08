@@ -37,8 +37,11 @@ pub const DraftRequest = struct {
 };
 
 fn targetKvDonorLayer(target_config: gpt_mod.Config, wants_sliding: bool) ?u32 {
-    if (target_config.num_kv_shared_layers == 0 or target_config.num_hidden_layers <= target_config.num_kv_shared_layers) return null;
-    const non_shared_layers = target_config.num_hidden_layers - target_config.num_kv_shared_layers;
+    if (target_config.num_hidden_layers == 0 or target_config.num_hidden_layers <= target_config.num_kv_shared_layers) return null;
+    const non_shared_layers = if (target_config.num_kv_shared_layers > 0)
+        target_config.num_hidden_layers - target_config.num_kv_shared_layers
+    else
+        target_config.num_hidden_layers;
     var donor: ?u32 = null;
     for (0..non_shared_layers) |layer| {
         if (target_config.layerUsesSlidingAttention(layer) == wants_sliding) {
@@ -52,7 +55,7 @@ fn maskedEmbeddingArgmax(
     request: DraftRequest,
     draft_cfg: gpt_mod.Config,
     assistant_hidden: ops.CT,
-    logits: []const f32,
+    logits_ct: ops.CT,
 ) !?usize {
     if (!draft_cfg.mtp_use_ordered_embeddings or draft_cfg.mtp_num_centroids == 0 or draft_cfg.mtp_centroid_intermediate_top_k == 0) return null;
     const allocator = request.allocator;
@@ -70,11 +73,31 @@ fn maskedEmbeddingArgmax(
         @intCast(num_centroids),
     );
     defer request.draft_cb.free(centroid_logits_ct);
+    const ordering_w = request.draft_cb.getWeight("masked_embedding.token_ordering") catch return null;
+    defer request.draft_cb.free(ordering_w);
+    const top_k = @min(@as(usize, @intCast(draft_cfg.mtp_centroid_intermediate_top_k)), num_centroids);
+    const use_inverse_ordering = getenvBool("ANTFLY_INFERENCE_GEMMA4_MTP_INVERSE_TOKEN_ORDERING");
+    if (!getenvBool("ANTFLY_CUDA_DISABLE_GEMMA4_MTP_DEVICE")) {
+        if (try request.draft_cb.gemma4MtpMaskedArgmax(&.{
+            .logits = logits_ct,
+            .centroid_logits = centroid_logits_ct,
+            .token_ordering = ordering_w,
+            .vocab_size = vocab_size,
+            .num_centroids = num_centroids,
+            .top_k = top_k,
+            .use_inverse_ordering = use_inverse_ordering,
+        })) |token| {
+            return @intCast(token);
+        }
+    }
+
+    const logits = try request.draft_cb.toFloat32(logits_ct, allocator);
+    defer allocator.free(logits);
+    if (logits.len < vocab_size) return error.InvalidTensorShape;
     const centroid_logits = try request.draft_cb.toFloat32(centroid_logits_ct, allocator);
     defer allocator.free(centroid_logits);
     if (centroid_logits.len != num_centroids) return error.InvalidTensorShape;
 
-    const top_k = @min(@as(usize, @intCast(draft_cfg.mtp_centroid_intermediate_top_k)), num_centroids);
     var top_centroids = try allocator.alloc(usize, top_k);
     defer allocator.free(top_centroids);
     var top_scores = try allocator.alloc(f32, top_k);
@@ -99,8 +122,6 @@ fn maskedEmbeddingArgmax(
         top_centroids[insert_at] = centroid;
     }
 
-    const ordering_w = request.draft_cb.getWeight("masked_embedding.token_ordering") catch return null;
-    defer request.draft_cb.free(ordering_w);
     const ordering_host = try request.draft_cb.toFloat32(ordering_w, allocator);
     defer allocator.free(ordering_host);
     if (ordering_host.len != vocab_size) return error.InvalidTensorShape;
@@ -108,7 +129,6 @@ fn maskedEmbeddingArgmax(
     const cluster_size = vocab_size / num_centroids;
     var best_token: usize = 0;
     var best_score = -std.math.inf(f32);
-    const use_inverse_ordering = getenvBool("ANTFLY_INFERENCE_GEMMA4_MTP_INVERSE_TOKEN_ORDERING");
     for (top_centroids) |centroid| {
         const start = centroid * cluster_size;
         const end = start + cluster_size;
@@ -139,8 +159,30 @@ fn maskedEmbeddingArgmax(
     return best_token;
 }
 
+fn hasMaskedEmbeddingWeights(cb: *const ops.ComputeBackend, draft_cfg: gpt_mod.Config) bool {
+    if (!draft_cfg.mtp_use_ordered_embeddings or draft_cfg.mtp_num_centroids == 0 or draft_cfg.mtp_centroid_intermediate_top_k == 0) return false;
+    const centroid_w = cb.getWeight("masked_embedding.centroids.weight") catch return false;
+    cb.free(centroid_w);
+    const ordering_w = cb.getWeight("masked_embedding.token_ordering") catch return false;
+    cb.free(ordering_w);
+    return true;
+}
+
 fn getenvBool(comptime name: [*:0]const u8) bool {
     return platform.env.getenvBool(name);
+}
+
+fn getMtpWeight(cb: *const ops.ComputeBackend, name: []const u8) !ops.CT {
+    return cb.getWeight(name) catch |err| {
+        if (err != error.WeightNotFound) return err;
+        var buf: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&buf, "mtp.{s}", .{name}) catch return error.NameTooLong;
+        return cb.getWeight(prefixed) catch |prefixed_err| {
+            if (prefixed_err != error.WeightNotFound) return prefixed_err;
+            const nextn_prefixed = std.fmt.bufPrint(&buf, "nextn.{s}", .{name}) catch return error.NameTooLong;
+            return cb.getWeight(nextn_prefixed);
+        };
+    };
 }
 
 /// Run one Gemma 4 MTP assistant draft step.
@@ -158,8 +200,13 @@ pub fn draftToken(request: DraftRequest) !DraftResult {
     if (!draft_cfg.gemma4_mtp_assistant or backbone_hidden == 0) return error.InvalidDraftModelForGeneration;
     if (request.activation.len != backbone_hidden) return error.InvalidTensorShape;
     if (request.target_config.hidden_size != backbone_hidden) return error.IncompatibleDraftModel;
-    draft_cfg.mtp_kv_sliding_donor_layer = targetKvDonorLayer(request.target_config, true) orelse return error.IncompatibleDraftModel;
-    draft_cfg.mtp_kv_full_donor_layer = targetKvDonorLayer(request.target_config, false) orelse return error.IncompatibleDraftModel;
+    if (request.target_config.num_kv_shared_layers == 0 and draft_cfg.mtp_num_centroids == 0) {
+        if (request.target_config.num_hidden_layers < draft_cfg.num_hidden_layers) return error.IncompatibleDraftModel;
+        draft_cfg.mtp_kv_donor_base_layer = request.target_config.num_hidden_layers - draft_cfg.num_hidden_layers;
+    } else {
+        draft_cfg.mtp_kv_sliding_donor_layer = targetKvDonorLayer(request.target_config, true) orelse return error.IncompatibleDraftModel;
+        draft_cfg.mtp_kv_full_donor_layer = targetKvDonorLayer(request.target_config, false) orelse return error.IncompatibleDraftModel;
+    }
 
     const target_embed_w = try gpt_arch.getEmbeddingWeight(request.target_cb, request.target_config);
     defer request.target_cb.free(target_embed_w);
@@ -186,7 +233,7 @@ pub fn draftToken(request: DraftRequest) !DraftResult {
     const concat_ct = try request.draft_cb.fromFloat32Shape(concat_host, &concat_shape);
     defer request.draft_cb.free(concat_ct);
 
-    const pre_w = try request.draft_cb.getWeight("pre_projection.weight");
+    const pre_w = try getMtpWeight(request.draft_cb, "pre_projection.weight");
     defer request.draft_cb.free(pre_w);
     const assistant_input = try request.draft_cb.linearNoBias(concat_ct, pre_w, 1, backbone_hidden * 2, draft_hidden);
 
@@ -203,20 +250,7 @@ pub fn draftToken(request: DraftRequest) !DraftResult {
     );
     defer request.draft_cb.free(assistant_hidden);
 
-    const draft_lm_w = try gpt_arch.getEmbeddingWeight(request.draft_cb, draft_cfg);
-    defer request.draft_cb.free(draft_lm_w);
-    const logits_ct = try request.draft_cb.linearNoBias(
-        assistant_hidden,
-        draft_lm_w,
-        1,
-        draft_hidden,
-        draft_cfg.vocab_size,
-    );
-    defer request.draft_cb.free(logits_ct);
-    const logits = try request.draft_cb.toFloat32(logits_ct, allocator);
-    defer allocator.free(logits);
-
-    const post_w = try request.draft_cb.getWeight("post_projection.weight");
+    const post_w = try getMtpWeight(request.draft_cb, "post_projection.weight");
     defer request.draft_cb.free(post_w);
     const projected = try request.draft_cb.linearNoBias(assistant_hidden, post_w, 1, draft_hidden, backbone_hidden);
     defer request.draft_cb.free(projected);
@@ -224,8 +258,38 @@ pub fn draftToken(request: DraftRequest) !DraftResult {
     errdefer allocator.free(projected_host);
     if (projected_host.len != backbone_hidden) return error.InvalidTensorShape;
 
-    const token = (try maskedEmbeddingArgmax(request, draft_cfg, assistant_hidden, logits)) orelse
-        activations.argmax(logits[0..draft_cfg.vocab_size]);
+    const draft_lm_w = try gpt_arch.getEmbeddingWeight(request.draft_cb, draft_cfg);
+    defer request.draft_cb.free(draft_lm_w);
+    const token = blk: {
+        if (!hasMaskedEmbeddingWeights(request.draft_cb, draft_cfg)) {
+            if (try request.draft_cb.linearNoBiasArgmaxLastRow(
+                assistant_hidden,
+                draft_lm_w,
+                1,
+                draft_hidden,
+                draft_cfg.vocab_size,
+            )) |token_id| {
+                break :blk @as(usize, @intCast(token_id));
+            }
+        }
+        const logits_ct = try request.draft_cb.linearNoBias(
+            assistant_hidden,
+            draft_lm_w,
+            1,
+            draft_hidden,
+            draft_cfg.vocab_size,
+        );
+        defer request.draft_cb.free(logits_ct);
+        if (try maskedEmbeddingArgmax(request, draft_cfg, assistant_hidden, logits_ct)) |token_id| {
+            break :blk token_id;
+        }
+        if (try request.draft_cb.argmaxLastRow(logits_ct, 1, @intCast(draft_cfg.vocab_size))) |token_id| {
+            break :blk @as(usize, @intCast(token_id));
+        }
+        const logits = try request.draft_cb.toFloat32(logits_ct, allocator);
+        defer allocator.free(logits);
+        break :blk activations.argmax(logits[0..draft_cfg.vocab_size]);
+    };
     return .{
         .token = token,
         .projected_activation = projected_host,

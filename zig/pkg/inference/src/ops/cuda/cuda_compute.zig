@@ -68,6 +68,9 @@ pub const RuntimeStats = struct {
     upload_syncs: usize = 0,
     download_syncs: usize = 0,
     eval_syncs: usize = 0,
+    eval_requests: usize = 0,
+    eval_skipped_eager: usize = 0,
+    eval_forced_syncs: usize = 0,
     from_float32_calls: usize = 0,
     from_float32_bytes: usize = 0,
     to_float32_calls: usize = 0,
@@ -128,6 +131,12 @@ pub const RuntimeStats = struct {
     qkv_fused_f32: usize = 0,
     qkv_fallback_unsupported: usize = 0,
     qkv_kernel_unavailable: usize = 0,
+    q4k_decode_fast_hits: usize = 0,
+    q4k_decode_fast_fallbacks: usize = 0,
+    head_norm_rope_fused_hits: usize = 0,
+    head_norm_rope_fused_fallbacks: usize = 0,
+    mtp_masked_argmax_hits: usize = 0,
+    mtp_masked_argmax_fallbacks: usize = 0,
 };
 
 fn noteTopTransferSize(sizes: *[RuntimeStats.top_transfer_size_count]usize, counts: *[RuntimeStats.top_transfer_size_count]usize, bytes: usize) void {
@@ -752,8 +761,14 @@ fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
 
 fn evalTensorOp(ctx: *anyopaque, _: CT) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.stats.eval_requests += 1;
+    if (!cudaForceEvalSync()) {
+        self.stats.eval_skipped_eager += 1;
+        return;
+    }
     try self.ctx.synchronize();
     self.stats.eval_syncs += 1;
+    self.stats.eval_forced_syncs += 1;
 }
 
 fn createTensor(
@@ -970,6 +985,18 @@ fn quantPlanFormatForTensor(tensor: *const CudaTensor) quant_matmul.Format {
 
 fn cudaAllowPlannedFallback() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_ALLOW_PLANNED_FALLBACK", false);
+}
+
+fn cudaForceEvalSync() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_FORCE_EVAL_SYNC", false);
+}
+
+fn cudaEnableQ4KDecodeFast() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_Q4K_DECODE_FAST", false);
+}
+
+fn cudaDisableHeadNormRopeFusion() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_HEAD_NORM_ROPE_FUSION", false);
 }
 
 fn recordQuantMatmulPlan(self: *CudaCompute, weight_tensor: *const CudaTensor, op_plan: operator_plan.OperatorPlan) !void {
@@ -1389,7 +1416,23 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
             .known => |known| switch (known) {
                 .Q8_0 => try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 .Q4_0 => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                .Q4_K => try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                .Q4_K => {
+                    if (rows == 1 and cudaEnableQ4KDecodeFast()) {
+                        var used_fallback = false;
+                        self.kernels.launchLinearQ4KTile8F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |err| switch (err) {
+                            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                                used_fallback = true;
+                                self.stats.q4k_decode_fast_fallbacks += 1;
+                                try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                            },
+                            else => return err,
+                        };
+                        if (!used_fallback) self.stats.q4k_decode_fast_hits += 1;
+                    } else {
+                        if (rows == 1) self.stats.q4k_decode_fast_fallbacks += 1;
+                        try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                    }
+                },
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,
@@ -1445,6 +1488,45 @@ fn linearNoBiasArgmaxLastRowTensor(ctx: *anyopaque, input: CT, weight: CT, rows:
     errdefer self.allocator.free(shape);
     shape[0] = 1;
     return createTensorWithDType(self, token_device, shape, 1, .i32);
+}
+
+fn gemma4MtpMaskedArgmax(ctx: *anyopaque, request: *const ops.Gemma4MtpMaskedArgmaxRequest) anyerror!?u32 {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const logits_tensor = tensorFromCt(request.logits);
+    const centroid_tensor = tensorFromCt(request.centroid_logits);
+    const ordering_tensor = tensorFromCt(request.token_ordering);
+    try ensureF32(logits_tensor);
+    try ensureF32(centroid_tensor);
+    try ensureF32(ordering_tensor);
+    if (request.vocab_size == 0 or request.num_centroids == 0 or request.top_k == 0) return null;
+    try ensureCount(logits_tensor, request.vocab_size);
+    try ensureCount(centroid_tensor, request.num_centroids);
+    try ensureCount(ordering_tensor, request.vocab_size);
+
+    var token_device = try allocDeviceBuffer(self, @sizeOf(u32));
+    defer releaseDeviceBuffer(self, &token_device);
+    const launched = try self.kernels.launchGemma4MtpMaskedArgmaxF32(
+        &self.ctx,
+        token_device,
+        logits_tensor.buffer,
+        centroid_tensor.buffer,
+        ordering_tensor.buffer,
+        request.vocab_size,
+        request.num_centroids,
+        request.top_k,
+        request.use_inverse_ordering,
+    );
+    if (!launched) {
+        self.stats.mtp_masked_argmax_fallbacks += 1;
+        return null;
+    }
+    self.stats.launch_argmax += 1;
+    self.stats.mtp_masked_argmax_hits += 1;
+    var token: u32 = 0;
+    try copyToHostTracked(self, token_device, std.mem.asBytes(&token));
+    try self.ctx.synchronize();
+    self.stats.download_syncs += 1;
+    return token;
 }
 
 fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_weight: CT, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) anyerror!?ops.LinearNoBiasTripleResult {
@@ -1785,6 +1867,31 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn rmsNormAddMultiplyScalarTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const weight_tensor = tensorFromCt(weight);
+    const residual_tensor = tensorFromCt(residual);
+    const scalar_tensor = tensorFromCt(scalar);
+    if (!platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_RMSNORM_ADD_MUL_SCALAR_FUSION", false)) return null;
+    try ensureF32(input_tensor);
+    try ensureF32(weight_tensor);
+    try ensureF32(residual_tensor);
+    try ensureF32(scalar_tensor);
+    if (input_tensor.elem_count != residual_tensor.elem_count or !sameShape(input_tensor.shape, residual_tensor.shape)) return error.InvalidShape;
+    if (dim == 0 or input_tensor.elem_count % dim != 0) return error.InvalidShape;
+    try ensureCount(weight_tensor, dim);
+    try ensureCount(scalar_tensor, 1);
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchRmsNormAddMulScalarF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, residual_tensor.buffer, scalar_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    self.stats.launch_norm += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
 fn rmsNormBare(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -2005,6 +2112,27 @@ fn activationMultiply(ctx: *anyopaque, gate: CT, up: CT, activation: ops.Decoder
     try self.kernels.launchActivationMultiplyF32(&self.ctx, device, gate_tensor.buffer, up_tensor.buffer, gate_tensor.elem_count, @intFromEnum(activation));
     self.stats.launch_elementwise += 1;
     return createTensor(self, device, shape, gate_tensor.elem_count);
+}
+
+fn addMultiplyScalarTensor(ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a_tensor = tensorFromCt(a);
+    const b_tensor = tensorFromCt(b);
+    const scalar_tensor = tensorFromCt(scalar);
+    if (!platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_ADD_MUL_SCALAR_FUSION", false)) return null;
+    try ensureF32(a_tensor);
+    try ensureF32(b_tensor);
+    try ensureF32(scalar_tensor);
+    if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) return error.InvalidShape;
+    try ensureCount(scalar_tensor, 1);
+
+    const shape = try dupeShape(self.allocator, a_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchAddMulScalarF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, scalar_tensor.buffer, a_tensor.elem_count);
+    self.stats.launch_elementwise += 1;
+    return createTensor(self, device, shape, a_tensor.elem_count);
 }
 
 fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -2741,6 +2869,36 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn rmsNormHeadsRope(ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (cudaDisableHeadNormRopeFusion()) {
+        self.stats.head_norm_rope_fused_fallbacks += 1;
+        return null;
+    }
+    const input_tensor = tensorFromCt(input);
+    const weight_tensor = tensorFromCt(weight);
+    try ensureF32(input_tensor);
+    try ensureF32(weight_tensor);
+    if (rows == 0 or total_dim == 0 or head_dim == 0 or total_dim % head_dim != 0 or rope_dim == 0 or rope_dim > head_dim or rope_dim % 2 != 0 or seq_len == 0) return error.InvalidShape;
+    try ensureCount(input_tensor, try checkedMul(rows, total_dim));
+    try ensureCount(weight_tensor, head_dim);
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    self.kernels.launchRmsNormHeadsRopeF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            self.stats.head_norm_rope_fused_fallbacks += 1;
+            return null;
+        },
+        else => return err,
+    };
+    self.stats.head_norm_rope_fused_hits += 1;
+    self.stats.launch_norm += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
 fn ropeScaled(ctx: *anyopaque, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -2842,6 +3000,7 @@ const vtable = ops.ComputeBackend.VTable{
     .argmaxLastRow = &argmaxLastRow,
     .linearNoBiasArgmaxLastRow = &linearNoBiasArgmaxLastRow,
     .linearNoBiasArgmaxLastRowTensor = &linearNoBiasArgmaxLastRowTensor,
+    .gemma4MtpMaskedArgmax = &gemma4MtpMaskedArgmax,
     .linearNoBiasQkv = &linearNoBiasQkv,
     .linearPair = &linearPair,
     .linearTriple = &linearTriple,
@@ -2849,9 +3008,12 @@ const vtable = ops.ComputeBackend.VTable{
     .addScalar = &addScalar,
     .siluMultiply = &siluMultiply,
     .activationMultiply = &activationMultiply,
+    .addMultiplyScalarTensor = &addMultiplyScalarTensor,
     .layerNorm = &layerNorm,
     .addLayerNorm = &addLayerNorm,
     .rmsNorm = &rmsNorm,
+    .rmsNormAddMultiplyScalarTensor = &rmsNormAddMultiplyScalarTensor,
+    .rmsNormHeadsRope = &rmsNormHeadsRope,
     .rmsNormBare = &rmsNormBare,
     .gelu = &gelu,
     .relu = &relu,

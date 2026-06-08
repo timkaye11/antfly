@@ -47,6 +47,8 @@ const hf_tokenizer = tokenizer_mod.hf;
 const graph_mod = @import("../graph/root.zig");
 const pjrt_executor_mod = if (build_options.enable_pjrt) @import("../graph/pjrt_executor.zig") else struct {};
 
+pub var gemma4_mtp_debug_override: bool = false;
+
 pub const Message = struct {
     pub const ContentPart = union(enum) {
         text: []const u8,
@@ -216,9 +218,18 @@ pub const SpeculativeDecodeStats = struct {
     accepted_tokens: usize = 0,
     correction_tokens: usize = 0,
     bonus_tokens: usize = 0,
+    adaptive_fallbacks: usize = 0,
+    mtp_enabled: bool = false,
+    mtp_disabled_reason: ?[]const u8 = null,
+    mtp_acceptance_gate_fallbacks: usize = 0,
 
     pub fn rejectedDraftTokens(self: SpeculativeDecodeStats) usize {
         return self.drafted_tokens -| self.matched_draft_tokens;
+    }
+
+    pub fn acceptancePermille(self: SpeculativeDecodeStats) usize {
+        if (self.drafted_tokens == 0) return 0;
+        return (self.matched_draft_tokens * 1000) / self.drafted_tokens;
     }
 };
 
@@ -324,7 +335,7 @@ fn enableGenerationStageDebug() bool {
 }
 
 fn enableGemma4MtpDebug() bool {
-    return getenvBool("TERMITE_DEBUG_GEMMA4_MTP");
+    return gemma4_mtp_debug_override or getenvBool("ANTFLY_GEMMA4_MTP_DEBUG") or getenvBool("TERMITE_DEBUG_GEMMA4_MTP");
 }
 
 fn traceGraphExecutorOutputs() bool {
@@ -339,6 +350,46 @@ fn debugGenerationStage(comptime fmt: []const u8, args: anytype) void {
 fn debugGemma4Mtp(comptime fmt: []const u8, args: anytype) void {
     if (!enableGemma4MtpDebug()) return;
     std.debug.print("gemma4_mtp_debug: " ++ fmt ++ "\n", args);
+}
+
+fn debugGemma4MtpLogitChoice(prefix: []const u8, index: usize, logits: []const f32, draft_token: ?i64, target_token: usize) void {
+    if (!enableGemma4MtpDebug()) return;
+    var top1_token: usize = 0;
+    var top2_token: usize = 0;
+    var top1_score = -std.math.inf(f32);
+    var top2_score = -std.math.inf(f32);
+    for (logits, 0..) |score, token| {
+        if (score > top1_score) {
+            top2_score = top1_score;
+            top2_token = top1_token;
+            top1_score = score;
+            top1_token = token;
+        } else if (score > top2_score) {
+            top2_score = score;
+            top2_token = token;
+        }
+    }
+    const margin = top1_score - top2_score;
+    if (draft_token) |draft| {
+        std.debug.print(
+            "gemma4_mtp_debug: {s} index={d} draft={d} target={d} top1={d} top2={d} margin={d:.6}\n",
+            .{ prefix, index, draft, target_token, top1_token, top2_token, margin },
+        );
+    } else {
+        std.debug.print(
+            "gemma4_mtp_debug: {s} index={d} target={d} top1={d} top2={d} margin={d:.6}\n",
+            .{ prefix, index, target_token, top1_token, top2_token, margin },
+        );
+    }
+}
+
+fn gemma4MtpMinAcceptancePermille() usize {
+    const configured = platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_MIN_ACCEPTANCE_PERMILLE") orelse 500;
+    return @min(configured, 1000);
+}
+
+fn gemma4MtpAcceptanceProbeDrafts() usize {
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_ACCEPTANCE_PROBE_DRAFTS") orelse 8;
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -1260,6 +1311,7 @@ pub const NativeGenerationPipeline = struct {
     pjrt_client: ?*anyopaque = null,
 
     const prefetch_drain_budget_per_step: usize = 4;
+    const default_mtp_zero_match_fallback_rounds: usize = 1;
 
     fn rejectUnsupportedDeepSeekV4GraphMode(self: *const NativeGenerationPipeline) !void {
         if (!NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config)) return;
@@ -1365,8 +1417,23 @@ pub const NativeGenerationPipeline = struct {
         // the target. When grammar constraints are active, draft proposals
         // remain unconstrained but target-side verification still applies the
         // grammar at each accepted position.
+        const draft_is_gemma4_mtp = if (self.draft_gpt_config) |cfg| cfg.gemma4_mtp_assistant else false;
+        const draft_is_nextn_gemma4_mtp = if (self.draft_gpt_config) |cfg|
+            cfg.gemma4_mtp_assistant and cfg.mtp_num_centroids == 0 and cfg.mtp_backbone_hidden_size == self.gpt_config.hidden_size
+        else
+            false;
+        const disable_unshared_gemma4_mtp =
+            draft_is_gemma4_mtp and
+            !draft_is_nextn_gemma4_mtp and
+            self.gpt_config.num_kv_shared_layers == 0 and
+            !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET");
+        if (disable_unshared_gemma4_mtp) {
+            std.log.warn("Gemma4 MTP disabled: target has no shared-KV metadata; set ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET=1 to force experimental MTP", .{});
+        }
+        const draft_requested = self.draft_cb != null and self.draft_gpt_config != null;
         const use_speculative = self.draft_cb != null and
-            self.draft_gpt_config != null;
+            self.draft_gpt_config != null and
+            !disable_unshared_gemma4_mtp;
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
         if (use_speculative and self.speculativeUsesDeepSeekV4CompressedCache()) return error.DeepSeekV4CompressedSpeculativeDecodingNotSupported;
 
@@ -1561,6 +1628,12 @@ pub const NativeGenerationPipeline = struct {
         var finish_reason: []const u8 = "length";
         var tokens_generated: usize = 0;
         var speculative_stats = SpeculativeDecodeStats{};
+        if (draft_requested) {
+            speculative_stats.mtp_enabled = use_speculative and draft_is_gemma4_mtp;
+            if (disable_unshared_gemma4_mtp) {
+                speculative_stats.mtp_disabled_reason = "target_missing_shared_kv_metadata";
+            }
+        }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
         var emitted_text: []u8 = if (stream_enabled) try allocator.dupe(u8, "") else &.{};
         defer if (stream_enabled) allocator.free(emitted_text);
@@ -1703,6 +1776,20 @@ pub const NativeGenerationPipeline = struct {
 
             // Speculative decode loop
             if (!first_is_eos and !first_outcome.grammar_complete) {
+                var mtp_zero_match_rounds: usize = 0;
+                const mtp_zero_match_fallback_rounds: usize = if (use_gemma4_mtp)
+                    platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_ZERO_MATCH_FALLBACK_ROUNDS") orelse default_mtp_zero_match_fallback_rounds
+                else
+                    default_mtp_zero_match_fallback_rounds;
+                const mtp_acceptance_probe_drafts: usize = if (use_gemma4_mtp)
+                    gemma4MtpAcceptanceProbeDrafts()
+                else
+                    0;
+                const mtp_min_acceptance_permille: usize = if (use_gemma4_mtp)
+                    gemma4MtpMinAcceptancePermille()
+                else
+                    0;
+                var mtp_acceptance_gate_checked = false;
                 while (tokens_generated < max_tokens) {
                     const remaining = max_tokens - tokens_generated;
                     const step_k = @min(config.speculative_k, @as(u32, @intCast(remaining)));
@@ -1743,6 +1830,14 @@ pub const NativeGenerationPipeline = struct {
                     speculative_stats.correction_tokens += @intFromBool(result.correction_added);
                     speculative_stats.bonus_tokens += @intFromBool(result.had_bonus);
 
+                    if (use_gemma4_mtp and result.drafted > 0) {
+                        if (result.matched_drafts == 0) {
+                            mtp_zero_match_rounds += 1;
+                        } else {
+                            mtp_zero_match_rounds = 0;
+                        }
+                    }
+
                     tokens_generated += result.accepted;
                     if (stream_enabled and result.accepted > 0) {
                         const keep_streaming = try self.emitDecodedDelta(
@@ -1765,6 +1860,77 @@ pub const NativeGenerationPipeline = struct {
 
                     if (result.hit_eos or result.hit_grammar_stop) {
                         finish_reason = "stop";
+                        break;
+                    }
+
+                    if (use_gemma4_mtp and
+                        !mtp_acceptance_gate_checked and
+                        mtp_acceptance_probe_drafts > 0 and
+                        speculative_stats.drafted_tokens >= mtp_acceptance_probe_drafts and
+                        speculative_stats.acceptancePermille() < mtp_min_acceptance_permille and
+                        tokens_generated < max_tokens)
+                    {
+                        mtp_acceptance_gate_checked = true;
+                        speculative_stats.adaptive_fallbacks += 1;
+                        speculative_stats.mtp_acceptance_gate_fallbacks += 1;
+                        debugGemma4Mtp(
+                            "acceptance gate fallback drafted={d} matched={d} acceptance_permille={d} threshold_permille={d}",
+                            .{
+                                speculative_stats.drafted_tokens,
+                                speculative_stats.matched_draft_tokens,
+                                speculative_stats.acceptancePermille(),
+                                mtp_min_acceptance_permille,
+                            },
+                        );
+                        var fallback_prefill_logits: ?[]f32 = null;
+                        defer if (fallback_prefill_logits) |logits| allocator.free(logits);
+                        var fallback_greedy_token: ?usize = null;
+                        const fallback = try self.standardDecode(
+                            token_ids,
+                            &seq_len,
+                            decode_state,
+                            config,
+                            &fallback_prefill_logits,
+                            &fallback_greedy_token,
+                            &penalty_state,
+                            if (token_table) |*tt| tt else null,
+                            &json_grammar,
+                            if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
+                            max_tokens - tokens_generated,
+                            prompt_token_count,
+                            if (stream_enabled) on_token_fn else null,
+                            if (stream_enabled) on_token_ctx else null,
+                            if (stream_enabled) &emitted_text else null,
+                        );
+                        tokens_generated += fallback.tokens_generated;
+                        finish_reason = fallback.finish_reason;
+                        break;
+                    }
+
+                    if (use_gemma4_mtp and mtp_zero_match_fallback_rounds > 0 and mtp_zero_match_rounds >= mtp_zero_match_fallback_rounds and tokens_generated < max_tokens) {
+                        speculative_stats.adaptive_fallbacks += 1;
+                        var fallback_prefill_logits: ?[]f32 = null;
+                        defer if (fallback_prefill_logits) |logits| allocator.free(logits);
+                        var fallback_greedy_token: ?usize = null;
+                        const fallback = try self.standardDecode(
+                            token_ids,
+                            &seq_len,
+                            decode_state,
+                            config,
+                            &fallback_prefill_logits,
+                            &fallback_greedy_token,
+                            &penalty_state,
+                            if (token_table) |*tt| tt else null,
+                            &json_grammar,
+                            if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
+                            max_tokens - tokens_generated,
+                            prompt_token_count,
+                            if (stream_enabled) on_token_fn else null,
+                            if (stream_enabled) on_token_ctx else null,
+                            if (stream_enabled) &emitted_text else null,
+                        );
+                        tokens_generated += fallback.tokens_generated;
+                        finish_reason = fallback.finish_reason;
                         break;
                     }
 
@@ -1830,7 +1996,7 @@ pub const NativeGenerationPipeline = struct {
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
-            .speculative = if (use_speculative) speculative_stats else null,
+            .speculative = if (use_speculative or draft_requested) speculative_stats else null,
             .allocator = allocator,
         };
     }
@@ -2178,7 +2344,7 @@ pub const NativeGenerationPipeline = struct {
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             if (self.io) |io| {
-                                if (self.graph_cache == null and decode_runtime.kvView() != null and tokens_generated > 0) {
+                                if (self.graph_cache == null and decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) {
                                     used_decode_microbatch = true;
                                     owns_last_logits = true;
                                     break :logits_blk try self.runScheduledDecodeBatch(scheduler, lease, io, decode_state, token_ids[seq_len.* - 1], seq_len.*);
@@ -2189,7 +2355,7 @@ pub const NativeGenerationPipeline = struct {
                     }
 
                     self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-                    const query_seq_len = if (decode_runtime.kvView() != null and tokens_generated > 0) 1 else seq_len.*;
+                    const query_seq_len = if (decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
                     const decode_context = decode_runtime.makeDecodeContext(seq_len.*, query_seq_len);
                     const input_ids = if (query_seq_len == seq_len.*)
                         token_ids[0..seq_len.*]
@@ -2326,7 +2492,7 @@ pub const NativeGenerationPipeline = struct {
             decoder_runtime_debug_stats.graph_blocked += 1;
             return null;
         }
-        if (tokens_generated == 0) {
+        if (tokens_generated == 0 and decode_runtime.kvView() == null) {
             decoder_runtime_debug_stats.first_token_blocked += 1;
             return null;
         }
@@ -3081,6 +3247,9 @@ pub const NativeGenerationPipeline = struct {
         const actual_k = @min(k, 16);
         var draft_count: usize = 0;
         const draft_ctx = decode_state.gptDecodeContext(seq_len.*, 1);
+        var assistant_ctx = draft_ctx;
+        assistant_ctx.total_sequence_len = 1;
+        assistant_ctx.query_sequence_len = 1;
 
         for (0..actual_k) |_| {
             const source_token = token_ids[seq_len.* + draft_count - 1];
@@ -3092,7 +3261,7 @@ pub const NativeGenerationPipeline = struct {
                 .draft_config = draft_pipeline.gpt_config,
                 .token_id = source_token,
                 .activation = activation,
-                .decode_context = &draft_ctx,
+                .decode_context = &assistant_ctx,
             });
             if (activation.ptr != last_activation.*.?.ptr) allocator.free(activation);
             activation = draft_result.projected_activation;
@@ -3291,6 +3460,7 @@ pub const NativeGenerationPipeline = struct {
                 gbnf_grammar,
             );
             const target_choice = outcome.token;
+            debugGemma4MtpLogitChoice("verify", i, pos_logits, draft_tokens[i], target_choice);
             debugGemma4Mtp("verify index={d} draft={d} target={d}", .{
                 i,
                 draft_tokens[i],
@@ -3342,6 +3512,7 @@ pub const NativeGenerationPipeline = struct {
                 gbnf_grammar,
             );
             const bonus_token = outcome.token;
+            debugGemma4MtpLogitChoice("bonus", draft_tokens.len, bonus_logits, null, bonus_token);
             debugGemma4Mtp("bonus index={d} target={d}", .{
                 draft_tokens.len,
                 bonus_token,

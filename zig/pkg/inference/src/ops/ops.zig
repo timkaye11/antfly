@@ -165,6 +165,16 @@ pub const SampleLastRowRequest = struct {
     token_history: []const i64 = &.{},
 };
 
+pub const Gemma4MtpMaskedArgmaxRequest = struct {
+    logits: CT,
+    centroid_logits: CT,
+    token_ordering: CT,
+    vocab_size: usize,
+    num_centroids: usize,
+    top_k: usize,
+    use_inverse_ordering: bool = false,
+};
+
 pub const TakeRowsRequest = struct {
     input: CT,
     row_ids: []const u32,
@@ -893,6 +903,18 @@ pub const ComputeBackend = struct {
         /// Backends may fuse the common gated-FFN activation/multiply pair.
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 
+        /// Y = (A + B) * scalar[0]. Backends may fuse residual add and a
+        /// device-resident scalar multiply used by per-layer output scales.
+        addMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT = null,
+
+        /// Y = (rms_norm(input, weight, dim, eps) + residual) * scalar[0].
+        /// Backends may fuse Gemma-style post-norm residual epilogues.
+        rmsNormAddMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = rope(rms_norm_heads(input, weight, eps), ...), optionally scaled.
+        /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
+        rmsNormHeadsRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT = null,
+
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
@@ -1326,6 +1348,11 @@ pub const ComputeBackend = struct {
         /// the token id as a backend tensor. Used by decode paths that want to
         /// feed the next token back into the backend without a host upload.
         linearNoBiasArgmaxLastRowTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
+
+        /// Gemma4 MTP masked embedding selection. Backends may keep centroid
+        /// top-k and restricted-token argmax on device; callers fall back to
+        /// the portable host implementation when unsupported.
+        gemma4MtpMaskedArgmax: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedArgmaxRequest) anyerror!?u32 = null,
 
         /// Prepare a backend-owned whole-token greedy decode runtime for a
         /// decoder-only model. Backends return false when unsupported so the
@@ -2526,6 +2553,21 @@ pub const ComputeBackend = struct {
         return op(self.ptr, gate, up, activation);
     }
 
+    pub fn addMultiplyScalarTensor(self: *const ComputeBackend, a: CT, b: CT, scalar: CT) !?CT {
+        const op = self.vtable.addMultiplyScalarTensor orelse return null;
+        return op(self.ptr, a, b, scalar);
+    }
+
+    pub fn rmsNormAddMultiplyScalarTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) !?CT {
+        const op = self.vtable.rmsNormAddMultiplyScalarTensor orelse return null;
+        return op(self.ptr, input, weight, residual, scalar, dim, eps);
+    }
+
+    pub fn rmsNormHeadsRope(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) !?CT {
+        const op = self.vtable.rmsNormHeadsRope orelse return null;
+        return op(self.ptr, input, weight, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale);
+    }
+
     pub fn rope(self: *const ComputeBackend, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !CT {
         return self.vtable.rope(self.ptr, input, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
     }
@@ -2657,6 +2699,13 @@ pub const ComputeBackend = struct {
     pub fn linearNoBiasArgmaxLastRowTensor(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !?CT {
         if (self.vtable.linearNoBiasArgmaxLastRowTensor) |op| {
             return op(self.ptr, input, weight, rows, in_dim, out_dim);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpMaskedArgmax(self: *const ComputeBackend, request: *const Gemma4MtpMaskedArgmaxRequest) !?u32 {
+        if (self.vtable.gemma4MtpMaskedArgmax) |op| {
+            return op(self.ptr, request);
         }
         return null;
     }

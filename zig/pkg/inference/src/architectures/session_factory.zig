@@ -2323,11 +2323,13 @@ fn collectMissingRequiredGptWeights(
         if (config.family == .qwen2 or config.family == .phi) {
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.bias", .{layer});
         }
-        try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
-        if (config.family == .qwen2 or config.family == .phi) {
-            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.bias", .{layer});
+        if (!config.gemma4_mtp_assistant) {
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+            if (config.family == .qwen2 or config.family == .phi) {
+                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.bias", .{layer});
+            }
         }
-        if (!config.layerOmitsVProj(layer)) {
+        if (!config.gemma4_mtp_assistant and !config.layerOmitsVProj(layer)) {
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
             if (config.family == .qwen2 or config.family == .phi) {
                 try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.v_proj.bias", .{layer});

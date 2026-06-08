@@ -26,11 +26,13 @@ const graph_mod = @import("graph/root.zig");
 const onnx_decoder_only_vlm = @import("pipelines/onnx_decoder_only_vlm.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const manifest_mod = @import("models/manifest.zig");
+const gpt_mod = @import("models/gpt.zig");
 const runtime = @import("runtime/root.zig");
 const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
+const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
@@ -79,6 +81,9 @@ const Options = struct {
     print_prompt: bool = false,
     print_chat_template_status: bool = false,
     print_timing: bool = false,
+    debug_mtp: bool = false,
+    debug_gemma4_target: bool = false,
+    disable_gemma_embedding_scale: bool = false,
     host_budget_mb: usize = 0,
     backend_budget_mb: usize = 0,
     combined_budget_mb: usize = 0,
@@ -324,9 +329,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
 
+    generation.gemma4_mtp_debug_override = opts.debug_mtp;
+    try warmInitCudaBeforeLargeModelScan(opts.backend);
     const model = try model_manager.loadFromDir(opts.model_dir);
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
-    const gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
+    var gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
+    if (opts.disable_gemma_embedding_scale and gpt_config.family == .gemma) {
+        gpt_config.disable_token_embedding_scale = true;
+    }
     const tokenizer = model.getTokenizer();
     if (opts.draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
@@ -536,6 +546,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
+    if (opts.debug_gemma4_target) {
+        try printGemma4TargetDebug(&cb, tokenizer, model.manifest, gpt_config, prompt_encoded.ids[0..prompt_tokens]);
+    }
     var draft_cb: ?ops.ComputeBackend = if (draft_model) |loaded|
         session_factory.getComputeBackendWithBudget(loaded.session, allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
@@ -1050,6 +1063,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
+                    .{
+                        cuda_stats.eval_requests,
+                        cuda_stats.eval_skipped_eager,
+                        cuda_stats.eval_forced_syncs,
+                    },
+                );
+                print(
                     "cuda_runtime_bytes: h2d={d} d2h={d} d2d={d} resident_weights={d} device_allocated={d}\n",
                     .{
                         cuda_stats.h2d_bytes,
@@ -1166,6 +1187,27 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_q4k_fast_counts: decode_hits={d} decode_fallbacks={d}\n",
+                    .{
+                        cuda_stats.q4k_decode_fast_hits,
+                        cuda_stats.q4k_decode_fast_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_head_norm_rope_counts: fused_hits={d} fused_fallbacks={d}\n",
+                    .{
+                        cuda_stats.head_norm_rope_fused_hits,
+                        cuda_stats.head_norm_rope_fused_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_mtp_counts: masked_argmax_hits={d} masked_argmax_fallbacks={d}\n",
+                    .{
+                        cuda_stats.mtp_masked_argmax_hits,
+                        cuda_stats.mtp_masked_argmax_fallbacks,
+                    },
+                );
+                print(
                     "cuda_device_kv_counts: attempts={d} successes={d} writes={d} reads={d} fail_batch={d} fail_no_cache={d} fail_no_storage={d} fail_no_hook={d} fail_write={d} fail_read={d} fail_shape={d}\n",
                     .{
                         cuda_stats.device_kv_attempts,
@@ -1182,8 +1224,37 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
             }
+            if (draft_model) |loaded_draft| {
+                if (session_factory.getCudaRuntimeStats(loaded_draft.session)) |draft_cuda_stats| {
+                    print(
+                        "draft_cuda_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} linear={d} argmax={d} h2d={d} d2h={d} mtp_masked_argmax_hits={d} mtp_masked_argmax_fallbacks={d}\n",
+                        .{
+                            draft_cuda_stats.kernel_launches,
+                            draft_cuda_stats.stream_syncs,
+                            draft_cuda_stats.upload_syncs,
+                            draft_cuda_stats.download_syncs,
+                            draft_cuda_stats.launch_linear,
+                            draft_cuda_stats.launch_argmax,
+                            draft_cuda_stats.h2d_bytes,
+                            draft_cuda_stats.d2h_bytes,
+                            draft_cuda_stats.mtp_masked_argmax_hits,
+                            draft_cuda_stats.mtp_masked_argmax_fallbacks,
+                        },
+                    );
+                }
+            }
         }
     }
+}
+
+fn warmInitCudaBeforeLargeModelScan(backend: BackendChoice) !void {
+    if (backend != .cuda) return;
+    if (!build_options.enable_cuda) return;
+    var ctx = cuda_context.CudaContext.initDefault() catch |err| {
+        std.log.err("CUDA warm init before model load failed: {s}", .{@errorName(err)});
+        return;
+    };
+    ctx.deinit();
 }
 
 fn nanosToMillis(nanos: i128) u64 {
@@ -2013,6 +2084,14 @@ fn validateDraftTokenizerCompatibility(
     target_cfg: @import("models/gpt.zig").Config,
     draft_cfg: @import("models/gpt.zig").Config,
 ) !void {
+    if (draft_cfg.gemma4_mtp_assistant) {
+        if (draft_tokenizer.vocabSize() != target_tokenizer.vocabSize() or
+            draft_cfg.vocab_size != target_cfg.vocab_size)
+        {
+            return error.IncompatibleDraftTokenizer;
+        }
+        return;
+    }
     const target_special = target_tokenizer.specialTokens();
     const draft_special = draft_tokenizer.specialTokens();
     if (draft_tokenizer.vocabSize() != target_tokenizer.vocabSize() or
@@ -2121,6 +2200,12 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.print_chat_template_status = true;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--debug-mtp")) {
+            opts.debug_mtp = true;
+        } else if (std.mem.eql(u8, arg, "--debug-gemma4-target")) {
+            opts.debug_gemma4_target = true;
+        } else if (std.mem.eql(u8, arg, "--disable-gemma-embedding-scale")) {
+            opts.disable_gemma_embedding_scale = true;
         } else if (std.mem.eql(u8, arg, "--raw-prompt")) {
             opts.raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--no-bos")) {
@@ -2194,7 +2279,7 @@ fn printBudgetExceeded(
 fn printSpeculativeStats(result: *const generation.GenerationResult) void {
     const stats = result.speculative orelse return;
     print(
-        "speculative: rounds={d} drafted={d} matched={d} rejected={d} accepted={d} corrections={d} bonus={d}\n",
+        "speculative: rounds={d} drafted={d} matched={d} rejected={d} accepted={d} corrections={d} bonus={d} adaptive_fallbacks={d} mtp_enabled={} mtp_acceptance_permille={d} mtp_acceptance_gate_fallbacks={d}",
         .{
             stats.rounds,
             stats.drafted_tokens,
@@ -2203,8 +2288,133 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
             stats.accepted_tokens,
             stats.correction_tokens,
             stats.bonus_tokens,
+            stats.adaptive_fallbacks,
+            stats.mtp_enabled,
+            stats.acceptancePermille(),
+            stats.mtp_acceptance_gate_fallbacks,
         },
     );
+    if (stats.mtp_disabled_reason) |reason| {
+        print(" mtp_disabled_reason={s}", .{reason});
+    }
+    print("\n", .{});
+}
+
+fn printGemma4TargetDebug(
+    cb: *const ops.ComputeBackend,
+    tokenizer: tokenizer_mod.Tokenizer,
+    manifest: manifest_mod.ModelManifest,
+    cfg: gpt_mod.Config,
+    prompt_ids: []const i32,
+) !void {
+    const special = tokenizer.specialTokens();
+    print(
+        "gemma4_target_debug: family={s} hidden={d} layers={d} heads={d} kv_heads={d} global_kv_heads={d} head_dim={d} global_head_dim={d} sliding_window={d} sliding_pattern={d} kv_shared_layers={d} ple_hidden={d} rope_theta={d:.6} rope_local_theta={d:.6} rope_partial_factor={d:.6} rope_dim_override={d} final_logit_softcap={d:.6} embedding_scale={d:.6} weight_tying={} norm_offset={d:.6}\n",
+        .{
+            @tagName(cfg.family),
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.num_global_key_value_heads,
+            cfg.attention_head_dim,
+            cfg.global_head_dim,
+            cfg.sliding_window,
+            cfg.sliding_window_pattern,
+            cfg.num_kv_shared_layers,
+            cfg.ple_hidden_size,
+            cfg.rope_theta,
+            cfg.rope_local_theta,
+            cfg.rope_partial_factor,
+            cfg.rope_dim_override,
+            cfg.final_logit_softcapping,
+            cfg.tokenEmbeddingScale(),
+            cfg.weight_tying,
+            cfg.norm_weight_offset,
+        },
+    );
+    print(
+        "gemma4_tokenizer_debug: vocab={d} bos={d} eos={d} pad={d} unk={d} manifest_bos={s} manifest_eos={s} manifest_pad={s} add_bos={} add_eos={}\n",
+        .{
+            tokenizer.vocabSize(),
+            special.cls_id,
+            special.sep_id,
+            special.pad_id,
+            special.unk_id,
+            manifest.bos_token,
+            manifest.eos_token,
+            manifest.pad_token,
+            manifest.add_bos_token,
+            manifest.add_eos_token,
+        },
+    );
+    print("gemma4_prompt_debug: tokens={d} ids", .{prompt_ids.len});
+    for (prompt_ids[0..@min(prompt_ids.len, 48)]) |id| print(" {d}", .{id});
+    if (prompt_ids.len > 48) print(" ...", .{});
+    print("\n", .{});
+
+    print(
+        "gemma4_weight_debug: raw_token_embd={} model_token_embd={} raw_output={} lm_head={} raw_output_norm={} model_norm={}\n",
+        .{
+            try backendHasWeight(cb, "token_embd.weight"),
+            try backendHasWeight(cb, "model.embed_tokens.weight"),
+            try backendHasWeight(cb, "output.weight"),
+            try backendHasWeight(cb, "lm_head.weight"),
+            try backendHasWeight(cb, "output_norm.weight"),
+            try backendHasWeight(cb, "model.norm.weight"),
+        },
+    );
+    try printDebugWeightSample(cb, cfg, "model.norm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.input_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.post_attention_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.pre_feedforward_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.post_feedforward_layernorm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.self_attn.q_norm.weight");
+    try printDebugWeightSample(cb, cfg, "model.layers.0.self_attn.k_norm.weight");
+
+    const layer_samples = [_]usize{ 0, 1, 5, 6, 47 };
+    for (layer_samples) |layer| {
+        if (layer >= cfg.num_hidden_layers) continue;
+        print(
+            "gemma4_layer_debug: layer={d} sliding={} shared_tail={} donor={?} kv_heads={d} head_dim={d} rope_dim={d} rope_freq_dim={d} omits_v={}\n",
+            .{
+                layer,
+                cfg.layerUsesSlidingAttention(layer),
+                cfg.layerSharesKv(layer),
+                cfg.kvDonorLayerIndex(layer),
+                cfg.effectiveKVHeadsForLayer(layer),
+                cfg.effectiveHeadDimForLayer(layer),
+                cfg.layerRopeDim(layer),
+                cfg.layerRopeFrequencyDim(layer),
+                cfg.layerOmitsVProj(layer),
+            },
+        );
+    }
+}
+
+fn backendHasWeight(cb: *const ops.ComputeBackend, name: []const u8) !bool {
+    const weight = cb.getWeight(name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return false,
+        else => return err,
+    };
+    cb.free(weight);
+    return true;
+}
+
+fn printDebugWeightSample(cb: *const ops.ComputeBackend, cfg: gpt_mod.Config, name: []const u8) !void {
+    const weight = gpt_arch.getModelWeight(cb, cfg, name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => {
+            print("gemma4_weight_sample: {s} missing\n", .{name});
+            return;
+        },
+        else => return err,
+    };
+    defer cb.free(weight);
+    const values = try cb.toFloat32(weight, std.heap.page_allocator);
+    defer std.heap.page_allocator.free(values);
+    print("gemma4_weight_sample: {s} len={d} first", .{ name, values.len });
+    for (values[0..@min(values.len, 8)]) |value| print(" {d:.6}", .{value});
+    print("\n", .{});
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
@@ -2306,7 +2516,7 @@ fn enableMlxRawMetalWholeTokenDebug() bool {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
