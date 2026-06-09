@@ -297,6 +297,7 @@ def parse_zig_output(output: str) -> dict[str, Any]:
     preprocess_debug = extract_prefixed_json(output, "SPAN_PREPROCESS_DEBUG ")
     component_debug = extract_prefixed_json(output, "SPAN_COMPONENT_DEBUG ")
     total_component_debug = extract_prefixed_json(output, "GLINER2_TOTAL_LOSS_COMPONENT_DEBUG ")
+    classification_debug = extract_prefixed_json(output, "GLINER2_CLASSIFICATION_DEBUG ")
     return {
         "step_loss": parse_float(step.group(1)) if step else None,
         "grad_norm": parse_float(step.group(2)) if step else None,
@@ -307,6 +308,7 @@ def parse_zig_output(output: str) -> dict[str, Any]:
         "span_preprocess_debug": preprocess_debug[-1] if preprocess_debug else None,
         "span_component_debug": component_debug[-1] if component_debug else None,
         "gliner2_total_loss_components": total_component_debug[-1] if total_component_debug else None,
+        "gliner2_classification_debug": classification_debug[-1] if classification_debug else None,
     }
 
 
@@ -513,6 +515,54 @@ def compare_component_losses(py: dict[str, Any] | None, zig: dict[str, Any] | No
         delta = float(zv) - float(pv)
         field_ok = abs(delta) <= tolerance
         deltas[field] = {"python": float(pv), "zig": float(zv), "delta": delta, "ok": field_ok}
+        ok = ok and field_ok
+    return ok, deltas
+
+
+def compare_classification_debug(py: dict[str, Any] | None, zig: dict[str, Any] | None, tolerance: float) -> tuple[bool, dict[str, Any]]:
+    if not py or not zig:
+        return False, {"missing": {"python": bool(py), "zig": bool(zig)}}
+    fields = [
+        "valid_count",
+        "positive_count",
+        "label_sum",
+        "mask_sum",
+        "logits_min",
+        "logits_max",
+        "logits_mean",
+        "bce_sum",
+    ]
+    deltas: dict[str, Any] = {}
+    ok = True
+    for field in fields:
+        pv = py.get(field)
+        zv = zig.get(field)
+        if isinstance(pv, int) and isinstance(zv, int):
+            field_ok = pv == zv
+            delta = int(zv) - int(pv)
+        elif finite_number(pv) and finite_number(zv):
+            delta = float(zv) - float(pv)
+            field_ok = abs(delta) <= tolerance
+        else:
+            delta = None
+            field_ok = pv == zv
+        deltas[field] = {"python": pv, "zig": zv, "delta": delta, "ok": field_ok}
+        ok = ok and field_ok
+    for field in ("valid_logits_head", "valid_labels_head"):
+        py_values = py.get(field) or []
+        zig_values = zig.get(field) or []
+        count = min(len(py_values), len(zig_values))
+        max_delta = 0.0
+        for idx in range(count):
+            if finite_number(py_values[idx]) and finite_number(zig_values[idx]):
+                max_delta = max(max_delta, abs(float(zig_values[idx]) - float(py_values[idx])))
+        field_ok = len(py_values) == len(zig_values) and max_delta <= tolerance
+        deltas[field] = {
+            "python_len": len(py_values),
+            "zig_len": len(zig_values),
+            "max_abs_delta": max_delta,
+            "ok": field_ok,
+        }
         ok = ok and field_ok
     return ok, deltas
 
@@ -888,6 +938,27 @@ sampling.remove_classification_label_prob = 0.0
 sampling.synthetic_label_prob = 0.0
 sampling.include_true_label_prob = 1.0
 if args.no_train_shuffle:
+    def _build_classification_prefix_ordered(self, schema):
+        prefix_tokens = []
+        for struct in schema.get("json_structures", []):
+            for parent, fields in struct.items():
+                cls_fields = [
+                    (fname, fval) for fname, fval in fields.items()
+                    if isinstance(fval, dict) and "value" in fval and "choices" in fval
+                ]
+                inner = []
+                for fname, fval in cls_fields:
+                    choice_tokens = []
+                    for i, choice in enumerate(fval["choices"]):
+                        if i > 0:
+                            choice_tokens.append('|')
+                        choice_tokens.append(choice)
+                    inner.extend([fname, '('] + choice_tokens + [')', ','])
+                if inner:
+                    inner = inner[:-1]
+                    prefix_tokens.extend(['(', f"{parent}:", *inner, ')'])
+        return prefix_tokens
+
     def _process_json_structures_ordered(self, schema, schemas, labels, types, sampling):
         if "json_structures" not in schema:
             return
@@ -930,6 +1001,25 @@ if args.no_train_shuffle:
                 example_mode="descriptions" if json_descs.get(parent, {}) else "none",
             ))
             types.append("json_structures")
+
+    def _infer_from_json_ordered(self, schema):
+        schemas = []
+        labels = []
+        types = []
+        sampling = self.sampling_config if self.is_training else None
+        self._process_json_structures(schema, schemas, labels, types, sampling)
+        self._process_entities(schema, schemas, labels, types, sampling)
+        self._process_relations(schema, schemas, labels, types, sampling)
+        self._process_classifications(schema, schemas, labels, types, sampling)
+        return {
+            "schemas": schemas,
+            "structure_labels": labels,
+            "task_types": types,
+            "new_schema": schema,
+        }
+
+    trainer.processor._infer_from_json = types.MethodType(_infer_from_json_ordered, trainer.processor)
+    trainer.processor._build_classification_prefix = types.MethodType(_build_classification_prefix_ordered, trainer.processor)
     trainer.processor._process_json_structures = types.MethodType(_process_json_structures_ordered, trainer.processor)
 python_step_timings = []
 original_create_dataloader = trainer._create_dataloader
@@ -990,6 +1080,7 @@ preprocess_debug = []
 preprocess_debug_samples = []
 component_debug = []
 sample_loss_debug = []
+classification_debug = []
 if args.dump_parity:
     def _finite(value):
         value = float(value)
@@ -1042,6 +1133,7 @@ if args.dump_parity:
             pos += _token_piece_count(token)
         return out
 
+    debug_model = getattr(trainer.model, "model", trainer.model)
     original_collator_call = ExtractorCollator.__call__
     def _preprocess_sample_debug(out, sample_idx, text_tokens, schema_tokens_list, text_word_indices, text_word_counts, schema_special_indices, structure_labels, task_types):
         sample_text_tokens = text_tokens[sample_idx] if text_tokens and sample_idx < len(text_tokens) else []
@@ -1066,13 +1158,7 @@ if args.dump_parity:
         }
 
     def collator_call_with_debug(self, batch):
-        original_is_training = self.is_training
-        if args.no_train_shuffle:
-            self.is_training = False
-        try:
-            out = original_collator_call(self, batch)
-        finally:
-            self.is_training = original_is_training
+        out = original_collator_call(self, batch)
         if not preprocess_debug and getattr(out, "input_ids", None) is not None and len(out) > 0:
             text_word_indices = getattr(out, "text_word_indices", None)
             text_word_counts = getattr(out, "text_word_counts", None)
@@ -1102,7 +1188,7 @@ if args.dump_parity:
         return out
 
     ExtractorCollator.__call__ = collator_call_with_debug
-    original_compute_span_rep = trainer.model.compute_span_rep
+    original_compute_span_rep = debug_model.compute_span_rep
     span_hidden_debug = []
 
     def compute_span_rep_with_hidden_debug(self, token_embeddings):
@@ -1111,32 +1197,48 @@ if args.dump_parity:
             span_hidden_debug.append(token_embeddings.detach())
         return out
 
-    trainer.model.compute_span_rep = types.MethodType(compute_span_rep_with_hidden_debug, trainer.model)
+    debug_model.compute_span_rep = types.MethodType(compute_span_rep_with_hidden_debug, debug_model)
+    original_classifier_forward = debug_model.classifier.forward
+    classifier_forward_outputs = []
 
-    def compute_struct_loss_with_debug(self, span_rep, schema_emb, structure, span_mask, masking_rate=args.span_negative_mask_rate):
+    def classifier_forward_with_debug(self, *forward_args, **forward_kwargs):
+        out = original_classifier_forward(*forward_args, **forward_kwargs)
+        if len(classifier_forward_outputs) < 64:
+            classifier_forward_outputs.append(out.detach().squeeze(-1).cpu())
+        return out
+
+    debug_model.classifier.forward = types.MethodType(classifier_forward_with_debug, debug_model.classifier)
+
+    original_compute_struct_loss = debug_model.compute_struct_loss
+
+    def record_struct_loss_debug(self, span_rep, schema_emb, structure, span_mask, masking_rate=args.span_negative_mask_rate):
         gold_count = min(structure[0], 19)
         struct_proj = self.count_embed(schema_emb[1:], gold_count)
         scores = torch.einsum('lkd,bpd->bplk', span_rep, struct_proj)
         labs = torch.zeros_like(scores)
 
+        def _mark_position(count_idx, entity_idx, start, end):
+            width = end - start
+            if 0 <= start < scores.shape[2] and 0 <= width < scores.shape[3]:
+                labs[count_idx, entity_idx, start, width] = 1
+
+        def _visit_position(value, count_idx, entity_idx):
+            if value is None or value == (-1, -1) or value == [-1, -1]:
+                return
+            if isinstance(value, tuple) and len(value) == 2:
+                _mark_position(count_idx, entity_idx, int(value[0]), int(value[1]))
+                return
+            if isinstance(value, list):
+                if len(value) == 2 and all(isinstance(item, (int, float)) for item in value):
+                    _mark_position(count_idx, entity_idx, int(value[0]), int(value[1]))
+                    return
+                for item in value:
+                    _visit_position(item, count_idx, entity_idx)
+
         for i in range(gold_count):
             gold_spans = structure[1][i]
             for k, span in enumerate(gold_spans):
-                if span is None or span == (-1, -1):
-                    continue
-                if isinstance(span, tuple):
-                    start, end = span
-                    width = end - start
-                    if 0 <= start < scores.shape[2] and 0 <= width < scores.shape[3]:
-                        labs[i, k, start, width] = 1
-                elif isinstance(span, list):
-                    for sub in span:
-                        if sub is None or sub == (-1, -1):
-                            continue
-                        start, end = sub
-                        width = end - start
-                        if 0 <= start < scores.shape[2] and 0 <= width < scores.shape[3]:
-                            labs[i, k, start, width] = 1
+                _visit_position(span, i, k)
 
         if masking_rate > 0.0 and self.training:
             negative = (labs == 0)
@@ -1335,10 +1437,55 @@ if args.dump_parity:
             })
         return loss
 
-    Extractor.compute_struct_loss = compute_struct_loss_with_debug
-    trainer.model.compute_struct_loss = types.MethodType(compute_struct_loss_with_debug, trainer.model)
-    original_compute_sample_loss = trainer.model._compute_sample_loss
+    def compute_struct_loss_with_debug(self, span_rep, schema_emb, structure, span_mask, masking_rate=args.span_negative_mask_rate):
+        loss = original_compute_struct_loss(span_rep, schema_emb, structure, span_mask, masking_rate)
+        if not parity_debug:
+            try:
+                record_struct_loss_debug(self, span_rep, schema_emb, structure, span_mask, masking_rate)
+            except Exception as exc:
+                parity_debug.append({
+                    "debug_error": repr(exc),
+                    "official_loss": _finite(loss.detach().cpu().item()),
+                })
+        return loss
+
+    debug_model.compute_struct_loss = types.MethodType(compute_struct_loss_with_debug, debug_model)
+    original_compute_sample_loss = debug_model._compute_sample_loss
+    def _classification_debug_payload(logits, labels):
+        logits = logits.float().detach().cpu()
+        labels = torch.tensor(labels, dtype=torch.float32).detach().cpu()
+        if logits.ndim == 0:
+            logits = logits.reshape(1)
+        if labels.ndim == 0:
+            labels = labels.reshape(1)
+        count = min(int(logits.numel()), int(labels.numel()))
+        logits = logits.reshape(-1)[:count]
+        labels = labels.reshape(-1)[:count]
+        mask = torch.ones_like(labels)
+        bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+        valid = mask > 0
+        logits_valid = logits[valid] if valid.any() else logits
+        return {
+            "rows": 1,
+            "entity_types": count,
+            "logits_count": count,
+            "valid_count": int(valid.sum().item()),
+            "positive_count": int((labels > 0).sum().item()),
+            "label_sum": _finite(labels.sum().item()),
+            "mask_sum": _finite(mask.sum().item()),
+            "logits_min": _finite(logits_valid.min().item()) if logits_valid.numel() else 0.0,
+            "logits_max": _finite(logits_valid.max().item()) if logits_valid.numel() else 0.0,
+            "logits_mean": _finite(logits.mean().item()) if logits.numel() else 0.0,
+            "bce_sum": _finite((bce * mask).sum().item()),
+            "logits_head": [_finite(x) for x in logits[:16].tolist()],
+            "labels_head": [_finite(x) for x in labels[:16].tolist()],
+            "mask_head": [_finite(x) for x in mask[:16].tolist()],
+            "valid_logits_head": [_finite(x) for x in logits[valid][:16].tolist()],
+            "valid_labels_head": [_finite(x) for x in labels[valid][:16].tolist()],
+        }
+
     def compute_sample_loss_with_debug(self, *sample_args, **sample_kwargs):
+        classifier_start = len(classifier_forward_outputs)
         out = original_compute_sample_loss(*sample_args, **sample_kwargs)
         if len(sample_loss_debug) < args.batch_size:
             sample_loss_debug.append({
@@ -1346,8 +1493,34 @@ if args.dump_parity:
                 "structure_loss": _finite(out["structure"].detach().cpu().item()),
                 "count_loss": _finite(out["count"].detach().cpu().item()),
             })
+        if not classification_debug:
+            task_types = sample_kwargs.get("task_types")
+            structure_labels = sample_kwargs.get("structure_labels")
+            if task_types is None and len(sample_args) >= 3:
+                task_types = sample_args[2]
+            if structure_labels is None and len(sample_args) >= 4:
+                structure_labels = sample_args[3]
+            output_idx = classifier_start
+            logits_parts = []
+            label_parts = []
+            for idx, task_type in enumerate(task_types or []):
+                if task_type != "classifications":
+                    continue
+                if structure_labels is None or idx >= len(structure_labels):
+                    continue
+                if output_idx >= len(classifier_forward_outputs):
+                    continue
+                logits_parts.append(classifier_forward_outputs[output_idx].reshape(-1))
+                label_parts.extend(structure_labels[idx])
+                output_idx += 1
+            if logits_parts and label_parts:
+                classification_debug.append(_classification_debug_payload(
+                    torch.cat(logits_parts),
+                    label_parts,
+                ))
+            del classifier_forward_outputs[classifier_start:]
         return out
-    trainer.model._compute_sample_loss = types.MethodType(compute_sample_loss_with_debug, trainer.model)
+    debug_model._compute_sample_loss = types.MethodType(compute_sample_loss_with_debug, debug_model)
 result = trainer.train(train_data=args.train_data)
 trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in trainer.model.parameters())
@@ -1381,6 +1554,7 @@ payload = {
         }
         if sample_loss_debug else None
     ),
+    "gliner2_classification_debug": classification_debug[0] if classification_debug else None,
 }
 (out / "comparison_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 print("PYTHON_GLINER2_COMPARISON " + json.dumps(payload, sort_keys=True))
@@ -1700,6 +1874,13 @@ def main() -> int:
     zig_total_components = report.get("zig", {}).get("metrics", {}).get("gliner2_total_loss_components")
     component_loss_matches, component_loss_deltas = compare_component_losses(python_total_components, zig_total_components, args.loss_parity_tolerance)
     component_loss_focus = summarize_component_deltas(component_loss_deltas)
+    python_classification_debug = report.get("python", {}).get("metrics", {}).get("gliner2_classification_debug")
+    zig_classification_debug = report.get("zig", {}).get("metrics", {}).get("gliner2_classification_debug")
+    classification_debug_matches, classification_debug_deltas = compare_classification_debug(
+        python_classification_debug,
+        zig_classification_debug,
+        args.loss_parity_tolerance,
+    )
     zig_manifest = report.get("zig", {}).get("training_manifest", {})
     zig_warm_step_rows = zig_step_rows[1:] if len(zig_step_rows) > 1 else []
     zig_warm_total_trainer_ms = (
@@ -1917,6 +2098,8 @@ def main() -> int:
         "component_loss_parity_matches": component_loss_matches,
         "component_loss_deltas": component_loss_deltas,
         "component_loss_focus": component_loss_focus,
+        "classification_debug_matches": classification_debug_matches,
+        "classification_debug_deltas": classification_debug_deltas,
         "python_preprocess_task_breakdown": python_task_breakdown,
         "zig_manifest_backend": zig_manifest.get("backend"),
         "zig_manifest_objective": zig_manifest.get("objective"),

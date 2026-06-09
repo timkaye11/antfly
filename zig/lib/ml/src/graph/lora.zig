@@ -380,6 +380,18 @@ test "injectLoRA by_weight keeps one adapter for shared weight uses" {
 
     try std.testing.expectEqual(@as(usize, 1), result.adapter.adapters.items.len);
     try std.testing.expectEqualStrings("shared.q_proj.weight.lora_A", result.adapter.adapters.items[0].lora_a_name);
+    const info = result.adapter.adapters.items[0];
+    var lora_a_uses: usize = 0;
+    var lora_b_uses: usize = 0;
+    for (0..result.graph.nodeCount()) |idx| {
+        const node = result.graph.node(@intCast(idx));
+        if (node.op == .fused_linear_no_bias) {
+            if (node.inputs[1] == info.lora_a_id) lora_a_uses += 1;
+            if (node.inputs[1] == info.lora_b_id) lora_b_uses += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), lora_a_uses);
+    try std.testing.expectEqual(@as(usize, 2), lora_b_uses);
 }
 
 /// Merge LoRA weights back into base weights: W' = W + scale * B @ A.

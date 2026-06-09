@@ -1082,6 +1082,19 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     opts.seq_len,
                 );
                 printGliner2TotalLossComponentDebug(components);
+                const classification_logits = try gliner2_autodiff.gliner2ClassificationLogitsForBatch(
+                    allocator,
+                    &trainer,
+                    &gliner_ctx,
+                    input_ids[0 .. ab * sl],
+                    attention_mask[0 .. ab * sl],
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    opts.seq_len,
+                );
+                defer allocator.free(classification_logits);
+                try printGliner2ClassificationDebug(classification_logits, target_slice, targets_shape, entity_types.len);
             }
 
             const result = try trainer.step(trainer_input);
@@ -2586,6 +2599,120 @@ fn printGliner2TotalLossComponentDebug(components: gliner2_autodiff.Gliner2Total
             components.total_loss,
         },
     );
+}
+
+fn printGliner2ClassificationDebug(
+    logits: []const f32,
+    targets: []const f32,
+    targets_shape: ml.graph.Shape,
+    entity_types: usize,
+) !void {
+    if (entity_types == 0) return error.InvalidEntityTypes;
+    if (targets_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
+    const rows: usize = @intCast(targets_shape.dims[0]);
+    const target_width: usize = @intCast(targets_shape.dims[1]);
+    if (targets.len != rows * target_width) return error.InvalidGlinerSpanTargetShape;
+    if (logits.len != rows * entity_types) return error.InvalidGlinerSpanLogitsShape;
+    const label_offset = gliner2_autodiff.gliner2TotalLossClassificationLabelsOffset(entity_types);
+    const mask_offset = gliner2_autodiff.gliner2TotalLossClassificationMaskOffset(entity_types);
+    if (target_width < mask_offset + entity_types) return error.InvalidGlinerSpanTargetShape;
+
+    var valid_count: usize = 0;
+    var positive_count: usize = 0;
+    var logits_min: f64 = std.math.inf(f64);
+    var logits_max: f64 = -std.math.inf(f64);
+    var logits_sum: f64 = 0.0;
+    var label_sum: f64 = 0.0;
+    var mask_sum: f64 = 0.0;
+    var bce_sum: f64 = 0.0;
+
+    for (0..rows) |row_idx| {
+        const target_row = row_idx * target_width;
+        const logit_row = row_idx * entity_types;
+        for (0..entity_types) |entity_idx| {
+            const label = @as(f64, @floatCast(targets[target_row + label_offset + entity_idx]));
+            const mask = @as(f64, @floatCast(targets[target_row + mask_offset + entity_idx]));
+            const logit = @as(f64, @floatCast(logits[logit_row + entity_idx]));
+            label_sum += label;
+            mask_sum += mask;
+            if (label > 0.0) positive_count += 1;
+            if (mask > 0.0) {
+                valid_count += 1;
+                logits_min = @min(logits_min, logit);
+                logits_max = @max(logits_max, logit);
+                logits_sum += logit;
+                bce_sum += stableBceWithLogits(logit, label) * mask;
+            }
+        }
+    }
+
+    if (valid_count == 0) {
+        logits_min = 0.0;
+        logits_max = 0.0;
+    }
+    const logits_mean = if (valid_count > 0) logits_sum / @as(f64, @floatFromInt(valid_count)) else 0.0;
+    print(
+        "GLINER2_CLASSIFICATION_DEBUG {{\"rows\":{d},\"entity_types\":{d},\"logits_count\":{d},\"valid_count\":{d},\"positive_count\":{d},\"label_sum\":{d:.9},\"mask_sum\":{d:.9},\"logits_min\":{d:.9},\"logits_max\":{d:.9},\"logits_mean\":{d:.9},\"bce_sum\":{d:.9},\"logits_head\":[",
+        .{
+            rows,
+            entity_types,
+            logits.len,
+            valid_count,
+            positive_count,
+            label_sum,
+            mask_sum,
+            logits_min,
+            logits_max,
+            logits_mean,
+            bce_sum,
+        },
+    );
+    const head_count = @min(logits.len, 16);
+    for (0..head_count) |idx| {
+        if (idx != 0) print(",", .{});
+        print("{d:.9}", .{logits[idx]});
+    }
+    print("],\"labels_head\":[", .{});
+    const label_head_count = @min(rows * entity_types, 16);
+    for (0..label_head_count) |idx| {
+        if (idx != 0) print(",", .{});
+        const row_idx = idx / entity_types;
+        const entity_idx = idx % entity_types;
+        print("{d:.1}", .{targets[row_idx * target_width + label_offset + entity_idx]});
+    }
+    print("],\"mask_head\":[", .{});
+    for (0..label_head_count) |idx| {
+        if (idx != 0) print(",", .{});
+        const row_idx = idx / entity_types;
+        const entity_idx = idx % entity_types;
+        print("{d:.1}", .{targets[row_idx * target_width + mask_offset + entity_idx]});
+    }
+    print("],\"valid_logits_head\":[", .{});
+    var valid_printed: usize = 0;
+    outer: for (0..rows) |row_idx| {
+        const target_row = row_idx * target_width;
+        const logit_row = row_idx * entity_types;
+        for (0..entity_types) |entity_idx| {
+            if (targets[target_row + mask_offset + entity_idx] <= 0.0) continue;
+            if (valid_printed != 0) print(",", .{});
+            print("{d:.9}", .{logits[logit_row + entity_idx]});
+            valid_printed += 1;
+            if (valid_printed >= 16) break :outer;
+        }
+    }
+    print("],\"valid_labels_head\":[", .{});
+    valid_printed = 0;
+    outer_labels: for (0..rows) |row_idx| {
+        const target_row = row_idx * target_width;
+        for (0..entity_types) |entity_idx| {
+            if (targets[target_row + mask_offset + entity_idx] <= 0.0) continue;
+            if (valid_printed != 0) print(",", .{});
+            print("{d:.1}", .{targets[target_row + label_offset + entity_idx]});
+            valid_printed += 1;
+            if (valid_printed >= 16) break :outer_labels;
+        }
+    }
+    print("]}}\n", .{});
 }
 
 fn printSpanPreprocessDebug(batch: *const gliner2_data.EncodedBatch) void {

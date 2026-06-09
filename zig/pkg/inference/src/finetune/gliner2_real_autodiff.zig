@@ -157,6 +157,7 @@ pub const GlinerAutodiffCtx = struct {
     span_debug_count_out2: ?NodeId = null,
     span_debug_schema_projection: ?NodeId = null,
     gliner2_structure_loss: ?NodeId = null,
+    gliner2_classification_logits: ?NodeId = null,
     gliner2_classification_loss: ?NodeId = null,
     gliner2_count_loss: ?NodeId = null,
     graph_batch: u32 = 0,
@@ -287,6 +288,7 @@ pub const GlinerAutodiffCtx = struct {
         if (self.span_debug_count_out2) |node_id| self.span_debug_count_out2 = id_map[node_id];
         if (self.span_debug_schema_projection) |node_id| self.span_debug_schema_projection = id_map[node_id];
         if (self.gliner2_structure_loss) |node_id| self.gliner2_structure_loss = id_map[node_id];
+        if (self.gliner2_classification_logits) |node_id| self.gliner2_classification_logits = id_map[node_id];
         if (self.gliner2_classification_loss) |node_id| self.gliner2_classification_loss = id_map[node_id];
         if (self.gliner2_count_loss) |node_id| self.gliner2_count_loss = id_map[node_id];
     }
@@ -644,6 +646,7 @@ pub const GlinerAutodiffCtx = struct {
         const classifier_act = try bld.relu(classifier_0);
         const classifier_logits_flat = try linearNamed(bld, classifier_act, "classifier.2.weight", "classifier.2.bias", rows * E, H * 2, 1);
         const classifier_logits = try bld.reshape(classifier_logits_flat, Shape.init(.f32, &.{ @intCast(rows), @intCast(E) }));
+        self.gliner2_classification_logits = classifier_logits;
         const labels = try bld.sliceLastDim(targets, labels_offset, labels_offset + @as(i64, @intCast(E)));
         const mask = try bld.sliceLastDim(targets, mask_offset, mask_offset + @as(i64, @intCast(E)));
         return buildMaskedSpanStartBceLoss(
@@ -1361,6 +1364,43 @@ pub fn tokenLogitsForBatch(
     }
 
     return executeEvalGraphOutputToFloat32(allocator, trainer, &gs.graph, rt_inputs.items);
+}
+
+pub fn gliner2ClassificationLogitsForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    targets: []const f32,
+    targets_shape: Shape,
+    batch: u32,
+    seq_len: u32,
+) ![]f32 {
+    if (ctx.config.objective != .gliner2_total_loss) return error.InvalidGlinerObjective;
+    const trainer_input = makeTrainerInput(
+        ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        targets_shape,
+        batch,
+        seq_len,
+    );
+    try trainer.ensureGraphBuilt(trainer_input);
+    const logits_node = ctx.gliner2_classification_logits orelse return error.MissingGliner2ClassificationLossNode;
+    return evalSpanStartNodeForBatch(
+        allocator,
+        trainer,
+        ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        targets_shape,
+        batch,
+        seq_len,
+        logits_node,
+    );
 }
 
 pub fn spanStartLogitsForBatch(
