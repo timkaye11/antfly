@@ -10,6 +10,7 @@ from ..models.inference_generate_request_backend import InferenceGenerateRequest
 from ..models.inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from ..models.inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from ..models.inference_generate_request_mode import InferenceGenerateRequestMode
+from ..models.inference_generate_request_speculative_method import InferenceGenerateRequestSpeculativeMethod
 from ..models.inference_tool_choice_type_0 import InferenceToolChoiceType0
 from ..types import UNSET, Unset
 
@@ -51,6 +52,9 @@ class InferenceGenerateRequest:
             Grammar-constrained decoding is currently native-backend only.
         draft_model (str | Unset): inference-native speculative decoding extension. Path or model identifier for a
             smaller draft model.
+        speculative_method (InferenceGenerateRequestSpeculativeMethod | Unset): inference-native speculative decoding
+            method. `ar` uses autoregressive draft verification; `dflash` uses Gemma4 DFlash block drafting.
+            Default: InferenceGenerateRequestSpeculativeMethod.AR.
         speculative_k (int | Unset): inference-native speculative decoding extension. Number of draft tokens proposed
             per verification round.
              Default: 4.
@@ -100,6 +104,7 @@ class InferenceGenerateRequest:
     response_format: InferenceGenerateResponseFormat | Unset = UNSET
     grammar: str | Unset = UNSET
     draft_model: str | Unset = UNSET
+    speculative_method: InferenceGenerateRequestSpeculativeMethod | Unset = InferenceGenerateRequestSpeculativeMethod.AR
     speculative_k: int | Unset = 4
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
@@ -149,6 +154,10 @@ class InferenceGenerateRequest:
         grammar = self.grammar
 
         draft_model = self.draft_model
+
+        speculative_method: str | Unset = UNSET
+        if not isinstance(self.speculative_method, Unset):
+            speculative_method = self.speculative_method.value
 
         speculative_k = self.speculative_k
 
@@ -212,6 +221,8 @@ class InferenceGenerateRequest:
             field_dict["grammar"] = grammar
         if draft_model is not UNSET:
             field_dict["draft_model"] = draft_model
+        if speculative_method is not UNSET:
+            field_dict["speculative_method"] = speculative_method
         if speculative_k is not UNSET:
             field_dict["speculative_k"] = speculative_k
         if cache_dtype is not UNSET:
@@ -284,6 +295,13 @@ class InferenceGenerateRequest:
 
         draft_model = d.pop("draft_model", UNSET)
 
+        _speculative_method = d.pop("speculative_method", UNSET)
+        speculative_method: InferenceGenerateRequestSpeculativeMethod | Unset
+        if isinstance(_speculative_method, Unset):
+            speculative_method = UNSET
+        else:
+            speculative_method = InferenceGenerateRequestSpeculativeMethod(_speculative_method)
+
         speculative_k = d.pop("speculative_k", UNSET)
 
         _cache_dtype = d.pop("cache_dtype", UNSET)
@@ -351,6 +369,7 @@ class InferenceGenerateRequest:
             response_format=response_format,
             grammar=grammar,
             draft_model=draft_model,
+            speculative_method=speculative_method,
             speculative_k=speculative_k,
             cache_dtype=cache_dtype,
             cache_compaction_ratio=cache_compaction_ratio,

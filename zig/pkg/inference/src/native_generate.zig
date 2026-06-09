@@ -19,6 +19,7 @@ const backends = @import("backends/backends.zig");
 const decoder_gated_runtime = @import("backends/decoder_gated_runtime.zig");
 const debug_timing = @import("debug_timing.zig");
 const ops = @import("ops/ops.zig");
+const gemma4_dflash = @import("architectures/gemma4_dflash.zig");
 const gpt_arch = @import("architectures/gpt.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
@@ -71,6 +72,8 @@ const Options = struct {
     prefill_chunk_size: usize = 0,
     draft_model: ?[]const u8 = null,
     speculative_k: u32 = 4,
+    speculative_k_set: bool = false,
+    speculative_method: generation.SpeculativeMethod = .ar,
     no_chat_template: bool = false,
     print_finish_reason: bool = false,
     print_token_count: bool = false,
@@ -97,6 +100,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const opts = try parseArgs(args);
     try native_backend_choice.validate(opts.backend);
     if (opts.draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
+    if (opts.speculative_method == .dflash and opts.draft_model == null) return error.DFlashRequiresDraftModel;
+    if (opts.speculative_method == .dflash and opts.backend != .auto and opts.backend != .metal) return error.DFlashRequiresMetalBackend;
+    if (opts.speculative_method == .dflash and !gemma4_dflash.isDeterministicSampling(.{
+        .temperature = opts.temperature,
+        .top_p = opts.top_p,
+        .top_k = opts.top_k,
+        .repetition_penalty = opts.repetition_penalty,
+    })) return error.DFlashRequiresDeterministicSampling;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -171,6 +182,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .prefill_chunk_size = opts.prefill_chunk_size,
         .draft_model = opts.draft_model,
         .speculative_k = opts.speculative_k,
+        .speculative_method = opts.speculative_method,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
     };
 
@@ -1911,11 +1923,18 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingDraftModel;
             opts.draft_model = args[i];
+        } else if (std.mem.eql(u8, arg, "--speculative-method")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSpeculativeMethod;
+            opts.speculative_method = generation.parseSpeculativeMethod(args[i]) orelse return error.InvalidSpeculativeMethod;
+        } else if (std.mem.startsWith(u8, arg, "--speculative-method=")) {
+            opts.speculative_method = generation.parseSpeculativeMethod(arg["--speculative-method=".len..]) orelse return error.InvalidSpeculativeMethod;
         } else if (std.mem.eql(u8, arg, "--speculative-k")) {
             i += 1;
             if (i >= args.len) return error.MissingSpeculativeK;
             opts.speculative_k = try std.fmt.parseInt(u32, args[i], 10);
             if (opts.speculative_k == 0) return error.InvalidSpeculativeK;
+            opts.speculative_k_set = true;
         } else if (std.mem.eql(u8, arg, "--image")) {
             i += 1;
             if (i >= args.len) return error.MissingImagePath;
@@ -1982,6 +2001,9 @@ fn parseArgs(args: []const []const u8) !Options {
         }
     }
 
+    if (opts.speculative_method == .dflash and !opts.speculative_k_set) {
+        opts.speculative_k = 16;
+    }
     return opts;
 }
 
@@ -2016,9 +2038,14 @@ fn printBudgetExceeded(
 
 fn printSpeculativeStats(result: *const generation.GenerationResult) void {
     const stats = result.speculative orelse return;
+    const method: []const u8 = switch (stats.method) {
+        .ar => "ar",
+        .dflash => "dflash",
+    };
     print(
-        "speculative: rounds={d} drafted={d} matched={d} rejected={d} accepted={d} corrections={d} bonus={d}\n",
+        "speculative: method={s} rounds={d} drafted={d} matched={d} rejected={d} accepted={d} corrections={d} bonus={d}\n",
         .{
+            method,
             stats.rounds,
             stats.drafted_tokens,
             stats.matched_draft_tokens,
@@ -2028,6 +2055,22 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
             stats.bonus_tokens,
         },
     );
+    if (stats.method == .dflash) {
+        print(
+            "dflash: draft_block_ns={d} feature_fusion_ns={d} kv_injection_ns={d} verification_ns={d} feature_extractions={d} device_feature_captures={d} host_fallbacks={d} full_tensor_download_bytes={d} max_accepted={d}\n",
+            .{
+                stats.dflash_draft_block_nanos,
+                stats.dflash_feature_fusion_nanos,
+                stats.dflash_kv_injection_nanos,
+                stats.dflash_verification_nanos,
+                stats.dflash_feature_extractions,
+                stats.dflash_device_feature_captures,
+                stats.dflash_host_fallbacks,
+                stats.dflash_full_tensor_download_bytes,
+                stats.dflash_max_accepted_in_round,
+            },
+        );
+    }
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
@@ -2129,7 +2172,7 @@ fn enableMlxRawMetalWholeTokenDebug() bool {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-method ar|dflash] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
@@ -2200,6 +2243,33 @@ test "parseArgs accepts compiled target" {
     try std.testing.expectEqual(BackendChoice.xla, opts.backend);
     try std.testing.expectEqual(ExecutionMode.compiled, opts.mode.?);
     try std.testing.expectEqual(CompiledTarget.whole_model, opts.compiled_target.?);
+}
+
+test "parseArgs accepts DFlash speculative method" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--draft-model",
+        "/tmp/draft",
+        "--speculative-method",
+        "dflash",
+    });
+    try std.testing.expectEqual(generation.SpeculativeMethod.dflash, opts.speculative_method);
+    try std.testing.expectEqual(@as(u32, 16), opts.speculative_k);
+}
+
+test "parseArgs preserves explicit DFlash block size" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--draft-model",
+        "/tmp/draft",
+        "--speculative-method=dflash",
+        "--speculative-k",
+        "8",
+    });
+    try std.testing.expectEqual(generation.SpeculativeMethod.dflash, opts.speculative_method);
+    try std.testing.expectEqual(@as(u32, 8), opts.speculative_k);
 }
 
 test "explicit compiled whole model does not route through live executor" {

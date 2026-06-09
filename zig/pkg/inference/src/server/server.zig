@@ -42,6 +42,7 @@ const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
+const gemma4_dflash = @import("../architectures/gemma4_dflash.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const document_classification = @import("../pipelines/document_classification.zig");
@@ -2180,6 +2181,21 @@ pub const Node = struct {
 
         const want_stream = body.stream orelse false;
         const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
+        const speculative_method = if (body.speculative_method) |method|
+            generation.parseSpeculativeMethod(method) orelse {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "speculative_method must be ar or dflash",
+                });
+            }
+        else
+            generation.SpeculativeMethod.ar;
+        if (speculative_method == .dflash and effective_draft_model_name == null) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "speculative_method=dflash requires draft_model",
+            });
+        }
         const queue_units = self.estimateGenerateQueueUnits(messages.items, configured_max_tokens);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
         defer self.releaseSlotUnits(queue_units);
@@ -2194,9 +2210,10 @@ pub const Node = struct {
             .frequency_penalty = body.frequency_penalty orelse 0,
             .presence_penalty = body.presence_penalty orelse 0,
             .speculative_k = if (effective_draft_model_name != null)
-                if (body.speculative_k) |k| @intCast(@max(k, 1)) else 4
+                if (body.speculative_k) |k| @intCast(@max(k, 1)) else if (speculative_method == .dflash) 16 else 4
             else
                 4,
+            .speculative_method = speculative_method,
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
@@ -2211,6 +2228,26 @@ pub const Node = struct {
                 },
             });
         };
+        if (speculative_method == .dflash and backend_selection.native_choice != .auto and backend_selection.native_choice != .metal) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = generation.userFacingErrorMessage(error.DFlashRequiresMetalBackend),
+            });
+        }
+        if (speculative_method == .dflash and !gemma4_dflash.isDeterministicSampling(.{
+            .temperature = config.temperature,
+            .top_p = config.top_p,
+            .top_k = config.top_k,
+            .min_p = config.min_p,
+            .repetition_penalty = config.repetition_penalty,
+            .frequency_penalty = config.frequency_penalty,
+            .presence_penalty = config.presence_penalty,
+        })) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = generation.userFacingErrorMessage(error.DFlashRequiresDeterministicSampling),
+            });
+        }
         const allow_onnx = effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
@@ -2262,6 +2299,20 @@ pub const Node = struct {
                 compiled.deinit();
             }
             config.grammar = grammar;
+        }
+        if (speculative_method == .dflash and config.grammar != null) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "speculative_method=dflash does not support grammar-constrained decoding yet",
+            });
+        }
+        if (speculative_method == .dflash and
+            (generation.messagesHaveImages(messages.items) or generation.messagesHaveAudio(messages.items)))
+        {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "speculative_method=dflash supports text-only Gemma4 prompts in this milestone",
+            });
         }
 
         // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
@@ -2580,6 +2631,14 @@ pub const Node = struct {
                         .@"error" = "INVALID_REQUEST",
                         .message = "draft_model tokenizer is incompatible with target model",
                     });
+                }
+                if (speculative_method == .dflash) {
+                    gemma4_dflash.validatePair(gpt_config, draft_cfg) catch |err| {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = generation.userFacingErrorMessage(err),
+                        });
+                    };
                 }
 
                 draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {

@@ -1245,6 +1245,13 @@ pub const ComputeBackend = struct {
         /// they grow true paged KV implementations.
         gqaPagedAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, attention: AttentionContext, batch: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// Non-causal GQA cross-attention with independent query and K/V lengths.
+        /// Q: [batch*q_len, num_heads*head_dim], K/V: [batch*kv_len, num_kv_heads*head_dim].
+        /// Returns [batch*q_len, num_heads*head_dim]. This is used by DFlash
+        /// masked drafting where target context K/V and noisy block K/V are
+        /// concatenated and every draft query may attend to the full K/V span.
+        gqaCrossAttentionFull: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, q_len: usize, kv_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!?CT = null,
+
         /// Create a tensor from raw f32 data. The data is copied (caller retains ownership).
         fromFloat32: *const fn (ctx: *anyopaque, data: []const f32) anyerror!CT,
 
@@ -2472,6 +2479,13 @@ pub const ComputeBackend = struct {
 
     pub fn gqaPagedAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, attention: AttentionContext, batch: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !CT {
         return self.vtable.gqaPagedAttention(self.ptr, Q, K, V, attn_bias, attention, batch, num_heads, num_kv_heads, head_dim);
+    }
+
+    pub fn gqaCrossAttentionFull(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, q_len: usize, kv_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !?CT {
+        if (self.vtable.gqaCrossAttentionFull) |op| {
+            return op(self.ptr, Q, K, V, attn_bias, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim);
+        }
+        return null;
     }
 
     pub fn fromFloat32(self: *const ComputeBackend, data: []const f32) !CT {

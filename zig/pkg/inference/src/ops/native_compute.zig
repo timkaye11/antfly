@@ -4428,6 +4428,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .ropePerItem = &ropePerItemOp,
     .gqaCausalAttention = &gqaCausalAttentionOp,
     .gqaPagedAttention = &gqaPagedAttentionOp,
+    .gqaCrossAttentionFull = &gqaCrossAttentionFullOp,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
     .toFloat32 = &toFloat32Op,
@@ -34791,6 +34792,16 @@ fn gqaCausalAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias
     return gqaAttentionSlices(self, Q, K, V, bias, null, 0, null, seq_len, batch, seq_len, seq_len, 0, 0, num_heads, num_kv_heads, head_dim);
 }
 
+fn gqaCrossAttentionFullOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, q_len: usize, kv_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const Q = getData(q_ct);
+    const K = getData(k_ct);
+    const V = getData(v_ct);
+    const bias: ?[]f32 = if (attn_bias_ct) |b| getData(b) else null;
+    const output = try gqaCrossAttentionFullHost(self.allocator, Q, K, V, bias, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim);
+    return self.makeBuf(output, true);
+}
+
 fn attentionSinkScores(sink: AttentionSinkMetadata, num_heads: usize) !?[]const f32 {
     if (sink.per_head_tensor) |tensor| {
         const scores = getData(tensor);
@@ -35035,6 +35046,76 @@ pub fn gqaCausalAttentionNaiveHost(
         }
     }
 
+    return output;
+}
+
+pub fn gqaCrossAttentionFullHost(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    batch: usize,
+    q_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    if (q_len == 0 or kv_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    if (num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
+    const h_q = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const h_kv = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
+    if (Q.len != batch * q_len * h_q) return error.InvalidAttentionShape;
+    if (K.len != batch * kv_len * h_kv) return error.InvalidAttentionShape;
+    if (V.len != batch * kv_len * h_kv) return error.InvalidAttentionShape;
+    if (bias) |bias_data| {
+        if (bias_data.len != num_heads * q_len * kv_len) return error.InvalidAttentionShape;
+    }
+
+    const output = try allocator.alloc(f32, batch * q_len * h_q);
+    errdefer allocator.free(output);
+    @memset(output, 0.0);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const heads_per_group = num_heads / num_kv_heads;
+    var scores = try allocator.alloc(f32, kv_len);
+    defer allocator.free(scores);
+
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..q_len) |qi| {
+                const q_base = (b * q_len + qi) * h_q + h * head_dim;
+                var row_max: f32 = -std.math.inf(f32);
+                for (0..kv_len) |ki| {
+                    const k_base = (b * kv_len + ki) * h_kv + kv_h * head_dim;
+                    var score: f32 = 0.0;
+                    for (0..head_dim) |d| score += Q[q_base + d] * K[k_base + d];
+                    score *= scale;
+                    if (bias) |bias_data| score += bias_data[h * q_len * kv_len + qi * kv_len + ki];
+                    scores[ki] = score;
+                    row_max = @max(row_max, score);
+                }
+
+                var denom: f32 = 0.0;
+                for (scores) |*score| {
+                    score.* = @exp(score.* - row_max);
+                    denom += score.*;
+                }
+                if (denom == 0.0) continue;
+                const inv_denom = 1.0 / denom;
+                const out_base = (b * q_len + qi) * h_q + h * head_dim;
+                for (0..kv_len) |ki| {
+                    const weight = scores[ki] * inv_denom;
+                    const v_base = (b * kv_len + ki) * h_kv + kv_h * head_dim;
+                    for (0..head_dim) |d| {
+                        output[out_base + d] += weight * V[v_base + d];
+                    }
+                }
+            }
+        }
+    }
     return output;
 }
 
@@ -43969,6 +44050,43 @@ test "gqa causal attention matches naive reference" {
         if (diff > max_diff) max_diff = diff;
     }
     try std.testing.expect(max_diff < 1e-4);
+}
+
+test "gqa cross attention full attends to future KV rows and GQA groups" {
+    const allocator = std.testing.allocator;
+    {
+        const q = [_]f32{1.0};
+        const k = [_]f32{ 0.0, 10.0 };
+        const v = [_]f32{ 1.0, 5.0 };
+        const out = try gqaCrossAttentionFullHost(allocator, &q, &k, &v, null, 1, 1, 2, 1, 1, 1);
+        defer allocator.free(out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expect(out[0] > 4.99);
+    }
+    {
+        const batch: usize = 1;
+        const q_len: usize = 2;
+        const kv_len: usize = 4;
+        const num_heads: usize = 4;
+        const num_kv_heads: usize = 2;
+        const head_dim: usize = 3;
+        const h_q = num_heads * head_dim;
+        const h_kv = num_kv_heads * head_dim;
+        var q: [batch * q_len * h_q]f32 = undefined;
+        var k: [batch * kv_len * h_kv]f32 = undefined;
+        var v: [batch * kv_len * h_kv]f32 = undefined;
+        for (&q, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 17)) - 8)) / 9.0;
+        for (&k, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 19)) - 9)) / 10.0;
+        for (&v, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 23)) - 11)) / 11.0;
+        const out = try gqaCrossAttentionFullHost(allocator, &q, &k, &v, null, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim);
+        defer allocator.free(out);
+        try std.testing.expectEqual(q.len, out.len);
+        var any_nonzero = false;
+        for (out) |value| {
+            if (@abs(value) > 1e-6) any_nonzero = true;
+        }
+        try std.testing.expect(any_nonzero);
+    }
 }
 
 test "compressed-key paged attention scores encoded keys directly" {

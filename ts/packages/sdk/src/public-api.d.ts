@@ -8502,6 +8502,12 @@ export interface components {
             /** @description inference-native speculative decoding extension. Path or model identifier for a smaller draft model. */
             draft_model?: string;
             /**
+             * @description inference-native speculative decoding method. `ar` uses autoregressive draft verification; `dflash` uses Gemma4 DFlash block drafting.
+             * @default ar
+             * @enum {string}
+             */
+            speculative_method?: "ar" | "dflash";
+            /**
              * @description inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
              * @default 4
              */

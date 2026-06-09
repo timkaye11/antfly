@@ -39,6 +39,7 @@ const jinja = @import("jinja");
 const grammar_mod = @import("grammar.zig");
 const gemma3_mm = @import("gemma3_multimodal.zig");
 const gemma4_mm = @import("../architectures/gemma4_multimodal.zig");
+const gemma4_dflash = @import("../architectures/gemma4_dflash.zig");
 const gemma4_mtp = @import("../architectures/gemma4_mtp.zig");
 const gemma4_projector = @import("../architectures/gemma4_projector.zig");
 const qwen2vl_mm = @import("qwen2vl_multimodal.zig");
@@ -96,6 +97,36 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 pub fn userFacingErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.AudioInputTooLong => "audio input is too long for the Gemma4 direct audio projector; trim the clip or raise clip.audio.max_tokens in the projector metadata",
+        error.DFlashGrammarConstrainedDecodingNotSupported => "DFlash speculative decoding does not support grammar-constrained decoding yet",
+        error.DFlashRequiresDraftModel => "DFlash speculative decoding requires --draft-model",
+        error.DFlashDraftMetadataMissing => "DFlash speculative decoding requires a draft checkpoint with DFlash metadata",
+        error.DFlashRequiresGemma4Target => "DFlash speculative decoding currently supports Gemma4 targets only",
+        error.DFlashTargetHiddenSizeMismatch => "DFlash draft target hidden size does not match the target model",
+        error.DFlashVocabMismatch => "DFlash draft vocabulary must match the target model",
+        error.DFlashMoEDraftUnsupported => "DFlash draft checkpoints with MoE are not supported yet",
+        error.DFlashSlidingWindowDraftUnsupported => "DFlash draft checkpoints with sliding-window attention are not supported yet",
+        error.DFlashBlockSizeUnsupported => "DFlash block size is larger than the native implementation limit",
+        error.DFlashMaskTokenMissing => "DFlash draft config must declare mask_token_id or pad_token_id",
+        error.DFlashRequiresMetalBackend => "DFlash device-resident decoding currently requires Metal for both target and draft",
+        error.DFlashRequiresDeterministicSampling => "DFlash device-resident decoding currently requires deterministic sampling (temperature=0, no top-p/top-k/min-p or penalties)",
+        error.DFlashFeatureBankTooLarge => "DFlash feature bank capacity exceeds the native device-resident limit",
+        error.DFlashCrossContextTooLarge => "DFlash cross-context window cannot exceed the feature bank capacity",
+        error.DFlashFeatureCaptureTooLarge => "DFlash target feature capture exceeds the device feature-bank capacity",
+        error.DFlashFeatureCaptureNotDeviceResident => "DFlash target feature capture could not remain device-resident",
+        error.DFlashTargetFeatureLayersMissing => "DFlash draft metadata must declare selected target feature layers",
+        error.DFlashTargetFeatureBankIncomplete => "DFlash target feature bank is missing required captured layers",
+        error.DFlashTargetFeatureBankShapeMismatch => "DFlash target feature bank captured layers with incompatible shapes",
+        error.DFlashDeviceArgmaxUnavailable => "DFlash device-resident greedy token selection is unavailable on this backend",
+        error.DFlashDeviceRowArgmaxUnavailable => "DFlash device-resident row-wise greedy token selection is unavailable on this backend",
+        error.DFlashFusionWeightMissing => "DFlash draft checkpoint is missing a supported target-feature fusion weight",
+        error.DFlashDraftWeightMissing => "DFlash draft checkpoint is missing a required z-lab DFlash transformer weight",
+        error.DFlashKvInjectionWeightMissing => "DFlash draft checkpoint is missing a supported K/V injection weight",
+        error.DFlashNoiseEmbeddingProjectionMissing => "DFlash target embedding width differs from the DFlash draft width and no native projection is supported yet",
+        error.DFlashCrossAttentionUnavailable => "DFlash device-resident non-causal GQA cross-attention is unavailable on this backend",
+        error.DFlashDeviceKvInjectionNotImplemented => "DFlash device-resident K/V injection is not implemented yet",
+        error.DFlashDeviceMaskedDraftNotImplemented => "DFlash device-resident masked block draft forward is not implemented yet",
+        error.DFlashDeviceDraftNotImplemented => "DFlash device-resident draft fusion and KV injection are not implemented yet",
+        error.DFlashDebugHostFallbackRequested => "DFlash debug host fallback was requested",
         else => @errorName(err),
     };
 }
@@ -119,12 +150,28 @@ pub const GenerationConfig = struct {
     /// Number of candidate tokens the draft model proposes per speculation
     /// round (default 4).
     speculative_k: u32 = 4,
+    speculative_method: SpeculativeMethod = .ar,
     /// KV cache quantization format override. null = auto-select based on backend.
     cache_dtype: ?[]const u8 = null,
     /// KV cache compaction ratio after prefill. null = no compaction.
     /// 0.02 = 50x compression, 0.1 = 10x compression.
     cache_compaction_ratio: ?f32 = null,
 };
+
+pub const SpeculativeMethod = enum {
+    ar,
+    dflash,
+
+    pub fn parse(value: []const u8) ?SpeculativeMethod {
+        if (std.mem.eql(u8, value, "ar")) return .ar;
+        if (std.mem.eql(u8, value, "dflash")) return .dflash;
+        return null;
+    }
+};
+
+pub fn parseSpeculativeMethod(value: []const u8) ?SpeculativeMethod {
+    return SpeculativeMethod.parse(value);
+}
 
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
@@ -210,12 +257,22 @@ pub const GenerationResult = struct {
 };
 
 pub const SpeculativeDecodeStats = struct {
+    method: SpeculativeMethod = .ar,
     rounds: usize = 0,
     drafted_tokens: usize = 0,
     matched_draft_tokens: usize = 0,
     accepted_tokens: usize = 0,
     correction_tokens: usize = 0,
     bonus_tokens: usize = 0,
+    dflash_feature_extractions: usize = 0,
+    dflash_host_fallbacks: usize = 0,
+    dflash_draft_block_nanos: u128 = 0,
+    dflash_feature_fusion_nanos: u128 = 0,
+    dflash_kv_injection_nanos: u128 = 0,
+    dflash_verification_nanos: u128 = 0,
+    dflash_full_tensor_download_bytes: usize = 0,
+    dflash_device_feature_captures: usize = 0,
+    dflash_max_accepted_in_round: usize = 0,
 
     pub fn rejectedDraftTokens(self: SpeculativeDecodeStats) usize {
         return self.drafted_tokens -| self.matched_draft_tokens;
@@ -1347,6 +1404,7 @@ pub const NativeGenerationPipeline = struct {
         // grammar at each accepted position.
         const use_speculative = self.draft_cb != null and
             self.draft_gpt_config != null;
+        const use_dflash = use_speculative and config.speculative_method == .dflash;
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
         if (use_speculative and self.speculativeUsesDeepSeekV4CompressedCache()) return error.DeepSeekV4CompressedSpeculativeDecodingNotSupported;
 
@@ -1540,7 +1598,7 @@ pub const NativeGenerationPipeline = struct {
         const vocab_size = self.gpt_config.vocab_size;
         var finish_reason: []const u8 = "length";
         var tokens_generated: usize = 0;
-        var speculative_stats = SpeculativeDecodeStats{};
+        var speculative_stats = SpeculativeDecodeStats{ .method = if (use_speculative) config.speculative_method else .ar };
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
         var emitted_text: []u8 = if (stream_enabled) try allocator.dupe(u8, "") else &.{};
         defer if (stream_enabled) allocator.free(emitted_text);
@@ -1561,6 +1619,7 @@ pub const NativeGenerationPipeline = struct {
         defer if (gbnf_grammar) |*gg| gg.deinit();
 
         const has_any_grammar = json_grammar != null or gbnf_grammar != null;
+        if (use_dflash and has_any_grammar) return error.DFlashGrammarConstrainedDecodingNotSupported;
         var token_table: ?grammar_mod.TokenByteTable = if (has_any_grammar)
             grammar_mod.TokenByteTable.init(allocator, self.tokenizer, vocab_size) catch null
         else
@@ -1571,6 +1630,17 @@ pub const NativeGenerationPipeline = struct {
             const draft_cb = self.draft_cb.?;
             const draft_gpt_config = self.draft_gpt_config.?;
             const use_gemma4_mtp = draft_gpt_config.gemma4_mtp_assistant;
+            if (use_dflash) try gemma4_dflash.validatePair(self.gpt_config, draft_gpt_config);
+            const dflash_sampling = dflashSamplingConfig(config);
+            if (use_dflash and !gemma4_dflash.isDeterministicSampling(dflash_sampling)) {
+                return error.DFlashRequiresDeterministicSampling;
+            }
+            var dflash_state: ?DFlashRoundState = if (use_dflash)
+                try DFlashRoundState.init(allocator, &self.cb, self.gpt_config, draft_gpt_config)
+            else
+                null;
+            defer if (dflash_state) |*state| state.deinit();
+            var dflash_first_token: ?usize = null;
             var mtp_last_activation: ?[]f32 = null;
             defer if (mtp_last_activation) |activation| allocator.free(activation);
 
@@ -1582,7 +1652,7 @@ pub const NativeGenerationPipeline = struct {
             var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
 
             // Prefill draft model with the same prompt
-            try draft_runtime.notePrefill(seq_len);
+            if (!use_dflash) try draft_runtime.notePrefill(seq_len);
 
             var draft_pipeline = NativeGenerationPipeline{
                 .allocator = allocator,
@@ -1598,7 +1668,7 @@ pub const NativeGenerationPipeline = struct {
             // Prefill an ordinary draft model. Gemma 4 MTP assistants are not
             // standalone decoders: they are seeded from target activations and
             // target KV during each draft round.
-            if (!use_gemma4_mtp) {
+            if (!use_gemma4_mtp and !use_dflash) {
                 const draft_ctx = draft_runtime.makeDecodeContext(seq_len, seq_len);
                 const draft_prefill_logits = try draft_pipeline.forwardAllLogits(token_ids[0..seq_len], 1, seq_len, &draft_ctx);
                 allocator.free(draft_prefill_logits);
@@ -1607,7 +1677,18 @@ pub const NativeGenerationPipeline = struct {
             // Also prefill the target if we haven't yet (non-chunked path)
             if (prefill_last_logits == null) {
                 const target_ctx = decode_runtime.makeDecodeContext(seq_len, seq_len);
-                if (use_gemma4_mtp) {
+                if (use_dflash) {
+                    const state = &(dflash_state.?);
+                    const capture = try self.forwardGreedyDFlashTargetTokenAndCaptureDevice(
+                        token_ids[0..seq_len],
+                        1,
+                        seq_len,
+                        &target_ctx,
+                        &state.feature_bank,
+                    );
+                    state.noteCaptures(capture.device_feature_captures);
+                    dflash_first_token = capture.token;
+                } else if (use_gemma4_mtp) {
                     var target_prefill = try self.forwardAllLogitsAndHiddenHost(token_ids[0..seq_len], 1, seq_len, &target_ctx);
                     defer target_prefill.deinit();
                     prefill_last_logits = try allocator.dupe(
@@ -1627,6 +1708,8 @@ pub const NativeGenerationPipeline = struct {
                         target_prefill_logits[(seq_len - 1) * vocab_size ..][0..vocab_size],
                     );
                 }
+            } else if (use_dflash) {
+                return error.DFlashDeviceArgmaxUnavailable;
             } else if (use_gemma4_mtp and mtp_last_activation == null) {
                 const target_ctx = decode_runtime.makeDecodeContext(seq_len, 1);
                 var target_last = try self.forwardAllLogitsAndHiddenHost(token_ids[seq_len - 1 .. seq_len], 1, seq_len, &target_ctx);
@@ -1636,19 +1719,37 @@ pub const NativeGenerationPipeline = struct {
             }
 
             // Use prefill last logits for the first token
-            const first_outcome = try self.sampleNextToken(
-                prefill_last_logits.?,
-                config,
-                &penalty_state,
-                if (token_table) |*tt| tt else null,
-                &json_grammar,
-                if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
-            );
+            const first_outcome = if (use_dflash)
+                SampleOutcome{
+                    .token = dflash_first_token orelse return error.DFlashDeviceArgmaxUnavailable,
+                    .grammar_complete = false,
+                }
+            else
+                try self.sampleNextToken(
+                    prefill_last_logits.?,
+                    config,
+                    &penalty_state,
+                    if (token_table) |*tt| tt else null,
+                    &json_grammar,
+                    if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
+                );
             const first_token = first_outcome.token;
             token_ids[seq_len] = @intCast(first_token);
             seq_len += 1;
             tokens_generated += 1;
-            if (!use_gemma4_mtp) {
+            if (use_dflash) {
+                const state = &(dflash_state.?);
+                const first_token_ctx = decode_runtime.makeDecodeContext(seq_len, 1);
+                const captures = try self.captureDFlashTargetFeaturesDevice(
+                    token_ids[seq_len - 1 .. seq_len],
+                    1,
+                    seq_len,
+                    &first_token_ctx,
+                    &state.feature_bank,
+                );
+                state.noteCaptures(captures);
+                _ = try decode_runtime.appendGeneratedToken();
+            } else if (!use_gemma4_mtp) {
                 _ = try decode_runtime.appendGeneratedToken();
                 _ = try draft_runtime.appendGeneratedToken();
             }
@@ -1685,9 +1786,28 @@ pub const NativeGenerationPipeline = struct {
             if (!first_is_eos and !first_outcome.grammar_complete) {
                 while (tokens_generated < max_tokens) {
                     const remaining = max_tokens - tokens_generated;
-                    const step_k = @min(config.speculative_k, @as(u32, @intCast(remaining)));
+                    const requested_k = if (use_dflash)
+                        @as(u32, @intCast(gemma4_dflash.effectiveBlockSize(draft_gpt_config, config.speculative_k)))
+                    else
+                        config.speculative_k;
+                    const step_k = @min(requested_k, @as(u32, @intCast(remaining)));
 
-                    const result = if (use_gemma4_mtp)
+                    const result = if (use_dflash) blk: {
+                        const state = &(dflash_state.?);
+                        break :blk try self.speculativeDecodeDFlashGemma4(
+                            &draft_pipeline,
+                            token_ids,
+                            &seq_len,
+                            decode_state,
+                            config,
+                            step_k,
+                            &penalty_state,
+                            if (token_table) |*tt| tt else null,
+                            &json_grammar,
+                            if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
+                            state,
+                        );
+                    } else if (use_gemma4_mtp)
                         try self.speculativeDecodeGemma4Mtp(
                             &draft_pipeline,
                             token_ids,
@@ -1722,6 +1842,16 @@ pub const NativeGenerationPipeline = struct {
                     speculative_stats.accepted_tokens += result.accepted;
                     speculative_stats.correction_tokens += @intFromBool(result.correction_added);
                     speculative_stats.bonus_tokens += @intFromBool(result.had_bonus);
+                    speculative_stats.method = config.speculative_method;
+                    speculative_stats.dflash_feature_extractions += result.dflash_feature_extractions;
+                    speculative_stats.dflash_host_fallbacks += result.dflash_host_fallbacks;
+                    speculative_stats.dflash_draft_block_nanos += result.dflash_draft_block_nanos;
+                    speculative_stats.dflash_feature_fusion_nanos += result.dflash_feature_fusion_nanos;
+                    speculative_stats.dflash_kv_injection_nanos += result.dflash_kv_injection_nanos;
+                    speculative_stats.dflash_verification_nanos += result.dflash_verification_nanos;
+                    speculative_stats.dflash_full_tensor_download_bytes += result.dflash_full_tensor_download_bytes;
+                    speculative_stats.dflash_device_feature_captures += result.dflash_device_feature_captures;
+                    speculative_stats.dflash_max_accepted_in_round = @max(speculative_stats.dflash_max_accepted_in_round, result.accepted);
 
                     tokens_generated += result.accepted;
                     if (stream_enabled and result.accepted > 0) {
@@ -1819,6 +1949,54 @@ pub const NativeGenerationPipeline = struct {
         last_logits: ?[]f32 = null,
         greedy_token: ?usize = null,
     };
+
+    const DFlashRoundState = struct {
+        feature_bank: gemma4_dflash.DFlashFeatureBank,
+        device_feature_captures: usize = 0,
+
+        fn init(
+            allocator: std.mem.Allocator,
+            cb: *const ops.ComputeBackend,
+            target_config: gpt_arch.Config,
+            draft_config: gpt_arch.Config,
+        ) !DFlashRoundState {
+            return .{
+                .feature_bank = try gemma4_dflash.DFlashFeatureBank.init(
+                    allocator,
+                    cb,
+                    target_config,
+                    draft_config,
+                ),
+            };
+        }
+
+        fn deinit(self: *DFlashRoundState) void {
+            self.feature_bank.deinit();
+            self.* = undefined;
+        }
+
+        fn noteCaptures(self: *DFlashRoundState, captures: usize) void {
+            self.device_feature_captures += captures;
+        }
+    };
+
+    const DFlashDeviceGreedyCaptureResult = struct {
+        token: usize,
+        device_feature_captures: usize,
+    };
+
+    const DFlashAcceptedCaptureRows = struct {
+        source_row_start: usize,
+        row_count: usize,
+    };
+
+    fn dflashAcceptedDraftCaptureRows(target_query_len: usize, verify_len: usize, matched_drafts: usize) DFlashAcceptedCaptureRows {
+        std.debug.assert(target_query_len >= verify_len);
+        return .{
+            .source_row_start = target_query_len - verify_len + 1,
+            .row_count = matched_drafts,
+        };
+    }
 
     /// Run the prefill phase: process prompt tokens through the model,
     /// either chunked (for paged KV) or in one pass. Returns the logits
@@ -2671,6 +2849,113 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn captureDFlashTargetFeaturesDevice(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        feature_bank: *gemma4_dflash.DFlashFeatureBank,
+    ) !usize {
+        try self.rejectUnsupportedDeepSeekV4GraphMode();
+        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
+        if (self.cb.kind() != .metal) return error.DFlashRequiresMetalBackend;
+        const allocator = self.allocator;
+        const query_seq_len = decode_context.query_sequence_len;
+        const total = batch * query_seq_len;
+        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
+        if (input_ids.len != total) return error.InvalidTensorShape;
+
+        const before = feature_bank.totalCaptureCount();
+        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(embed_w);
+        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
+
+        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
+        defer if (ple_vectors) |pv| self.cb.free(pv);
+
+        const hidden_result = try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0OverridesAndDFlashCapture(
+            &self.cb,
+            allocator,
+            self.gpt_config,
+            hidden_input,
+            .{},
+            batch,
+            seq_len,
+            decode_context,
+            ple_vectors,
+            .{ .feature_bank = feature_bank },
+        );
+        defer self.cb.free(hidden_result.final_hidden);
+        defer self.cb.free(hidden_result.pre_norm_hidden);
+        return feature_bank.totalCaptureCount() - before;
+    }
+
+    fn forwardGreedyDFlashTargetTokenAndCaptureDevice(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        feature_bank: *gemma4_dflash.DFlashFeatureBank,
+    ) !DFlashDeviceGreedyCaptureResult {
+        try self.rejectUnsupportedDeepSeekV4GraphMode();
+        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
+        if (self.cb.kind() != .metal) return error.DFlashRequiresMetalBackend;
+        const allocator = self.allocator;
+        const query_seq_len = decode_context.query_sequence_len;
+        const total = batch * query_seq_len;
+        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
+        if (input_ids.len != total) return error.InvalidTensorShape;
+
+        const before = feature_bank.totalCaptureCount();
+        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(embed_w);
+        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
+
+        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
+        defer if (ple_vectors) |pv| self.cb.free(pv);
+
+        const hidden_result = try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0OverridesAndDFlashCapture(
+            &self.cb,
+            allocator,
+            self.gpt_config,
+            hidden_input,
+            .{},
+            batch,
+            seq_len,
+            decode_context,
+            ple_vectors,
+            .{ .feature_bank = feature_bank },
+        );
+        defer self.cb.free(hidden_result.final_hidden);
+        defer self.cb.free(hidden_result.pre_norm_hidden);
+
+        const lm_w = if (self.gpt_config.weight_tying)
+            try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config)
+        else
+            self.cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(lm_w);
+
+        const token_tensor = (try self.cb.linearNoBiasArgmaxLastRowTensor(
+            hidden_result.final_hidden,
+            lm_w,
+            hidden_result.total_rows,
+            @intCast(self.gpt_config.hidden_size),
+            @intCast(self.gpt_config.vocab_size),
+        )) orelse return error.DFlashDeviceArgmaxUnavailable;
+        defer self.cb.free(token_tensor);
+        const ids = try self.cb.toFloat32(token_tensor, allocator);
+        defer allocator.free(ids);
+        if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+        return .{
+            .token = @intFromFloat(ids[0]),
+            .device_feature_captures = feature_bank.totalCaptureCount() - before,
+        };
+    }
+
     /// Run the forward pass through the graph IR: trace once, cache the
     /// graph, and replay it via the interpreter on subsequent calls.
     /// Returns logits for the last position, same as the eager path.
@@ -3032,6 +3317,368 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn speculativeDecodeDFlashGemma4(
+        self: *NativeGenerationPipeline,
+        draft_pipeline: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: *usize,
+        decode_state: *NativeDecodeState,
+        config: GenerationConfig,
+        k: usize,
+        penalty_state: *SamplingPenaltyState,
+        token_table: ?*const grammar_mod.TokenByteTable,
+        json_grammar: *?grammar_mod.JsonGrammar,
+        gbnf_grammar: ?*grammar_mod.GbnfGrammar,
+        dflash_state: *DFlashRoundState,
+    ) !SpeculativeRoundResult {
+        _ = .{ token_table, json_grammar, gbnf_grammar };
+        const allocator = self.allocator;
+        const round_start = seq_len.*;
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        var round_penalties = try penalty_state.clone(allocator);
+        defer round_penalties.deinit(allocator);
+
+        const policy = gemma4_dflash.fallbackPolicyFromEnv();
+        const actual_k = @min(k, gemma4_dflash.max_block_size);
+        var output_tokens: [gemma4_dflash.max_block_size]i64 = undefined;
+        const draft_started = self.monotonicNanoTimestamp();
+        const device_result = gemma4_dflash.draftBlockDevice(.{
+            .allocator = self.allocator,
+            .target_cb = &self.cb,
+            .draft_cb = &draft_pipeline.cb,
+            .target_config = self.gpt_config,
+            .draft_config = draft_pipeline.gpt_config,
+            .feature_bank = &dflash_state.feature_bank,
+            .token_context = token_ids[0..seq_len.*],
+            .current_seq_len = seq_len.*,
+            .block_size = actual_k,
+            .sampling = dflashSamplingConfig(config),
+            .policy = policy,
+            .output_tokens = output_tokens[0..actual_k],
+        }) catch |err| switch (err) {
+            error.DFlashDebugHostFallbackRequested,
+            error.DFlashDeviceDraftNotImplemented,
+            => {
+                if (policy == .debug_host_fallback) {
+                    return self.speculativeDecodeDFlashGemma4DebugHostFallback(
+                        draft_pipeline,
+                        token_ids,
+                        seq_len,
+                        decode_state,
+                        config,
+                        k,
+                        penalty_state,
+                        token_table,
+                        json_grammar,
+                        gbnf_grammar,
+                    );
+                }
+                return err;
+            },
+            else => return err,
+        };
+        const draft_finished = self.monotonicNanoTimestamp();
+        const draft_count = device_result.token_ids.len;
+        if (draft_count == 0) return .{
+            .drafted = 0,
+            .matched_drafts = 0,
+            .accepted = 0,
+            .correction_added = false,
+            .had_bonus = false,
+            .hit_eos = false,
+            .hit_grammar_stop = false,
+            .dflash_feature_extractions = dflash_state.feature_bank.slots.len,
+            .dflash_device_feature_captures = dflash_state.device_feature_captures,
+        };
+        @memcpy(token_ids[seq_len.*..][0..draft_count], device_result.token_ids);
+
+        const verify_len = draft_count + 1;
+        const verify_seq = seq_len.* + draft_count;
+        _ = try decode_runtime.appendGeneratedTokens(draft_count);
+        const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
+        const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
+        const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
+
+        var target_choices: [gemma4_dflash.max_block_size + 1]i64 = undefined;
+        var verify_feature_bank = try gemma4_dflash.DFlashFeatureBank.init(
+            allocator,
+            &self.cb,
+            self.gpt_config,
+            draft_pipeline.gpt_config,
+        );
+        defer verify_feature_bank.deinit();
+        const verify_started = self.monotonicNanoTimestamp();
+        const verify_captures = try self.forwardDFlashTargetVerifyTokenIdsDevice(
+            token_ids[verify_start..verify_seq],
+            verify_seq,
+            &target_ctx,
+            verify_len,
+            target_choices[0..verify_len],
+            &verify_feature_bank,
+        );
+        const verify_finished = self.monotonicNanoTimestamp();
+
+        const verify_result = try self.acceptDeviceVerifiedDraftTokens(
+            token_ids,
+            seq_len.*,
+            device_result.token_ids,
+            target_choices[0..verify_len],
+            &round_penalties,
+        );
+
+        const rollback = draft_count - verify_result.matched_drafts;
+        if (rollback > 0) try decode_runtime.truncateGeneratedTokens(rollback);
+
+        const accepted_capture_rows = dflashAcceptedDraftCaptureRows(target_query_len, verify_len, verify_result.matched_drafts);
+        const accepted_captures = try dflash_state.feature_bank.appendRowsFromBank(
+            &verify_feature_bank,
+            accepted_capture_rows.source_row_start,
+            seq_len.*,
+            accepted_capture_rows.row_count,
+        );
+        dflash_state.noteCaptures(verify_captures + accepted_captures);
+
+        if (verify_result.correction_added or verify_result.had_bonus) {
+            const accepted_seq_len = seq_len.* + verify_result.accepted;
+            const materialized_captures = try self.materializeAcceptedTokenKvAndCaptureDFlashFeatures(
+                token_ids,
+                accepted_seq_len,
+                decode_state,
+                dflash_state,
+            );
+            dflash_state.noteCaptures(materialized_captures);
+        }
+
+        seq_len.* += verify_result.accepted;
+        try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
+
+        return .{
+            .drafted = draft_count,
+            .matched_drafts = verify_result.matched_drafts,
+            .accepted = verify_result.accepted,
+            .correction_added = verify_result.correction_added,
+            .had_bonus = verify_result.had_bonus,
+            .hit_eos = verify_result.hit_eos,
+            .hit_grammar_stop = false,
+            .dflash_feature_extractions = dflash_state.feature_bank.slots.len,
+            .dflash_device_feature_captures = dflash_state.device_feature_captures,
+            .dflash_draft_block_nanos = if (device_result.counters.draft_block_nanos != 0)
+                device_result.counters.draft_block_nanos
+            else
+                draft_finished - draft_started,
+            .dflash_feature_fusion_nanos = device_result.counters.feature_fusion_nanos,
+            .dflash_kv_injection_nanos = device_result.counters.kv_injection_nanos,
+            .dflash_verification_nanos = verify_finished - verify_started,
+            .dflash_host_fallbacks = device_result.counters.host_fallbacks,
+            .dflash_full_tensor_download_bytes = device_result.counters.full_tensor_download_bytes,
+        };
+    }
+
+    fn forwardDFlashTargetVerifyTokenIdsDevice(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        verify_len: usize,
+        out: []i64,
+        feature_bank: ?*gemma4_dflash.DFlashFeatureBank,
+    ) !usize {
+        try self.rejectUnsupportedDeepSeekV4GraphMode();
+        if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
+        if (self.cb.kind() != .metal) return error.DFlashRequiresMetalBackend;
+        if (out.len < verify_len or verify_len == 0) return error.InvalidTensorShape;
+        const allocator = self.allocator;
+        const query_seq_len = decode_context.query_sequence_len;
+        const total = query_seq_len;
+        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
+        if (input_ids.len != total) return error.InvalidTensorShape;
+
+        const embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(embed_w);
+        const embedded = try self.cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+        const hidden_input = try gpt_arch.maybeScaleTokenEmbeddings(&self.cb, allocator, self.gpt_config, embedded, total, hidden_size);
+        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
+        defer if (ple_vectors) |pv| self.cb.free(pv);
+
+        const before_captures = if (feature_bank) |bank| bank.totalCaptureCount() else 0;
+        const hidden_result = if (feature_bank) |bank|
+            try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0OverridesAndDFlashCapture(
+                &self.cb,
+                allocator,
+                self.gpt_config,
+                hidden_input,
+                .{},
+                1,
+                seq_len,
+                decode_context,
+                ple_vectors,
+                .{ .feature_bank = bank },
+            )
+        else
+            try gpt_arch.forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
+                &self.cb,
+                allocator,
+                self.gpt_config,
+                hidden_input,
+                .{},
+                1,
+                seq_len,
+                decode_context,
+                ple_vectors,
+            );
+        defer self.cb.free(hidden_result.final_hidden);
+        defer self.cb.free(hidden_result.pre_norm_hidden);
+
+        const lm_w = if (self.gpt_config.weight_tying)
+            try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config)
+        else
+            self.cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(lm_w);
+
+        const start_row = hidden_result.total_rows - verify_len;
+        var idx: usize = 0;
+        while (idx < verify_len) : (idx += 1) {
+            const row_hidden = try self.cb.sliceRows2D(allocator, hidden_result.final_hidden, start_row + idx, 1, hidden_size);
+            defer self.cb.free(row_hidden);
+            const token_tensor = (try self.cb.linearNoBiasArgmaxLastRowTensor(
+                row_hidden,
+                lm_w,
+                1,
+                hidden_size,
+                @intCast(self.gpt_config.vocab_size),
+            )) orelse return error.DFlashDeviceRowArgmaxUnavailable;
+            defer self.cb.free(token_tensor);
+            out[idx] = try gemma4_dflash.readScalarTokenIdDevice(&self.cb, allocator, token_tensor);
+        }
+        return if (feature_bank) |bank| bank.totalCaptureCount() - before_captures else 0;
+    }
+
+    fn speculativeDecodeDFlashGemma4DebugHostFallback(
+        self: *NativeGenerationPipeline,
+        draft_pipeline: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: *usize,
+        decode_state: *NativeDecodeState,
+        config: GenerationConfig,
+        k: usize,
+        penalty_state: *SamplingPenaltyState,
+        token_table: ?*const grammar_mod.TokenByteTable,
+        json_grammar: *?grammar_mod.JsonGrammar,
+        gbnf_grammar: ?*grammar_mod.GbnfGrammar,
+    ) !SpeculativeRoundResult {
+        const allocator = self.allocator;
+        const round_start = seq_len.*;
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        var round_penalties = try penalty_state.clone(allocator);
+        defer round_penalties.deinit(allocator);
+
+        var draft_tokens: [gemma4_dflash.max_block_size]i64 = undefined;
+        const actual_k = @min(k, gemma4_dflash.max_block_size);
+        if (actual_k == 0) return .{
+            .drafted = 0,
+            .matched_drafts = 0,
+            .accepted = 0,
+            .correction_added = false,
+            .had_bonus = false,
+            .hit_eos = false,
+            .hit_grammar_stop = false,
+        };
+        const mask_token = gemma4_dflash.maskTokenId(draft_pipeline.gpt_config) orelse return error.DFlashMaskTokenMissing;
+
+        const draft_started = self.monotonicNanoTimestamp();
+        var draft_input = try allocator.alloc(i64, seq_len.* + actual_k);
+        defer allocator.free(draft_input);
+        @memcpy(draft_input[0..seq_len.*], token_ids[0..seq_len.*]);
+        for (draft_input[seq_len.*..]) |*slot| slot.* = mask_token;
+
+        var draft_state = NativeDecodeState.initContiguous(allocator);
+        defer draft_state.deinit();
+        const draft_ctx = draft_state.gptDecodeContext(draft_input.len, draft_input.len);
+        const draft_logits = try draft_pipeline.forwardAllLogits(draft_input, 1, draft_input.len, &draft_ctx);
+        defer allocator.free(draft_logits);
+
+        var draft_count: usize = 0;
+        while (draft_count < actual_k) : (draft_count += 1) {
+            const row = @min(seq_len.* + draft_count, draft_input.len - 1);
+            const offset = row * draft_pipeline.gpt_config.vocab_size;
+            const draft_token = activations.argmax(draft_logits[offset..][0..draft_pipeline.gpt_config.vocab_size]);
+            draft_tokens[draft_count] = @intCast(draft_token);
+            token_ids[seq_len.* + draft_count] = @intCast(draft_token);
+        }
+        const draft_finished = self.monotonicNanoTimestamp();
+
+        const verify_len = draft_count + 1;
+        const verify_seq = seq_len.* + draft_count;
+        _ = try decode_runtime.appendGeneratedTokens(draft_count);
+        const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
+        const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
+        const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
+
+        const verify_started = self.monotonicNanoTimestamp();
+        var target_result = self.forwardAllLogitsAndHiddenHost(
+            token_ids[verify_start..verify_seq],
+            1,
+            verify_seq,
+            &target_ctx,
+        ) catch |err| {
+            decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+            return err;
+        };
+        defer target_result.deinit();
+        const verify_finished = self.monotonicNanoTimestamp();
+
+        const verify_result = try self.acceptVerifiedDraftTokens(
+            token_ids,
+            seq_len.*,
+            draft_tokens[0..draft_count],
+            target_result.logits,
+            target_query_len,
+            config,
+            &round_penalties,
+            token_table,
+            json_grammar,
+            gbnf_grammar,
+        );
+
+        const matched_drafts = verify_result.matched_drafts;
+        const accepted = verify_result.accepted;
+        const rollback = draft_count - matched_drafts;
+        if (rollback > 0) {
+            try decode_runtime.truncateGeneratedTokens(rollback);
+        }
+
+        if (verify_result.correction_added or verify_result.had_bonus) {
+            const accepted_seq_len = seq_len.* + accepted;
+            const materialized_hidden = try self.materializeAcceptedTokenKvAndReturnHidden(
+                token_ids,
+                accepted_seq_len,
+                decode_state,
+            );
+            allocator.free(materialized_hidden);
+        }
+
+        seq_len.* += accepted;
+        try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
+
+        return .{
+            .drafted = draft_count,
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
+            .correction_added = verify_result.correction_added,
+            .had_bonus = verify_result.had_bonus,
+            .hit_eos = verify_result.hit_eos,
+            .hit_grammar_stop = verify_result.hit_grammar_stop,
+            .dflash_feature_extractions = @intFromBool(gemma4_dflash.requiresFeatureFusion(draft_pipeline.gpt_config)),
+            .dflash_host_fallbacks = 1,
+            .dflash_draft_block_nanos = draft_finished - draft_started,
+            .dflash_feature_fusion_nanos = 0,
+            .dflash_kv_injection_nanos = 0,
+            .dflash_verification_nanos = verify_finished - verify_started,
+            .dflash_full_tensor_download_bytes = (target_result.logits.len + target_result.hidden.len) * @sizeOf(f32),
+            .dflash_device_feature_captures = 0,
+        };
+    }
+
     fn speculativeDecodeGemma4Mtp(
         self: *NativeGenerationPipeline,
         draft_pipeline: *NativeGenerationPipeline,
@@ -3189,7 +3836,34 @@ pub const NativeGenerationPipeline = struct {
         had_bonus: bool,
         hit_eos: bool,
         hit_grammar_stop: bool,
+        dflash_feature_extractions: usize = 0,
+        dflash_host_fallbacks: usize = 0,
+        dflash_draft_block_nanos: u128 = 0,
+        dflash_feature_fusion_nanos: u128 = 0,
+        dflash_kv_injection_nanos: u128 = 0,
+        dflash_verification_nanos: u128 = 0,
+        dflash_full_tensor_download_bytes: usize = 0,
+        dflash_device_feature_captures: usize = 0,
     };
+
+    fn dflashSamplingConfig(config: GenerationConfig) gemma4_dflash.SamplingConfig {
+        return .{
+            .temperature = config.temperature,
+            .top_p = config.top_p,
+            .top_k = config.top_k,
+            .min_p = config.min_p,
+            .repetition_penalty = config.repetition_penalty,
+            .frequency_penalty = config.frequency_penalty,
+            .presence_penalty = config.presence_penalty,
+        };
+    }
+
+    fn monotonicNanoTimestamp(self: *NativeGenerationPipeline) u128 {
+        const io = self.io orelse return 0;
+        const ts = std.Io.Timestamp.now(io, .awake);
+        if (ts.nanoseconds < 0) return 0;
+        return @intCast(ts.nanoseconds);
+    }
 
     const SpeculativeVerificationResult = struct {
         matched_drafts: usize,
@@ -3346,6 +4020,63 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn acceptDeviceVerifiedDraftTokens(
+        self: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: usize,
+        draft_tokens: []const i64,
+        target_choices: []const i64,
+        round_penalties: *SamplingPenaltyState,
+    ) !SpeculativeVerificationResult {
+        if (target_choices.len != draft_tokens.len + 1) return error.InvalidTensorShape;
+        var matched_drafts: usize = 0;
+        var accepted: usize = 0;
+        var hit_eos = false;
+        var correction_added = false;
+
+        for (draft_tokens, 0..) |draft_token, i| {
+            const target_choice = target_choices[i];
+            if (target_choice == draft_token) {
+                matched_drafts += 1;
+                accepted += 1;
+                try round_penalties.noteToken(self.allocator, draft_token);
+                if (self.gpt_config.eos_token_id >= 0 and @as(i32, @intCast(draft_token)) == self.gpt_config.eos_token_id) {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                token_ids[seq_len + matched_drafts] = target_choice;
+                accepted = matched_drafts + 1;
+                correction_added = true;
+                try round_penalties.noteToken(self.allocator, target_choice);
+                if (self.gpt_config.eos_token_id >= 0 and @as(i32, @intCast(target_choice)) == self.gpt_config.eos_token_id) {
+                    hit_eos = true;
+                }
+                break;
+            }
+        }
+
+        const had_bonus = matched_drafts == draft_tokens.len and !hit_eos;
+        if (had_bonus) {
+            const bonus_token = target_choices[draft_tokens.len];
+            token_ids[seq_len + accepted] = bonus_token;
+            accepted += 1;
+            try round_penalties.noteToken(self.allocator, bonus_token);
+            if (self.gpt_config.eos_token_id >= 0 and @as(i32, @intCast(bonus_token)) == self.gpt_config.eos_token_id) {
+                hit_eos = true;
+            }
+        }
+
+        return .{
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
+            .hit_eos = hit_eos,
+            .hit_grammar_stop = false,
+            .correction_added = correction_added,
+            .had_bonus = had_bonus,
+        };
+    }
+
     fn applyGrammarMask(
         self: *NativeGenerationPipeline,
         logits: []f32,
@@ -3412,6 +4143,27 @@ pub const NativeGenerationPipeline = struct {
         );
         self.allocator.free(logits);
         _ = try decode_runtime.appendGeneratedToken();
+    }
+
+    fn materializeAcceptedTokenKvAndCaptureDFlashFeatures(
+        self: *NativeGenerationPipeline,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        dflash_state: *DFlashRoundState,
+    ) !usize {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (decode_state.requiresFullRecompute()) return error.DFlashRequiresMetalBackend;
+        const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        const captures = try self.captureDFlashTargetFeaturesDevice(
+            token_ids[total_seq_len - 1 .. total_seq_len],
+            1,
+            total_seq_len,
+            &decode_context,
+            &dflash_state.feature_bank,
+        );
+        _ = try decode_runtime.appendGeneratedToken();
+        return captures;
     }
 
     fn materializeAcceptedTokenKvAndReturnHidden(
@@ -4988,6 +5740,24 @@ test "sampling penalties reuse incremental token counts" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.75), logits[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, -0.25), logits[2], 0.0001);
     try std.testing.expectEqual(@as(f32, 1.0), logits[3]);
+}
+
+test "DFlash verification capture rows skip previous token and commit matched drafts" {
+    {
+        const rows = NativeGenerationPipeline.dflashAcceptedDraftCaptureRows(5, 5, 0);
+        try std.testing.expectEqual(@as(usize, 1), rows.source_row_start);
+        try std.testing.expectEqual(@as(usize, 0), rows.row_count);
+    }
+    {
+        const rows = NativeGenerationPipeline.dflashAcceptedDraftCaptureRows(5, 5, 2);
+        try std.testing.expectEqual(@as(usize, 1), rows.source_row_start);
+        try std.testing.expectEqual(@as(usize, 2), rows.row_count);
+    }
+    {
+        const rows = NativeGenerationPipeline.dflashAcceptedDraftCaptureRows(12, 5, 4);
+        try std.testing.expectEqual(@as(usize, 8), rows.source_row_start);
+        try std.testing.expectEqual(@as(usize, 4), rows.row_count);
+    }
 }
 
 test "speculative verification applies grammar mask before accepting draft tokens" {

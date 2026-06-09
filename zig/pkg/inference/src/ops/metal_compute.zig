@@ -857,6 +857,38 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return false;
     }
 
+    pub fn appendTrimRowsDevice(cb: *const ops.ComputeBackend, existing: ?CT, incoming: CT, cols: usize, max_rows: usize) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (cols == 0 or max_rows == 0) return null;
+        var incoming_tensor = try self.ownedMetalTensorFromCt(incoming);
+        defer incoming_tensor.deinit();
+        if (!incoming_tensor.isDevice() or incoming_tensor.ndim() != 2) return null;
+        const incoming_rows: usize = @intCast(incoming_tensor.dim(0));
+        if (incoming_rows == 0 or @as(usize, @intCast(incoming_tensor.dim(1))) != cols) return null;
+
+        var combined: MetalTensor = if (existing) |old_ct| blk: {
+            var old_tensor = try self.ownedMetalTensorFromCt(old_ct);
+            defer old_tensor.deinit();
+            if (!old_tensor.isDevice() or old_tensor.ndim() != 2) return null;
+            if (@as(usize, @intCast(old_tensor.dim(1))) != cols) return null;
+            break :blk try metal_runtime.concatenateRows(self.provider_impl, old_tensor, incoming_tensor);
+        } else try incoming_tensor.retainedCopy();
+        defer combined.deinit();
+
+        const combined_rows: usize = @intCast(combined.dim(0));
+        var result = if (combined_rows > max_rows) blk: {
+            const start = combined_rows - max_rows;
+            const byte_offset = start * cols * @sizeOf(f32);
+            const byte_len = max_rows * cols * @sizeOf(f32);
+            const shape = [_]i32{ @intCast(max_rows), @intCast(cols) };
+            break :blk try combined.retainedView(byte_offset, byte_len, &shape);
+        } else try combined.retainedCopy();
+        errdefer result.deinit();
+        if (!result.isDevice()) return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+
     pub fn applyPleResidual(
         cb: *const ops.ComputeBackend,
         hidden: CT,
@@ -7135,6 +7167,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (a_buf.quantized_storage != null or b_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        if (cols == 0) return error.InvalidTensorShape;
+        if (a_buf.metal_tensor) |*a_metal| {
+            if (b_buf.metal_tensor) |*b_metal| {
+                if (a_metal.isDevice() and b_metal.isDevice()) {
+                    if (a_metal.ndim() != 2 or b_metal.ndim() != 2) return error.InvalidTensorShape;
+                    if (@as(usize, @intCast(a_metal.dim(0))) != rows_a or
+                        @as(usize, @intCast(b_metal.dim(0))) != rows_b or
+                        @as(usize, @intCast(a_metal.dim(1))) != cols or
+                        @as(usize, @intCast(b_metal.dim(1))) != cols)
+                    {
+                        return error.InvalidTensorShape;
+                    }
+                    var a_tensor = try a_metal.retainedCopy();
+                    defer a_tensor.deinit();
+                    var b_tensor = try b_metal.retainedCopy();
+                    defer b_tensor.deinit();
+                    const combined = try metal_runtime.concatenateRows(self.provider_impl, a_tensor, b_tensor);
+                    return self.ctFromOwnedMetalTensor(combined);
+                }
+            }
+        }
         const a_data = try hostSliceForBuf(a_buf);
         const b_data = try hostSliceForBuf(b_buf);
         if (a_data.len != rows_a * cols or b_data.len != rows_b * cols) return error.InvalidTensorShape;
@@ -9575,6 +9628,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer self.allocator.free(output);
         const out_shape = [_]i32{ @intCast(total), @intCast(h_q) };
         return denseBuf(self.allocator, output, true, &out_shape);
+    }
+
+    fn gqaCrossAttentionFullOp(
+        ctx: *anyopaque,
+        Q: CT,
+        K: CT,
+        V: CT,
+        attn_bias: ?CT,
+        batch: usize,
+        q_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) anyerror!?CT {
+        if (attn_bias != null) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var q_mt = try self.ownedDeviceMetalTensorFromCt(Q);
+        defer q_mt.deinit();
+        var k_mt = try self.ownedDeviceMetalTensorFromCt(K);
+        defer k_mt.deinit();
+        var v_mt = try self.ownedDeviceMetalTensorFromCt(V);
+        defer v_mt.deinit();
+        const out = (try metal_runtime.decoderRuntimeApplyGqaCrossAttentionFullF32(self.provider_impl, .{
+            .q = q_mt,
+            .k = k_mt,
+            .v = v_mt,
+            .batch = batch,
+            .q_len = q_len,
+            .kv_len = kv_len,
+            .num_heads = num_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(out);
     }
 
     fn applyBatchedDenseCausalAttentionDevice(
@@ -19322,6 +19410,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rope = ropeOp;
         vt.ropePerItem = ropePerItemOp;
         vt.gqaCausalAttention = gqaCausalAttentionOp;
+        vt.gqaCrossAttentionFull = gqaCrossAttentionFullOp;
         vt.runAttention = runAttentionOp;
         vt.runDeepSeekV4CompressedAttention = runDeepSeekV4CompressedAttentionOp;
         vt.gqaPagedAttention = gqaPagedAttentionOp;
@@ -19410,6 +19499,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn copyTensorInto(_: *const ops.ComputeBackend, _: CT, _: CT) !bool {
         return false;
+    }
+
+    pub fn appendTrimRowsDevice(_: *const ops.ComputeBackend, _: ?CT, _: CT, _: usize, _: usize) !?CT {
+        return null;
     }
 
     pub fn beginPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScopeKind) !PlannedGraphScope {
@@ -19921,6 +20014,85 @@ test "metal_compute: mixed paged attention batch matches native" {
     for (native_data, metal_data) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
     }
+}
+
+test "metal_compute: gqa cross attention full matches native on gqa future rows" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const batch: usize = 1;
+    const q_len: usize = 2;
+    const kv_len: usize = 4;
+    const num_heads: usize = 4;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 3;
+    const h_q = num_heads * head_dim;
+    const h_kv = num_kv_heads * head_dim;
+
+    var q_data: [batch * q_len * h_q]f32 = undefined;
+    var k_data: [batch * kv_len * h_kv]f32 = undefined;
+    var v_data: [batch * kv_len * h_kv]f32 = undefined;
+    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 17)) - 8)) / 7.0;
+    for (&k_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 19)) - 9)) / 5.0;
+    for (&v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 23)) - 11)) / 6.0;
+
+    const expected = try native_compute_mod.gqaCrossAttentionFullHost(allocator, &q_data, &k_data, &v_data, null, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim);
+    defer allocator.free(expected);
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const q_shape = [_]i32{ @intCast(batch * q_len), @intCast(h_q) };
+    const kv_shape = [_]i32{ @intCast(batch * kv_len), @intCast(h_kv) };
+    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    defer metal_cb.free(metal_q);
+    const metal_k = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    defer metal_cb.free(metal_k);
+    const metal_v = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    defer metal_cb.free(metal_v);
+    const out = (try metal_cb.gqaCrossAttentionFull(metal_q, metal_k, metal_v, null, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim)) orelse return error.SkipZigTest;
+    defer metal_cb.free(out);
+    const actual = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-4);
+}
+
+test "metal_compute: concatRows2D keeps device tensors resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const a_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const a_shape = [_]i32{ 2, 3 };
+    const a_host = try metal_cb.fromFloat32Shape(&a_data, &a_shape);
+    defer metal_cb.free(a_host);
+    const a = (try MetalCompute.makeDeviceResident(&metal_cb, a_host)) orelse return error.SkipZigTest;
+    defer metal_cb.free(a);
+    const b_fixed_data = [_]f32{ 7, 8, 9, 10, 11, 12 };
+    const b_fixed_shape = [_]i32{ 2, 3 };
+    const b_fixed_host = try metal_cb.fromFloat32Shape(&b_fixed_data, &b_fixed_shape);
+    defer metal_cb.free(b_fixed_host);
+    const b_fixed = (try MetalCompute.makeDeviceResident(&metal_cb, b_fixed_host)) orelse return error.SkipZigTest;
+    defer metal_cb.free(b_fixed);
+
+    const out = try metal_cb.concatRows2D(allocator, a, b_fixed, 2, 2, 3);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+    const actual = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(actual);
+    const expected = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    try std.testing.expectEqualSlices(f32, &expected, actual);
 }
 
 test "metal_compute: paged decode attention matches native on storage runtime f32 cache" {

@@ -874,6 +874,8 @@ pub const GenerateRequest = struct {
     grammar: ?[]const u8 = null,
     /// inference-native speculative decoding extension. Path or model identifier for a smaller draft model.
     draft_model: ?[]const u8 = null,
+    /// inference-native speculative decoding method. `ar` uses autoregressive draft verification; `dflash` uses Gemma4 DFlash block drafting.
+    speculative_method: ?[]const u8 = null,
     /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
     speculative_k: ?i64 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).

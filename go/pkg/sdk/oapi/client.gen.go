@@ -543,6 +543,12 @@ const (
 	InferenceGenerateRequestModeEager    InferenceGenerateRequestMode = "eager"
 )
 
+// Defines values for InferenceGenerateRequestSpeculativeMethod.
+const (
+	InferenceGenerateRequestSpeculativeMethodAr     InferenceGenerateRequestSpeculativeMethod = "ar"
+	InferenceGenerateRequestSpeculativeMethodDflash InferenceGenerateRequestSpeculativeMethod = "dflash"
+)
+
 // Defines values for InferenceGenerateResponseObject.
 const (
 	InferenceGenerateResponseObjectChatCompletion InferenceGenerateResponseObject = "chat.completion"
@@ -4478,6 +4484,9 @@ type InferenceGenerateRequest struct {
 	RepetitionPenalty float32                         `json:"repetition_penalty,omitempty,omitzero"`
 	ResponseFormat    InferenceGenerateResponseFormat `json:"response_format,omitempty,omitzero"`
 
+	// SpeculativeMethod inference-native speculative decoding method. `ar` uses autoregressive draft verification; `dflash` uses Gemma4 DFlash block drafting.
+	SpeculativeMethod InferenceGenerateRequestSpeculativeMethod `json:"speculative_method,omitempty,omitzero"`
+
 	// SpeculativeK inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
 	SpeculativeK int `json:"speculative_k,omitempty,omitzero"`
 
@@ -4528,6 +4537,9 @@ type InferenceGenerateRequestCompiledTarget string
 // InferenceGenerateRequestMode inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
 // `compiled` runs inference graph planning, partitioning, and backend executor attachment.
 type InferenceGenerateRequestMode string
+
+// InferenceGenerateRequestSpeculativeMethod defines model for InferenceGenerateRequest.SpeculativeMethod.
+type InferenceGenerateRequestSpeculativeMethod string
 
 // InferenceGenerateResponse OpenAI-compatible chat completion response
 type InferenceGenerateResponse struct {

@@ -333,6 +333,17 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_block_parity_test_step.dependOn(&metal_gemma4_prefill_block_parity_test.step);
 
+    const metal_gemma4_dflash_speculative_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_dflash_speculative.sh",
+    });
+    metal_gemma4_dflash_speculative_test.step.dependOn(b.getInstallStep());
+    const metal_gemma4_dflash_speculative_test_step = b.step(
+        "test-metal-gemma4-dflash-speculative",
+        "Run the local Metal Gemma4 DFlash speculative smoke test",
+    );
+    metal_gemma4_dflash_speculative_test_step.dependOn(&metal_gemma4_dflash_speculative_test.step);
+
     const metal_prefill_bucket_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-metal-prefill-buckets-bench",
         .root_module = b.createModule(.{

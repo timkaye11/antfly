@@ -163,6 +163,20 @@ pub const Config = struct {
     mtp_kv_sliding_donor_layer: u32 = std.math.maxInt(u32),
     mtp_kv_full_donor_layer: u32 = std.math.maxInt(u32),
 
+    // DFlash draft checkpoints for Gemma4. These drafts share the target
+    // tokenizer/LM-head contract and consume selected target hidden features.
+    dflash_draft: bool = false,
+    dflash_block_size: u32 = 0,
+    dflash_target_hidden_size: u32 = 0,
+    dflash_draft_layer_count: u32 = 0,
+    dflash_target_feature_layer_count: u32 = 0,
+    dflash_target_feature_layers: [16]u32 = [_]u32{0} ** 16,
+    dflash_feature_bank_capacity: u32 = 0,
+    dflash_cross_context: u32 = 0,
+    dflash_mask_token_id: i32 = -1,
+    dflash_shared_embeddings: bool = false,
+    dflash_shared_lm_head: bool = false,
+
     // Architecture choices
     norm_type: NormType = .layer_norm,
     position_encoding: PositionEncoding = .absolute,
@@ -254,6 +268,11 @@ pub const Config = struct {
 
     pub fn isMultimodal(self: Config) bool {
         return self.image_token_index >= 0 and (self.mm_tokens_per_image > 0 or self.vision_patch_size > 0 or self.vision_embed_dim > 0);
+    }
+
+    pub fn isGemma4(self: Config) bool {
+        return self.family == .gemma and
+            (self.num_kv_shared_layers > 0 or self.ple_hidden_size > 0 or self.gemma4_mtp_assistant);
     }
 
     pub fn supportsNativeQwen2VlVision(self: Config) bool {
@@ -562,6 +581,13 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             config.mtp_use_ordered_embeddings = val;
         };
     }
+    parseDFlashMetadata(&config, obj);
+    parseDFlashMetadata(&config, model_obj);
+    parseDFlashMetadata(&config, text_obj);
+    if (obj.get("dflash_config")) |v| if (v == .object) parseDFlashMetadata(&config, v.object);
+    if (model_obj.get("dflash_config")) |v| if (v == .object) parseDFlashMetadata(&config, v.object);
+    if (obj.get("dflash")) |v| if (v == .object) parseDFlashMetadata(&config, v.object);
+    if (model_obj.get("dflash")) |v| if (v == .object) parseDFlashMetadata(&config, v.object);
 
     if (text_obj.get("hidden_size")) |v| if (jsonU32(v)) |val| {
         config.hidden_size = val;
@@ -1274,6 +1300,137 @@ fn isGemma4ModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "gemma4_unified_text") or
         std.mem.eql(u8, model_type, "gemma4_assistant") or
         std.mem.eql(u8, model_type, "gemma4_unified_assistant");
+}
+
+fn parseDFlashMetadata(config: *Config, obj: std.json.ObjectMap) void {
+    var saw_marker = false;
+    if (obj.get("model_type")) |v| {
+        if (v == .string and containsIgnoreCase(v.string, "dflash")) saw_marker = true;
+    }
+    if (obj.get("architectures")) |v| {
+        if (v == .array) {
+            for (v.array.items) |item| {
+                if (item == .string and containsIgnoreCase(item.string, "dflash")) saw_marker = true;
+            }
+        }
+    }
+    if (obj.get("speculative_method")) |v| {
+        if (v == .string and std.ascii.eqlIgnoreCase(v.string, "dflash")) saw_marker = true;
+    }
+    if (obj.get("is_dflash_draft")) |v| {
+        if (jsonBool(v)) |val| saw_marker = saw_marker or val;
+    }
+    if (obj.get("dflash_draft")) |v| {
+        if (jsonBool(v)) |val| saw_marker = saw_marker or val;
+    }
+
+    if (obj.get("block_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_block_size = val;
+        saw_marker = true;
+    };
+    if (obj.get("dflash_block_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_block_size = val;
+        saw_marker = true;
+    };
+    if (obj.get("diffusion_block_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_block_size = val;
+        saw_marker = true;
+    };
+    if (obj.get("target_hidden_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_target_hidden_size = val;
+        saw_marker = true;
+    };
+    if (obj.get("dflash_target_hidden_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_target_hidden_size = val;
+        saw_marker = true;
+    };
+    if (obj.get("draft_layer_count")) |v| if (jsonU32(v)) |val| {
+        config.dflash_draft_layer_count = val;
+        saw_marker = true;
+    };
+    if (obj.get("num_draft_layers")) |v| if (jsonU32(v)) |val| {
+        config.dflash_draft_layer_count = val;
+        saw_marker = true;
+    };
+    if (obj.get("feature_bank_capacity")) |v| if (jsonU32(v)) |val| {
+        config.dflash_feature_bank_capacity = val;
+        saw_marker = true;
+    };
+    if (obj.get("target_feature_window")) |v| if (jsonU32(v)) |val| {
+        config.dflash_feature_bank_capacity = val;
+        saw_marker = true;
+    };
+    if (obj.get("hidden_ring_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_feature_bank_capacity = val;
+        saw_marker = true;
+    };
+    if (obj.get("cross_context")) |v| if (jsonU32(v)) |val| {
+        config.dflash_cross_context = val;
+        saw_marker = true;
+    };
+    if (obj.get("cross_context_size")) |v| if (jsonU32(v)) |val| {
+        config.dflash_cross_context = val;
+        saw_marker = true;
+    };
+    if (obj.get("dflash_cross_context")) |v| if (jsonU32(v)) |val| {
+        config.dflash_cross_context = val;
+        saw_marker = true;
+    };
+    if (obj.get("mask_token_id")) |v| if (jsonI32(v)) |val| {
+        config.dflash_mask_token_id = val;
+        saw_marker = true;
+    };
+    if (obj.get("dflash_mask_token_id")) |v| if (jsonI32(v)) |val| {
+        config.dflash_mask_token_id = val;
+        saw_marker = true;
+    };
+    if (obj.get("shared_embeddings")) |v| if (jsonBool(v)) |val| {
+        config.dflash_shared_embeddings = val;
+        saw_marker = true;
+    };
+    if (obj.get("shared_lm_head")) |v| if (jsonBool(v)) |val| {
+        config.dflash_shared_lm_head = val;
+        saw_marker = true;
+    };
+    if (obj.get("target_feature_layers")) |v| {
+        parseDFlashFeatureLayers(config, v);
+        saw_marker = true;
+    }
+    if (obj.get("selected_target_feature_layers")) |v| {
+        parseDFlashFeatureLayers(config, v);
+        saw_marker = true;
+    }
+    if (obj.get("feature_layers")) |v| {
+        parseDFlashFeatureLayers(config, v);
+        saw_marker = true;
+    }
+    if (obj.get("target_layer_ids")) |v| {
+        parseDFlashFeatureLayers(config, v);
+        saw_marker = true;
+    }
+    if (saw_marker) config.dflash_draft = true;
+}
+
+fn parseDFlashFeatureLayers(config: *Config, value: std.json.Value) void {
+    if (value != .array) return;
+    var count: u32 = 0;
+    for (value.array.items) |item| {
+        if (count >= config.dflash_target_feature_layers.len) break;
+        const layer = jsonU32(item) orelse continue;
+        config.dflash_target_feature_layers[count] = layer;
+        count += 1;
+    }
+    config.dflash_target_feature_layer_count = count;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 fn applyFamilyDefaults(config: *Config) void {
@@ -2741,4 +2898,74 @@ test "parse colqwen2 merged config lacks native vision detail" {
     try std.testing.expectEqual(@as(u32, 1536), config.vision_embed_dim);
     try std.testing.expectEqual(@as(u32, 14), config.vision_patch_size);
     try std.testing.expect(!config.supportsNativeQwen2VlVision());
+}
+
+test "parse DFlash draft metadata" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "architectures": ["Gemma4DFlashForCausalLM"],
+        \\  "model_type": "gemma4_text",
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 8,
+        \\  "vocab_size": 256000,
+        \\  "dflash_config": {
+        \\    "block_size": 16,
+        \\    "target_hidden_size": 2048,
+        \\    "draft_layer_count": 8,
+        \\    "target_feature_layers": [7, 15, 23],
+        \\    "feature_bank_capacity": 4096,
+        \\    "cross_context": 1024,
+        \\    "mask_token_id": 0,
+        \\    "shared_embeddings": true,
+        \\    "shared_lm_head": true
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expect(config.dflash_draft);
+    try std.testing.expectEqual(@as(u32, 16), config.dflash_block_size);
+    try std.testing.expectEqual(@as(u32, 2048), config.dflash_target_hidden_size);
+    try std.testing.expectEqual(@as(u32, 8), config.dflash_draft_layer_count);
+    try std.testing.expectEqual(@as(u32, 3), config.dflash_target_feature_layer_count);
+    try std.testing.expectEqual(@as(u32, 15), config.dflash_target_feature_layers[1]);
+    try std.testing.expectEqual(@as(u32, 4096), config.dflash_feature_bank_capacity);
+    try std.testing.expectEqual(@as(u32, 1024), config.dflash_cross_context);
+    try std.testing.expectEqual(@as(i32, 0), config.dflash_mask_token_id);
+    try std.testing.expect(config.dflash_shared_embeddings);
+    try std.testing.expect(config.dflash_shared_lm_head);
+}
+
+test "parse z-lab DFlash Gemma4 draft metadata" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "architectures": ["DFlashDraftModel"],
+        \\  "model_type": "gemma4_text",
+        \\  "hidden_size": 2816,
+        \\  "num_hidden_layers": 5,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 88,
+        \\  "vocab_size": 256000,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "dflash_config": {
+        \\    "block_size": 16,
+        \\    "target_layer_ids": [1, 6, 11, 17, 22, 27],
+        \\    "mask_token_id": 4
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expect(config.dflash_draft);
+    try std.testing.expectEqual(@as(u32, 16), config.dflash_block_size);
+    try std.testing.expectEqual(@as(u32, 5), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try std.testing.expectEqual(@as(u32, 88), config.headDim());
+    try std.testing.expectEqual(@as(u32, 6), config.dflash_target_feature_layer_count);
+    try std.testing.expectEqual(@as(u32, 1), config.dflash_target_feature_layers[0]);
+    try std.testing.expectEqual(@as(u32, 27), config.dflash_target_feature_layers[5]);
+    try std.testing.expectEqual(@as(i32, 4), config.dflash_mask_token_id);
 }

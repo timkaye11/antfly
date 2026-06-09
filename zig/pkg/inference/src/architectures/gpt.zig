@@ -38,6 +38,7 @@ const activations = @import("../backends/activations.zig");
 const native_blas = @import("../backends/native.zig");
 const native_compute_mod = @import("../ops/native_compute.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
+const gemma4_dflash = @import("gemma4_dflash.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
 const deepseek_v4_host = @import("deepseek_v4_host.zig");
 const tensor_mod = @import("../backends/tensor.zig");
@@ -148,6 +149,10 @@ const FinalAndPreNormHiddenTensorResult = struct {
     final_hidden: CT,
     pre_norm_hidden: CT,
     total_rows: usize,
+};
+
+pub const DFlashCapturePlan = struct {
+    feature_bank: *gemma4_dflash.DFlashFeatureBank,
 };
 
 const ReservedHiddenCarrier = struct {
@@ -1001,6 +1006,32 @@ pub fn forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !FinalAndPreNormHiddenTensorResult {
+    return forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0OverridesAndDFlashCapture(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        overrides,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        null,
+    );
+}
+
+pub fn forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0OverridesAndDFlashCapture(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    dflash_capture: ?DFlashCapturePlan,
+) !FinalAndPreNormHiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -1039,6 +1070,7 @@ pub fn forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
         decode_context,
         ple_vectors,
         &pre_norm_hidden,
+        dflash_capture,
     );
     errdefer cb.free(final_result.hidden);
     errdefer cb.free(pre_norm_hidden);
@@ -1095,6 +1127,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
         decode_context,
         ple_vectors,
         null,
+        null,
     );
 }
 
@@ -1109,10 +1142,12 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
     pre_norm_out: ?*CT,
+    dflash_capture: ?DFlashCapturePlan,
 ) !HiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
+    const capture_start_token = positionOffset(seq_len, query_seq_len, decode_context);
     var hidden = hidden_input;
     var owns_hidden = true;
 
@@ -1189,6 +1224,9 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             if (new_hidden != hidden) cb.free(hidden);
             hidden = new_hidden;
             owns_hidden = true;
+        }
+        if (dflash_capture) |capture| {
+            _ = try capture.feature_bank.captureLayer(layer, hidden, capture_start_token, total);
         }
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);

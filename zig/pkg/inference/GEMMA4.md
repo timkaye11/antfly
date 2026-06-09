@@ -34,6 +34,10 @@ The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
 enabled for multimodal prompts or the ONNX direct path.
 
+Antfly also exposes an explicit `--speculative-method dflash` mode for Gemma4
+DFlash block-diffusion drafts. See `DFLASH.md` for supported metadata, command
+examples, and current limitations.
+
 ## Google Gemma 4 MTP Design
 
 Google's MTP assistants are not just arbitrary smaller language models. They

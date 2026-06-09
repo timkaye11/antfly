@@ -2376,6 +2376,14 @@ components:
           type: string
           description: |
             inference-native speculative decoding extension. Path or model identifier for a smaller draft model.
+        speculative_method:
+          type: string
+          enum:
+            - ar
+            - dflash
+          description: |
+            inference-native speculative decoding method. `ar` uses autoregressive draft verification; `dflash` uses Gemma4 DFlash block drafting.
+          default: ar
         speculative_k:
           type: integer
           description: |

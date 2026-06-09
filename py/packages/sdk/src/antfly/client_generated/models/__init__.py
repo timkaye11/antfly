@@ -250,6 +250,7 @@ from .inference_generate_request_backend import InferenceGenerateRequestBackend
 from .inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from .inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from .inference_generate_request_mode import InferenceGenerateRequestMode
+from .inference_generate_request_speculative_method import InferenceGenerateRequestSpeculativeMethod
 from .inference_generate_response import InferenceGenerateResponse
 from .inference_generate_response_format import InferenceGenerateResponseFormat
 from .inference_generate_response_format_type import InferenceGenerateResponseFormatType
@@ -752,6 +753,7 @@ __all__ = (
     "InferenceGenerateRequestCacheDtype",
     "InferenceGenerateRequestCompiledTarget",
     "InferenceGenerateRequestMode",
+    "InferenceGenerateRequestSpeculativeMethod",
     "InferenceGenerateResponse",
     "InferenceGenerateResponseFormat",
     "InferenceGenerateResponseFormatType",

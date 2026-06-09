@@ -1665,6 +1665,59 @@ pub fn decoderRuntimeApplyRmsNormScratch(self: anytype, request: anytype, output
     return MetalTensor.deviceBorrowed(@ptrCast(runtime), handle, 0, request.hidden_size * @sizeOf(f32), request.input.shape());
 }
 
+pub fn decoderRuntimeApplyGqaCrossAttentionFullF32(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.q.ndim() != 2 or request.k.ndim() != 2 or request.v.ndim() != 2) return null;
+    if (!request.q.isDevice() or !request.k.isDevice() or !request.v.isDevice()) return null;
+    if (request.batch == 0 or request.q_len == 0 or request.kv_len == 0 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return null;
+    if (request.num_heads % request.num_kv_heads != 0) return null;
+    if (@as(usize, @intCast(request.q.dim(0))) != request.batch * request.q_len or
+        @as(usize, @intCast(request.k.dim(0))) != request.batch * request.kv_len or
+        @as(usize, @intCast(request.v.dim(0))) != request.batch * request.kv_len)
+    {
+        return null;
+    }
+    if (@as(usize, @intCast(request.q.dim(1))) != request.num_heads * request.head_dim or
+        @as(usize, @intCast(request.k.dim(1))) != request.num_kv_heads * request.head_dim or
+        @as(usize, @intCast(request.v.dim(1))) != request.num_kv_heads * request.head_dim)
+    {
+        return null;
+    }
+
+    const shape = [_]i32{ @intCast(request.batch * request.q_len), @intCast(request.num_heads * request.head_dim) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        request.batch * request.q_len * request.num_heads * request.head_dim * @sizeOf(f32),
+        .private,
+        &shape,
+    );
+    errdefer output.deinit();
+
+    const device_rc = termite_metal_decode_runtime_gqa_cross_attention_full_f32_device(
+        runtime,
+        request.q.deviceHandle(),
+        request.q.deviceByteOffset(),
+        request.k.deviceHandle(),
+        request.k.deviceByteOffset(),
+        request.v.deviceHandle(),
+        request.v.deviceByteOffset(),
+        request.batch,
+        request.q_len,
+        request.kv_len,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (device_rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
+}
+
 pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -6571,6 +6624,23 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_device(
     bias_host: [*c]const f32,
     mask: [*c]const u8,
     total_sequence_len: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gqa_cross_attention_full_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    batch: usize,
+    q_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
