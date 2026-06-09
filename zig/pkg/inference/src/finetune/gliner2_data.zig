@@ -27,6 +27,49 @@ pub const Example = struct {
     entities: []Entity,
 };
 
+pub const UpstreamTaskKind = enum {
+    entities,
+    json_structures,
+    relations,
+    classifications,
+};
+
+pub const UpstreamField = struct {
+    name: []const u8,
+    value: []const u8,
+    start: ?usize = null,
+    end: ?usize = null,
+    target_word_start: ?usize = null,
+    target_word_end: ?usize = null,
+};
+
+pub const UpstreamTask = struct {
+    kind: UpstreamTaskKind,
+    name: []const u8,
+    labels: []const []const u8 = &.{},
+    true_labels: []const []const u8 = &.{},
+    fields: []const UpstreamField = &.{},
+    count: usize = 0,
+};
+
+pub const UpstreamRecord = struct {
+    text: []const u8,
+    tasks: []const UpstreamTask,
+    prefix_tokens: []const []const u8 = &.{},
+};
+
+pub const UpstreamTaskStats = struct {
+    num_records: usize = 0,
+    entity_tasks: usize = 0,
+    classification_tasks: usize = 0,
+    json_structure_tasks: usize = 0,
+    relation_tasks: usize = 0,
+    classification_label_count: usize = 0,
+    classification_true_label_count: usize = 0,
+    span_field_annotations: usize = 0,
+    non_entity_task_annotations: usize = 0,
+};
+
 pub const DatasetStats = struct {
     num_examples: usize = 0,
     avg_text_chars: f64 = 0,
@@ -106,6 +149,17 @@ pub const LoadedExamples = struct {
     }
 };
 
+pub const LoadedTrainingRecords = struct {
+    arena: std.heap.ArenaAllocator,
+    dataset_root: []const u8,
+    records: []UpstreamRecord,
+
+    pub fn deinit(self: *LoadedTrainingRecords) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Tokenizer = struct {
     const MetaspacePrependScheme = enum {
         always,
@@ -122,6 +176,10 @@ pub const Tokenizer = struct {
     ent_id: i32 = 4,
     ent_sep_id: i32 = 5,
     p_token_id: i32 = 0,
+    c_token_id: i32 = 0,
+    r_token_id: i32 = 0,
+    l_token_id: i32 = 0,
+    sep_struct_token_id: i32 = 0,
     sep_text_token_id: i32 = 2,
     use_gliner2_hf_prompt: bool = false,
     hf_unigram_scores: []f32 = &.{},
@@ -140,6 +198,18 @@ pub const Tokenizer = struct {
         try tok.vocab.put(allocator, try allocator.dupe(u8, "[UNK]"), 3);
         try tok.vocab.put(allocator, try allocator.dupe(u8, "<<ENT>>"), 4);
         try tok.vocab.put(allocator, try allocator.dupe(u8, "<<SEP>>"), 5);
+        try tok.vocab.put(allocator, try allocator.dupe(u8, "[P]"), 6);
+        try tok.vocab.put(allocator, try allocator.dupe(u8, "[C]"), 7);
+        try tok.vocab.put(allocator, try allocator.dupe(u8, "[R]"), 8);
+        try tok.vocab.put(allocator, try allocator.dupe(u8, "[L]"), 9);
+        try tok.vocab.put(allocator, try allocator.dupe(u8, "[SEP_STRUCT]"), 10);
+        try tok.vocab.put(allocator, try allocator.dupe(u8, "[SEP_TEXT]"), 11);
+        tok.p_token_id = 6;
+        tok.c_token_id = 7;
+        tok.r_token_id = 8;
+        tok.l_token_id = 9;
+        tok.sep_struct_token_id = 10;
+        tok.sep_text_token_id = 11;
         const words = [_][]const u8{
             "the",   "a",         "an",     "is",      "are",  "was",     "were",      "be",        "of",           "in",       "for",     "on",
             "with",  "at",        "by",     "from",    "and",  "or",      "but",       "person",    "organization", "location", "product", "event",
@@ -147,7 +217,7 @@ pub const Tokenizer = struct {
             "apple", "microsoft", "amazon", "new",     "york", "san",     "francisco", "london",
         };
         for (words, 0..) |word, i| {
-            try tok.vocab.put(allocator, try allocator.dupe(u8, word), @as(i32, @intCast(i + 6)));
+            try tok.vocab.put(allocator, try allocator.dupe(u8, word), @as(i32, @intCast(i + 12)));
         }
         tok.vocab_size = @intCast(tok.vocab.count());
         return tok;
@@ -212,9 +282,13 @@ pub const Tokenizer = struct {
             const content = content_val.string;
             if (std.mem.eql(u8, content, "[E]")) tok.ent_id = id;
             if (std.mem.eql(u8, content, "[P]")) tok.p_token_id = id;
+            if (std.mem.eql(u8, content, "[C]")) tok.c_token_id = id;
+            if (std.mem.eql(u8, content, "[R]")) tok.r_token_id = id;
+            if (std.mem.eql(u8, content, "[L]")) tok.l_token_id = id;
+            if (std.mem.eql(u8, content, "[SEP_STRUCT]")) tok.sep_struct_token_id = id;
             if (std.mem.eql(u8, content, "[SEP_TEXT]")) tok.sep_text_token_id = id;
         }
-        if (tok.ent_id <= 0 or tok.p_token_id <= 0 or tok.sep_text_token_id <= 0) return error.InvalidTokenizerJson;
+        if (tok.ent_id <= 0 or tok.p_token_id <= 0 or tok.c_token_id <= 0 or tok.r_token_id <= 0 or tok.l_token_id <= 0 or tok.sep_struct_token_id <= 0 or tok.sep_text_token_id <= 0) return error.InvalidTokenizerJson;
         tok.ent_sep_id = tok.sep_text_token_id;
         return tok;
     }
@@ -572,11 +646,18 @@ pub const EncodedBatch = struct {
     e_token_positions: []i32,
     e_token_end_positions: []i32,
     entity_type_kind: []i32,
+    text_word_counts: []i32 = &.{},
+    schema_counts: []i32 = &.{},
+    task_type_ids: []i32 = &.{},
+    schema_special_positions: []i32 = &.{},
+    schema_special_counts: []i32 = &.{},
     batch_size: usize,
     max_length: usize,
     max_words_per_sample: usize,
     max_spans: usize,
     num_entity_types: usize,
+    max_schemas: usize = 0,
+    max_schema_specials: usize = 0,
 
     pub fn deinit(self: *EncodedBatch) void {
         if (!self.owns_memory) {
@@ -597,6 +678,11 @@ pub const EncodedBatch = struct {
         self.allocator.free(self.e_token_positions);
         self.allocator.free(self.e_token_end_positions);
         self.allocator.free(self.entity_type_kind);
+        if (self.text_word_counts.len > 0) self.allocator.free(self.text_word_counts);
+        if (self.schema_counts.len > 0) self.allocator.free(self.schema_counts);
+        if (self.task_type_ids.len > 0) self.allocator.free(self.task_type_ids);
+        if (self.schema_special_positions.len > 0) self.allocator.free(self.schema_special_positions);
+        if (self.schema_special_counts.len > 0) self.allocator.free(self.schema_special_counts);
         self.* = undefined;
     }
 };
@@ -884,6 +970,54 @@ pub fn loadExamples(allocator: std.mem.Allocator, path: []const u8, split: ?[]co
     };
 }
 
+pub fn loadTrainingRecords(allocator: std.mem.Allocator, path: []const u8, split: ?[]const u8) !LoadedTrainingRecords {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var resolved = try resolveJsonlFiles(arena_alloc, path, split);
+    defer resolved.deinit();
+
+    var records: std.ArrayListUnmanaged(UpstreamRecord) = .empty;
+    defer records.deinit(arena_alloc);
+    for (resolved.paths) |resolved_path| {
+        try loadTrainingRecordsFromFile(arena_alloc, resolved_path, &records);
+    }
+
+    return .{
+        .arena = arena,
+        .dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(resolved.base_dir) orelse resolved.base_dir),
+        .records = try records.toOwnedSlice(arena_alloc),
+    };
+}
+
+pub fn computeUpstreamTaskStats(records: []const UpstreamRecord) UpstreamTaskStats {
+    var stats = UpstreamTaskStats{ .num_records = records.len };
+    for (records) |record| {
+        for (record.tasks) |task| {
+            switch (task.kind) {
+                .entities => stats.entity_tasks += 1,
+                .classifications => {
+                    stats.classification_tasks += 1;
+                    stats.classification_label_count += task.labels.len;
+                    stats.classification_true_label_count += task.true_labels.len;
+                    stats.non_entity_task_annotations += 1;
+                },
+                .json_structures => {
+                    stats.json_structure_tasks += 1;
+                    stats.non_entity_task_annotations += 1;
+                },
+                .relations => {
+                    stats.relation_tasks += 1;
+                    stats.non_entity_task_annotations += 1;
+                },
+            }
+            stats.span_field_annotations += task.fields.len;
+        }
+    }
+    return stats;
+}
+
 pub fn computeStats(allocator: std.mem.Allocator, examples: []const Example) !DatasetStats {
     var stats = DatasetStats{ .num_examples = examples.len };
     if (examples.len == 0) return stats;
@@ -923,6 +1057,72 @@ pub fn buildLabelVocab(allocator: std.mem.Allocator, examples: []const Example, 
     var idx: usize = 0;
     while (it.next()) |entry| : (idx += 1) out[idx] = try allocator.dupe(u8, entry.key_ptr.*);
     std.mem.sort([]const u8, out, {}, lessThanString);
+    return out;
+}
+
+pub fn buildUpstreamTaskLabelVocab(allocator: std.mem.Allocator, records: []const UpstreamRecord, extra_labels: ?[]const []const u8) ![][]const u8 {
+    var labels = std.StringHashMapUnmanaged(void){};
+    defer labels.deinit(allocator);
+    var ordered = std.ArrayListUnmanaged([]const u8).empty;
+    defer ordered.deinit(allocator);
+    var owned_temp = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (owned_temp.items) |label| allocator.free(label);
+        owned_temp.deinit(allocator);
+    }
+
+    if (extra_labels) |extras| {
+        for (extras) |label| {
+            const trimmed = std.mem.trim(u8, label, " \t\r\n");
+            if (trimmed.len > 0 and !labels.contains(trimmed)) {
+                try labels.put(allocator, trimmed, {});
+                try ordered.append(allocator, trimmed);
+            }
+        }
+    }
+
+    for (records) |record| {
+        for (record.tasks) |task| {
+            switch (task.kind) {
+                .classifications => {
+                    for (task.labels) |label| {
+                        const trimmed = std.mem.trim(u8, label, " \t\r\n");
+                        if (trimmed.len > 0 and !labels.contains(trimmed)) {
+                            try labels.put(allocator, trimmed, {});
+                            try ordered.append(allocator, trimmed);
+                        }
+                    }
+                },
+                .entities => {
+                    for (task.fields) |field| {
+                        const label = std.mem.trim(u8, field.name, " \t\r\n");
+                        if (label.len > 0 and !labels.contains(label)) {
+                            try labels.put(allocator, label, {});
+                            try ordered.append(allocator, label);
+                        }
+                    }
+                },
+                .json_structures, .relations => {
+                    for (task.fields) |field| {
+                        const field_name = std.mem.trim(u8, field.name, " \t\r\n");
+                        if (field_name.len == 0) continue;
+                        const full = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ task.name, field_name });
+                        if (labels.contains(full)) {
+                            allocator.free(full);
+                            continue;
+                        }
+                        try owned_temp.append(allocator, full);
+                        try labels.put(allocator, full, {});
+                        try ordered.append(allocator, full);
+                    }
+                },
+            }
+        }
+    }
+
+    var out = try allocator.alloc([]const u8, ordered.items.len);
+    errdefer allocator.free(out);
+    for (ordered.items, 0..) |label, idx| out[idx] = try allocator.dupe(u8, label);
     return out;
 }
 
@@ -1259,6 +1459,464 @@ pub fn buildSimpleBatchInto(
     };
 }
 
+pub fn buildUpstreamTaskBatch(
+    allocator: std.mem.Allocator,
+    tokenizer: *const Tokenizer,
+    records: []const UpstreamRecord,
+    entity_types: []const []const u8,
+    max_length: usize,
+    max_span_width: usize,
+    batch_size: usize,
+) !EncodedBatch {
+    const effective_batch = @min(batch_size, records.len);
+    const max_words_per_sample = max_length;
+    const max_spans = max_words_per_sample * max_span_width;
+    const max_schemas = @max(1, maxTaskCount(records[0..effective_batch]));
+    const max_schema_specials = entity_types.len + 1;
+
+    var input_ids = try allocator.alloc(i32, effective_batch * max_length);
+    errdefer allocator.free(input_ids);
+    var attention_mask = try allocator.alloc(i32, effective_batch * max_length);
+    errdefer allocator.free(attention_mask);
+    var words_mask = try allocator.alloc(i32, effective_batch * max_length);
+    errdefer allocator.free(words_mask);
+    var first_token_positions = try allocator.alloc(i32, effective_batch * max_words_per_sample);
+    errdefer allocator.free(first_token_positions);
+    var word_lengths = try allocator.alloc(f32, effective_batch * max_words_per_sample);
+    errdefer allocator.free(word_lengths);
+    var word_has_digit = try allocator.alloc(f32, effective_batch * max_words_per_sample);
+    errdefer allocator.free(word_has_digit);
+    var word_is_title = try allocator.alloc(f32, effective_batch * max_words_per_sample);
+    errdefer allocator.free(word_is_title);
+    var word_is_all_caps = try allocator.alloc(f32, effective_batch * max_words_per_sample);
+    errdefer allocator.free(word_is_all_caps);
+    var span_indices = try allocator.alloc(i32, effective_batch * max_spans * 2);
+    errdefer allocator.free(span_indices);
+    var span_mask = try allocator.alloc(f32, effective_batch * max_spans);
+    errdefer allocator.free(span_mask);
+    var span_labels = try allocator.alloc(f32, effective_batch * max_spans * entity_types.len);
+    errdefer allocator.free(span_labels);
+    var e_token_positions = try allocator.alloc(i32, effective_batch * entity_types.len);
+    errdefer allocator.free(e_token_positions);
+    var e_token_end_positions = try allocator.alloc(i32, effective_batch * entity_types.len);
+    errdefer allocator.free(e_token_end_positions);
+    var entity_type_kind = try allocator.alloc(i32, effective_batch * entity_types.len);
+    errdefer allocator.free(entity_type_kind);
+    var text_word_counts = try allocator.alloc(i32, effective_batch);
+    errdefer allocator.free(text_word_counts);
+    var schema_counts = try allocator.alloc(i32, effective_batch);
+    errdefer allocator.free(schema_counts);
+    var task_type_ids = try allocator.alloc(i32, effective_batch * max_schemas);
+    errdefer allocator.free(task_type_ids);
+    var schema_special_positions = try allocator.alloc(i32, effective_batch * max_schemas * max_schema_specials);
+    errdefer allocator.free(schema_special_positions);
+    var schema_special_counts = try allocator.alloc(i32, effective_batch * max_schemas);
+    errdefer allocator.free(schema_special_counts);
+
+    @memset(input_ids, 0);
+    @memset(attention_mask, 0);
+    @memset(words_mask, 0);
+    @memset(first_token_positions, -1);
+    @memset(word_lengths, 0);
+    @memset(word_has_digit, 0);
+    @memset(word_is_title, 0);
+    @memset(word_is_all_caps, 0);
+    @memset(span_indices, 0);
+    @memset(span_mask, 0);
+    @memset(span_labels, 0);
+    @memset(e_token_positions, -1);
+    @memset(e_token_end_positions, -1);
+    @memset(entity_type_kind, 0);
+    @memset(text_word_counts, 0);
+    @memset(schema_counts, 0);
+    @memset(task_type_ids, 0);
+    @memset(schema_special_positions, -1);
+    @memset(schema_special_counts, 0);
+
+    for (records[0..effective_batch], 0..) |record, b| {
+        const input_offset = b * max_length;
+        const word_offset = b * max_words_per_sample;
+        const span_offset = b * max_spans;
+        const e_offset = b * entity_types.len;
+        const schema_offset = b * max_schemas;
+        const schema_special_offset = b * max_schemas * max_schema_specials;
+
+        const encode_result = try encodeUpstreamRecordInto(
+            allocator,
+            tokenizer,
+            record,
+            entity_types,
+            max_schemas,
+            max_schema_specials,
+            input_ids[input_offset .. input_offset + max_length],
+            attention_mask[input_offset .. input_offset + max_length],
+            words_mask[input_offset .. input_offset + max_length],
+            first_token_positions[word_offset .. word_offset + max_words_per_sample],
+            e_token_positions[e_offset .. e_offset + entity_types.len],
+            e_token_end_positions[e_offset .. e_offset + entity_types.len],
+            task_type_ids[schema_offset .. schema_offset + max_schemas],
+            schema_special_positions[schema_special_offset .. schema_special_offset + max_schemas * max_schema_specials],
+            schema_special_counts[schema_offset .. schema_offset + max_schemas],
+        );
+        text_word_counts[b] = @intCast(encode_result.num_words);
+        schema_counts[b] = @intCast(encode_result.num_schemas);
+
+        fillUpstreamWordSurfaceFeatures(
+            record,
+            encode_result.num_words,
+            word_lengths[word_offset .. word_offset + max_words_per_sample],
+            word_has_digit[word_offset .. word_offset + max_words_per_sample],
+            word_is_title[word_offset .. word_offset + max_words_per_sample],
+            word_is_all_caps[word_offset .. word_offset + max_words_per_sample],
+        );
+        try fillUpstreamSpanGrid(
+            allocator,
+            record,
+            entity_types,
+            encode_result.num_words,
+            max_words_per_sample,
+            max_span_width,
+            span_indices[span_offset * 2 .. (span_offset + max_spans) * 2],
+            span_mask[span_offset .. span_offset + max_spans],
+            span_labels[span_offset * entity_types.len .. (span_offset + max_spans) * entity_types.len],
+            entity_type_kind[e_offset .. e_offset + entity_types.len],
+        );
+    }
+
+    return .{
+        .allocator = allocator,
+        .input_ids = input_ids,
+        .attention_mask = attention_mask,
+        .words_mask = words_mask,
+        .first_token_positions = first_token_positions,
+        .word_lengths = word_lengths,
+        .word_has_digit = word_has_digit,
+        .word_is_title = word_is_title,
+        .word_is_all_caps = word_is_all_caps,
+        .span_indices = span_indices,
+        .span_mask = span_mask,
+        .span_labels = span_labels,
+        .e_token_positions = e_token_positions,
+        .e_token_end_positions = e_token_end_positions,
+        .entity_type_kind = entity_type_kind,
+        .text_word_counts = text_word_counts,
+        .schema_counts = schema_counts,
+        .task_type_ids = task_type_ids,
+        .schema_special_positions = schema_special_positions,
+        .schema_special_counts = schema_special_counts,
+        .batch_size = effective_batch,
+        .max_length = max_length,
+        .max_words_per_sample = max_words_per_sample,
+        .max_spans = max_spans,
+        .num_entity_types = entity_types.len,
+        .max_schemas = max_schemas,
+        .max_schema_specials = max_schema_specials,
+    };
+}
+
+const UpstreamEncodeResult = struct {
+    num_words: usize,
+    num_schemas: usize,
+};
+
+fn encodeUpstreamRecordInto(
+    allocator: std.mem.Allocator,
+    tokenizer: *const Tokenizer,
+    record: UpstreamRecord,
+    entity_types: []const []const u8,
+    max_schemas: usize,
+    max_schema_specials: usize,
+    input_ids: []i32,
+    attention_mask: []i32,
+    words_mask: []i32,
+    first_token_positions: []i32,
+    e_token_positions: []i32,
+    e_token_end_positions: []i32,
+    task_type_ids: []i32,
+    schema_special_positions: []i32,
+    schema_special_counts: []i32,
+) !UpstreamEncodeResult {
+    var pos: usize = 0;
+    var schema_idx: usize = 0;
+    for (record.tasks) |task| {
+        if (schema_idx >= max_schemas or pos >= input_ids.len) break;
+        if (schema_idx > 0) try appendSpecialInputToken(tokenizer.sep_struct_token_id, input_ids, attention_mask, &pos);
+        task_type_ids[schema_idx] = upstreamTaskTypeId(task.kind);
+        try appendUpstreamSchema(
+            allocator,
+            tokenizer,
+            task,
+            entity_types,
+            schema_idx,
+            max_schema_specials,
+            input_ids,
+            attention_mask,
+            &pos,
+            e_token_positions,
+            e_token_end_positions,
+            schema_special_positions[schema_idx * max_schema_specials .. (schema_idx + 1) * max_schema_specials],
+            &schema_special_counts[schema_idx],
+        );
+        schema_idx += 1;
+    }
+    if (pos < input_ids.len) try appendSpecialInputToken(tokenizer.sep_text_token_id, input_ids, attention_mask, &pos);
+
+    var num_words: usize = 0;
+    for (record.prefix_tokens) |token| {
+        if (num_words >= first_token_positions.len or pos >= input_ids.len) break;
+        const appended = try appendUpstreamTextToken(
+            allocator,
+            tokenizer,
+            token,
+            input_ids,
+            attention_mask,
+            words_mask,
+            first_token_positions,
+            &pos,
+            &num_words,
+        );
+        if (!appended) break;
+    }
+    var text_idx: usize = 0;
+    while (text_idx < record.text.len) {
+        while (text_idx < record.text.len and std.ascii.isWhitespace(record.text[text_idx])) : (text_idx += 1) {}
+        if (text_idx >= record.text.len) break;
+        if (num_words >= first_token_positions.len or pos >= input_ids.len) break;
+
+        const token_start = text_idx;
+        text_idx = nextUpstreamTextTokenEnd(record.text, text_idx);
+        const appended = try appendUpstreamTextToken(
+            allocator,
+            tokenizer,
+            record.text[token_start..text_idx],
+            input_ids,
+            attention_mask,
+            words_mask,
+            first_token_positions,
+            &pos,
+            &num_words,
+        );
+        if (!appended) break;
+    }
+    if (num_words == 0 and pos < input_ids.len) {
+        first_token_positions[0] = @intCast(pos);
+        const next_pos = try tokenizer.encodeHFFragmentIntoAllocating(allocator, ".", input_ids, attention_mask, pos, input_ids.len);
+        for (pos..next_pos) |token_pos| words_mask[token_pos] = 1;
+        pos = next_pos;
+        num_words = 1;
+    }
+    return .{ .num_words = num_words, .num_schemas = schema_idx };
+}
+
+fn appendUpstreamTextToken(
+    allocator: std.mem.Allocator,
+    tokenizer: *const Tokenizer,
+    token: []const u8,
+    input_ids: []i32,
+    attention_mask: []i32,
+    words_mask: []i32,
+    first_token_positions: []i32,
+    pos: *usize,
+    num_words: *usize,
+) !bool {
+    if (token.len == 0 or num_words.* >= first_token_positions.len or pos.* >= input_ids.len) return false;
+    first_token_positions[num_words.*] = @intCast(pos.*);
+    const lower_token = try std.ascii.allocLowerString(allocator, token);
+    defer allocator.free(lower_token);
+    const next_pos = try tokenizer.encodeHFFragmentIntoAllocating(allocator, lower_token, input_ids, attention_mask, pos.*, input_ids.len);
+    if (next_pos == pos.*) return false;
+    for (pos.*..next_pos) |token_pos| words_mask[token_pos] = @intCast(num_words.* + 1);
+    pos.* = next_pos;
+    num_words.* += 1;
+    return true;
+}
+
+fn nextUpstreamTextTokenEnd(text: []const u8, start: usize) usize {
+    if (startsWithHttpUrl(text, start) or startsWithWwwUrl(text, start)) return scanUntilWhitespace(text, start);
+    if (looksLikeEmail(text, start)) return scanEmail(text, start);
+    if (text[start] == '@' and start + 1 < text.len and isUpstreamWordByte(text[start + 1])) {
+        var idx = start + 2;
+        while (idx < text.len and isUpstreamWordByte(text[idx])) : (idx += 1) {}
+        return idx;
+    }
+    if (isUpstreamWordByte(text[start])) return scanUpstreamWord(text, start);
+    return start + utf8ByteLen(text[start]);
+}
+
+fn scanUpstreamWord(text: []const u8, start: usize) usize {
+    var idx = start;
+    while (idx < text.len and isUpstreamWordByte(text[idx])) : (idx += 1) {}
+    while (idx + 1 < text.len and (text[idx] == '-' or text[idx] == '_') and isUpstreamWordByte(text[idx + 1])) {
+        idx += 1;
+        while (idx < text.len and isUpstreamWordByte(text[idx])) : (idx += 1) {}
+    }
+    return idx;
+}
+
+fn scanUntilWhitespace(text: []const u8, start: usize) usize {
+    var idx = start;
+    while (idx < text.len and !std.ascii.isWhitespace(text[idx])) : (idx += utf8ByteLen(text[idx])) {}
+    return idx;
+}
+
+fn scanEmail(text: []const u8, start: usize) usize {
+    var idx = start;
+    while (idx < text.len and isEmailLocalByte(text[idx])) : (idx += 1) {}
+    if (idx >= text.len or text[idx] != '@') return scanUpstreamWord(text, start);
+    idx += 1;
+    while (idx < text.len and (std.ascii.isAlphanumeric(text[idx]) or text[idx] == '.' or text[idx] == '-')) : (idx += 1) {}
+    return idx;
+}
+
+fn startsWithHttpUrl(text: []const u8, start: usize) bool {
+    return std.mem.startsWith(u8, text[start..], "http://") or std.mem.startsWith(u8, text[start..], "https://");
+}
+
+fn startsWithWwwUrl(text: []const u8, start: usize) bool {
+    return std.mem.startsWith(u8, text[start..], "www.");
+}
+
+fn looksLikeEmail(text: []const u8, start: usize) bool {
+    var idx = start;
+    while (idx < text.len and isEmailLocalByte(text[idx])) : (idx += 1) {}
+    if (idx == start or idx >= text.len or text[idx] != '@') return false;
+    var saw_dot = false;
+    idx += 1;
+    while (idx < text.len and (std.ascii.isAlphanumeric(text[idx]) or text[idx] == '.' or text[idx] == '-')) : (idx += 1) {
+        if (text[idx] == '.') saw_dot = true;
+    }
+    return saw_dot;
+}
+
+fn isEmailLocalByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '%' or c == '+' or c == '-';
+}
+
+fn isUpstreamWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
+}
+
+fn utf8ByteLen(first: u8) usize {
+    if (first < 0x80) return 1;
+    if ((first & 0xe0) == 0xc0) return 2;
+    if ((first & 0xf0) == 0xe0) return 3;
+    if ((first & 0xf8) == 0xf0) return 4;
+    return 1;
+}
+
+fn appendUpstreamSchema(
+    allocator: std.mem.Allocator,
+    tokenizer: *const Tokenizer,
+    task: UpstreamTask,
+    entity_types: []const []const u8,
+    schema_idx: usize,
+    max_schema_specials: usize,
+    input_ids: []i32,
+    attention_mask: []i32,
+    pos: *usize,
+    e_token_positions: []i32,
+    e_token_end_positions: []i32,
+    schema_special_positions: []i32,
+    schema_special_count: *i32,
+) !void {
+    _ = schema_idx;
+    try appendInputFragment(allocator, tokenizer, "(", input_ids, attention_mask, pos);
+    try appendSchemaSpecial(tokenizer.p_token_id, input_ids, attention_mask, pos, schema_special_positions, schema_special_count, max_schema_specials);
+    try appendInputFragment(allocator, tokenizer, task.name, input_ids, attention_mask, pos);
+    try appendInputFragment(allocator, tokenizer, "(", input_ids, attention_mask, pos);
+
+    switch (task.kind) {
+        .classifications => {
+            for (task.labels) |label| {
+                const marker_pos = pos.*;
+                try appendSchemaSpecial(tokenizer.l_token_id, input_ids, attention_mask, pos, schema_special_positions, schema_special_count, max_schema_specials);
+                if (indexOfLabel(entity_types, label)) |label_idx| {
+                    e_token_positions[label_idx] = @intCast(marker_pos);
+                    e_token_end_positions[label_idx] = @intCast(pos.*);
+                }
+                try appendInputFragment(allocator, tokenizer, label, input_ids, attention_mask, pos);
+            }
+        },
+        .entities => {
+            for (task.fields) |field| {
+                const marker_pos = pos.*;
+                try appendSchemaSpecial(tokenizer.ent_id, input_ids, attention_mask, pos, schema_special_positions, schema_special_count, max_schema_specials);
+                if (indexOfLabel(entity_types, field.name)) |label_idx| {
+                    e_token_positions[label_idx] = @intCast(marker_pos);
+                    e_token_end_positions[label_idx] = @intCast(pos.*);
+                }
+                try appendInputFragment(allocator, tokenizer, field.name, input_ids, attention_mask, pos);
+            }
+        },
+        .json_structures, .relations => {
+            const marker_id = if (task.kind == .json_structures) tokenizer.c_token_id else tokenizer.r_token_id;
+            for (task.fields) |field| {
+                const marker_pos = pos.*;
+                try appendSchemaSpecial(marker_id, input_ids, attention_mask, pos, schema_special_positions, schema_special_count, max_schema_specials);
+                const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ task.name, field.name });
+                defer allocator.free(label);
+                if (indexOfLabel(entity_types, label)) |label_idx| {
+                    e_token_positions[label_idx] = @intCast(marker_pos);
+                    e_token_end_positions[label_idx] = @intCast(pos.*);
+                }
+                try appendInputFragment(allocator, tokenizer, field.name, input_ids, attention_mask, pos);
+            }
+        },
+    }
+
+    try appendInputFragment(allocator, tokenizer, ")", input_ids, attention_mask, pos);
+    try appendInputFragment(allocator, tokenizer, ")", input_ids, attention_mask, pos);
+}
+
+fn appendSchemaSpecial(
+    token_id: i32,
+    input_ids: []i32,
+    attention_mask: []i32,
+    pos: *usize,
+    schema_special_positions: []i32,
+    schema_special_count: *i32,
+    max_schema_specials: usize,
+) !void {
+    if (@as(usize, @intCast(@max(schema_special_count.*, 0))) < max_schema_specials) {
+        schema_special_positions[@intCast(schema_special_count.*)] = @intCast(pos.*);
+        schema_special_count.* += 1;
+    }
+    try appendSpecialInputToken(token_id, input_ids, attention_mask, pos);
+}
+
+fn appendSpecialInputToken(token_id: i32, input_ids: []i32, attention_mask: []i32, pos: *usize) !void {
+    if (pos.* >= input_ids.len) return;
+    input_ids[pos.*] = token_id;
+    attention_mask[pos.*] = 1;
+    pos.* += 1;
+}
+
+fn appendInputFragment(
+    allocator: std.mem.Allocator,
+    tokenizer: *const Tokenizer,
+    fragment: []const u8,
+    input_ids: []i32,
+    attention_mask: []i32,
+    pos: *usize,
+) !void {
+    pos.* = try tokenizer.encodeHFFragmentIntoAllocating(allocator, fragment, input_ids, attention_mask, pos.*, input_ids.len);
+}
+
+fn maxTaskCount(records: []const UpstreamRecord) usize {
+    var max_count: usize = 0;
+    for (records) |record| max_count = @max(max_count, record.tasks.len);
+    return max_count;
+}
+
+pub fn upstreamTaskTypeId(kind: UpstreamTaskKind) i32 {
+    return switch (kind) {
+        .entities => 1,
+        .json_structures => 2,
+        .relations => 3,
+        .classifications => 4,
+    };
+}
+
 pub fn freeExamples(allocator: std.mem.Allocator, examples: []Example) void {
     for (examples) |ex| allocator.free(ex.entities);
     allocator.free(examples);
@@ -1322,10 +1980,480 @@ fn loadExamplesFromFile(allocator: std.mem.Allocator, path: []const u8, out: *st
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
-        const parsed = try std.json.parseFromSliceLeaky(Example, allocator, line, .{ .ignore_unknown_fields = true });
-        if (std.mem.trim(u8, parsed.text, " \t\r\n").len == 0) return error.MissingText;
-        try out.append(allocator, parsed);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, line, .{});
+        try appendExampleFromJsonValue(allocator, parsed, out);
     }
+}
+
+fn loadTrainingRecordsFromFile(allocator: std.mem.Allocator, path: []const u8, out: *std.ArrayListUnmanaged(UpstreamRecord)) !void {
+    const data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, line, .{});
+        try appendTrainingRecordFromJsonValue(allocator, parsed, out);
+    }
+}
+
+fn appendExampleFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value, out: *std.ArrayListUnmanaged(Example)) !void {
+    if (value != .object) return error.InvalidGliner2Example;
+    const obj = value.object;
+    if (obj.get("text")) |text_value| {
+        const text = try jsonString(text_value);
+        if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.MissingText;
+        var entities: std.ArrayListUnmanaged(Entity) = .empty;
+        errdefer entities.deinit(allocator);
+        if (obj.get("entities")) |entities_value| {
+            try appendLegacyEntitiesFromJson(allocator, text, entities_value, &entities);
+        }
+        try out.append(allocator, .{
+            .text = text,
+            .entities = try entities.toOwnedSlice(allocator),
+        });
+        return;
+    }
+
+    const input_value = obj.get("input") orelse return error.MissingText;
+    const output_value = obj.get("output") orelse return error.InvalidGliner2Example;
+    const text = try jsonString(input_value);
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.MissingText;
+    var entities: std.ArrayListUnmanaged(Entity) = .empty;
+    errdefer entities.deinit(allocator);
+    try appendUpstreamOutputEntities(allocator, text, output_value, &entities);
+    try out.append(allocator, .{
+        .text = text,
+        .entities = try entities.toOwnedSlice(allocator),
+    });
+}
+
+fn appendTrainingRecordFromJsonValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(UpstreamRecord),
+) !void {
+    if (value != .object) return error.InvalidGliner2Example;
+    const obj = value.object;
+    var tasks = std.ArrayListUnmanaged(UpstreamTask).empty;
+    errdefer tasks.deinit(allocator);
+
+    if (obj.get("text")) |text_value| {
+        const text = try jsonString(text_value);
+        if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.MissingText;
+        if (obj.get("entities")) |entities_value| {
+            try appendLegacyEntityTasks(allocator, text, entities_value, &tasks);
+        }
+        try out.append(allocator, .{
+            .text = text,
+            .tasks = try tasks.toOwnedSlice(allocator),
+        });
+        return;
+    }
+
+    const text = try jsonString(obj.get("input") orelse return error.MissingText);
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.MissingText;
+    const output_value = obj.get("output") orelse return error.InvalidGliner2Example;
+    if (output_value != .object) return error.InvalidGliner2Example;
+    var prefix_tokens = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer prefix_tokens.deinit(allocator);
+    try appendUpstreamOutputTasks(allocator, text, output_value.object, &tasks, &prefix_tokens);
+    try out.append(allocator, .{
+        .text = text,
+        .tasks = try tasks.toOwnedSlice(allocator),
+        .prefix_tokens = try prefix_tokens.toOwnedSlice(allocator),
+    });
+}
+
+fn appendLegacyEntityTasks(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    value: std.json.Value,
+    tasks: *std.ArrayListUnmanaged(UpstreamTask),
+) !void {
+    if (value != .array) return error.InvalidGliner2Example;
+    for (value.array.items) |entity_value| {
+        if (entity_value != .object) return error.InvalidGliner2Example;
+        const obj = entity_value.object;
+        const mention = try jsonString(obj.get("text") orelse return error.InvalidGliner2Example);
+        const label = try jsonString(obj.get("label") orelse return error.InvalidGliner2Example);
+        const start = try jsonUsize(obj.get("start") orelse return error.InvalidGliner2Example);
+        const end = try jsonUsize(obj.get("end") orelse return error.InvalidGliner2Example);
+        const use_supplied_span = end <= text.len and start <= end and std.ascii.eqlIgnoreCase(text[start..end], mention);
+        const resolved_start, const resolved_end = if (use_supplied_span)
+            .{ start, end }
+        else if (indexOfIgnoreCase(text, mention)) |found|
+            .{ found, found + mention.len }
+        else
+            continue;
+        const fields = try allocator.alloc(UpstreamField, 1);
+        fields[0] = .{
+            .name = label,
+            .value = text[resolved_start..resolved_end],
+            .start = resolved_start,
+            .end = resolved_end,
+        };
+        try tasks.append(allocator, .{
+            .kind = .entities,
+            .name = label,
+            .fields = fields,
+            .count = 1,
+        });
+    }
+}
+
+fn appendUpstreamOutputTasks(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    output: std.json.ObjectMap,
+    tasks: *std.ArrayListUnmanaged(UpstreamTask),
+    prefix_tokens: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var entity_task: ?UpstreamTask = null;
+    if (output.get("entities")) |entity_map| {
+        if (entity_map != .object) return error.InvalidGliner2Example;
+        var fields = std.ArrayListUnmanaged(UpstreamField).empty;
+        errdefer fields.deinit(allocator);
+        var iter = entity_map.object.iterator();
+        while (iter.next()) |entry| {
+            try appendTaskFieldsFromValue(allocator, text, entry.key_ptr.*, entry.value_ptr.*, null, &fields);
+        }
+        if (fields.items.len > 0) {
+            entity_task = .{
+                .kind = .entities,
+                .name = "entities",
+                .fields = try fields.toOwnedSlice(allocator),
+                .count = 1,
+            };
+        }
+    }
+
+    if (output.get("json_structures")) |structures_value| {
+        if (structures_value != .array) return error.InvalidGliner2Example;
+        for (structures_value.array.items) |structure_value| {
+            if (structure_value != .object) return error.InvalidGliner2Example;
+            var struct_iter = structure_value.object.iterator();
+            while (struct_iter.next()) |struct_entry| {
+                if (struct_entry.value_ptr.* != .object) continue;
+                var choice_targets = std.ArrayListUnmanaged(ChoiceFieldTarget).empty;
+                defer choice_targets.deinit(allocator);
+                try appendJsonChoicePrefixTokens(
+                    allocator,
+                    struct_entry.key_ptr.*,
+                    struct_entry.value_ptr.object,
+                    prefix_tokens,
+                    &choice_targets,
+                );
+                var fields = std.ArrayListUnmanaged(UpstreamField).empty;
+                errdefer fields.deinit(allocator);
+                var field_iter = struct_entry.value_ptr.object.iterator();
+                while (field_iter.next()) |field_entry| {
+                    try appendTaskFieldsFromValue(
+                        allocator,
+                        text,
+                        field_entry.key_ptr.*,
+                        field_entry.value_ptr.*,
+                        findChoiceFieldTarget(choice_targets.items, field_entry.key_ptr.*),
+                        &fields,
+                    );
+                }
+                try tasks.append(allocator, .{
+                    .kind = .json_structures,
+                    .name = struct_entry.key_ptr.*,
+                    .fields = try fields.toOwnedSlice(allocator),
+                    .count = 1,
+                });
+            }
+        }
+    }
+
+    if (entity_task) |task| try tasks.append(allocator, task);
+
+    if (output.get("relations")) |relations_value| {
+        if (relations_value != .array) return error.InvalidGliner2Example;
+        for (relations_value.array.items) |relation_value| {
+            if (relation_value != .object) return error.InvalidGliner2Example;
+            var relation_iter = relation_value.object.iterator();
+            while (relation_iter.next()) |relation_entry| {
+                if (relation_entry.value_ptr.* != .object) continue;
+                var fields = std.ArrayListUnmanaged(UpstreamField).empty;
+                errdefer fields.deinit(allocator);
+                var field_iter = relation_entry.value_ptr.object.iterator();
+                while (field_iter.next()) |field_entry| {
+                    try appendTaskFieldsFromValue(allocator, text, field_entry.key_ptr.*, field_entry.value_ptr.*, null, &fields);
+                }
+                try tasks.append(allocator, .{
+                    .kind = .relations,
+                    .name = relation_entry.key_ptr.*,
+                    .fields = try fields.toOwnedSlice(allocator),
+                    .count = 1,
+                });
+            }
+        }
+    }
+
+    if (output.get("classifications")) |classifications_value| {
+        if (classifications_value != .array) return error.InvalidGliner2Example;
+        for (classifications_value.array.items) |classification_value| {
+            if (classification_value != .object) return error.InvalidGliner2Example;
+            const cls = classification_value.object;
+            const labels = try jsonStringArray(allocator, cls.get("labels") orelse return error.InvalidGliner2Example);
+            const true_labels = try jsonStringArray(allocator, cls.get("true_label") orelse return error.InvalidGliner2Example);
+            try tasks.append(allocator, .{
+                .kind = .classifications,
+                .name = try jsonString(cls.get("task") orelse return error.InvalidGliner2Example),
+                .labels = labels,
+                .true_labels = true_labels,
+                .count = true_labels.len,
+            });
+        }
+    }
+}
+
+fn appendLegacyEntitiesFromJson(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    value: std.json.Value,
+    entities: *std.ArrayListUnmanaged(Entity),
+) !void {
+    if (value != .array) return error.InvalidGliner2Example;
+    for (value.array.items) |entity_value| {
+        if (entity_value != .object) return error.InvalidGliner2Example;
+        const obj = entity_value.object;
+        const entity_text = try jsonString(obj.get("text") orelse return error.InvalidGliner2Example);
+        const label = try jsonString(obj.get("label") orelse return error.InvalidGliner2Example);
+        const start = try jsonUsize(obj.get("start") orelse return error.InvalidGliner2Example);
+        const end = try jsonUsize(obj.get("end") orelse return error.InvalidGliner2Example);
+        const use_supplied_span = end <= text.len and start <= end and std.ascii.eqlIgnoreCase(text[start..end], entity_text);
+        const resolved_start, const resolved_end = if (use_supplied_span)
+            .{ start, end }
+        else if (indexOfIgnoreCase(text, entity_text)) |found|
+            .{ found, found + entity_text.len }
+        else
+            continue;
+        try entities.append(allocator, .{
+            .text = text[resolved_start..resolved_end],
+            .label = label,
+            .start = resolved_start,
+            .end = resolved_end,
+        });
+    }
+}
+
+fn appendUpstreamOutputEntities(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    output_value: std.json.Value,
+    entities: *std.ArrayListUnmanaged(Entity),
+) !void {
+    if (output_value != .object) return error.InvalidGliner2Example;
+    const output = output_value.object;
+
+    if (output.get("entities")) |entity_map| {
+        if (entity_map != .object) return error.InvalidGliner2Example;
+        var iter = entity_map.object.iterator();
+        while (iter.next()) |entry| {
+            try appendMentionValueAsEntities(allocator, text, entry.key_ptr.*, entry.value_ptr.*, entities);
+        }
+    }
+
+    if (output.get("json_structures")) |structures_value| {
+        if (structures_value != .array) return error.InvalidGliner2Example;
+        for (structures_value.array.items) |structure_value| {
+            if (structure_value != .object) return error.InvalidGliner2Example;
+            var struct_iter = structure_value.object.iterator();
+            while (struct_iter.next()) |struct_entry| {
+                if (struct_entry.value_ptr.* != .object) continue;
+                var field_iter = struct_entry.value_ptr.object.iterator();
+                while (field_iter.next()) |field_entry| {
+                    const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ struct_entry.key_ptr.*, field_entry.key_ptr.* });
+                    try appendMentionValueAsEntities(allocator, text, label, field_entry.value_ptr.*, entities);
+                }
+            }
+        }
+    }
+
+    if (output.get("relations")) |relations_value| {
+        if (relations_value != .array) return error.InvalidGliner2Example;
+        for (relations_value.array.items) |relation_value| {
+            if (relation_value != .object) return error.InvalidGliner2Example;
+            var relation_iter = relation_value.object.iterator();
+            while (relation_iter.next()) |relation_entry| {
+                if (relation_entry.value_ptr.* != .object) continue;
+                var field_iter = relation_entry.value_ptr.object.iterator();
+                while (field_iter.next()) |field_entry| {
+                    const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ relation_entry.key_ptr.*, field_entry.key_ptr.* });
+                    try appendMentionValueAsEntities(allocator, text, label, field_entry.value_ptr.*, entities);
+                }
+            }
+        }
+    }
+}
+
+fn appendMentionValueAsEntities(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    label: []const u8,
+    value: std.json.Value,
+    entities: *std.ArrayListUnmanaged(Entity),
+) !void {
+    switch (value) {
+        .string => try appendMentionAsEntity(allocator, text, label, value.string, entities),
+        .array => for (value.array.items) |item| try appendMentionValueAsEntities(allocator, text, label, item, entities),
+        .object => {
+            if (value.object.get("value")) |choice_value| {
+                try appendMentionValueAsEntities(allocator, text, label, choice_value, entities);
+            }
+        },
+        else => {},
+    }
+}
+
+const ChoiceFieldTarget = struct {
+    name: []const u8,
+    word_start: usize,
+    word_end: usize,
+};
+
+fn appendJsonChoicePrefixTokens(
+    allocator: std.mem.Allocator,
+    parent: []const u8,
+    fields_obj: std.json.ObjectMap,
+    prefix_tokens: *std.ArrayListUnmanaged([]const u8),
+    targets: *std.ArrayListUnmanaged(ChoiceFieldTarget),
+) !void {
+    var iter = fields_obj.iterator();
+    var started = false;
+    while (iter.next()) |entry| {
+        const value = entry.value_ptr.*;
+        if (value != .object) continue;
+        const value_obj = value.object;
+        const choice_value_raw = value_obj.get("value") orelse continue;
+        const choices_raw = value_obj.get("choices") orelse continue;
+        if (choices_raw != .array) continue;
+        const choice_value = jsonString(choice_value_raw) catch continue;
+        if (!started) {
+            try prefix_tokens.append(allocator, "(");
+            try prefix_tokens.append(allocator, try std.fmt.allocPrint(allocator, "{s}:", .{parent}));
+            started = true;
+        } else {
+            try prefix_tokens.append(allocator, ",");
+        }
+        try prefix_tokens.append(allocator, entry.key_ptr.*);
+        try prefix_tokens.append(allocator, "(");
+        var target_word: ?usize = null;
+        for (choices_raw.array.items, 0..) |choice_item, choice_idx| {
+            if (choice_idx > 0) try prefix_tokens.append(allocator, "|");
+            const choice = jsonString(choice_item) catch continue;
+            const word_idx = prefix_tokens.items.len;
+            try prefix_tokens.append(allocator, choice);
+            if (std.mem.eql(u8, choice, choice_value)) target_word = word_idx;
+        }
+        try prefix_tokens.append(allocator, ")");
+        if (target_word) |word_idx| {
+            try targets.append(allocator, .{
+                .name = entry.key_ptr.*,
+                .word_start = word_idx,
+                .word_end = word_idx,
+            });
+        }
+    }
+    if (started) try prefix_tokens.append(allocator, ")");
+}
+
+fn findChoiceFieldTarget(targets: []const ChoiceFieldTarget, name: []const u8) ?ChoiceFieldTarget {
+    for (targets) |target| {
+        if (std.mem.eql(u8, target.name, name)) return target;
+    }
+    return null;
+}
+
+fn appendTaskFieldsFromValue(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    field_name: []const u8,
+    value: std.json.Value,
+    choice_target: ?ChoiceFieldTarget,
+    fields: *std.ArrayListUnmanaged(UpstreamField),
+) !void {
+    switch (value) {
+        .string => try appendTaskFieldMention(allocator, text, field_name, value.string, choice_target, fields),
+        .array => for (value.array.items) |item| try appendTaskFieldsFromValue(allocator, text, field_name, item, choice_target, fields),
+        .object => {
+            if (value.object.get("value")) |choice_value| {
+                try appendTaskFieldsFromValue(allocator, text, field_name, choice_value, choice_target, fields);
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendTaskFieldMention(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    field_name: []const u8,
+    mention: []const u8,
+    choice_target: ?ChoiceFieldTarget,
+    fields: *std.ArrayListUnmanaged(UpstreamField),
+) !void {
+    if (std.mem.trim(u8, mention, " \t\r\n").len == 0) return;
+    const maybe_start = indexOfIgnoreCase(text, mention);
+    try fields.append(allocator, .{
+        .name = field_name,
+        .value = mention,
+        .start = maybe_start,
+        .end = if (maybe_start) |start| start + mention.len else null,
+        .target_word_start = if (choice_target) |target| target.word_start else null,
+        .target_word_end = if (choice_target) |target| target.word_end else null,
+    });
+}
+
+fn appendMentionAsEntity(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    label: []const u8,
+    mention: []const u8,
+    entities: *std.ArrayListUnmanaged(Entity),
+) !void {
+    if (std.mem.trim(u8, mention, " \t\r\n").len == 0) return;
+    const start = indexOfIgnoreCase(text, mention) orelse return;
+    const end = start + mention.len;
+    try entities.append(allocator, .{
+        .text = text[start..end],
+        .label = label,
+        .start = start,
+        .end = end,
+    });
+}
+
+fn jsonString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => value.string,
+        else => error.InvalidGliner2Example,
+    };
+}
+
+fn jsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    if (value != .array) return error.InvalidGliner2Example;
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer out.deinit(allocator);
+    for (value.array.items) |item| try out.append(allocator, try jsonString(item));
+    return out.toOwnedSlice(allocator);
+}
+
+fn jsonUsize(value: std.json.Value) !usize {
+    return switch (value) {
+        .integer => |v| if (v >= 0) @as(usize, @intCast(v)) else error.InvalidGliner2Example,
+        else => error.InvalidGliner2Example,
+    };
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 fn resolveTokenizerJsonPath(allocator: std.mem.Allocator, model_input: []const u8) ![]u8 {
@@ -1365,6 +2493,46 @@ fn fillWordSurfaceFeatures(
         word_is_all_caps[idx] = if (isAllCapsWord(word)) 1.0 else 0.0;
         idx += 1;
     }
+}
+
+fn fillUpstreamWordSurfaceFeatures(
+    record: UpstreamRecord,
+    num_words: usize,
+    word_lengths: []f32,
+    word_has_digit: []f32,
+    word_is_title: []f32,
+    word_is_all_caps: []f32,
+) void {
+    var idx: usize = 0;
+    for (record.prefix_tokens) |token| {
+        if (idx >= num_words or idx >= word_lengths.len) return;
+        fillOneWordSurfaceFeature(token, idx, word_lengths, word_has_digit, word_is_title, word_is_all_caps);
+        idx += 1;
+    }
+    var text_idx: usize = 0;
+    while (text_idx < record.text.len) {
+        while (text_idx < record.text.len and std.ascii.isWhitespace(record.text[text_idx])) : (text_idx += 1) {}
+        if (text_idx >= record.text.len) break;
+        if (idx >= num_words or idx >= word_lengths.len) break;
+        const end = nextUpstreamTextTokenEnd(record.text, text_idx);
+        fillOneWordSurfaceFeature(record.text[text_idx..end], idx, word_lengths, word_has_digit, word_is_title, word_is_all_caps);
+        text_idx = end;
+        idx += 1;
+    }
+}
+
+fn fillOneWordSurfaceFeature(
+    word: []const u8,
+    idx: usize,
+    word_lengths: []f32,
+    word_has_digit: []f32,
+    word_is_title: []f32,
+    word_is_all_caps: []f32,
+) void {
+    word_lengths[idx] = @as(f32, @floatFromInt(@min(word.len, 32))) / 32.0;
+    word_has_digit[idx] = if (containsDigit(word)) 1.0 else 0.0;
+    word_is_title[idx] = if (isTitleCaseWord(word)) 1.0 else 0.0;
+    word_is_all_caps[idx] = if (isAllCapsWord(word)) 1.0 else 0.0;
 }
 
 fn containsDigit(word: []const u8) bool {
@@ -1427,18 +2595,89 @@ fn fillSpanGrid(
     }
 }
 
+fn fillUpstreamSpanGrid(
+    allocator: std.mem.Allocator,
+    record: UpstreamRecord,
+    entity_types: []const []const u8,
+    num_words: usize,
+    max_words: usize,
+    max_span_width: usize,
+    span_indices: []i32,
+    span_mask: []f32,
+    span_labels: []f32,
+    entity_type_kind: []i32,
+) !void {
+    const num_entity_types = entity_types.len;
+    const max_spans = max_words * max_span_width;
+    const char_to_word = try buildCharToWordMap(allocator, record.text);
+    defer allocator.free(char_to_word);
+    const prefix_word_count = record.prefix_tokens.len;
+
+    for (0..max_words) |start_word| {
+        for (0..max_span_width) |w| {
+            const span_idx = start_word * max_span_width + w;
+            if (span_idx >= max_spans) continue;
+            const end_word = start_word + w;
+            if (start_word < num_words and end_word < num_words) {
+                span_indices[span_idx * 2] = @intCast(start_word);
+                span_indices[span_idx * 2 + 1] = @intCast(end_word);
+                span_mask[span_idx] = 1.0;
+            }
+        }
+    }
+
+    for (record.tasks) |task| {
+        if (task.kind == .classifications) continue;
+        const count_state: i32 = @intCast(@min(task.count, @as(usize, 19)) + 1);
+        for (task.fields) |field| {
+            const start_word, const end_word = if (field.target_word_start != null and field.target_word_end != null)
+                .{ field.target_word_start.?, field.target_word_end.? }
+            else blk: {
+                const start = field.start orelse continue;
+                const end_exclusive = field.end orelse continue;
+                if (start >= char_to_word.len or end_exclusive == 0 or end_exclusive > char_to_word.len) continue;
+                const end = end_exclusive - 1;
+                if (end >= char_to_word.len) continue;
+                const start_word_raw = char_to_word[start];
+                const end_word_raw = char_to_word[end];
+                if (start_word_raw < 0 or end_word_raw < start_word_raw) continue;
+                break :blk .{
+                    prefix_word_count + @as(usize, @intCast(start_word_raw)),
+                    prefix_word_count + @as(usize, @intCast(end_word_raw)),
+                };
+            };
+            if (start_word >= max_words or end_word >= max_words) continue;
+            const width = end_word - start_word + 1;
+            if (width == 0 or width > max_span_width) continue;
+            const span_idx = start_word * max_span_width + (width - 1);
+            if (span_idx >= max_spans) continue;
+            const label_idx = if (task.kind == .entities)
+                indexOfLabel(entity_types, field.name)
+            else blk: {
+                const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ task.name, field.name });
+                defer allocator.free(label);
+                break :blk indexOfLabel(entity_types, label);
+            };
+            if (label_idx) |idx| {
+                span_labels[span_idx * num_entity_types + idx] = 1.0;
+                entity_type_kind[idx] = count_state;
+            }
+        }
+    }
+}
+
 fn buildCharToWordMap(allocator: std.mem.Allocator, text: []const u8) ![]i32 {
     const map = try allocator.alloc(i32, text.len);
     @memset(map, -1);
-    var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    var search_start: usize = 0;
+    var text_idx: usize = 0;
     var word_idx: usize = 0;
-    while (words.next()) |word| : (word_idx += 1) {
-        const idx = std.mem.indexOfPos(u8, text, search_start, word) orelse continue;
-        const start = idx;
-        const end = idx + word.len;
+    while (text_idx < text.len) : (word_idx += 1) {
+        while (text_idx < text.len and std.ascii.isWhitespace(text[text_idx])) : (text_idx += 1) {}
+        if (text_idx >= text.len) break;
+        const start = text_idx;
+        const end = nextUpstreamTextTokenEnd(text, text_idx);
         for (start..@min(end, map.len)) |pos| map[pos] = @intCast(word_idx);
-        search_start = end;
+        text_idx = end;
     }
     return map;
 }

@@ -323,12 +323,25 @@ pub fn expandLoRATargetModules(
             try appendUniqueString(allocator, &expanded, "attention.output.dense");
             try appendUniqueString(allocator, &expanded, "intermediate.dense");
             try appendUniqueString(allocator, &expanded, "output.dense");
-        } else if (std.mem.eql(u8, target, "span_rep") or
-            std.mem.eql(u8, target, "classifier") or
-            std.mem.eql(u8, target, "count_embed") or
-            std.mem.eql(u8, target, "count_pred"))
-        {
+        } else if (std.mem.eql(u8, target, "span_rep")) {
             try appendUniqueString(allocator, &expanded, target);
+        } else if (std.mem.eql(u8, target, "classifier")) {
+            try appendUniqueString(allocator, &expanded, "classifier.0");
+            try appendUniqueString(allocator, &expanded, "classifier.2");
+        } else if (std.mem.eql(u8, target, "count_embed")) {
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.in_projector");
+            // Official GLiNER2 wraps this module, but PyTorch MultiheadAttention
+            // reads out_proj.weight directly and does not call the LoRA forward.
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.0.linear1");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.0.linear2");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.1.linear1");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.1.linear2");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.out_projector.0");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.out_projector.2");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.out_projector.4");
+        } else if (std.mem.eql(u8, target, "count_pred")) {
+            try appendUniqueString(allocator, &expanded, "count_pred.0");
+            try appendUniqueString(allocator, &expanded, "count_pred.2");
         } else {
             try appendUniqueString(allocator, &expanded, target);
         }
@@ -3062,9 +3075,23 @@ test "gliner2 upstream lora target groups expand to concrete modules" {
     try std.testing.expect(stringSliceContains(expanded, "intermediate.dense"));
     try std.testing.expect(stringSliceContains(expanded, "output.dense"));
     try std.testing.expect(stringSliceContains(expanded, "span_rep"));
-    try std.testing.expect(stringSliceContains(expanded, "classifier"));
-    try std.testing.expect(stringSliceContains(expanded, "count_embed"));
-    try std.testing.expect(stringSliceContains(expanded, "count_pred"));
+    try std.testing.expect(stringSliceContains(expanded, "classifier.0"));
+    try std.testing.expect(stringSliceContains(expanded, "classifier.2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.in_projector"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.0.linear1"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.0.linear2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.1.linear1"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.1.linear2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.out_projector.0"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.out_projector.2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.out_projector.4"));
+    try std.testing.expect(stringSliceContains(expanded, "count_pred.0"));
+    try std.testing.expect(stringSliceContains(expanded, "count_pred.2"));
+    try std.testing.expect(!stringSliceContains(expanded, "count_embed.gru"));
+    try std.testing.expect(!stringSliceContains(expanded, "count_embed.transformer.transformer.layers.0.self_attn.out_proj"));
+    try std.testing.expect(!stringSliceContains(expanded, "count_embed.transformer.transformer.layers.1.self_attn.out_proj"));
+    try std.testing.expect(!stringSliceContains(expanded, "self_attn.in_proj_weight"));
+    try std.testing.expect(!stringSliceContains(expanded, "task_classifier"));
 }
 
 test "gliner2 lora dropout validates python-compatible range" {

@@ -20,14 +20,17 @@ Options:
   --model-dir DIR         Model directory (default: /private/tmp/termite-models/gliner2)
   --train-data FILE       Train data (default for smoke/suite: testdata/gliner2_ner_smoke.jsonl)
   --eval-data FILE        Eval data for readiness gates (default: train data)
-  --seq-len N             Sequence length (default: 16)
+  --seq-len N             Sequence length (default: 32)
   --max-span-width N      Max span width (default: 2)
+  --zig-optimize MODE     Zig optimize mode (default: ReleaseFast)
   --lora-rank N           LoRA rank (default: 1)
   --lora-alpha N          LoRA alpha (default: 2)
   --lora-dropout N        LoRA dropout (default: 0)
+  --train-regular-head    Train regular task-head params too (default: LoRA-only)
   --max-examples N        Max examples (default: 1)
   --batch-size N          Batch size (default: 1)
   --learning-rate N       Learning rate (default: 1e-3)
+  --objective NAME        Training objective (default: gliner2-total-loss)
   --entity-types CSV      Entity types (default: person,organization,location)
   --num-classes N         Number of classes (default: 4)
   --semantic-golden TEXT EXPECT_TEXT LABEL MIN_SCORE
@@ -68,16 +71,21 @@ skip_semantic_eval=0
 dry_run=0
 train_data_explicit=0
 eval_data_explicit=0
-seq_len=16
+seq_len=32
 max_span_width=2
+zig_optimize="ReleaseFast"
 lora_rank=1
 lora_alpha=2
 lora_dropout=0
+lora_only_trainables=1
 max_examples=1
 batch_size=1
 learning_rate="1e-3"
+objective="gliner2-total-loss"
 entity_types="person,organization,location"
 num_classes=4
+entity_types_explicit=0
+num_classes_explicit=0
 extra_args=()
 semantic_args=()
 
@@ -134,6 +142,10 @@ while [[ $# -gt 0 ]]; do
       seq_len="${2:?missing value for --seq-len}"
       shift 2
       ;;
+    --zig-optimize)
+      zig_optimize="${2:?missing value for --zig-optimize}"
+      shift 2
+      ;;
     --max-span-width)
       max_span_width="${2:?missing value for --max-span-width}"
       shift 2
@@ -150,6 +162,10 @@ while [[ $# -gt 0 ]]; do
       lora_dropout="${2:?missing value for --lora-dropout}"
       shift 2
       ;;
+    --train-regular-head)
+      lora_only_trainables=0
+      shift
+      ;;
     --max-examples)
       max_examples="${2:?missing value for --max-examples}"
       shift 2
@@ -162,12 +178,18 @@ while [[ $# -gt 0 ]]; do
       learning_rate="${2:?missing value for --learning-rate}"
       shift 2
       ;;
+    --objective)
+      objective="${2:?missing value for --objective}"
+      shift 2
+      ;;
     --entity-types)
       entity_types="${2:?missing value for --entity-types}"
+      entity_types_explicit=1
       shift 2
       ;;
     --num-classes)
       num_classes="${2:?missing value for --num-classes}"
+      num_classes_explicit=1
       shift 2
       ;;
     --semantic-golden)
@@ -280,7 +302,7 @@ if [[ -n "${trace_range}" ]]; then
 fi
 
 cmd=(
-  zig build -Dmetal=true train-gliner2-autodiff --
+  zig build -Dmetal=true "-Doptimize=${zig_optimize}" train-gliner2-autodiff --
   --model-dir "${model_dir}"
   --train-data "${train_data}"
   --out-dir "${out_dir}"
@@ -290,14 +312,21 @@ cmd=(
   --seq-len "${seq_len}"
   --learning-rate "${learning_rate}"
   --backend metal
-  --objective span-start
-  --entity-types "${entity_types}"
-  --num-classes "${num_classes}"
+  --objective "${objective}"
   --lora-rank "${lora_rank}"
   --lora-alpha "${lora_alpha}"
   --lora-dropout "${lora_dropout}"
   --max-span-width "${max_span_width}"
 )
+if [[ "${objective}" != "gliner2-total-loss" || "${entity_types_explicit}" -eq 1 ]]; then
+  cmd+=("--entity-types" "${entity_types}")
+fi
+if [[ "${objective}" != "gliner2-total-loss" || "${num_classes_explicit}" -eq 1 ]]; then
+  cmd+=("--num-classes" "${num_classes}")
+fi
+if [[ "${lora_only_trainables}" -eq 1 ]]; then
+  cmd+=("--lora-only-trainables")
+fi
 
 if [[ "${#extra_args[@]}" -gt 0 ]]; then
   cmd+=("${extra_args[@]}")
@@ -345,7 +374,7 @@ run_train() {
   shift
   local -a run_env=("${env_args[@]}")
   local -a run_cmd_args=(
-    zig build -Dmetal=true train-gliner2-autodiff --
+    zig build -Dmetal=true "-Doptimize=${zig_optimize}" train-gliner2-autodiff --
     --model-dir "${model_dir}"
     --train-data "${train_data}"
     --out-dir "${run_out_dir}"
@@ -355,14 +384,21 @@ run_train() {
     --seq-len "${seq_len}"
     --learning-rate "${learning_rate}"
     --backend metal
-    --objective span-start
-    --entity-types "${entity_types}"
-    --num-classes "${num_classes}"
+    --objective "${objective}"
     --lora-rank "${lora_rank}"
     --lora-alpha "${lora_alpha}"
     --lora-dropout "${lora_dropout}"
     --max-span-width "${max_span_width}"
   )
+  if [[ "${objective}" != "gliner2-total-loss" || "${entity_types_explicit}" -eq 1 ]]; then
+    run_cmd_args+=("--entity-types" "${entity_types}")
+  fi
+  if [[ "${objective}" != "gliner2-total-loss" || "${num_classes_explicit}" -eq 1 ]]; then
+    run_cmd_args+=("--num-classes" "${num_classes}")
+  fi
+  if [[ "${lora_only_trainables}" -eq 1 ]]; then
+    run_cmd_args+=("--lora-only-trainables")
+  fi
   if [[ $# -gt 0 ]]; then
     run_cmd_args+=("$@")
   fi
@@ -370,37 +406,47 @@ run_train() {
 }
 
 run_readiness_smoke() {
-  run_env_cmd TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR=1 -- \
-    zig build -Dmetal=true gliner2-production-readiness -- \
-    "${model_dir}" "${train_data}" "${eval_data}" "${out_dir}-readiness" "${entity_types}" \
-    --epochs 1 \
-    --batch-size "${batch_size}" \
-    --max-examples "${max_examples}" \
-    --seq-len "${seq_len}" \
-    --learning-rate "${learning_rate}" \
-    --backend metal \
-    --compiled-required \
-    --skip-semantic-eval \
-    --allow-flat-loss \
-    --min-train-examples 1 \
-    --min-eval-examples 1 \
-    --min-total-entities 1 \
-    --min-unique-labels 1 \
-    --min-target-coverage-ratio 0.1 \
-    --min-positive-span-labels 1 \
-    --min-steps 1 \
-    --min-supervised-tokens 1 \
-    --min-entity-tokens 1 \
-    --max-avg-step-wall-ms 10000 \
+  local -a readiness_smoke_args=(
+    zig build -Dmetal=true "-Doptimize=${zig_optimize}" gliner2-production-readiness --
+    "${model_dir}" "${train_data}" "${eval_data}" "${out_dir}-readiness" "${entity_types}"
+    --epochs 1
+    --batch-size "${batch_size}"
+    --max-examples "${max_examples}"
+    --seq-len "${seq_len}"
+    --learning-rate "${learning_rate}"
+    --backend metal
+    --objective "${objective}"
+    --compiled-required
+    --skip-semantic-eval
+    --allow-flat-loss
+    --min-train-examples 1
+    --min-eval-examples 1
+    --min-total-entities 1
+    --min-unique-labels 1
+    --min-target-coverage-ratio 0.1
+    --min-positive-span-labels 1
+    --min-steps 1
+    --min-supervised-tokens 1
+    --min-entity-tokens 1
+    --max-avg-step-wall-ms 10000
     --max-total-execute-ms 10000
+  )
+  if [[ "${lora_only_trainables}" -eq 1 ]]; then
+    readiness_smoke_args+=("--lora-only-trainables")
+  fi
+  run_env_cmd TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR=1 -- "${readiness_smoke_args[@]}"
 }
 
 run_production_gate() {
   local -a readiness_args=(
-    zig build -Dmetal=true gliner2-production-readiness --
+    zig build -Dmetal=true "-Doptimize=${zig_optimize}" gliner2-production-readiness --
     "${model_dir}" "${train_data}" "${eval_data}" "${out_dir}" "${entity_types}"
     --production-metal-gate
+    --objective "${objective}"
   )
+  if [[ "${lora_only_trainables}" -eq 1 ]]; then
+    readiness_args+=("--lora-only-trainables")
+  fi
   if [[ "${skip_semantic_eval}" -eq 1 ]]; then
     readiness_args+=("--skip-semantic-eval")
   fi
@@ -419,8 +465,8 @@ echo "out_dir=${out_dir}"
 if [[ "${production_gate}" -eq 1 ]]; then
   run_production_gate
 elif [[ "${suite}" -eq 1 ]]; then
-  run_cmd zig build -Dmetal=true train-gliner2-autodiff -- --help
-  run_cmd zig build -Dmetal=true -Druntime-test-filter=true test -- "metal_compute: device transpose matches gliner2 flattened attention key shape"
+  run_cmd zig build -Dmetal=true "-Doptimize=${zig_optimize}" train-gliner2-autodiff -- --help
+  run_cmd zig build -Dmetal=true "-Doptimize=${zig_optimize}" -Druntime-test-filter=true test -- "metal_compute: device transpose matches gliner2 flattened attention key shape"
   if [[ "${#extra_args[@]}" -gt 0 ]]; then
     run_train "${out_dir}-smoke" "${extra_args[@]}"
   else
@@ -435,5 +481,9 @@ elif [[ "${suite}" -eq 1 ]]; then
   unset 'env_args[${#env_args[@]}-1]'
   run_readiness_smoke
 else
-  run_env_cmd "${env_args[@]}" -- "${cmd[@]}"
+  if [[ "${#env_args[@]}" -gt 0 ]]; then
+    run_env_cmd "${env_args[@]}" -- "${cmd[@]}"
+  else
+    run_cmd "${cmd[@]}"
+  fi
 fi

@@ -800,6 +800,7 @@ fn parseUsize(value: []const u8) !usize {
 fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
     if (std.mem.eql(u8, value, "token")) return .token;
     if (std.mem.eql(u8, value, "span-start") or std.mem.eql(u8, value, "span_start")) return .span_start;
+    if (std.mem.eql(u8, value, "gliner2-total-loss") or std.mem.eql(u8, value, "gliner2_total_loss")) return .gliner2_total_loss;
     return error.InvalidObjective;
 }
 
@@ -815,6 +816,7 @@ fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
     return switch (objective) {
         .token => "token",
         .span_start => "span-start",
+        .gliner2_total_loss => "gliner2-total-loss",
     };
 }
 

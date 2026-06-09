@@ -30,6 +30,7 @@
 //   --batch-size <n>             Examples per step (default: 8)
 //   --seq-len <n>                Max sequence length (default: 256)
 //   --learning-rate <f>          Learning rate (default: 2e-5)
+//   --weight-decay <f>           AdamW weight decay (default: 0)
 //   --lora-rank <n>              LoRA rank (default: 16)
 //   --lora-alpha <f>             LoRA alpha scaling (default: 32)
 //   --lora-dropout <f>           LoRA dropout probability (default: 0.1)
@@ -41,6 +42,8 @@
 //   --max-grad-norm <f>          Gradient clipping norm (default: 1.0)
 //   --grad-accum <n>             Gradient accumulation steps (default: 1)
 //   --seed <n>                   RNG seed (default: 42)
+//   --initial-adapter-checkpoint <path>
+//                                  Optional PEFT safetensors checkpoint used to seed LoRA weights
 //   --lora-only-trainables       Freeze regular task-head params; train LoRA only
 
 const std = @import("std");
@@ -53,6 +56,7 @@ const gpu_hosted_store = inference.native_compute.gpu_hosted_store;
 const metal_runtime = inference.metal_runtime;
 const compat = inference.io.compat;
 const weight_source_mod = inference.models.weight_source;
+const safetensors = inference.models.safetensors;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const LoadedWeight = weight_source_mod.LoadedWeight;
 const Tensor = inference.backends.Tensor;
@@ -87,6 +91,7 @@ const Options = struct {
     batch_size: u32 = 8,
     seq_len: u32 = 256,
     learning_rate: f32 = 2e-5,
+    weight_decay: f32 = 0.0,
     lora_rank: u32 = 16,
     lora_alpha: f32 = 32.0,
     lora_dropout: f32 = gliner2_bundle.default_lora_dropout,
@@ -106,6 +111,7 @@ const Options = struct {
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
     seed: u64 = 42,
+    initial_adapter_checkpoint: ?[]const u8 = null,
     backend: Gliner2TrainBackend = .auto,
     compiled_required: bool = false,
     dump_span_parity: bool = false,
@@ -138,6 +144,7 @@ pub fn main(init: std.process.Init) !void {
     var batch_size: u32 = 8;
     var seq_len: u32 = 256;
     var learning_rate: f32 = 2e-5;
+    var weight_decay: f32 = 0.0;
     var lora_rank: u32 = 16;
     var lora_alpha: f32 = 32.0;
     var lora_dropout: f32 = gliner2_bundle.default_lora_dropout;
@@ -157,6 +164,7 @@ pub fn main(init: std.process.Init) !void {
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
     var seed: u64 = 42;
+    var initial_adapter_checkpoint: ?[]const u8 = null;
     var backend: Gliner2TrainBackend = .auto;
     var compiled_required: bool = false;
     var dump_span_parity: bool = false;
@@ -184,6 +192,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--learning-rate") or std.mem.eql(u8, arg, "--lr")) {
             const val = args.next() orelse return error.MissingLearningRate;
             learning_rate = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--weight-decay")) {
+            const val = args.next() orelse return error.MissingWeightDecay;
+            weight_decay = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--lora-rank")) {
             const val = args.next() orelse return error.MissingLoraRank;
             lora_rank = try std.fmt.parseUnsigned(u32, val, 10);
@@ -238,6 +249,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--seed")) {
             const val = args.next() orelse return error.MissingSeed;
             seed = try std.fmt.parseUnsigned(u64, val, 10);
+        } else if (std.mem.eql(u8, arg, "--initial-adapter-checkpoint")) {
+            initial_adapter_checkpoint = args.next() orelse return error.MissingInitialAdapterCheckpoint;
         } else if (std.mem.eql(u8, arg, "--backend")) {
             const val = args.next() orelse return error.MissingBackend;
             backend = parseBackend(val) orelse return error.InvalidBackend;
@@ -274,6 +287,7 @@ pub fn main(init: std.process.Init) !void {
         .batch_size = batch_size,
         .seq_len = seq_len,
         .learning_rate = learning_rate,
+        .weight_decay = weight_decay,
         .lora_rank = lora_rank,
         .lora_alpha = lora_alpha,
         .lora_dropout = lora_dropout,
@@ -293,6 +307,7 @@ pub fn main(init: std.process.Init) !void {
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
         .seed = seed,
+        .initial_adapter_checkpoint = initial_adapter_checkpoint,
         .backend = backend,
         .compiled_required = compiled_required,
         .dump_span_parity = dump_span_parity,
@@ -317,11 +332,12 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.train_data,
         opts.out_dir,
     });
-    print("  epochs={d} batch_size={d} seq_len={d} lr={e:.6}\n", .{
+    print("  epochs={d} batch_size={d} seq_len={d} lr={e:.6} weight_decay={e:.6}\n", .{
         opts.epochs,
         opts.batch_size,
         opts.seq_len,
         opts.learning_rate,
+        opts.weight_decay,
     });
     print("  lora_rank={d} lora_alpha={d:.1} lora_dropout={d:.3} lora_targets={s}\n", .{
         opts.lora_rank,
@@ -577,10 +593,19 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     var train_loaded = try gliner2_data.loadExamples(allocator, opts.train_data, null);
     defer train_loaded.deinit();
+    var train_records_loaded = if (opts.objective == .gliner2_total_loss)
+        try gliner2_data.loadTrainingRecords(allocator, opts.train_data, null)
+    else
+        null;
+    defer if (train_records_loaded) |*loaded| loaded.deinit();
 
     var examples = train_loaded.examples;
+    var training_records: []gliner2_data.UpstreamRecord = if (train_records_loaded) |*loaded| loaded.records else &.{};
     if (opts.max_examples > 0 and examples.len > opts.max_examples) {
         examples = examples[0..opts.max_examples];
+    }
+    if (opts.max_examples > 0 and training_records.len > opts.max_examples) {
+        training_records = training_records[0..opts.max_examples];
     }
 
     const stats = try gliner2_data.computeStats(allocator, examples);
@@ -595,6 +620,10 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         print("error: no training examples loaded\n", .{});
         return error.NoTrainingData;
     }
+    if (opts.objective == .gliner2_total_loss and training_records.len != examples.len) {
+        print("error: gliner2-total-loss requires aligned upstream records ({d}) and flattened examples ({d})\n", .{ training_records.len, examples.len });
+        return error.InvalidGliner2Example;
+    }
 
     // ------------------------------------------------------------------
     // 6. Build a label-to-class-index mapping from the training data
@@ -604,33 +633,44 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // class IDs; legacy direct invocations fall back to sorted dataset labels.
     var label_map = std.StringHashMapUnmanaged(u32){};
     defer label_map.deinit(allocator);
-    const entity_types = if (opts.entity_types_csv) |csv|
-        try parseEntityTypesCsvOwned(allocator, csv)
+    const extra_entity_types = if (opts.entity_types_csv) |csv| try parseEntityTypesCsvOwned(allocator, csv) else null;
+    defer if (extra_entity_types) |items| {
+        for (items) |label| allocator.free(label);
+        allocator.free(items);
+    };
+    const entity_types = if (opts.objective == .gliner2_total_loss)
+        try gliner2_data.buildUpstreamTaskLabelVocab(allocator, training_records, extra_entity_types)
+    else if (extra_entity_types) |items|
+        try dupeStringSlice(allocator, items)
     else
         try gliner2_data.buildLabelVocab(allocator, examples, null);
     defer {
         for (entity_types) |label| allocator.free(label);
         allocator.free(entity_types);
     }
-    if (entity_types.len + 1 > opts.num_classes) {
+    const effective_num_classes: u32 = if (opts.objective == .gliner2_total_loss and opts.entity_types_csv == null)
+        @intCast(entity_types.len + 1)
+    else
+        opts.num_classes;
+    if (entity_types.len + 1 > effective_num_classes) {
         print("error: dataset has {d} entity labels but num_classes={d} only has {d} entity slots\n", .{
             entity_types.len,
-            opts.num_classes,
-            if (opts.num_classes > 0) opts.num_classes - 1 else 0,
+            effective_num_classes,
+            if (effective_num_classes > 0) effective_num_classes - 1 else 0,
         });
         return error.TooManyEntityTypes;
     }
-    if (opts.objective == .span_start and entity_types.len + 1 != @as(usize, @intCast(opts.num_classes))) {
+    if ((opts.objective == .span_start or opts.objective == .gliner2_total_loss) and entity_types.len + 1 != @as(usize, @intCast(effective_num_classes))) {
         print("error: span-start objective currently requires num_classes == entity_label_count + 1 ({d}); got {d}\n", .{
             entity_types.len + 1,
-            opts.num_classes,
+            effective_num_classes,
         });
         return error.SpanObjectiveRequiresExactClassCount;
     }
     for (entity_types, 0..) |label, idx| {
         try label_map.put(allocator, label, @intCast(idx + 1));
     }
-    print("  entity labels mapped: {d} (num_classes={d})\n", .{ label_map.count(), opts.num_classes });
+    print("  entity labels mapped: {d} (num_classes={d})\n", .{ label_map.count(), effective_num_classes });
     const resolved_span_label_positive_weights = try resolveSpanLabelPositiveWeights(
         allocator,
         opts.span_label_positive_weights,
@@ -700,7 +740,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
     var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
         .graph_config = graph_config,
-        .num_classes = opts.num_classes,
+        .num_classes = effective_num_classes,
         .objective = opts.objective,
         .span_start_loss = opts.span_loss,
         .span_start_loss_reduction = opts.span_loss_reduction,
@@ -737,7 +777,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         &cb,
         .{
             .lora = lora_config,
-            .optimizer = .{},
+            .optimizer = .{ .weight_decay = opts.weight_decay },
             .lr_schedule = .{ .constant = opts.learning_rate },
             .max_grad_norm = opts.max_grad_norm,
             .grad_accum_steps = opts.grad_accum,
@@ -770,11 +810,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // Pre-allocate batch buffers.
     const sl: usize = opts.seq_len;
     const bs: usize = opts.batch_size;
-    const nc: usize = opts.num_classes;
+    const nc: usize = effective_num_classes;
     const batch_tokens = bs * sl;
     const use_label_positive_weights = opts.span_label_positive_weights != null;
-    const span_entity_types: usize = if (opts.num_classes > 1) @as(usize, @intCast(opts.num_classes)) - 1 else 0;
-    const span_target_width: usize = if (use_label_positive_weights)
+    const span_entity_types: usize = if (effective_num_classes > 1) @as(usize, @intCast(effective_num_classes)) - 1 else 0;
+    const span_target_width: usize = if (opts.objective == .gliner2_total_loss)
+        gliner2_autodiff.gliner2TotalLossTargetWidth(span_entity_types)
+    else if (use_label_positive_weights)
         gliner2_autodiff.weightedSpanStartTargetWidth(span_entity_types)
     else
         gliner2_autodiff.spanStartTargetWidth(span_entity_types);
@@ -792,6 +834,28 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var targets_buf = try allocator.alloc(f32, target_buf_values);
     defer allocator.free(targets_buf);
 
+    if (opts.initial_adapter_checkpoint) |checkpoint_path| {
+        try ensureTrainerGraphBuiltFromFirstBatch(
+            allocator,
+            opts,
+            &tokenizer,
+            entity_types,
+            examples,
+            training_records,
+            &label_map,
+            effective_num_classes,
+            use_label_positive_weights,
+            resolved_span_label_positive_weights,
+            input_ids,
+            attention_mask,
+            targets_buf,
+            &trainer,
+            &gliner_ctx,
+        );
+        try loadPeftAdaptersIntoTrainer(allocator, checkpoint_path, &trainer);
+        print("  loaded initial LoRA adapter checkpoint: {s}\n", .{checkpoint_path});
+    }
+
     var rng = std.Random.DefaultPrng.init(opts.seed);
     var prng = rng.random();
 
@@ -803,7 +867,11 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
     for (0..opts.epochs) |epoch| {
         // Shuffle examples at the start of each epoch.
-        prng.shuffle(gliner2_data.Example, examples);
+        if (opts.objective == .gliner2_total_loss) {
+            if (!opts.dump_span_parity) shuffleExamplesAndRecords(&prng, examples, training_records);
+        } else {
+            prng.shuffle(gliner2_data.Example, examples);
+        }
 
         const epoch_started_ns = monotonicNowNs();
         var epoch_loss: f64 = 0.0;
@@ -842,16 +910,27 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     );
                     target_slice = targets_buf[0 .. ab * sl * nc];
                 },
-                .span_start => {
-                    var encoded = try gliner2_data.buildSimpleBatch(
-                        allocator,
-                        &tokenizer,
-                        examples[batch_start..batch_end],
-                        entity_types,
-                        opts.seq_len,
-                        opts.max_span_width,
-                        ab,
-                    );
+                .span_start, .gliner2_total_loss => {
+                    var encoded = if (opts.objective == .gliner2_total_loss)
+                        try gliner2_data.buildUpstreamTaskBatch(
+                            allocator,
+                            &tokenizer,
+                            training_records[batch_start..batch_end],
+                            entity_types,
+                            opts.seq_len,
+                            opts.max_span_width,
+                            ab,
+                        )
+                    else
+                        try gliner2_data.buildSimpleBatch(
+                            allocator,
+                            &tokenizer,
+                            examples[batch_start..batch_end],
+                            entity_types,
+                            opts.seq_len,
+                            opts.max_span_width,
+                            ab,
+                        );
                     defer encoded.deinit();
 
                     if (encoded.input_ids.len != ab * sl or encoded.attention_mask.len != ab * sl) return error.InvalidGlinerBatchShape;
@@ -860,20 +939,31 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         attention_mask[i] = @floatFromInt(encoded.attention_mask[i]);
                     }
 
-                    const width = if (use_label_positive_weights)
+                    const width = if (opts.objective == .gliner2_total_loss)
+                        gliner2_autodiff.gliner2TotalLossTargetWidth(encoded.num_entity_types)
+                    else if (use_label_positive_weights)
                         gliner2_autodiff.weightedSpanStartTargetWidth(encoded.num_entity_types)
                     else
                         gliner2_autodiff.spanStartTargetWidth(encoded.num_entity_types);
                     const target_len = encoded.batch_size * encoded.max_spans * width;
-                    const span_stats = try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatchWithOptions(
-                        &encoded,
-                        .{
-                            .positive_weights_by_entity_type = if (use_label_positive_weights) resolved_span_label_positive_weights else null,
-                            .hard_negative_weight = opts.span_hard_negative_weight,
-                        },
-                        targets_buf[0..target_len],
-                    );
-                    if (opts.span_negative_mask_rate > 0.0) {
+                    const span_stats = if (opts.objective == .gliner2_total_loss)
+                        try fillGliner2TotalLossTargetsFromRecords(
+                            allocator,
+                            &encoded,
+                            training_records[batch_start..batch_end],
+                            entity_types,
+                            targets_buf[0..target_len],
+                        )
+                    else
+                        try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatchWithOptions(
+                            &encoded,
+                            .{
+                                .positive_weights_by_entity_type = if (use_label_positive_weights) resolved_span_label_positive_weights else null,
+                                .hard_negative_weight = opts.span_hard_negative_weight,
+                            },
+                            targets_buf[0..target_len],
+                        );
+                    if (opts.span_negative_mask_rate > 0.0 and opts.objective == .span_start) {
                         applySpanNegativeMask(
                             targets_buf[0..target_len],
                             encoded.max_spans,
@@ -884,7 +974,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         );
                     }
                     target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
-                    targets_shape = if (use_label_positive_weights)
+                    targets_shape = if (opts.objective == .gliner2_total_loss)
+                        gliner2_autodiff.gliner2TotalLossTargetsShape(
+                            actual_batch,
+                            @intCast(encoded.max_spans),
+                            @intCast(encoded.num_entity_types),
+                        )
+                    else if (use_label_positive_weights)
                         gliner2_autodiff.weightedSpanStartTargetsShape(
                             actual_batch,
                             @intCast(encoded.max_spans),
@@ -942,6 +1038,50 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     entity_types.len,
                 );
                 printSpanComponentDebug(components);
+            }
+            if (opts.dump_span_parity and opts.objective == .gliner2_total_loss and total_steps == 0) {
+                const logits = try gliner2_autodiff.spanStartLogitsForBatch(
+                    allocator,
+                    &trainer,
+                    &gliner_ctx,
+                    input_ids[0 .. ab * sl],
+                    attention_mask[0 .. ab * sl],
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    opts.seq_len,
+                );
+                defer allocator.free(logits);
+                try printSpanParityDebug(logits, target_slice, targets_shape, entity_types.len, false, opts);
+                if (gliner2_autodiff.spanStartComponentDebugForBatch(
+                    allocator,
+                    &trainer,
+                    &gliner_ctx,
+                    input_ids[0 .. ab * sl],
+                    attention_mask[0 .. ab * sl],
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    opts.seq_len,
+                    entity_types.len,
+                )) |span_components| {
+                    printSpanComponentDebug(span_components);
+                } else |err| switch (err) {
+                    error.MissingPositiveSpanLabel => {},
+                    else => return err,
+                }
+                const components = try gliner2_autodiff.gliner2TotalLossComponentDebugForBatch(
+                    allocator,
+                    &trainer,
+                    &gliner_ctx,
+                    input_ids[0 .. ab * sl],
+                    attention_mask[0 .. ab * sl],
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    opts.seq_len,
+                );
+                printGliner2TotalLossComponentDebug(components);
             }
 
             const result = try trainer.step(trainer_input);
@@ -1031,7 +1171,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
     const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, regular_trainable_params, resolved_target_patterns, run_target_stats);
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, effective_num_classes, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, regular_trainable_params, resolved_target_patterns, run_target_stats);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -1160,6 +1300,7 @@ fn writeTrainingManifest(
     opts: Options,
     backend_label: []const u8,
     hidden_size: u32,
+    num_classes: u32,
     entity_labels: []const []const u8,
     span_label_positive_weights: []const f32,
     example_count: usize,
@@ -1204,7 +1345,7 @@ fn writeTrainingManifest(
         .lora_dropout = opts.lora_dropout,
         .lora_targets = opts.lora_targets,
         .resolved_lora_targets = resolved_lora_targets,
-        .num_classes = opts.num_classes,
+        .num_classes = num_classes,
         .objective = objectiveName(opts.objective),
         .max_span_width = opts.max_span_width,
         .span_loss = spanLossName(opts.span_loss),
@@ -1261,6 +1402,203 @@ fn collectRegularTrainableParams(
         };
     }
     return params;
+}
+
+fn ensureTrainerGraphBuiltFromFirstBatch(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    tokenizer: *const gliner2_data.Tokenizer,
+    entity_types: []const []const u8,
+    examples: []const gliner2_data.Example,
+    training_records: []const gliner2_data.UpstreamRecord,
+    label_map: *const std.StringHashMapUnmanaged(u32),
+    effective_num_classes: u32,
+    use_label_positive_weights: bool,
+    resolved_span_label_positive_weights: []const f32,
+    input_ids: []i64,
+    attention_mask: []f32,
+    targets_buf: []f32,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
+) !void {
+    if (examples.len == 0) return error.NoTrainingExamples;
+    const ab = @min(@as(usize, opts.batch_size), examples.len);
+    const actual_batch: u32 = @intCast(ab);
+    const sl: usize = opts.seq_len;
+    const nc: usize = effective_num_classes;
+
+    var targets_shape: ml.graph.Shape = undefined;
+    var target_slice: []const f32 = undefined;
+    switch (opts.objective) {
+        .token => {
+            _ = fillBatchBuffers(
+                allocator,
+                tokenizer,
+                entity_types,
+                examples[0..ab],
+                opts.seq_len,
+                effective_num_classes,
+                label_map,
+                input_ids,
+                attention_mask,
+                targets_buf[0 .. ab * sl * nc],
+            );
+            targets_shape = gliner2_autodiff.tokenTargetsShape(actual_batch, opts.seq_len, effective_num_classes);
+            target_slice = targets_buf[0 .. ab * sl * nc];
+        },
+        .span_start, .gliner2_total_loss => {
+            var encoded = if (opts.objective == .gliner2_total_loss)
+                try gliner2_data.buildUpstreamTaskBatch(
+                    allocator,
+                    tokenizer,
+                    training_records[0..ab],
+                    entity_types,
+                    opts.seq_len,
+                    opts.max_span_width,
+                    ab,
+                )
+            else
+                try gliner2_data.buildSimpleBatch(
+                    allocator,
+                    tokenizer,
+                    examples[0..ab],
+                    entity_types,
+                    opts.seq_len,
+                    opts.max_span_width,
+                    ab,
+                );
+            defer encoded.deinit();
+
+            if (encoded.input_ids.len != ab * sl or encoded.attention_mask.len != ab * sl) return error.InvalidGlinerBatchShape;
+            for (0..ab * sl) |i| {
+                input_ids[i] = encoded.input_ids[i];
+                attention_mask[i] = @floatFromInt(encoded.attention_mask[i]);
+            }
+
+            const width = if (opts.objective == .gliner2_total_loss)
+                gliner2_autodiff.gliner2TotalLossTargetWidth(encoded.num_entity_types)
+            else if (use_label_positive_weights)
+                gliner2_autodiff.weightedSpanStartTargetWidth(encoded.num_entity_types)
+            else
+                gliner2_autodiff.spanStartTargetWidth(encoded.num_entity_types);
+            const target_len = encoded.batch_size * encoded.max_spans * width;
+            _ = if (opts.objective == .gliner2_total_loss)
+                try fillGliner2TotalLossTargetsFromRecords(
+                    allocator,
+                    &encoded,
+                    training_records[0..ab],
+                    entity_types,
+                    targets_buf[0..target_len],
+                )
+            else
+                try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatchWithOptions(
+                    &encoded,
+                    .{
+                        .positive_weights_by_entity_type = if (use_label_positive_weights) resolved_span_label_positive_weights else null,
+                        .hard_negative_weight = opts.span_hard_negative_weight,
+                    },
+                    targets_buf[0..target_len],
+                );
+            targets_shape = if (opts.objective == .gliner2_total_loss)
+                gliner2_autodiff.gliner2TotalLossTargetsShape(
+                    actual_batch,
+                    @intCast(encoded.max_spans),
+                    @intCast(encoded.num_entity_types),
+                )
+            else if (use_label_positive_weights)
+                gliner2_autodiff.weightedSpanStartTargetsShape(
+                    actual_batch,
+                    @intCast(encoded.max_spans),
+                    @intCast(encoded.num_entity_types),
+                )
+            else
+                gliner2_autodiff.spanStartTargetsShape(
+                    actual_batch,
+                    @intCast(encoded.max_spans),
+                    @intCast(encoded.num_entity_types),
+                );
+            target_slice = targets_buf[0..target_len];
+        },
+    }
+
+    const trainer_input = gliner2_autodiff.makeTrainerInput(
+        gliner_ctx,
+        input_ids[0 .. ab * sl],
+        attention_mask[0 .. ab * sl],
+        target_slice,
+        targets_shape,
+        actual_batch,
+        opts.seq_len,
+    );
+    try trainer.ensureGraphBuilt(trainer_input);
+}
+
+fn loadPeftAdaptersIntoTrainer(
+    allocator: std.mem.Allocator,
+    adapter_checkpoint_path: []const u8,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+) !void {
+    var reader = try safetensors.MMapReader.openFileAbsolute(allocator, adapter_checkpoint_path);
+    defer reader.deinit();
+    for (trainer.lora_params.items) |*slot| {
+        const peft_name = try autodiffSlotNameToOfficialPeftName(allocator, slot.name);
+        defer allocator.free(peft_name);
+        var tensor = reader.readTensor(peft_name) catch blk: {
+            const zig_peft_name = try autodiffSlotNameToZigPeftName(allocator, slot.name);
+            defer allocator.free(zig_peft_name);
+            break :blk try reader.readTensor(zig_peft_name);
+        };
+        defer tensor.deinit();
+        if (tensor.elementCount() != slot.weights.len) return error.AdapterTensorShapeMismatch;
+        try copyTensorF32Into(slot.weights, &tensor);
+        @memset(slot.grad_accum, 0.0);
+    }
+}
+
+fn copyTensorF32Into(dst: []f32, tensor: *const Tensor) !void {
+    if (tensor.dtype != .f32) return error.AdapterTensorDTypeMismatch;
+    if (tensor.data.len != dst.len * @sizeOf(f32)) return error.AdapterTensorShapeMismatch;
+    for (dst, 0..) |*value, idx| {
+        const raw = tensor.data[idx * @sizeOf(f32) ..][0..@sizeOf(f32)];
+        value.* = @bitCast(std.mem.readInt(u32, raw, .little));
+    }
+}
+
+fn autodiffSlotNameToOfficialPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, name, ".lora_A")) {
+        const base = name[0 .. name.len - ".lora_A".len];
+        return autodiffBaseToPeftName(allocator, tensorBaseName(base), "lora_A", false);
+    }
+    if (std.mem.endsWith(u8, name, ".lora_B")) {
+        const base = name[0 .. name.len - ".lora_B".len];
+        return autodiffBaseToPeftName(allocator, tensorBaseName(base), "lora_B", false);
+    }
+    return error.InvalidAutodiffAdapterName;
+}
+
+fn autodiffSlotNameToZigPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, name, ".lora_A")) {
+        const base = name[0 .. name.len - ".lora_A".len];
+        return autodiffBaseToPeftName(allocator, tensorBaseName(base), "lora_A", true);
+    }
+    if (std.mem.endsWith(u8, name, ".lora_B")) {
+        const base = name[0 .. name.len - ".lora_B".len];
+        return autodiffBaseToPeftName(allocator, tensorBaseName(base), "lora_B", true);
+    }
+    return error.InvalidAutodiffAdapterName;
+}
+
+fn autodiffBaseToPeftName(allocator: std.mem.Allocator, base_no_weight: []const u8, adapter_name: []const u8, zig_weight_suffix: bool) ![]const u8 {
+    const suffix = if (zig_weight_suffix) ".weight" else "";
+    if (std.mem.startsWith(u8, base_no_weight, "encoder.layer.")) {
+        return std.fmt.allocPrint(allocator, "encoder.{s}.{s}{s}", .{ base_no_weight, adapter_name, suffix });
+    }
+    return std.fmt.allocPrint(allocator, "{s}.{s}{s}", .{ base_no_weight, adapter_name, suffix });
+}
+
+fn tensorBaseName(tensor_name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, tensor_name, ".weight")) return tensor_name[0 .. tensor_name.len - ".weight".len];
+    return tensor_name;
 }
 
 const TaskHeadExportParams = struct {
@@ -1949,11 +2287,16 @@ fn fillVector(data: []f32, fill: ParityVectorFill) void {
     });
 }
 
-fn parityVectorSpecs(hidden_size: u32) [22]ParityVectorSpec {
+fn parityVectorSpecs(hidden_size: u32) [26]ParityVectorSpec {
     const H = hidden_size;
+    const MID = H * 2;
     const COUNT: u32 = 128;
     const COUNT_FF: u32 = 256;
     return .{
+        .{ .name = "classifier.0.bias", .dim = MID },
+        .{ .name = "classifier.2.bias", .dim = 1 },
+        .{ .name = "count_pred.0.bias", .dim = MID },
+        .{ .name = "count_pred.2.bias", .dim = 20 },
         .{ .name = "count_embed.gru.bias_ih_l0", .dim = H * 3 },
         .{ .name = "count_embed.gru.bias_hh_l0", .dim = H * 3 },
         .{ .name = "count_embed.transformer.in_projector.bias", .dim = COUNT },
@@ -2045,11 +2388,11 @@ fn printSpanParityDebug(
     if (entity_types == 0) return error.InvalidEntityTypes;
     const rows: usize = @intCast(targets_shape.dims[0]);
     const width: usize = @intCast(targets_shape.dims[1]);
-    const expected_width = if (has_label_positive_weights)
+    const expected_min_width = if (has_label_positive_weights)
         gliner2_autodiff.weightedSpanStartTargetWidth(entity_types)
     else
         gliner2_autodiff.spanStartTargetWidth(entity_types);
-    if (width != expected_width) return error.InvalidGlinerSpanTargetShape;
+    if (width < expected_min_width) return error.InvalidGlinerSpanTargetShape;
     if (targets.len != rows * width) return error.InvalidGlinerSpanTargetShape;
     if (logits.len != rows * entity_types) return error.InvalidGlinerSpanLogitsShape;
 
@@ -2064,6 +2407,11 @@ fn printSpanParityDebug(
     var pos_logits_sum: f64 = 0.0;
     var neg_logits_sum: f64 = 0.0;
     var neg_count: usize = 0;
+    const top_k = 5;
+    var top_bce = [_]f64{-1.0} ** top_k;
+    var top_logits = [_]f64{0.0} ** top_k;
+    var top_rows = [_]usize{0} ** top_k;
+    var top_entities = [_]usize{0} ** top_k;
 
     for (0..rows) |row_idx| {
         const target_row = row_idx * width;
@@ -2107,6 +2455,19 @@ fn printSpanParityDebug(
                 } else {
                     stats.bce_masked_negative_sum += bce * mask_weight64;
                     stats.bce_weighted_negative_sum += bce * mask_weight64 * label_weight;
+                    if (bce > top_bce[top_k - 1]) {
+                        var insert_idx: usize = top_k - 1;
+                        while (insert_idx > 0 and bce > top_bce[insert_idx - 1]) : (insert_idx -= 1) {
+                            top_bce[insert_idx] = top_bce[insert_idx - 1];
+                            top_logits[insert_idx] = top_logits[insert_idx - 1];
+                            top_rows[insert_idx] = top_rows[insert_idx - 1];
+                            top_entities[insert_idx] = top_entities[insert_idx - 1];
+                        }
+                        top_bce[insert_idx] = bce;
+                        top_logits[insert_idx] = logit;
+                        top_rows[insert_idx] = row_idx;
+                        top_entities[insert_idx] = entity_idx;
+                    }
                 }
             }
         }
@@ -2118,7 +2479,7 @@ fn printSpanParityDebug(
     if (stats.weighted_mask_sum > 0.0) stats.bce_weighted_mean = stats.bce_weighted_sum / stats.weighted_mask_sum;
 
     print(
-        "SPAN_PARITY_DEBUG {{\"rows\":{d},\"entity_types\":{d},\"logits_count\":{d},\"valid_weight_count\":{d},\"positive_count\":{d},\"mask_weight_sum\":{d:.9},\"weighted_mask_sum\":{d:.9},\"logits_min\":{d:.9},\"logits_max\":{d:.9},\"logits_mean\":{d:.9},\"positive_logits_mean\":{d:.9},\"negative_logits_mean\":{d:.9},\"bce_unweighted_sum\":{d:.9},\"bce_masked_sum\":{d:.9},\"bce_masked_positive_sum\":{d:.9},\"bce_masked_negative_sum\":{d:.9},\"bce_weighted_sum\":{d:.9},\"bce_weighted_positive_sum\":{d:.9},\"bce_weighted_negative_sum\":{d:.9},\"bce_weighted_mean\":{d:.9},\"reduction\":\"{s}\"}}\n",
+        "SPAN_PARITY_DEBUG {{\"rows\":{d},\"entity_types\":{d},\"logits_count\":{d},\"valid_weight_count\":{d},\"positive_count\":{d},\"mask_weight_sum\":{d:.9},\"weighted_mask_sum\":{d:.9},\"logits_min\":{d:.9},\"logits_max\":{d:.9},\"logits_mean\":{d:.9},\"positive_logits_mean\":{d:.9},\"negative_logits_mean\":{d:.9},\"bce_unweighted_sum\":{d:.9},\"bce_masked_sum\":{d:.9},\"bce_masked_positive_sum\":{d:.9},\"bce_masked_negative_sum\":{d:.9},\"bce_weighted_sum\":{d:.9},\"bce_weighted_positive_sum\":{d:.9},\"bce_weighted_negative_sum\":{d:.9},\"bce_weighted_mean\":{d:.9},\"top_valid_negative_logits\":[",
         .{
             stats.rows,
             stats.entity_types,
@@ -2140,14 +2501,32 @@ fn printSpanParityDebug(
             stats.bce_weighted_positive_sum,
             stats.bce_weighted_negative_sum,
             stats.bce_weighted_mean,
-            spanLossReductionName(opts.span_loss_reduction),
         },
     );
+    var printed: usize = 0;
+    for (0..top_k) |idx| {
+        if (top_bce[idx] < 0.0) continue;
+        if (printed > 0) print(",", .{});
+        const row = top_rows[idx];
+        print(
+            "{{\"row\":{d},\"entity\":{d},\"start\":{d},\"width\":{d},\"logit\":{d:.9},\"bce\":{d:.9}}}",
+            .{
+                row,
+                top_entities[idx],
+                row / opts.max_span_width,
+                row % opts.max_span_width,
+                top_logits[idx],
+                top_bce[idx],
+            },
+        );
+        printed += 1;
+    }
+    print("],\"reduction\":\"{s}\"}}\n", .{spanLossReductionName(opts.span_loss_reduction)});
 }
 
 fn printSpanComponentDebug(components: gliner2_autodiff.SpanStartComponentDebug) void {
     print(
-        "SPAN_COMPONENT_DEBUG {{\"positive_row\":{d},\"positive_entity\":{d},\"schema_row\":{d},\"start_hidden_norm\":{d:.9},\"end_hidden_norm\":{d:.9},\"projected_span_norm\":{d:.9},\"schema_hidden_norm\":{d:.9},\"schema_projection_norm\":{d:.9},\"projected_schema_dot\":{d:.9},\"projected_span_mean\":{d:.9},\"schema_projection_mean\":{d:.9}}}\n",
+        "SPAN_COMPONENT_DEBUG {{\"positive_row\":{d},\"positive_entity\":{d},\"schema_row\":{d},\"start_hidden_norm\":{d:.9},\"end_hidden_norm\":{d:.9},\"projected_span_norm\":{d:.9},\"schema_hidden_norm\":{d:.9},\"count_gru_state_norm\":{d:.9},\"count_state_norm\":{d:.9},\"count_in_project_norm\":{d:.9},\"count_layer0_norm\":{d:.9},\"count_layer1_norm\":{d:.9},\"count_out0_norm\":{d:.9},\"count_out2_norm\":{d:.9},\"schema_projection_norm\":{d:.9},\"projected_schema_dot\":{d:.9},\"projected_span_mean\":{d:.9},\"count_gru_state_mean\":{d:.9},\"count_state_mean\":{d:.9},\"count_in_project_mean\":{d:.9},\"count_layer0_mean\":{d:.9},\"count_layer1_mean\":{d:.9},\"count_out0_mean\":{d:.9},\"count_out2_mean\":{d:.9},\"schema_projection_mean\":{d:.9}",
         .{
             components.positive_row,
             components.positive_entity,
@@ -2156,10 +2535,55 @@ fn printSpanComponentDebug(components: gliner2_autodiff.SpanStartComponentDebug)
             components.end_hidden_norm,
             components.projected_span_norm,
             components.schema_hidden_norm,
+            components.count_gru_state_norm,
+            components.count_state_norm,
+            components.count_in_project_norm,
+            components.count_layer0_norm,
+            components.count_layer1_norm,
+            components.count_out0_norm,
+            components.count_out2_norm,
             components.schema_projection_norm,
             components.projected_schema_dot,
             components.projected_span_mean,
+            components.count_gru_state_mean,
+            components.count_state_mean,
+            components.count_in_project_mean,
+            components.count_layer0_mean,
+            components.count_layer1_mean,
+            components.count_out0_mean,
+            components.count_out2_mean,
             components.schema_projection_mean,
+        },
+    );
+    print(
+        ",\"negative_row\":{d},\"negative_entity\":{d},\"negative_logit\":{d:.9},\"negative_start_hidden_norm\":{d:.9},\"negative_end_hidden_norm\":{d:.9},\"negative_schema_hidden_norm\":{d:.9},\"negative_projected_span_norm\":{d:.9},\"negative_schema_projection_norm\":{d:.9},\"negative_projected_schema_dot\":{d:.9},\"negative_start_hidden_mean\":{d:.9},\"negative_end_hidden_mean\":{d:.9},\"negative_schema_hidden_mean\":{d:.9},\"negative_projected_span_mean\":{d:.9},\"negative_schema_projection_mean\":{d:.9}}}\n",
+        .{
+            components.negative_row,
+            components.negative_entity,
+            components.negative_logit,
+            components.negative_start_hidden_norm,
+            components.negative_end_hidden_norm,
+            components.negative_schema_hidden_norm,
+            components.negative_projected_span_norm,
+            components.negative_schema_projection_norm,
+            components.negative_projected_schema_dot,
+            components.negative_start_hidden_mean,
+            components.negative_end_hidden_mean,
+            components.negative_schema_hidden_mean,
+            components.negative_projected_span_mean,
+            components.negative_schema_projection_mean,
+        },
+    );
+}
+
+fn printGliner2TotalLossComponentDebug(components: gliner2_autodiff.Gliner2TotalLossComponentDebug) void {
+    print(
+        "GLINER2_TOTAL_LOSS_COMPONENT_DEBUG {{\"classification_loss\":{d:.9},\"structure_loss\":{d:.9},\"count_loss\":{d:.9},\"total_loss\":{d:.9}}}\n",
+        .{
+            components.classification_loss,
+            components.structure_loss,
+            components.count_loss,
+            components.total_loss,
         },
     );
 }
@@ -2171,28 +2595,74 @@ fn printSpanPreprocessDebug(batch: *const gliner2_data.EncodedBatch) void {
     const span_mask = batch.span_mask[0..batch.max_spans];
     const span_indices = batch.span_indices[0 .. batch.max_spans * 2];
     const span_labels = batch.span_labels[0 .. batch.max_spans * batch.num_entity_types];
-    print("SPAN_PREPROCESS_DEBUG {{\"batch_size\":{d},\"max_length\":{d},\"max_words_per_sample\":{d},\"max_spans\":{d},\"num_entity_types\":{d},\"input_ids\":", .{
+    print("SPAN_PREPROCESS_DEBUG {{\"batch_size\":{d},\"max_length\":{d},\"max_words_per_sample\":{d},\"max_spans\":{d},\"num_entity_types\":{d},\"max_schemas\":{d},\"max_schema_specials\":{d},\"input_ids\":", .{
         batch.batch_size,
         batch.max_length,
         batch.max_words_per_sample,
         batch.max_spans,
         batch.num_entity_types,
+        batch.max_schemas,
+        batch.max_schema_specials,
     });
     printI32JsonArray(input_ids);
+    print(",\"input_ids_all\":", .{});
+    printI32JsonArray(batch.input_ids[0 .. batch.batch_size * batch.max_length]);
     print(",\"attention_mask\":", .{});
     printI32JsonArray(attention_mask);
+    print(",\"attention_mask_all\":", .{});
+    printI32JsonArray(batch.attention_mask[0 .. batch.batch_size * batch.max_length]);
     print(",\"first_token_positions\":", .{});
     printI32JsonArray(first_positions);
+    print(",\"first_token_positions_all\":", .{});
+    printI32JsonArray(batch.first_token_positions[0 .. batch.batch_size * batch.max_words_per_sample]);
     print(",\"e_token_positions\":", .{});
     printI32JsonArray(batch.e_token_positions[0..batch.num_entity_types]);
     print(",\"e_token_end_positions\":", .{});
     printI32JsonArray(batch.e_token_end_positions[0..batch.num_entity_types]);
+    print(",\"e_token_positions_all\":", .{});
+    printI32JsonArray(batch.e_token_positions[0 .. batch.batch_size * batch.num_entity_types]);
+    print(",\"e_token_end_positions_all\":", .{});
+    printI32JsonArray(batch.e_token_end_positions[0 .. batch.batch_size * batch.num_entity_types]);
+    if (batch.text_word_counts.len > 0) {
+        print(",\"text_word_counts\":", .{});
+        printI32JsonArray(batch.text_word_counts[0..batch.batch_size]);
+    }
+    if (batch.schema_counts.len > 0) {
+        print(",\"schema_counts\":", .{});
+        printI32JsonArray(batch.schema_counts[0..batch.batch_size]);
+    }
+    if (batch.task_type_ids.len > 0 and batch.max_schemas > 0) {
+        print(",\"task_type_ids\":", .{});
+        printI32JsonArray(batch.task_type_ids[0..batch.max_schemas]);
+        print(",\"task_type_ids_all\":", .{});
+        printI32JsonArray(batch.task_type_ids[0 .. batch.batch_size * batch.max_schemas]);
+    }
+    if (batch.schema_special_counts.len > 0 and batch.max_schemas > 0) {
+        print(",\"schema_special_counts\":", .{});
+        printI32JsonArray(batch.schema_special_counts[0..batch.max_schemas]);
+        print(",\"schema_special_counts_all\":", .{});
+        printI32JsonArray(batch.schema_special_counts[0 .. batch.batch_size * batch.max_schemas]);
+    }
+    if (batch.schema_special_positions.len > 0 and batch.max_schemas > 0 and batch.max_schema_specials > 0) {
+        print(",\"schema_special_positions\":", .{});
+        printI32JsonArray(batch.schema_special_positions[0 .. batch.max_schemas * batch.max_schema_specials]);
+        print(",\"schema_special_positions_all\":", .{});
+        printI32JsonArray(batch.schema_special_positions[0 .. batch.batch_size * batch.max_schemas * batch.max_schema_specials]);
+    }
+    if (batch.entity_type_kind.len > 0) {
+        print(",\"entity_type_kind\":", .{});
+        printI32JsonArray(batch.entity_type_kind[0..batch.num_entity_types]);
+        print(",\"entity_type_kind_all\":", .{});
+        printI32JsonArray(batch.entity_type_kind[0 .. batch.batch_size * batch.num_entity_types]);
+    }
     print(",\"span_indices\":", .{});
     printI32JsonArray(span_indices);
     print(",\"span_mask\":", .{});
     printF32JsonArray(span_mask);
     print(",\"span_labels\":", .{});
     printF32JsonArray(span_labels);
+    print(",\"span_labels_all\":", .{});
+    printF32JsonArray(batch.span_labels[0 .. batch.batch_size * batch.max_spans * batch.num_entity_types]);
     print("}}\n", .{});
 }
 
@@ -2264,13 +2734,14 @@ fn printUsage() void {
         \\  --batch-size <n>          Examples per step (default: 8)
         \\  --seq-len <n>             Max sequence length (default: 256)
         \\  --learning-rate, --lr <f> Learning rate (default: 2e-5)
+        \\  --weight-decay <f>        AdamW weight decay (default: 0)
         \\  --lora-rank <n>           LoRA rank (default: 16)
         \\  --lora-alpha <f>          LoRA alpha scaling (default: 32)
         \\  --lora-dropout <f>        LoRA dropout probability (default: 0.1)
         \\  --lora-targets <csv>      Target module groups (default: encoder,span_rep,classifier,count_embed,count_pred)
         \\  --num-classes <n>         Entity classes incl. O tag (default: 5)
         \\  --entity-types <csv>      Entity label order for classes 1..N
-        \\  --objective <name>        token or span-start (default: token)
+        \\  --objective <name>        token, span-start, or gliner2-total-loss (default: token)
         \\  --max-span-width <n>      Max span width for span-start objective (default: 4)
         \\  --span-loss <name>        bce or mse for span-start labels (default: bce)
         \\  --span-loss-reduction <r> mean or sum (default: mean; sum matches upstream GLiNER2)
@@ -2283,6 +2754,7 @@ fn printUsage() void {
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --seed <n>                RNG seed (default: 42)
+        \\  --initial-adapter-checkpoint <path> Seed LoRA weights from a PEFT safetensors checkpoint
         \\  --backend <name>          auto, metal, mlx, or native (default: auto)
         \\  --compiled-required       Fail if the requested compiled backend cannot run
         \\  --lora-only-trainables    Freeze regular task-head params; train LoRA params only
@@ -2306,7 +2778,8 @@ fn printUsage() void {
 fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
     if (std.mem.eql(u8, value, "token")) return .token;
     if (std.mem.eql(u8, value, "span-start") or std.mem.eql(u8, value, "span_start")) return .span_start;
-    print("error: unsupported --objective '{s}' (expected token or span-start)\n", .{value});
+    if (std.mem.eql(u8, value, "gliner2-total-loss") or std.mem.eql(u8, value, "gliner2_total_loss")) return .gliner2_total_loss;
+    print("error: unsupported --objective '{s}' (expected token, span-start, or gliner2-total-loss)\n", .{value});
     return error.InvalidObjective;
 }
 
@@ -2380,11 +2853,158 @@ fn parseEntityTypesCsvOwned(allocator: std.mem.Allocator, csv: []const u8) ![][]
     return out.toOwnedSlice(allocator);
 }
 
+fn dupeStringSlice(allocator: std.mem.Allocator, items: []const []const u8) ![][]const u8 {
+    const out = try allocator.alloc([]const u8, items.len);
+    errdefer allocator.free(out);
+    for (items, 0..) |item, idx| {
+        out[idx] = try allocator.dupe(u8, item);
+    }
+    return out;
+}
+
+fn shuffleExamplesAndRecords(prng: *std.Random, examples: []gliner2_data.Example, records: []gliner2_data.UpstreamRecord) void {
+    if (examples.len != records.len) return;
+    var i = examples.len;
+    while (i > 1) {
+        i -= 1;
+        const j = prng.intRangeLessThan(usize, 0, i + 1);
+        std.mem.swap(gliner2_data.Example, &examples[i], &examples[j]);
+        std.mem.swap(gliner2_data.UpstreamRecord, &records[i], &records[j]);
+    }
+}
+
+fn fillGliner2TotalLossTargetsFromRecords(
+    allocator: std.mem.Allocator,
+    encoded: *const gliner2_data.EncodedBatch,
+    records: []const gliner2_data.UpstreamRecord,
+    entity_labels: []const []const u8,
+    out: []f32,
+) !gliner2_autodiff.SpanStartTargetStats {
+    if (records.len != encoded.batch_size) return error.InvalidGlinerBatchShape;
+    if (entity_labels.len != encoded.num_entity_types) return error.EntityTypeCountMismatch;
+    const E = encoded.num_entity_types;
+    const total_width = gliner2_autodiff.gliner2TotalLossTargetWidth(E);
+    const rows = encoded.batch_size * encoded.max_spans;
+    if (out.len != rows * total_width) return error.InvalidGlinerSpanTargetShape;
+    @memset(out, 0.0);
+
+    _ = allocator;
+    var stats = gliner2_autodiff.SpanStartTargetStats{ .entity_type_count = E };
+
+    const cls_labels_offset = gliner2_autodiff.gliner2TotalLossClassificationLabelsOffset(E);
+    const cls_mask_offset = gliner2_autodiff.gliner2TotalLossClassificationMaskOffset(E);
+    const count_labels_offset = gliner2_autodiff.gliner2TotalLossCountLabelsOffset(E);
+    const count_mask_offset = gliner2_autodiff.gliner2TotalLossCountMaskOffset(E);
+    const parent_idx_offset = gliner2_autodiff.gliner2TotalLossParentIndexOffset(E);
+    const schema_idx_offset = 2 * E;
+    const row_idx_offset = schema_idx_offset + E;
+    const count_idx_offset = row_idx_offset + E;
+    const start_idx_offset = count_idx_offset + E;
+
+    for (records, 0..) |record, sample_idx| {
+        const word_pos_offset = sample_idx * encoded.max_words_per_sample;
+        const schema_count = if (encoded.schema_counts.len > sample_idx)
+            @as(usize, @intCast(@max(encoded.schema_counts[sample_idx], 0)))
+        else
+            record.tasks.len;
+        for (0..encoded.max_spans) |span_idx| {
+            const flat_span_idx = sample_idx * encoded.max_spans + span_idx;
+            const row = out[flat_span_idx * total_width ..][0..total_width];
+            for (0..E) |entity_type_idx| {
+                const label_token_pos_raw = encoded.e_token_positions[sample_idx * E + entity_type_idx];
+                const label_token_pos: usize = if (label_token_pos_raw >= 0) @intCast(label_token_pos_raw) else 0;
+                row[schema_idx_offset + entity_type_idx] = @floatFromInt(sample_idx * encoded.max_length + label_token_pos);
+                row[row_idx_offset + entity_type_idx] = @floatFromInt(flat_span_idx);
+                const count_state = if (encoded.entity_type_kind.len > sample_idx * E + entity_type_idx and encoded.entity_type_kind[sample_idx * E + entity_type_idx] > 0)
+                    @as(usize, @intCast(@max(encoded.entity_type_kind[sample_idx * E + entity_type_idx] - 2, 0)))
+                else
+                    0;
+                row[count_idx_offset + entity_type_idx] = @floatFromInt(count_state * encoded.batch_size * E + sample_idx * E + entity_type_idx);
+            }
+
+            if (encoded.span_mask[flat_span_idx] <= 0.0) {
+                stats.ignored_span_count += 1;
+                continue;
+            }
+            const start_word_raw = encoded.span_indices[flat_span_idx * 2];
+            const end_word_raw = encoded.span_indices[flat_span_idx * 2 + 1];
+            if (start_word_raw < 0 or end_word_raw < start_word_raw) {
+                stats.ignored_span_count += 1;
+                continue;
+            }
+            const start_word: usize = @intCast(start_word_raw);
+            const end_word: usize = @intCast(end_word_raw);
+            if (start_word >= encoded.max_words_per_sample or end_word >= encoded.max_words_per_sample) return error.InvalidSpanWordIndex;
+            const start_token_raw = encoded.first_token_positions[word_pos_offset + start_word];
+            const end_token_raw = encoded.first_token_positions[word_pos_offset + end_word];
+            if (start_token_raw < 0 or end_token_raw < 0) {
+                stats.ignored_span_count += 1;
+                continue;
+            }
+            row[start_idx_offset] = @floatFromInt(sample_idx * encoded.max_length + @as(usize, @intCast(start_token_raw)));
+            row[start_idx_offset + 1] = @floatFromInt(sample_idx * encoded.max_length + @as(usize, @intCast(end_token_raw)));
+            stats.valid_span_count += 1;
+            for (0..E) |entity_type_idx| {
+                const active = encoded.entity_type_kind.len > sample_idx * E + entity_type_idx and encoded.entity_type_kind[sample_idx * E + entity_type_idx] > 0;
+                if (!active) continue;
+                const label = encoded.span_labels[flat_span_idx * E + entity_type_idx];
+                row[entity_type_idx] = label;
+                row[E + entity_type_idx] = 1.0;
+                if (label > 0.0) {
+                    stats.positive_span_label_count += 1;
+                    stats.positive_counts_by_entity_type[entity_type_idx] += 1;
+                }
+            }
+        }
+
+        const task_limit = @min(record.tasks.len, encoded.max_spans);
+        for (record.tasks[0..task_limit], 0..) |task, task_idx| {
+            if (task_idx >= schema_count) break;
+            const row_idx = sample_idx * encoded.max_spans + task_idx;
+            const row = out[row_idx * total_width ..][0..total_width];
+            row[parent_idx_offset] = @floatFromInt(sample_idx * encoded.max_length + upstreamSchemaParentTokenPosition(encoded, sample_idx, task_idx));
+            switch (task.kind) {
+                .classifications => {
+                    for (task.labels) |label| {
+                        const label_idx = indexOfEntityLabel(entity_labels, label) orelse continue;
+                        row[cls_mask_offset + label_idx] = 1.0;
+                    }
+                    for (task.true_labels) |label| {
+                        const label_idx = indexOfEntityLabel(entity_labels, label) orelse continue;
+                        row[cls_labels_offset + label_idx] = 1.0;
+                        row[cls_mask_offset + label_idx] = 1.0;
+                    }
+                },
+                .entities => {},
+                .json_structures, .relations => {
+                    const count = @min(task.count, @as(usize, 19));
+                    row[count_labels_offset + count] = 1.0;
+                    row[count_mask_offset] = 1.0;
+                },
+            }
+        }
+    }
+
+    return stats;
+}
+
 fn indexOfEntityLabel(entity_labels: []const []const u8, label: []const u8) ?usize {
     for (entity_labels, 0..) |candidate, idx| {
         if (std.mem.eql(u8, candidate, label)) return idx;
     }
     return null;
+}
+
+fn upstreamSchemaParentTokenPosition(encoded: *const gliner2_data.EncodedBatch, sample_idx: usize, task_idx: usize) usize {
+    if (encoded.max_schemas == 0 or encoded.max_schema_specials == 0) return 1;
+    if (task_idx >= encoded.max_schemas) return 1;
+    const count_idx = sample_idx * encoded.max_schemas + task_idx;
+    if (count_idx >= encoded.schema_special_counts.len or encoded.schema_special_counts[count_idx] <= 0) return 1;
+    const pos_idx = (sample_idx * encoded.max_schemas + task_idx) * encoded.max_schema_specials;
+    if (pos_idx >= encoded.schema_special_positions.len) return 1;
+    const raw = encoded.schema_special_positions[pos_idx];
+    if (raw < 0) return 1;
+    return @intCast(raw);
 }
 
 fn stringSliceContains(items: []const []const u8, needle: []const u8) bool {
@@ -2412,6 +3032,7 @@ fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
     return switch (objective) {
         .token => "token",
         .span_start => "span-start",
+        .gliner2_total_loss => "gliner2-total-loss",
     };
 }
 

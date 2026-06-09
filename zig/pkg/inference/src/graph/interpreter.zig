@@ -523,6 +523,8 @@ pub fn execute(
     const donated_values = try allocator.alloc(bool, count);
     defer allocator.free(donated_values);
     @memset(donated_values, false);
+    var freed_values = std.ArrayListUnmanaged(CT).empty;
+    defer freed_values.deinit(allocator);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
             if (ri.node_id >= count) continue;
@@ -693,6 +695,7 @@ pub fn execute(
                         }
                     }
                     cb.free(ct);
+                    try freed_values.append(allocator, ct);
                     values[input_id] = null;
                 }
             }
@@ -739,6 +742,7 @@ pub fn execute(
     //    graph nodes, and ExecutionResult owns that handle until deinit.
     for (0..count) |i| {
         if (values[i] == null) continue;
+        if (containsCt(freed_values.items, values[i].?)) continue;
         if (containsCt(outputs, values[i].?)) continue;
         // Skip output nodes — caller frees via ExecutionResult.deinit
         var is_output = false;

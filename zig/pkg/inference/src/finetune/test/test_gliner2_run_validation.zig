@@ -71,6 +71,7 @@ test "GLiNER2 autodiff run validator accepts complete output" {
     try std.testing.expectEqual(@as(usize, 64), summary.manifest_seq_len);
     try std.testing.expectEqual(@as(usize, 3), summary.manifest_entity_label_count);
     try std.testing.expectEqualStrings("Metal", summary.manifest_backend);
+    try std.testing.expectEqualStrings("gliner2-total-loss", summary.manifest_objective);
     try std.testing.expectEqual(@as(usize, 2), summary.step_record_count);
     try std.testing.expectEqual(@as(usize, 18), summary.supervised_token_count);
     try std.testing.expectEqual(@as(usize, 3), summary.entity_token_count);
@@ -399,6 +400,39 @@ test "GLiNER2 autodiff run validator rejects non-resident Metal optimizer metric
     }));
 }
 
+test "GLiNER2 autodiff run validator rejects objective mismatch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(out_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ out_dir, validation.manifest_file_name });
+    defer allocator.free(manifest_path);
+    const metrics_path = try std.fs.path.join(allocator, &.{ out_dir, validation.metrics_file_name });
+    defer allocator.free(metrics_path);
+    const adapter_path = try std.fs.path.join(allocator, &.{ out_dir, "encoder.layer.0.attention.self.query_proj.lora_A.bin" });
+    defer allocator.free(adapter_path);
+    const peft_config_path = try std.fs.path.join(allocator, &.{ out_dir, "adapter_config.json" });
+    defer allocator.free(peft_config_path);
+    const peft_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "adapter_model.safetensors" });
+    defer allocator.free(peft_checkpoint_path);
+    const task_head_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, "task_head.safetensors" });
+    defer allocator.free(task_head_checkpoint_path);
+
+    try writeManifestWithRun(allocator, manifest_path, 1, 1, 2, 4, 1, 1, 1, 1, 1.0);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metrics_path, .data = "{\"event\":\"step\",\"loss\":1.0,\"supervised_token_count\":4,\"entity_token_count\":1,\"ignored_token_count\":0,\"target_build_ms\":1.0,\"train_step_ms\":9.0,\"step_wall_ms\":10.0,\"graph_build_ms\":1.0,\"runtime_input_ms\":1.0,\"autodiff_ms\":2.0,\"execute_ms\":3.0,\"extract_ms\":1.0,\"optimizer_update_ms\":1.0,\"device_optimizer_ms\":0.5,\"optimizer_backend\":\"metal\",\"device_resident_transfer_count\":0,\"device_trainable_bytes\":128,\"trainer_total_ms\":8.0,\"peak_resident_bytes\":1024,\"supervised_tokens_per_second\":400.0}\n{\"event\":\"epoch\",\"avg_loss\":1.0}\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = adapter_path, .data = "LORA" });
+    try writePeftConfig(peft_config_path);
+    try writeOneTensorSafetensors(allocator, peft_checkpoint_path);
+    try writeTaskHeadSafetensors(allocator, task_head_checkpoint_path);
+
+    try std.testing.expectError(error.TrainingObjectiveMismatch, validation.validateRun(allocator, out_dir, .{
+        .require_objective = "span-start",
+    }));
+}
+
 test "GLiNER2 autodiff run validator rejects run below requested cardinality thresholds" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -515,6 +549,7 @@ fn writeManifestWithRun(
         \\  "schema_version": "gliner2_autodiff_training/v1",
         \\  "artifact_family_version": "gliner2_autodiff_adapter/v1",
         \\  "backend": "Metal",
+        \\  "objective": "gliner2-total-loss",
         \\  "metrics_file": "training_metrics.jsonl",
         \\  "adapter_parameter_file_count": {},
         \\  "peft_adapter_checkpoint": "adapter_model.safetensors",

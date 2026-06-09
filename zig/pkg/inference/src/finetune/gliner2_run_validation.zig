@@ -36,6 +36,7 @@ pub const ValidationOptions = struct {
     min_supervised_tokens: ?usize = null,
     min_entity_tokens: ?usize = null,
     require_backend: ?[]const u8 = null,
+    require_objective: ?[]const u8 = null,
     require_optimizer_backend: ?[]const u8 = null,
     max_device_trainable_transfer_count: ?u64 = null,
     max_device_resident_transfer_count: ?u64 = null,
@@ -64,6 +65,7 @@ pub const RunValidationSummary = struct {
     manifest_seq_len: usize,
     manifest_entity_label_count: usize,
     manifest_backend: []const u8,
+    manifest_objective: []const u8,
     metric_record_count: usize,
     step_record_count: usize,
     epoch_record_count: usize,
@@ -161,6 +163,9 @@ pub fn validateRun(
     if (options.require_backend) |backend| {
         if (!std.mem.eql(u8, manifest.backend, backend)) return error.TrainingBackendMismatch;
     }
+    if (options.require_objective) |objective| {
+        if (!std.mem.eql(u8, manifest.objective, objective)) return error.TrainingObjectiveMismatch;
+    }
     if (options.require_optimizer_backend) |backend| {
         if (metrics.optimizer_backend_mismatch or !std.mem.eql(u8, metrics.optimizer_backend orelse "", backend)) return error.OptimizerBackendMismatch;
     }
@@ -212,6 +217,7 @@ pub fn validateRun(
         .manifest_seq_len = manifest.seq_len,
         .manifest_entity_label_count = manifest.entity_label_count,
         .manifest_backend = try allocator.dupe(u8, manifest.backend),
+        .manifest_objective = try allocator.dupe(u8, manifest.objective),
         .metric_record_count = metrics.metric_record_count,
         .step_record_count = metrics.step_record_count,
         .epoch_record_count = metrics.epoch_record_count,
@@ -246,6 +252,7 @@ pub fn freeRunValidationSummary(allocator: std.mem.Allocator, summary: *RunValid
     allocator.free(summary.manifest_path);
     allocator.free(summary.metrics_path);
     allocator.free(summary.manifest_backend);
+    allocator.free(summary.manifest_objective);
     if (summary.optimizer_backend) |backend| allocator.free(backend);
     allocator.free(summary.peft_adapter_checkpoint_path);
     allocator.free(summary.peft_adapter_config_path);
@@ -336,6 +343,7 @@ const ManifestInspection = struct {
     final_avg_loss: f64,
     entity_label_count: usize,
     backend: []const u8,
+    objective: []const u8,
 };
 
 fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
@@ -374,6 +382,8 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
     const entity_label_count = try inspectEntityLabels(obj.get("entity_labels"));
     const backend = jsonString(obj.get("backend")) orelse return error.InvalidTrainingManifest;
     if (std.mem.trim(u8, backend, " \t\r\n").len == 0) return error.InvalidTrainingManifest;
+    const objective = jsonString(obj.get("objective")) orelse return error.InvalidTrainingManifest;
+    if (!isSupportedObjective(objective)) return error.InvalidTrainingManifest;
     if (epochs == 0 or batch_size == 0 or seq_len == 0 or example_count == 0 or total_steps == 0) return error.InvalidTrainingManifest;
     if (!std.math.isFinite(final_avg_loss)) return error.InvalidTrainingManifest;
     if (entity_label_count == 0 or entity_label_count + 1 > num_classes) return error.InvalidTrainingManifest;
@@ -400,7 +410,14 @@ fn inspectManifest(obj: std.json.ObjectMap) !ManifestInspection {
         .final_avg_loss = final_avg_loss,
         .entity_label_count = entity_label_count,
         .backend = backend,
+        .objective = objective,
     };
+}
+
+fn isSupportedObjective(value: []const u8) bool {
+    return std.mem.eql(u8, value, "token") or
+        std.mem.eql(u8, value, "span-start") or
+        std.mem.eql(u8, value, "gliner2-total-loss");
 }
 
 fn inspectEntityLabels(value: ?std.json.Value) !usize {

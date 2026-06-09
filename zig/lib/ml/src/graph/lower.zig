@@ -62,7 +62,7 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     }
     for (0..count) |i| {
         const n = graph.node(@intCast(i));
-        if (n.op == .fused_gelu) continue;
+        if (n.op == .fused_gelu or n.op == .fused_softmax) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             redirect[i] = n.vjp_alternate;
         }

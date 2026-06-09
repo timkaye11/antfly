@@ -63,7 +63,7 @@ test "GLiNER2 smoke NER fixture has stable stats and span shape" {
     try std.testing.expectEqual(@as(usize, 244), batch_shape.max_words_per_sample);
     try std.testing.expectEqual(@as(usize, 1952), batch_shape.max_spans);
     try std.testing.expectEqual(@as(usize, 51), batch_shape.valid_spans);
-    try std.testing.expectEqual(@as(usize, 8), batch_shape.positive_labels);
+    try std.testing.expectEqual(@as(usize, 9), batch_shape.positive_labels);
 
     const span_targets = try gliner2_data.summarizeSpanTargetsForExamples(
         allocator,
@@ -74,7 +74,7 @@ test "GLiNER2 smoke NER fixture has stable stats and span shape" {
     );
     try std.testing.expectEqual(@as(usize, 3), span_targets.num_examples);
     try std.testing.expectEqual(@as(usize, 51), span_targets.valid_spans);
-    try std.testing.expectEqual(@as(usize, 8), span_targets.positive_labels);
+    try std.testing.expectEqual(@as(usize, 9), span_targets.positive_labels);
 }
 
 test "GLiNER2 dataset readiness exposes non-toy gate failures" {
@@ -98,14 +98,14 @@ test "GLiNER2 dataset readiness exposes non-toy gate failures" {
             .min_target_entities = 9,
             .min_target_coverage_ratio = 1.0,
             .require_all_examples_with_target = true,
-            .min_positive_span_labels = 8,
+            .min_positive_span_labels = 9,
         },
     );
     defer gliner2_data.freeDatasetReadinessSummary(allocator, &smoke);
     try std.testing.expect(smoke.passed);
     try std.testing.expectEqual(@as(usize, 0), smoke.failed_reasons.len);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), smoke.target_coverage_ratio, 0.000001);
-    try std.testing.expectEqual(@as(usize, 8), smoke.span_targets.positive_labels);
+    try std.testing.expectEqual(@as(usize, 9), smoke.span_targets.positive_labels);
 
     var small_preview = try gliner2_data.evaluateDatasetReadiness(
         allocator,
@@ -121,13 +121,13 @@ test "GLiNER2 dataset readiness exposes non-toy gate failures" {
             .min_target_entities = 9,
             .min_target_coverage_ratio = 1.0,
             .require_all_examples_with_target = true,
-            .min_positive_span_labels = 8,
+            .min_positive_span_labels = 9,
         },
     );
     defer gliner2_data.freeDatasetReadinessSummary(allocator, &small_preview);
     try std.testing.expect(small_preview.passed);
     try std.testing.expectEqual(@as(usize, 1), small_preview.batch_shape.batch_size);
-    try std.testing.expectEqual(@as(usize, 8), small_preview.span_targets.positive_labels);
+    try std.testing.expectEqual(@as(usize, 9), small_preview.span_targets.positive_labels);
 
     var non_toy = try gliner2_data.evaluateDatasetReadiness(
         allocator,
@@ -154,6 +154,151 @@ test "GLiNER2 dataset readiness exposes non-toy gate failures" {
     try std.testing.expect(containsReason(non_toy.failed_reasons, "min_positive_span_labels"));
 }
 
+test "GLiNER2 upstream all-task fixture exposes extractive span labels" {
+    const allocator = std.testing.allocator;
+
+    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    defer loaded.deinit();
+
+    const stats = try gliner2_data.computeStats(allocator, loaded.examples);
+    try std.testing.expectEqual(@as(usize, 4), stats.num_examples);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), stats.avg_entities, 0.01);
+    try std.testing.expectEqual(@as(usize, 10), stats.unique_labels);
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.examples[0].entities.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.examples[1].entities.len);
+    try std.testing.expectEqual(@as(usize, 4), loaded.examples[2].entities.len);
+    try std.testing.expectEqual(@as(usize, 3), loaded.examples[3].entities.len);
+
+    const label_vocab = try gliner2_data.buildLabelVocab(allocator, loaded.examples, null);
+    defer {
+        for (label_vocab) |label| allocator.free(label);
+        allocator.free(label_vocab);
+    }
+
+    try std.testing.expect(containsLabel(label_vocab, "person"));
+    try std.testing.expect(containsLabel(label_vocab, "product.name"));
+    try std.testing.expect(containsLabel(label_vocab, "product.status"));
+    try std.testing.expect(containsLabel(label_vocab, "founded.head"));
+    try std.testing.expect(containsLabel(label_vocab, "founded.tail"));
+}
+
+test "GLiNER2 upstream all-task fixture preserves task-level labels" {
+    const allocator = std.testing.allocator;
+
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), loaded.records.len);
+    const stats = gliner2_data.computeUpstreamTaskStats(loaded.records);
+    try std.testing.expectEqual(@as(usize, 4), stats.num_records);
+    try std.testing.expectEqual(@as(usize, 1), stats.entity_tasks);
+    try std.testing.expectEqual(@as(usize, 2), stats.classification_tasks);
+    try std.testing.expectEqual(@as(usize, 1), stats.json_structure_tasks);
+    try std.testing.expectEqual(@as(usize, 1), stats.relation_tasks);
+    try std.testing.expectEqual(@as(usize, 4), stats.non_entity_task_annotations);
+    try std.testing.expectEqual(@as(usize, 5), stats.classification_label_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.classification_true_label_count);
+    try std.testing.expectEqual(@as(usize, 10), stats.span_field_annotations);
+
+    const entities = loaded.records[0].tasks[0];
+    try std.testing.expectEqual(gliner2_data.UpstreamTaskKind.entities, entities.kind);
+    try std.testing.expectEqualStrings("entities", entities.name);
+    try std.testing.expectEqual(@as(usize, 3), entities.fields.len);
+    try std.testing.expectEqualStrings("person", entities.fields[0].name);
+
+    const cls = loaded.records[1].tasks[0];
+    try std.testing.expectEqual(gliner2_data.UpstreamTaskKind.classifications, cls.kind);
+    try std.testing.expectEqualStrings("sentiment", cls.name);
+    try std.testing.expectEqual(@as(usize, 2), cls.labels.len);
+    try std.testing.expectEqualStrings("negative", cls.true_labels[0]);
+
+    const structure = loaded.records[2].tasks[0];
+    try std.testing.expectEqual(gliner2_data.UpstreamTaskKind.json_structures, structure.kind);
+    try std.testing.expectEqualStrings("product", structure.name);
+    try std.testing.expectEqual(@as(usize, 4), structure.fields.len);
+    try std.testing.expectEqualStrings("status", structure.fields[3].name);
+    try std.testing.expectEqualStrings("available", structure.fields[3].value);
+    try std.testing.expectEqual(@as(usize, 4), structure.fields[3].target_word_start.?);
+    try std.testing.expectEqual(@as(usize, 4), structure.fields[3].target_word_end.?);
+    try std.testing.expectEqual(@as(usize, 9), loaded.records[2].prefix_tokens.len);
+
+    const relation = loaded.records[3].tasks[0];
+    try std.testing.expectEqual(gliner2_data.UpstreamTaskKind.relations, relation.kind);
+    try std.testing.expectEqualStrings("founded", relation.name);
+    try std.testing.expectEqual(@as(usize, 3), relation.fields.len);
+    try std.testing.expectEqualStrings("head", relation.fields[0].name);
+    try std.testing.expect(relation.fields[0].start != null);
+}
+
+test "GLiNER2 upstream all-task label vocab includes classification and structured labels" {
+    const allocator = std.testing.allocator;
+
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    defer loaded.deinit();
+
+    const labels = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, loaded.records, null);
+    defer {
+        for (labels) |label| allocator.free(label);
+        allocator.free(labels);
+    }
+
+    try std.testing.expect(containsLabel(labels, "person"));
+    try std.testing.expect(containsLabel(labels, "negative"));
+    try std.testing.expect(containsLabel(labels, "urgent"));
+    try std.testing.expect(containsLabel(labels, "product.name"));
+    try std.testing.expect(containsLabel(labels, "product.status"));
+    try std.testing.expect(containsLabel(labels, "founded.head"));
+    try std.testing.expect(containsLabel(labels, "founded.tail"));
+    try std.testing.expectEqualStrings("person", labels[0]);
+    try std.testing.expectEqualStrings("organization", labels[1]);
+    try std.testing.expectEqualStrings("location", labels[2]);
+    try std.testing.expectEqualStrings("positive", labels[3]);
+    try std.testing.expectEqualStrings("negative", labels[4]);
+    try std.testing.expectEqualStrings("product.name", labels[8]);
+    try std.testing.expectEqualStrings("product.price", labels[9]);
+    try std.testing.expectEqualStrings("product.color", labels[10]);
+    try std.testing.expectEqualStrings("product.status", labels[11]);
+}
+
+test "GLiNER2 upstream task batch carries schema markers and structured span labels" {
+    const allocator = std.testing.allocator;
+
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    defer loaded.deinit();
+
+    const labels = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, loaded.records, null);
+    defer {
+        for (labels) |label| allocator.free(label);
+        allocator.free(labels);
+    }
+
+    var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+
+    var batch = try gliner2_data.buildUpstreamTaskBatch(allocator, &tokenizer, loaded.records, labels, 96, 4, loaded.records.len);
+    defer batch.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), batch.batch_size);
+    try std.testing.expectEqual(@as(usize, labels.len), batch.num_entity_types);
+    try std.testing.expectEqual(@as(i32, 1), batch.schema_counts[0]);
+    try std.testing.expectEqual(@as(i32, 2), batch.schema_counts[1]);
+    try std.testing.expectEqual(@as(i32, 1), batch.schema_counts[2]);
+    try std.testing.expectEqual(@as(i32, 1), batch.schema_counts[3]);
+    try std.testing.expectEqual(gliner2_data.upstreamTaskTypeId(.entities), batch.task_type_ids[0]);
+    try std.testing.expectEqual(gliner2_data.upstreamTaskTypeId(.classifications), batch.task_type_ids[batch.max_schemas]);
+    try std.testing.expect(batch.schema_special_counts[0] > 0);
+    try std.testing.expect(batch.schema_special_positions[0] >= 0);
+
+    const negative_idx = labelIndex(labels, "negative").?;
+    const urgent_idx = labelIndex(labels, "urgent").?;
+    const product_name_idx = labelIndex(labels, "product.name").?;
+    try std.testing.expect(batch.e_token_positions[1 * labels.len + negative_idx] >= 0);
+    try std.testing.expect(batch.e_token_positions[1 * labels.len + urgent_idx] >= 0);
+    try std.testing.expect(batch.e_token_positions[2 * labels.len + product_name_idx] >= 0);
+    try std.testing.expectEqual(@as(i32, 2), batch.entity_type_kind[2 * labels.len + product_name_idx]);
+}
+
 test "GLiNER2 label class capacity rejects collapsed label mappings" {
     const allocator = std.testing.allocator;
 
@@ -170,4 +315,18 @@ fn containsReason(reasons: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, reason, needle)) return true;
     }
     return false;
+}
+
+fn containsLabel(labels: []const []const u8, needle: []const u8) bool {
+    for (labels) |label| {
+        if (std.mem.eql(u8, label, needle)) return true;
+    }
+    return false;
+}
+
+fn labelIndex(labels: []const []const u8, needle: []const u8) ?usize {
+    for (labels, 0..) |label, idx| {
+        if (std.mem.eql(u8, label, needle)) return idx;
+    }
+    return null;
 }

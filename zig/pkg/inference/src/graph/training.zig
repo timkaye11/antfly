@@ -705,7 +705,7 @@ pub const CompiledTrainSession = struct {
         defer mesh.deinit();
 
         const metal_debug_before = cb.debugTimingSnapshot().provider;
-        var multi_result = try multi_executor.executeMultiDevice(
+        var multi_result = multi_executor.executeMultiDevice(
             self.allocator,
             &self.graph,
             &dpp,
@@ -718,7 +718,13 @@ pub const CompiledTrainSession = struct {
                 .collect_partition_stats = true,
                 .preserve_runtime_input_residency = true,
             },
-        );
+        ) catch |err| switch (err) {
+            error.MissingRuntimeInput => {
+                compiledDiag("graph executor fallback missing partition input; retrying regular compiled Metal path", .{});
+                return null;
+            },
+            else => return err,
+        };
         defer multi_result.deinit(&mesh);
 
         profile.execute_ns = elapsedNs(execute_start);

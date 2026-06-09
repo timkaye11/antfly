@@ -165,10 +165,12 @@ pub const TrainerConfig = struct {
     hidden_size_hint: u32 = 0,
     num_layers_hint: u32 = 0,
 
-    /// Initial values for the LoRA A matrices (one fan-in std-dev each).
+    /// Optional Gaussian std-dev override for LoRA A matrices.
     /// B is always zero-initialized so the LoRA path is a no-op at step 0.
-    /// When `null`, A matrices are drawn from a Kaiming-scaled Gaussian.
-    lora_a_init_std: f32 = 0.02,
+    /// When `null`, A matrices use the official GLiNER2/PyTorch default:
+    /// `kaiming_uniform_(A, a=sqrt(5))`, which reduces to
+    /// uniform[-1/sqrt(fan_in), 1/sqrt(fan_in)].
+    lora_a_init_std: ?f32 = null,
     /// RNG seed used to initialize A matrices.
     seed: u64 = 42,
     /// Regular graph parameters that should be owned and updated by the
@@ -894,25 +896,29 @@ pub const RealAutodiffTrainer = struct {
                     } else {
                         const opt_config = optimizers.Optimizer{ .adamw = self.config.optimizer };
                         for (self.lora_params.items) |*slot| {
-                            try optimizers.step(
-                                opt_config,
-                                &self.optimizer_state,
-                                lr,
-                                slot.name,
-                                slot.weights,
-                                slot.grad_accum,
-                            );
+                            if (!allZero(slot.grad_accum)) {
+                                try optimizers.step(
+                                    opt_config,
+                                    &self.optimizer_state,
+                                    lr,
+                                    slot.name,
+                                    slot.weights,
+                                    slot.grad_accum,
+                                );
+                            }
                             @memset(slot.grad_accum, 0);
                         }
                         for (self.regular_params.items) |*slot| {
-                            try optimizers.step(
-                                opt_config,
-                                &self.optimizer_state,
-                                lr,
-                                slot.name,
-                                slot.weights,
-                                slot.grad_accum,
-                            );
+                            if (!allZero(slot.grad_accum)) {
+                                try optimizers.step(
+                                    opt_config,
+                                    &self.optimizer_state,
+                                    lr,
+                                    slot.name,
+                                    slot.weights,
+                                    slot.grad_accum,
+                                );
+                            }
                             @memset(slot.grad_accum, 0);
                         }
                     }
@@ -1719,8 +1725,15 @@ pub const RealAutodiffTrainer = struct {
         const weights = try self.allocator.alloc(f32, n_elems);
         errdefer self.allocator.free(weights);
         if (init_random) {
-            const std_dev = self.config.lora_a_init_std;
-            for (weights) |*w| w.* = rnd.floatNorm(f32) * std_dev;
+            if (self.config.lora_a_init_std) |std_dev| {
+                for (weights) |*w| w.* = rnd.floatNorm(f32) * std_dev;
+            } else {
+                if (shape.rank() < 2) return error.InvalidLoRAAdapterShape;
+                const fan_in = @as(f32, @floatFromInt(shape.dim(1)));
+                if (fan_in <= 0.0) return error.InvalidLoRAAdapterShape;
+                const bound = 1.0 / @sqrt(fan_in);
+                for (weights) |*w| w.* = (rnd.float(f32) * 2.0 - 1.0) * bound;
+            }
         } else {
             @memset(weights, 0.0);
         }
@@ -1858,6 +1871,13 @@ fn shapeToDims(allocator: std.mem.Allocator, shape: Shape) ![]i32 {
     const dims = try allocator.alloc(i32, rank);
     for (0..rank) |i| dims[i] = @intCast(shape.dim(@intCast(i)));
     return dims;
+}
+
+fn allZero(values: []const f32) bool {
+    for (values) |value| {
+        if (value != 0.0) return false;
+    }
+    return true;
 }
 
 fn monotonicNowNs() u64 {

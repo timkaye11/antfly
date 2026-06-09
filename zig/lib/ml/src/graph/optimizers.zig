@@ -90,6 +90,7 @@ pub const ParamState = struct {
     m: []f32, // first moment (momentum / Adam m)
     v: []f32, // second moment (Adam v); empty slice for SGD without momentum
     z: ?[]f32 = null, // base iterate for Schedule-Free AdamW; null until first SF step
+    step_count: u32 = 0,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, size: usize, needs_v: bool) !ParamState {
@@ -172,17 +173,20 @@ pub fn step(
         .sgd => |sgd| {
             const has_momentum = sgd.momentum != 0.0;
             const ps = try state.getOrCreate(name, param.len, false);
-            stepSlices(config, state.step_count, current_lr, param, grad, if (has_momentum) ps.m else &.{}, &.{});
+            ps.step_count += 1;
+            stepSlices(config, ps.step_count, current_lr, param, grad, if (has_momentum) ps.m else &.{}, &.{});
         },
         .adam => |adam| {
             _ = adam;
             const ps = try state.getOrCreate(name, param.len, true);
-            stepSlices(config, state.step_count, current_lr, param, grad, ps.m, ps.v);
+            ps.step_count += 1;
+            stepSlices(config, ps.step_count, current_lr, param, grad, ps.m, ps.v);
         },
         .adamw => |adamw| {
             _ = adamw;
             const ps = try state.getOrCreate(name, param.len, true);
-            stepSlices(config, state.step_count, current_lr, param, grad, ps.m, ps.v);
+            ps.step_count += 1;
+            stepSlices(config, ps.step_count, current_lr, param, grad, ps.m, ps.v);
         },
         .schedule_free_adamw => {
             const ps = try state.getOrCreate(name, param.len, true);
@@ -192,7 +196,8 @@ pub fn step(
                 @memcpy(z_buf, param);
                 ps.z = z_buf;
             }
-            stepScheduleFreeAdamW(state.step_count, current_lr, config.schedule_free_adamw, param, grad, ps.m, ps.v, ps.z.?);
+            ps.step_count += 1;
+            stepScheduleFreeAdamW(ps.step_count, current_lr, config.schedule_free_adamw, param, grad, ps.m, ps.v, ps.z.?);
         },
     }
 }

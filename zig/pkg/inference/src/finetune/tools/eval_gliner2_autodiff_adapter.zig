@@ -531,7 +531,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         try dupeStringSlice(allocator, manifest.entity_labels);
     errdefer freeStringSlice(allocator, entity_types);
     if (entity_types.len == 0 or entity_types.len + 1 > manifest.num_classes) return error.InvalidEntityTypes;
-    if (objective == .span_start and entity_types.len + 1 != manifest.num_classes) return error.InvalidEntityTypes;
+    if ((objective == .span_start or objective == .gliner2_total_loss) and entity_types.len + 1 != manifest.num_classes) return error.InvalidEntityTypes;
     try validateLabelThresholds(opts.label_thresholds, entity_types);
     try validateLabelScoreBiases(opts.label_score_biases, entity_types);
 
@@ -1276,7 +1276,7 @@ fn ensureGraphBuilt(
             );
             try trainer.ensureGraphBuilt(trainer_input);
         },
-        .span_start => {
+        .span_start, .gliner2_total_loss => {
             const examples = [_]gliner2_data.Example{.{ .text = text, .entities = &.{} }};
             var encoded = try gliner2_data.buildSimpleBatch(allocator, tokenizer, &examples, entity_types, seq_len, max_span_width, 1);
             defer encoded.deinit();
@@ -1332,7 +1332,7 @@ fn decodeTextEntities(
             prediction_threshold,
             label_score_biases,
         ),
-        .span_start => decodeTextEntitiesFromSpanStart(
+        .span_start, .gliner2_total_loss => decodeTextEntitiesFromSpanStart(
             allocator,
             tokenizer,
             entity_types,
@@ -1811,6 +1811,7 @@ fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) voi
 fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
     if (std.mem.eql(u8, value, "token")) return .token;
     if (std.mem.eql(u8, value, "span-start") or std.mem.eql(u8, value, "span_start")) return .span_start;
+    if (std.mem.eql(u8, value, "gliner2-total-loss") or std.mem.eql(u8, value, "gliner2_total_loss")) return .gliner2_total_loss;
     return error.InvalidObjective;
 }
 
@@ -1818,6 +1819,7 @@ fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
     return switch (objective) {
         .token => "token",
         .span_start => "span-start",
+        .gliner2_total_loss => "gliner2-total-loss",
     };
 }
 

@@ -1028,6 +1028,7 @@ pub const MetalPartitionExecutor = struct {
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         if (trace_nodes or collect_op_stats) printInterpreterFallbackNullInputs(graph, values, node_id, partition_index, node_pos);
+                        if (interpreterFallbackHasMissingInput(graph, values, node_id)) return error.MissingRuntimeInput;
                         values[i] = try interpreter.executeNode(graph, cb, values, node_id, &exec_state);
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_end partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     }
@@ -1489,6 +1490,21 @@ fn printInterpreterFallbackNullInputs(
         std.debug.print("{}:{s}:{s}", .{ input_id, input_op, state });
     }
     std.debug.print("\n", .{});
+}
+
+fn interpreterFallbackHasMissingInput(
+    graph: *const Graph,
+    values: []?CT,
+    node_id: NodeId,
+) bool {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return true;
+    const node = graph.node(node_id);
+    for (node.getInputs()) |input_id| {
+        if (input_id == null_node) continue;
+        const input_index: usize = @intCast(input_id);
+        if (input_index >= values.len or values[input_index] == null) return true;
+    }
+    return false;
 }
 
 fn metalPartitionOpStatsEnabled() bool {

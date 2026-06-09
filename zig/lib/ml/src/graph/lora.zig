@@ -144,7 +144,7 @@ pub fn injectLoRA(
     // the correct per-site `rows`. This avoids duplicate adapter names
     // (which would cause gradient overwrites) and preserves weight-sharing
     // semantics.
-    var weight_lora_map = std.StringHashMapUnmanaged(void){};
+    var weight_lora_map = std.StringHashMapUnmanaged(usize){};
     defer weight_lora_map.deinit(allocator);
     var weight_lora_keys: std.ArrayListUnmanaged([]u8) = .empty;
     defer freeOwnedStrings(allocator, &weight_lora_keys);
@@ -155,6 +155,16 @@ pub fn injectLoRA(
     const matched_patterns = try allocator.alloc(bool, config.target_patterns.len);
     defer allocator.free(matched_patterns);
     @memset(matched_patterns, false);
+
+    const AdapterNodes = struct {
+        a_name: []const u8,
+        b_name: []const u8,
+        mask_name: ?[]const u8,
+        lora_a: NodeId,
+        lora_b: NodeId,
+        dropout_mask_id: NodeId,
+        is_new: bool,
+    };
 
     for (0..node_count) |i| {
         const id: NodeId = @intCast(i);
@@ -189,19 +199,18 @@ pub fn injectLoRA(
         const rank = config.rank;
         const scale = config.alpha / @as(f32, @floatFromInt(rank));
 
-        // Skip if this weight was already LoRA-adapted via a different
-        // fused_linear. When the same weight is used in multiple linears
-        // (e.g. DeBERTa's shared Q/K projections for content and relative
-        // position), the LoRA perturbation on the first use already affects
-        // the shared weight for all uses. Injecting a separate matmul path
-        // for the second use creates gradient graph shape mismatches.
+        // In by_weight mode, repeated uses of the same frozen projection must
+        // share the same LoRA A/B parameters while still adding a LoRA branch
+        // at each use site. This matches PEFT module wrapping: DeBERTa's
+        // query/key projections are called for both content and relative
+        // position embeddings, and both calls must contribute to the shared
+        // adapter gradients.
+        const existing_adapter_index: ?usize = switch (config.sharing) {
+            .by_weight => weight_lora_map.get(weight_name),
+            .by_use => null,
+        };
         const current_use_site = switch (config.sharing) {
             .by_weight => blk: {
-                if (weight_lora_map.contains(weight_name)) continue;
-                const key = try allocator.dupe(u8, weight_name);
-                errdefer allocator.free(key);
-                try weight_lora_map.put(allocator, key, {});
-                try weight_lora_keys.append(allocator, key);
                 break :blk 0;
             },
             .by_use => blk: {
@@ -218,34 +227,60 @@ pub fn injectLoRA(
             },
         };
 
-        // Create LoRA parameter names.
-        const a_name = switch (config.sharing) {
-            .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_A", .{weight_name}),
-            .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_A", .{ weight_name, current_use_site }),
-        };
-        const b_name = switch (config.sharing) {
-            .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_B", .{weight_name}),
-            .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_B", .{ weight_name, current_use_site }),
-        };
-        const mask_name = if (config.dropout > 0.0) switch (config.sharing) {
-            .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_dropout_mask", .{weight_name}),
-            .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_dropout_mask", .{ weight_name, current_use_site }),
-        } else null;
+        const adapter_nodes = if (existing_adapter_index) |existing_idx| blk: {
+            if (config.dropout > 0.0) return error.UnsupportedSharedLoRADropout;
+            const info = adapter.adapters.items[existing_idx];
+            break :blk AdapterNodes{
+                .a_name = info.lora_a_name,
+                .b_name = info.lora_b_name,
+                .mask_name = @as(?[]const u8, null),
+                .lora_a = info.lora_a_id,
+                .lora_b = info.lora_b_id,
+                .dropout_mask_id = null_node,
+                .is_new = false,
+            };
+        } else blk: {
+            // Create LoRA parameter names.
+            const a_name = switch (config.sharing) {
+                .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_A", .{weight_name}),
+                .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_A", .{ weight_name, current_use_site }),
+            };
+            const b_name = switch (config.sharing) {
+                .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_B", .{weight_name}),
+                .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_B", .{ weight_name, current_use_site }),
+            };
+            const mask_name = if (config.dropout > 0.0) switch (config.sharing) {
+                .by_weight => try arenaFmt(&adapter.name_arena, allocator, "{s}.lora_dropout_mask", .{weight_name}),
+                .by_use => try arenaFmt(&adapter.name_arena, allocator, "{s}.loop_{d}.lora_dropout_mask", .{ weight_name, current_use_site }),
+            } else null;
 
-        // A: [rank, in_dim], B: [out_dim, rank]
-        const lora_a = try bld.parameter(a_name, Shape.init(.f32, &.{ @intCast(rank), @intCast(in_dim) }));
-        const lora_b = try bld.parameter(b_name, Shape.init(.f32, &.{ @intCast(out_dim), @intCast(rank) }));
-        var dropout_mask_id: NodeId = null_node;
-        const lora_input = if (mask_name) |name| blk: {
-            const mask = try bld.parameter(name, Shape.init(.f32, &.{ @intCast(rows), @intCast(in_dim) }));
-            dropout_mask_id = mask;
-            break :blk try bld.mul(input_id, mask);
-        } else input_id;
+            // A: [rank, in_dim], B: [out_dim, rank]
+            const lora_a = try bld.parameter(a_name, Shape.init(.f32, &.{ @intCast(rank), @intCast(in_dim) }));
+            const lora_b = try bld.parameter(b_name, Shape.init(.f32, &.{ @intCast(out_dim), @intCast(rank) }));
+            var dropout_mask_id: NodeId = null_node;
+            if (mask_name) |name| {
+                dropout_mask_id = try bld.parameter(name, Shape.init(.f32, &.{ @intCast(rows), @intCast(in_dim) }));
+            }
+            break :blk AdapterNodes{
+                .a_name = a_name,
+                .b_name = b_name,
+                .mask_name = mask_name,
+                .lora_a = lora_a,
+                .lora_b = lora_b,
+                .dropout_mask_id = dropout_mask_id,
+                .is_new = true,
+            };
+        };
+
+        const lora_input = if (adapter_nodes.dropout_mask_id != null_node)
+            try bld.mul(input_id, adapter_nodes.dropout_mask_id)
+        else
+            input_id;
 
         // x @ A^T → [rows, rank]
-        const after_a = try bld.linearNoBias(lora_input, lora_a, rows, in_dim, rank);
+        const after_a = try bld.linearNoBias(lora_input, adapter_nodes.lora_a, rows, in_dim, rank);
         // [rows, rank] @ B^T → [rows, out_dim]
-        const after_b = try bld.linearNoBias(after_a, lora_b, rows, rank, out_dim);
+        const after_b = try bld.linearNoBias(after_a, adapter_nodes.lora_b, rows, rank, out_dim);
 
         // Scale.
         const scale_const = try bld.scalarConst(.f32, scale);
@@ -262,16 +297,25 @@ pub fn injectLoRA(
             if (out.* == id) out.* = combined;
         }
 
-        try adapter.adapters.append(allocator, .{
-            .base_name = weight_name,
-            .lora_a_name = a_name,
-            .lora_b_name = b_name,
-            .lora_a_id = lora_a,
-            .lora_b_id = lora_b,
-            .dropout_mask_name = mask_name,
-            .dropout_mask_id = dropout_mask_id,
-            .use_site_index = current_use_site,
-        });
+        if (adapter_nodes.is_new) {
+            const new_index = adapter.adapters.items.len;
+            try adapter.adapters.append(allocator, .{
+                .base_name = weight_name,
+                .lora_a_name = adapter_nodes.a_name,
+                .lora_b_name = adapter_nodes.b_name,
+                .lora_a_id = adapter_nodes.lora_a,
+                .lora_b_id = adapter_nodes.lora_b,
+                .dropout_mask_name = adapter_nodes.mask_name,
+                .dropout_mask_id = adapter_nodes.dropout_mask_id,
+                .use_site_index = current_use_site,
+            });
+            if (config.sharing == .by_weight) {
+                const key = try allocator.dupe(u8, weight_name);
+                errdefer allocator.free(key);
+                try weight_lora_map.put(allocator, key, new_index);
+                try weight_lora_keys.append(allocator, key);
+            }
+        }
     }
     if (config.strict_target_patterns) {
         for (matched_patterns) |matched| {

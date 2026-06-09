@@ -168,8 +168,6 @@ fn applyVjp(
     adjoints: []NodeId,
 ) !void {
     const ins = n.getInputs();
-    _ = node_id;
-
     switch (n.op) {
         // ── No gradient ──────────────────────────────────────────────
         .parameter, .constant => {},
@@ -247,6 +245,22 @@ fn applyVjp(
                 .num_inputs = 2,
             });
             try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        .fused_softmax => {
+            // For y = softmax(x), dL/dx = y * (dL/dy - sum(dL/dy * y)).
+            // Keeping this fused avoids routing attention gradients through
+            // the reduce_max stabilization subgraph used by the forward
+            // decomposition.
+            const y = node_id;
+            const rank = n.output_shape.rank();
+            const last_axis: u8 = @intCast(rank - 1);
+            const adj_times_y = try b.mul(adj, y);
+            const dot = try b.reduceSum(adj_times_y, &.{last_axis});
+            const dot_shape = b.graph.node(dot).output_shape;
+            const dot_bc = try broadcastToShape(b, dot, dot_shape, n.output_shape, &.{last_axis});
+            const centered = try b.sub(adj, dot_bc);
+            try accumulate(b, adjoints, ins[0], try b.mul(y, centered));
         },
 
         .abs => {

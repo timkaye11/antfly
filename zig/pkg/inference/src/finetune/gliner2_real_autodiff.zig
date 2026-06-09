@@ -88,6 +88,11 @@ pub const GlinerObjective = enum {
     /// First graph-native span objective: gather the span start token hidden
     /// state and score entity labels directly over candidate spans.
     span_start,
+    /// Upstream GLiNER2 total-loss objective. This currently reuses the
+    /// schema-conditioned span-start graph path; classification/count loss
+    /// components are exposed as an explicit parity gap in the harness until
+    /// their graph-native targets are available.
+    gliner2_total_loss,
 };
 
 pub const SpanStartLossKind = enum {
@@ -143,7 +148,17 @@ pub const GlinerAutodiffCtx = struct {
     span_debug_end_hidden: ?NodeId = null,
     span_debug_projected_span: ?NodeId = null,
     span_debug_schema_hidden: ?NodeId = null,
+    span_debug_count_gru_state: ?NodeId = null,
+    span_debug_count_state: ?NodeId = null,
+    span_debug_count_in_project: ?NodeId = null,
+    span_debug_count_layer0: ?NodeId = null,
+    span_debug_count_layer1: ?NodeId = null,
+    span_debug_count_out0: ?NodeId = null,
+    span_debug_count_out2: ?NodeId = null,
     span_debug_schema_projection: ?NodeId = null,
+    gliner2_structure_loss: ?NodeId = null,
+    gliner2_classification_loss: ?NodeId = null,
+    gliner2_count_loss: ?NodeId = null,
     graph_batch: u32 = 0,
     graph_seq_len: u32 = 0,
 
@@ -263,7 +278,17 @@ pub const GlinerAutodiffCtx = struct {
         if (self.span_debug_end_hidden) |node_id| self.span_debug_end_hidden = id_map[node_id];
         if (self.span_debug_projected_span) |node_id| self.span_debug_projected_span = id_map[node_id];
         if (self.span_debug_schema_hidden) |node_id| self.span_debug_schema_hidden = id_map[node_id];
+        if (self.span_debug_count_gru_state) |node_id| self.span_debug_count_gru_state = id_map[node_id];
+        if (self.span_debug_count_state) |node_id| self.span_debug_count_state = id_map[node_id];
+        if (self.span_debug_count_in_project) |node_id| self.span_debug_count_in_project = id_map[node_id];
+        if (self.span_debug_count_layer0) |node_id| self.span_debug_count_layer0 = id_map[node_id];
+        if (self.span_debug_count_layer1) |node_id| self.span_debug_count_layer1 = id_map[node_id];
+        if (self.span_debug_count_out0) |node_id| self.span_debug_count_out0 = id_map[node_id];
+        if (self.span_debug_count_out2) |node_id| self.span_debug_count_out2 = id_map[node_id];
         if (self.span_debug_schema_projection) |node_id| self.span_debug_schema_projection = id_map[node_id];
+        if (self.gliner2_structure_loss) |node_id| self.gliner2_structure_loss = id_map[node_id];
+        if (self.gliner2_classification_loss) |node_id| self.gliner2_classification_loss = id_map[node_id];
+        if (self.gliner2_count_loss) |node_id| self.gliner2_count_loss = id_map[node_id];
     }
 
     /// Task head + scalar loss. Token classification only — GLiNER2 does
@@ -278,6 +303,7 @@ pub const GlinerAutodiffCtx = struct {
         return switch (self.config.objective) {
             .token => self.buildTokenLoss(bld, forward_output, targets),
             .span_start => self.buildSpanStartLoss(bld, forward_output, targets),
+            .gliner2_total_loss => self.buildGliner2TotalLoss(bld, forward_output, targets),
         };
     }
 
@@ -464,6 +490,12 @@ pub const GlinerAutodiffCtx = struct {
                 Shape.init(.f32, &.{ @intCast(compact_schema_rows), @intCast(H) }),
             );
             self.span_debug_schema_hidden = schema_hidden;
+            const compact_active_mask_2d = try bld.gather(
+                mask,
+                first_span_rows_i64,
+                Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }),
+            );
+            const compact_active_mask = try bld.reshape(compact_active_mask_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
             const count_state_idx_i64 = if (has_schema_count_idx) count_idx: {
                 const count_idx_2d = try bld.sliceLastDim(targets, @intCast(count_idx_offset), @intCast(count_idx_offset + E));
                 const compact_count_idx_2d = try bld.gather(
@@ -474,7 +506,15 @@ pub const GlinerAutodiffCtx = struct {
                 const count_idx_f32 = try bld.reshape(compact_count_idx_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
                 break :count_idx try bld.convertDtype(count_idx_f32, .i64);
             } else null;
-            const compact_schema_projection = try buildParityCountEmbed(bld, schema_hidden, count_state_idx_i64, compact_schema_rows, H);
+            var count_debug_nodes: CountEmbedDebugNodes = .{};
+            const compact_schema_projection = try buildParityCountEmbed(bld, schema_hidden, count_state_idx_i64, compact_active_mask, compact_schema_rows, E, H, &count_debug_nodes);
+            self.span_debug_count_gru_state = count_debug_nodes.gru_state;
+            self.span_debug_count_state = count_debug_nodes.count_state;
+            self.span_debug_count_in_project = count_debug_nodes.in_project;
+            self.span_debug_count_layer0 = count_debug_nodes.layer0;
+            self.span_debug_count_layer1 = count_debug_nodes.layer1;
+            self.span_debug_count_out0 = count_debug_nodes.out0;
+            self.span_debug_count_out2 = count_debug_nodes.out2;
             self.span_debug_schema_projection = compact_schema_projection;
 
             const schema_repeat_rows_buf = try bld.graph.allocator.alloc(f32, span_rows * E);
@@ -507,6 +547,7 @@ pub const GlinerAutodiffCtx = struct {
             const span_schema_product = try bld.mul(repeated_span, schema_projection);
             const span_schema_score_flat = try bld.reduceSum(span_schema_product, &.{1});
             const schema_logits = try bld.reshape(span_schema_score_flat, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(E) }));
+            if (self.config.objective == .gliner2_total_loss) break :blk schema_logits;
             const aux_scalar = try buildSchemaObjectiveAuxiliaryZeroScalar(bld, projected_span, span_rows, H, C);
             break :blk try bld.add(schema_logits, aux_scalar);
         } else blk: {
@@ -549,6 +590,109 @@ pub const GlinerAutodiffCtx = struct {
             ),
         };
     }
+
+    fn buildGliner2TotalLoss(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+    ) !NodeId {
+        const C: u32 = self.config.num_classes;
+        if (C < 2) return error.InvalidGlinerClassCount;
+        const E: u32 = C - 1;
+        const target_shape = bld.graph.node(targets).output_shape;
+        if (target_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
+        const expected_width: i64 = @intCast(gliner2TotalLossTargetWidth(@intCast(E)));
+        if (target_shape.dim(1) != expected_width) return error.InvalidGlinerSpanTargetShape;
+
+        const span_width: i64 = @intCast(spanStartTargetWidth(@intCast(E)));
+        const structure_targets = try bld.sliceLastDim(targets, 0, span_width);
+        const structure_loss = try self.buildSpanStartLoss(bld, hidden, structure_targets);
+        const classification_loss = try self.buildGliner2ClassificationLoss(bld, hidden, targets);
+        const count_loss = try self.buildGliner2CountLoss(bld, hidden, targets);
+        self.gliner2_structure_loss = structure_loss;
+        self.gliner2_classification_loss = classification_loss;
+        self.gliner2_count_loss = count_loss;
+        return bld.add(try bld.add(structure_loss, classification_loss), count_loss);
+    }
+
+    fn buildGliner2ClassificationLoss(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+    ) !NodeId {
+        const C: u32 = self.config.num_classes;
+        const E: u32 = C - 1;
+        const H: u32 = self.config.graph_config.hidden_size;
+        const target_shape = bld.graph.node(targets).output_shape;
+        const rows: u32 = @intCast(target_shape.dim(0));
+        const labels_offset: i64 = @intCast(gliner2TotalLossClassificationLabelsOffset(@intCast(E)));
+        const mask_offset: i64 = @intCast(gliner2TotalLossClassificationMaskOffset(@intCast(E)));
+        const schema_idx_offset: i64 = @intCast(2 * E);
+
+        const hidden_flat = try flattenHiddenForLoss(bld, hidden, H);
+        const schema_idx_2d = try bld.sliceLastDim(targets, schema_idx_offset, schema_idx_offset + @as(i64, @intCast(E)));
+        const schema_idx_f32 = try bld.reshape(schema_idx_2d, Shape.init(.f32, &.{@intCast(rows * E)}));
+        const schema_idx_i64 = try bld.convertDtype(schema_idx_f32, .i64);
+        const schema_hidden = try bld.gather(
+            hidden_flat,
+            schema_idx_i64,
+            Shape.init(.f32, &.{ @intCast(rows * E), @intCast(H) }),
+        );
+        const classifier_0 = try linearNamed(bld, schema_hidden, "classifier.0.weight", "classifier.0.bias", rows * E, H, H * 2);
+        const classifier_act = try bld.relu(classifier_0);
+        const classifier_logits_flat = try linearNamed(bld, classifier_act, "classifier.2.weight", "classifier.2.bias", rows * E, H * 2, 1);
+        const classifier_logits = try bld.reshape(classifier_logits_flat, Shape.init(.f32, &.{ @intCast(rows), @intCast(E) }));
+        const labels = try bld.sliceLastDim(targets, labels_offset, labels_offset + @as(i64, @intCast(E)));
+        const mask = try bld.sliceLastDim(targets, mask_offset, mask_offset + @as(i64, @intCast(E)));
+        return buildMaskedSpanStartBceLoss(
+            bld,
+            classifier_logits,
+            labels,
+            mask,
+            null,
+            1.0,
+            1.0,
+            .sum,
+        );
+    }
+
+    fn buildGliner2CountLoss(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+    ) !NodeId {
+        const C: u32 = self.config.num_classes;
+        const E: u32 = C - 1;
+        const H: u32 = self.config.graph_config.hidden_size;
+        const target_shape = bld.graph.node(targets).output_shape;
+        const rows: u32 = @intCast(target_shape.dim(0));
+        const count_labels_offset: i64 = @intCast(gliner2TotalLossCountLabelsOffset(@intCast(E)));
+        const count_mask_offset: i64 = @intCast(gliner2TotalLossCountMaskOffset(@intCast(E)));
+        const parent_idx_offset: i64 = @intCast(gliner2TotalLossParentIndexOffset(@intCast(E)));
+
+        const hidden_flat = try flattenHiddenForLoss(bld, hidden, H);
+        const parent_idx_2d = try bld.sliceLastDim(targets, parent_idx_offset, parent_idx_offset + 1);
+        const parent_idx_f32 = try bld.reshape(parent_idx_2d, Shape.init(.f32, &.{@intCast(rows)}));
+        const parent_idx_i64 = try bld.convertDtype(parent_idx_f32, .i64);
+        const parent_hidden = try bld.gather(
+            hidden_flat,
+            parent_idx_i64,
+            Shape.init(.f32, &.{ @intCast(rows), @intCast(H) }),
+        );
+        const count_pred_0 = try linearNamed(bld, parent_hidden, "count_pred.0.weight", "count_pred.0.bias", rows, H, H * 2);
+        const count_pred_act = try bld.relu(count_pred_0);
+        const count_logits = try linearNamed(bld, count_pred_act, "count_pred.2.weight", "count_pred.2.bias", rows, H * 2, 20);
+        const log_probs = try bld.logSoftmax(count_logits);
+        const count_labels = try bld.sliceLastDim(targets, count_labels_offset, count_labels_offset + 20);
+        const count_mask = try bld.sliceLastDim(targets, count_mask_offset, count_mask_offset + 1);
+        const weighted = try bld.mul(count_labels, log_probs);
+        const per_row = try bld.reduceSum(weighted, &.{1});
+        const masked = try bld.mul(per_row, count_mask);
+        return bld.neg(try bld.reduceSum(masked, &.{ 0, 1 }));
+    }
 };
 
 fn buildParitySpanProjection(
@@ -582,21 +726,47 @@ fn buildParityAuxiliaryHeads(
     hidden_size: u32,
 ) !NodeId {
     const classifier_mid: u32 = hidden_size * 2;
-    const classifier_0 = try linearNoBiasNamed(bld, hidden, "classifier.0.weight", rows, hidden_size, classifier_mid);
-    const classifier_act = try bld.gelu(classifier_0);
-    const classifier_scalar = try linearNoBiasNamed(bld, classifier_act, "classifier.2.weight", rows, classifier_mid, 1);
+    const classifier_0 = try linearNamed(bld, hidden, "classifier.0.weight", "classifier.0.bias", rows, hidden_size, classifier_mid);
+    const classifier_act = try bld.relu(classifier_0);
+    const classifier_scalar = try linearNamed(bld, classifier_act, "classifier.2.weight", "classifier.2.bias", rows, classifier_mid, 1);
 
-    const count_pred_0 = try linearNoBiasNamed(bld, hidden, "count_pred.0.weight", rows, hidden_size, classifier_mid);
-    const count_pred_act = try bld.gelu(count_pred_0);
-    const count_pred = try linearNoBiasNamed(bld, count_pred_act, "count_pred.2.weight", rows, classifier_mid, 20);
+    const count_pred_0 = try linearNamed(bld, hidden, "count_pred.0.weight", "count_pred.0.bias", rows, hidden_size, classifier_mid);
+    const count_pred_act = try bld.relu(count_pred_0);
+    const count_pred = try linearNamed(bld, count_pred_act, "count_pred.2.weight", "count_pred.2.bias", rows, classifier_mid, 20);
     const count_pred_sum = try bld.reduceSum(count_pred, &.{ 0, 1 });
 
-    const count_embed = try buildParityCountEmbed(bld, hidden, null, rows, hidden_size);
+    const count_embed = try buildParityCountEmbed(bld, hidden, null, null, rows, rows, hidden_size, null);
     const count_embed_sum = try bld.reduceSum(count_embed, &.{ 0, 1 });
     const classifier_sum = try bld.reduceSum(classifier_scalar, &.{ 0, 1 });
     const aux_sum = try bld.add(try bld.add(classifier_sum, count_pred_sum), count_embed_sum);
     const zero = try bld.scalarConst(.f32, 0.0);
     return bld.mul(aux_sum, zero);
+}
+
+fn flattenHiddenForLoss(bld: *Builder, hidden: NodeId, hidden_size: u32) !NodeId {
+    const hidden_shape = bld.graph.node(hidden).output_shape;
+    if (hidden_shape.rank() == 2) return hidden;
+    if (hidden_shape.rank() != 3) return error.InvalidGlinerHiddenShape;
+    const rows: i64 = hidden_shape.dim(0) * hidden_shape.dim(1);
+    return bld.reshape(hidden, Shape.init(.f32, &.{ rows, @intCast(hidden_size) }));
+}
+
+fn broadcastInDim(
+    bld: *Builder,
+    input: NodeId,
+    target_shape: Shape,
+    axes: []const u8,
+) !NodeId {
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = target_shape };
+    if (axes.len > attrs.broadcast_axes.len) return error.InvalidTensorShape;
+    for (axes, 0..) |axis, idx| attrs.broadcast_axes[idx] = axis;
+    attrs.num_axes = @intCast(axes.len);
+    return bld.graph.addNode(.{
+        .op = .{ .broadcast_in_dim = attrs },
+        .output_shape = target_shape,
+        .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 1,
+    });
 }
 
 fn buildSchemaObjectiveAuxiliaryZeroScalar(
@@ -617,13 +787,13 @@ fn buildSchemaObjectiveAuxiliaryZeroScalar(
     );
     const task_head = try bld.linear(hidden, task_head_w, task_head_b, rows, hidden_size, num_classes);
 
-    const classifier_0 = try linearNoBiasNamed(bld, hidden, "classifier.0.weight", rows, hidden_size, classifier_mid);
-    const classifier_act = try bld.gelu(classifier_0);
-    const classifier_scalar = try linearNoBiasNamed(bld, classifier_act, "classifier.2.weight", rows, classifier_mid, 1);
+    const classifier_0 = try linearNamed(bld, hidden, "classifier.0.weight", "classifier.0.bias", rows, hidden_size, classifier_mid);
+    const classifier_act = try bld.relu(classifier_0);
+    const classifier_scalar = try linearNamed(bld, classifier_act, "classifier.2.weight", "classifier.2.bias", rows, classifier_mid, 1);
 
-    const count_pred_0 = try linearNoBiasNamed(bld, hidden, "count_pred.0.weight", rows, hidden_size, classifier_mid);
-    const count_pred_act = try bld.gelu(count_pred_0);
-    const count_pred = try linearNoBiasNamed(bld, count_pred_act, "count_pred.2.weight", rows, classifier_mid, 20);
+    const count_pred_0 = try linearNamed(bld, hidden, "count_pred.0.weight", "count_pred.0.bias", rows, hidden_size, classifier_mid);
+    const count_pred_act = try bld.relu(count_pred_0);
+    const count_pred = try linearNamed(bld, count_pred_act, "count_pred.2.weight", "count_pred.2.bias", rows, classifier_mid, 20);
 
     const task_head_sum = try bld.reduceSum(task_head, &.{ 0, 1 });
     const classifier_sum = try bld.reduceSum(classifier_scalar, &.{ 0, 1 });
@@ -633,12 +803,25 @@ fn buildSchemaObjectiveAuxiliaryZeroScalar(
     return bld.mul(aux_sum, zero);
 }
 
+const CountEmbedDebugNodes = struct {
+    gru_state: ?NodeId = null,
+    count_state: ?NodeId = null,
+    in_project: ?NodeId = null,
+    layer0: ?NodeId = null,
+    layer1: ?NodeId = null,
+    out0: ?NodeId = null,
+    out2: ?NodeId = null,
+};
+
 fn buildParityCountEmbed(
     bld: *Builder,
     hidden: NodeId,
     count_state_indices: ?NodeId,
+    active_schema_mask: ?NodeId,
     rows: u32,
+    attention_seq_len: u32,
     hidden_size: u32,
+    debug_nodes: ?*CountEmbedDebugNodes,
 ) !NodeId {
     const count_dim: u32 = 128;
     const count_ff: u32 = 256;
@@ -646,25 +829,36 @@ fn buildParityCountEmbed(
     const count_state = try bld.add(gru_state, hidden);
     const in_project = try linearNamed(bld, count_state, "count_embed.transformer.in_projector.weight", "count_embed.transformer.in_projector.bias", rows, hidden_size, count_dim);
 
-    const layer0_out = try buildCountTransformerLayer(bld, in_project, rows, count_dim, count_ff, 0);
-    const layer1_out = try buildCountTransformerLayer(bld, layer0_out, rows, count_dim, count_ff, 1);
+    const layer0_out = try buildCountTransformerLayer(bld, in_project, active_schema_mask, rows, attention_seq_len, count_dim, count_ff, 0);
+    const layer1_out = try buildCountTransformerLayer(bld, layer0_out, active_schema_mask, rows, attention_seq_len, count_dim, count_ff, 1);
 
     const transformer_joined = try bld.concat(layer1_out, count_state, 1);
     const out0 = try bld.relu(try linearNamed(bld, transformer_joined, "count_embed.transformer.out_projector.0.weight", "count_embed.transformer.out_projector.0.bias", rows, count_dim + hidden_size, hidden_size));
     const out2 = try bld.relu(try linearNamed(bld, out0, "count_embed.transformer.out_projector.2.weight", "count_embed.transformer.out_projector.2.bias", rows, hidden_size, hidden_size));
+    if (debug_nodes) |nodes| {
+        nodes.gru_state = gru_state;
+        nodes.count_state = count_state;
+        nodes.in_project = in_project;
+        nodes.layer0 = layer0_out;
+        nodes.layer1 = layer1_out;
+        nodes.out0 = out0;
+        nodes.out2 = out2;
+    }
     return linearNamed(bld, out2, "count_embed.transformer.out_projector.4.weight", "count_embed.transformer.out_projector.4.bias", rows, hidden_size, hidden_size);
 }
 
 fn buildCountTransformerLayer(
     bld: *Builder,
     input: NodeId,
+    active_schema_mask: ?NodeId,
     rows: u32,
+    attention_seq_len: u32,
     hidden_size: u32,
     ff_size: u32,
     comptime layer: usize,
 ) !NodeId {
     const prefix = comptime std.fmt.comptimePrint("count_embed.transformer.transformer.layers.{d}", .{layer});
-    const attn_out = try buildCountSelfAttention(bld, input, rows, hidden_size, layer);
+    const attn_out = try buildCountSelfAttention(bld, input, active_schema_mask, rows, attention_seq_len, hidden_size, layer);
     const attn_resid = try bld.add(input, attn_out);
     const norm1 = try layerNormNamed(
         bld,
@@ -704,7 +898,9 @@ fn buildCountTransformerLayer(
 fn buildCountSelfAttention(
     bld: *Builder,
     input: NodeId,
+    active_schema_mask: ?NodeId,
     rows: u32,
+    attention_seq_len: u32,
     hidden_size: u32,
     comptime layer: usize,
 ) !NodeId {
@@ -721,7 +917,7 @@ fn buildCountSelfAttention(
     const q = try bld.sliceLastDim(qkv, 0, @intCast(hidden_size));
     const k = try bld.sliceLastDim(qkv, @intCast(hidden_size), @intCast(hidden_size * 2));
     const v = try bld.sliceLastDim(qkv, @intCast(hidden_size * 2), @intCast(hidden_size * 3));
-    const context = try buildCountScaledDotProductAttention(bld, q, k, v, rows, hidden_size, 4);
+    const context = try buildCountScaledDotProductAttention(bld, q, k, v, active_schema_mask, rows, attention_seq_len, hidden_size, 4);
     return linearNamed(
         bld,
         context,
@@ -738,30 +934,48 @@ fn buildCountScaledDotProductAttention(
     q: NodeId,
     k: NodeId,
     v: NodeId,
+    active_schema_mask: ?NodeId,
     rows: u32,
+    attention_seq_len: u32,
     hidden_size: u32,
     num_heads: u32,
 ) !NodeId {
+    if (attention_seq_len == 0 or @mod(rows, attention_seq_len) != 0) return error.InvalidGlinerSpanTargetShape;
+    const batch = rows / attention_seq_len;
     const head_dim = hidden_size / num_heads;
-    const q_heads = try bld.transpose(
-        try bld.reshape(q, Shape.init(.f32, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) })),
-        &.{ 1, 0, 2 },
-    );
-    const k_heads = try bld.transpose(
-        try bld.reshape(k, Shape.init(.f32, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) })),
-        &.{ 1, 2, 0 },
-    );
-    const v_heads = try bld.transpose(
-        try bld.reshape(v, Shape.init(.f32, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) })),
-        &.{ 1, 0, 2 },
-    );
-    const scores = try bld.matmul3D(q_heads, k_heads);
+    const q_bsnh = try bld.reshape(q, Shape.init(.f32, &.{ @intCast(batch), @intCast(attention_seq_len), @intCast(num_heads), @intCast(head_dim) }));
+    const k_bsnh = try bld.reshape(k, Shape.init(.f32, &.{ @intCast(batch), @intCast(attention_seq_len), @intCast(num_heads), @intCast(head_dim) }));
+    const v_bsnh = try bld.reshape(v, Shape.init(.f32, &.{ @intCast(batch), @intCast(attention_seq_len), @intCast(num_heads), @intCast(head_dim) }));
+    const q_bnsh = try bld.transpose(q_bsnh, &.{ 0, 2, 1, 3 });
+    const k_bnsh = try bld.transpose(k_bsnh, &.{ 0, 2, 1, 3 });
+    const v_bnsh = try bld.transpose(v_bsnh, &.{ 0, 2, 1, 3 });
+    const q_bhsd = try bld.reshape(q_bnsh, Shape.init(.f32, &.{ @intCast(batch * num_heads), @intCast(attention_seq_len), @intCast(head_dim) }));
+    const k_bhsd = try bld.reshape(k_bnsh, Shape.init(.f32, &.{ @intCast(batch * num_heads), @intCast(attention_seq_len), @intCast(head_dim) }));
+    const v_bhsd = try bld.reshape(v_bnsh, Shape.init(.f32, &.{ @intCast(batch * num_heads), @intCast(attention_seq_len), @intCast(head_dim) }));
+    const k_t = try bld.transpose(k_bhsd, &.{ 0, 2, 1 });
+    const scores = try bld.matmul3D(q_bhsd, k_t);
     const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))));
-    const scaled_scores = try bld.mul(scores, scale);
+    var scaled_scores = try bld.mul(scores, scale);
+    if (active_schema_mask) |mask| {
+        const mask_be = try bld.reshape(mask, Shape.init(.f32, &.{ @intCast(batch), @intCast(attention_seq_len) }));
+        const mask_bhss = try broadcastInDim(
+            bld,
+            mask_be,
+            Shape.init(.f32, &.{ @intCast(batch), @intCast(num_heads), @intCast(attention_seq_len), @intCast(attention_seq_len) }),
+            &.{ 0, 3 },
+        );
+        const mask_bhs = try bld.reshape(mask_bhss, Shape.init(.f32, &.{ @intCast(batch * num_heads), @intCast(attention_seq_len), @intCast(attention_seq_len) }));
+        const one = try bld.scalarConst(.f32, 1.0);
+        const inactive = try bld.sub(one, mask_bhs);
+        const neg_large = try bld.scalarConst(.f32, -1.0e9);
+        const key_bias = try bld.mul(inactive, neg_large);
+        scaled_scores = try bld.add(scaled_scores, key_bias);
+    }
     const probs = try bld.softmax(scaled_scores);
-    const context_heads = try bld.matmul3D(probs, v_heads);
-    const context_rows_heads = try bld.transpose(context_heads, &.{ 1, 0, 2 });
-    return bld.reshape(context_rows_heads, Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden_size) }));
+    const context_bhsd = try bld.matmul3D(probs, v_bhsd);
+    const context_bnsh = try bld.reshape(context_bhsd, Shape.init(.f32, &.{ @intCast(batch), @intCast(num_heads), @intCast(attention_seq_len), @intCast(head_dim) }));
+    const context_bsnh = try bld.transpose(context_bnsh, &.{ 0, 2, 1, 3 });
+    return bld.reshape(context_bsnh, Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden_size) }));
 }
 
 fn buildCountLstmV2UnrolledState(
@@ -974,15 +1188,17 @@ fn buildMaskedSpanStartBceLoss(
     const pos_weight = label_positive_weights orelse try bld.scalarConst(.f32, positive_weight);
     const neg_weight = try bld.scalarConst(.f32, negative_weight);
 
-    const relu_logits = try bld.relu(logits);
-    const labels_logits = try bld.mul(labels, logits);
-    const abs_logits = try bld.absOp(logits);
+    const safe_logits = try bld.mul(logits, mask);
+    const safe_labels = try bld.mul(labels, mask);
+    const relu_logits = try bld.relu(safe_logits);
+    const labels_logits = try bld.mul(safe_labels, safe_logits);
+    const abs_logits = try bld.absOp(safe_logits);
     const neg_abs_logits = try bld.neg(abs_logits);
     const exp_neg_abs = try bld.expOp(neg_abs_logits);
     const log_term = try bld.logOp(try bld.add(one, exp_neg_abs));
     const bce = try bld.add(try bld.sub(relu_logits, labels_logits), log_term);
-    const inverse_labels = try bld.sub(one, labels);
-    const pos_term = try bld.mul(labels, pos_weight);
+    const inverse_labels = try bld.sub(one, safe_labels);
+    const pos_term = try bld.mul(safe_labels, pos_weight);
     const neg_term = try bld.mul(inverse_labels, neg_weight);
     const label_weights = try bld.add(pos_term, neg_term);
     const weighted_loss = try bld.mul(bce, label_weights);
@@ -1160,7 +1376,7 @@ pub fn spanStartLogitsForBatch(
 ) ![]f32 {
     const rows: usize = @intCast(batch * seq_len);
     if (input_ids.len != rows or attention_mask.len != rows) return error.InvalidGlinerBatchShape;
-    if (ctx.config.objective != .span_start) return error.InvalidGlinerObjective;
+    if (ctx.config.objective != .span_start and ctx.config.objective != .gliner2_total_loss) return error.InvalidGlinerObjective;
 
     const trainer_input = makeTrainerInput(
         ctx,
@@ -1247,11 +1463,148 @@ pub const SpanStartComponentDebug = struct {
     end_hidden_norm: f64,
     projected_span_norm: f64,
     schema_hidden_norm: f64,
+    count_gru_state_norm: f64,
+    count_state_norm: f64,
+    count_in_project_norm: f64,
+    count_layer0_norm: f64,
+    count_layer1_norm: f64,
+    count_out0_norm: f64,
+    count_out2_norm: f64,
     schema_projection_norm: f64,
     projected_schema_dot: f64,
     projected_span_mean: f64,
+    count_gru_state_mean: f64,
+    count_state_mean: f64,
+    count_in_project_mean: f64,
+    count_layer0_mean: f64,
+    count_layer1_mean: f64,
+    count_out0_mean: f64,
+    count_out2_mean: f64,
     schema_projection_mean: f64,
+    negative_row: usize,
+    negative_entity: usize,
+    negative_logit: f64,
+    negative_start_hidden_norm: f64,
+    negative_end_hidden_norm: f64,
+    negative_schema_hidden_norm: f64,
+    negative_projected_span_norm: f64,
+    negative_schema_projection_norm: f64,
+    negative_projected_schema_dot: f64,
+    negative_start_hidden_mean: f64,
+    negative_end_hidden_mean: f64,
+    negative_schema_hidden_mean: f64,
+    negative_projected_span_mean: f64,
+    negative_schema_projection_mean: f64,
 };
+
+pub const Gliner2TotalLossComponentDebug = struct {
+    classification_loss: f64,
+    structure_loss: f64,
+    count_loss: f64,
+    total_loss: f64,
+};
+
+pub fn gliner2TotalLossComponentDebugForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    targets: []const f32,
+    targets_shape: Shape,
+    batch: u32,
+    seq_len: u32,
+) !Gliner2TotalLossComponentDebug {
+    if (ctx.config.objective != .gliner2_total_loss) return error.InvalidGlinerObjective;
+    if (ctx.config.num_classes < 2) return error.InvalidGlinerClassCount;
+    if (targets_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
+    const rows: usize = @intCast(targets_shape.dim(0));
+    const target_width: usize = @intCast(targets_shape.dim(1));
+    if (targets.len != rows * target_width) return error.InvalidGlinerSpanTargetShape;
+    const E: usize = @intCast(ctx.config.num_classes - 1);
+    const expected_width = gliner2TotalLossTargetWidth(E);
+    if (target_width != expected_width) return error.InvalidGlinerSpanTargetShape;
+
+    const structure_mask_mass = sumPackedTargetColumns(targets, rows, target_width, E, E);
+    const classification_mask_mass = sumPackedTargetColumns(
+        targets,
+        rows,
+        target_width,
+        gliner2TotalLossClassificationMaskOffset(E),
+        E,
+    );
+    const count_mask_mass = sumPackedTargetColumns(
+        targets,
+        rows,
+        target_width,
+        gliner2TotalLossCountMaskOffset(E),
+        1,
+    );
+
+    const trainer_input = makeTrainerInput(
+        ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        targets_shape,
+        batch,
+        seq_len,
+    );
+    try trainer.ensureGraphBuilt(trainer_input);
+
+    const structure_node = ctx.gliner2_structure_loss orelse return error.MissingGliner2StructureLossNode;
+    const classification_node = ctx.gliner2_classification_loss orelse return error.MissingGliner2ClassificationLossNode;
+    const count_node = ctx.gliner2_count_loss orelse return error.MissingGliner2CountLossNode;
+    const structure = if (structure_mask_mass > 0.0)
+        try evalScalarNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len, structure_node)
+    else
+        0.0;
+    const classification = if (classification_mask_mass > 0.0)
+        try evalScalarNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len, classification_node)
+    else
+        0.0;
+    const count = if (count_mask_mass > 0.0)
+        try evalScalarNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len, count_node)
+    else
+        0.0;
+    return .{
+        .classification_loss = classification,
+        .structure_loss = structure,
+        .count_loss = count,
+        .total_loss = classification + structure + count,
+    };
+}
+
+fn sumPackedTargetColumns(targets: []const f32, rows: usize, width: usize, start: usize, count: usize) f64 {
+    var total: f64 = 0.0;
+    if (start >= width) return total;
+    const end = @min(width, start + count);
+    for (0..rows) |row| {
+        const base = row * width;
+        for (start..end) |col| {
+            total += targets[base + col];
+        }
+    }
+    return total;
+}
+
+fn evalScalarNodeForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    targets: []const f32,
+    targets_shape: Shape,
+    batch: u32,
+    seq_len: u32,
+    output_node: NodeId,
+) !f64 {
+    const values = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len, output_node);
+    defer allocator.free(values);
+    if (values.len == 0) return error.InvalidTensorShape;
+    return @floatCast(values[0]);
+}
 
 pub fn spanStartComponentDebugForBatch(
     allocator: std.mem.Allocator,
@@ -1266,7 +1619,7 @@ pub fn spanStartComponentDebugForBatch(
     entity_types: usize,
 ) !SpanStartComponentDebug {
     if (entity_types == 0) return error.InvalidEntityTypes;
-    if (ctx.config.objective != .span_start) return error.InvalidGlinerObjective;
+    if (ctx.config.objective != .span_start and ctx.config.objective != .gliner2_total_loss) return error.InvalidGlinerObjective;
     if (span_targets_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
     const span_rows: usize = @intCast(span_targets_shape.dim(0));
     const target_width: usize = @intCast(span_targets_shape.dim(1));
@@ -1276,9 +1629,9 @@ pub fn spanStartComponentDebugForBatch(
     var positive_row: usize = 0;
     var positive_entity: usize = 0;
     var found_positive = false;
-    for (0..span_rows) |row_idx| {
-        const row = row_idx * target_width;
-        for (0..entity_types) |entity_idx| {
+    for (0..entity_types) |entity_idx| {
+        for (0..span_rows) |row_idx| {
+            const row = row_idx * target_width;
             if (span_targets[row + entity_idx] > 0.0) {
                 positive_row = row_idx;
                 positive_entity = entity_idx;
@@ -1297,6 +1650,17 @@ pub fn spanStartComponentDebugForBatch(
     const schema_row = sample_idx * entity_types + positive_entity;
     const H: usize = @intCast(ctx.config.graph_config.hidden_size);
 
+    const trainer_input = makeTrainerInput(
+        ctx,
+        input_ids,
+        attention_mask,
+        span_targets,
+        span_targets_shape,
+        batch,
+        seq_len,
+    );
+    try trainer.ensureGraphBuilt(trainer_input);
+
     const start_hidden = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_start_hidden orelse return error.MissingGlinerSpanLogitsNode);
     defer allocator.free(start_hidden);
     const end_hidden = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_end_hidden orelse return error.MissingGlinerSpanLogitsNode);
@@ -1305,13 +1669,60 @@ pub fn spanStartComponentDebugForBatch(
     defer allocator.free(projected_span);
     const schema_hidden = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_schema_hidden orelse return error.MissingGlinerSpanLogitsNode);
     defer allocator.free(schema_hidden);
+    const count_gru_state = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_gru_state orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_gru_state);
+    const count_state = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_state orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_state);
+    const count_in_project = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_in_project orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_in_project);
+    const count_layer0 = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_layer0 orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_layer0);
+    const count_layer1 = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_layer1 orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_layer1);
+    const count_out0 = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_out0 orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_out0);
+    const count_out2 = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_count_out2 orelse return error.MissingGlinerSpanLogitsNode);
+    defer allocator.free(count_out2);
     const schema_projection = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len, ctx.span_debug_schema_projection orelse return error.MissingGlinerSpanLogitsNode);
     defer allocator.free(schema_projection);
+    const logits = try spanStartLogitsForBatch(allocator, trainer, ctx, input_ids, attention_mask, span_targets, span_targets_shape, batch, seq_len);
+    defer allocator.free(logits);
 
     const span_offset = positive_row * H;
     const schema_offset = schema_row * H;
+    const count_offset = schema_row * 128;
     if (start_hidden.len < span_offset + H or end_hidden.len < span_offset + H or projected_span.len < span_offset + H) return error.InvalidTensorShape;
     if (schema_hidden.len < schema_offset + H or schema_projection.len < schema_offset + H) return error.InvalidTensorShape;
+    if (count_gru_state.len < schema_offset + H or count_state.len < schema_offset + H or count_out0.len < schema_offset + H or count_out2.len < schema_offset + H) return error.InvalidTensorShape;
+    if (count_in_project.len < count_offset + 128 or count_layer0.len < count_offset + 128 or count_layer1.len < count_offset + 128) return error.InvalidTensorShape;
+    if (logits.len != span_rows * entity_types) return error.InvalidGlinerSpanLogitsShape;
+
+    var negative_row: usize = 0;
+    var negative_entity: usize = 0;
+    var negative_logit: f64 = -std.math.inf(f64);
+    var found_negative = false;
+    for (0..span_rows) |row_idx| {
+        const target_row = row_idx * target_width;
+        const logit_row = row_idx * entity_types;
+        for (0..entity_types) |entity_idx| {
+            if (span_targets[target_row + entity_idx] > 0.0) continue;
+            if (span_targets[target_row + entity_types + entity_idx] <= 0.0) continue;
+            const logit: f64 = @floatCast(logits[logit_row + entity_idx]);
+            if (!found_negative or logit > negative_logit) {
+                negative_row = row_idx;
+                negative_entity = entity_idx;
+                negative_logit = logit;
+                found_negative = true;
+            }
+        }
+    }
+    if (!found_negative) return error.MissingPositiveSpanLabel;
+    const negative_sample_idx = negative_row / max_spans_per_sample;
+    const negative_schema_row = negative_sample_idx * entity_types + negative_entity;
+    const negative_span_offset = negative_row * H;
+    const negative_schema_offset = negative_schema_row * H;
+    if (start_hidden.len < negative_span_offset + H or end_hidden.len < negative_span_offset + H or projected_span.len < negative_span_offset + H) return error.InvalidTensorShape;
+    if (schema_hidden.len < negative_schema_offset + H or schema_projection.len < negative_schema_offset + H) return error.InvalidTensorShape;
 
     return .{
         .positive_row = positive_row,
@@ -1321,10 +1732,38 @@ pub fn spanStartComponentDebugForBatch(
         .end_hidden_norm = vectorNorm(end_hidden[span_offset .. span_offset + H]),
         .projected_span_norm = vectorNorm(projected_span[span_offset .. span_offset + H]),
         .schema_hidden_norm = vectorNorm(schema_hidden[schema_offset .. schema_offset + H]),
+        .count_gru_state_norm = vectorNorm(count_gru_state[schema_offset .. schema_offset + H]),
+        .count_state_norm = vectorNorm(count_state[schema_offset .. schema_offset + H]),
+        .count_in_project_norm = vectorNorm(count_in_project[count_offset .. count_offset + 128]),
+        .count_layer0_norm = vectorNorm(count_layer0[count_offset .. count_offset + 128]),
+        .count_layer1_norm = vectorNorm(count_layer1[count_offset .. count_offset + 128]),
+        .count_out0_norm = vectorNorm(count_out0[schema_offset .. schema_offset + H]),
+        .count_out2_norm = vectorNorm(count_out2[schema_offset .. schema_offset + H]),
         .schema_projection_norm = vectorNorm(schema_projection[schema_offset .. schema_offset + H]),
         .projected_schema_dot = vectorDot(projected_span[span_offset .. span_offset + H], schema_projection[schema_offset .. schema_offset + H]),
         .projected_span_mean = vectorMean(projected_span[span_offset .. span_offset + H]),
+        .count_gru_state_mean = vectorMean(count_gru_state[schema_offset .. schema_offset + H]),
+        .count_state_mean = vectorMean(count_state[schema_offset .. schema_offset + H]),
+        .count_in_project_mean = vectorMean(count_in_project[count_offset .. count_offset + 128]),
+        .count_layer0_mean = vectorMean(count_layer0[count_offset .. count_offset + 128]),
+        .count_layer1_mean = vectorMean(count_layer1[count_offset .. count_offset + 128]),
+        .count_out0_mean = vectorMean(count_out0[schema_offset .. schema_offset + H]),
+        .count_out2_mean = vectorMean(count_out2[schema_offset .. schema_offset + H]),
         .schema_projection_mean = vectorMean(schema_projection[schema_offset .. schema_offset + H]),
+        .negative_row = negative_row,
+        .negative_entity = negative_entity,
+        .negative_logit = negative_logit,
+        .negative_start_hidden_norm = vectorNorm(start_hidden[negative_span_offset .. negative_span_offset + H]),
+        .negative_end_hidden_norm = vectorNorm(end_hidden[negative_span_offset .. negative_span_offset + H]),
+        .negative_schema_hidden_norm = vectorNorm(schema_hidden[negative_schema_offset .. negative_schema_offset + H]),
+        .negative_projected_span_norm = vectorNorm(projected_span[negative_span_offset .. negative_span_offset + H]),
+        .negative_schema_projection_norm = vectorNorm(schema_projection[negative_schema_offset .. negative_schema_offset + H]),
+        .negative_projected_schema_dot = vectorDot(projected_span[negative_span_offset .. negative_span_offset + H], schema_projection[negative_schema_offset .. negative_schema_offset + H]),
+        .negative_start_hidden_mean = vectorMean(start_hidden[negative_span_offset .. negative_span_offset + H]),
+        .negative_end_hidden_mean = vectorMean(end_hidden[negative_span_offset .. negative_span_offset + H]),
+        .negative_schema_hidden_mean = vectorMean(schema_hidden[negative_schema_offset .. negative_schema_offset + H]),
+        .negative_projected_span_mean = vectorMean(projected_span[negative_span_offset .. negative_span_offset + H]),
+        .negative_schema_projection_mean = vectorMean(schema_projection[negative_schema_offset .. negative_schema_offset + H]),
     };
 }
 
@@ -1529,6 +1968,37 @@ pub fn spanStartTargetWidth(num_entity_types: usize) usize {
 /// row_repeat_indices[E], count_state_indices[E], start_token_index, end_token_index.
 pub fn weightedSpanStartTargetWidth(num_entity_types: usize) usize {
     return 6 * num_entity_types + 2;
+}
+
+pub fn gliner2TotalLossClassificationLabelsOffset(num_entity_types: usize) usize {
+    return spanStartTargetWidth(num_entity_types);
+}
+
+pub fn gliner2TotalLossClassificationMaskOffset(num_entity_types: usize) usize {
+    return gliner2TotalLossClassificationLabelsOffset(num_entity_types) + num_entity_types;
+}
+
+pub fn gliner2TotalLossCountLabelsOffset(num_entity_types: usize) usize {
+    return gliner2TotalLossClassificationMaskOffset(num_entity_types) + num_entity_types;
+}
+
+pub fn gliner2TotalLossCountMaskOffset(num_entity_types: usize) usize {
+    return gliner2TotalLossCountLabelsOffset(num_entity_types) + 20;
+}
+
+pub fn gliner2TotalLossParentIndexOffset(num_entity_types: usize) usize {
+    return gliner2TotalLossCountMaskOffset(num_entity_types) + 1;
+}
+
+pub fn gliner2TotalLossTargetWidth(num_entity_types: usize) usize {
+    return gliner2TotalLossParentIndexOffset(num_entity_types) + 1;
+}
+
+pub fn gliner2TotalLossTargetsShape(batch: u32, max_rows: u32, num_entity_types: u32) Shape {
+    return Shape.init(.f32, &.{
+        @intCast(batch * max_rows),
+        @intCast(gliner2TotalLossTargetWidth(@intCast(num_entity_types))),
+    });
 }
 
 /// Shape for packed span-start targets:

@@ -48,6 +48,7 @@ const Options = struct {
     lora_rank: []const u8 = "16",
     lora_alpha: []const u8 = "32",
     lora_dropout: []const u8 = "0.1",
+    lora_only_trainables: bool = true,
     objective: []const u8 = "span-start",
     max_span_width: []const u8 = "4",
     span_loss: []const u8 = "bce",
@@ -245,6 +246,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     try train_args_list.appendSlice(allocator, &train_args);
     if (opts.span_label_positive_weights) |value| try train_args_list.appendSlice(allocator, &.{ "--span-label-positive-weights", value });
     try train_args_list.appendSlice(allocator, &.{ "--span-negative-weight", opts.span_negative_weight });
+    if (opts.lora_only_trainables) try train_args_list.append(allocator, "--lora-only-trainables");
     if (opts.compiled_required) try train_args_list.append(allocator, "--compiled-required");
     try runCommand(init, allocator, "train-gliner2-autodiff", train_gliner2_autodiff.main, train_args_list.items);
 
@@ -269,6 +271,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
             "MLX (Apple Silicon)"
         else
             null,
+        .require_objective = opts.objective,
         .require_optimizer_backend = if (metal_required)
             "metal"
         else if (mlx_required)
@@ -520,6 +523,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\lora_rank: {s}
         \\lora_alpha: {s}
         \\lora_dropout: {s}
+        \\lora_only_trainables: {}
         \\span_loss: {s}
         \\span_positive_weight: {s}
         \\span_label_positive_weights: {?s}
@@ -554,6 +558,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.lora_rank,
         opts.lora_alpha,
         opts.lora_dropout,
+        opts.lora_only_trainables,
         opts.span_loss,
         opts.span_positive_weight,
         opts.span_label_positive_weights,
@@ -615,6 +620,10 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.lora_alpha = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--lora-dropout")) {
             opts.lora_dropout = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--lora-only-trainables")) {
+            opts.lora_only_trainables = true;
+        } else if (std.mem.eql(u8, arg, "--train-regular-head")) {
+            opts.lora_only_trainables = false;
         } else if (std.mem.eql(u8, arg, "--objective")) {
             opts.objective = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-span-width")) {
@@ -909,12 +918,18 @@ fn printUsage() void {
         \\  --min-entity-f1 FLOAT
         \\
         \\Common options:
-        \\  --objective token|span-start      Training/eval objective (default: span-start)
+        \\  --objective token|span-start|gliner2-total-loss
+        \\                                    Training/eval objective (default: span-start)
         \\  --epochs N                       Training epochs (default: 5)
         \\  --max-examples N                 Training cap (default: 100)
         \\  --seq-len N                      Sequence length (default: 256)
         \\  --batch-size N                   Batch size (default: 1)
         \\  --learning-rate FLOAT            Learning rate (default: 1e-3)
+        \\  --lora-rank N                    LoRA rank (default: 16)
+        \\  --lora-alpha FLOAT               LoRA alpha (default: 32)
+        \\  --lora-dropout FLOAT             LoRA dropout (default: 0.1)
+        \\  --lora-only-trainables           Freeze regular task-head params (default)
+        \\  --train-regular-head             Train regular task-head params too
         \\  --span-loss bce|mse              Span-start label loss (default: bce)
         \\  --span-positive-weight FLOAT     Positive span-label loss weight (default: 32)
         \\  --span-label-positive-weights CSV Per-label positive weights, e.g. person=32,organization=96
