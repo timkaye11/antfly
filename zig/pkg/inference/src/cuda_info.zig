@@ -22,6 +22,8 @@ const print = std.debug.print;
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const cuda_compute = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
 const cuda_kernels = if (build_options.enable_cuda) @import("ops/cuda/kernels.zig") else struct {};
+const cuda_buffer = if (build_options.enable_cuda) @import("ops/cuda/buffer.zig") else struct {};
+const cuda_cublaslt = if (build_options.enable_cuda) @import("ops/cuda/cublaslt.zig") else struct {};
 
 const NormRopeParityCase = struct {
     weight_name: []const u8,
@@ -119,6 +121,15 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: gemma4_primitives ok\n", .{});
+            const cublaslt_ok = smokeCublasLtBf16(allocator) catch |err| {
+                print("smoke: cublaslt_bf16 failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (cublaslt_ok) {
+                print("smoke: cublaslt_bf16 ok\n", .{});
+            } else {
+                print("smoke: cublaslt_bf16 skipped\n", .{});
+            }
         }
 
         if (gemma4_parity_path) |path| {
@@ -129,6 +140,54 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
             print("gemma4_parity: ok\n", .{});
         }
     }
+}
+
+fn smokeCublasLtBf16(allocator: std.mem.Allocator) !bool {
+    if (comptime !build_options.enable_cuda) return false;
+    var ctx = try cuda_context.CudaContext.initDefault();
+    defer ctx.deinit();
+    if (ctx.info.compute_major < 8) return false;
+
+    var module = try cuda_kernels.KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    var blas = cuda_cublaslt.CublasLt.open() catch return false;
+    defer blas.deinit();
+
+    const rows: usize = 2;
+    const in_dim: usize = 16;
+    const out_dim: usize = 16;
+    var input_data: [rows * in_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, i| value.* = @floatFromInt((i % 7) + 1);
+    var weight_data: [out_dim * in_dim]u16 = .{0} ** (out_dim * in_dim);
+    for (0..out_dim) |row| weight_data[row * in_dim + row] = bf16Bits(1.0);
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(&ctx, input_data.len * @sizeOf(f32));
+    defer input.free(&ctx);
+    var input_bf16 = try cuda_buffer.DeviceBuffer.alloc(&ctx, input_data.len * @sizeOf(u16));
+    defer input_bf16.free(&ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(&ctx, weight_data.len * @sizeOf(u16));
+    defer weight.free(&ctx);
+    var output = try cuda_buffer.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
+    defer output.free(&ctx);
+
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&input_data));
+    try weight.copyFromHost(&ctx, std.mem.sliceAsBytes(&weight_data));
+    try module.launchF32ToBf16(&ctx, input_bf16, input, input_data.len);
+    try blas.matmulBf16WeightF32Out(&ctx, output, input_bf16, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+
+    const actual = try allocator.alloc(f32, rows * out_dim);
+    defer allocator.free(actual);
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+    try ctx.synchronize();
+    for (actual, input_data) |got, expected| {
+        if (@abs(got - expected) > 0.0001) return error.CudaParityMismatch;
+    }
+    return true;
+}
+
+fn bf16Bits(value: f32) u16 {
+    return @intCast(@as(u32, @bitCast(value)) >> 16);
 }
 
 fn printUsage() void {

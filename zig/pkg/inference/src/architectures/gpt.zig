@@ -763,6 +763,10 @@ pub fn applyFinalLogitSoftcapInPlace(config: Config, logits: []f32) void {
     applyFinalLogitSoftcap(config, logits);
 }
 
+pub fn canUseFastGreedyArgmaxForConfig(config: Config) bool {
+    return config.final_logit_softcapping <= 0.0;
+}
+
 fn forwardGreedyLastTokenTensorFromEmbeddings(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -856,28 +860,31 @@ fn forwardGreedyLastTokenTensorFromFinalHidden(
         cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
     defer cb.free(lm_w);
 
-    if (try cb.linearNoBiasArgmaxLastRowTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_tensor| {
-        errdefer cb.free(token_tensor);
-        const ids = try cb.toFloat32(token_tensor, allocator);
-        defer allocator.free(ids);
-        if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
-        return .{
-            .token_id = @intFromFloat(ids[0]),
-            .token_tensor = token_tensor,
-        };
-    }
+    if (canUseFastGreedyArgmaxForConfig(config)) {
+        if (try cb.linearNoBiasArgmaxLastRowTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_tensor| {
+            errdefer cb.free(token_tensor);
+            const ids = try cb.toFloat32(token_tensor, allocator);
+            defer allocator.free(ids);
+            if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+            return .{
+                .token_id = @intFromFloat(ids[0]),
+                .token_tensor = token_tensor,
+            };
+        }
 
-    if (try cb.linearNoBiasArgmaxLastRow(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_id| {
-        return .{ .token_id = @intCast(token_id) };
+        if (try cb.linearNoBiasArgmaxLastRow(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_id| {
+            return .{ .token_id = @intCast(token_id) };
+        }
     }
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
     defer cb.free(logits);
     try maybeDebugTensor(cb, allocator, "lm_head", logits);
 
-    // Final logit softcapping is tanh-based and monotonic, so argmax is preserved.
-    if (try cb.argmaxLastRow(logits, hidden_result.total_rows, config.vocab_size)) |token_id| {
-        return .{ .token_id = @intCast(token_id) };
+    if (canUseFastGreedyArgmaxForConfig(config)) {
+        if (try cb.argmaxLastRow(logits, hidden_result.total_rows, config.vocab_size)) |token_id| {
+            return .{ .token_id = @intCast(token_id) };
+        }
     }
 
     const result = try cb.toFloat32(logits, allocator);
@@ -1151,7 +1158,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
+    prefetchGemmaCudaLayerWeights(cb, config, 0, 96);
+    prefetchGemmaCudaLayerWeights(cb, config, 1, 80);
     for (0..config.num_hidden_layers) |layer| {
+        prefetchGemmaCudaLayerWeights(cb, config, layer + 1, 96);
+        prefetchGemmaCudaLayerWeights(cb, config, layer + 2, 64);
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} start\n", .{layer});
         }
@@ -1366,7 +1377,11 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
+    prefetchGemmaCudaLayerWeights(cb, config, 0, 96);
+    prefetchGemmaCudaLayerWeights(cb, config, 1, 80);
     for (0..config.num_hidden_layers) |layer| {
+        prefetchGemmaCudaLayerWeights(cb, config, layer + 1, 96);
+        prefetchGemmaCudaLayerWeights(cb, config, layer + 2, 64);
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
         const new_hidden = try decoderBlock(
@@ -3503,8 +3518,7 @@ fn decoderBlock(
     // but the backend always computes attention as QK^T / sqrt(head_dim).
     // Pre-scale Q by sqrt(head_dim) to cancel the backend's division.
     const Q_for_attn = blk: {
-        if (config.global_head_dim == 0) break :blk Q_attn; // Not Gemma 4
-        if (config.position_encoding == .rope) break :blk Q_attn;
+        if (!shouldScaleGemma4QBeforeAttention(config, qk_already_roped)) break :blk Q_attn;
         const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
         if (try cb.multiplyScalar(Q_attn, scale)) |scaled| break :blk scaled;
         if (cb.vtable.reshape2d != null) {
@@ -3745,19 +3759,7 @@ fn decoderBlock(
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
 
                 var layer_result_output_scaled = false;
-                var layer_result = if (ple_vectors == null) scaled_residual_blk: {
-                    const output_scale = (try getLayerOutputScaleWeight(cb, config, layer)) orelse break :scaled_residual_blk try cb.add(combined_normed, sa_out);
-                    defer cb.free(output_scale);
-                    if (try cb.addMultiplyScalarTensor(combined_normed, sa_out, output_scale)) |fused| {
-                        layer_result_output_scaled = true;
-                        break :scaled_residual_blk fused;
-                    }
-                    const branch_scaled = try cb.multiply(combined_normed, output_scale);
-                    defer cb.free(branch_scaled);
-                    const scaled = try cb.add(branch_scaled, sa_out);
-                    layer_result_output_scaled = true;
-                    break :scaled_residual_blk scaled;
-                } else try cb.add(combined_normed, sa_out);
+                var layer_result = try cb.add(combined_normed, sa_out);
                 cb.free(sa_out);
 
                 if (config.hasPle()) {
@@ -3788,35 +3790,11 @@ fn decoderBlock(
             debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
             var layer_result_output_scaled = false;
-            const ffn_residual = if (ple_vectors == null) scaled_residual_blk: {
-                if (try getLayerOutputScaleWeight(cb, config, layer)) |output_scale| {
-                    defer cb.free(output_scale);
-                    if (try maybeGetGemmaFfnPostNormWeight(cb, allocator, config, layer, &name_buf)) |post_norm_w| {
-                        defer cb.free(post_norm_w);
-                        if (try cb.rmsNormAddMultiplyScalarTensor(ffn_out_raw, post_norm_w, sa_out, output_scale, hidden_size, config.norm_eps)) |fused| {
-                            layer_result_output_scaled = true;
-                            break :scaled_residual_blk fused;
-                        }
-                    }
-
-                    const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
-                    defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
-                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
-                    if (try cb.addMultiplyScalarTensor(ffn_out, sa_out, output_scale)) |fused| {
-                        layer_result_output_scaled = true;
-                        break :scaled_residual_blk fused;
-                    }
-                    const branch_scaled = try cb.multiply(ffn_out, output_scale);
-                    defer cb.free(branch_scaled);
-                    const scaled = try cb.add(branch_scaled, sa_out);
-                    layer_result_output_scaled = true;
-                    break :scaled_residual_blk scaled;
-                }
-
+            const ffn_residual = if (ple_vectors == null) residual_blk: {
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
-                break :scaled_residual_blk try cb.add(ffn_out, sa_out);
+                break :residual_blk try cb.add(ffn_out, sa_out);
             } else ple_residual_blk: {
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
@@ -4284,6 +4262,13 @@ fn applyFinalLogitSoftcap(config: Config, logits: []f32) void {
     for (logits) |*value| {
         value.* = std.math.tanh(value.* / softcap) * softcap;
     }
+}
+
+fn shouldScaleGemma4QBeforeAttention(config: Config, qk_already_roped: bool) bool {
+    if (config.global_head_dim == 0) return false;
+    if (qk_already_roped) return false;
+    if (config.position_encoding == .rope) return false;
+    return true;
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -6991,24 +6976,6 @@ fn applyGemmaFfnPostNorm(
     })) orelse hidden;
 }
 
-fn maybeGetGemmaFfnPostNormWeight(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    config: Config,
-    layer: usize,
-    buf: *[256]u8,
-) !?CT {
-    const name = std.fmt.bufPrint(buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong;
-    const base_w = getModelWeight(cb, config, name) catch |err| switch (err) {
-        error.MissingWeight, error.WeightNotFound => return null,
-        else => return err,
-    };
-    errdefer cb.free(base_w);
-    const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, config.hidden_size);
-    if (w != base_w) cb.free(base_w);
-    return w;
-}
-
 /// Gemma 4: post-norm for the shared expert FFN sublayer (post_ffw_norm_1).
 fn applyGemmaSharedFfnPostNorm(
     cb: *const ComputeBackend,
@@ -7341,7 +7308,7 @@ pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u
         var buf: [256]u8 = undefined;
         const prefixed = try maybePrefixedModelName(config, name, &buf);
         return cb.getWeight(prefixed) catch |err| switch (err) {
-            error.MissingWeight => getModelWeightUnprefixedFallback(cb, name),
+            error.MissingWeight, error.WeightNotFound => getModelWeightUnprefixedFallback(cb, name),
             else => err,
         };
     }
@@ -7422,6 +7389,40 @@ fn prefetchMoeExperts(cb: *const ComputeBackend, layer: usize, expert_indices: [
     }
 }
 
+fn prefetchGemmaCudaLayerWeights(cb: *const ComputeBackend, config: Config, layer: usize, hint: u32) void {
+    if (cb.kind() != .cuda or config.family != .gemma or layer >= config.num_hidden_layers) return;
+    var buf: [256]u8 = undefined;
+    prefetchFormattedModelWeight(cb, config, &buf, hint, "model.layers.{d}.input_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint, "model.layers.{d}.post_attention_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint / 2 + 1, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 4, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 4, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+    if (!config.layerOmitsVProj(layer)) {
+        prefetchFormattedModelWeight(cb, config, &buf, hint + 4, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+    }
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 2, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 3, "model.layers.{d}.mlp.gate_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 3, "model.layers.{d}.mlp.up_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 1, "model.layers.{d}.mlp.down_proj.weight", .{layer});
+}
+
+fn prefetchFormattedModelWeight(cb: *const ComputeBackend, config: Config, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
+    const name = std.fmt.bufPrint(buf, fmt, args) catch return;
+    if (config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model.")) {
+        var prefixed_buf: [256]u8 = undefined;
+        const prefixed = maybePrefixedModelName(config, name, &prefixed_buf) catch return;
+        cb.prefetchWeightHint(prefixed, hint);
+        return;
+    }
+    cb.prefetchWeightHint(name, hint);
+}
+
+fn prefetchFormattedWeight(cb: *const ComputeBackend, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
+    const name = std.fmt.bufPrint(buf, fmt, args) catch return;
+    cb.prefetchWeightHint(name, hint);
+}
+
 fn prefetchMoeExpertWeight(cb: *const ComputeBackend, layer: usize, expert_index: u32, proj: []const u8, hint: u32, buf: *[256]u8) void {
     const name = std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight", .{ layer, expert_index, proj }) catch return;
     cb.prefetchWeightHint(name, hint);
@@ -7459,8 +7460,6 @@ pub fn getLayerOutputScaleWeight(
     config: Config,
     layer: usize,
 ) !?CT {
-    if (config.family == .gemma and config.ple_hidden_size == 0) return null;
-
     var name_buf: [256]u8 = undefined;
     const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch return error.NameTooLong;
     return getModelWeight(cb, config, scale_name) catch |err| switch (err) {
@@ -7485,8 +7484,6 @@ pub fn applyLayerOutputScale(
     hidden_size: usize,
     layer: usize,
 ) !CT {
-    if (config.family == .gemma) return hidden;
-
     const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return hidden;
 
     if (cb.kind() == .graph) {
@@ -7781,6 +7778,38 @@ fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {
 }
 
 // --- Embedding weight helper ---
+
+test "gemma4 q attention scale is not duplicated for rope attention" {
+    const llama_cfg: Config = .{ .family = .llama };
+    try std.testing.expect(!shouldScaleGemma4QBeforeAttention(llama_cfg, false));
+
+    const gemma4_rope_cfg: Config = .{
+        .family = .gemma,
+        .position_encoding = .rope,
+        .global_head_dim = 512,
+    };
+    try std.testing.expect(!shouldScaleGemma4QBeforeAttention(gemma4_rope_cfg, false));
+
+    var gemma4_absolute_cfg = gemma4_rope_cfg;
+    gemma4_absolute_cfg.position_encoding = .absolute;
+    try std.testing.expect(shouldScaleGemma4QBeforeAttention(gemma4_absolute_cfg, false));
+    try std.testing.expect(!shouldScaleGemma4QBeforeAttention(gemma4_absolute_cfg, true));
+}
+
+test "final logit softcap disables pre-softcap greedy argmax fast paths" {
+    const uncapped: Config = .{};
+    try std.testing.expect(canUseFastGreedyArgmaxForConfig(uncapped));
+
+    const capped: Config = .{ .final_logit_softcapping = 30.0 };
+    try std.testing.expect(!canUseFastGreedyArgmaxForConfig(capped));
+
+    var logits = [_]f32{ 1.0e20, 2.0e20 };
+    try std.testing.expectEqual(@as(usize, 1), activations.argmax(&logits));
+    applyFinalLogitSoftcap(capped, &logits);
+    try std.testing.expectEqual(@as(f32, 30.0), logits[0]);
+    try std.testing.expectEqual(@as(f32, 30.0), logits[1]);
+    try std.testing.expectEqual(@as(usize, 0), activations.argmax(&logits));
+}
 
 test "selectTopExperts picks correct top-k from 8 experts" {
     const allocator = std.testing.allocator;

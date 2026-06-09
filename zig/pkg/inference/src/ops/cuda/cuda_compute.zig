@@ -18,8 +18,13 @@ const tensor_mod = @import("../../backends/tensor.zig");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const kernels_mod = @import("kernels.zig");
+const cublaslt_mod = @import("cublaslt.zig");
 const scratch_mod = @import("scratch.zig");
 const weight_source_mod = @import("../../models/weight_source.zig");
+const tensor_store_mod = @import("../../models/tensor_store.zig");
+const c_file = @import("../../util/c_file.zig");
+const native_compute_mod = @import("../native_compute.zig");
+const run_memory = @import("../../runtime/tier/memory.zig");
 const gguf_tensor_types = @import("../../gguf/tensor_types.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
@@ -45,6 +50,13 @@ pub const CapabilityProfile = enum {
     clipclap,
     gliner2,
     gemma4,
+};
+
+const DenseStreamEntry = struct {
+    name: []u8,
+    tensor: *CudaTensor,
+    byte_len: usize,
+    last_access: u64 = 0,
 };
 
 pub const RuntimeStats = struct {
@@ -129,6 +141,12 @@ pub const RuntimeStats = struct {
     qkv_fused_q4: usize = 0,
     qkv_fused_q4_q4_f32: usize = 0,
     qkv_fused_f32: usize = 0,
+    bf16_cublaslt_linear_calls: usize = 0,
+    bf16_cublaslt_qkv_calls: usize = 0,
+    bf16_cublaslt_activation_staging_calls: usize = 0,
+    bf16_cublaslt_fallbacks: usize = 0,
+    bf16_scalar_linear_calls: usize = 0,
+    bf16_scalar_qkv_calls: usize = 0,
     qkv_fallback_unsupported: usize = 0,
     qkv_kernel_unavailable: usize = 0,
     q4k_decode_fast_hits: usize = 0,
@@ -137,6 +155,41 @@ pub const RuntimeStats = struct {
     head_norm_rope_fused_fallbacks: usize = 0,
     mtp_masked_argmax_hits: usize = 0,
     mtp_masked_argmax_fallbacks: usize = 0,
+    lazy_prefetch_enqueues: usize = 0,
+    lazy_prefetch_duplicates: usize = 0,
+    lazy_prefetch_missing: usize = 0,
+    lazy_prefetch_cancelled_for_demand: usize = 0,
+    lazy_prefetch_drain_calls: usize = 0,
+    lazy_demand_loads: usize = 0,
+    lazy_host_prefetch_hits: usize = 0,
+    lazy_host_load_ns: u64 = 0,
+    lazy_host_page_touch_ns: u64 = 0,
+    lazy_upload_ns: u64 = 0,
+    lazy_uploaded_bytes: usize = 0,
+    ffn_stream_requests: usize = 0,
+    ffn_stream_hits: usize = 0,
+    ffn_stream_misses: usize = 0,
+    ffn_stream_fallbacks: usize = 0,
+    ffn_stream_evictions: usize = 0,
+    ffn_stream_read_ns: u64 = 0,
+    ffn_stream_h2d_ns: u64 = 0,
+    ffn_stream_read_bytes: usize = 0,
+    ffn_stream_uploaded_bytes: usize = 0,
+    ffn_stream_resident_bytes: usize = 0,
+    ffn_stream_fadvise_calls: usize = 0,
+    dense_stream_requests: usize = 0,
+    dense_stream_hits: usize = 0,
+    dense_stream_misses: usize = 0,
+    dense_stream_fallbacks: usize = 0,
+    dense_stream_evictions: usize = 0,
+    dense_stream_read_ns: u64 = 0,
+    dense_stream_h2d_ns: u64 = 0,
+    dense_stream_read_bytes: usize = 0,
+    dense_stream_uploaded_bytes: usize = 0,
+    dense_stream_resident_bytes: usize = 0,
+    dense_stream_fadvise_calls: usize = 0,
+    dense_stream_attention_loads: usize = 0,
+    dense_stream_mlp_loads: usize = 0,
 };
 
 fn noteTopTransferSize(sizes: *[RuntimeStats.top_transfer_size_count]usize, counts: *[RuntimeStats.top_transfer_size_count]usize, bytes: usize) void {
@@ -193,13 +246,29 @@ fn noteDownloadBucket(stats: *RuntimeStats, bytes: usize) void {
     }
 }
 
+fn elapsedNsSince(start_ns: u64) u64 {
+    const end_ns = platform.time.monotonicNs();
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
 pub const CudaCompute = struct {
     allocator: std.mem.Allocator,
     ctx: context_mod.CudaContext,
     kernels: kernels_mod.KernelModule,
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
+    lazy_host_store: ?*native_compute_mod.WeightStore = null,
+    lazy_device_epochs: std.StringHashMapUnmanaged(u64) = .{},
+    lazy_device_bytes: usize = 0,
+    lazy_device_budget_bytes: usize = 0,
+    lazy_access_epoch: u64 = 1,
+    run_budget: ?*run_memory.RunBudget = null,
+    dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
+    dense_stream_epoch: u64 = 1,
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
+    bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
+    cublaslt: ?cublaslt_mod.CublasLt = null,
     stats: RuntimeStats = .{},
     owned_by_backend: bool = false,
 
@@ -207,10 +276,16 @@ pub const CudaCompute = struct {
         var ctx = try context_mod.CudaContext.initDefault();
         errdefer ctx.deinit();
         const kernels = try kernels_mod.KernelModule.load(&ctx);
+        errdefer {
+            var kernels_mut = kernels;
+            kernels_mut.unload(&ctx);
+        }
+        const cublaslt = initCublasLtIfAvailable(&ctx);
         return .{
             .allocator = allocator,
             .ctx = ctx,
             .kernels = kernels,
+            .cublaslt = cublaslt,
         };
     }
 
@@ -223,6 +298,9 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        if (self.lazy_host_store) |store| {
+            native_compute_mod.stopPrefetchWorker(store);
+        }
         var it = self.resident_weights.iterator();
         while (it.next()) |entry| {
             var tensor = entry.value_ptr.*;
@@ -232,9 +310,18 @@ pub const CudaCompute = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.resident_weights.deinit(self.allocator);
+        var lazy_it = self.lazy_device_epochs.iterator();
+        while (lazy_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.lazy_device_epochs.deinit(self.allocator);
+        deinitDenseStreamCache(self);
         for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
         self.temp_buffers.deinit(self.allocator);
         self.temp_ids_masks.deinit(&self.ctx);
+        self.bf16_activation_scratch.deinit(&self.ctx);
+        if (self.cublaslt) |*blas| {
+            blas.deinit();
+            self.cublaslt = null;
+        }
         self.kernels.unload(&self.ctx);
         self.ctx.deinit();
     }
@@ -252,6 +339,7 @@ pub const CudaCompute = struct {
             .clipclap => self.kernels.hasClipClapPrimitives(),
             .gliner2 => self.kernels.hasGliner2Primitives(),
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
+                self.kernels.hasBf16WeightPrimitives() and
                 (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
         };
     }
@@ -268,6 +356,26 @@ pub const CudaCompute = struct {
             stats.temp_buffer_cached_bytes += buffer.len;
         }
         return stats;
+    }
+
+    pub fn attachLazyHostStore(self: *CudaCompute, store: *native_compute_mod.WeightStore) !void {
+        self.lazy_host_store = store;
+        try self.resident_weights.ensureTotalCapacity(
+            self.allocator,
+            self.resident_weights.count() + store.lazy_weights.count() + 16,
+        );
+        try installCudaLazyHostPrefetch(self, store);
+    }
+
+    pub fn configureRunBudget(self: *CudaCompute, run_budget: ?*run_memory.RunBudget) void {
+        self.run_budget = run_budget;
+        const default_lazy_budget: usize = 10 * 1024 * 1024 * 1024;
+        self.lazy_device_budget_bytes = if (run_budget) |budget| blk: {
+            const backend_limit = budget.limits.backend_limit_bytes;
+            if (backend_limit == 0) break :blk default_lazy_budget;
+            const reserved = budget.backend_kv_bytes + budget.backend_scratch_bytes;
+            break :blk if (backend_limit > reserved) backend_limit - reserved else 0;
+        } else default_lazy_budget;
     }
 
     fn noteDeviceBytes(self: *CudaCompute, bytes: usize) void {
@@ -323,8 +431,40 @@ pub const CudaCompute = struct {
             });
             return;
         }
-        if (loaded.quantized or loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
+        if (loaded.quantized) return error.UnsupportedTensorType;
+        if (loaded.tensor.dtype == .bf16 and loaded.tensor.shape.len >= 2) {
+            return self.insertBf16WeightFromTensor(owned_key, &loaded.tensor);
+        }
+        if (loaded.tensor.dtype != .f32) {
+            var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
+            defer converted.deinit();
+            return self.insertWeightFromTensor(owned_key, &converted);
+        }
         try self.insertWeightFromTensor(owned_key, &loaded.tensor);
+    }
+
+    pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        if (tensor.dtype != .bf16) return error.UnsupportedTensorType;
+        const elem_count = tensor.elementCount();
+        if (tensor.data.len != elem_count * @sizeOf(u16)) return error.InvalidShape;
+        const shape = try self.allocator.dupe(i64, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, tensor.data.len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, tensor.data);
+        try self.ctx.synchronize();
+        self.stats.resident_weight_bytes += tensor.data.len;
+        errdefer self.allocator.free(owned_key);
+        try self.resident_weights.put(self.allocator, owned_key, .{
+            .buffer = device,
+            .dtype = .bf16,
+            .shape = shape,
+            .elem_count = elem_count,
+            .quant_type = null,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
     }
 
     pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
@@ -515,6 +655,38 @@ fn cudaDequantizeQuantWeightsOnUpload() bool {
     return platform.env.getenvBoolDefault("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS", false);
 }
 
+fn cudaCublasLtEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT", true);
+}
+
+fn cudaFfnStreamEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_FFN_STREAM");
+}
+
+fn cudaFfnStreamProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_FFN_STREAM_PROFILE");
+}
+
+fn cudaDenseStreamEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_STREAM") or cudaFfnStreamEnabled();
+}
+
+fn cudaDenseStreamProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_PROFILE") or cudaFfnStreamProfileEnabled();
+}
+
+fn cudaDenseStreamBudgetBytes() usize {
+    const requested_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_BUDGET_MB") orelse 1536;
+    const budget_mb = @max(@as(usize, 512), requested_mb);
+    return budget_mb * 1024 * 1024;
+}
+
+fn initCublasLtIfAvailable(ctx: *const context_mod.CudaContext) ?cublaslt_mod.CublasLt {
+    if (!cudaCublasLtEnabled()) return null;
+    if (ctx.info.compute_major < 8) return null;
+    return cublaslt_mod.CublasLt.open() catch null;
+}
+
 fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
     // Matrix weights stay quantized for CUDA matmul kernels. Small affine
     // parameters are consumed by f32 norm/elementwise kernels, so upload them
@@ -576,6 +748,187 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
 }
 
+fn freeCudaTensorStorageUncached(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
+    if (cuda_tensor.owns_buffer and cuda_tensor.buffer.ptr != 0) {
+        self.stats.device_free_calls += 1;
+        cuda_tensor.buffer.free(&self.ctx);
+    }
+    if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
+}
+
+fn deinitDenseStreamCache(self: *CudaCompute) void {
+    for (self.dense_stream_entries.items) |*entry| {
+        freeCudaTensorStorageUncached(self, entry.tensor);
+        self.allocator.destroy(entry.tensor);
+        self.allocator.free(entry.name);
+    }
+    self.dense_stream_entries.deinit(self.allocator);
+    self.stats.ffn_stream_resident_bytes = 0;
+    self.stats.dense_stream_resident_bytes = 0;
+}
+
+fn isDenseFfnStreamWeightName(name: []const u8) bool {
+    if (std.mem.indexOf(u8, name, ".mlp.") == null) return false;
+    return std.mem.endsWith(u8, name, ".mlp.gate_proj.weight") or
+        std.mem.endsWith(u8, name, ".mlp.up_proj.weight") or
+        std.mem.endsWith(u8, name, ".mlp.down_proj.weight");
+}
+
+fn isDenseAttentionStreamWeightName(name: []const u8) bool {
+    if (std.mem.indexOf(u8, name, ".self_attn.") == null) return false;
+    return std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.k_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.v_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.o_proj.weight");
+}
+
+fn isDenseStreamWeightName(name: []const u8) bool {
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_STREAM")) {
+        return isDenseFfnStreamWeightName(name) or isDenseAttentionStreamWeightName(name);
+    }
+    return cudaFfnStreamEnabled() and isDenseFfnStreamWeightName(name);
+}
+
+fn findDenseStreamEntry(self: *CudaCompute, name: []const u8) ?*DenseStreamEntry {
+    for (self.dense_stream_entries.items) |*entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
+}
+
+fn evictOneDenseStreamEntry(self: *CudaCompute, protected_name: []const u8) !void {
+    var victim_index: ?usize = null;
+    var oldest_epoch: u64 = std.math.maxInt(u64);
+    for (self.dense_stream_entries.items, 0..) |*entry, index| {
+        if (std.mem.eql(u8, entry.name, protected_name)) continue;
+        if (entry.last_access < oldest_epoch) {
+            oldest_epoch = entry.last_access;
+            victim_index = index;
+        }
+    }
+    const index = victim_index orelse return error.MemoryBudgetExceeded;
+    try self.ctx.synchronize();
+    self.stats.stream_syncs += 1;
+    const entry = self.dense_stream_entries.orderedRemove(index);
+    const bytes = entry.byte_len;
+    freeCudaTensorStorageUncached(self, entry.tensor);
+    self.allocator.destroy(entry.tensor);
+    self.stats.ffn_stream_resident_bytes -|= bytes;
+    self.stats.dense_stream_resident_bytes -|= bytes;
+    self.stats.resident_weight_bytes -|= bytes;
+    self.stats.ffn_stream_evictions += 1;
+    self.stats.dense_stream_evictions += 1;
+    self.allocator.free(entry.name);
+}
+
+fn ensureDenseStreamBudgetForInsert(self: *CudaCompute, protected_name: []const u8, byte_len: usize) !void {
+    const budget = cudaDenseStreamBudgetBytes();
+    if (byte_len > budget) return error.MemoryBudgetExceeded;
+    while (self.stats.dense_stream_resident_bytes + byte_len > budget) {
+        try evictOneDenseStreamEntry(self, protected_name);
+    }
+}
+
+fn streamDenseWeightFromRange(self: *CudaCompute, name: []const u8, range: tensor_store_mod.TensorRangeRef) !*CudaTensor {
+    if (range.dtype != .bf16) return error.UnsupportedTensorType;
+    if (range.shape.len < 2) return error.InvalidShape;
+    if (range.byte_len == 0) return error.InvalidShape;
+    try ensureDenseStreamBudgetForInsert(self, name, range.byte_len);
+
+    self.stats.ffn_stream_fadvise_calls += 1;
+    self.stats.dense_stream_fadvise_calls += 1;
+    c_file.adviseFileRange(self.allocator, range.path, range.byte_offset, range.byte_len, .will_need);
+    const read_start = platform.time.monotonicNs();
+    const host = try self.allocator.alloc(u8, range.byte_len);
+    defer self.allocator.free(host);
+    try c_file.readRegionInto(self.allocator, range.path, range.byte_offset, host);
+    const read_ns = elapsedNsSince(read_start);
+    self.stats.ffn_stream_read_ns +|= read_ns;
+    self.stats.dense_stream_read_ns +|= read_ns;
+    self.stats.ffn_stream_read_bytes += host.len;
+    self.stats.dense_stream_read_bytes += host.len;
+
+    const shape = try self.allocator.dupe(i64, range.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, host.len);
+    errdefer device.free(&self.ctx);
+    const h2d_start = platform.time.monotonicNs();
+    try copyFromHostTracked(self, device, host);
+    try self.ctx.synchronize();
+    self.stats.upload_syncs += 1;
+    const h2d_ns = elapsedNsSince(h2d_start);
+    self.stats.ffn_stream_h2d_ns +|= h2d_ns;
+    self.stats.dense_stream_h2d_ns +|= h2d_ns;
+    self.stats.ffn_stream_uploaded_bytes += host.len;
+    self.stats.dense_stream_uploaded_bytes += host.len;
+    self.stats.ffn_stream_fadvise_calls += 1;
+    self.stats.dense_stream_fadvise_calls += 1;
+    c_file.adviseFileRange(self.allocator, range.path, range.byte_offset, range.byte_len, .dont_need);
+
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    const tensor = try self.allocator.create(CudaTensor);
+    errdefer self.allocator.destroy(tensor);
+    const elem_count = range.byte_len / @sizeOf(u16);
+    tensor.* = .{
+        .buffer = device,
+        .dtype = .bf16,
+        .shape = shape,
+        .elem_count = elem_count,
+        .quant_type = null,
+        .owns_buffer = true,
+        .owns_shape = true,
+        .owned_by_tensor = false,
+    };
+    self.dense_stream_epoch +|= 1;
+    try self.dense_stream_entries.append(self.allocator, .{
+        .name = owned_name,
+        .tensor = tensor,
+        .byte_len = host.len,
+        .last_access = self.dense_stream_epoch,
+    });
+    self.stats.ffn_stream_resident_bytes += host.len;
+    self.stats.dense_stream_resident_bytes += host.len;
+    self.stats.resident_weight_bytes += host.len;
+    if (isDenseAttentionStreamWeightName(name)) {
+        self.stats.dense_stream_attention_loads += 1;
+    } else if (isDenseFfnStreamWeightName(name)) {
+        self.stats.dense_stream_mlp_loads += 1;
+    }
+    if (cudaDenseStreamProfileEnabled()) {
+        std.log.info("cuda_dense_stream: loaded name={s} mb={d} read_ms={d} h2d_ms={d} entries={d} resident_mb={d}", .{
+            name,
+            host.len / (1024 * 1024),
+            read_ns / 1_000_000,
+            h2d_ns / 1_000_000,
+            self.dense_stream_entries.items.len,
+            self.stats.dense_stream_resident_bytes / (1024 * 1024),
+        });
+    }
+    return tensor;
+}
+
+fn getDenseStreamWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
+    if (!cudaDenseStreamEnabled()) return null;
+    if (!isDenseStreamWeightName(name)) return null;
+    const store = self.lazy_host_store orelse return null;
+    const tensor_store = store.tensor_store orelse return null;
+    self.stats.ffn_stream_requests += 1;
+    self.stats.dense_stream_requests += 1;
+    self.dense_stream_epoch +|= 1;
+    if (findDenseStreamEntry(self, name)) |entry| {
+        entry.last_access = self.dense_stream_epoch;
+        self.stats.ffn_stream_hits += 1;
+        self.stats.dense_stream_hits += 1;
+        return entry.tensor;
+    }
+    self.stats.ffn_stream_misses += 1;
+    self.stats.dense_stream_misses += 1;
+    var range = (try tensor_store.describeTensorRange(self.allocator, name)) orelse return null;
+    defer range.deinit(self.allocator);
+    return try streamDenseWeightFromRange(self, name, range);
+}
+
 fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
     try device.copyFromHost(&self.ctx, bytes);
     self.stats.h2d_bytes += bytes.len;
@@ -591,7 +944,152 @@ fn copyFromDeviceTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, sr
     self.stats.d2d_bytes += len;
 }
 
+fn stageBf16ActivationForCublasLt(
+    self: *CudaCompute,
+    input: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+) !?buffer_mod.DeviceBuffer {
+    if (!cudaCublasLtEnabled()) return null;
+    if (self.ctx.info.compute_major < 8) return null;
+    if (self.cublaslt == null) return null;
+    const count = try checkedMul(rows, in_dim);
+    const bytes = try checkedMul(count, @sizeOf(u16));
+    const scratch = self.bf16_activation_scratch.acquire(&self.ctx, bytes) catch return null;
+    self.kernels.launchF32ToBf16(&self.ctx, scratch, input, count) catch return null;
+    self.stats.bf16_cublaslt_activation_staging_calls += 1;
+    return scratch;
+}
+
+fn tryCublasLtBf16Linear(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    const input_bf16 = try stageBf16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
+    const blas = &(self.cublaslt orelse return false);
+    blas.matmulBf16WeightF32Out(&self.ctx, dst, input_bf16, weight, rows, in_dim, out_dim) catch return false;
+    self.stats.bf16_cublaslt_linear_calls += 1;
+    return true;
+}
+
+fn tryCublasLtBf16Qkv(
+    self: *CudaCompute,
+    dst_q: buffer_mod.DeviceBuffer,
+    dst_k: buffer_mod.DeviceBuffer,
+    dst_v: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight_q: buffer_mod.DeviceBuffer,
+    weight_k: buffer_mod.DeviceBuffer,
+    weight_v: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+) !bool {
+    const input_bf16 = try stageBf16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
+    const blas = &(self.cublaslt orelse return false);
+    blas.matmulBf16WeightF32Out(&self.ctx, dst_q, input_bf16, weight_q, rows, in_dim, q_out_dim) catch return false;
+    blas.matmulBf16WeightF32Out(&self.ctx, dst_k, input_bf16, weight_k, rows, in_dim, kv_out_dim) catch return false;
+    blas.matmulBf16WeightF32Out(&self.ctx, dst_v, input_bf16, weight_v, rows, in_dim, kv_out_dim) catch return false;
+    self.stats.bf16_cublaslt_qkv_calls += 1;
+    return true;
+}
+
 const max_temp_buffers = 256;
+
+fn cudaTempCacheBudgetBytes() usize {
+    const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB") orelse 1024;
+    return mb * 1024 * 1024;
+}
+
+fn disableCudaLazyHostPrefetchWorker() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_PREFETCH_WORKER");
+}
+
+fn installCudaLazyHostPrefetch(self: *CudaCompute, store: *native_compute_mod.WeightStore) !void {
+    if (store.prefetch_initialized) {
+        native_compute_mod.stopPrefetchWorker(store);
+        native_compute_mod.deinitPrefetchQueue(store);
+    }
+    store.prefetch = @TypeOf(store.prefetch).initWithPriorityUnlocked(
+        self.allocator,
+        self,
+        &cudaLazyHostPrefetchProcess,
+        &cudaLazyHostPrefetchPriority,
+    );
+    store.prefetch_initialized = true;
+    var lazy_it = store.lazy_weights.iterator();
+    while (lazy_it.next()) |entry| {
+        entry.value_ptr.guard = store.prefetch.mutexPtr();
+    }
+    if (store.lazy_weights.count() > 0 and !disableCudaLazyHostPrefetchWorker()) {
+        try native_compute_mod.startPrefetchWorker(store);
+    }
+}
+
+fn cudaLazyHostPrefetchProcess(ctx: *anyopaque, entry: *native_compute_mod.LazyWeightEntry) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const store = self.lazy_host_store orelse {
+        entry.pending_prefetch = false;
+        return;
+    };
+    var tensor_touch: []const u8 = &.{};
+    var quant_touch: []const u8 = &.{};
+    store.prefetch.lock();
+    entry.pending_prefetch = false;
+    native_compute_mod.ensureLazyWeightLoadedLocked(store, null, entry) catch {
+        store.prefetch.unlock();
+        return;
+    };
+    if (entry.loaded) |*loaded| {
+        if (!loaded.tensor.owns_data) {
+            tensor_touch = loaded.tensor.data;
+        }
+        if (loaded.quantized_storage) |*storage| {
+            if (!storage.raw_owned or storage.raw_mmap_backed) {
+                quant_touch = storage.raw_bytes;
+            }
+        }
+    }
+    store.prefetch.unlock();
+    touchBytesForPageCache(tensor_touch);
+    touchBytesForPageCache(quant_touch);
+    store.prefetch.lock();
+    defer store.prefetch.unlock();
+    if (store.shared_prefetch) |shared_prefetch| {
+        entry.prefetch_score = shared_prefetch.noteComplete(entry.tensor_ref.name) catch 0;
+    } else {
+        entry.prefetch_score = 0;
+    }
+}
+
+fn cudaLazyHostPrefetchPriority(entry: *native_compute_mod.LazyWeightEntry) u64 {
+    return entry.prefetch_score;
+}
+
+fn touchLoadedWeightPages(loaded: *const weight_source_mod.LoadedWeight) void {
+    touchBytesForPageCache(loaded.tensor.data);
+    if (loaded.quantized_storage) |storage| {
+        touchBytesForPageCache(storage.raw_bytes);
+    }
+}
+
+fn touchBytesForPageCache(bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    const page_size = 4096;
+    var checksum: u8 = 0;
+    var index: usize = 0;
+    while (index < bytes.len) : (index += page_size) {
+        checksum +%= bytes[index];
+    }
+    checksum +%= bytes[bytes.len - 1];
+    std.mem.doNotOptimizeAway(checksum);
+}
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
@@ -617,7 +1115,10 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
-    if (self.temp_buffers.items.len < max_temp_buffers) {
+    const cache_budget = cudaTempCacheBudgetBytes();
+    var cached_bytes: usize = 0;
+    for (self.temp_buffers.items) |cached| cached_bytes += cached.len;
+    if (self.temp_buffers.items.len < max_temp_buffers and buffer.len <= cache_budget and cached_bytes + buffer.len <= cache_budget) {
         self.temp_buffers.append(self.allocator, buffer.*) catch {
             self.stats.temp_buffer_evictions += 1;
             self.stats.device_free_calls += 1;
@@ -641,13 +1142,269 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     self.allocator.destroy(cuda_tensor);
 }
 
-fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
-    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    return self.resident_weights.getPtr(name) orelse error.WeightNotFound;
+fn cudaTensorDeviceBytes(tensor: *const CudaTensor) usize {
+    if (tensor.quant_type) |quant_type| {
+        const block_size = gguf_tensor_types.bytesPerBlock(quant_type) orelse return tensor.buffer.len;
+        const values_per_block = gguf_tensor_types.valuesPerBlock(quant_type) orelse return tensor.buffer.len;
+        return ((tensor.elem_count + values_per_block - 1) / values_per_block) * block_size;
+    }
+    return tensor.elem_count * tensor.dtype.byteSize();
 }
 
-fn prefetchWeightHint(_: *anyopaque, _: []const u8, _: u32) void {}
-fn drainPrefetchBudget(_: *anyopaque, _: usize) void {}
+fn noteLazyDeviceAccess(self: *CudaCompute, name: []const u8, bytes: usize) !void {
+    if (bytes == 0) return;
+    self.lazy_access_epoch +|= 1;
+    if (self.lazy_device_epochs.getPtr(name)) |epoch| {
+        epoch.* = self.lazy_access_epoch;
+        return;
+    }
+    const owned_key = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_key);
+    try self.lazy_device_epochs.put(self.allocator, owned_key, self.lazy_access_epoch);
+    self.lazy_device_bytes += bytes;
+}
+
+fn evictLazyDeviceWeightsToBudget(self: *CudaCompute, protected_name: []const u8) !void {
+    if (self.lazy_device_budget_bytes == 0) return;
+    const trace = cudaLazyTraceEnabled();
+    var synchronized = false;
+    while (self.lazy_device_bytes > self.lazy_device_budget_bytes) {
+        var oldest_name: ?[]const u8 = null;
+        var oldest_epoch: u64 = std.math.maxInt(u64);
+        var it = self.lazy_device_epochs.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.eql(u8, name, protected_name)) continue;
+            if (entry.value_ptr.* < oldest_epoch) {
+                oldest_epoch = entry.value_ptr.*;
+                oldest_name = name;
+            }
+        }
+        const victim_name = oldest_name orelse break;
+        if (trace) {
+            std.log.info("cuda_lazy_trace: evict_start victim={s} protected={s} lazy_device_mb={d} budget_mb={d}", .{
+                victim_name,
+                protected_name,
+                self.lazy_device_bytes / (1024 * 1024),
+                self.lazy_device_budget_bytes / (1024 * 1024),
+            });
+        }
+        if (!synchronized) {
+            try self.ctx.synchronize();
+            synchronized = true;
+        }
+        if (self.resident_weights.fetchRemove(victim_name)) |removed| {
+            var tensor = removed.value;
+            tensor.owns_buffer = true;
+            tensor.owns_shape = true;
+            const bytes = cudaTensorDeviceBytes(&tensor);
+            freeCudaTensorStorageUncached(self, &tensor);
+            self.lazy_device_bytes -|= bytes;
+            self.stats.resident_weight_bytes -|= bytes;
+            if (trace) {
+                std.log.info("cuda_lazy_trace: evicted victim={s} evicted_mb={d} lazy_device_mb={d}", .{
+                    victim_name,
+                    bytes / (1024 * 1024),
+                    self.lazy_device_bytes / (1024 * 1024),
+                });
+            }
+            self.allocator.free(removed.key);
+        }
+        if (self.lazy_device_epochs.fetchRemove(victim_name)) |removed_epoch| {
+            self.allocator.free(removed_epoch.key);
+        }
+    }
+}
+
+fn cancelPendingLazyHostPrefetchLocked(store: *native_compute_mod.WeightStore, entry: *native_compute_mod.LazyWeightEntry) bool {
+    if (!entry.pending_prefetch) return false;
+    for (store.prefetch.items.items, 0..) |queued, index| {
+        if (queued == entry) {
+            _ = store.prefetch.items.orderedRemove(index);
+            entry.pending_prefetch = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn materializeLazyWeight(self: *CudaCompute, name: []const u8) !*CudaTensor {
+    const store = self.lazy_host_store orelse return error.MissingWeight;
+    const trace = cudaLazyTraceEnabled();
+    const demand_start = platform.time.monotonicNs();
+    if (trace) {
+        std.log.info("cuda_lazy_trace: demand_start name={s} resident_mb={d} lazy_device_mb={d} budget_mb={d}", .{
+            name,
+            self.stats.resident_weight_bytes / (1024 * 1024),
+            self.lazy_device_bytes / (1024 * 1024),
+            self.lazy_device_budget_bytes / (1024 * 1024),
+        });
+    }
+    store.prefetch.lock();
+    var store_locked = true;
+    errdefer if (store_locked) store.prefetch.unlock();
+    const loaded = blk: {
+        const entry = store.lazy_weights.getPtr(name) orelse {
+            store_locked = false;
+            store.prefetch.unlock();
+            return error.MissingWeight;
+        };
+        self.stats.lazy_demand_loads += 1;
+        if (entry.loaded != null) {
+            self.stats.lazy_host_prefetch_hits += 1;
+            if (trace) {
+                std.log.info("cuda_lazy_trace: host_hit name={s} loaded_mb={d}", .{ name, entry.loaded_bytes / (1024 * 1024) });
+            }
+        } else {
+            if (cancelPendingLazyHostPrefetchLocked(store, entry)) {
+                self.stats.lazy_prefetch_cancelled_for_demand += 1;
+                if (trace) std.log.info("cuda_lazy_trace: cancelled_prefetch name={s}", .{name});
+            }
+            const host_start = platform.time.monotonicNs();
+            try native_compute_mod.ensureLazyWeightLoadedLocked(store, self.run_budget, entry);
+            const host_ns = elapsedNsSince(host_start);
+            self.stats.lazy_host_load_ns +|= host_ns;
+            if (trace) {
+                std.log.info("cuda_lazy_trace: host_loaded name={s} loaded_mb={d} host_ms={d}", .{
+                    name,
+                    entry.loaded_bytes / (1024 * 1024),
+                    host_ns / 1_000_000,
+                });
+            }
+        }
+        const moved_loaded = entry.loaded.?;
+        entry.loaded = null;
+        entry.active_tier = entry.placement.spill_tier;
+        if (store.tier_cache) |*tier_cache| {
+            tier_cache.noteRelease(.host, entry.loaded_bytes);
+        }
+        store_locked = false;
+        store.prefetch.unlock();
+        break :blk moved_loaded;
+    };
+    var owned_loaded = loaded;
+    defer owned_loaded.deinit();
+    const page_touch_start = platform.time.monotonicNs();
+    touchLoadedWeightPages(&owned_loaded);
+    const page_touch_ns = elapsedNsSince(page_touch_start);
+    self.stats.lazy_host_page_touch_ns +|= page_touch_ns;
+    if (trace and page_touch_ns > 0) {
+        std.log.info("cuda_lazy_trace: page_touched name={s} touch_ms={d}", .{
+            name,
+            page_touch_ns / 1_000_000,
+        });
+    }
+    const owned_key = try self.allocator.dupe(u8, name);
+    const upload_start = platform.time.monotonicNs();
+    self.insertWeightFromLoaded(owned_key, &owned_loaded) catch |err| {
+        self.allocator.free(owned_key);
+        return err;
+    };
+    const tensor = self.resident_weights.getPtr(name) orelse return error.MissingWeight;
+    const uploaded_bytes = cudaTensorDeviceBytes(tensor);
+    const upload_ns = elapsedNsSince(upload_start);
+    self.stats.lazy_upload_ns +|= upload_ns;
+    self.stats.lazy_uploaded_bytes += uploaded_bytes;
+    if (trace) {
+        std.log.info("cuda_lazy_trace: uploaded name={s} dtype={s} uploaded_mb={d} upload_ms={d}", .{
+            name,
+            @tagName(tensor.dtype),
+            uploaded_bytes / (1024 * 1024),
+            upload_ns / 1_000_000,
+        });
+    }
+    try noteLazyDeviceAccess(self, name, uploaded_bytes);
+    try evictLazyDeviceWeightsToBudget(self, name);
+    if (trace) {
+        std.log.info("cuda_lazy_trace: demand_done name={s} total_ms={d} lazy_device_mb={d} resident_mb={d}", .{
+            name,
+            elapsedNsSince(demand_start) / 1_000_000,
+            self.lazy_device_bytes / (1024 * 1024),
+            self.stats.resident_weight_bytes / (1024 * 1024),
+        });
+    }
+    return self.resident_weights.getPtr(name) orelse error.MissingWeight;
+}
+
+fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.resident_weights.getPtr(name)) |tensor| {
+        if (self.lazy_device_epochs.contains(name)) {
+            try noteLazyDeviceAccess(self, name, 0);
+        }
+        return tensor;
+    }
+    if (getDenseStreamWeight(self, name)) |maybe_tensor| {
+        if (maybe_tensor) |tensor| return tensor;
+    } else |err| {
+        self.stats.ffn_stream_fallbacks += 1;
+        self.stats.dense_stream_fallbacks += 1;
+        if (cudaDenseStreamProfileEnabled()) {
+            std.log.warn("cuda_dense_stream: fallback name={s} err={s}", .{ name, @errorName(err) });
+        }
+    }
+    return materializeLazyWeight(self, name) catch |err| switch (err) {
+        error.MissingWeight => error.WeightNotFound,
+        else => err,
+    };
+}
+
+fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.resident_weights.contains(name)) return;
+    if (cudaDenseStreamEnabled() and isDenseStreamWeightName(name)) {
+        if (findDenseStreamEntry(self, name)) |entry| {
+            self.dense_stream_epoch +|= 1;
+            entry.last_access = self.dense_stream_epoch;
+            self.stats.ffn_stream_hits += 1;
+            self.stats.dense_stream_hits += 1;
+            return;
+        }
+        if (self.lazy_host_store) |store| {
+            if (store.tensor_store) |tensor_store| {
+                if (tensor_store.describeTensorRange(self.allocator, name)) |maybe_range| {
+                    if (maybe_range) |range_value| {
+                        var range = range_value;
+                        self.stats.ffn_stream_fadvise_calls += 1;
+                        self.stats.dense_stream_fadvise_calls += 1;
+                        c_file.adviseFileRange(self.allocator, range.path, range.byte_offset, range.byte_len, .will_need);
+                        range.deinit(self.allocator);
+                    }
+                } else |_| {}
+            }
+        }
+        return;
+    }
+    const store = self.lazy_host_store orelse return;
+    if (!store.prefetch_initialized) return;
+    store.prefetch.lock();
+    defer store.prefetch.unlock();
+    const entry = store.lazy_weights.getPtr(name) orelse {
+        self.stats.lazy_prefetch_missing += 1;
+        return;
+    };
+    if (store.shared_prefetch) |shared_prefetch| {
+        entry.prefetch_score = shared_prefetch.noteRequest(name, hint) catch entry.prefetch_score;
+    } else {
+        entry.prefetch_score +|= hint;
+    }
+    if (entry.pending_prefetch) {
+        self.stats.lazy_prefetch_duplicates += 1;
+        return;
+    }
+    store.prefetch.appendLocked(entry) catch return;
+    entry.pending_prefetch = true;
+    self.stats.lazy_prefetch_enqueues += 1;
+    store.prefetch.signal();
+}
+
+fn drainPrefetchBudget(ctx: *anyopaque, max_items: usize) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const store = self.lazy_host_store orelse return;
+    if (!store.prefetch_initialized) return;
+    self.stats.lazy_prefetch_drain_calls += 1;
+    store.prefetch.drainBudget(max_items);
+}
 
 fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     var shape = [_]i32{@intCast(data.len)};
@@ -826,7 +1583,10 @@ fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
         if (dim < 0) return error.InvalidShape;
         elem_count = try std.math.mul(usize, elem_count, @as(usize, @intCast(dim)));
     }
-    if (elem_count != input_tensor.elem_count) return error.InvalidShape;
+    if (elem_count != input_tensor.elem_count) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=reshape input_elems={d} requested_elems={d} new_rank={d}", .{ input_tensor.elem_count, elem_count, new_shape.len });
+        return error.InvalidShape;
+    }
 
     const shape = try self.allocator.dupe(i64, new_shape);
     errdefer self.allocator.free(shape);
@@ -848,10 +1608,16 @@ fn reshape2DOp(
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
     const new_count = try std.math.mul(usize, new_rows, new_cols);
-    if (new_count != input_tensor.elem_count) return error.InvalidShape;
+    if (new_count != input_tensor.elem_count) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=reshape2D input_elems={d} new_rows={d} new_cols={d}", .{ input_tensor.elem_count, new_rows, new_cols });
+        return error.InvalidShape;
+    }
     if (old_rows != 0 or old_cols != 0) {
         const old_count = try std.math.mul(usize, old_rows, old_cols);
-        if (old_count != new_count) return error.InvalidShape;
+        if (old_count != new_count) {
+            if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=reshape2D old_rows={d} old_cols={d} new_rows={d} new_cols={d}", .{ old_rows, old_cols, new_rows, new_cols });
+            return error.InvalidShape;
+        }
     }
     const shape = try self.allocator.dupe(i64, &[_]i64{ @intCast(new_rows), @intCast(new_cols) });
     errdefer self.allocator.free(shape);
@@ -870,7 +1636,11 @@ fn reshape2DOp(
 
 fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
     const input_tensor = tensorFromCt(input);
-    if (try std.math.mul(usize, rows, cols) != input_tensor.elem_count) return error.InvalidShape;
+    const requested = try std.math.mul(usize, rows, cols);
+    if (requested != input_tensor.elem_count) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=reshape2d input_elems={d} rows={d} cols={d}", .{ input_tensor.elem_count, rows, cols });
+        return error.InvalidShape;
+    }
     return reshape2DOp(ctx, input, input_tensor.elem_count, 1, rows, cols);
 }
 
@@ -957,6 +1727,15 @@ fn ensureF32(tensor: *const CudaTensor) !void {
 fn ensureF32OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.quant_type != null) return;
     try ensureF32(tensor);
+}
+
+fn ensureF32Bf16OrQuantized(tensor: *const CudaTensor) !void {
+    if (tensor.quant_type != null) return;
+    if (tensor.dtype != .f32 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
+}
+
+fn isBf16Weight(tensor: *const CudaTensor) bool {
+    return tensor.dtype == .bf16 and tensor.quant_type == null;
 }
 
 fn isKnownQuant(tensor: *const CudaTensor, known: gguf_tensor_types.KnownTensorType) bool {
@@ -1049,6 +1828,14 @@ fn sameShape(a: []const i64, b: []const i64) bool {
     return std.mem.eql(i64, a, b);
 }
 
+fn cudaLazyProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE");
+}
+
+fn cudaLazyTraceEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_TRACE");
+}
+
 fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len * @sizeOf(i64));
     try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
@@ -1070,9 +1857,15 @@ fn uploadTempU8(self: *CudaCompute, data: []const u8) !buffer_mod.DeviceBuffer {
 fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(weight);
-    try ensureF32OrQuantized(weight_tensor);
-    if (ids.len != total) return error.InvalidShape;
-    if (dim == 0 or weight_tensor.elem_count % dim != 0) return error.InvalidShape;
+    try ensureF32Bf16OrQuantized(weight_tensor);
+    if (ids.len != total) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding ids_len={d} total={d}", .{ ids.len, total });
+        return error.InvalidShape;
+    }
+    if (dim == 0 or weight_tensor.elem_count % dim != 0) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding weight_elems={d} dim={d}", .{ weight_tensor.elem_count, dim });
+        return error.InvalidShape;
+    }
     const vocab = weight_tensor.elem_count / dim;
     for (ids) |raw_id| {
         if (raw_id < 0) return error.InvalidTokenId;
@@ -1093,6 +1886,8 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             },
             else => return error.UnsupportedTensorType,
         }
+    } else if (isBf16Weight(weight_tensor)) {
+        try self.kernels.launchEmbeddingLookupBf16WeightF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim);
     } else {
         try self.kernels.launchEmbeddingLookupF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim);
     }
@@ -1104,10 +1899,17 @@ fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(weight);
     const ids_tensor = tensorFromCt(ids);
+    if (isBf16Weight(weight_tensor)) return null;
     try ensureF32OrQuantized(weight_tensor);
     if (ids_tensor.dtype != .i32 or ids_tensor.quant_type != null) return null;
-    if (ids_tensor.elem_count != total) return error.InvalidShape;
-    if (dim == 0 or weight_tensor.elem_count % dim != 0) return error.InvalidShape;
+    if (ids_tensor.elem_count != total) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding_tensor ids_elems={d} total={d}", .{ ids_tensor.elem_count, total });
+        return error.InvalidShape;
+    }
+    if (dim == 0 or weight_tensor.elem_count % dim != 0) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding_tensor weight_elems={d} dim={d}", .{ weight_tensor.elem_count, dim });
+        return error.InvalidShape;
+    }
 
     const out_count = try checkedMul(total, dim);
     const shape = try allocShape2(self.allocator, total, dim);
@@ -1248,9 +2050,20 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     try ensureF32(input_tensor);
     try ensureF32OrQuantized(weight_tensor);
     try ensureF32(bias_tensor);
-    try ensureCount(input_tensor, try checkedMul(rows, in_dim));
-    try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
-    try ensureCount(bias_tensor, out_dim);
+    const input_expected = try checkedMul(rows, in_dim);
+    if (input_tensor.elem_count != input_expected) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear input_elems={d} rows={d} in_dim={d}", .{ input_tensor.elem_count, rows, in_dim });
+        return error.InvalidShape;
+    }
+    const weight_expected = try checkedMul(out_dim, in_dim);
+    if (weight_tensor.elem_count != weight_expected) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear weight_elems={d} out_dim={d} in_dim={d}", .{ weight_tensor.elem_count, out_dim, in_dim });
+        return error.InvalidShape;
+    }
+    if (bias_tensor.elem_count != out_dim) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear bias_elems={d} out_dim={d}", .{ bias_tensor.elem_count, out_dim });
+        return error.InvalidShape;
+    }
 
     const out_count = try checkedMul(rows, out_dim);
     const shape = try allocShape2(self.allocator, rows, out_dim);
@@ -1402,9 +2215,17 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
     try ensureF32(input_tensor);
-    try ensureF32OrQuantized(weight_tensor);
-    try ensureCount(input_tensor, try checkedMul(rows, in_dim));
-    try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
+    try ensureF32Bf16OrQuantized(weight_tensor);
+    const input_expected = try checkedMul(rows, in_dim);
+    if (input_tensor.elem_count != input_expected) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear_no_bias input_elems={d} rows={d} in_dim={d}", .{ input_tensor.elem_count, rows, in_dim });
+        return error.InvalidShape;
+    }
+    const weight_expected = try checkedMul(out_dim, in_dim);
+    if (weight_tensor.elem_count != weight_expected) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear_no_bias weight_elems={d} out_dim={d} in_dim={d}", .{ weight_tensor.elem_count, out_dim, in_dim });
+        return error.InvalidShape;
+    }
 
     const out_count = try checkedMul(rows, out_dim);
     const shape = try allocShape2(self.allocator, rows, out_dim);
@@ -1436,6 +2257,14 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,
+        }
+    } else if (isBf16Weight(weight_tensor)) {
+        if (try tryCublasLtBf16Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+            // cuBLASLt counters are updated by the helper.
+        } else {
+            self.stats.bf16_cublaslt_fallbacks += 1;
+            try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+            self.stats.bf16_scalar_linear_calls += 1;
         }
     } else {
         try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
@@ -1537,9 +2366,13 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const v_weight_tensor = tensorFromCt(v_weight);
     try ensureF32(input_tensor);
     const use_q4 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and isKnownQuant(v_weight_tensor, .Q4_K);
-    const use_q4_q4_f32 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and v_weight_tensor.quant_type == null;
-    const use_f32 = q_weight_tensor.quant_type == null and k_weight_tensor.quant_type == null and v_weight_tensor.quant_type == null;
-    if (!use_q4 and !use_q4_q4_f32 and !use_f32) {
+    const use_q4_q4_f32 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and
+        v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
+    const use_f32 = q_weight_tensor.dtype == .f32 and q_weight_tensor.quant_type == null and
+        k_weight_tensor.dtype == .f32 and k_weight_tensor.quant_type == null and
+        v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
+    const use_bf16 = isBf16Weight(q_weight_tensor) and isBf16Weight(k_weight_tensor) and isBf16Weight(v_weight_tensor);
+    if (!use_q4 and !use_q4_q4_f32 and !use_f32 and !use_bf16) {
         self.stats.qkv_fallback_unsupported += 1;
         return null;
     }
@@ -1623,6 +2456,48 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             else => return err,
         };
         self.stats.qkv_fused_q4_q4_f32 += 1;
+        self.stats.launch_linear_qkv += 1;
+    } else if (use_bf16) {
+        if (try tryCublasLtBf16Qkv(
+            self,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor.buffer,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        )) {
+            // cuBLASLt counters are updated by the helper.
+        } else {
+            self.stats.bf16_cublaslt_fallbacks += 1;
+            self.kernels.launchLinearBf16WeightF32QkvNoBiasTiled(
+                &self.ctx,
+                q_device,
+                k_device,
+                v_device,
+                input_tensor.buffer,
+                q_weight_tensor.buffer,
+                k_weight_tensor.buffer,
+                v_weight_tensor.buffer,
+                rows,
+                in_dim,
+                q_out_dim,
+                kv_out_dim,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable => {
+                    self.stats.qkv_kernel_unavailable += 1;
+                    return null;
+                },
+                else => return err,
+            };
+            self.stats.bf16_scalar_qkv_calls += 1;
+        }
+        self.stats.qkv_fused_f32 += 1;
         self.stats.launch_linear_qkv += 1;
     } else {
         self.kernels.launchLinearF32QkvNoBiasTiled(
@@ -1855,8 +2730,14 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     const weight_tensor = tensorFromCt(weight);
     try ensureF32(input_tensor);
     try ensureF32(weight_tensor);
-    if (dim == 0 or input_tensor.elem_count % dim != 0) return error.InvalidShape;
-    try ensureCount(weight_tensor, dim);
+    if (dim == 0 or input_tensor.elem_count % dim != 0) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=rms_norm input_elems={d} dim={d}", .{ input_tensor.elem_count, dim });
+        return error.InvalidShape;
+    }
+    if (weight_tensor.elem_count != dim) {
+        if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=rms_norm weight_elems={d} dim={d}", .{ weight_tensor.elem_count, dim });
+        return error.InvalidShape;
+    }
 
     const shape = try dupeShape(self.allocator, input_tensor.shape);
     errdefer self.allocator.free(shape);
@@ -3072,4 +3953,39 @@ test "cuda shape helpers reject incompatible shapes" {
     try std.testing.expect(try checkedMul(2, 3) == 6);
     try std.testing.expect(sameShape(&.{ 2, 3 }, &.{ 2, 3 }));
     try std.testing.expect(!sameShape(&.{ 2, 3 }, &.{ 3, 2 }));
+}
+
+test "cuda lazy demand cancels pending host prefetch item" {
+    const allocator = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    native_compute_mod.initPrefetchQueue(&store, allocator);
+    defer native_compute_mod.deinitPrefetchQueue(&store);
+
+    var entry = native_compute_mod.LazyWeightEntry{
+        .tensor_ref = .{ .name = "weight", .byte_len = 4 },
+        .pending_prefetch = true,
+    };
+    try store.prefetch.items.append(allocator, &entry);
+
+    try std.testing.expect(cancelPendingLazyHostPrefetchLocked(&store, &entry));
+    try std.testing.expect(!entry.pending_prefetch);
+    try std.testing.expectEqual(@as(usize, 0), store.prefetch.items.items.len);
+    try std.testing.expect(!cancelPendingLazyHostPrefetchLocked(&store, &entry));
+}
+
+test "cuda dense stream weight classifier covers gemma attention and mlp matrices" {
+    try std.testing.expect(isDenseFfnStreamWeightName("model.language_model.layers.0.mlp.gate_proj.weight"));
+    try std.testing.expect(isDenseFfnStreamWeightName("model.language_model.layers.0.mlp.up_proj.weight"));
+    try std.testing.expect(isDenseFfnStreamWeightName("model.language_model.layers.0.mlp.down_proj.weight"));
+    try std.testing.expect(!isDenseFfnStreamWeightName("model.language_model.layers.0.self_attn.q_proj.weight"));
+
+    try std.testing.expect(isDenseAttentionStreamWeightName("model.language_model.layers.0.self_attn.q_proj.weight"));
+    try std.testing.expect(isDenseAttentionStreamWeightName("model.language_model.layers.0.self_attn.k_proj.weight"));
+    try std.testing.expect(isDenseAttentionStreamWeightName("model.language_model.layers.0.self_attn.v_proj.weight"));
+    try std.testing.expect(isDenseAttentionStreamWeightName("model.language_model.layers.0.self_attn.o_proj.weight"));
+    try std.testing.expect(!isDenseAttentionStreamWeightName("model.language_model.layers.0.input_layernorm.weight"));
 }

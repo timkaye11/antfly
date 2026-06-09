@@ -82,6 +82,55 @@ extern "C" __global__ void termite_linear_f32(
     dst[idx] = acc;
 }
 
+__device__ __forceinline__ float termite_bf16_to_f32(unsigned short value) {
+    return __uint_as_float(((unsigned int)value) << 16);
+}
+
+__device__ __forceinline__ unsigned short termite_f32_to_bf16(float value) {
+    unsigned int bits = __float_as_uint(value);
+    unsigned int lsb = (bits >> 16) & 1u;
+    unsigned int rounding_bias = 0x7fffu + lsb;
+    return (unsigned short)((bits + rounding_bias) >> 16);
+}
+
+extern "C" __global__ void termite_f32_to_bf16(
+    unsigned short* dst,
+    const float* input,
+    unsigned int count
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    dst[idx] = termite_f32_to_bf16(input[idx]);
+}
+
+extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int global = blockIdx.x;
+    unsigned int total = rows * out_dim;
+    if (global >= total) return;
+    unsigned int row = global / out_dim;
+    unsigned int col = global - row * out_dim;
+    unsigned int tid = threadIdx.x;
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        acc += input[row * in_dim + i] * termite_bf16_to_f32(weight[col * in_dim + i]);
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) dst[global] = partial[0];
+}
+
 extern "C" __global__ void termite_argmax_last_row_f32(
     unsigned int* dst,
     const float* input,
@@ -824,6 +873,22 @@ extern "C" __global__ void termite_embedding_lookup_f32(
     unsigned int col = idx - row * dim;
     long long id = ids[row];
     dst[idx] = weight[(unsigned long long)id * dim + col];
+}
+
+extern "C" __global__ void termite_embedding_lookup_bf16_weight_f32(
+    float* dst,
+    const unsigned short* weight,
+    const long long* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
+    long long id = ids[row];
+    dst[idx] = termite_bf16_to_f32(weight[(unsigned long long)id * dim + col]);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_f32(
@@ -2197,6 +2262,63 @@ extern "C" __global__ void termite_linear_f32_qkv_nobias_tiled(
     float acc = 0.0f;
     for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
         acc += input[row * in_dim + i] * weight[col * in_dim + i];
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) dst[local] = partial[0];
+}
+
+extern "C" __global__ void termite_linear_bf16_weight_f32_qkv_nobias_tiled(
+    float* dst_q,
+    float* dst_k,
+    float* dst_v,
+    const float* input,
+    const unsigned short* weight_q,
+    const unsigned short* weight_k,
+    const unsigned short* weight_v,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int q_out_dim,
+    unsigned int kv_out_dim
+) {
+    unsigned int q_plane = rows * q_out_dim;
+    unsigned int kv_plane = rows * kv_out_dim;
+    unsigned int total = q_plane + kv_plane * 2u;
+    unsigned int global = blockIdx.x;
+    if (global >= total) return;
+
+    const unsigned short* weight;
+    float* dst;
+    unsigned int out_dim;
+    unsigned int local;
+    if (global < q_plane) {
+        weight = weight_q;
+        dst = dst_q;
+        out_dim = q_out_dim;
+        local = global;
+    } else if (global < q_plane + kv_plane) {
+        weight = weight_k;
+        dst = dst_k;
+        out_dim = kv_out_dim;
+        local = global - q_plane;
+    } else {
+        weight = weight_v;
+        dst = dst_v;
+        out_dim = kv_out_dim;
+        local = global - q_plane - kv_plane;
+    }
+
+    unsigned int row = local / out_dim;
+    unsigned int col = local - row * out_dim;
+    unsigned int tid = threadIdx.x;
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        acc += input[row * in_dim + i] * termite_bf16_to_f32(weight[col * in_dim + i]);
     }
     partial[tid] = acc;
     __syncthreads();

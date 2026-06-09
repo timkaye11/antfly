@@ -23,11 +23,13 @@ const fill_ptx_z = fill_ptx ++ "\x00";
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     fill_f32: driver_mod.CUfunction = null,
+    f32_to_bf16: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
     binary_scalar_f32: driver_mod.CUfunction = null,
     add_mul_scalar_f32: driver_mod.CUfunction = null,
     linear_f32: driver_mod.CUfunction = null,
+    linear_bf16_weight_f32_tiled: driver_mod.CUfunction = null,
     argmax_last_row_f32: driver_mod.CUfunction = null,
     gemma4_mtp_masked_argmax_f32: driver_mod.CUfunction = null,
     linear_bias_f32: driver_mod.CUfunction = null,
@@ -47,6 +49,7 @@ pub const KernelModule = struct {
     silu_multiply_f32: driver_mod.CUfunction = null,
     activation_multiply_f32: driver_mod.CUfunction = null,
     embedding_lookup_f32: driver_mod.CUfunction = null,
+    embedding_lookup_bf16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
     gliner_word_embeddings_f32: driver_mod.CUfunction = null,
@@ -83,6 +86,7 @@ pub const KernelModule = struct {
     linear_q4_k_triple_bias_f32_tiled: driver_mod.CUfunction = null,
     linear_q4_k_pair_bias_f32_tiled: driver_mod.CUfunction = null,
     linear_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
+    linear_bf16_weight_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
     linear_q4_k_qkv_nobias_f32_tiled: driver_mod.CUfunction = null,
     linear_q4_k_q4_k_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
     embedding_lookup_q4_k_f32: driver_mod.CUfunction = null,
@@ -96,6 +100,7 @@ pub const KernelModule = struct {
 
         var fill_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&fill_f32, module, "termite_fill_f32"));
+        const f32_to_bf16 = loadOptionalFunction(ctx, module, "termite_f32_to_bf16");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
         var add_scalar_f32: driver_mod.CUfunction = null;
@@ -106,6 +111,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_mul_scalar_f32, module, "termite_add_mul_scalar_f32"));
         var linear_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_f32, module, "termite_linear_f32"));
+        const linear_bf16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_tiled");
         var argmax_last_row_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
         const gemma4_mtp_masked_argmax_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_argmax_f32");
@@ -143,6 +149,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&activation_multiply_f32, module, "termite_activation_multiply_f32"));
         var embedding_lookup_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_f32, module, "termite_embedding_lookup_f32"));
+        const embedding_lookup_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_bf16_weight_f32");
         var embedding_lookup_i32_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_f32, module, "termite_embedding_lookup_i32_f32"));
         var take_rows_f32: driver_mod.CUfunction = null;
@@ -218,6 +225,7 @@ pub const KernelModule = struct {
         var linear_q4_k_pair_bias_f32_tiled: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_pair_bias_f32_tiled, module, "termite_linear_q4_k_pair_bias_f32_tiled"));
         const linear_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_qkv_nobias_tiled");
+        const linear_bf16_weight_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_qkv_nobias_tiled");
         const linear_q4_k_qkv_nobias_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_qkv_nobias_f32_tiled");
         const linear_q4_k_q4_k_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled");
         var embedding_lookup_q4_k_f32: driver_mod.CUfunction = null;
@@ -228,11 +236,13 @@ pub const KernelModule = struct {
         return .{
             .module = module,
             .fill_f32 = fill_f32,
+            .f32_to_bf16 = f32_to_bf16,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
             .binary_scalar_f32 = binary_scalar_f32,
             .add_mul_scalar_f32 = add_mul_scalar_f32,
             .linear_f32 = linear_f32,
+            .linear_bf16_weight_f32_tiled = linear_bf16_weight_f32_tiled,
             .argmax_last_row_f32 = argmax_last_row_f32,
             .gemma4_mtp_masked_argmax_f32 = gemma4_mtp_masked_argmax_f32,
             .linear_bias_f32 = linear_bias_f32,
@@ -252,6 +262,7 @@ pub const KernelModule = struct {
             .silu_multiply_f32 = silu_multiply_f32,
             .activation_multiply_f32 = activation_multiply_f32,
             .embedding_lookup_f32 = embedding_lookup_f32,
+            .embedding_lookup_bf16_weight_f32 = embedding_lookup_bf16_weight_f32,
             .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
             .take_rows_f32 = take_rows_f32,
             .gliner_word_embeddings_f32 = gliner_word_embeddings_f32,
@@ -288,6 +299,7 @@ pub const KernelModule = struct {
             .linear_q4_k_triple_bias_f32_tiled = linear_q4_k_triple_bias_f32_tiled,
             .linear_q4_k_pair_bias_f32_tiled = linear_q4_k_pair_bias_f32_tiled,
             .linear_f32_qkv_nobias_tiled = linear_f32_qkv_nobias_tiled,
+            .linear_bf16_weight_f32_qkv_nobias_tiled = linear_bf16_weight_f32_qkv_nobias_tiled,
             .linear_q4_k_qkv_nobias_f32_tiled = linear_q4_k_qkv_nobias_f32_tiled,
             .linear_q4_k_q4_k_f32_qkv_nobias_tiled = linear_q4_k_q4_k_f32_qkv_nobias_tiled,
             .embedding_lookup_q4_k_f32 = embedding_lookup_q4_k_f32,
@@ -301,11 +313,13 @@ pub const KernelModule = struct {
             _ = ctx.driver.fns.cuModuleUnload(self.module);
             self.module = null;
             self.fill_f32 = null;
+            self.f32_to_bf16 = null;
             self.scale_f32 = null;
             self.add_scalar_f32 = null;
             self.binary_scalar_f32 = null;
             self.add_mul_scalar_f32 = null;
             self.linear_f32 = null;
+            self.linear_bf16_weight_f32_tiled = null;
             self.argmax_last_row_f32 = null;
             self.gemma4_mtp_masked_argmax_f32 = null;
             self.linear_bias_f32 = null;
@@ -325,6 +339,7 @@ pub const KernelModule = struct {
             self.silu_multiply_f32 = null;
             self.activation_multiply_f32 = null;
             self.embedding_lookup_f32 = null;
+            self.embedding_lookup_bf16_weight_f32 = null;
             self.embedding_lookup_i32_f32 = null;
             self.take_rows_f32 = null;
             self.gliner_word_embeddings_f32 = null;
@@ -361,6 +376,7 @@ pub const KernelModule = struct {
             self.linear_q4_k_triple_bias_f32_tiled = null;
             self.linear_q4_k_pair_bias_f32_tiled = null;
             self.linear_f32_qkv_nobias_tiled = null;
+            self.linear_bf16_weight_f32_qkv_nobias_tiled = null;
             self.linear_q4_k_qkv_nobias_f32_tiled = null;
             self.linear_q4_k_q4_k_f32_qkv_nobias_tiled = null;
             self.embedding_lookup_q4_k_f32 = null;
@@ -371,7 +387,17 @@ pub const KernelModule = struct {
     pub fn hasGemma4DecoderPrimitives(self: *const KernelModule) bool {
         return self.rope_f32 != null and
             self.rope_per_item_f32 != null and
-            self.gqa_attention_f32 != null;
+            self.gqa_attention_f32 != null and
+            self.add_mul_scalar_f32 != null and
+            self.rms_norm_add_mul_scalar_f32 != null and
+            self.rms_norm_heads_rope_f32 != null and
+            self.gemma4_mtp_masked_argmax_f32 != null;
+    }
+
+    pub fn hasBf16WeightPrimitives(self: *const KernelModule) bool {
+        return self.linear_bf16_weight_f32_tiled != null and
+            self.embedding_lookup_bf16_weight_f32 != null and
+            self.linear_bf16_weight_f32_qkv_nobias_tiled != null;
     }
 
     pub fn hasClipClapPrimitives(self: *const KernelModule) bool {
@@ -487,6 +513,63 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
         };
         try launch1d(self.linear_f32, ctx, out_count, &params);
+    }
+
+    pub fn launchF32ToBf16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        count: usize,
+    ) driver_mod.Error!void {
+        const function = self.f32_to_bf16 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(dst, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var count_u32 = try toU32(count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&count_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchLinearBf16WeightF32Tiled(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_bf16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
     pub fn launchScaleF32(
@@ -1253,6 +1336,37 @@ pub const KernelModule = struct {
             @ptrCast(&dim_u32),
         };
         try launch1d(self.embedding_lookup_f32, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingLookupBf16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_bf16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i64));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+        };
+        try launch1d(function, ctx, count, &params);
     }
 
     pub fn launchEmbeddingLookupI32F32(
@@ -2854,6 +2968,62 @@ pub const KernelModule = struct {
         try launchBlocks(function, ctx, total_with_v, f32_tiled_threads, &params);
     }
 
+    pub fn launchLinearBf16WeightF32QkvNoBiasTiled(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q: buffer_mod.DeviceBuffer,
+        dst_k: buffer_mod.DeviceBuffer,
+        dst_v: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_q: buffer_mod.DeviceBuffer,
+        weight_k: buffer_mod.DeviceBuffer,
+        weight_v: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_bf16_weight_f32_qkv_nobias_tiled orelse return error.CudaKernelUnavailable;
+        const q_count = try checkedTensorElements(rows, q_out_dim);
+        const kv_count = try checkedTensorElements(rows, kv_out_dim);
+        try checkBytes(dst_q, q_count);
+        try checkBytes(dst_k, kv_count);
+        try checkBytes(dst_v, kv_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_q, try checkedTensorElements(try checkedTensorElements(q_out_dim, in_dim), @sizeOf(u16)));
+        try checkRawBytes(weight_k, try checkedTensorElements(try checkedTensorElements(kv_out_dim, in_dim), @sizeOf(u16)));
+        try checkRawBytes(weight_v, try checkedTensorElements(try checkedTensorElements(kv_out_dim, in_dim), @sizeOf(u16)));
+        const total = try checkedTensorElements(q_count + kv_count, 1);
+        const total_with_v = try checkedTensorElements(total + kv_count, 1);
+        if (total_with_v == 0) return;
+
+        var dst_q_ptr = dst_q.ptr;
+        var dst_k_ptr = dst_k.ptr;
+        var dst_v_ptr = dst_v.ptr;
+        var input_ptr = input.ptr;
+        var weight_q_ptr = weight_q.ptr;
+        var weight_k_ptr = weight_k.ptr;
+        var weight_v_ptr = weight_v.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var q_out_dim_u32 = try toU32(q_out_dim);
+        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_q_ptr),
+            @ptrCast(&dst_k_ptr),
+            @ptrCast(&dst_v_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_q_ptr),
+            @ptrCast(&weight_k_ptr),
+            @ptrCast(&weight_v_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&q_out_dim_u32),
+            @ptrCast(&kv_out_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_with_v, f32_tiled_threads, &params);
+    }
+
     pub fn launchLinearQ4KQ4KF32QkvNoBiasTiled(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -3117,9 +3287,252 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     defer module.unload(&ctx);
 
     try module.requireGemma4DecoderPrimitives();
+    try smokeBf16WeightPrimitives(allocator, &ctx, &module);
+    try smokeAddMulScalarF32(allocator, &ctx, &module);
+    try smokeRmsNormAddMulScalarF32(allocator, &ctx, &module);
     try smokeRopeF32(allocator, &ctx, &module);
+    try smokeRmsNormHeadsRopeF32(allocator, &ctx, &module);
     try smokeRopePerItemF32(allocator, &ctx, &module);
     try smokeGqaAttentionF32(allocator, &ctx, &module);
+    try smokeGemma4MtpMaskedArgmaxF32(&ctx, &module);
+}
+
+fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 2;
+    const input_data = [_]f32{ 1.0, 2.0, 3.0, -1.0, 0.5, 4.0 };
+    const weight_data = [_]u16{
+        bf16Bits(1.0), bf16Bits(0.0), bf16Bits(-1.0),
+        bf16Bits(0.5), bf16Bits(2.0), bf16Bits(1.0),
+    };
+    const expected_linear = [_]f32{ -2.0, 7.5, -5.0, 4.5 };
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_data.len * @sizeOf(u16));
+    defer weight.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, rows * out_dim * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try weight.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_data));
+    try module.launchLinearBf16WeightF32Tiled(ctx, output, input, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, rows * out_dim);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_linear, 0.0001);
+
+    const vocab: usize = 3;
+    const embed_dim: usize = 2;
+    _ = vocab;
+    const embed_weight_data = [_]u16{
+        bf16Bits(1.0), bf16Bits(2.0),
+        bf16Bits(3.0), bf16Bits(4.0),
+        bf16Bits(5.0), bf16Bits(6.0),
+    };
+    const ids_data = [_]i64{ 2, 0 };
+    const expected_embed = [_]f32{ 5.0, 6.0, 1.0, 2.0 };
+    var embed_weight = try buffer_mod.DeviceBuffer.alloc(ctx, embed_weight_data.len * @sizeOf(u16));
+    defer embed_weight.free(ctx);
+    var ids = try buffer_mod.DeviceBuffer.alloc(ctx, ids_data.len * @sizeOf(i64));
+    defer ids.free(ctx);
+    var embed_output = try buffer_mod.DeviceBuffer.alloc(ctx, ids_data.len * embed_dim * @sizeOf(f32));
+    defer embed_output.free(ctx);
+    try embed_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&embed_weight_data));
+    try ids.copyFromHost(ctx, std.mem.sliceAsBytes(&ids_data));
+    try module.launchEmbeddingLookupBf16WeightF32(ctx, embed_output, embed_weight, ids, ids_data.len, embed_dim);
+    try ctx.synchronize();
+
+    const embed_out = try allocator.alloc(f32, ids_data.len * embed_dim);
+    defer allocator.free(embed_out);
+    try embed_output.copyToHost(ctx, std.mem.sliceAsBytes(embed_out));
+    try ctx.synchronize();
+    try expectApproxSlice(embed_out, &expected_embed, 0.0001);
+
+    const q_out_dim: usize = 2;
+    const kv_out_dim: usize = 1;
+    const k_weight_data = [_]u16{ bf16Bits(1.0), bf16Bits(1.0), bf16Bits(1.0) };
+    const v_weight_data = [_]u16{ bf16Bits(-1.0), bf16Bits(0.0), bf16Bits(1.0) };
+    const expected_q = [_]f32{ -2.0, 7.5, -5.0, 4.5 };
+    const expected_k = [_]f32{ 6.0, 3.5 };
+    const expected_v = [_]f32{ 2.0, 5.0 };
+    var k_weight = try buffer_mod.DeviceBuffer.alloc(ctx, k_weight_data.len * @sizeOf(u16));
+    defer k_weight.free(ctx);
+    var v_weight = try buffer_mod.DeviceBuffer.alloc(ctx, v_weight_data.len * @sizeOf(u16));
+    defer v_weight.free(ctx);
+    var q_output = try buffer_mod.DeviceBuffer.alloc(ctx, rows * q_out_dim * @sizeOf(f32));
+    defer q_output.free(ctx);
+    var k_output = try buffer_mod.DeviceBuffer.alloc(ctx, rows * kv_out_dim * @sizeOf(f32));
+    defer k_output.free(ctx);
+    var v_output = try buffer_mod.DeviceBuffer.alloc(ctx, rows * kv_out_dim * @sizeOf(f32));
+    defer v_output.free(ctx);
+    try k_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&k_weight_data));
+    try v_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&v_weight_data));
+    try module.launchLinearBf16WeightF32QkvNoBiasTiled(ctx, q_output, k_output, v_output, input, weight, k_weight, v_weight, rows, in_dim, q_out_dim, kv_out_dim);
+    try ctx.synchronize();
+
+    const q_out = try allocator.alloc(f32, rows * q_out_dim);
+    defer allocator.free(q_out);
+    const k_out = try allocator.alloc(f32, rows * kv_out_dim);
+    defer allocator.free(k_out);
+    const v_out = try allocator.alloc(f32, rows * kv_out_dim);
+    defer allocator.free(v_out);
+    try q_output.copyToHost(ctx, std.mem.sliceAsBytes(q_out));
+    try k_output.copyToHost(ctx, std.mem.sliceAsBytes(k_out));
+    try v_output.copyToHost(ctx, std.mem.sliceAsBytes(v_out));
+    try ctx.synchronize();
+    try expectApproxSlice(q_out, &expected_q, 0.0001);
+    try expectApproxSlice(k_out, &expected_k, 0.0001);
+    try expectApproxSlice(v_out, &expected_v, 0.0001);
+}
+
+fn smokeAddMulScalarF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const a_data = [_]f32{ 1.0, -2.0, 3.5, 0.25 };
+    const b_data = [_]f32{ 0.5, 4.0, -1.5, 1.75 };
+    const scale_data = [_]f32{0.25};
+    const expected = [_]f32{ 0.75, 3.5, -0.625, 1.8125 };
+
+    var a = try buffer_mod.DeviceBuffer.alloc(ctx, a_data.len * @sizeOf(f32));
+    defer a.free(ctx);
+    var b = try buffer_mod.DeviceBuffer.alloc(ctx, b_data.len * @sizeOf(f32));
+    defer b.free(ctx);
+    var scale = try buffer_mod.DeviceBuffer.alloc(ctx, scale_data.len * @sizeOf(f32));
+    defer scale.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, a_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try a.copyFromHost(ctx, std.mem.sliceAsBytes(&a_data));
+    try b.copyFromHost(ctx, std.mem.sliceAsBytes(&b_data));
+    try scale.copyFromHost(ctx, std.mem.sliceAsBytes(&scale_data));
+    try module.launchAddMulScalarF32(ctx, output, a, b, scale, a_data.len);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, a_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+}
+
+fn smokeRmsNormAddMulScalarF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const rows: usize = 2;
+    const dim: usize = 3;
+    const eps: f32 = 1.0e-5;
+    const input_data = [_]f32{ 1.0, 2.0, -1.0, -2.0, 0.5, 4.0 };
+    const weight_data = [_]f32{ 1.0, -0.5, 2.0 };
+    const residual_data = [_]f32{ 0.25, 0.5, -0.75, 1.0, -1.0, 0.0 };
+    const scale_data = [_]f32{0.5};
+    var expected: [rows * dim]f32 = undefined;
+    for (0..rows) |row| {
+        const src = input_data[row * dim ..][0..dim];
+        var sumsq: f32 = 0.0;
+        for (src) |value| sumsq += value * value;
+        const norm_scale = 1.0 / std.math.sqrt(sumsq / @as(f32, @floatFromInt(dim)) + eps);
+        for (0..dim) |col| {
+            const idx = row * dim + col;
+            const normed = input_data[idx] * norm_scale * weight_data[col];
+            expected[idx] = normed * scale_data[0] + residual_data[idx];
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_data.len * @sizeOf(f32));
+    defer weight.free(ctx);
+    var residual = try buffer_mod.DeviceBuffer.alloc(ctx, residual_data.len * @sizeOf(f32));
+    defer residual.free(ctx);
+    var scale = try buffer_mod.DeviceBuffer.alloc(ctx, scale_data.len * @sizeOf(f32));
+    defer scale.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try weight.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_data));
+    try residual.copyFromHost(ctx, std.mem.sliceAsBytes(&residual_data));
+    try scale.copyFromHost(ctx, std.mem.sliceAsBytes(&scale_data));
+    try module.launchRmsNormAddMulScalarF32(ctx, output, input, weight, residual, scale, rows, dim, eps);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+}
+
+fn smokeRmsNormHeadsRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const rows: usize = 2;
+    const total_dim: usize = 4;
+    const head_dim: usize = 2;
+    const rope_dim: usize = 2;
+    const eps: f32 = 1.0e-5;
+    const theta: f32 = 10000.0;
+    const input_data = [_]f32{ 1.0, 2.0, -1.0, 0.5, 0.25, -0.75, 3.0, -2.0 };
+    const weight_data = [_]f32{ 1.0, 0.5 };
+    const output_scale: f32 = 1.25;
+    var normed: [rows * total_dim]f32 = undefined;
+    for (0..(rows * total_dim / head_dim)) |chunk| {
+        const src = input_data[chunk * head_dim ..][0..head_dim];
+        var sumsq: f32 = 0.0;
+        for (src) |value| sumsq += value * value;
+        const norm_scale = 1.0 / std.math.sqrt(sumsq / @as(f32, @floatFromInt(head_dim)) + eps);
+        for (0..head_dim) |col| normed[chunk * head_dim + col] = src[col] * norm_scale * weight_data[col];
+    }
+    var expected: [rows * total_dim]f32 = undefined;
+    for (0..(rows * total_dim / head_dim)) |chunk| {
+        const token_pos = (chunk / (total_dim / head_dim)) % rows;
+        expectedRopePair(normed[chunk * head_dim ..][0..head_dim], expected[chunk * head_dim ..][0..head_dim], @floatFromInt(token_pos), theta, 1.0);
+        for (expected[chunk * head_dim ..][0..head_dim]) |*value| value.* *= output_scale;
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_data.len * @sizeOf(f32));
+    defer weight.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try weight.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_data));
+    try module.launchRmsNormHeadsRopeF32(ctx, output, input, weight, rows, total_dim, head_dim, rope_dim, eps, theta, 1.0, 0, rows, false, output_scale);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
+}
+
+fn smokeGemma4MtpMaskedArgmaxF32(ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const logits = [_]f32{ 0.1, 0.2, 9.0, 0.4, 0.5, 0.6, 8.0, 0.7 };
+    const centroid_logits = [_]f32{ 0.25, 1.0 };
+    const token_ordering = [_]f32{ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0 };
+
+    var logits_device = try buffer_mod.DeviceBuffer.alloc(ctx, logits.len * @sizeOf(f32));
+    defer logits_device.free(ctx);
+    var centroid_device = try buffer_mod.DeviceBuffer.alloc(ctx, centroid_logits.len * @sizeOf(f32));
+    defer centroid_device.free(ctx);
+    var ordering_device = try buffer_mod.DeviceBuffer.alloc(ctx, token_ordering.len * @sizeOf(f32));
+    defer ordering_device.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(u32));
+    defer output.free(ctx);
+
+    try logits_device.copyFromHost(ctx, std.mem.sliceAsBytes(&logits));
+    try centroid_device.copyFromHost(ctx, std.mem.sliceAsBytes(&centroid_logits));
+    try ordering_device.copyFromHost(ctx, std.mem.sliceAsBytes(&token_ordering));
+    const launched = try module.launchGemma4MtpMaskedArgmaxF32(ctx, output, logits_device, centroid_device, ordering_device, logits.len, centroid_logits.len, 1, false);
+    if (!launched) return error.CudaKernelUnavailable;
+    try ctx.synchronize();
+
+    var actual: u32 = 0;
+    try output.copyToHost(ctx, std.mem.asBytes(&actual));
+    try ctx.synchronize();
+    if (actual != 6) return error.CudaSmokeMismatch;
 }
 
 fn smokeLinearF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -3751,6 +4164,20 @@ fn fillRopeSmokeExpected(dst: []f32, position: usize, theta: f32, freq_scale: f3
     dst[1] = -std.math.sin(angle1);
     dst[2] = std.math.sin(angle0);
     dst[3] = std.math.cos(angle1);
+}
+
+fn expectedRopePair(input: []const f32, dst: []f32, position: f32, theta: f32, freq_scale: f32) void {
+    std.debug.assert(input.len == 2);
+    std.debug.assert(dst.len == 2);
+    const angle = position * freq_scale / std.math.pow(f32, theta, 0.0);
+    const s = std.math.sin(angle);
+    const c = std.math.cos(angle);
+    dst[0] = input[0] * c - input[1] * s;
+    dst[1] = input[0] * s + input[1] * c;
+}
+
+fn bf16Bits(value: f32) u16 {
+    return @intCast(@as(u32, @bitCast(value)) >> 16);
 }
 
 fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32) !void {

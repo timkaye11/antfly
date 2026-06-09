@@ -1272,13 +1272,39 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
 
     var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, override);
-    defer native_session.close();
+    var native_session_live = true;
+    errdefer if (native_session_live) native_session.close();
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
     const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
+    const retain_host_session = native_impl.backend_data.native.lazy_weights.count() > 0;
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE")) {
+        var resident_bytes: usize = 0;
+        var resident_it = native_impl.backend_data.native.resident_weights.iterator();
+        while (resident_it.next()) |entry| {
+            if (entry.value_ptr.quantized_storage) |storage| {
+                resident_bytes += storage.raw_bytes.len;
+            } else {
+                resident_bytes += entry.value_ptr.tensor.data.len;
+            }
+        }
+        var lazy_bytes: usize = 0;
+        var lazy_it = native_impl.backend_data.native.lazy_weights.iterator();
+        while (lazy_it.next()) |entry| lazy_bytes += entry.value_ptr.tensor_ref.byte_len;
+        std.log.info(
+            "cuda_lazy_profile: native_resident_count={d} native_resident_mb={d} native_lazy_count={d} native_lazy_mb={d}",
+            .{
+                native_impl.backend_data.native.resident_weights.count(),
+                resident_bytes / (1024 * 1024),
+                native_impl.backend_data.native.lazy_weights.count(),
+                lazy_bytes / (1024 * 1024),
+            },
+        );
+    }
 
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
-    errdefer cuda_compute.deinit();
+    var cuda_compute_live = true;
+    errdefer if (cuda_compute_live) cuda_compute.deinit();
     try cuda_compute.requireProfile(cuda_profile);
     var it = native_impl.backend_data.native.resident_weights.iterator();
     while (it.next()) |entry| {
@@ -1290,13 +1316,28 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     }
 
     const impl = try allocator.create(ArchSession);
+    var impl_initialized = false;
+    errdefer if (impl_initialized) archClose(impl) else allocator.destroy(impl);
     impl.* = .{
         .allocator = allocator,
         .arch_config = native_impl.arch_config,
         .task = native_impl.task,
         .backend_type = .cuda,
-        .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
+        .backend_data = .{ .cuda = .{
+            .compute = cuda_compute,
+            .host_session = if (retain_host_session) native_session else null,
+        } },
     };
+    cuda_compute_live = false;
+    impl_initialized = true;
+    if (retain_host_session) {
+        native_session_live = false;
+        try impl.backend_data.cuda.compute.attachLazyHostStore(&native_impl.backend_data.native);
+    } else {
+        native_session.close();
+        native_session_live = false;
+    }
+    impl_initialized = false;
     return .{ .ptr = impl, .vtable = &arch_vtable };
 }
 
@@ -2973,11 +3014,40 @@ fn refineGptConfigFromStore(
 }
 
 fn shouldLazyLoadWeight(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8) bool {
+    if (store_kind == .safetensors) {
+        return switch (arch_config) {
+            .gpt => |cfg| cfg.family == .gemma and shouldLazyLoadGemmaSafetensorsWeight(key),
+            else => false,
+        };
+    }
     if (store_kind != .gguf) return false;
     return switch (arch_config) {
         .gpt => |cfg| cfg.usesMoe() and (std.mem.indexOf(u8, key, ".block_sparse_moe.experts.") != null or (cfg.family == .deepseek_v4 and std.mem.indexOf(u8, key, ".mlp.experts.") != null)),
         else => false,
     };
+}
+
+fn shouldLazyLoadGemmaSafetensorsWeight(key: []const u8) bool {
+    if (std.mem.startsWith(u8, key, "model.language_model.layers.")) return true;
+    if (std.mem.startsWith(u8, key, "language_model.layers.")) return true;
+    if (std.mem.startsWith(u8, key, "layers.")) return true;
+    if (std.mem.startsWith(u8, key, "model.layers.")) return true;
+    if (std.mem.startsWith(u8, key, "model.embed_audio.")) return true;
+    if (std.mem.startsWith(u8, key, "model.embed_vision.")) return true;
+    if (std.mem.startsWith(u8, key, "model.vision_embedder.")) return true;
+    if (std.mem.startsWith(u8, key, "embed_audio.")) return true;
+    if (std.mem.startsWith(u8, key, "embed_vision.")) return true;
+    if (std.mem.startsWith(u8, key, "vision_embedder.")) return true;
+    return false;
+}
+
+test "gemma safetensors lazy loading keeps hot text globals resident" {
+    try std.testing.expect(shouldLazyLoadWeight(.safetensors, .{ .gpt = .{ .family = .gemma } }, "model.language_model.layers.0.self_attn.q_proj.weight"));
+    try std.testing.expect(shouldLazyLoadWeight(.safetensors, .{ .gpt = .{ .family = .gemma } }, "layers.0.self_attn.q_proj.weight"));
+    try std.testing.expect(shouldLazyLoadWeight(.safetensors, .{ .gpt = .{ .family = .gemma } }, "model.vision_embedder.patch_dense.weight"));
+    try std.testing.expect(!shouldLazyLoadWeight(.safetensors, .{ .gpt = .{ .family = .gemma } }, "embed_tokens.weight"));
+    try std.testing.expect(!shouldLazyLoadWeight(.safetensors, .{ .gpt = .{ .family = .gemma } }, "norm.weight"));
+    try std.testing.expect(!shouldLazyLoadWeight(.safetensors, .{ .gpt = .{ .family = .qwen2 } }, "layers.0.self_attn.q_proj.weight"));
 }
 
 fn shouldKeepResidentWeightQuantizedOnly(
@@ -3344,7 +3414,8 @@ pub fn widenBudgetLimitsForModelPath(
     switch (backend_type) {
         .mlx => if (!build_options.enable_mlx) return limits,
         .metal => if (!build_options.enable_metal) return limits,
-        else => unreachable,
+        .cuda => return limits,
+        else => return limits,
     }
 
     const direct_quant_enabled = directQuantEnabled();
@@ -4405,6 +4476,7 @@ const PjrtData = struct {
 
 const CudaData = struct {
     compute: if (build_options.enable_cuda) cuda_compute_mod.CudaCompute else void,
+    host_session: ?Session = null,
 };
 
 const BackendData = union {
@@ -4530,7 +4602,20 @@ fn makeComputeBackend(
                     .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
                 });
             },
-            .cuda => {},
+            .cuda => if (comptime build_options.enable_cuda) {
+                self.backend_data.cuda.compute.configureRunBudget(budget);
+                if (self.backend_data.cuda.host_session) |host_session| {
+                    const host_impl: *ArchSession = @ptrCast(@alignCast(host_session.ptr));
+                    if (host_impl.backend_type == .native) {
+                        if (host_impl.backend_data.native.tier_cache) |*tier_cache| {
+                            tier_cache.widenToAtLeast(.{
+                                .host_limit_bytes = @max(budget.limits.host_limit_bytes, self.shared_cache_budget_floor.host_limit_bytes),
+                                .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
+                            });
+                        }
+                    }
+                }
+            },
             .onnx => {},
             .wasm => {},
         }
@@ -4557,10 +4642,10 @@ fn makeComputeBackend(
                 NativeCompute.init(allocator, &self.backend_data.pjrt.native, run_budget);
             break :blk compute.computeBackend();
         },
-        .cuda => if (comptime build_options.enable_cuda)
-            self.backend_data.cuda.compute.computeBackend()
-        else
-            return error.CudaNotEnabled,
+        .cuda => if (comptime build_options.enable_cuda) blk: {
+            if (run_budget == null) self.backend_data.cuda.compute.configureRunBudget(null);
+            break :blk self.backend_data.cuda.compute.computeBackend();
+        } else return error.CudaNotEnabled,
         .onnx => return error.OnnxNotSupportedHere,
         .wasm => return error.WasmNotSupportedHere,
     };
@@ -4624,6 +4709,31 @@ pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.p
             break :blk .f16;
         },
     };
+}
+
+test "recommended kv dtype keeps gemma cuda on f32 until compressed kv fast path exists" {
+    const allocator = std.testing.allocator;
+    var arch_session = ArchSession{
+        .allocator = allocator,
+        .arch_config = .{ .gpt = .{ .family = .gemma } },
+        .backend_type = .native,
+        .backend_data = .{ .native = .{
+            .allocator = allocator,
+            .resident_weights = .{},
+            .lazy_weights = .{},
+        } },
+    };
+    const session = Session{
+        .ptr = &arch_session,
+        .vtable = &arch_vtable,
+    };
+
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForSession(session, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForSession(session, .metal));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForSession(session, .mlx));
+
+    arch_session.arch_config = .{ .gpt = .{ .family = .qwen2 } };
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForSession(session, .cuda));
 }
 
 pub fn getClipConfig(session: Session) ?clip_mod.Config {
@@ -5839,6 +5949,9 @@ fn archClose(ptr: *anyopaque) void {
         .cuda => {
             if (comptime build_options.enable_cuda) {
                 self.backend_data.cuda.compute.deinit();
+                if (self.backend_data.cuda.host_session) |host_session| {
+                    host_session.close();
+                }
             }
         },
         .onnx => {},
@@ -5907,6 +6020,7 @@ test "gemma gguf norm aliases stay distinct" {
     var buf3: [256]u8 = undefined;
     var buf4: [256]u8 = undefined;
     var buf5: [256]u8 = undefined;
+    var buf6: [256]u8 = undefined;
 
     const attn = normalizeGgufGptWeightKey(cfg, "blk.0.attn_norm.weight", &buf0).?;
     const q = normalizeGgufGptWeightKey(cfg, "blk.0.attn_q_norm.weight", &buf1).?;
@@ -5914,6 +6028,7 @@ test "gemma gguf norm aliases stay distinct" {
     const ffn = normalizeGgufGptWeightKey(cfg, "blk.0.ffn_norm.weight", &buf3).?;
     const post_attn = normalizeGgufGptWeightKey(cfg, "blk.0.post_attention_norm.weight", &buf4).?;
     const post_ffn = normalizeGgufGptWeightKey(cfg, "blk.0.post_ffw_norm.weight", &buf5).?;
+    const layer_output_scale = normalizeGgufGptWeightKey(cfg, "blk.0.layer_output_scale.weight", &buf6).?;
 
     try std.testing.expectEqualStrings("model.layers.0.input_layernorm.weight", attn);
     try std.testing.expectEqualStrings("model.layers.0.self_attn.q_norm.weight", q);
@@ -5921,6 +6036,7 @@ test "gemma gguf norm aliases stay distinct" {
     try std.testing.expectEqualStrings("model.layers.0.pre_feedforward_layernorm.weight", ffn);
     try std.testing.expectEqualStrings("model.layers.0.post_attention_layernorm.weight", post_attn);
     try std.testing.expectEqualStrings("model.layers.0.post_feedforward_layernorm.weight", post_ffn);
+    try std.testing.expectEqualStrings("model.layers.0.per_layer_input.layer_output_scale.weight", layer_output_scale);
 }
 
 test "overlay gpt structural config keeps gguf gemma norm offset" {

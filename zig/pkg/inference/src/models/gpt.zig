@@ -2200,6 +2200,9 @@ test "parse gemma4 12b unified config aliases" {
         \\  "boi_token_id": 255999,
         \\  "eoi_token_id": 258882,
         \\  "text_config": {
+        \\    "bos_token_id": 2,
+        \\    "eos_token_id": 1,
+        \\    "pad_token_id": 0,
         \\    "model_type": "gemma4_unified_text",
         \\    "hidden_size": 3840,
         \\    "num_hidden_layers": 48,
@@ -2214,6 +2217,8 @@ test "parse gemma4 12b unified config aliases" {
         \\    "tie_word_embeddings": true,
         \\    "vocab_size": 262144,
         \\    "hidden_activation": "gelu_pytorch_tanh",
+        \\    "rms_norm_eps": 1e-6,
+        \\    "final_logit_softcapping": 30.0,
         \\    "layer_types": [
         \\      "sliding_attention", "sliding_attention", "sliding_attention",
         \\      "sliding_attention", "sliding_attention", "full_attention"
@@ -2236,6 +2241,9 @@ test "parse gemma4 12b unified config aliases" {
     try std.testing.expectEqual(@as(i32, 258880), config.image_token_index);
     try std.testing.expectEqual(@as(i32, 255999), config.boi_token_index);
     try std.testing.expectEqual(@as(i32, 258882), config.eoi_token_index);
+    try std.testing.expectEqual(@as(i32, 2), config.bos_token_id);
+    try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
+    try std.testing.expectEqual(@as(i32, 0), config.pad_token_id);
     try std.testing.expectEqual(@as(u32, 3840), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 16), config.num_attention_heads);
@@ -2251,6 +2259,9 @@ test "parse gemma4 12b unified config aliases" {
     try std.testing.expectEqual(@as(f32, 0.25), config.rope_partial_factor);
     try std.testing.expectEqual(@as(f32, 1000000.0), config.rope_theta);
     try std.testing.expectEqual(@as(f32, 10000.0), config.rope_local_theta);
+    try std.testing.expectEqual(ActivationType.gelu_new, config.activation);
+    try std.testing.expectEqual(@as(f32, 1e-6), config.norm_eps);
+    try std.testing.expectEqual(@as(f32, 30.0), config.final_logit_softcapping);
     try std.testing.expectEqual(@as(u32, 8), config.effectiveKVHeadsForLayer(0));
     try std.testing.expectEqual(@as(u32, 1), config.effectiveKVHeadsForLayer(5));
     try std.testing.expectEqual(@as(u32, 256), config.effectiveHeadDimForLayer(0));
@@ -2488,6 +2499,41 @@ test "parse gguf metadata for gemma4 shared kv config" {
     try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(4)); // global
 }
 
+test "parse gguf metadata for gemma4 assistant mtp fields" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 11);
+
+    try appendMetadataString(allocator, &data, "general.architecture", "gemma4_assistant");
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.embedding_length", 256);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.block_count", 4);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.attention.head_count", 4);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.attention.head_count_kv", 1);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.feed_forward_length", 1024);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.context_length", 131072);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.backbone_hidden_size", 1536);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.num_centroids", 2048);
+    try appendMetadataU32(allocator, &data, "gemma4_assistant.centroid_intermediate_top_k", 32);
+    try appendMetadataBool(allocator, &data, "gemma4_assistant.use_ordered_embeddings", true);
+
+    var parsed = try @import("../gguf/format.zig").parse(allocator, data.items);
+    defer parsed.deinit(allocator);
+
+    const view = gguf_metadata.View.init(&parsed);
+    const config = parseGgufMetadata(view).?;
+    try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.gemma4_mtp_assistant);
+    try std.testing.expectEqual(@as(u32, 1536), config.mtp_backbone_hidden_size);
+    try std.testing.expectEqual(@as(u32, 2048), config.mtp_num_centroids);
+    try std.testing.expectEqual(@as(u32, 32), config.mtp_centroid_intermediate_top_k);
+    try std.testing.expect(config.mtp_use_ordered_embeddings);
+}
+
 test "gemma family defaults to gelu_new activation" {
     var config = Config{
         .family = .gemma,
@@ -2541,6 +2587,12 @@ fn appendMetadataF32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged
     try appendString(allocator, data, key);
     try appendLe(u32, allocator, data, 6);
     try appendLe(u32, allocator, data, @bitCast(value));
+}
+
+fn appendMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
+    try appendString(allocator, data, key);
+    try appendLe(u32, allocator, data, 7);
+    try data.append(allocator, if (value) @as(u8, 1) else 0);
 }
 
 fn appendMetadataBoolArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const bool) !void {

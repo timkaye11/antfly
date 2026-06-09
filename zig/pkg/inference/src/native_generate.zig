@@ -1080,6 +1080,56 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.device_allocated_bytes,
                     },
                 );
+                print(
+                    "cuda_lazy_profile: prefetch_enqueues={d} prefetch_duplicates={d} prefetch_missing={d} prefetch_cancelled_for_demand={d} drain_calls={d} demand_loads={d} host_prefetch_hits={d} host_load_ms={d} page_touch_ms={d} upload_ms={d} uploaded_mb={d}\n",
+                    .{
+                        cuda_stats.lazy_prefetch_enqueues,
+                        cuda_stats.lazy_prefetch_duplicates,
+                        cuda_stats.lazy_prefetch_missing,
+                        cuda_stats.lazy_prefetch_cancelled_for_demand,
+                        cuda_stats.lazy_prefetch_drain_calls,
+                        cuda_stats.lazy_demand_loads,
+                        cuda_stats.lazy_host_prefetch_hits,
+                        cuda_stats.lazy_host_load_ns / 1_000_000,
+                        cuda_stats.lazy_host_page_touch_ns / 1_000_000,
+                        cuda_stats.lazy_upload_ns / 1_000_000,
+                        cuda_stats.lazy_uploaded_bytes / (1024 * 1024),
+                    },
+                );
+                print(
+                    "cuda_ffn_stream_profile: requests={d} hits={d} misses={d} fallbacks={d} evictions={d} read_ms={d} h2d_ms={d} read_mb={d} uploaded_mb={d} resident_mb={d} fadvise_calls={d}\n",
+                    .{
+                        cuda_stats.ffn_stream_requests,
+                        cuda_stats.ffn_stream_hits,
+                        cuda_stats.ffn_stream_misses,
+                        cuda_stats.ffn_stream_fallbacks,
+                        cuda_stats.ffn_stream_evictions,
+                        cuda_stats.ffn_stream_read_ns / 1_000_000,
+                        cuda_stats.ffn_stream_h2d_ns / 1_000_000,
+                        cuda_stats.ffn_stream_read_bytes / (1024 * 1024),
+                        cuda_stats.ffn_stream_uploaded_bytes / (1024 * 1024),
+                        cuda_stats.ffn_stream_resident_bytes / (1024 * 1024),
+                        cuda_stats.ffn_stream_fadvise_calls,
+                    },
+                );
+                print(
+                    "cuda_dense_stream_profile: requests={d} hits={d} misses={d} fallbacks={d} evictions={d} read_ms={d} h2d_ms={d} read_mb={d} uploaded_mb={d} resident_mb={d} fadvise_calls={d} attention_loads={d} mlp_loads={d}\n",
+                    .{
+                        cuda_stats.dense_stream_requests,
+                        cuda_stats.dense_stream_hits,
+                        cuda_stats.dense_stream_misses,
+                        cuda_stats.dense_stream_fallbacks,
+                        cuda_stats.dense_stream_evictions,
+                        cuda_stats.dense_stream_read_ns / 1_000_000,
+                        cuda_stats.dense_stream_h2d_ns / 1_000_000,
+                        cuda_stats.dense_stream_read_bytes / (1024 * 1024),
+                        cuda_stats.dense_stream_uploaded_bytes / (1024 * 1024),
+                        cuda_stats.dense_stream_resident_bytes / (1024 * 1024),
+                        cuda_stats.dense_stream_fadvise_calls,
+                        cuda_stats.dense_stream_attention_loads,
+                        cuda_stats.dense_stream_mlp_loads,
+                    },
+                );
                 const attributed_launches =
                     cuda_stats.launch_embedding +
                     cuda_stats.launch_linear +
@@ -1184,6 +1234,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.qkv_fused_f32,
                         cuda_stats.qkv_fallback_unsupported,
                         cuda_stats.qkv_kernel_unavailable,
+                    },
+                );
+                print(
+                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d}\n",
+                    .{
+                        cuda_stats.bf16_cublaslt_linear_calls,
+                        cuda_stats.bf16_cublaslt_qkv_calls,
+                        cuda_stats.bf16_cublaslt_activation_staging_calls,
+                        cuda_stats.bf16_cublaslt_fallbacks,
+                        cuda_stats.bf16_scalar_linear_calls,
+                        cuda_stats.bf16_scalar_qkv_calls,
                     },
                 );
                 print(
@@ -2427,7 +2488,7 @@ fn preflightModelLoadBudget(
     opts: Options,
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
-    const weight_bytes = estimateModelArtifactBytes(allocator, manifest) catch 0;
+    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
     if (weight_bytes == 0) return;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
@@ -2437,7 +2498,11 @@ fn preflightModelLoadBudget(
     });
     const predicted_backend_type: backends.BackendType = switch (reservation_tier) {
         .host => .native,
-        .backend => if (opts.backend == .metal) .metal else .mlx,
+        .backend => switch (opts.backend) {
+            .metal => .metal,
+            .cuda => .cuda,
+            else => .mlx,
+        },
         .disk => unreachable,
     };
     limits = try session_factory.widenBudgetLimitsForModelPath(
@@ -2503,6 +2568,25 @@ fn estimateModelArtifactBytes(
     if (manifest.gguf_path) |path| return @intCast(try c_file.fileSize(allocator, path));
     if (manifest.safetensors_path) |path| return @intCast(try c_file.fileSize(allocator, path));
     return 0;
+}
+
+fn estimatePreflightWeightBytes(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    opts: Options,
+) !usize {
+    const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
+    if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
+
+    const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return artifact_bytes;
+    if (cfg.family != .gemma) return artifact_bytes;
+
+    const embed_elements = std.math.mul(usize, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch return artifact_bytes;
+    const embed_bytes = std.math.mul(usize, embed_elements, @sizeOf(f32)) catch return artifact_bytes;
+    const overhead_bytes: usize = 512 * 1024 * 1024;
+    return @min(artifact_bytes, embed_bytes + overhead_bytes);
 }
 
 fn mlxEagerDenseMaxBytes() u64 {

@@ -3507,6 +3507,49 @@ test "fuse preserves already-optimal graph" {
     try std.testing.expectEqual(g.nodeCount(), result.graph.nodeCount());
 }
 
+test "fuse detects add multiplied by scalar" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const y = try b.parameter("y", Shape.init(.f32, &.{ 2, 4 }));
+    const scale = try b.scalarConst(.f32, 0.5);
+    const sum = try b.add(x, y);
+    const out = try b.mul(sum, scale);
+    try g.markOutput(out);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.num_rewrites);
+    const out_id = result.graph.outputs.items[0];
+    try std.testing.expectEqual(@as(usize, 3), result.graph.node(out_id).num_inputs);
+    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = {} }, result.graph.node(out_id).op);
+}
+
+test "fuse skips add multiplied by non-scalar tensor" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const y = try b.parameter("y", Shape.init(.f32, &.{ 2, 4 }));
+    const scale = try b.parameter("scale", Shape.init(.f32, &.{ 2, 4 }));
+    const sum = try b.add(x, y);
+    const out = try b.mul(sum, scale);
+    try g.markOutput(out);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.num_rewrites);
+    const out_id = result.graph.outputs.items[0];
+    try std.testing.expectEqualDeep(OpCode{ .mul = {} }, result.graph.node(out_id).op);
+}
+
 test "fuse preserves fused ops" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);

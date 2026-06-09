@@ -3857,6 +3857,21 @@ pub const NativeGenerationPipeline = struct {
         claimed: []const runtime.scheduler.native_generate.StepItem,
         err: anyerror,
     ) void {
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE")) {
+            for (claimed) |item| {
+                std.log.err(
+                    "scheduled_step_failed: phase={s} err={s} query_seq_len={d} total_seq_len={d} kv_seq_len={d} kv_pos={d}",
+                    .{
+                        @tagName(item.phase),
+                        @errorName(err),
+                        item.query_sequence_len,
+                        item.total_sequence_len,
+                        item.kv_sequence_len,
+                        item.kv_position_offset,
+                    },
+                );
+            }
+        }
         for (claimed) |item| {
             switch (item.phase) {
                 .decode => {

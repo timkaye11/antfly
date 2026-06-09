@@ -524,7 +524,7 @@ fn preflightModelLoadBudget(
     opts: Options,
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
-    const weight_bytes = estimateModelArtifactBytes(allocator, manifest) catch 0;
+    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
     if (weight_bytes == 0) return;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
@@ -607,6 +607,25 @@ fn estimateModelArtifactBytes(
     if (manifest.gguf_path) |path| return @intCast(try c_file.fileSize(allocator, path));
     if (manifest.safetensors_path) |path| return @intCast(try c_file.fileSize(allocator, path));
     return 0;
+}
+
+fn estimatePreflightWeightBytes(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    opts: Options,
+) !usize {
+    const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
+    if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
+
+    const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return artifact_bytes;
+    if (cfg.family != .gemma) return artifact_bytes;
+
+    const embed_elements = std.math.mul(usize, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch return artifact_bytes;
+    const embed_bytes = std.math.mul(usize, embed_elements, @sizeOf(f32)) catch return artifact_bytes;
+    const overhead_bytes: usize = 512 * 1024 * 1024;
+    return @min(artifact_bytes, embed_bytes + overhead_bytes);
 }
 
 fn mlxEagerDenseMaxBytes() u64 {
