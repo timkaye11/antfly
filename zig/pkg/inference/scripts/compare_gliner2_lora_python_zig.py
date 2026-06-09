@@ -61,6 +61,20 @@ def summarize_upstream_output(output: dict[str, Any], labels: set[str], allowed_
     return counts
 
 
+def ensure_terminal_punctuation(text: str) -> str:
+    """Mirror upstream SchemaTransformer text normalization.
+
+    The upstream processor appends "." to any training text that does not end
+    with sentence punctuation. Bake that into the converted JSONL so the Zig
+    side (which consumes the converted file directly) sees identical text.
+    """
+    if text and not text.endswith((".", "!", "?")):
+        return text + "."
+    if not text:
+        return "."
+    return text
+
+
 def normalize_python_record(record: dict[str, Any], allowed_labels: set[str] | None) -> tuple[dict[str, Any], dict[str, int], set[str]]:
     labels: set[str] = set()
     if "input" in record and "output" in record:
@@ -72,7 +86,7 @@ def normalize_python_record(record: dict[str, Any], allowed_labels: set[str] | N
                 if label in allowed_labels
             }
         counts = summarize_upstream_output(output, labels, allowed_labels)
-        return {"input": record["input"], "output": output}, counts, labels
+        return {"input": ensure_terminal_punctuation(record["input"]), "output": output}, counts, labels
 
     grouped: dict[str, list[str]] = {}
     for ent in record.get("entities", []):
@@ -82,7 +96,7 @@ def normalize_python_record(record: dict[str, Any], allowed_labels: set[str] | N
         grouped.setdefault(label, []).append(ent["text"])
         labels.add(label)
     return (
-        {"input": record["text"], "output": {"entities": grouped}},
+        {"input": ensure_terminal_punctuation(record["text"]), "output": {"entities": grouped}},
         {"entity_mentions": sum(len(v) for v in grouped.values()), "classifications": 0, "json_structures": 0, "relations": 0},
         labels,
     )
@@ -1021,6 +1035,16 @@ if args.no_train_shuffle:
     trainer.processor._infer_from_json = types.MethodType(_infer_from_json_ordered, trainer.processor)
     trainer.processor._build_classification_prefix = types.MethodType(_build_classification_prefix_ordered, trainer.processor)
     trainer.processor._process_json_structures = types.MethodType(_process_json_structures_ordered, trainer.processor)
+# Pin the structure-loss negative masking rate unconditionally. Upstream
+# compute_struct_loss defaults to masking_rate=0.5; without this patch a
+# --span-negative-mask-rate 0 run would still randomly mask negatives on the
+# Python side whenever --dump-parity is off.
+_mask_rate_model = getattr(trainer.model, "model", trainer.model)
+_orig_compute_struct_loss = _mask_rate_model.compute_struct_loss
+def _compute_struct_loss_pinned_mask_rate(span_rep, schema_emb, structure, span_mask, masking_rate=args.span_negative_mask_rate):
+    return _orig_compute_struct_loss(span_rep, schema_emb, structure, span_mask, masking_rate)
+_mask_rate_model.compute_struct_loss = _compute_struct_loss_pinned_mask_rate
+
 python_step_timings = []
 original_create_dataloader = trainer._create_dataloader
 original_prepare_data = trainer._prepare_data
@@ -1561,6 +1585,339 @@ print("PYTHON_GLINER2_COMPARISON " + json.dumps(payload, sort_keys=True))
 '''
 
 
+def adapter_roundtrip_script() -> str:
+    return r'''
+import argparse, json, math, os, pathlib, types
+import torch
+import gliner2.model as gliner2_model
+from gliner2.model import Extractor
+from gliner2.training.trainer import ExtractorCollator
+from safetensors.torch import load_file, save_file
+from transformers import AutoConfig
+
+p = argparse.ArgumentParser()
+p.add_argument("--model-dir", required=True)
+p.add_argument("--train-data", required=True)
+p.add_argument("--python-adapter-dir", required=True)
+p.add_argument("--zig-adapter-checkpoint", required=True)
+p.add_argument("--converted-zig-adapter-dir", required=True)
+p.add_argument("--result-json", required=True)
+p.add_argument("--batch-size", type=int, required=True)
+p.add_argument("--max-span-width", type=int, required=True)
+p.add_argument("--seed", type=int, required=True)
+p.add_argument("--tolerance", type=float, required=True)
+args = p.parse_args()
+
+torch.manual_seed(args.seed)
+
+_extractor_config_from_pretrained = Extractor.config_class.from_pretrained
+def _local_file_aware_extractor_config(cls, path_or_repo_id, *cfg_args, **cfg_kwargs):
+    if isinstance(path_or_repo_id, (str, os.PathLike)) and os.path.isfile(path_or_repo_id):
+        return cls.from_json_file(os.fspath(path_or_repo_id))
+    return _extractor_config_from_pretrained(path_or_repo_id, *cfg_args, **cfg_kwargs)
+Extractor.config_class.from_pretrained = classmethod(_local_file_aware_extractor_config)
+
+_auto_config_from_pretrained = AutoConfig.from_pretrained
+def _local_file_aware_auto_config(path_or_repo_id, *cfg_args, **cfg_kwargs):
+    if isinstance(path_or_repo_id, (str, os.PathLike)) and os.path.isfile(path_or_repo_id):
+        return _auto_config_from_pretrained(os.path.dirname(os.fspath(path_or_repo_id)), *cfg_args, **cfg_kwargs)
+    return _auto_config_from_pretrained(path_or_repo_id, *cfg_args, **cfg_kwargs)
+AutoConfig.from_pretrained = _local_file_aware_auto_config
+gliner2_model.AutoConfig.from_pretrained = _local_file_aware_auto_config
+
+python_adapter_dir = pathlib.Path(args.python_adapter_dir)
+converted_dir = pathlib.Path(args.converted_zig_adapter_dir)
+converted_dir.mkdir(parents=True, exist_ok=True)
+
+# PEFT-migrated gliner2 saves `adapter_model.safetensors` with
+# `base_model.model.<module>.lora_{A,B}.weight` keys; the legacy gliner2 LoRA
+# implementation saves `adapter_weights.safetensors` with `<module>.lora_{A,B}`.
+peft_format = (python_adapter_dir / "adapter_model.safetensors").exists()
+zig_state = load_file(args.zig_adapter_checkpoint)
+unconverted_keys = []
+
+if peft_format:
+    py_state = load_file(str(python_adapter_dir / "adapter_model.safetensors"))
+    converted = {}
+    for key, value in zig_state.items():
+        if key.endswith(".lora_A.weight") or key.endswith(".lora_B.weight"):
+            converted_key = key if key.startswith("base_model.model.") else "base_model.model." + key
+            converted[converted_key] = value
+        else:
+            unconverted_keys.append(key)
+    save_file(converted, str(converted_dir / "adapter_model.safetensors"))
+    # Reuse the Python-side PEFT adapter config so target modules and scaling
+    # are interpreted identically for both checkpoints.
+    python_adapter_config = json.loads((python_adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    zig_adapter_config = dict(python_adapter_config)
+    zig_adapter_config["lora_dropout"] = 0.0
+    (converted_dir / "adapter_config.json").write_text(json.dumps(zig_adapter_config, indent=2), encoding="utf-8")
+    expected_keys = set(py_state.keys())
+    got_keys = set(converted.keys())
+    missing_keys = sorted(expected_keys - got_keys)
+    unexpected_keys = sorted(got_keys - expected_keys)
+else:
+    py_state = load_file(str(python_adapter_dir / "adapter_weights.safetensors"))
+    converted = {}
+    for key, value in zig_state.items():
+        if key.endswith(".lora_A.weight") or key.endswith(".lora_B.weight"):
+            converted[key[: -len(".weight")]] = value
+        elif key.endswith(".lora_A") or key.endswith(".lora_B"):
+            converted[key] = value
+        else:
+            unconverted_keys.append(key)
+    save_file(converted, str(converted_dir / "adapter_weights.safetensors"))
+    python_adapter_config = json.loads((python_adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    zig_adapter_config = dict(python_adapter_config)
+    zig_adapter_config["lora_dropout"] = 0.0
+    (converted_dir / "adapter_config.json").write_text(json.dumps(zig_adapter_config, indent=2), encoding="utf-8")
+    expected_keys = set(py_state.keys())
+    got_keys = set(converted.keys())
+    missing_keys = sorted(expected_keys - got_keys)
+    unexpected_keys = sorted(got_keys - expected_keys)
+
+
+def _disable_dropout(m):
+    for module in m.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
+        elif isinstance(module, torch.nn.MultiheadAttention):
+            module.dropout = 0.0
+
+
+def _configure_processor(proc):
+    sampling = proc.sampling_config
+    sampling.remove_json_structure_prob = 0.0
+    sampling.shuffle_json_fields = False
+    sampling.remove_json_field_prob = 0.0
+    sampling.synthetic_entity_label_prob = 0.0
+    sampling.shuffle_entities = False
+    sampling.remove_entity_prob = 0.0
+    sampling.remove_entities_prob = 0.0
+    sampling.remove_relations_prob = 0.0
+    sampling.swap_head_tail_prob = 0.0
+    sampling.remove_classification_prob = 0.0
+    sampling.shuffle_classification_labels = False
+    sampling.remove_classification_label_prob = 0.0
+    sampling.synthetic_label_prob = 0.0
+    sampling.include_true_label_prob = 1.0
+
+
+def _load_extractor():
+    model = Extractor.from_pretrained(args.model_dir, map_location="cpu")
+    model.max_width = args.max_span_width
+    model.config.max_width = args.max_span_width
+    if hasattr(model, "span_rep") and hasattr(model.span_rep, "span_rep_layer") and hasattr(model.span_rep.span_rep_layer, "max_width"):
+        model.span_rep.span_rep_layer.max_width = args.max_span_width
+    _disable_dropout(model)
+    _configure_processor(model.processor)
+    return model
+
+
+records = []
+with open(args.train_data, "r", encoding="utf-8") as fin:
+    for line in fin:
+        if line.strip():
+            records.append(json.loads(line))
+records = records[: args.batch_size]
+items = [(r["input"], r["output"]) for r in records]
+
+batch_builder = _load_extractor()
+torch.manual_seed(args.seed)
+batch = ExtractorCollator(batch_builder.processor, is_training=True)(items)
+del batch_builder
+
+captures = {"classification": [], "span_scores": []}
+original_compute_struct_loss = Extractor.compute_struct_loss
+
+
+def run_with_adapter(adapter_dir):
+    model = _load_extractor()
+    if peft_format:
+        from peft import PeftModel
+        peft_model = PeftModel.from_pretrained(model, str(adapter_dir))
+        extractor = peft_model.get_base_model()
+    else:
+        from gliner2.training.lora import load_lora_adapter
+        load_lora_adapter(model, str(adapter_dir), auto_unload=True)
+        extractor = model
+        peft_model = model
+    _disable_dropout(peft_model)
+    peft_model.eval()
+    captures["classification"] = []
+    captures["span_scores"] = []
+
+    def compute_struct_loss_capture(self, span_rep, schema_emb, structure, span_mask, masking_rate=0.0):
+        gold_count = min(structure[0], 19)
+        with torch.no_grad():
+            struct_proj = self.count_embed(schema_emb[1:], gold_count)
+            scores = torch.einsum("lkd,bpd->bplk", span_rep, struct_proj)
+            captures["span_scores"].append(scores.detach().float().flatten().cpu())
+        return original_compute_struct_loss(self, span_rep, schema_emb, structure, span_mask, masking_rate)
+
+    original_classifier_forward = extractor.classifier.forward
+    def classifier_forward_with_capture(*fargs, **fkwargs):
+        out = original_classifier_forward(*fargs, **fkwargs)
+        captures["classification"].append(out.detach().float().flatten().cpu())
+        return out
+    extractor.classifier.forward = classifier_forward_with_capture
+    extractor.compute_struct_loss = types.MethodType(compute_struct_loss_capture, extractor)
+    try:
+        with torch.no_grad():
+            out = extractor(batch)
+    finally:
+        extractor.classifier.forward = original_classifier_forward
+        extractor.compute_struct_loss = types.MethodType(original_compute_struct_loss, extractor)
+    span_flat = torch.cat(captures["span_scores"]) if captures["span_scores"] else torch.zeros(0)
+    cls_flat = torch.cat(captures["classification"]) if captures["classification"] else torch.zeros(0)
+    return {
+        "total_loss": float(out["total_loss"].detach().cpu().item()),
+        "classification_loss": float(out["classification_loss"].detach().cpu().item()),
+        "structure_loss": float(out["structure_loss"].detach().cpu().item()),
+        "count_loss": float(out["count_loss"].detach().cpu().item()),
+        "span_scores": span_flat,
+        "classification_logits": cls_flat,
+    }
+
+
+python_run = run_with_adapter(python_adapter_dir)
+zig_run = run_with_adapter(converted_dir)
+
+def _max_abs_delta(a, b):
+    if a.numel() != b.numel():
+        return None
+    if a.numel() == 0:
+        return 0.0
+    return float((a - b).abs().max().item())
+
+# Direct adapter-weight comparison over the tensors both checkpoints contain.
+weights_max_abs_delta = 0.0
+weight_shape_mismatches = []
+for key, value in converted.items():
+    py_value = py_state.get(key)
+    if py_value is None:
+        continue
+    if py_value.shape != value.shape:
+        weight_shape_mismatches.append(key)
+        continue
+    weights_max_abs_delta = max(weights_max_abs_delta, float((py_value - value).abs().max().item()))
+
+# Missing tensors are tolerated only when they are functionally inert on the
+# Python side: a LoRA pair contributes nothing to the forward pass while its
+# lora_B is exactly zero (e.g. PEFT wraps MultiheadAttention out_proj but
+# nn.MultiheadAttention reads out_proj.weight directly, so those adapters
+# never train and stay at their zero init).
+def _missing_key_functionally_zero(key):
+    if "lora_B" in key:
+        tensor = py_state.get(key)
+        return tensor is not None and not bool(torch.any(tensor))
+    if "lora_A" in key:
+        sibling = key.replace("lora_A", "lora_B")
+        tensor = py_state.get(sibling)
+        return tensor is not None and not bool(torch.any(tensor))
+    return False
+
+missing_keys_functionally_zero = all(_missing_key_functionally_zero(key) for key in missing_keys)
+
+span_delta = _max_abs_delta(python_run["span_scores"], zig_run["span_scores"])
+cls_delta = _max_abs_delta(python_run["classification_logits"], zig_run["classification_logits"])
+loss_deltas = {
+    key: zig_run[key] - python_run[key]
+    for key in ("total_loss", "classification_loss", "structure_loss", "count_loss")
+}
+naming_ok = (
+    not unconverted_keys
+    and not unexpected_keys
+    and not weight_shape_mismatches
+    and (not missing_keys or missing_keys_functionally_zero)
+)
+weights_ok = weights_max_abs_delta <= args.tolerance
+logits_ok = (
+    span_delta is not None
+    and cls_delta is not None
+    and span_delta <= args.tolerance
+    and cls_delta <= args.tolerance
+)
+result = {
+    "ok": bool(naming_ok and weights_ok and logits_ok),
+    "naming_ok": bool(naming_ok),
+    "weights_ok": bool(weights_ok),
+    "weights_max_abs_delta": weights_max_abs_delta,
+    "weight_shape_mismatches": weight_shape_mismatches[:20],
+    "missing_keys_functionally_zero": bool(missing_keys_functionally_zero),
+    "logits_ok": bool(logits_ok),
+    "adapter_format": "peft" if peft_format else "gliner2_legacy",
+    "tolerance": args.tolerance,
+    "span_scores_count_python": int(python_run["span_scores"].numel()),
+    "span_scores_count_zig": int(zig_run["span_scores"].numel()),
+    "span_scores_max_abs_delta": span_delta,
+    "classification_logits_count_python": int(python_run["classification_logits"].numel()),
+    "classification_logits_count_zig": int(zig_run["classification_logits"].numel()),
+    "classification_logits_max_abs_delta": cls_delta,
+    "loss_deltas_zig_minus_python": loss_deltas,
+    "python_losses": {k: python_run[k] for k in ("total_loss", "classification_loss", "structure_loss", "count_loss")},
+    "zig_losses": {k: zig_run[k] for k in ("total_loss", "classification_loss", "structure_loss", "count_loss")},
+    "python_adapter_tensor_count": len(py_state),
+    "zig_adapter_tensor_count": len(converted),
+    "unconverted_zig_keys": unconverted_keys[:20],
+    "unconverted_zig_key_count": len(unconverted_keys),
+    "zig_missing_adapter_keys": missing_keys[:20],
+    "zig_missing_adapter_key_count": len(missing_keys),
+    "zig_unexpected_adapter_keys": unexpected_keys[:20],
+    "zig_unexpected_adapter_key_count": len(unexpected_keys),
+    "batch_size": len(items),
+}
+pathlib.Path(args.result_json).write_text(json.dumps(result, indent=2), encoding="utf-8")
+print("ADAPTER_ROUNDTRIP " + json.dumps(result, sort_keys=True))
+'''
+
+
+def run_adapter_roundtrip(args: argparse.Namespace, out_dir: Path, report: dict[str, Any]) -> dict[str, Any]:
+    python_adapter_dir = out_dir / "python" / "final"
+    zig_adapter_checkpoint = out_dir / "zig" / "adapter_model.safetensors"
+    roundtrip_dir = out_dir / "roundtrip"
+    roundtrip_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Any] = {"ran": False}
+    if not (
+        (python_adapter_dir / "adapter_model.safetensors").exists()
+        or (python_adapter_dir / "adapter_weights.safetensors").exists()
+    ):
+        result["skip_reason"] = f"missing Python adapter checkpoint at {python_adapter_dir}"
+        return result
+    if not zig_adapter_checkpoint.exists():
+        result["skip_reason"] = f"missing Zig adapter checkpoint at {zig_adapter_checkpoint}"
+        return result
+    python_model = report.get("config", {}).get("python_model", str(args.python_model))
+    patched_model_dir = out_dir / "python_model"
+    model_dir = str(patched_model_dir) if patched_model_dir.exists() else python_model
+    script = roundtrip_dir / "run_adapter_roundtrip.py"
+    script.write_text(adapter_roundtrip_script(), encoding="utf-8")
+    result_json = roundtrip_dir / "adapter_roundtrip.json"
+    cmd = [
+        args.python_bin,
+        str(script),
+        "--model-dir", model_dir,
+        "--train-data", str(out_dir / "python_train.jsonl"),
+        "--python-adapter-dir", str(python_adapter_dir),
+        "--zig-adapter-checkpoint", str(zig_adapter_checkpoint),
+        "--converted-zig-adapter-dir", str(roundtrip_dir / "zig_adapter"),
+        "--result-json", str(result_json),
+        "--batch-size", str(args.batch_size),
+        "--max-span-width", str(args.max_span_width),
+        "--seed", str(args.seed),
+        "--tolerance", str(args.adapter_roundtrip_tolerance),
+    ]
+    command_result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env={"PYTHONHASHSEED": "0"})
+    result["ran"] = True
+    result["returncode"] = command_result.get("returncode")
+    result["elapsed_seconds"] = command_result.get("elapsed_seconds")
+    result.update(load_json_file(result_json))
+    if command_result.get("returncode") != 0:
+        result["ok"] = False
+        result["output_tail"] = (command_result.get("output") or "")[-4000:]
+    return result
+
+
 def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path) -> dict[str, Any]:
     script = out_dir / "run_python_gliner2_train.py"
     script.write_text(python_training_script(), encoding="utf-8")
@@ -1619,11 +1976,18 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     ]
     if args.zig_optimize is not None:
         cmd.append(f"-Doptimize={args.zig_optimize}")
+    # Feed the Zig trainer the same converted upstream-format JSONL the Python
+    # trainer consumes. The raw legacy {"text", "entities": [...]} format maps
+    # to one schema per entity mention on the Zig side, while upstream groups
+    # all entity labels into a single "entities" schema — converting first
+    # keeps the prompt/schema construction identical for parity runs.
+    converted_train_data = out_dir / "python_train.jsonl"
+    zig_train_data = converted_train_data if converted_train_data.exists() else args.train_data
     cmd.extend([
         "train-gliner2-autodiff",
         "--",
         "--model-dir", str(args.model_dir),
-        "--train-data", str(args.train_data),
+        "--train-data", str(zig_train_data),
         "--out-dir", str(out_dir / "zig"),
         "--epochs", "1",
         "--batch-size", str(args.batch_size),
@@ -1653,6 +2017,8 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         ])
     if args.zig_lora_only_trainables:
         cmd.append("--lora-only-trainables")
+    if args.deterministic:
+        cmd.append("--deterministic")
     initial_adapter_checkpoint = out_dir / "python" / "initial_adapter" / "adapter_weights.safetensors"
     if initial_adapter_checkpoint.exists():
         cmd.extend(["--initial-adapter-checkpoint", str(initial_adapter_checkpoint)])
@@ -1739,6 +2105,30 @@ def main() -> int:
         help="Maximum absolute Python/Zig loss delta for valid loss parity when both sides run",
     )
     p.add_argument(
+        "--strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail (non-zero exit) when any parity comparison that ran does not match (default: on; use --no-strict to only gate on subprocess return codes)",
+    )
+    p.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force off per-step stochastic regularization on both sides (lora dropout 0, span negative mask 0, Python model dropout 0; passes --deterministic to the Zig CLI)",
+    )
+    p.add_argument(
+        "--adapter-roundtrip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After both trainings, load the Zig-written LoRA adapter into Python and compare span/classification logits against the Python-trained adapter on one fixed batch",
+    )
+    p.add_argument(
+        "--adapter-roundtrip-tolerance",
+        type=float,
+        default=1e-4,
+        help="Maximum absolute logit delta for the adapter round-trip comparison",
+    )
+    p.add_argument(
         "--perf-target-only-python",
         action="store_true",
         help="Treat Python as a timing target only; report Python/Zig loss delta but mark loss parity invalid",
@@ -1756,6 +2146,16 @@ def main() -> int:
     args = p.parse_args()
     if args.dump_preprocess_parity:
         args.dump_parity = True
+    if args.deterministic:
+        if args.lora_dropout != 0.0:
+            print(f"deterministic: overriding --lora-dropout {args.lora_dropout} -> 0.0")
+            args.lora_dropout = 0.0
+        if args.span_negative_mask_rate != 0.0:
+            print(f"deterministic: overriding --span-negative-mask-rate {args.span_negative_mask_rate} -> 0.0")
+            args.span_negative_mask_rate = 0.0
+        if not args.disable_python_model_dropout:
+            print("deterministic: enabling --disable-python-model-dropout")
+            args.disable_python_model_dropout = True
     args.model_dir = args.model_dir.expanduser().resolve()
     args.train_data = args.train_data.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
@@ -1808,6 +2208,10 @@ def main() -> int:
             "dump_preprocess_parity": args.dump_preprocess_parity,
             "loss_parity_tolerance": args.loss_parity_tolerance,
             "perf_target_only_python": args.perf_target_only_python,
+            "strict": args.strict,
+            "deterministic": args.deterministic,
+            "adapter_roundtrip": args.adapter_roundtrip,
+            "adapter_roundtrip_tolerance": args.adapter_roundtrip_tolerance,
         },
     }
 
@@ -1815,6 +2219,19 @@ def main() -> int:
         report["python"] = run_python_side(args, args.out_dir / "python_train.jsonl", args.out_dir)
     if not args.skip_zig:
         report["zig"] = run_zig_side(args, args.out_dir)
+
+    adapter_roundtrip: dict[str, Any] = {"ran": False, "skip_reason": "disabled via --no-adapter-roundtrip"}
+    if args.adapter_roundtrip:
+        if (
+            not args.skip_python
+            and not args.skip_zig
+            and report.get("python", {}).get("returncode") == 0
+            and report.get("zig", {}).get("returncode") == 0
+        ):
+            adapter_roundtrip = run_adapter_roundtrip(args, args.out_dir, report)
+        else:
+            adapter_roundtrip = {"ran": False, "skip_reason": "python or zig side skipped or failed"}
+    report["adapter_roundtrip"] = adapter_roundtrip
 
     zig_step_rows = [row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "step"]
     python_step_rows = report.get("python", {}).get("metrics", {}).get("train_metrics_history", [])
@@ -2123,6 +2540,12 @@ def main() -> int:
             and upstream_preprocessing_supported
             and args.zig_objective == "gliner2-total-loss"
         ),
+        "adapter_roundtrip_ran": bool(adapter_roundtrip.get("ran")),
+        "adapter_roundtrip_ok": adapter_roundtrip.get("ok"),
+        "adapter_roundtrip_span_scores_max_abs_delta": adapter_roundtrip.get("span_scores_max_abs_delta"),
+        "adapter_roundtrip_classification_logits_max_abs_delta": adapter_roundtrip.get("classification_logits_max_abs_delta"),
+        "adapter_roundtrip_weights_max_abs_delta": adapter_roundtrip.get("weights_max_abs_delta"),
+        "adapter_roundtrip_tolerance": args.adapter_roundtrip_tolerance,
         "entity_only_structure_parity": entity_only_structure_parity,
         "non_entity_task_annotations": source_non_entity_task_count,
         "training_slice_non_entity_task_annotations": non_entity_task_count,
@@ -2135,14 +2558,69 @@ def main() -> int:
         if section in report:
             trim_result_output(report[section], args.max_command_output_chars)
 
+    # ── Strict parity gating ──────────────────────────────────────────────
+    # Each check is gated on whether the relevant comparison actually ran;
+    # checks that did not run are reported as SKIPPED and do not fail strict
+    # mode. Subprocess return codes always gate the exit code.
+    both_sides_ran = (
+        not args.skip_python
+        and not args.skip_zig
+        and report.get("python", {}).get("returncode") == 0
+        and report.get("zig", {}).get("returncode") == 0
+    )
+    is_total_loss_objective = args.zig_objective == "gliner2-total-loss"
+    component_loss_applicable = both_sides_ran and args.dump_parity and is_total_loss_objective
+    # The classification debug comparison is meaningful only when the Python
+    # side saw classification tasks in the first batch (entity-only fixtures
+    # never emit it); the Zig side prints its debug unconditionally.
+    classification_debug_applicable = component_loss_applicable and python_classification_debug is not None
+    step_loss_applicable = both_sides_ran and not args.perf_target_only_python
+    preprocess_applicable = both_sides_ran and args.dump_parity
+    full_loss_applicable = both_sides_ran and is_total_loss_objective and not args.perf_target_only_python
+    roundtrip_applicable = bool(adapter_roundtrip.get("ran"))
+    strict_checks: dict[str, bool | None] = {
+        "component_loss_parity_matches": component_loss_matches if component_loss_applicable else None,
+        "classification_debug_matches": classification_debug_matches if classification_debug_applicable else None,
+        "step_loss_parity_matches": step_loss_parity_matches if step_loss_applicable else None,
+        "step_loss_counts_match": step_loss_counts_match if step_loss_applicable else None,
+        "preprocess_parity_matches": preprocess_matches if preprocess_applicable else None,
+        "valid_full_loss_parity": report["summary"]["valid_full_loss_parity"] if full_loss_applicable else None,
+        "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
+    }
+    report["summary"]["strict_mode"] = args.strict
+    report["summary"]["strict_checks"] = strict_checks
+
     report_path = args.out_dir / "comparison_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"comparison report: {report_path}")
     print(json.dumps(report["summary"], indent=2))
-    ok = all(
+
+    returncodes_ok = all(
         section not in report or report[section].get("returncode") == 0
         for section in ("python", "zig")
     )
+    strict_failures: list[str] = []
+    print(f"strict parity gating: {'ON' if args.strict else 'OFF (--no-strict)'}")
+    for check_name, check_value in strict_checks.items():
+        if check_value is None:
+            status = "SKIPPED (comparison did not run)"
+        elif check_value:
+            status = "PASS"
+        else:
+            status = "FAIL"
+            strict_failures.append(check_name)
+        print(f"  PARITY {check_name}: {status}")
+    print(f"  PARITY python_returncode: {'PASS' if 'python' not in report or report['python'].get('returncode') == 0 else 'FAIL'}")
+    print(f"  PARITY zig_returncode: {'PASS' if 'zig' not in report or report['zig'].get('returncode') == 0 else 'FAIL'}")
+
+    ok = returncodes_ok and (not args.strict or not strict_failures)
+    if not ok:
+        if not returncodes_ok:
+            print("RESULT: FAIL (subprocess returncode)")
+        else:
+            print(f"RESULT: FAIL (strict parity checks failed: {', '.join(strict_failures)})")
+    else:
+        print("RESULT: PASS")
     return 0 if ok else 1
 
 

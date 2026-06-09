@@ -239,7 +239,7 @@ reloaded adapter, and optional materialization. Use `--dry-run
 | Recipe | Family | Current route |
 |--------|--------|---------------|
 | `lora-sft`, `qlora-sft` | `gemma4` | `prepare-gemma4-lora-inputs` → `bootstrap-gemma4-lora` → `train-eval-gemma4-lora-bundle` |
-| `lora-sft`, `qlora-sft` | `gliner2` | `bootstrap-gliner2-lora` → `prepare-gliner2-top-layer-boundary-cache` → `train-eval-gliner2-lora-bundle` → optional `materialize-gliner2-lora` |
+| `lora-sft`, `qlora-sft` | `gliner2` | `train-gliner2-autodiff` (real full-encoder autodiff training; the cached probe-surrogate bundle route was removed) |
 | `lora-sft`, `qlora-sft` | `layoutlmv3` | `bootstrap-layoutlmv3-lora` → `train-eval-layoutlmv3-lora-sequence` or `train-eval-layoutlmv3-lora-token` → optional `materialize-layoutlmv3-checkpoint` |
 | `sft` | supported LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
 | `dpo` | scalar preference fixtures | direct internal `preference_loss.zig` adapter over `dataset.format = "scalar-logprobs"` JSONL |
@@ -1009,36 +1009,20 @@ Flags:
   --schedule-free               Enable Schedule-Free AdamW (default: false)
 ```
 
-### GLiNER2 LoRA Bundle
+### GLiNER2 LoRA (Real Autodiff)
 
-This is the backend train/eval command behind `lora-sft` / `qlora-sft`
-GLiNER2 recipes.
+GLiNER2 LoRA fine-tuning runs through `train-gliner2-autodiff`: full
+DeBERTa-v3 encoder forward + autodiff with the upstream GLiNER2 total loss
+(`structure + classification + count`) via `--objective gliner2-total-loss`.
+The earlier cached probe-surrogate bundle route
+(`train-eval-gliner2-lora-bundle`, MSE against deterministic probe targets)
+was removed — it was a smoke fixture, not real GLiNER2 training. Python↔Zig
+loss parity is gated by
+`scripts/compare_gliner2_lora_python_zig.py --strict` (see
+`zig/e2e/inference/test_gliner2_lora_parity.py`).
 
-Uses pre-cached top-layer boundary representations produced by `prepare-gliner2-top-layer-boundary-cache` (no live inference required at train time). Training loop uses cached `hidden_in` tensors from `CachedBoundarySummary`, computes mean-pooled span representations, runs MSE loss against deterministic probe targets, and applies AdamW with optional LLRD, norm clipping, and gradient accumulation.
-
-**Prerequisites:** Run `prepare-gliner2-top-layer-boundary-cache` on train and eval datasets first.
-
-```
-usage: train-eval-gliner2-lora-bundle <base_model_dir> <adapter_model_dir>
-    <train_cache.json> <eval_cache.json> <out_dir> [options]
-
-Flags:
-  --lr, --learning-rate <f>   Learning rate (default: 0.0001)
-  --max-examples <n>          Max training examples (default: 0 = all)
-  --epochs <n>                Number of epochs (default: 1)
-  --layer-name, --layer <str> Scope to a specific layer name
-  --max-grad-norm <f>         Gradient norm clipping threshold (default: 1.0, 0=disabled)
-  --grad-accum <n>            Gradient accumulation steps (default: 1)
-  --llrd-decay <f>            Layer-wise LR decay factor (default: 1.0=disabled)
-
-example: train-eval-gliner2-lora-bundle /tmp/gliner2 /tmp/lora \
-           /tmp/train_cache.json /tmp/eval_cache.json /tmp/out \
-           --lr 0.0001 --epochs 3 --max-grad-norm 1.0 --grad-accum 4 --llrd-decay 0.9
-```
-
-Outputs:
-- `<out_dir>/adapter_model.safetensors`
-- `<out_dir>/train_eval_lora_report.json` — `eval_mse_before`, per-epoch `train_metrics`, `eval_mse_after`
+Adapters are saved in PEFT-compatible format
+(`adapter_model.safetensors` + `adapter_config.json`).
 
 ### Gemma4 LoRA
 
@@ -1234,7 +1218,6 @@ Applies to:
 - `train-eval-layoutlmv3-lora-sequence`
 - `train-eval-layoutlmv3-lora-token`
 - `train-eval-colqwen2-lora-bundle`
-- `train-eval-gliner2-lora-bundle`
 - `train-eval-gliner2-top-layer-boundary-task-head`
 
 ### `run_status.json`

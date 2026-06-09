@@ -26,10 +26,10 @@
 //   --model-dir <path>           Directory with DeBERTa model (config.json + model.safetensors + tokenizer.json)
 //   --train-data <path>          JSONL training data (file or directory)
 //   --out-dir <path>             Output directory for saved LoRA adapters
-//   --epochs <n>                 Number of training epochs (default: 3)
-//   --batch-size <n>             Examples per step (default: 8)
+//   --epochs <n>                 Number of training epochs (default: 10)
+//   --batch-size <n>             Examples per step (default: 16)
 //   --seq-len <n>                Max sequence length (default: 256)
-//   --learning-rate <f>          Learning rate (default: 2e-5)
+//   --learning-rate <f>          Learning rate (default: 5e-4)
 //   --weight-decay <f>           AdamW weight decay (default: 0)
 //   --lora-rank <n>              LoRA rank (default: 16)
 //   --lora-alpha <f>             LoRA alpha scaling (default: 32)
@@ -87,10 +87,10 @@ const Options = struct {
     model_dir: []const u8,
     train_data: []const u8,
     out_dir: []const u8,
-    epochs: u32 = 3,
-    batch_size: u32 = 8,
+    epochs: u32 = 10,
+    batch_size: u32 = 16,
     seq_len: u32 = 256,
-    learning_rate: f32 = 2e-5,
+    learning_rate: f32 = 5e-4,
     weight_decay: f32 = 0.0,
     lora_rank: u32 = 16,
     lora_alpha: f32 = 32.0,
@@ -116,6 +116,11 @@ const Options = struct {
     compiled_required: bool = false,
     dump_span_parity: bool = false,
     lora_only_trainables: bool = false,
+    deterministic: bool = false,
+    eval_strategy: EvalStrategy = .epoch,
+    eval_steps: u32 = 0,
+    save_best: bool = false,
+    report_to: ReportTo = .stdout,
 };
 
 const Gliner2TrainBackend = enum {
@@ -123,6 +128,17 @@ const Gliner2TrainBackend = enum {
     metal,
     mlx,
     native,
+};
+
+const EvalStrategy = enum {
+    epoch,
+    steps,
+    none,
+};
+
+const ReportTo = enum {
+    stdout,
+    jsonl,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,10 +156,10 @@ pub fn main(init: std.process.Init) !void {
     var model_dir: ?[]const u8 = null;
     var train_data: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
-    var epochs: u32 = 3;
-    var batch_size: u32 = 8;
+    var epochs: u32 = 10;
+    var batch_size: u32 = 16;
     var seq_len: u32 = 256;
-    var learning_rate: f32 = 2e-5;
+    var learning_rate: f32 = 5e-4;
     var weight_decay: f32 = 0.0;
     var lora_rank: u32 = 16;
     var lora_alpha: f32 = 32.0;
@@ -169,6 +185,11 @@ pub fn main(init: std.process.Init) !void {
     var compiled_required: bool = false;
     var dump_span_parity: bool = false;
     var lora_only_trainables: bool = false;
+    var deterministic: bool = false;
+    var eval_strategy: EvalStrategy = .epoch;
+    var eval_steps: u32 = 0;
+    var save_best: bool = false;
+    var report_to: ReportTo = .stdout;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -260,11 +281,52 @@ pub fn main(init: std.process.Init) !void {
             dump_span_parity = true;
         } else if (std.mem.eql(u8, arg, "--lora-only-trainables")) {
             lora_only_trainables = true;
+        } else if (std.mem.eql(u8, arg, "--deterministic")) {
+            deterministic = true;
+        } else if (std.mem.eql(u8, arg, "--eval-strategy")) {
+            const val = args.next() orelse return error.MissingEvalStrategy;
+            eval_strategy = parseEvalStrategy(val) orelse {
+                print("error: unsupported --eval-strategy '{s}' (expected epoch, steps, or none)\n", .{val});
+                return error.InvalidEvalStrategy;
+            };
+        } else if (std.mem.eql(u8, arg, "--eval-steps")) {
+            const val = args.next() orelse return error.MissingEvalSteps;
+            eval_steps = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--save-best")) {
+            save_best = true;
+        } else if (std.mem.eql(u8, arg, "--report-to")) {
+            const val = args.next() orelse return error.MissingReportTo;
+            report_to = parseReportTo(val) orelse {
+                print("error: unsupported --report-to '{s}' (expected stdout or jsonl)\n", .{val});
+                return error.InvalidReportTo;
+            };
         } else {
             print("error: unknown argument: {s}\n", .{arg});
             printUsage();
             return error.InvalidArguments;
         }
+    }
+
+    if (deterministic) {
+        // Force off every per-step stochastic regularizer on this training
+        // path so repeated runs (and Python/Zig parity comparisons) are
+        // bitwise-stable given the same seed and adapter init.
+        //
+        // NEFTune-style embedding noise is not wired into the GLiNER2
+        // real-autodiff path, so LoRA dropout masks and span negative
+        // masking are the only per-step stochastic inputs to disable here.
+        if (lora_dropout != 0.0) {
+            print("warning: --deterministic overrides --lora-dropout {d:.3} -> 0.0\n", .{lora_dropout});
+            lora_dropout = 0.0;
+        }
+        if (span_negative_mask_rate != 0.0) {
+            print("warning: --deterministic overrides --span-negative-mask-rate {d:.3} -> 0.0\n", .{span_negative_mask_rate});
+            span_negative_mask_rate = 0.0;
+        }
+    }
+    if (eval_strategy == .steps and eval_steps == 0) {
+        print("error: --eval-strategy steps requires --eval-steps > 0\n", .{});
+        return error.InvalidEvalSteps;
     }
 
     const opts = Options{
@@ -312,6 +374,11 @@ pub fn main(init: std.process.Init) !void {
         .compiled_required = compiled_required,
         .dump_span_parity = dump_span_parity,
         .lora_only_trainables = lora_only_trainables,
+        .deterministic = deterministic,
+        .eval_strategy = eval_strategy,
+        .eval_steps = eval_steps,
+        .save_best = save_best,
+        .report_to = report_to,
     };
 
     try runTraining(allocator, opts);
@@ -865,6 +932,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var metrics_jsonl: std.Io.Writer.Allocating = .init(allocator);
     defer metrics_jsonl.deinit();
 
+    // Eval/save-best bookkeeping. With no held-out eval set wired into this
+    // CLI yet, the eval metric is the average training loss over the eval
+    // window (per epoch, or per --eval-steps optimizer steps).
+    var best_eval_loss: f64 = std.math.inf(f64);
+    var eval_window_loss: f64 = 0.0;
+    var eval_window_steps: u64 = 0;
+
     for (0..opts.epochs) |epoch| {
         // Shuffle examples at the start of each epoch.
         if (opts.objective == .gliner2_total_loss) {
@@ -1110,8 +1184,16 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             epoch_target_stats.add(target_stats);
             run_target_stats.add(target_stats);
             total_steps += 1;
+            eval_window_loss += result.loss;
+            eval_window_steps += 1;
             try writeStepMetric(&metrics_jsonl.writer, epoch + 1, total_steps, epoch_steps, result.loss, result.grad_norm, result.optimizer_stepped, target_stats, timing);
 
+            if (opts.report_to == .jsonl) {
+                print(
+                    "{{\"event\":\"step\",\"step\":{d},\"epoch\":{d},\"epoch_step\":{d},\"loss\":{d:.9},\"grad_norm\":{d:.9},\"lr\":{e:.6}}}\n",
+                    .{ total_steps, epoch + 1, epoch_steps, result.loss, result.grad_norm, opts.learning_rate },
+                );
+            }
             if (total_steps % 10 == 0 or batch_end >= total_examples) {
                 print("  [epoch {d}/{d}] step {d}/{d}  loss={d:.6}  grad_norm={d:.4}  supervised_tok/s={d:.2}{s}\n", .{
                     epoch + 1,
@@ -1123,6 +1205,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     timing.supervisedTokensPerSecond(target_stats),
                     if (result.optimizer_stepped) "" else " (accum)",
                 });
+            }
+
+            if (opts.eval_strategy == .steps and opts.eval_steps > 0 and total_steps % opts.eval_steps == 0) {
+                const eval_loss = eval_window_loss / @as(f64, @floatFromInt(eval_window_steps));
+                eval_window_loss = 0.0;
+                eval_window_steps = 0;
+                try emitEvalEvent(allocator, opts, &metrics_jsonl.writer, epoch + 1, total_steps, eval_loss, &best_eval_loss, &trainer);
             }
 
             batch_start = batch_end;
@@ -1150,6 +1239,12 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .epoch_wall_ns = elapsedNs(epoch_started_ns, monotonicNowNs()),
         };
         try writeEpochMetric(&metrics_jsonl.writer, epoch + 1, avg_epoch_loss, approx_acc, gold_ent_count, epoch_steps, epoch_target_stats, epoch_timing);
+
+        if (opts.eval_strategy == .epoch) {
+            eval_window_loss = 0.0;
+            eval_window_steps = 0;
+            try emitEvalEvent(allocator, opts, &metrics_jsonl.writer, epoch + 1, total_steps, avg_epoch_loss, &best_eval_loss, &trainer);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1308,6 +1403,56 @@ fn writeEpochMetric(
     try writer.writeByte('\n');
 }
 
+/// Emit one eval event (stdout text or JSONL, plus the metrics JSONL file)
+/// and, when --save-best is set and the eval metric improved, snapshot the
+/// current adapters into `<out_dir>/best`.
+///
+/// LIMITATION: this CLI has no held-out eval dataset input yet, so the eval
+/// metric is the average training loss over the eval window.
+fn emitEvalEvent(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    metrics_writer: *std.Io.Writer,
+    epoch: usize,
+    global_step: u64,
+    eval_loss: f64,
+    best_eval_loss: *f64,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+) !void {
+    const improved = eval_loss < best_eval_loss.*;
+    if (improved) best_eval_loss.* = eval_loss;
+
+    switch (opts.report_to) {
+        .jsonl => print(
+            "{{\"event\":\"eval\",\"step\":{d},\"epoch\":{d},\"loss\":{d:.9},\"best_loss\":{d:.9},\"improved\":{},\"lr\":{e:.6}}}\n",
+            .{ global_step, epoch, eval_loss, best_eval_loss.*, improved, opts.learning_rate },
+        ),
+        .stdout => print(
+            "  eval [epoch {d}] step {d}  avg_train_loss={d:.6}  best={d:.6}{s}\n",
+            .{ epoch, global_step, eval_loss, best_eval_loss.*, if (improved) " (improved)" else "" },
+        ),
+    }
+    try std.json.Stringify.value(.{
+        .event = "eval",
+        .epoch = epoch,
+        .step = global_step,
+        .loss = eval_loss,
+        .best_loss = best_eval_loss.*,
+        .improved = improved,
+        .eval_metric = "avg_train_loss",
+    }, .{}, metrics_writer);
+    try metrics_writer.writeByte('\n');
+
+    if (opts.save_best and improved) {
+        const best_dir = try std.fs.path.join(allocator, &.{ opts.out_dir, "best" });
+        defer allocator.free(best_dir);
+        try compat.cwd().createDirPath(compat.io(), best_dir);
+        try trainer.syncDeviceTrainablesToHost();
+        try trainer.saveAdapters(best_dir);
+        print("  saved best adapters (loss={d:.6}) to {s}\n", .{ eval_loss, best_dir });
+    }
+}
+
 fn writeTrainingManifest(
     allocator: std.mem.Allocator,
     opts: Options,
@@ -1349,6 +1494,10 @@ fn writeTrainingManifest(
         .regular_trainable_tensor_count = regular_trainable_tensor_count,
         .regular_trainable_params = regular_trainable_params,
         .lora_only_trainables = opts.lora_only_trainables,
+        .deterministic = opts.deterministic,
+        .eval_strategy = @tagName(opts.eval_strategy),
+        .eval_steps = opts.eval_steps,
+        .save_best = opts.save_best,
         .epochs = opts.epochs,
         .batch_size = opts.batch_size,
         .seq_len = opts.seq_len,
@@ -2008,6 +2157,19 @@ fn parseBackend(value: []const u8) ?Gliner2TrainBackend {
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
     if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
+    return null;
+}
+
+fn parseEvalStrategy(value: []const u8) ?EvalStrategy {
+    if (std.ascii.eqlIgnoreCase(value, "epoch")) return .epoch;
+    if (std.ascii.eqlIgnoreCase(value, "steps")) return .steps;
+    if (std.ascii.eqlIgnoreCase(value, "none") or std.ascii.eqlIgnoreCase(value, "no")) return .none;
+    return null;
+}
+
+fn parseReportTo(value: []const u8) ?ReportTo {
+    if (std.ascii.eqlIgnoreCase(value, "stdout")) return .stdout;
+    if (std.ascii.eqlIgnoreCase(value, "jsonl")) return .jsonl;
     return null;
 }
 
@@ -2857,10 +3019,10 @@ fn printUsage() void {
         \\  --out-dir <path>          Output directory for LoRA adapter weights
         \\
         \\options:
-        \\  --epochs <n>              Number of training epochs (default: 3)
-        \\  --batch-size <n>          Examples per step (default: 8)
+        \\  --epochs <n>              Number of training epochs (default: 10)
+        \\  --batch-size <n>          Examples per step (default: 16)
         \\  --seq-len <n>             Max sequence length (default: 256)
-        \\  --learning-rate, --lr <f> Learning rate (default: 2e-5)
+        \\  --learning-rate, --lr <f> Learning rate (default: 5e-4)
         \\  --weight-decay <f>        AdamW weight decay (default: 0)
         \\  --lora-rank <n>           LoRA rank (default: 16)
         \\  --lora-alpha <f>          LoRA alpha scaling (default: 32)
@@ -2885,6 +3047,12 @@ fn printUsage() void {
         \\  --backend <name>          auto, metal, mlx, or native (default: auto)
         \\  --compiled-required       Fail if the requested compiled backend cannot run
         \\  --lora-only-trainables    Freeze regular task-head params; train LoRA params only
+        \\  --deterministic           Disable per-step stochastic regularization (forces lora-dropout=0
+        \\                            and span-negative-mask-rate=0; prints a warning when overriding)
+        \\  --eval-strategy <name>    epoch, steps, or none (default: epoch; eval metric is avg train loss)
+        \\  --eval-steps <n>          Eval every N steps when --eval-strategy steps
+        \\  --save-best               Snapshot adapters to <out-dir>/best when the eval metric improves
+        \\  --report-to <name>        stdout or jsonl; jsonl emits one JSON object per step/eval to stdout
         \\  --dump-span-parity        Print first span-start batch logits/label/mask BCE stats as JSON
         \\
         \\notes:
@@ -3104,9 +3272,15 @@ fn fillGliner2TotalLossTargetsFromRecords(
                 },
                 .entities => {},
                 .json_structures, .relations => {
-                    const count = @min(task.count, @as(usize, 19));
-                    row[count_labels_offset + count] = 1.0;
-                    row[count_mask_offset] = 1.0;
+                    // Upstream `_compute_sample_loss` skips schemas whose
+                    // structure count is zero entirely (no structure loss and
+                    // no count loss), so only emit a count target for
+                    // schemas with at least one gold instance.
+                    if (task.count > 0) {
+                        const count = @min(task.count, @as(usize, 19));
+                        row[count_labels_offset + count] = 1.0;
+                        row[count_mask_offset] = 1.0;
+                    }
                 },
             }
         }

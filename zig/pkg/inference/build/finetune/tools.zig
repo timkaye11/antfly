@@ -130,13 +130,6 @@ const commands = [_]common.CommandSpec{
         .native_link = .default,
     },
     .{
-        .name = "train-eval-gliner2-lora-bundle",
-        .root_source_file = "src/finetune/train/train_eval_gliner2_lora_bundle.zig",
-        .description = "Train GLiNER2 LoRA adapters using cached top-layer boundary representations and report before/after MSE",
-        .imports = &.{ .build_options, .ml, .inference_internal, .pjrt },
-        .native_link = .default,
-    },
-    .{
         .name = "train-eval-entity-cleanup-head",
         .root_source_file = "src/finetune/train/train_eval_entity_cleanup_head.zig",
         .description = "Train/eval a learned entity cleanup head from cached mention features",

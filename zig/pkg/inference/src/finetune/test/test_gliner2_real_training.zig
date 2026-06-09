@@ -915,3 +915,178 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
         .{ NUM_STEPS, losses[0], losses[NUM_STEPS - 1] },
     );
 }
+
+test "GLiNER2 real training: gliner2_total_loss one step produces finite loss" {
+    const allocator = std.testing.allocator;
+    const model_dir = platform.env.getenv(model_dir_env) orelse return error.SkipZigTest;
+    const ner_data_path = platform.env.getenv(ner_data_env) orelse return error.SkipZigTest;
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
+
+    // ── Load full GLiNER2 checkpoint (encoder + span_rep/classifier/count
+    // heads) with `encoder.` prefix stripping ──────────────────────────────
+    var weight_store = WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    var owned_names = std.ArrayListUnmanaged([]const u8).empty;
+    defer owned_names.deinit(allocator);
+    defer {
+        var it = weight_store.resident_weights.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit();
+        weight_store.resident_weights.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+    }
+
+    const source_ptr = SafetensorsSource.initAbsolute(allocator, safetensors_path) catch |err| {
+        std.debug.print("SKIP: could not open safetensors file at {s}: {}\n", .{ safetensors_path, err });
+        return;
+    };
+    var ws = source_ptr.weightSource();
+    defer ws.deinit();
+    const hf_names = try ws.listNames(allocator);
+    defer allocator.free(hf_names);
+    for (hf_names) |hf_name| {
+        var lw = ws.getTensor(hf_name) catch continue;
+        const owned_name = try allocator.dupe(u8, stripEncoderPrefix(hf_name));
+        try owned_names.append(allocator, owned_name);
+        lw.tensor.name = owned_name;
+        try weight_store.resident_weights.put(allocator, owned_name, lw);
+    }
+
+    var native = NativeCompute.init(allocator, &weight_store, null);
+    var cb = native.computeBackend();
+
+    // ── Upstream-format records + entity vocab + HF tokenizer ─────────────
+    var records_loaded = gliner2_data.loadTrainingRecords(allocator, ner_data_path, null) catch |err| {
+        std.debug.print("SKIP: could not load upstream training records from {s}: {}\n", .{ ner_data_path, err });
+        return;
+    };
+    defer records_loaded.deinit();
+    if (records_loaded.records.len == 0) {
+        std.debug.print("SKIP: no upstream training records loaded\n", .{});
+        return;
+    }
+    const batch_count: usize = @min(records_loaded.records.len, 2);
+    const records = records_loaded.records[0..batch_count];
+
+    const entity_types = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, records, null);
+    defer {
+        for (entity_types) |label| allocator.free(label);
+        allocator.free(entity_types);
+    }
+    if (entity_types.len == 0) return error.SkipZigTest;
+    const num_classes: u32 = @intCast(entity_types.len + 1);
+
+    var tokenizer = try gliner2_data.Tokenizer.initGLiNER2HF(allocator, model_dir);
+    defer tokenizer.deinit(allocator);
+
+    const seq_len: u32 = SEQ_LEN;
+    const max_span_width: u32 = 4;
+    var encoded = try gliner2_data.buildUpstreamTaskBatch(
+        allocator,
+        &tokenizer,
+        records,
+        entity_types,
+        seq_len,
+        max_span_width,
+        batch_count,
+    );
+    defer encoded.deinit();
+
+    // ── Pack gliner2-total-loss targets: span/structure section via the
+    // public span filler, classification/count sections left masked-out so
+    // they contribute zero loss. This exercises the full total-loss graph
+    // (structure + classification + count nodes) end-to-end. ───────────────
+    const E = encoded.num_entity_types;
+    const span_width = gliner2_autodiff.spanStartTargetWidth(E);
+    const total_width = gliner2_autodiff.gliner2TotalLossTargetWidth(E);
+    const rows = encoded.batch_size * encoded.max_spans;
+
+    const span_targets = try allocator.alloc(f32, rows * span_width);
+    defer allocator.free(span_targets);
+    const stats = try gliner2_autodiff.fillSpanStartTargetsFromEncodedBatch(&encoded, span_targets);
+    try std.testing.expect(stats.valid_span_count > 0);
+
+    const targets = try allocator.alloc(f32, rows * total_width);
+    defer allocator.free(targets);
+    @memset(targets, 0.0);
+    for (0..rows) |row_idx| {
+        @memcpy(
+            targets[row_idx * total_width ..][0..span_width],
+            span_targets[row_idx * span_width ..][0..span_width],
+        );
+    }
+
+    var input_ids = try allocator.alloc(i64, encoded.batch_size * encoded.max_length);
+    defer allocator.free(input_ids);
+    var attention_mask = try allocator.alloc(f32, encoded.batch_size * encoded.max_length);
+    defer allocator.free(attention_mask);
+    for (0..encoded.batch_size * encoded.max_length) |i| {
+        input_ids[i] = encoded.input_ids[i];
+        attention_mask[i] = @floatFromInt(encoded.attention_mask[i]);
+    }
+
+    // ── Trainer (LoRA-only, mirrors upstream GLiNER2 LoRA freezing) ───────
+    var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
+        .graph_config = graph_config,
+        .num_classes = num_classes,
+        .objective = .gliner2_total_loss,
+        .span_start_loss = .bce,
+        .span_start_loss_reduction = .sum,
+        .span_start_positive_weight = 1.0,
+        .span_start_negative_weight = 1.0,
+    });
+    const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
+    var trainer = try real_autodiff.RealAutodiffTrainer.init(
+        allocator,
+        &cb,
+        .{
+            .lora = .{
+                .rank = 4,
+                .alpha = 8.0,
+                .target_patterns = &lora_targets,
+            },
+            .lr_schedule = .{ .constant = 1e-3 },
+            .max_grad_norm = 1.0,
+            .grad_accum_steps = 1,
+            .lora_a_init_std = 0.02,
+            .hidden_size_hint = graph_config.hidden_size,
+            .num_layers_hint = graph_config.num_hidden_layers,
+            .seed = 42,
+            .regular_trainable_params = &.{},
+        },
+    );
+    defer trainer.deinit();
+
+    const targets_shape = gliner2_autodiff.gliner2TotalLossTargetsShape(
+        @intCast(encoded.batch_size),
+        @intCast(encoded.max_spans),
+        @intCast(E),
+    );
+    const result = try gliner2_autodiff.trainStep(
+        &trainer,
+        &gliner_ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        targets_shape,
+        @intCast(encoded.batch_size),
+        @intCast(encoded.max_length),
+    );
+
+    if (!std.math.isFinite(result.loss)) {
+        std.debug.print("FAIL: gliner2_total_loss step produced non-finite loss: {d}\n", .{result.loss});
+        return error.NonFiniteLoss;
+    }
+    if (!std.math.isFinite(result.grad_norm)) {
+        std.debug.print("FAIL: gliner2_total_loss step produced non-finite grad norm: {d}\n", .{result.grad_norm});
+        return error.NonFiniteGradNorm;
+    }
+    try std.testing.expect(result.loss >= 0.0);
+    std.debug.print(
+        "PASS: gliner2_total_loss one step -- loss={d:.6} grad_norm={d:.4} (valid_spans={d}, positives={d})\n",
+        .{ result.loss, result.grad_norm, stats.valid_span_count, stats.positive_span_label_count },
+    );
+}
