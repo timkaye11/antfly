@@ -15,7 +15,7 @@
 // Full training loop for the fused chunker-embedder model.
 //
 // Orchestrates:
-//   1. Graph-based boundary head training step (cross-entropy loss, autodiff)
+//   1. Boundary head training (Metal CE fast path, graph fallback/focal path)
 //   2. CPU InfoNCE contrastive loss
 //   3. AdamW optimizer steps for all trainable parameters
 //   4. Evaluation (micro-F1)
@@ -31,8 +31,11 @@ const optimizers = ml.graph.optimizers;
 const ops_mod = @import("../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
 const CT = ops_mod.CT;
+
+pub const contrastive_gradient_path = "direct_mean_pool_scatter";
 const training = @import("../graph/training.zig");
 const compat = @import("../io/compat.zig");
+const native_compute = @import("../ops/native_compute.zig");
 const fused_chunker_data = @import("fused_chunker_data.zig");
 const fused_chunker = @import("fused_chunker.zig");
 const fused_chunker_loss = @import("fused_chunker_loss.zig");
@@ -59,8 +62,9 @@ pub const FusedTrainingConfig = struct {
     warmup_steps: u32 = 50,
     total_steps: u32 = 1000,
     weight_decay: f32 = 0.01,
-    max_grad_norm: f32 = 1.0,
+    max_grad_norm: f32 = 0.0,
     seed: u64 = 42,
+    step_log_every: u32 = 1,
 
     // AdamW
     beta1: f32 = 0.9,
@@ -69,11 +73,13 @@ pub const FusedTrainingConfig = struct {
 
     // Loss (delegates to FusedLossConfig)
     lambda_chunk: f32 = 1.0,
-    lambda_embed: f32 = 0.5,
+    lambda_embed: f32 = 0.3,
     temperature: f32 = 0.07,
-    focal_gamma: f32 = 0.0,
+    use_boundary_focal: bool = false,
+    focal_gamma: f32 = 2.0,
     focal_alpha: f32 = 0.75,
     pos_weight: f32 = 5.0,
+    boundary_dropout: f32 = 0.1,
 
     // Curriculum
     boundary_focus_epochs: u32 = 3,
@@ -112,6 +118,8 @@ pub const FusedTrainingConfig = struct {
 
     // Matryoshka Representation Learning
     use_mrl: bool = false,
+    mrl_dims: []const u32 = &.{ 768, 256, 128 },
+    mrl_weights: []const f32 = &.{ 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 },
 
     // LoRA+ ratio: multiplier on the LoRA B-matrix learning rate relative to A
     lora_plus_ratio: f32 = 1.0,
@@ -119,12 +127,61 @@ pub const FusedTrainingConfig = struct {
     pub fn lrSchedule(self: FusedTrainingConfig) optimizers.LearningRateSchedule {
         return .{ .warmup_cosine = .{
             .initial_lr = self.learning_rate,
-            .min_lr = self.learning_rate * 0.1,
+            .min_lr = 0.0,
             .warmup_steps = self.warmup_steps,
             .total_steps = self.total_steps,
         } };
     }
 };
+
+pub fn selectActiveLoRALayers(
+    allocator: std.mem.Allocator,
+    num_layers: u32,
+    lisa_sample_layers: u32,
+    lisa_top_k: u32,
+    step: u64,
+    seed: u64,
+) ![]bool {
+    const n: usize = @intCast(num_layers);
+    const active = try allocator.alloc(bool, n);
+    errdefer allocator.free(active);
+
+    if (lisa_sample_layers == 0) {
+        @memset(active, true);
+        return active;
+    }
+
+    @memset(active, false);
+    const top_k: usize = @min(@as(usize, @intCast(lisa_top_k)), n);
+    const top_start = n - top_k;
+    for (top_start..n) |layer_idx| active[layer_idx] = true;
+
+    const remaining_count = top_start;
+    const sample_count: usize = @min(@as(usize, @intCast(lisa_sample_layers)), remaining_count);
+    if (sample_count == 0) return active;
+
+    const remaining = try allocator.alloc(u32, remaining_count);
+    defer allocator.free(remaining);
+    for (remaining, 0..) |*layer_idx, i| layer_idx.* = @intCast(i);
+
+    var prng = std.Random.DefaultPrng.init(seed +% step);
+    const rng = prng.random();
+    var i = remaining.len;
+    while (i > 1) {
+        i -= 1;
+        const j = rng.uintLessThan(usize, i + 1);
+        const tmp = remaining[i];
+        remaining[i] = remaining[j];
+        remaining[j] = tmp;
+    }
+    for (remaining[0..sample_count]) |layer_idx| active[@intCast(layer_idx)] = true;
+    return active;
+}
+
+pub inline fn isLoRALayerActive(active_layers: []const bool, layer_idx: u32) bool {
+    const idx: usize = @intCast(layer_idx);
+    return idx < active_layers.len and active_layers[idx];
+}
 
 // ----------------------------------------------------------------------------
 // CrossBatchMemory (Feature 1)
@@ -269,11 +326,15 @@ pub const BoundaryHead = struct {
     hidden_dim: usize,
     mlp_dim: usize,
 
-    /// Initialise weights with small deterministic values:
-    ///   angle = (row+1)*(col+5)
-    ///   w[idx] = (sin(0.11*angle) + cos(0.07*angle)) * 0.05
-    /// All biases are zero.
     pub fn init(allocator: std.mem.Allocator, hidden_dim: usize, mlp_dim: usize) !BoundaryHead {
+        return initWithSeed(allocator, hidden_dim, mlp_dim, 42);
+    }
+
+    /// Initialise weights with GoMLX's default dense-layer semantics: He normal
+    /// weights and zero biases. Go stores dense weights as [input, output], while
+    /// this trainer stores them as [output, input], so the sampled logical dense
+    /// matrix is transposed into Zig's layout.
+    pub fn initWithSeed(allocator: std.mem.Allocator, hidden_dim: usize, mlp_dim: usize, seed: u64) !BoundaryHead {
         const w1 = try allocator.alloc(f32, mlp_dim * hidden_dim);
         errdefer allocator.free(w1);
         const b1 = try allocator.alloc(f32, mlp_dim);
@@ -283,24 +344,13 @@ pub const BoundaryHead = struct {
         const b2 = try allocator.alloc(f32, 2);
         errdefer allocator.free(b2);
 
-        // w1: [mlp_dim, hidden_dim]
-        for (0..mlp_dim) |row| {
-            for (0..hidden_dim) |col| {
-                const idx = row * hidden_dim + col;
-                const angle = @as(f32, @floatFromInt((row + 1) * (col + 5)));
-                w1[idx] = (@sin(angle * 0.11) + @cos(angle * 0.07)) * 0.05;
-            }
-        }
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+
+        fillDenseHeNormalTransposed(w1, hidden_dim, mlp_dim, rng);
         @memset(b1, 0);
 
-        // w2: [2, mlp_dim]
-        for (0..2) |row| {
-            for (0..mlp_dim) |col| {
-                const idx = row * mlp_dim + col;
-                const angle = @as(f32, @floatFromInt((row + 1) * (col + 5)));
-                w2[idx] = (@sin(angle * 0.11) + @cos(angle * 0.07)) * 0.05;
-            }
-        }
+        fillDenseHeNormalTransposed(w2, mlp_dim, 2, rng);
         @memset(b2, 0);
 
         return .{
@@ -319,6 +369,45 @@ pub const BoundaryHead = struct {
         self.allocator.free(self.b1);
         self.allocator.free(self.w2);
         self.allocator.free(self.b2);
+        self.* = undefined;
+    }
+};
+
+fn fillDenseHeNormalTransposed(values: []f32, fan_in: usize, fan_out: usize, rng: std.Random) void {
+    std.debug.assert(values.len == fan_in * fan_out);
+    const scale = @max(@as(f32, @floatFromInt(fan_in)), 1.0);
+    const stddev: f32 = @sqrt(2.0 / scale);
+    for (0..fan_in) |in_i| {
+        for (0..fan_out) |out_i| {
+            values[out_i * fan_in + in_i] = rng.floatNorm(f32) * stddev;
+        }
+    }
+}
+
+pub const LegacyDenseBoundaryHead = struct {
+    allocator: std.mem.Allocator,
+    weight: []f32, // [2, hidden_dim]
+    bias: []f32, // [2]
+    hidden_dim: usize,
+
+    pub fn init(allocator: std.mem.Allocator, hidden_dim: usize) !LegacyDenseBoundaryHead {
+        const weight = try allocator.alloc(f32, 2 * hidden_dim);
+        errdefer allocator.free(weight);
+        const bias = try allocator.alloc(f32, 2);
+        errdefer allocator.free(bias);
+        @memset(weight, 0);
+        @memset(bias, 0);
+        return .{
+            .allocator = allocator,
+            .weight = weight,
+            .bias = bias,
+            .hidden_dim = hidden_dim,
+        };
+    }
+
+    pub fn deinit(self: *LegacyDenseBoundaryHead) void {
+        self.allocator.free(self.weight);
+        self.allocator.free(self.bias);
         self.* = undefined;
     }
 };
@@ -350,6 +439,28 @@ pub const TrainStepWithGradSummary = struct {
     }
 };
 
+pub const BoundaryStepDebugSummary = struct {
+    boundary_loss: f32 = 0,
+    grad_norm_w1: f32 = 0,
+    grad_norm_b1: f32 = 0,
+    grad_norm_w2: f32 = 0,
+    grad_norm_b2: f32 = 0,
+    grad_max_abs_w1: f32 = 0,
+    grad_max_abs_b1: f32 = 0,
+    grad_max_abs_w2: f32 = 0,
+    grad_max_abs_b2: f32 = 0,
+    features_grad_norm: f32 = 0,
+    features_grad_max_abs: f32 = 0,
+    has_features_grad: bool = false,
+    eval_predicted_positives: u64 = 0,
+    eval_tp: u64 = 0,
+    eval_fp: u64 = 0,
+    eval_fn: u64 = 0,
+    eval_f1: f32 = 0,
+    eval_mean_prob_gold_positive: f32 = 0,
+    eval_mean_prob_gold_negative: f32 = 0,
+};
+
 // ----------------------------------------------------------------------------
 // EvalSummary
 // ----------------------------------------------------------------------------
@@ -358,7 +469,147 @@ pub const EvalSummary = struct {
     boundary_f1: f32 = 0,
     boundary_precision: f32 = 0,
     boundary_recall: f32 = 0,
+    boundary_tp: u64 = 0,
+    boundary_fp: u64 = 0,
+    boundary_fn: u64 = 0,
+    best_boundary_f1: f32 = 0,
+    best_boundary_precision: f32 = 0,
+    best_boundary_recall: f32 = 0,
+    best_boundary_threshold: f32 = 0.5,
+    best_boundary_tp: u64 = 0,
+    best_boundary_fp: u64 = 0,
+    best_boundary_fn: u64 = 0,
+    valid_tokens: u64 = 0,
+    gold_positives: u64 = 0,
+    gold_positive_rate: f32 = 0,
+    predicted_positives: u64 = 0,
+    predicted_positive_rate: f32 = 0,
+    best_predicted_positives: u64 = 0,
+    best_predicted_positive_rate: f32 = 0,
+    mean_positive_probability_gold_positive: f32 = 0,
+    mean_positive_probability_gold_negative: f32 = 0,
     num_batches: u32 = 0,
+};
+
+pub const BoundaryEvalAccumulator = struct {
+    pub const sweep_count = 101;
+
+    agg: fused_chunker_loss.BoundaryMetrics = .{ .tp = 0, .fp = 0, .fn_ = 0 },
+    sweep_metrics: [sweep_count]fused_chunker_loss.BoundaryMetrics = [_]fused_chunker_loss.BoundaryMetrics{.{ .tp = 0, .fp = 0, .fn_ = 0 }} ** sweep_count,
+    valid_tokens: u64 = 0,
+    gold_positives: u64 = 0,
+    prob_sum_gold_positive: f64 = 0,
+    prob_sum_gold_negative: f64 = 0,
+    num_batches: u32 = 0,
+
+    pub fn addLogits(
+        self: *BoundaryEvalAccumulator,
+        allocator: std.mem.Allocator,
+        logits: []const f32,
+        labels: []const f32,
+        mask: ?[]const f32,
+    ) !void {
+        if (labels.len % 2 != 0) return error.InvalidBoundaryLabelShape;
+        const total = labels.len / 2;
+        const scalar_labels = try allocator.alloc(f32, total);
+        defer allocator.free(scalar_labels);
+        for (0..total) |i| {
+            scalar_labels[i] = if (labels[i * 2 + 1] > 0.5) 1.0 else 0.0;
+        }
+
+        for (0..total) |i| {
+            if (mask) |m| {
+                if (m[i] <= 0.5) continue;
+            }
+            self.valid_tokens += 1;
+            const prob = fused_chunker_loss.positiveBoundaryProbability(logits[i * 2], logits[i * 2 + 1]);
+            if (scalar_labels[i] > 0.5) {
+                self.gold_positives += 1;
+                self.prob_sum_gold_positive += prob;
+            } else {
+                self.prob_sum_gold_negative += prob;
+            }
+        }
+
+        const metrics = fused_chunker_loss.computeBoundaryMetrics(logits, scalar_labels, mask);
+        self.agg.tp += metrics.tp;
+        self.agg.fp += metrics.fp;
+        self.agg.fn_ += metrics.fn_;
+
+        for (&self.sweep_metrics, 0..) |*sweep, threshold_idx| {
+            const threshold = @as(f32, @floatFromInt(threshold_idx)) / @as(f32, @floatFromInt(sweep_count - 1));
+            const threshold_metrics = fused_chunker_loss.computeBoundaryMetricsWithThreshold(logits, scalar_labels, mask, threshold);
+            sweep.tp += threshold_metrics.tp;
+            sweep.fp += threshold_metrics.fp;
+            sweep.fn_ += threshold_metrics.fn_;
+        }
+        self.num_batches += 1;
+    }
+
+    pub fn finish(self: BoundaryEvalAccumulator) EvalSummary {
+        var best_idx: usize = 50;
+        var best_metrics = self.sweep_metrics[best_idx];
+        var best_f1 = best_metrics.f1();
+        for (self.sweep_metrics, 0..) |metrics, threshold_idx| {
+            const f1 = metrics.f1();
+            if (f1 > best_f1) {
+                best_idx = threshold_idx;
+                best_metrics = metrics;
+                best_f1 = f1;
+            }
+        }
+        const best_threshold = @as(f32, @floatFromInt(best_idx)) / @as(f32, @floatFromInt(sweep_count - 1));
+        const predicted_positives = self.agg.tp + self.agg.fp;
+        const best_predicted_positives = best_metrics.tp + best_metrics.fp;
+        const valid_f: f32 = if (self.valid_tokens == 0) 0 else @floatFromInt(self.valid_tokens);
+        const gold_positive_rate = if (self.valid_tokens == 0)
+            0.0
+        else
+            @as(f32, @floatFromInt(self.gold_positives)) / valid_f;
+        const predicted_positive_rate = if (self.valid_tokens == 0)
+            0.0
+        else
+            @as(f32, @floatFromInt(predicted_positives)) / valid_f;
+        const best_predicted_positive_rate = if (self.valid_tokens == 0)
+            0.0
+        else
+            @as(f32, @floatFromInt(best_predicted_positives)) / valid_f;
+        const gold_negatives = self.valid_tokens - self.gold_positives;
+        const mean_pos_prob_gold_positive = if (self.gold_positives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.prob_sum_gold_positive / @as(f64, @floatFromInt(self.gold_positives))));
+        const mean_pos_prob_gold_negative = if (gold_negatives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.prob_sum_gold_negative / @as(f64, @floatFromInt(gold_negatives))));
+
+        return EvalSummary{
+            .boundary_f1 = self.agg.f1(),
+            .boundary_precision = self.agg.precision(),
+            .boundary_recall = self.agg.recall(),
+            .boundary_tp = self.agg.tp,
+            .boundary_fp = self.agg.fp,
+            .boundary_fn = self.agg.fn_,
+            .best_boundary_f1 = best_f1,
+            .best_boundary_precision = best_metrics.precision(),
+            .best_boundary_recall = best_metrics.recall(),
+            .best_boundary_threshold = best_threshold,
+            .best_boundary_tp = best_metrics.tp,
+            .best_boundary_fp = best_metrics.fp,
+            .best_boundary_fn = best_metrics.fn_,
+            .valid_tokens = self.valid_tokens,
+            .gold_positives = self.gold_positives,
+            .gold_positive_rate = gold_positive_rate,
+            .predicted_positives = predicted_positives,
+            .predicted_positive_rate = predicted_positive_rate,
+            .best_predicted_positives = best_predicted_positives,
+            .best_predicted_positive_rate = best_predicted_positive_rate,
+            .mean_positive_probability_gold_positive = mean_pos_prob_gold_positive,
+            .mean_positive_probability_gold_negative = mean_pos_prob_gold_negative,
+            .num_batches = self.num_batches,
+        };
+    }
 };
 
 // ----------------------------------------------------------------------------
@@ -373,6 +624,7 @@ pub const FusedTrainer = struct {
 
     // Head weights
     boundary_head: BoundaryHead,
+    legacy_dense_boundary_head: ?LegacyDenseBoundaryHead = null,
 
     // Optimizer
     optimizer: optimizers.Optimizer,
@@ -406,6 +658,24 @@ pub const FusedTrainer = struct {
     // LoRA features_grad accumulator for grad_accum_steps > 1 (Fix 4)
     grad_accum_lora_features_grad_accum: ?[]f32 = null,
 
+    // Shape-keyed cache for the boundary-head training graph. The common
+    // training path uses a fixed [batch * max_seq_len] shape, so compiling the
+    // autodiff graph once avoids rebuilding/lowering it every step.
+    boundary_graph_cache: std.AutoHashMapUnmanaged(usize, BoundaryGraphCacheEntry) = .{},
+
+    const BoundaryGraphCacheEntry = struct {
+        graph: fused_chunker_loss.BoundaryHeadGraph,
+        head_session: ?training.CompiledTrainSession = null,
+        encoder_grad_session: ?training.CompiledTrainSession = null,
+
+        fn deinit(self: *BoundaryGraphCacheEntry) void {
+            if (self.head_session) |*session| session.deinit();
+            if (self.encoder_grad_session) |*session| session.deinit();
+            self.graph.deinit();
+            self.* = undefined;
+        }
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         config: FusedTrainingConfig,
@@ -414,6 +684,7 @@ pub const FusedTrainer = struct {
         const loss_config = fused_chunker_loss.FusedLossConfig{
             .lambda_chunk = config.lambda_chunk,
             .lambda_embed = config.lambda_embed,
+            .use_focal = config.use_boundary_focal,
             .focal_gamma = config.focal_gamma,
             .focal_alpha = config.focal_alpha,
             .temperature = config.temperature,
@@ -423,12 +694,15 @@ pub const FusedTrainer = struct {
             .lambda_flops = config.lambda_flops,
             .splade_focus_epoch = config.splade_focus_epoch,
             .use_mrl = config.use_mrl,
+            .mrl_dims = config.mrl_dims,
+            .mrl_weights = config.mrl_weights,
         };
 
-        var head = try BoundaryHead.init(
+        var head = try BoundaryHead.initWithSeed(
             allocator,
             @intCast(config.hidden_size),
             @intCast(config.boundary_mlp_dim),
+            config.seed,
         );
         errdefer head.deinit();
 
@@ -504,6 +778,7 @@ pub const FusedTrainer = struct {
 
     pub fn deinit(self: *FusedTrainer) void {
         self.boundary_head.deinit();
+        if (self.legacy_dense_boundary_head) |*head| head.deinit();
         self.optimizer_state.deinit();
         // Gradient accumulation buffers (Feature 2)
         self.allocator.free(self.grad_accum_w1);
@@ -519,7 +794,646 @@ pub const FusedTrainer = struct {
         if (self.xbm) |*x| x.deinit();
         // LoRA features_grad accumulator (Fix 4)
         if (self.grad_accum_lora_features_grad_accum) |buf| self.allocator.free(buf);
+        var cache_it = self.boundary_graph_cache.iterator();
+        while (cache_it.next()) |entry| entry.value_ptr.deinit();
+        self.boundary_graph_cache.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    fn sanitizeGradientBufferInPlace(values: []f32) void {
+        _ = optimizers.sanitizeSlice(values);
+    }
+
+    fn sanitizeBoundaryStepGradients(step: *BoundaryTrainStepResult) void {
+        sanitizeGradientBufferInPlace(step.w1_grad);
+        sanitizeGradientBufferInPlace(step.b1_grad);
+        sanitizeGradientBufferInPlace(step.w2_grad);
+        sanitizeGradientBufferInPlace(step.b2_grad);
+        if (step.features_grad) |grad| sanitizeGradientBufferInPlace(grad);
+    }
+
+    fn sanitizeBoundaryHeadParameters(self: *FusedTrainer) void {
+        sanitizeGradientBufferInPlace(self.boundary_head.w1);
+        sanitizeGradientBufferInPlace(self.boundary_head.b1);
+        sanitizeGradientBufferInPlace(self.boundary_head.w2);
+        sanitizeGradientBufferInPlace(self.boundary_head.b2);
+        if (self.legacy_dense_boundary_head) |*head| {
+            sanitizeGradientBufferInPlace(head.weight);
+            sanitizeGradientBufferInPlace(head.bias);
+        }
+    }
+
+    fn addGradientNormSq(total_sq: *f64, values: []const f32) void {
+        for (values) |value| {
+            const v: f64 = @floatCast(value);
+            total_sq.* += v * v;
+        }
+    }
+
+    fn scaleGradientBuffer(values: []f32, scale: f32) void {
+        for (values) |*value| value.* *= scale;
+    }
+
+    fn resetBoundaryGradientAccum(self: *FusedTrainer) void {
+        @memset(self.grad_accum_w1, 0);
+        @memset(self.grad_accum_b1, 0);
+        @memset(self.grad_accum_w2, 0);
+        @memset(self.grad_accum_b2, 0);
+    }
+
+    fn sanitizeAndClipBoundaryGradientAccum(self: *FusedTrainer) void {
+        sanitizeGradientBufferInPlace(self.grad_accum_w1);
+        sanitizeGradientBufferInPlace(self.grad_accum_b1);
+        sanitizeGradientBufferInPlace(self.grad_accum_w2);
+        sanitizeGradientBufferInPlace(self.grad_accum_b2);
+
+        var total_sq: f64 = 0;
+        addGradientNormSq(&total_sq, self.grad_accum_w1);
+        addGradientNormSq(&total_sq, self.grad_accum_b1);
+        addGradientNormSq(&total_sq, self.grad_accum_w2);
+        addGradientNormSq(&total_sq, self.grad_accum_b2);
+
+        if (!std.math.isFinite(total_sq)) {
+            self.resetBoundaryGradientAccum();
+            return;
+        }
+
+        const total_norm: f32 = @floatCast(@sqrt(total_sq));
+        if (!std.math.isFinite(total_norm) or total_norm == 0.0) return;
+        if (self.config.max_grad_norm > 0.0 and total_norm > self.config.max_grad_norm) {
+            const grad_scale = self.config.max_grad_norm / (total_norm + 1e-6);
+            scaleGradientBuffer(self.grad_accum_w1, grad_scale);
+            scaleGradientBuffer(self.grad_accum_b1, grad_scale);
+            scaleGradientBuffer(self.grad_accum_w2, grad_scale);
+            scaleGradientBuffer(self.grad_accum_b2, grad_scale);
+        }
+    }
+
+    fn sanitizeScheduleFreeState(state: *ScheduleFreeAdamWState) void {
+        sanitizeGradientBufferInPlace(state.z);
+        sanitizeGradientBufferInPlace(state.v);
+    }
+
+    fn sanitizeBoundaryOptimizerState(self: *FusedTrainer) void {
+        _ = optimizers.sanitizeState(&self.optimizer_state);
+        if (self.sf_state_w1) |*state| sanitizeScheduleFreeState(state);
+        if (self.sf_state_b1) |*state| sanitizeScheduleFreeState(state);
+        if (self.sf_state_w2) |*state| sanitizeScheduleFreeState(state);
+        if (self.sf_state_b2) |*state| sanitizeScheduleFreeState(state);
+    }
+
+    fn applyAccumulatedBoundaryHeadStep(self: *FusedTrainer, lr: f32) !void {
+        self.sanitizeAndClipBoundaryGradientAccum();
+        self.sanitizeBoundaryOptimizerState();
+        if (self.config.use_schedule_free) {
+            scheduleFreeAdamWStep(self.boundary_head.w1, self.grad_accum_w1, &self.sf_state_w1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
+            scheduleFreeAdamWStep(self.boundary_head.b1, self.grad_accum_b1, &self.sf_state_b1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
+            scheduleFreeAdamWStep(self.boundary_head.w2, self.grad_accum_w2, &self.sf_state_w2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
+            scheduleFreeAdamWStep(self.boundary_head.b2, self.grad_accum_b2, &self.sf_state_b2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
+        } else {
+            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w1", self.boundary_head.w1, self.grad_accum_w1);
+            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b1", self.boundary_head.b1, self.grad_accum_b1);
+            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w2", self.boundary_head.w2, self.grad_accum_w2);
+            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b2", self.boundary_head.b2, self.grad_accum_b2);
+        }
+        self.sanitizeBoundaryOptimizerState();
+        self.sanitizeBoundaryHeadParameters();
+        self.resetBoundaryGradientAccum();
+        self.accum_count = 0;
+    }
+
+    fn getBoundaryGraphCacheEntry(self: *FusedTrainer, total_tokens: usize) !*BoundaryGraphCacheEntry {
+        if (self.boundary_graph_cache.getPtr(total_tokens)) |entry| return entry;
+
+        var graph = try fused_chunker_loss.BoundaryHeadGraph.init(
+            self.allocator,
+            total_tokens,
+            self.config.hidden_size,
+            self.config.boundary_mlp_dim,
+            self.loss_config.pos_weight,
+            self.loss_config.use_focal,
+            self.loss_config.focal_gamma,
+            self.loss_config.focal_alpha,
+            self.config.boundary_dropout,
+        );
+        errdefer graph.deinit();
+
+        try self.boundary_graph_cache.put(self.allocator, total_tokens, .{
+            .graph = graph,
+        });
+        return self.boundary_graph_cache.getPtr(total_tokens).?;
+    }
+
+    fn getHeadTrainSession(self: *FusedTrainer, entry: *BoundaryGraphCacheEntry) !*training.CompiledTrainSession {
+        if (entry.head_session == null) {
+            entry.head_session = try training.CompiledTrainSession.init(
+                self.allocator,
+                &entry.graph.graph,
+                entry.graph.loss_id,
+                .{ .trainable_params = &.{ "w1", "b1", "w2", "b2" } },
+            );
+        }
+        return &entry.head_session.?;
+    }
+
+    fn getEncoderGradTrainSession(self: *FusedTrainer, entry: *BoundaryGraphCacheEntry) !*training.CompiledTrainSession {
+        if (entry.encoder_grad_session == null) {
+            entry.encoder_grad_session = try training.CompiledTrainSession.init(
+                self.allocator,
+                &entry.graph.graph,
+                entry.graph.loss_id,
+                .{ .trainable_params = &.{ "features", "w1", "b1", "w2", "b2" } },
+            );
+        }
+        return &entry.encoder_grad_session.?;
+    }
+
+    const BoundaryTrainStepResult = struct {
+        boundary_loss: f32,
+        w1_grad: []f32,
+        b1_grad: []f32,
+        w2_grad: []f32,
+        b2_grad: []f32,
+        features_grad: ?[]f32 = null,
+
+        fn deinit(self: *BoundaryTrainStepResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.w1_grad);
+            allocator.free(self.b1_grad);
+            allocator.free(self.w2_grad);
+            allocator.free(self.b2_grad);
+            if (self.features_grad) |grad| allocator.free(grad);
+            self.* = undefined;
+        }
+
+        fn takeFeaturesGrad(self: *BoundaryTrainStepResult) ?[]f32 {
+            const grad = self.features_grad;
+            self.features_grad = null;
+            return grad;
+        }
+    };
+
+    fn runBoundaryHeadTraining(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        boundary_labels: []const f32,
+        attention_mask: []const f32,
+        total_tokens: usize,
+        want_features_grad: bool,
+    ) !BoundaryTrainStepResult {
+        if (!self.loss_config.use_focal and self.cb.kind() == .metal) {
+            return self.runBoundaryHeadCeOpsStep(
+                allocator,
+                features,
+                boundary_labels,
+                attention_mask,
+                total_tokens,
+                want_features_grad,
+            ) catch |err| {
+                std.log.debug("fused_chunker boundary CE Metal fast path failed with {s}; falling back to graph", .{@errorName(err)});
+                return self.runBoundaryHeadGraphStep(
+                    allocator,
+                    features,
+                    boundary_labels,
+                    attention_mask,
+                    total_tokens,
+                    want_features_grad,
+                );
+            };
+        }
+
+        return self.runBoundaryHeadGraphStep(
+            allocator,
+            features,
+            boundary_labels,
+            attention_mask,
+            total_tokens,
+            want_features_grad,
+        );
+    }
+
+    fn runBoundaryHeadGraphStep(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        boundary_labels: []const f32,
+        attention_mask: []const f32,
+        total_tokens: usize,
+        want_features_grad: bool,
+    ) !BoundaryTrainStepResult {
+        const graph_entry = try self.getBoundaryGraphCacheEntry(total_tokens);
+        const graph = &graph_entry.graph;
+        const train_session = if (want_features_grad)
+            try self.getEncoderGradTrainSession(graph_entry)
+        else
+            try self.getHeadTrainSession(graph_entry);
+
+        const feature_dropout_mask = try allocInvertedDropoutMask(
+            allocator,
+            total_tokens * @as(usize, @intCast(self.config.hidden_size)),
+            self.config.boundary_dropout,
+            dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0001),
+        );
+        defer allocator.free(feature_dropout_mask);
+        const hidden_dropout_mask = try allocInvertedDropoutMask(
+            allocator,
+            total_tokens * @as(usize, @intCast(self.config.boundary_mlp_dim)),
+            self.config.boundary_dropout,
+            dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0002),
+        );
+        defer allocator.free(hidden_dropout_mask);
+
+        var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+        defer {
+            var it = rt.iterator();
+            while (it.next()) |e| self.cb.free(e.value_ptr.*);
+            rt.deinit(allocator);
+        }
+
+        try putRuntimeInput(allocator, self.cb, &rt, graph.feature_id, features, &.{
+            @intCast(total_tokens),
+            @intCast(self.config.hidden_size),
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.target_id, boundary_labels, &.{
+            @intCast(total_tokens),
+            2,
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.mask_id, attention_mask, &.{
+            @intCast(total_tokens),
+            1,
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.feature_dropout_mask_id, feature_dropout_mask, &.{
+            @intCast(total_tokens),
+            @intCast(self.config.hidden_size),
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.hidden_dropout_mask_id, hidden_dropout_mask, &.{
+            @intCast(total_tokens),
+            @intCast(self.config.boundary_mlp_dim),
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.w1_id, self.boundary_head.w1, &.{
+            @intCast(self.config.boundary_mlp_dim),
+            @intCast(self.config.hidden_size),
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.b1_id, self.boundary_head.b1, &.{
+            @intCast(self.config.boundary_mlp_dim),
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.w2_id, self.boundary_head.w2, &.{
+            2,
+            @intCast(self.config.boundary_mlp_dim),
+        });
+        try putRuntimeInput(allocator, self.cb, &rt, graph.b2_id, self.boundary_head.b2, &.{2});
+
+        var step_result = try train_session.execute(self.cb, rt);
+        defer step_result.deinit();
+
+        const w1_src = step_result.gradients.get("w1") orelse return error.MissingGradient;
+        const b1_src = step_result.gradients.get("b1") orelse return error.MissingGradient;
+        const w2_src = step_result.gradients.get("w2") orelse return error.MissingGradient;
+        const b2_src = step_result.gradients.get("b2") orelse return error.MissingGradient;
+
+        const w1_grad = try allocator.dupe(f32, w1_src);
+        errdefer allocator.free(w1_grad);
+        const b1_grad = try allocator.dupe(f32, b1_src);
+        errdefer allocator.free(b1_grad);
+        const w2_grad = try allocator.dupe(f32, w2_src);
+        errdefer allocator.free(w2_grad);
+        const b2_grad = try allocator.dupe(f32, b2_src);
+        errdefer allocator.free(b2_grad);
+
+        var features_grad: ?[]f32 = null;
+        errdefer if (features_grad) |g| allocator.free(g);
+        if (want_features_grad) {
+            if (step_result.gradients.get("features")) |g| {
+                features_grad = try allocator.dupe(f32, g);
+            }
+        }
+        return .{
+            .boundary_loss = step_result.loss,
+            .w1_grad = w1_grad,
+            .b1_grad = b1_grad,
+            .w2_grad = w2_grad,
+            .b2_grad = b2_grad,
+            .features_grad = features_grad,
+        };
+    }
+
+    fn runBoundaryHeadCeOpsStep(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        boundary_labels: []const f32,
+        attention_mask: []const f32,
+        total_tokens: usize,
+        want_features_grad: bool,
+    ) !BoundaryTrainStepResult {
+        const H: usize = @intCast(self.config.hidden_size);
+        const M: usize = @intCast(self.config.boundary_mlp_dim);
+        if (features.len != total_tokens * H) return error.UnexpectedOutputShape;
+        if (boundary_labels.len != total_tokens * 2) return error.UnexpectedOutputShape;
+        if (attention_mask.len != total_tokens) return error.UnexpectedOutputShape;
+
+        const feature_dropout_mask = try allocInvertedDropoutMask(
+            allocator,
+            total_tokens * H,
+            self.config.boundary_dropout,
+            dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0001),
+        );
+        defer allocator.free(feature_dropout_mask);
+        const hidden_dropout_mask = try allocInvertedDropoutMask(
+            allocator,
+            total_tokens * M,
+            self.config.boundary_dropout,
+            dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0002),
+        );
+        defer allocator.free(hidden_dropout_mask);
+
+        const features_ct = try self.cb.fromFloat32Shape(features, &.{ @intCast(total_tokens), @intCast(H) });
+        defer self.cb.free(features_ct);
+        const feature_dropout_mask_ct = try self.cb.fromFloat32Shape(feature_dropout_mask, &.{ @intCast(total_tokens), @intCast(H) });
+        defer self.cb.free(feature_dropout_mask_ct);
+        const hidden_dropout_mask_ct = try self.cb.fromFloat32Shape(hidden_dropout_mask, &.{ @intCast(total_tokens), @intCast(M) });
+        defer self.cb.free(hidden_dropout_mask_ct);
+        const w1_ct = try self.cb.fromFloat32Shape(self.boundary_head.w1, &.{ @intCast(M), @intCast(H) });
+        defer self.cb.free(w1_ct);
+        const b1_ct = try self.cb.fromFloat32Shape(self.boundary_head.b1, &.{@intCast(M)});
+        defer self.cb.free(b1_ct);
+        const w2_ct = try self.cb.fromFloat32Shape(self.boundary_head.w2, &.{ 2, @intCast(M) });
+        defer self.cb.free(w2_ct);
+        const b2_ct = try self.cb.fromFloat32Shape(self.boundary_head.b2, &.{2});
+        defer self.cb.free(b2_ct);
+
+        const dropped_features_ct = try self.cb.multiply(features_ct, feature_dropout_mask_ct);
+        defer self.cb.free(dropped_features_ct);
+        const dense_ct = try self.cb.linear(dropped_features_ct, w1_ct, b1_ct, total_tokens, H, M);
+        defer self.cb.free(dense_ct);
+        const hidden_ct = try self.cb.gelu(dense_ct);
+        defer self.cb.free(hidden_ct);
+        const dropped_hidden_ct = try self.cb.multiply(hidden_ct, hidden_dropout_mask_ct);
+        defer self.cb.free(dropped_hidden_ct);
+        const logits_ct = try self.cb.linear(dropped_hidden_ct, w2_ct, b2_ct, total_tokens, M, 2);
+        defer self.cb.free(logits_ct);
+
+        var forward_cts = [_]CT{ logits_ct, dense_ct };
+        const forward_host = try self.cb.toFloat32Batch(&forward_cts, allocator);
+        defer {
+            for (forward_host) |slice| allocator.free(slice);
+            allocator.free(forward_host);
+        }
+        const logits = forward_host[0];
+        const dense = forward_host[1];
+
+        const ce = try computeBoundaryWeightedCeAndLogitGrad(
+            allocator,
+            logits,
+            boundary_labels,
+            attention_mask,
+            total_tokens,
+            self.loss_config.pos_weight,
+        );
+        defer allocator.free(ce.logit_grad);
+
+        const gelu_deriv = try allocGeluExactDerivative(allocator, dense);
+        defer allocator.free(gelu_deriv);
+
+        const dlogits_ct = try self.cb.fromFloat32Shape(ce.logit_grad, &.{ @intCast(total_tokens), 2 });
+        defer self.cb.free(dlogits_ct);
+        const gelu_deriv_ct = try self.cb.fromFloat32Shape(gelu_deriv, &.{ @intCast(total_tokens), @intCast(M) });
+        defer self.cb.free(gelu_deriv_ct);
+
+        const total_i64: i64 = @intCast(total_tokens);
+        const h_i64: i64 = @intCast(H);
+        const m_i64: i64 = @intCast(M);
+        const grad_w2_ct = try self.cb.primDotGeneral(
+            dlogits_ct,
+            dropped_hidden_ct,
+            &.{ total_i64, 2 },
+            &.{ total_i64, m_i64 },
+            &.{0},
+            &.{0},
+            &.{},
+            &.{},
+        );
+        defer self.cb.free(grad_w2_ct);
+        const grad_b2_ct = try self.cb.primReduceSum(dlogits_ct, &.{0}, &.{ total_i64, 2 });
+        defer self.cb.free(grad_b2_ct);
+        const d_hidden_drop_ct = try self.cb.primDotGeneral(
+            dlogits_ct,
+            w2_ct,
+            &.{ total_i64, 2 },
+            &.{ 2, m_i64 },
+            &.{1},
+            &.{0},
+            &.{},
+            &.{},
+        );
+        defer self.cb.free(d_hidden_drop_ct);
+        const d_hidden_ct = try self.cb.multiply(d_hidden_drop_ct, hidden_dropout_mask_ct);
+        defer self.cb.free(d_hidden_ct);
+        const d_dense_ct = try self.cb.multiply(d_hidden_ct, gelu_deriv_ct);
+        defer self.cb.free(d_dense_ct);
+        const grad_w1_ct = try self.cb.primDotGeneral(
+            d_dense_ct,
+            dropped_features_ct,
+            &.{ total_i64, m_i64 },
+            &.{ total_i64, h_i64 },
+            &.{0},
+            &.{0},
+            &.{},
+            &.{},
+        );
+        defer self.cb.free(grad_w1_ct);
+        const grad_b1_ct = try self.cb.primReduceSum(d_dense_ct, &.{0}, &.{ total_i64, m_i64 });
+        defer self.cb.free(grad_b1_ct);
+
+        var features_grad_ct_opt: ?CT = null;
+        defer if (features_grad_ct_opt) |ct| self.cb.free(ct);
+        if (want_features_grad) {
+            const raw_features_grad_ct = try self.cb.primDotGeneral(
+                d_dense_ct,
+                w1_ct,
+                &.{ total_i64, m_i64 },
+                &.{ m_i64, h_i64 },
+                &.{1},
+                &.{0},
+                &.{},
+                &.{},
+            );
+            defer self.cb.free(raw_features_grad_ct);
+            features_grad_ct_opt = try self.cb.multiply(raw_features_grad_ct, feature_dropout_mask_ct);
+        }
+
+        var grad_cts_buf: [5]CT = undefined;
+        grad_cts_buf[0] = grad_w1_ct;
+        grad_cts_buf[1] = grad_b1_ct;
+        grad_cts_buf[2] = grad_w2_ct;
+        grad_cts_buf[3] = grad_b2_ct;
+        var grad_ct_count: usize = 4;
+        if (features_grad_ct_opt) |ct| {
+            grad_cts_buf[grad_ct_count] = ct;
+            grad_ct_count += 1;
+        }
+
+        const grad_host = try self.cb.toFloat32Batch(grad_cts_buf[0..grad_ct_count], allocator);
+        errdefer {
+            for (grad_host) |slice| allocator.free(slice);
+            allocator.free(grad_host);
+        }
+
+        const out = BoundaryTrainStepResult{
+            .boundary_loss = ce.loss,
+            .w1_grad = grad_host[0],
+            .b1_grad = grad_host[1],
+            .w2_grad = grad_host[2],
+            .b2_grad = grad_host[3],
+            .features_grad = if (grad_ct_count == 5) grad_host[4] else null,
+        };
+        allocator.free(grad_host);
+        return out;
+    }
+
+    const ContrastiveStepResult = struct {
+        result: infonce_cpu.ContrastiveLossResult,
+        xbm_expanded_embeddings: ?[]f32 = null,
+        xbm_expanded_doc_ids: ?[]u32 = null,
+
+        fn deinit(self: *ContrastiveStepResult, allocator: std.mem.Allocator) void {
+            self.result.deinit(allocator);
+            if (self.xbm_expanded_embeddings) |e| allocator.free(e);
+            if (self.xbm_expanded_doc_ids) |d| allocator.free(d);
+            self.* = undefined;
+        }
+    };
+
+    fn mrlContrastiveResult(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        mrl: *infonce_cpu.MatryoshkaResult,
+    ) infonce_cpu.ContrastiveLossResult {
+        allocator.free(mrl.per_scale_loss);
+        mrl.per_scale_loss = &.{};
+        for (mrl.grad) |*g| g.* *= self.loss_config.lambda_embed;
+        const grad = mrl.grad;
+        mrl.grad = &.{};
+        return .{
+            .contrastive_loss = mrl.total_loss,
+            .total_loss = mrl.total_loss * @as(f64, self.loss_config.lambda_embed),
+            .grad = grad,
+        };
+    }
+
+    fn computeContrastiveStep(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        chunk_embeddings: []const f32,
+        chunk_mask: []const f32,
+        doc_ids: []const u32,
+        B: usize,
+        C: usize,
+        E: usize,
+    ) !ContrastiveStepResult {
+        var out = ContrastiveStepResult{
+            .result = .{
+                .contrastive_loss = 0,
+                .total_loss = 0,
+                .grad = &.{},
+            },
+        };
+        var result_ready = false;
+        errdefer {
+            if (result_ready) out.result.deinit(allocator);
+            if (out.xbm_expanded_embeddings) |e| allocator.free(e);
+            if (out.xbm_expanded_doc_ids) |d| allocator.free(d);
+        }
+
+        if (self.xbm) |*xbm| {
+            const stored = xbm.getStored();
+            if (stored.count > 0) {
+                const n_current = B * C;
+                const n_total = n_current + stored.count;
+                const expanded = try allocator.alloc(f32, n_total * E);
+                out.xbm_expanded_embeddings = expanded;
+                @memcpy(expanded[0 .. n_current * E], chunk_embeddings);
+                @memcpy(expanded[n_current * E ..], stored.embeddings[0 .. stored.count * E]);
+
+                const exp_ids = try allocator.alloc(u32, n_total);
+                out.xbm_expanded_doc_ids = exp_ids;
+                @memcpy(exp_ids[0..n_current], doc_ids);
+                @memcpy(exp_ids[n_current..], stored.doc_ids[0..stored.count]);
+
+                const exp_mask = try allocator.alloc(f32, n_total);
+                defer allocator.free(exp_mask);
+                @memcpy(exp_mask[0..n_current], chunk_mask[0..n_current]);
+                @memset(exp_mask[n_current..], 1.0);
+
+                out.result = if (self.loss_config.use_mrl) mrl_blk: {
+                    const mrl_config = infonce_cpu.MatryoshkaConfig{
+                        .dims = self.loss_config.mrl_dims,
+                        .weights = self.loss_config.mrl_weights,
+                    };
+                    var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+                        allocator,
+                        expanded,
+                        exp_mask,
+                        exp_ids,
+                        n_total,
+                        E,
+                        mrl_config,
+                        self.loss_config.temperature,
+                        self.loss_config.focal_gamma,
+                        self.loss_config.focal_alpha,
+                    );
+                    break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
+                } else try infonce_cpu.computeContrastiveLossOnCPU(
+                    allocator,
+                    expanded,
+                    exp_mask,
+                    exp_ids,
+                    @as(f64, self.loss_config.temperature),
+                    @as(f64, self.loss_config.lambda_embed),
+                    1,
+                    n_total,
+                    E,
+                    @as(f64, self.loss_config.focal_gamma),
+                    @as(f64, self.loss_config.focal_alpha),
+                );
+                result_ready = true;
+                return out;
+            }
+        }
+
+        out.result = if (self.loss_config.use_mrl) mrl_blk: {
+            const mrl_config = infonce_cpu.MatryoshkaConfig{
+                .dims = self.loss_config.mrl_dims,
+                .weights = self.loss_config.mrl_weights,
+            };
+            var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+                allocator,
+                chunk_embeddings,
+                chunk_mask,
+                doc_ids,
+                B * C,
+                E,
+                mrl_config,
+                self.loss_config.temperature,
+                self.loss_config.focal_gamma,
+                self.loss_config.focal_alpha,
+            );
+            break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
+        } else try infonce_cpu.computeContrastiveLossOnCPU(
+            allocator,
+            chunk_embeddings,
+            chunk_mask,
+            doc_ids,
+            @as(f64, self.loss_config.temperature),
+            @as(f64, self.loss_config.lambda_embed),
+            B,
+            C,
+            E,
+            @as(f64, self.loss_config.focal_gamma),
+            @as(f64, self.loss_config.focal_alpha),
+        );
+        result_ready = true;
+        return out;
     }
 
     /// Run one training step.
@@ -544,68 +1458,29 @@ pub const FusedTrainer = struct {
         C: usize,
         E: usize,
     ) !TrainStepSummary {
-        _ = attention_mask;
-
-        // 1. Build graph on-the-fly (total_tokens varies per batch)
-        var graph = try fused_chunker_loss.BoundaryHeadGraph.init(
-            allocator,
-            total_tokens,
-            self.config.hidden_size,
-            self.config.boundary_mlp_dim,
-        );
-        defer graph.deinit();
-
-        // 2. Build runtime map
-        var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
-        defer {
-            var it = rt.iterator();
-            while (it.next()) |e| self.cb.free(e.value_ptr.*);
-            rt.deinit(allocator);
-        }
-
-        try putRuntimeInput(allocator, self.cb, &rt, graph.feature_id, features, &.{
-            @intCast(total_tokens),
-            @intCast(self.config.hidden_size),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.target_id, boundary_labels, &.{
-            @intCast(total_tokens),
-            2,
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.w1_id, self.boundary_head.w1, &.{
-            @intCast(self.config.boundary_mlp_dim),
-            @intCast(self.config.hidden_size),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.b1_id, self.boundary_head.b1, &.{
-            @intCast(self.config.boundary_mlp_dim),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.w2_id, self.boundary_head.w2, &.{
-            2,
-            @intCast(self.config.boundary_mlp_dim),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.b2_id, self.boundary_head.b2, &.{2});
-
-        // 3. Training step (autodiff + execute)
         self.optimizer_state.step_count = self.step_count + 1;
-        var step_result = try training.trainStep(
+        self.sanitizeBoundaryHeadParameters();
+        var boundary_step = try self.runBoundaryHeadTraining(
             allocator,
-            &graph.graph,
-            graph.loss_id,
-            self.cb,
-            rt,
-            .{ .trainable_params = &.{ "w1", "b1", "w2", "b2" } },
+            features,
+            boundary_labels,
+            attention_mask,
+            total_tokens,
+            false,
         );
-        defer step_result.deinit();
+        defer boundary_step.deinit(allocator);
+        sanitizeBoundaryStepGradients(&boundary_step);
 
-        const boundary_loss = step_result.loss;
+        const boundary_loss = boundary_step.boundary_loss;
 
         // 4. Get current learning rate
         const lr = self.lr_schedule.lr(self.step_count);
 
         // 5. Accumulate gradients — scale by 1/accum_steps before adding
-        const w1_grad = step_result.gradients.get("w1") orelse return error.MissingGradient;
-        const b1_grad = step_result.gradients.get("b1") orelse return error.MissingGradient;
-        const w2_grad = step_result.gradients.get("w2") orelse return error.MissingGradient;
-        const b2_grad = step_result.gradients.get("b2") orelse return error.MissingGradient;
+        const w1_grad = boundary_step.w1_grad;
+        const b1_grad = boundary_step.b1_grad;
+        const w2_grad = boundary_step.w2_grad;
+        const b2_grad = boundary_step.b2_grad;
 
         const accum_steps = self.config.grad_accum_steps;
         const scale: f32 = 1.0 / @as(f32, @floatFromInt(@max(accum_steps, 1)));
@@ -618,40 +1493,8 @@ pub const FusedTrainer = struct {
         // Apply optimizer step only when accumulation window is full
         var applied_lr: f32 = 0.0;
         if (self.accum_count >= accum_steps) {
-            // Clip the accumulated gradient (global norm across all four tensors).
-            {
-                var total_sq: f64 = 0;
-                for (self.grad_accum_w1) |g| total_sq += @as(f64, g * g);
-                for (self.grad_accum_b1) |g| total_sq += @as(f64, g * g);
-                for (self.grad_accum_w2) |g| total_sq += @as(f64, g * g);
-                for (self.grad_accum_b2) |g| total_sq += @as(f64, g * g);
-                const total_norm: f32 = @floatCast(@sqrt(total_sq));
-                if (total_norm > self.config.max_grad_norm) {
-                    const gscale = self.config.max_grad_norm / (total_norm + 1e-6);
-                    for (self.grad_accum_w1) |*g| g.* *= gscale;
-                    for (self.grad_accum_b1) |*g| g.* *= gscale;
-                    for (self.grad_accum_w2) |*g| g.* *= gscale;
-                    for (self.grad_accum_b2) |*g| g.* *= gscale;
-                }
-            }
             applied_lr = lr;
-            if (self.config.use_schedule_free) {
-                scheduleFreeAdamWStep(self.boundary_head.w1, self.grad_accum_w1, &self.sf_state_w1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-                scheduleFreeAdamWStep(self.boundary_head.b1, self.grad_accum_b1, &self.sf_state_b1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-                scheduleFreeAdamWStep(self.boundary_head.w2, self.grad_accum_w2, &self.sf_state_w2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-                scheduleFreeAdamWStep(self.boundary_head.b2, self.grad_accum_b2, &self.sf_state_b2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-            } else {
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w1", self.boundary_head.w1, self.grad_accum_w1);
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b1", self.boundary_head.b1, self.grad_accum_b1);
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w2", self.boundary_head.w2, self.grad_accum_w2);
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b2", self.boundary_head.b2, self.grad_accum_b2);
-            }
-            // Reset accumulation
-            @memset(self.grad_accum_w1, 0);
-            @memset(self.grad_accum_b1, 0);
-            @memset(self.grad_accum_w2, 0);
-            @memset(self.grad_accum_b2, 0);
-            self.accum_count = 0;
+            try self.applyAccumulatedBoundaryHeadStep(lr);
         }
 
         // 6. CPU InfoNCE contrastive loss — with optional XBM expansion (Feature 1)
@@ -687,7 +1530,7 @@ pub const FusedTrainer = struct {
                             .dims = self.loss_config.mrl_dims,
                             .weights = self.loss_config.mrl_weights,
                         };
-                        const mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+                        var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
                             allocator,
                             expanded,
                             exp_mask,
@@ -699,12 +1542,7 @@ pub const FusedTrainer = struct {
                             self.loss_config.focal_gamma,
                             self.loss_config.focal_alpha,
                         );
-                        allocator.free(mrl.per_scale_loss);
-                        break :mrl_blk infonce_cpu.ContrastiveLossResult{
-                            .contrastive_loss = mrl.total_loss,
-                            .total_loss = mrl.total_loss * @as(f64, self.loss_config.lambda_embed),
-                            .grad = mrl.grad,
-                        };
+                        break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
                     } else try infonce_cpu.computeContrastiveLossOnCPU(
                         allocator,
                         expanded,
@@ -726,7 +1564,7 @@ pub const FusedTrainer = struct {
                     .dims = self.loss_config.mrl_dims,
                     .weights = self.loss_config.mrl_weights,
                 };
-                const mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+                var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
                     allocator,
                     chunk_embeddings,
                     chunk_mask,
@@ -738,12 +1576,7 @@ pub const FusedTrainer = struct {
                     self.loss_config.focal_gamma,
                     self.loss_config.focal_alpha,
                 );
-                allocator.free(mrl.per_scale_loss);
-                break :mrl_blk infonce_cpu.ContrastiveLossResult{
-                    .contrastive_loss = mrl.total_loss,
-                    .total_loss = mrl.total_loss * @as(f64, self.loss_config.lambda_embed),
-                    .grad = mrl.grad,
-                };
+                break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
             } else try infonce_cpu.computeContrastiveLossOnCPU(
                 allocator,
                 chunk_embeddings,
@@ -778,7 +1611,9 @@ pub const FusedTrainer = struct {
 
         // 8. Increment step count
         self.step_count += 1;
-        std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr });
+        if (self.config.step_log_every > 0 and self.step_count % self.config.step_log_every == 0) {
+            std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr });
+        }
 
         return TrainStepSummary{
             .boundary_loss = boundary_loss,
@@ -816,80 +1651,40 @@ pub const FusedTrainer = struct {
         B: usize,
         C: usize,
         E: usize,
+        pooled_chunk_starts: []const i32,
+        pooled_chunk_ends: []const i32,
+        pooled_batch_size: usize,
+        pooled_max_seq_len: usize,
+        pooled_max_chunks: usize,
     ) !TrainStepWithGradSummary {
-        _ = attention_mask;
-
-        // 1. Build graph on-the-fly (total_tokens varies per batch)
-        var graph = try fused_chunker_loss.BoundaryHeadGraph.init(
-            allocator,
-            total_tokens,
-            self.config.hidden_size,
-            self.config.boundary_mlp_dim,
-        );
-        defer graph.deinit();
-
-        // 2. Build runtime map
-        var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
-        defer {
-            var it = rt.iterator();
-            while (it.next()) |e| self.cb.free(e.value_ptr.*);
-            rt.deinit(allocator);
-        }
-
-        try putRuntimeInput(allocator, self.cb, &rt, graph.feature_id, features, &.{
-            @intCast(total_tokens),
-            @intCast(self.config.hidden_size),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.target_id, boundary_labels, &.{
-            @intCast(total_tokens),
-            2,
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.w1_id, self.boundary_head.w1, &.{
-            @intCast(self.config.boundary_mlp_dim),
-            @intCast(self.config.hidden_size),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.b1_id, self.boundary_head.b1, &.{
-            @intCast(self.config.boundary_mlp_dim),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.w2_id, self.boundary_head.w2, &.{
-            2,
-            @intCast(self.config.boundary_mlp_dim),
-        });
-        try putRuntimeInput(allocator, self.cb, &rt, graph.b2_id, self.boundary_head.b2, &.{2});
-
-        // 3. Training step (autodiff + execute) — include "features" so autodiff
-        //    computes dL/d(features) in addition to the head parameter gradients.
         self.optimizer_state.step_count = self.step_count + 1;
-        var step_result = try training.trainStep(
+        self.sanitizeBoundaryHeadParameters();
+        var boundary_step = try self.runBoundaryHeadTraining(
             allocator,
-            &graph.graph,
-            graph.loss_id,
-            self.cb,
-            rt,
-            .{ .trainable_params = &.{ "features", "w1", "b1", "w2", "b2" } },
+            features,
+            boundary_labels,
+            attention_mask,
+            total_tokens,
+            true,
         );
-        defer step_result.deinit();
+        defer boundary_step.deinit(allocator);
+        sanitizeBoundaryStepGradients(&boundary_step);
 
-        const boundary_loss = step_result.loss;
+        const boundary_loss = boundary_step.boundary_loss;
 
         // 4. Get current learning rate
         const lr = self.lr_schedule.lr(self.step_count);
 
-        // 5. Extract and dupe the features gradient before step_result.deinit().
-        //    The gradient slice is owned by step_result and will be freed by deinit(),
-        //    so we must copy it here.
-        //    We use a var so we can null it out once ownership is transferred (Fix 4).
-        var features_grad_owned: ?[]f32 = if (step_result.gradients.get("features")) |g|
-            try allocator.dupe(f32, g)
-        else
-            null;
+        // 5. Take ownership of the feature gradient so the existing LoRA
+        //    scatter/accumulation path can consume it.
+        var features_grad_owned: ?[]f32 = boundary_step.takeFeaturesGrad();
         errdefer if (features_grad_owned) |g| allocator.free(g);
 
         // 6. Accumulate gradients — scale by 1/accum_steps before adding
-        const w1_grad = step_result.gradients.get("w1") orelse return error.MissingGradient;
-        const b1_grad = step_result.gradients.get("b1") orelse return error.MissingGradient;
-        const w2_grad = step_result.gradients.get("w2") orelse return error.MissingGradient;
-        const b2_grad = step_result.gradients.get("b2") orelse return error.MissingGradient;
+        const w1_grad = boundary_step.w1_grad;
+        const b1_grad = boundary_step.b1_grad;
+        const w2_grad = boundary_step.w2_grad;
+        const b2_grad = boundary_step.b2_grad;
 
         const accum_steps = self.config.grad_accum_steps;
         const scale: f32 = 1.0 / @as(f32, @floatFromInt(@max(accum_steps, 1)));
@@ -899,79 +1694,11 @@ pub const FusedTrainer = struct {
         for (b2_grad, self.grad_accum_b2) |g, *a| a.* += g * scale;
         self.accum_count += 1;
 
-        // Accumulate features_grad across microbatches for LoRA (Fix 4).
-        // We null features_grad_owned after consuming it so the errdefer above
-        // doesn't double-free on any subsequent error.
-        if (accum_steps > 1) {
-            if (features_grad_owned) |fgo| {
-                const lora_scale = 1.0 / @as(f32, @floatFromInt(accum_steps));
-                if (self.grad_accum_lora_features_grad_accum == null or
-                    self.grad_accum_lora_features_grad_accum.?.len != fgo.len)
-                {
-                    if (self.grad_accum_lora_features_grad_accum) |old| self.allocator.free(old);
-                    self.grad_accum_lora_features_grad_accum = try self.allocator.alloc(f32, fgo.len);
-                    @memset(self.grad_accum_lora_features_grad_accum.?, 0);
-                }
-                for (self.grad_accum_lora_features_grad_accum.?, fgo) |*a, g| {
-                    a.* += g * lora_scale;
-                }
-                // Free the per-step copy and null the variable so errdefer won't fire.
-                self.allocator.free(fgo);
-                features_grad_owned = null;
-            }
-        }
-
         var applied_lr: f32 = 0.0;
         if (self.accum_count >= accum_steps) {
-            // Clip the accumulated gradient (global norm across all four tensors).
-            {
-                var total_sq: f64 = 0;
-                for (self.grad_accum_w1) |g| total_sq += @as(f64, g * g);
-                for (self.grad_accum_b1) |g| total_sq += @as(f64, g * g);
-                for (self.grad_accum_w2) |g| total_sq += @as(f64, g * g);
-                for (self.grad_accum_b2) |g| total_sq += @as(f64, g * g);
-                const total_norm: f32 = @floatCast(@sqrt(total_sq));
-                if (total_norm > self.config.max_grad_norm) {
-                    const gscale = self.config.max_grad_norm / (total_norm + 1e-6);
-                    for (self.grad_accum_w1) |*g| g.* *= gscale;
-                    for (self.grad_accum_b1) |*g| g.* *= gscale;
-                    for (self.grad_accum_w2) |*g| g.* *= gscale;
-                    for (self.grad_accum_b2) |*g| g.* *= gscale;
-                }
-            }
             applied_lr = lr;
-            if (self.config.use_schedule_free) {
-                scheduleFreeAdamWStep(self.boundary_head.w1, self.grad_accum_w1, &self.sf_state_w1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-                scheduleFreeAdamWStep(self.boundary_head.b1, self.grad_accum_b1, &self.sf_state_b1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-                scheduleFreeAdamWStep(self.boundary_head.w2, self.grad_accum_w2, &self.sf_state_w2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-                scheduleFreeAdamWStep(self.boundary_head.b2, self.grad_accum_b2, &self.sf_state_b2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-            } else {
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w1", self.boundary_head.w1, self.grad_accum_w1);
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b1", self.boundary_head.b1, self.grad_accum_b1);
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w2", self.boundary_head.w2, self.grad_accum_w2);
-                try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b2", self.boundary_head.b2, self.grad_accum_b2);
-            }
-            @memset(self.grad_accum_w1, 0);
-            @memset(self.grad_accum_b1, 0);
-            @memset(self.grad_accum_w2, 0);
-            @memset(self.grad_accum_b2, 0);
-            self.accum_count = 0;
+            try self.applyAccumulatedBoundaryHeadStep(lr);
         }
-
-        // Resolve the features_grad to return to the caller (Fix 4).
-        // When grad_accum_steps > 1, return the accumulated buffer only on the
-        // optimizer step boundary; otherwise return nil so LoRA skips this step.
-        const final_features_grad: ?[]f32 = if (accum_steps > 1) blk: {
-            if (self.accum_count == 0) {
-                // We just reset accum_count — this was the optimizer step boundary.
-                // Hand ownership of the accumulated buffer to the caller.
-                const buf = self.grad_accum_lora_features_grad_accum;
-                self.grad_accum_lora_features_grad_accum = null;
-                break :blk buf;
-            }
-            // Not yet at optimizer step — LoRA should skip this microbatch.
-            break :blk null;
-        } else features_grad_owned; // accum_steps == 1: return as-is
 
         // 7. CPU InfoNCE contrastive loss — with optional XBM expansion (Feature 1)
         var contrastive_result: infonce_cpu.ContrastiveLossResult = undefined;
@@ -1004,7 +1731,7 @@ pub const FusedTrainer = struct {
                             .dims = self.loss_config.mrl_dims,
                             .weights = self.loss_config.mrl_weights,
                         };
-                        const mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+                        var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
                             allocator,
                             expanded,
                             exp_mask,
@@ -1016,12 +1743,7 @@ pub const FusedTrainer = struct {
                             self.loss_config.focal_gamma,
                             self.loss_config.focal_alpha,
                         );
-                        allocator.free(mrl.per_scale_loss);
-                        break :mrl_blk infonce_cpu.ContrastiveLossResult{
-                            .contrastive_loss = mrl.total_loss,
-                            .total_loss = mrl.total_loss * @as(f64, self.loss_config.lambda_embed),
-                            .grad = mrl.grad,
-                        };
+                        break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
                     } else try infonce_cpu.computeContrastiveLossOnCPU(
                         allocator,
                         expanded,
@@ -1043,7 +1765,7 @@ pub const FusedTrainer = struct {
                     .dims = self.loss_config.mrl_dims,
                     .weights = self.loss_config.mrl_weights,
                 };
-                const mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+                var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
                     allocator,
                     chunk_embeddings,
                     chunk_mask,
@@ -1055,12 +1777,7 @@ pub const FusedTrainer = struct {
                     self.loss_config.focal_gamma,
                     self.loss_config.focal_alpha,
                 );
-                allocator.free(mrl.per_scale_loss);
-                break :mrl_blk infonce_cpu.ContrastiveLossResult{
-                    .contrastive_loss = mrl.total_loss,
-                    .total_loss = mrl.total_loss * @as(f64, self.loss_config.lambda_embed),
-                    .grad = mrl.grad,
-                };
+                break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
             } else try infonce_cpu.computeContrastiveLossOnCPU(
                 allocator,
                 chunk_embeddings,
@@ -1085,13 +1802,80 @@ pub const FusedTrainer = struct {
             self.xbm_doc_id_base +%= 100003;
         }
 
+        // Scatter the InfoNCE gradient on pooled current-batch chunks back into
+        // token features so LoRA receives the retrieval signal. This is the one
+        // remaining non-compiled backward segment in the fused chunker path;
+        // Go parity should replace it with embedding-head + late-pooling
+        // backward graph lowering once that graph surface is ready.
+        const pooled_chunk_count = pooled_batch_size * pooled_max_chunks;
+        if (pooled_chunk_count > 0 and E > 0 and contrastive_result.grad.len >= pooled_chunk_count * E) {
+            if (features_grad_owned == null) {
+                features_grad_owned = try allocator.alloc(f32, total_tokens * self.config.hidden_size);
+                @memset(features_grad_owned.?, 0);
+            }
+            try fused_chunker_data.addMeanPoolChunkEmbeddingGradToFeatures(
+                allocator,
+                features_grad_owned.?,
+                features,
+                contrastive_result.grad[0 .. pooled_chunk_count * E],
+                pooled_chunk_starts,
+                pooled_chunk_ends,
+                chunk_mask[0..pooled_chunk_count],
+                attention_mask,
+                pooled_batch_size,
+                pooled_max_seq_len,
+                pooled_max_chunks,
+                E,
+            );
+        }
+        if (features_grad_owned) |grad| sanitizeGradientBufferInPlace(grad);
+
+        // Accumulate features_grad across microbatches for LoRA (Fix 4).
+        // We null features_grad_owned after consuming it so the errdefer above
+        // doesn't double-free on any subsequent error.
+        if (accum_steps > 1) {
+            if (features_grad_owned) |fgo| {
+                const lora_scale = 1.0 / @as(f32, @floatFromInt(accum_steps));
+                if (self.grad_accum_lora_features_grad_accum == null or
+                    self.grad_accum_lora_features_grad_accum.?.len != fgo.len)
+                {
+                    if (self.grad_accum_lora_features_grad_accum) |old| self.allocator.free(old);
+                    self.grad_accum_lora_features_grad_accum = try self.allocator.alloc(f32, fgo.len);
+                    @memset(self.grad_accum_lora_features_grad_accum.?, 0);
+                }
+                for (self.grad_accum_lora_features_grad_accum.?, fgo) |*a, g| {
+                    a.* += g * lora_scale;
+                }
+                // Free the per-step copy and null the variable so errdefer won't fire.
+                self.allocator.free(fgo);
+                features_grad_owned = null;
+            }
+        }
+
+        // Resolve the features_grad to return to the caller (Fix 4).
+        // When grad_accum_steps > 1, return the accumulated buffer only on the
+        // optimizer step boundary; otherwise return nil so LoRA skips this step.
+        const final_features_grad: ?[]f32 = if (accum_steps > 1) blk: {
+            if (self.accum_count == 0) {
+                // We just reset accum_count — this was the optimizer step boundary.
+                // Hand ownership of the accumulated buffer to the caller.
+                const buf = self.grad_accum_lora_features_grad_accum;
+                self.grad_accum_lora_features_grad_accum = null;
+                break :blk buf;
+            }
+            // Not yet at optimizer step — LoRA should skip this microbatch.
+            break :blk null;
+        } else features_grad_owned; // accum_steps == 1: return as-is
+
         // 8. Total loss
         const total_loss = self.loss_config.lambda_chunk * boundary_loss +
             @as(f32, @floatCast(contrastive_result.total_loss));
 
         // 9. Increment step count
         self.step_count += 1;
-        std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr });
+        if (self.config.step_log_every > 0 and self.step_count % self.config.step_log_every == 0) {
+            std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr });
+        }
 
         const summary = TrainStepSummary{
             .boundary_loss = boundary_loss,
@@ -1124,48 +1908,117 @@ pub const FusedTrainer = struct {
         mask_list: []const []const f32,
         total_tokens_list: []const usize,
     ) !EvalSummary {
-        var agg_tp: u64 = 0;
-        var agg_fp: u64 = 0;
-        var agg_fn: u64 = 0;
-        var num_batches: u32 = 0;
+        var acc = BoundaryEvalAccumulator{};
 
         for (features_list, labels_list, mask_list, total_tokens_list) |features, labels, mask, total| {
-            // Run forward-only: build graph, populate runtime inputs, run trainStep
-            // with no trainable params to get loss (we only need logits here).
-            // Use the simple CPU forward pass to get logits directly.
-            const logits = try evaluateBoundaryLogitsSimple(
+            try self.evaluateBatchInto(allocator, &acc, features, labels, mask, total);
+        }
+
+        return acc.finish();
+    }
+
+    pub fn evaluateBatchInto(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        acc: *BoundaryEvalAccumulator,
+        features: []const f32,
+        labels: []const f32,
+        mask: []const f32,
+        total: usize,
+    ) !void {
+        const logits = if (self.legacy_dense_boundary_head) |*legacy_head|
+            try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, features, total)
+        else
+            try evaluateBoundaryLogitsSimple(
                 allocator,
                 &self.boundary_head,
                 features,
                 total,
             );
-            defer allocator.free(logits);
+        defer allocator.free(logits);
 
-            // Convert one-hot labels [total*2] -> scalar labels [total]
-            const scalar_labels = try allocator.alloc(f32, total);
-            defer allocator.free(scalar_labels);
-            for (0..total) |i| {
-                scalar_labels[i] = if (labels[i * 2 + 1] > 0.5) 1.0 else 0.0;
+        try acc.addLogits(allocator, logits, labels, mask);
+    }
+
+    /// Run the boundary-head training substep and probability diagnostics
+    /// without mutating trainer weights, optimizer state, or step counters.
+    pub fn debugBoundaryStep(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        boundary_labels: []const f32,
+        attention_mask: []const f32,
+        total_tokens: usize,
+        want_features_grad: bool,
+    ) !BoundaryStepDebugSummary {
+        self.sanitizeBoundaryHeadParameters();
+        var boundary_step = try self.runBoundaryHeadTraining(
+            allocator,
+            features,
+            boundary_labels,
+            attention_mask,
+            total_tokens,
+            want_features_grad,
+        );
+        defer boundary_step.deinit(allocator);
+        sanitizeBoundaryStepGradients(&boundary_step);
+
+        const logits = if (self.legacy_dense_boundary_head) |*legacy_head|
+            try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, features, total_tokens)
+        else
+            try evaluateBoundaryLogitsSimple(allocator, &self.boundary_head, features, total_tokens);
+        defer allocator.free(logits);
+
+        var predicted_positives: u64 = 0;
+        var tp: u64 = 0;
+        var fp: u64 = 0;
+        var fn_: u64 = 0;
+        var prob_sum_pos: f64 = 0;
+        var prob_sum_neg: f64 = 0;
+        var count_pos: u64 = 0;
+        var count_neg: u64 = 0;
+        for (0..total_tokens) |i| {
+            if (attention_mask[i] <= 0.5) continue;
+            const prob = fused_chunker_loss.positiveBoundaryProbability(logits[i * 2], logits[i * 2 + 1]);
+            const predicted = prob > 0.5;
+            if (predicted) predicted_positives += 1;
+            const is_positive = boundary_labels[i * 2 + 1] > 0.5;
+            if (predicted and is_positive) {
+                tp += 1;
+            } else if (predicted and !is_positive) {
+                fp += 1;
+            } else if (!predicted and is_positive) {
+                fn_ += 1;
             }
-
-            const metrics = fused_chunker_loss.computeBoundaryMetrics(logits, scalar_labels, mask);
-            agg_tp += metrics.tp;
-            agg_fp += metrics.fp;
-            agg_fn += metrics.fn_;
-            num_batches += 1;
+            if (is_positive) {
+                prob_sum_pos += @floatCast(prob);
+                count_pos += 1;
+            } else {
+                prob_sum_neg += @floatCast(prob);
+                count_neg += 1;
+            }
         }
 
-        const agg = fused_chunker_loss.BoundaryMetrics{
-            .tp = agg_tp,
-            .fp = agg_fp,
-            .fn_ = agg_fn,
-        };
-
-        return EvalSummary{
-            .boundary_f1 = agg.f1(),
-            .boundary_precision = agg.precision(),
-            .boundary_recall = agg.recall(),
-            .num_batches = num_batches,
+        return .{
+            .boundary_loss = boundary_step.boundary_loss,
+            .grad_norm_w1 = l2NormF32(boundary_step.w1_grad),
+            .grad_norm_b1 = l2NormF32(boundary_step.b1_grad),
+            .grad_norm_w2 = l2NormF32(boundary_step.w2_grad),
+            .grad_norm_b2 = l2NormF32(boundary_step.b2_grad),
+            .grad_max_abs_w1 = maxAbsF32(boundary_step.w1_grad),
+            .grad_max_abs_b1 = maxAbsF32(boundary_step.b1_grad),
+            .grad_max_abs_w2 = maxAbsF32(boundary_step.w2_grad),
+            .grad_max_abs_b2 = maxAbsF32(boundary_step.b2_grad),
+            .features_grad_norm = if (boundary_step.features_grad) |g| l2NormF32(g) else 0,
+            .features_grad_max_abs = if (boundary_step.features_grad) |g| maxAbsF32(g) else 0,
+            .has_features_grad = boundary_step.features_grad != null,
+            .eval_predicted_positives = predicted_positives,
+            .eval_tp = tp,
+            .eval_fp = fp,
+            .eval_fn = fn_,
+            .eval_f1 = (fused_chunker_loss.BoundaryMetrics{ .tp = tp, .fp = fp, .fn_ = fn_ }).f1(),
+            .eval_mean_prob_gold_positive = if (count_pos > 0) @as(f32, @floatCast(prob_sum_pos / @as(f64, @floatFromInt(count_pos)))) else 0,
+            .eval_mean_prob_gold_negative = if (count_neg > 0) @as(f32, @floatCast(prob_sum_neg / @as(f64, @floatFromInt(count_neg)))) else 0,
         };
     }
 
@@ -1178,39 +2031,8 @@ pub const FusedTrainer = struct {
     pub fn flushEpochEnd(self: *FusedTrainer, allocator: std.mem.Allocator) !void {
         if (self.accum_count == 0) return;
         const lr = self.config.lrSchedule().lr(self.step_count);
-        // Clip accumulated gradients before the optimizer step.
-        {
-            var total_sq: f64 = 0;
-            for (self.grad_accum_w1) |g| total_sq += @as(f64, g * g);
-            for (self.grad_accum_b1) |g| total_sq += @as(f64, g * g);
-            for (self.grad_accum_w2) |g| total_sq += @as(f64, g * g);
-            for (self.grad_accum_b2) |g| total_sq += @as(f64, g * g);
-            const total_norm: f32 = @floatCast(@sqrt(total_sq));
-            if (total_norm > self.config.max_grad_norm) {
-                const gscale = self.config.max_grad_norm / (total_norm + 1e-6);
-                for (self.grad_accum_w1) |*g| g.* *= gscale;
-                for (self.grad_accum_b1) |*g| g.* *= gscale;
-                for (self.grad_accum_w2) |*g| g.* *= gscale;
-                for (self.grad_accum_b2) |*g| g.* *= gscale;
-            }
-        }
         _ = allocator;
-        if (self.config.use_schedule_free) {
-            scheduleFreeAdamWStep(self.boundary_head.w1, self.grad_accum_w1, &self.sf_state_w1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-            scheduleFreeAdamWStep(self.boundary_head.b1, self.grad_accum_b1, &self.sf_state_b1.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-            scheduleFreeAdamWStep(self.boundary_head.w2, self.grad_accum_w2, &self.sf_state_w2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-            scheduleFreeAdamWStep(self.boundary_head.b2, self.grad_accum_b2, &self.sf_state_b2.?, lr, self.config.beta1, self.config.beta2, self.config.adam_epsilon, self.config.weight_decay, self.config.warmup_steps);
-        } else {
-            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w1", self.boundary_head.w1, self.grad_accum_w1);
-            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b1", self.boundary_head.b1, self.grad_accum_b1);
-            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "w2", self.boundary_head.w2, self.grad_accum_w2);
-            try optimizers.step(self.optimizer, &self.optimizer_state, lr, "b2", self.boundary_head.b2, self.grad_accum_b2);
-        }
-        @memset(self.grad_accum_w1, 0);
-        @memset(self.grad_accum_b1, 0);
-        @memset(self.grad_accum_w2, 0);
-        @memset(self.grad_accum_b2, 0);
-        self.accum_count = 0;
+        try self.applyAccumulatedBoundaryHeadStep(lr);
     }
 
     /// Save boundary head weights to a SafeTensors checkpoint.
@@ -1269,30 +2091,142 @@ pub const FusedTrainer = struct {
         // MMapReader.fromBytes stores the slice and frees it in deinit(), so we
         // must NOT also free it ourselves.
         const file_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .unlimited);
-        errdefer allocator.free(file_bytes);
 
         // fromBytes takes ownership of file_bytes (freed via deinit).
-        var reader = try safetensors.MMapReader.fromBytes(allocator, file_bytes);
+        var reader = safetensors.MMapReader.fromBytes(allocator, file_bytes) catch |err| {
+            allocator.free(file_bytes);
+            return err;
+        };
         defer reader.deinit();
 
-        // Helper to copy tensor data into a pre-allocated destination slice.
-        const targets = [_]struct {
-            name: []const u8,
-            dest: []f32,
-        }{
-            .{ .name = "w1", .dest = self.boundary_head.w1 },
-            .{ .name = "b1", .dest = self.boundary_head.b1 },
-            .{ .name = "w2", .dest = self.boundary_head.w2 },
-            .{ .name = "b2", .dest = self.boundary_head.b2 },
+        if (reader.header.tensors.contains("w1")) {
+            if (!try copySafetensorFirst(&reader, &.{"w1"}, self.boundary_head.w1)) return error.TensorNotFound;
+            if (!try copySafetensorFirst(&reader, &.{"b1"}, self.boundary_head.b1)) return error.TensorNotFound;
+            if (!try copySafetensorFirst(&reader, &.{"w2"}, self.boundary_head.w2)) return error.TensorNotFound;
+            if (!try copySafetensorFirst(&reader, &.{"b2"}, self.boundary_head.b2)) return error.TensorNotFound;
+            return;
+        }
+
+        const go_w1_names = [_][]const u8{
+            "boundary_head/mlp_dense1/weight",
+            "fused_chunker_embedder/boundary_head/mlp_dense1/weight",
+            "var:/fused_chunker_embedder/boundary_head/mlp_dense1/weight",
+        };
+        const go_b1_names = [_][]const u8{
+            "boundary_head/mlp_dense1/bias",
+            "fused_chunker_embedder/boundary_head/mlp_dense1/bias",
+            "var:/fused_chunker_embedder/boundary_head/mlp_dense1/bias",
+        };
+        const go_w2_names = [_][]const u8{
+            "boundary_head/mlp_dense2/weight",
+            "fused_chunker_embedder/boundary_head/mlp_dense2/weight",
+            "var:/fused_chunker_embedder/boundary_head/mlp_dense2/weight",
+        };
+        const go_b2_names = [_][]const u8{
+            "boundary_head/mlp_dense2/bias",
+            "fused_chunker_embedder/boundary_head/mlp_dense2/bias",
+            "var:/fused_chunker_embedder/boundary_head/mlp_dense2/bias",
         };
 
-        for (targets) |tgt| {
-            var tensor = try reader.readTensor(tgt.name);
-            defer tensor.deinit();
-            const src = tensor.asFloat32();
-            if (src.len != tgt.dest.len) return error.CheckpointSizeMismatch;
-            @memcpy(tgt.dest, src);
+        if (hasAnySafetensorName(&reader, &go_w1_names)) {
+            if (!try copySafetensorFirstTransposed(
+                &reader,
+                &go_w1_names,
+                self.boundary_head.w1,
+                self.boundary_head.hidden_dim,
+                self.boundary_head.mlp_dim,
+            )) return error.TensorNotFound;
+            if (!try copySafetensorFirst(&reader, &go_b1_names, self.boundary_head.b1)) return error.TensorNotFound;
+            if (!try copySafetensorFirstTransposed(
+                &reader,
+                &go_w2_names,
+                self.boundary_head.w2,
+                self.boundary_head.mlp_dim,
+                2,
+            )) return error.TensorNotFound;
+            if (!try copySafetensorFirst(&reader, &go_b2_names, self.boundary_head.b2)) return error.TensorNotFound;
+            return;
         }
+
+        const legacy_w_names = [_][]const u8{
+            "boundary_head/dense/weight",
+            "fused_chunker_embedder/boundary_head/dense/weight",
+            "var:/fused_chunker_embedder/boundary_head/dense/weight",
+        };
+        const legacy_b_names = [_][]const u8{
+            "boundary_head/dense/bias",
+            "fused_chunker_embedder/boundary_head/dense/bias",
+            "var:/fused_chunker_embedder/boundary_head/dense/bias",
+        };
+
+        if (hasAnySafetensorName(&reader, &legacy_w_names)) {
+            if (self.legacy_dense_boundary_head) |*old| {
+                old.deinit();
+                self.legacy_dense_boundary_head = null;
+            }
+            self.legacy_dense_boundary_head = try LegacyDenseBoundaryHead.init(allocator, self.boundary_head.hidden_dim);
+            if (self.legacy_dense_boundary_head) |*legacy| {
+                if (!try copySafetensorFirstTransposed(
+                    &reader,
+                    &legacy_w_names,
+                    legacy.weight,
+                    self.boundary_head.hidden_dim,
+                    2,
+                )) return error.TensorNotFound;
+                if (!try copySafetensorFirst(&reader, &legacy_b_names, legacy.bias)) return error.TensorNotFound;
+            }
+            return;
+        }
+
+        return error.TensorNotFound;
+    }
+
+    fn hasAnySafetensorName(reader: anytype, names: []const []const u8) bool {
+        for (names) |name| {
+            if (reader.header.tensors.contains(name)) return true;
+        }
+        return false;
+    }
+
+    fn copySafetensorFirst(reader: anytype, names: []const []const u8, dest: []f32) !bool {
+        for (names) |name| {
+            if (!reader.header.tensors.contains(name)) continue;
+            var tensor = try reader.readTensor(name);
+            defer tensor.deinit();
+            if (tensor.dtype != .f32) return error.InvalidCheckpoint;
+            const src = tensor.asFloat32();
+            if (src.len != dest.len) return error.CheckpointSizeMismatch;
+            @memcpy(dest, src);
+            return true;
+        }
+        return false;
+    }
+
+    fn copySafetensorFirstTransposed(
+        reader: anytype,
+        names: []const []const u8,
+        dest: []f32,
+        rows: usize,
+        cols: usize,
+    ) !bool {
+        for (names) |name| {
+            if (!reader.header.tensors.contains(name)) continue;
+            var tensor = try reader.readTensor(name);
+            defer tensor.deinit();
+            if (tensor.dtype != .f32) return error.InvalidCheckpoint;
+            if (tensor.shape.len != 2 or tensor.shape[0] != @as(i64, @intCast(rows)) or tensor.shape[1] != @as(i64, @intCast(cols))) {
+                return error.CheckpointSizeMismatch;
+            }
+            const src = tensor.asFloat32();
+            if (src.len != rows * cols or dest.len != rows * cols) return error.CheckpointSizeMismatch;
+            for (0..rows) |r| {
+                for (0..cols) |c| {
+                    dest[c * rows + r] = src[r * cols + c];
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     fn loadCheckpointBinary(self: *FusedTrainer, allocator: std.mem.Allocator, path: []const u8) !void {
@@ -1520,6 +2454,129 @@ pub const FusedTrainer = struct {
 // Helpers
 // ----------------------------------------------------------------------------
 
+fn dropoutSeed(base_seed: u64, step_count: u32, salt: u64) u64 {
+    return base_seed ^ ((@as(u64, step_count) + 1) *% 0x9E37_79B9_7F4A_7C15) ^ salt;
+}
+
+fn allocInvertedDropoutMask(
+    allocator: std.mem.Allocator,
+    len: usize,
+    dropout_prob: f32,
+    seed: u64,
+) ![]f32 {
+    const mask = try allocator.alloc(f32, len);
+    if (dropout_prob <= 0.0) {
+        @memset(mask, 1.0);
+        return mask;
+    }
+    if (dropout_prob >= 1.0) {
+        allocator.free(mask);
+        return error.InvalidBoundaryDropout;
+    }
+
+    const keep_prob = 1.0 - dropout_prob;
+    const scale = 1.0 / keep_prob;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    for (mask) |*v| {
+        v.* = if (rng.float(f32) < keep_prob) scale else 0.0;
+    }
+    return mask;
+}
+
+fn l2NormF32(values: []const f32) f32 {
+    var total_sq: f64 = 0;
+    for (values) |value| {
+        if (!std.math.isFinite(value)) continue;
+        const v: f64 = @floatCast(value);
+        total_sq += v * v;
+    }
+    return @floatCast(@sqrt(total_sq));
+}
+
+fn maxAbsF32(values: []const f32) f32 {
+    var out: f32 = 0;
+    for (values) |value| {
+        if (!std.math.isFinite(value)) continue;
+        out = @max(out, @abs(value));
+    }
+    return out;
+}
+
+const BoundaryCeGradResult = struct {
+    loss: f32,
+    logit_grad: []f32,
+};
+
+fn computeBoundaryWeightedCeAndLogitGrad(
+    allocator: std.mem.Allocator,
+    logits: []const f32,
+    targets: []const f32,
+    mask: []const f32,
+    total: usize,
+    pos_weight: f32,
+) !BoundaryCeGradResult {
+    if (logits.len != total * 2) return error.UnexpectedOutputShape;
+    if (targets.len != total * 2) return error.UnexpectedOutputShape;
+    if (mask.len != total) return error.UnexpectedOutputShape;
+
+    const grad = try allocator.alloc(f32, total * 2);
+    errdefer allocator.free(grad);
+
+    var mask_sum: f64 = 0;
+    for (mask) |m| mask_sum += @as(f64, m);
+    const denom = @as(f32, @floatCast(mask_sum)) + 1e-12;
+
+    var numerator: f64 = 0;
+    for (0..total) |i| {
+        const z0 = logits[i * 2];
+        const z1 = logits[i * 2 + 1];
+        const max_z = @max(z0, z1);
+        const e0 = @exp(z0 - max_z);
+        const e1 = @exp(z1 - max_z);
+        const inv_sum = 1.0 / (e0 + e1);
+        const p0 = e0 * inv_sum;
+        const p1 = e1 * inv_sum;
+        const log_sum = @log(e0 + e1);
+        const logp0 = z0 - max_z - log_sum;
+        const logp1 = z1 - max_z - log_sum;
+
+        const t0 = targets[i * 2];
+        const t1 = targets[i * 2 + 1];
+        const wt0 = t0;
+        const wt1 = t1 * pos_weight;
+        const wt_sum = wt0 + wt1;
+        const m = mask[i];
+
+        numerator += @as(f64, m * -(wt0 * logp0 + wt1 * logp1));
+        const row_scale = m / denom;
+        grad[i * 2] = row_scale * (p0 * wt_sum - wt0);
+        grad[i * 2 + 1] = row_scale * (p1 * wt_sum - wt1);
+    }
+
+    return .{
+        .loss = @floatCast(numerator / @as(f64, denom)),
+        .logit_grad = grad,
+    };
+}
+
+fn allocGeluExactDerivative(
+    allocator: std.mem.Allocator,
+    dense: []const f32,
+) ![]f32 {
+    const out = try allocator.alloc(f32, dense.len);
+    errdefer allocator.free(out);
+
+    const inv_sqrt2: f32 = 0.7071067811865475;
+    const inv_sqrt_2pi: f32 = 0.3989422804014327;
+    for (dense, out) |x, *dst| {
+        const cdf = 0.5 * (1.0 + erfApproxF32(x * inv_sqrt2));
+        const pdf = inv_sqrt_2pi * @exp(-0.5 * x * x);
+        dst.* = cdf + x * pdf;
+    }
+    return out;
+}
+
 /// Copy f32 data into a ComputeBackend tensor and insert it into the runtime map.
 fn putRuntimeInput(
     allocator: std.mem.Allocator,
@@ -1610,11 +2667,54 @@ fn evaluateBoundaryLogitsSimple(
     return logits;
 }
 
-/// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+fn evaluateLegacyDenseBoundaryLogits(
+    allocator: std.mem.Allocator,
+    head: *const LegacyDenseBoundaryHead,
+    features: []const f32,
+    total: usize,
+) ![]f32 {
+    const hidden_dim = head.hidden_dim;
+    if (features.len < total * hidden_dim) return error.UnexpectedOutputShape;
+
+    const logits = try allocator.alloc(f32, total * 2);
+    for (0..total) |i| {
+        for (0..2) |j| {
+            var acc: f32 = head.bias[j];
+            for (0..hidden_dim) |k| {
+                acc += features[i * hidden_dim + k] * head.weight[j * hidden_dim + k];
+            }
+            logits[i * 2 + j] = acc;
+        }
+    }
+    return logits;
+}
+
+/// Exact-form GELU activation used by the Go fused boundary head:
+/// 0.5 * x * (1 + erf(x / sqrt(2))).
 inline fn geluF32(x: f32) f32 {
-    const c: f32 = 0.7978845608028654; // sqrt(2/pi)
-    const inner = c * (x + 0.044715 * x * x * x);
-    return 0.5 * x * (1.0 + std.math.tanh(inner));
+    return 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865475));
+}
+
+// Abramowitz & Stegun 7.1.26, matching the native primitive erf op.
+inline fn erfApproxF32(x: f32) f32 {
+    const a1: f32 = 0.254829592;
+    const a2: f32 = -0.284496736;
+    const a3: f32 = 1.421413741;
+    const a4: f32 = -1.453152027;
+    const a5: f32 = 1.061405429;
+    const p: f32 = 0.3275911;
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + p * ax);
+    const poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    return sign * (1.0 - poly * @exp(-ax * ax));
+}
+
+fn expectApproxEqSlices(expected: []const f32, actual: []const f32, tolerance: f32) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| {
+        try std.testing.expectApproxEqAbs(e, a, tolerance);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1661,14 +2761,547 @@ test "FusedTrainingConfig lrSchedule warmup" {
     const lr0 = schedule.lr(0);
     const lr25 = schedule.lr(25);
     const lr50 = schedule.lr(50);
+    const lr1000 = schedule.lr(1000);
 
-    // During warmup: lr increases linearly from 0 to learning_rate
+    // During warmup: lr increases linearly to learning_rate, using the same
+    // first-update nonzero convention as the Go fused trainer.
     try std.testing.expect(lr0 < lr25);
     try std.testing.expect(lr25 < lr50);
 
-    // At step 0: lr should be 0 (linear warmup from 0)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), lr0, 1e-8);
+    // At step 0: lr should be learning_rate / warmup_steps.
+    try std.testing.expectApproxEqAbs(config.learning_rate / @as(f32, @floatFromInt(config.warmup_steps)), lr0, 1e-8);
 
     // At end of warmup (step 50): lr should equal initial_lr
     try std.testing.expectApproxEqAbs(config.learning_rate, lr50, 1e-6);
+
+    // The fused Go schedule decays to zero by the final configured step.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), lr1000, 1e-8);
+}
+
+test "boundary gradient sanitizer drops nonfinite values before clipping" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 1,
+        .max_grad_norm = 1.0,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memset(trainer.grad_accum_w1, 0);
+    @memset(trainer.grad_accum_b1, 0);
+    @memset(trainer.grad_accum_w2, 0);
+    @memset(trainer.grad_accum_b2, 0);
+
+    trainer.grad_accum_w1[0] = std.math.nan(f32);
+    trainer.grad_accum_w1[1] = 4.0;
+    trainer.grad_accum_b1[0] = std.math.inf(f32);
+    trainer.grad_accum_w2[0] = 3.0;
+    trainer.grad_accum_w2[1] = -std.math.inf(f32);
+    trainer.grad_accum_b2[0] = 0.0;
+    trainer.grad_accum_b2[1] = 0.0;
+
+    trainer.sanitizeAndClipBoundaryGradientAccum();
+
+    try std.testing.expectEqual(@as(f32, 0.0), trainer.grad_accum_w1[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), trainer.grad_accum_b1[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), trainer.grad_accum_w2[1]);
+
+    var total_sq: f64 = 0.0;
+    FusedTrainer.addGradientNormSq(&total_sq, trainer.grad_accum_w1);
+    FusedTrainer.addGradientNormSq(&total_sq, trainer.grad_accum_b1);
+    FusedTrainer.addGradientNormSq(&total_sq, trainer.grad_accum_w2);
+    FusedTrainer.addGradientNormSq(&total_sq, trainer.grad_accum_b2);
+    try std.testing.expect(@sqrt(total_sq) <= 1.000001);
+}
+
+test "BoundaryEvalAccumulator reports boundary rate and probability diagnostics" {
+    const allocator = std.testing.allocator;
+
+    const logits = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        0.0, 0.0,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+
+    var acc = BoundaryEvalAccumulator{};
+    try acc.addLogits(allocator, &logits, &labels, &mask);
+    const summary = acc.finish();
+
+    try std.testing.expectEqual(@as(u64, 3), summary.valid_tokens);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_positives);
+    try std.testing.expectEqual(@as(u64, 1), summary.predicted_positives);
+    try std.testing.expectEqual(@as(u64, 2), summary.best_predicted_positives);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.gold_positive_rate, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), summary.predicted_positive_rate, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.best_predicted_positive_rate, 1e-6);
+
+    const p0 = fused_chunker_loss.positiveBoundaryProbability(0.0, 1.0);
+    const p1 = fused_chunker_loss.positiveBoundaryProbability(1.0, 0.0);
+    const p2 = fused_chunker_loss.positiveBoundaryProbability(0.0, 0.0);
+    try std.testing.expectApproxEqAbs((p0 + p2) * 0.5, summary.mean_positive_probability_gold_positive, 1e-6);
+    try std.testing.expectApproxEqAbs(p1, summary.mean_positive_probability_gold_negative, 1e-6);
+}
+
+test "trainStep treats max_grad_norm zero as clipping disabled" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 2,
+        .max_chunks = 1,
+        .learning_rate = 0.01,
+        .warmup_steps = 1,
+        .weight_decay = 0.0,
+        .max_grad_norm = 0.0,
+        .lambda_embed = 0.0,
+        .pos_weight = 5.0,
+        .total_steps = 2,
+    };
+    try std.testing.expectEqual(@as(f32, 0.0), config.max_grad_norm);
+
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memset(trainer.boundary_head.w1, 0);
+    @memset(trainer.boundary_head.b1, 0);
+    @memset(trainer.boundary_head.w2, 0);
+    @memset(trainer.boundary_head.b2, 0);
+
+    const features = [_]f32{
+        0.0, 0.0,
+        0.0, 0.0,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+    };
+    const attention_mask = [_]f32{ 1.0, 1.0 };
+    const chunk_embeddings = [_]f32{ 0.0, 0.0 };
+    const chunk_mask = [_]f32{0.0};
+    const doc_ids = [_]u32{0};
+
+    _ = try trainer.trainStep(
+        allocator,
+        &features,
+        &labels,
+        &attention_mask,
+        &chunk_embeddings,
+        &chunk_mask,
+        &doc_ids,
+        2,
+        1,
+        1,
+        2,
+    );
+
+    try std.testing.expect(@abs(trainer.boundary_head.b2[0]) > 0.0);
+    try std.testing.expect(@abs(trainer.boundary_head.b2[1]) > 0.0);
+}
+
+test "trainStep applies boundary pos_weight and attention mask" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 2,
+        .max_chunks = 1,
+        .learning_rate = 0.0,
+        .lambda_embed = 0.0,
+        .pos_weight = 5.0,
+        .total_steps = 1,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memset(trainer.boundary_head.w1, 0);
+    @memset(trainer.boundary_head.b1, 0);
+    @memset(trainer.boundary_head.w2, 0);
+    @memset(trainer.boundary_head.b2, 0);
+
+    const features = [_]f32{
+        0.0, 0.0,
+        0.0, 0.0,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+    };
+    const attention_mask = [_]f32{ 1.0, 0.0 };
+    const chunk_embeddings = [_]f32{ 0.0, 0.0 };
+    const chunk_mask = [_]f32{0.0};
+    const doc_ids = [_]u32{0};
+
+    const summary = try trainer.trainStep(
+        allocator,
+        &features,
+        &labels,
+        &attention_mask,
+        &chunk_embeddings,
+        &chunk_mask,
+        &doc_ids,
+        2,
+        1,
+        1,
+        2,
+    );
+
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 2.0)) * config.pos_weight, summary.boundary_loss, 1e-5);
+}
+
+test "trainStep applies Go-compatible boundary focal loss when enabled" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 2,
+        .max_chunks = 1,
+        .learning_rate = 0.0,
+        .lambda_embed = 0.0,
+        .use_boundary_focal = true,
+        .focal_gamma = 2.0,
+        .focal_alpha = 0.75,
+        .total_steps = 1,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memset(trainer.boundary_head.w1, 0);
+    @memset(trainer.boundary_head.b1, 0);
+    @memset(trainer.boundary_head.w2, 0);
+    @memset(trainer.boundary_head.b2, 0);
+
+    const features = [_]f32{
+        0.0, 0.0,
+        0.0, 0.0,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+    };
+    const attention_mask = [_]f32{ 1.0, 0.0 };
+    const chunk_embeddings = [_]f32{ 0.0, 0.0 };
+    const chunk_mask = [_]f32{0.0};
+    const doc_ids = [_]u32{0};
+
+    const summary = try trainer.trainStep(
+        allocator,
+        &features,
+        &labels,
+        &attention_mask,
+        &chunk_embeddings,
+        &chunk_mask,
+        &doc_ids,
+        2,
+        1,
+        1,
+        2,
+    );
+
+    const expected = config.focal_alpha * 0.25 * @log(@as(f32, 2.0));
+    try std.testing.expectApproxEqAbs(expected, summary.boundary_loss, 1e-5);
+}
+
+test "trainStepWithEncoderGrad scatters contrastive gradients into features" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 2,
+        .max_chunks = 3,
+        .lambda_embed = 1.0,
+        .temperature = 0.5,
+        .total_steps = 4,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memset(trainer.boundary_head.w1, 0);
+    @memset(trainer.boundary_head.b1, 0);
+    @memset(trainer.boundary_head.w2, 0);
+    @memset(trainer.boundary_head.b2, 0);
+
+    const features = [_]f32{
+        1.0,  0.0,
+        0.0,  1.0,
+        -1.0, 0.0,
+    };
+    const labels = [_]f32{
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const attention_mask = [_]f32{ 1.0, 1.0, 1.0 };
+    const chunk_embeddings = features;
+    const chunk_mask = [_]f32{ 1.0, 1.0, 1.0 };
+    const doc_ids = [_]u32{ 0, 0, 1 };
+    const chunk_starts = [_]i32{ 0, 1, 2 };
+    const chunk_ends = [_]i32{ 1, 2, 3 };
+
+    var result = try trainer.trainStepWithEncoderGrad(
+        allocator,
+        &features,
+        &labels,
+        &attention_mask,
+        &chunk_embeddings,
+        &chunk_mask,
+        &doc_ids,
+        3,
+        1,
+        3,
+        2,
+        &chunk_starts,
+        &chunk_ends,
+        1,
+        3,
+        3,
+    );
+    defer result.deinit(allocator);
+
+    const grad = result.features_grad orelse return error.ExpectedFeatureGradient;
+    var nonzero_count: usize = 0;
+    for (grad) |g| {
+        if (@abs(g) > 1e-6) nonzero_count += 1;
+    }
+    try std.testing.expect(nonzero_count > 0);
+    try std.testing.expectEqual(@as(usize, 1), trainer.boundary_graph_cache.count());
+    const cached = trainer.boundary_graph_cache.getPtr(3) orelse return error.MissingBoundaryGraphCacheEntry;
+    try std.testing.expect(cached.encoder_grad_session != null);
+}
+
+test "MRL contrastive result scales gradients by lambda_embed" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 4,
+        .embedding_dim = 4,
+        .boundary_mlp_dim = 2,
+        .max_chunks = 2,
+        .lambda_embed = 0.25,
+        .use_mrl = true,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    var mrl = infonce_cpu.MatryoshkaResult{
+        .total_loss = 2.0,
+        .per_scale_loss = try allocator.dupe(f64, &[_]f64{ 1.0, 3.0 }),
+        .grad = try allocator.dupe(f32, &[_]f32{ 4.0, -8.0, 0.0, 2.0 }),
+    };
+    var result = trainer.mrlContrastiveResult(allocator, &mrl);
+    defer result.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.contrastive_loss, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), result.total_loss, 1e-9);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 0.0, 0.5 }, result.grad);
+}
+
+test "boundary CE ops step matches graph gradients" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 3,
+        .max_chunks = 1,
+        .learning_rate = 0.0,
+        .lambda_embed = 0.0,
+        .pos_weight = 2.5,
+        .boundary_dropout = 0.0,
+        .total_steps = 1,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memcpy(trainer.boundary_head.w1, &[_]f32{
+        0.10,  -0.20,
+        0.30,  0.05,
+        -0.15, 0.25,
+    });
+    @memcpy(trainer.boundary_head.b1, &[_]f32{ 0.01, -0.02, 0.03 });
+    @memcpy(trainer.boundary_head.w2, &[_]f32{
+        0.20,  -0.10, 0.15,
+        -0.05, 0.12,  -0.18,
+    });
+    @memcpy(trainer.boundary_head.b2, &[_]f32{ 0.04, -0.03 });
+
+    const features = [_]f32{
+        0.50,  -0.25,
+        -0.75, 0.40,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+    };
+    const attention_mask = [_]f32{ 1.0, 0.5 };
+
+    var graph_step = try trainer.runBoundaryHeadGraphStep(
+        allocator,
+        &features,
+        &labels,
+        &attention_mask,
+        2,
+        true,
+    );
+    defer graph_step.deinit(allocator);
+
+    var ce_step = try trainer.runBoundaryHeadCeOpsStep(
+        allocator,
+        &features,
+        &labels,
+        &attention_mask,
+        2,
+        true,
+    );
+    defer ce_step.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(graph_step.boundary_loss, ce_step.boundary_loss, 1e-5);
+    try expectApproxEqSlices(graph_step.w1_grad, ce_step.w1_grad, 1e-4);
+    try expectApproxEqSlices(graph_step.b1_grad, ce_step.b1_grad, 1e-4);
+    try expectApproxEqSlices(graph_step.w2_grad, ce_step.w2_grad, 1e-4);
+    try expectApproxEqSlices(graph_step.b2_grad, ce_step.b2_grad, 1e-4);
+    try expectApproxEqSlices(graph_step.features_grad.?, ce_step.features_grad.?, 1e-4);
+}
+
+test "LISA layer selector disables to all active layers" {
+    const allocator = std.testing.allocator;
+    const active = try selectActiveLoRALayers(allocator, 6, 0, 2, 11, 42);
+    defer allocator.free(active);
+
+    try std.testing.expectEqual(@as(usize, 6), active.len);
+    for (active) |is_active| try std.testing.expect(is_active);
+}
+
+test "LISA layer selector keeps top K and samples remaining deterministically" {
+    const allocator = std.testing.allocator;
+    const active_a = try selectActiveLoRALayers(allocator, 8, 2, 3, 17, 42);
+    defer allocator.free(active_a);
+    const active_b = try selectActiveLoRALayers(allocator, 8, 2, 3, 17, 42);
+    defer allocator.free(active_b);
+
+    try std.testing.expectEqual(@as(usize, 8), active_a.len);
+    try std.testing.expectEqualSlices(bool, active_a, active_b);
+
+    // Highest layer indices are always active.
+    try std.testing.expect(active_a[5]);
+    try std.testing.expect(active_a[6]);
+    try std.testing.expect(active_a[7]);
+
+    var active_count: usize = 0;
+    for (active_a) |is_active| {
+        if (is_active) active_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), active_count);
+}
+
+test "LISA layer selector clamps top and sample counts" {
+    const allocator = std.testing.allocator;
+    const active = try selectActiveLoRALayers(allocator, 4, 99, 99, 1, 2);
+    defer allocator.free(active);
+
+    try std.testing.expectEqual(@as(usize, 4), active.len);
+    for (active) |is_active| try std.testing.expect(is_active);
 }

@@ -219,6 +219,9 @@ pub const HfTokenizer = struct {
 
     pub fn encodeWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !?EncodingWithOffsets {
         if (text.len > std.math.maxInt(u32)) return null;
+        if (self.model_type == .bpe and self.pre_tokenizer_type == .byte_level) {
+            return try self.encodeBpeByteLevelWithOffsets(allocator, text);
+        }
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             return try self.encodeWordPieceWithOffsets(allocator, text);
         }
@@ -493,9 +496,21 @@ pub const HfTokenizer = struct {
             if (merges_val == .array) {
                 var rank: u32 = 0;
                 for (merges_val.array.items) |item| {
-                    if (item != .string) continue;
-                    if (std.mem.indexOfScalar(u8, item.string, ' ') == null) continue;
-                    const key = try self.allocator.dupe(u8, item.string);
+                    const key = switch (item) {
+                        .string => |merge| blk: {
+                            if (std.mem.indexOfScalar(u8, merge, ' ') == null) break :blk null;
+                            break :blk try self.allocator.dupe(u8, merge);
+                        },
+                        .array => |pair| blk: {
+                            if (pair.items.len < 2) break :blk null;
+                            if (pair.items[0] != .string or pair.items[1] != .string) break :blk null;
+                            break :blk try std.fmt.allocPrint(self.allocator, "{s} {s}", .{
+                                pair.items[0].string,
+                                pair.items[1].string,
+                            });
+                        },
+                        else => null,
+                    } orelse continue;
                     try self.arena_strings.append(self.allocator, key);
                     // Earlier merges win ties because getOrPut is no-op on existing.
                     const gop = try self.merge_ranks.getOrPut(self.allocator, key);
@@ -1312,6 +1327,213 @@ pub const HfTokenizer = struct {
         }
     }
 
+    fn encodeBpeByteLevelWithOffsets(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+    ) !EncodingWithOffsets {
+        var result = EncodingWithOffsets{};
+        errdefer result.deinit(allocator);
+
+        var start: usize = 0;
+        for (text, 0..) |c, i| {
+            if (std.ascii.isWhitespace(c)) {
+                if (i > start) {
+                    try self.bpeEncodeByteLevelSpanWithOffsets(allocator, text[start..i], start, &result);
+                }
+
+                if (i + 1 < text.len and !std.ascii.isWhitespace(text[i + 1])) {
+                    var end = i + 1;
+                    while (end < text.len and !std.ascii.isWhitespace(text[end])) : (end += 1) {}
+                    try self.bpeEncodeByteLevelSpanWithOffsets(allocator, text[i..end], i, &result);
+                    start = end;
+                } else {
+                    try self.bpeEncodeByteLevelSpanWithOffsets(allocator, text[i .. i + 1], i, &result);
+                    start = i + 1;
+                }
+            }
+        }
+
+        if (start < text.len) {
+            try self.bpeEncodeByteLevelSpanWithOffsets(allocator, text[start..], start, &result);
+        }
+
+        return result;
+    }
+
+    fn bpeEncodeByteLevelSpanWithOffsets(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        original_start: usize,
+        result: *EncodingWithOffsets,
+    ) !void {
+        if (text.len == 0) return;
+        const encoded = try byteLevelEncodeWithOffsetMap(allocator, text, original_start);
+        defer allocator.free(encoded.text);
+        defer allocator.free(encoded.offsets);
+        try self.bpeEncodeWordWithOffsets(allocator, encoded.text, encoded.offsets, result);
+    }
+
+    fn bpeAppendTokenWithOffset(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        token: []const u8,
+        offsets: []const [2]u32,
+        start: usize,
+        end: usize,
+        result: *EncodingWithOffsets,
+    ) !void {
+        if (token.len == 0) return;
+        const clamped_start = @min(start, offsets.len);
+        const clamped_end = @min(end, offsets.len);
+        const offset = if (clamped_start < clamped_end)
+            .{ offsets[clamped_start][0], offsets[clamped_end - 1][1] }
+        else if (offsets.len > 0)
+            .{ offsets[@min(clamped_start, offsets.len - 1)][0], offsets[@min(clamped_start, offsets.len - 1)][1] }
+        else
+            .{ 0, 0 };
+
+        if (self.vocab.get(token)) |id| {
+            try result.ids.append(allocator, id);
+            try result.offsets.append(allocator, offset);
+        } else if (self.byte_fallback) {
+            for (token, start..) |byte, idx| {
+                var hex_buf: [6]u8 = undefined;
+                const hex = std.fmt.bufPrint(&hex_buf, "<0x{X:0>2}>", .{byte}) catch continue;
+                const id = self.vocab.get(hex) orelse self.special.unk_id;
+                const byte_offset = if (idx < offsets.len) offsets[idx] else offset;
+                try result.ids.append(allocator, id);
+                try result.offsets.append(allocator, byte_offset);
+            }
+        } else {
+            try result.ids.append(allocator, self.special.unk_id);
+            try result.offsets.append(allocator, offset);
+        }
+    }
+
+    fn bpeEncodeWordWithOffsets(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        word: []const u8,
+        offsets: []const [2]u32,
+        result: *EncodingWithOffsets,
+    ) !void {
+        if (word.len == 0) return;
+
+        if (self.added_tokens.get(word)) |id| {
+            try result.ids.append(allocator, id);
+            const offset = if (offsets.len > 0) .{ offsets[0][0], offsets[offsets.len - 1][1] } else .{ 0, 0 };
+            try result.offsets.append(allocator, offset);
+            return;
+        }
+
+        if (self.vocab.get(word)) |id| {
+            try result.ids.append(allocator, id);
+            const offset = if (offsets.len > 0) .{ offsets[0][0], offsets[offsets.len - 1][1] } else .{ 0, 0 };
+            try result.offsets.append(allocator, offset);
+            return;
+        }
+
+        var work_owned: ?[]u8 = null;
+        defer if (work_owned) |buf| allocator.free(buf);
+        const work: []const u8 = if (self.end_of_word_suffix.len == 0)
+            word
+        else blk: {
+            const owned = try allocator.alloc(u8, word.len + self.end_of_word_suffix.len);
+            @memcpy(owned[0..word.len], word);
+            @memcpy(owned[word.len..], self.end_of_word_suffix);
+            work_owned = owned;
+            break :blk owned;
+        };
+
+        var symbols = std.ArrayListUnmanaged(BpeSymbol).empty;
+        defer symbols.deinit(allocator);
+        try symbols.ensureTotalCapacity(allocator, word.len + 1);
+
+        var pos: usize = 0;
+        while (pos < word.len) {
+            const cp_len = utf8CodepointLen(word[pos]);
+            const end = @min(pos + cp_len, word.len);
+            const idx: i32 = @intCast(symbols.items.len);
+            try symbols.append(allocator, .{
+                .start = @intCast(pos),
+                .end = @intCast(end),
+                .prev = idx - 1,
+                .next = idx + 1,
+            });
+            pos = end;
+        }
+        if (symbols.items.len > 0) {
+            symbols.items[symbols.items.len - 1].next = -1;
+            if (self.end_of_word_suffix.len > 0) {
+                symbols.items[symbols.items.len - 1].end = @intCast(work.len);
+            }
+        }
+
+        var pq = try PriorityQueue(BpeCandidate).init(allocator, bpeCandidateCmp);
+        defer pq.deinit();
+        for (0..symbols.items.len) |i| {
+            const next = symbols.items[i].next;
+            if (next < 0) continue;
+            const right_idx: u32 = @intCast(next);
+            const a = work[symbols.items[i].start..symbols.items[i].end];
+            const b = work[symbols.items[right_idx].start..symbols.items[right_idx].end];
+            if (try self.bpeMergeRank(allocator, a, b)) |rank| {
+                try pq.insert(.{ .rank = rank, .left = @intCast(i), .right = right_idx });
+            }
+        }
+
+        while (pq.len() > 0) {
+            const cand = pq.popMax();
+            const left = &symbols.items[cand.left];
+            if (!left.alive) continue;
+            if (left.next != @as(i32, @intCast(cand.right))) continue;
+            const right = &symbols.items[cand.right];
+            if (!right.alive) continue;
+
+            const a = work[left.start..left.end];
+            const b = work[right.start..right.end];
+            const cur_rank = (try self.bpeMergeRank(allocator, a, b)) orelse continue;
+            if (cur_rank != cand.rank) continue;
+
+            left.end = right.end;
+            const new_next = right.next;
+            left.next = new_next;
+            if (new_next >= 0) symbols.items[@intCast(new_next)].prev = @intCast(cand.left);
+            right.alive = false;
+
+            const left_bytes = work[left.start..left.end];
+            if (left.prev >= 0) {
+                const prev_idx: u32 = @intCast(left.prev);
+                const pa = work[symbols.items[prev_idx].start..symbols.items[prev_idx].end];
+                if (try self.bpeMergeRank(allocator, pa, left_bytes)) |r| {
+                    try pq.insert(.{ .rank = r, .left = prev_idx, .right = cand.left });
+                }
+            }
+            if (left.next >= 0) {
+                const next_idx: u32 = @intCast(left.next);
+                const nb = work[symbols.items[next_idx].start..symbols.items[next_idx].end];
+                if (try self.bpeMergeRank(allocator, left_bytes, nb)) |r| {
+                    try pq.insert(.{ .rank = r, .left = cand.left, .right = next_idx });
+                }
+            }
+        }
+
+        var idx: i32 = 0;
+        while (idx >= 0 and idx < symbols.items.len) {
+            const sym = symbols.items[@intCast(idx)];
+            if (sym.alive) {
+                const start = @as(usize, @intCast(sym.start));
+                const end = @as(usize, @intCast(sym.end));
+                const token = work[start..@min(end, word.len)];
+                try self.bpeAppendTokenWithOffset(allocator, token, offsets, start, @min(end, offsets.len), result);
+            }
+            if (sym.next < 0) break;
+            idx = sym.next;
+        }
+    }
+
     fn shouldPreferDirectBpePieces(self: *const HfTokenizer) bool {
         return self.model_type == .bpe and
             self.replace_space_with != null and
@@ -1533,12 +1755,17 @@ pub const HfTokenizer = struct {
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             var raw = try self.encodeWordPieceWithOffsets(allocator, text);
             defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, text.len, max_length);
         }
         if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split) {
             var raw = try self.encodeUnigramWithOffsets(allocator, text);
             defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, text.len, max_length);
+        }
+        if (self.model_type == .bpe and self.pre_tokenizer_type == .byte_level) {
+            var raw = try self.encodeBpeByteLevelWithOffsets(allocator, text);
+            defer raw.deinit(allocator);
+            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, text.len, max_length);
         }
         {
             const raw_ids = try self.encode(allocator, text);
@@ -1805,6 +2032,7 @@ pub const HfTokenizer = struct {
         allocator: std.mem.Allocator,
         raw_ids: []const i32,
         raw_offsets: []const [2]u32,
+        text_len: usize,
         max_length: usize,
     ) !@import("tokenizer.zig").EncodeResult {
         const special = self.getSpecialTokens();
@@ -1827,7 +2055,7 @@ pub const HfTokenizer = struct {
 
         ids[total - 1] = special.sep_id;
         mask[total - 1] = 1;
-        offsets[total - 1] = .{ 0, 0 };
+        offsets[total - 1] = .{ @intCast(text_len), @intCast(text_len) };
 
         for (total..max_length) |i| {
             ids[i] = special.pad_id;
@@ -2234,6 +2462,37 @@ fn byteLevelEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return try buf.toOwnedSlice(allocator);
 }
 
+const ByteLevelEncodedWithOffsets = struct {
+    text: []u8,
+    offsets: [][2]u32,
+};
+
+fn byteLevelEncodeWithOffsetMap(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    original_start: usize,
+) !ByteLevelEncodedWithOffsets {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(allocator);
+    var offsets = std.ArrayListUnmanaged([2]u32).empty;
+    errdefer offsets.deinit(allocator);
+
+    for (text, 0..) |byte, i| {
+        const cp = byte_to_unicode[byte];
+        var utf8_buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
+        try buf.appendSlice(allocator, utf8_buf[0..len]);
+        const start: u32 = @intCast(original_start + i);
+        const end: u32 = @intCast(original_start + i + 1);
+        for (0..len) |_| try offsets.append(allocator, .{ start, end });
+    }
+
+    return .{
+        .text = try buf.toOwnedSlice(allocator),
+        .offsets = try offsets.toOwnedSlice(allocator),
+    };
+}
+
 fn appendByteDecoded(result: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, token: []const u8) !void {
     var i: usize = 0;
     while (i < token.len) {
@@ -2496,8 +2755,8 @@ test "encode for model tracks wordpiece offsets" {
     try std.testing.expectEqual(@as(u32, 4), offsets[1][1]);
     try std.testing.expectEqual(@as(u32, 5), offsets[2][0]);
     try std.testing.expectEqual(@as(u32, 10), offsets[2][1]);
-    try std.testing.expectEqual(@as(u32, 0), offsets[3][0]);
-    try std.testing.expectEqual(@as(u32, 0), offsets[3][1]);
+    try std.testing.expectEqual(@as(u32, 10), offsets[3][0]);
+    try std.testing.expectEqual(@as(u32, 10), offsets[3][1]);
 }
 
 test "encode for model handles splade wordpiece tokenizer fixture" {
@@ -2641,6 +2900,74 @@ test "infer byte-level bpe when model type is omitted" {
         \\      "Ġd": 21, "Ġdo": 22, "Ġdoe": 23, "Ġdoes": 2
         \\    },
         \\    "merges": ["W h", "Wh a", "Wha t", "Ġ d", "Ġd o", "Ġdo e", "Ġdoe s"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    const ids = try tok.encode(allocator, "What does");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, ids);
+}
+
+test "byte-level bpe encodeForModel tracks offsets" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "[PAD]": 0, "[CLS]": 101, "[SEP]": 102,
+        \\      "W": 10, "h": 11, "a": 12, "t": 13,
+        \\      "d": 14, "o": 15, "e": 16, "s": 17, "Ġ": 18,
+        \\      "Wh": 19, "Wha": 20, "What": 1,
+        \\      "Ġd": 21, "Ġdo": 22, "Ġdoe": 23, "Ġdoes": 2
+        \\    },
+        \\    "merges": ["W h", "Wh a", "Wha t", "Ġ d", "Ġd o", "Ġdo e", "Ġdoe s"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true},
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "[PAD]", "special": true},
+        \\    {"id": 101, "content": "[CLS]", "special": true},
+        \\    {"id": 102, "content": "[SEP]", "special": true}
+        \\  ]
+        \\}
+    ;
+
+    var hf = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer hf.deinitSelf();
+
+    const tok = hf.tokenizer();
+    var encoded = try tok.encodeForModel(allocator, "What does", 5);
+    defer encoded.deinit();
+
+    try std.testing.expectEqualSlices(i32, &.{ 101, 1, 2, 102, 0 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0 }, encoded.attention_mask);
+    const offsets = encoded.offsets orelse return error.MissingOffsets;
+    try std.testing.expectEqual(@as(u32, 0), offsets[1][0]);
+    try std.testing.expectEqual(@as(u32, 4), offsets[1][1]);
+    try std.testing.expectEqual(@as(u32, 4), offsets[2][0]);
+    try std.testing.expectEqual(@as(u32, 9), offsets[2][1]);
+}
+
+test "byte-level bpe parses array-form merges" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "W": 10, "h": 11, "a": 12, "t": 13,
+        \\      "d": 14, "o": 15, "e": 16, "s": 17, "Ġ": 18,
+        \\      "Wh": 19, "Wha": 20, "What": 1,
+        \\      "Ġd": 21, "Ġdo": 22, "Ġdoe": 23, "Ġdoes": 2
+        \\    },
+        \\    "merges": [["W", "h"], ["Wh", "a"], ["Wha", "t"], ["Ġ", "d"], ["Ġd", "o"], ["Ġdo", "e"], ["Ġdoe", "s"]]
         \\  },
         \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true}
         \\}

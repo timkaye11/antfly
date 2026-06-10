@@ -38,11 +38,14 @@ const Builder = ml.graph.Builder;
 const Shape = ml.graph.Shape;
 const autodiff = ml.graph.autodiff;
 const checkpoint = ml.graph.checkpoint;
+const fuse_pass = ml.graph.passes.fuse;
 const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 const CT = contracts.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
 const interpreter = @import("interpreter.zig");
+const graph_runtime = @import("runtime.zig");
+const mpsgraph_executor = @import("mpsgraph_executor.zig");
 const RuntimeInput = interpreter.RuntimeInput;
 
 pub const TrainStepResult = struct {
@@ -79,6 +82,13 @@ pub const TrainStepProfile = struct {
     extract_ns: u64 = 0,
     total_ns: u64 = 0,
     peak_resident_bytes: usize = 0,
+    partitioned_runtime: bool = false,
+    mpsgraph_runtime: bool = false,
+    partitions_executed: u64 = 0,
+    backend_command_dispatches: u64 = 0,
+    planned_operator_dispatches: u64 = 0,
+    interpreter_fallbacks: u64 = 0,
+    graph_region_dispatches: u64 = 0,
 };
 
 pub const CheckpointSummary = struct {
@@ -95,6 +105,15 @@ pub const TrainStepOptions = struct {
     trainable_params: ?[]const []const u8 = null,
     checkpoint_config: ?checkpoint.CheckpointConfig = null,
     emit_checkpoint_analysis: bool = false,
+    execution_strategy: CompiledExecutionStrategy = .interpreter,
+};
+
+pub const CompiledExecutionStrategy = enum {
+    interpreter,
+    partitioned_preferred,
+    partitioned_required,
+    mpsgraph_preferred,
+    mpsgraph_required,
 };
 
 pub const CompiledTrainSession = struct {
@@ -105,6 +124,10 @@ pub const CompiledTrainSession = struct {
     param_grads: []NodeId,
     loss_output_index: usize = 0,
     build_profile: TrainStepProfile = .{},
+    execution_strategy: CompiledExecutionStrategy = .interpreter,
+    runtime: ?graph_runtime.Runtime = null,
+    runtime_backend_kind: ?contracts.BackendKind = null,
+    mpsgraph_runtime: ?mpsgraph_executor.CompiledGraph = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -154,14 +177,16 @@ pub const CompiledTrainSession = struct {
             compiledDiag("checkpoint done checkpoint_ms={d:.3} rss={}", .{ nsToMs(profile.checkpoint_ns), profile.peak_resident_bytes });
         }
 
-        const lowered_loss = grad_result.id_map[loss_node];
-        compiledDiag("mark outputs begin lowered_loss={} existing_outputs={} rss={}", .{ lowered_loss, grad_result.graph.outputs.items.len, currentResidentBytes() });
-        grad_result.graph.outputs.clearRetainingCapacity();
-        try grad_result.graph.markOutput(lowered_loss);
+        var lowered_loss = grad_result.id_map[loss_node];
+        try markTrainingOutputs(&grad_result.graph, lowered_loss, grad_result.param_grads);
+        const fused_rewrites = try fuseCompiledGradientGraph(allocator, &grad_result);
+        lowered_loss = grad_result.id_map[loss_node];
+        compiledDiag("post-autodiff fuse rewrites={} nodes={} rss={}", .{ fused_rewrites, grad_result.graph.nodeCount(), currentResidentBytes() });
+        compiledDiagGraphOpCounts("post_fuse", &grad_result.graph);
+        compiledDiagMpsGraphSupport("post_fuse", &grad_result.graph);
 
-        for (grad_result.param_grads) |grad_id| {
-            if (grad_id != null_node) try grad_result.graph.markOutput(grad_id);
-        }
+        compiledDiag("mark outputs begin lowered_loss={} existing_outputs={} rss={}", .{ lowered_loss, grad_result.graph.outputs.items.len, currentResidentBytes() });
+        try markTrainingOutputs(&grad_result.graph, lowered_loss, grad_result.param_grads);
         compiledDiag("mark outputs done outputs={} rss={}", .{ grad_result.graph.outputs.items.len, currentResidentBytes() });
 
         const id_map = try allocator.dupe(NodeId, grad_result.id_map);
@@ -200,10 +225,13 @@ pub const CompiledTrainSession = struct {
             .wrt_names = wrt_names,
             .param_grads = param_grads,
             .build_profile = profile,
+            .execution_strategy = options.execution_strategy,
         };
     }
 
     pub fn deinit(self: *CompiledTrainSession) void {
+        if (self.mpsgraph_runtime) |*rt| rt.deinit();
+        if (self.runtime) |*rt| rt.deinit();
         self.graph.deinit();
         self.allocator.free(self.id_map);
         for (self.wrt_names) |name| self.allocator.free(name);
@@ -264,23 +292,22 @@ pub const CompiledTrainSession = struct {
                 currentResidentBytes(),
             },
         );
-        var exec_result = try interpreter.execute(
-            self.allocator,
-            &self.graph,
-            cb,
-            .{ .runtime_inputs = rt_slice },
-        );
+        var exec_result = try self.executeGraph(cb, .{ .runtime_inputs = rt_slice });
         profile.execute_ns = elapsedNs(execute_start);
+        profile.partitioned_runtime = exec_result.isRuntime();
+        profile.mpsgraph_runtime = exec_result.isMpsGraph();
+        if (exec_result.stats()) |stats| {
+            profile.partitions_executed = stats.partitions_executed;
+            profile.backend_command_dispatches = stats.backend_command_dispatches;
+            profile.planned_operator_dispatches = stats.planned_operator_dispatches;
+            profile.interpreter_fallbacks = stats.interpreter_fallbacks;
+            profile.graph_region_dispatches = stats.runtime_region_plan_dispatches + stats.fused_graph_pattern_dispatches;
+        }
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         compiledDiag("execute done execute_ms={d:.3} rss={}", .{ nsToMs(profile.execute_ns), profile.peak_resident_bytes });
-        defer exec_result.deinit(cb);
+        defer exec_result.deinit(cb, if (self.runtime) |*rt| rt else null);
 
         const extract_start = nowNs();
-        compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ exec_result.outputs.len, retain_device_gradients, currentResidentBytes() });
-        const loss_data = try cb.toFloat32(exec_result.outputs[self.loss_output_index], self.allocator);
-        defer self.allocator.free(loss_data);
-        const loss_value: f32 = if (loss_data.len > 0) loss_data[0] else 0.0;
-
         var gradients = std.StringHashMapUnmanaged([]f32){};
         var device_gradients = std.StringHashMapUnmanaged(CT){};
         errdefer {
@@ -298,23 +325,46 @@ pub const CompiledTrainSession = struct {
             device_gradients.deinit(self.allocator);
         }
 
-        var grad_output_idx: usize = self.loss_output_index + 1;
-        for (self.wrt_names, 0..) |name, i| {
-            if (self.param_grads[i] == null_node) continue;
-            const grad_ct = exec_result.outputs[grad_output_idx];
-            const grad_output_node = self.graph.outputs.items[grad_output_idx];
-            grad_output_idx += 1;
-            const owned_name = try self.allocator.dupe(u8, name);
-            errdefer self.allocator.free(owned_name);
-            if (retain_device_gradients) {
-                const retained = try cloneTensorForOutputShape(self.allocator, &self.graph, cb, grad_ct, grad_output_node);
-                errdefer cb.free(retained);
-                try device_gradients.put(self.allocator, owned_name, retained);
-            } else {
-                const grad_data = try cb.toFloat32(grad_ct, self.allocator);
+        const loss_value: f32 = if (exec_result.hostOutputs()) |host_outputs| blk: {
+            compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ host_outputs.len, retain_device_gradients, currentResidentBytes() });
+            if (retain_device_gradients) return error.MpsGraphDeviceGradientsUnsupported;
+            const loss_host = host_outputs[self.loss_output_index];
+            var grad_output_idx: usize = self.loss_output_index + 1;
+            for (self.wrt_names, 0..) |name, i| {
+                if (self.param_grads[i] == null_node) continue;
+                const grad_src = host_outputs[grad_output_idx];
+                grad_output_idx += 1;
+                const owned_name = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(owned_name);
+                const grad_data = try self.allocator.dupe(f32, grad_src);
+                errdefer self.allocator.free(grad_data);
                 try gradients.put(self.allocator, owned_name, grad_data);
             }
-        }
+            break :blk if (loss_host.len > 0) loss_host[0] else 0.0;
+        } else blk: {
+            const outputs = exec_result.outputs();
+            compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ outputs.len, retain_device_gradients, currentResidentBytes() });
+            const loss_data = try cb.toFloat32(outputs[self.loss_output_index], self.allocator);
+            defer self.allocator.free(loss_data);
+            var grad_output_idx: usize = self.loss_output_index + 1;
+            for (self.wrt_names, 0..) |name, i| {
+                if (self.param_grads[i] == null_node) continue;
+                const grad_ct = outputs[grad_output_idx];
+                const grad_output_node = self.graph.outputs.items[grad_output_idx];
+                grad_output_idx += 1;
+                const owned_name = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(owned_name);
+                if (retain_device_gradients) {
+                    const retained = try cloneTensorForOutputShape(self.allocator, &self.graph, cb, grad_ct, grad_output_node);
+                    errdefer cb.free(retained);
+                    try device_gradients.put(self.allocator, owned_name, retained);
+                } else {
+                    const grad_data = try cb.toFloat32(grad_ct, self.allocator);
+                    try gradients.put(self.allocator, owned_name, grad_data);
+                }
+            }
+            break :blk if (loss_data.len > 0) loss_data[0] else 0.0;
+        };
 
         profile.extract_ns = elapsedNs(extract_start);
         profile.total_ns = elapsedNs(total_start);
@@ -339,7 +389,198 @@ pub const CompiledTrainSession = struct {
             .compute_backend = if (retain_device_gradients) cb else null,
         };
     }
+
+    fn executeGraph(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        options: interpreter.ExecuteOptions,
+    ) !CompiledExecutionResult {
+        switch (self.execution_strategy) {
+            .interpreter => return self.executeInterpreter(cb, options),
+            .partitioned_preferred, .partitioned_required => return self.executePartitioned(cb, options, self.execution_strategy),
+            .mpsgraph_preferred, .mpsgraph_required => {
+                self.ensureMpsGraph() catch |err| switch (self.execution_strategy) {
+                    .mpsgraph_preferred => {
+                        compiledDiag("mpsgraph runtime init unavailable err={s}; falling back to partitioned runtime", .{@errorName(err)});
+                        return self.executePartitioned(cb, options, .partitioned_preferred);
+                    },
+                    .mpsgraph_required => return err,
+                    else => unreachable,
+                };
+                const rt = if (self.mpsgraph_runtime) |*runtime_value| runtime_value else return error.MissingMpsGraphRuntimePlan;
+                var result = rt.execute(self.allocator, cb, options.runtime_inputs) catch |err| switch (self.execution_strategy) {
+                    .mpsgraph_preferred => {
+                        compiledDiag("mpsgraph runtime execute unavailable err={s}; falling back to partitioned runtime", .{@errorName(err)});
+                        return self.executePartitioned(cb, options, .partitioned_preferred);
+                    },
+                    .mpsgraph_required => return err,
+                    else => unreachable,
+                };
+                errdefer result.deinit();
+                return .{ .mpsgraph = result };
+            },
+        }
+    }
+
+    fn executePartitioned(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        options: interpreter.ExecuteOptions,
+        strategy: CompiledExecutionStrategy,
+    ) !CompiledExecutionResult {
+        self.ensureRuntime(cb) catch |err| switch (strategy) {
+            .partitioned_preferred => {
+                compiledDiag("partitioned runtime init unavailable err={s}; falling back to interpreter", .{@errorName(err)});
+                return self.executeInterpreter(cb, options);
+            },
+            .partitioned_required => return err,
+            else => unreachable,
+        };
+        const rt = if (self.runtime) |*runtime_value| runtime_value else return error.MissingGraphRuntimePlan;
+        var result = rt.execute(self.allocator, &self.graph, options) catch |err| switch (strategy) {
+            .partitioned_preferred => {
+                compiledDiag("partitioned runtime execute unavailable err={s}; falling back to interpreter", .{@errorName(err)});
+                return self.executeInterpreter(cb, options);
+            },
+            .partitioned_required => return err,
+            else => unreachable,
+        };
+        errdefer result.deinit(rt);
+        return .{ .runtime = result };
+    }
+
+    fn executeInterpreter(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        options: interpreter.ExecuteOptions,
+    ) !CompiledExecutionResult {
+        var result = try interpreter.execute(self.allocator, &self.graph, cb, options);
+        errdefer result.deinit(cb);
+        return .{ .interpreter = result };
+    }
+
+    fn ensureRuntime(self: *CompiledTrainSession, cb: *const ComputeBackend) !void {
+        const backend_kind = cb.kind();
+        if (self.runtime) |*rt| {
+            if (self.runtime_backend_kind == backend_kind) return;
+            rt.deinit();
+            self.runtime = null;
+            self.runtime_backend_kind = null;
+        }
+        self.runtime = try graph_runtime.Runtime.init(
+            self.allocator,
+            &self.graph,
+            cb,
+            .partitioned,
+        );
+        self.runtime_backend_kind = backend_kind;
+    }
+
+    fn ensureMpsGraph(self: *CompiledTrainSession) !void {
+        if (self.mpsgraph_runtime != null) return;
+        self.mpsgraph_runtime = try mpsgraph_executor.CompiledGraph.compile(
+            self.allocator,
+            &self.graph,
+        );
+    }
 };
+
+const CompiledExecutionResult = union(enum) {
+    interpreter: interpreter.ExecutionResult,
+    runtime: graph_runtime.Result,
+    mpsgraph: mpsgraph_executor.ExecutionResult,
+
+    fn outputs(self: *const CompiledExecutionResult) []CT {
+        return switch (self.*) {
+            .interpreter => |result| result.outputs,
+            .runtime => |result| result.outputs,
+            .mpsgraph => unreachable,
+        };
+    }
+
+    fn hostOutputs(self: *const CompiledExecutionResult) ?[][]f32 {
+        return switch (self.*) {
+            .interpreter, .runtime => null,
+            .mpsgraph => |result| result.outputs,
+        };
+    }
+
+    fn isRuntime(self: *const CompiledExecutionResult) bool {
+        return switch (self.*) {
+            .interpreter => false,
+            .runtime => true,
+            .mpsgraph => false,
+        };
+    }
+
+    fn isMpsGraph(self: *const CompiledExecutionResult) bool {
+        return switch (self.*) {
+            .interpreter, .runtime => false,
+            .mpsgraph => true,
+        };
+    }
+
+    fn stats(self: *const CompiledExecutionResult) ?graph_runtime.Result.StatsType {
+        return switch (self.*) {
+            .interpreter => null,
+            .runtime => |result| result.stats,
+            .mpsgraph => null,
+        };
+    }
+
+    fn deinit(
+        self: *CompiledExecutionResult,
+        cb: *const ComputeBackend,
+        runtime_value: ?*const graph_runtime.Runtime,
+    ) void {
+        switch (self.*) {
+            .interpreter => |*result| result.deinit(cb),
+            .runtime => |*result| result.deinit(runtime_value orelse unreachable),
+            .mpsgraph => |*result| result.deinit(),
+        }
+    }
+};
+
+fn markTrainingOutputs(graph: *Graph, loss_id: NodeId, param_grads: []const NodeId) !void {
+    graph.outputs.clearRetainingCapacity();
+    if (loss_id == null_node) return error.LossNotScalar;
+    try graph.markOutput(loss_id);
+    for (param_grads) |grad_id| {
+        if (grad_id != null_node) try graph.markOutput(grad_id);
+    }
+}
+
+fn remapFusedNode(id_map: []const NodeId, id: NodeId) NodeId {
+    if (id == null_node) return null_node;
+    if (id >= id_map.len) return null_node;
+    return id_map[id];
+}
+
+fn fuseCompiledGradientGraph(
+    allocator: std.mem.Allocator,
+    grad_result: *autodiff.GradientResult,
+) !u32 {
+    var total_rewrites: u32 = 0;
+    var iter: u32 = 0;
+    while (iter < 8) : (iter += 1) {
+        const fused = try fuse_pass.fuse(allocator, &grad_result.graph);
+
+        for (grad_result.id_map) |*id| {
+            id.* = remapFusedNode(fused.id_map, id.*);
+        }
+        for (grad_result.param_grads) |*grad_id| {
+            grad_id.* = remapFusedNode(fused.id_map, grad_id.*);
+        }
+
+        const rewrites = fused.num_rewrites;
+        total_rewrites += rewrites;
+        grad_result.graph.deinit();
+        grad_result.graph = fused.graph;
+        allocator.free(fused.id_map);
+        if (rewrites == 0) break;
+    }
+    return total_rewrites;
+}
 
 pub fn trainStep(
     allocator: std.mem.Allocator,
@@ -503,6 +744,246 @@ fn nsToMs(ns: u64) f64 {
 fn compiledDiag(comptime fmt: []const u8, args: anytype) void {
     if (!platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE", false)) return;
     std.debug.print("[compiled-train] " ++ fmt ++ "\n", args);
+}
+
+fn compiledDiagMpsGraphSupport(label: []const u8, graph: *const Graph) void {
+    const enabled =
+        platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE", false) or
+        platform.env.getenvBoolDefault("TERMITE_MPSGRAPH_TRAIN_TRACE", false);
+    if (!enabled) return;
+
+    const support = mpsgraph_executor.supportSummary(graph);
+    std.debug.print(
+        "[compiled-train] mpsgraph_support {s} nodes={} supported={} unsupported={} all_supported={} first_unsupported={} first_op={s}\n",
+        .{
+            label,
+            support.nodes,
+            support.supported,
+            support.unsupported,
+            support.allSupported(),
+            support.first_unsupported_node orelse null_node,
+            support.first_unsupported_op orelse "none",
+        },
+    );
+}
+
+fn compiledDiagGraphOpCounts(label: []const u8, graph: *const Graph) void {
+    if (!platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE", false)) return;
+    const detail = platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE_DETAIL", false);
+
+    var parameters: u32 = 0;
+    var constants: u32 = 0;
+    var dot_general: u32 = 0;
+    var fused_linear: u32 = 0;
+    var fused_linear_no_bias: u32 = 0;
+    var fused_linear_no_bias_pair: u32 = 0;
+    var fused_softmax: u32 = 0;
+    var fused_layer_norm: u32 = 0;
+    var fused_rope: u32 = 0;
+    var fused_gelu: u32 = 0;
+    var add: u32 = 0;
+    var mul: u32 = 0;
+    var sub: u32 = 0;
+    var div: u32 = 0;
+    var reduce_sum: u32 = 0;
+    var reduce_mean: u32 = 0;
+    var reduce_max: u32 = 0;
+    var reshape: u32 = 0;
+    var transpose: u32 = 0;
+    var broadcast: u32 = 0;
+    var slice: u32 = 0;
+    var exp: u32 = 0;
+    var erf: u32 = 0;
+    var sqrt: u32 = 0;
+    var rsqrt: u32 = 0;
+    var neg: u32 = 0;
+    var other: u32 = 0;
+
+    for (0..graph.nodeCount()) |raw_id| {
+        const node = graph.node(@intCast(raw_id));
+        switch (node.op) {
+            .parameter => parameters += 1,
+            .constant => constants += 1,
+            .dot_general => dot_general += 1,
+            .fused_linear => fused_linear += 1,
+            .fused_linear_no_bias => fused_linear_no_bias += 1,
+            .fused_linear_no_bias_pair => fused_linear_no_bias_pair += 1,
+            .fused_softmax => fused_softmax += 1,
+            .fused_layer_norm => fused_layer_norm += 1,
+            .fused_rope => fused_rope += 1,
+            .fused_gelu => fused_gelu += 1,
+            .add => add += 1,
+            .mul => mul += 1,
+            .sub => sub += 1,
+            .div => div += 1,
+            .reduce_sum => reduce_sum += 1,
+            .reduce_mean => reduce_mean += 1,
+            .reduce_max => reduce_max += 1,
+            .reshape => reshape += 1,
+            .transpose => transpose += 1,
+            .broadcast_in_dim => broadcast += 1,
+            .slice => slice += 1,
+            .exp => exp += 1,
+            .erf => erf += 1,
+            .sqrt => sqrt += 1,
+            .rsqrt => rsqrt += 1,
+            .neg => neg += 1,
+            else => {
+                other += 1;
+                if (detail and other <= 48) {
+                    std.debug.print(
+                        "[compiled-train] other_op {s} id={} op={s} shape={any} inputs={any}\n",
+                        .{
+                            label,
+                            raw_id,
+                            @tagName(std.meta.activeTag(node.op)),
+                            node.output_shape,
+                            node.getInputs(),
+                        },
+                    );
+                }
+            },
+        }
+    }
+
+    std.debug.print(
+        "[compiled-train] op_counts {s} nodes={} params={} const={} dot={} lin={} lin_nb={} lin_pair={} softmax={} ln={} rope={} gelu={} add={} mul={} sub={} div={} rsum={} rmean={} rmax={} reshape={} transpose={} broadcast={} slice={} exp={} erf={} sqrt={} rsqrt={} neg={} other={}\n",
+        .{
+            label,
+            graph.nodeCount(),
+            parameters,
+            constants,
+            dot_general,
+            fused_linear,
+            fused_linear_no_bias,
+            fused_linear_no_bias_pair,
+            fused_softmax,
+            fused_layer_norm,
+            fused_rope,
+            fused_gelu,
+            add,
+            mul,
+            sub,
+            div,
+            reduce_sum,
+            reduce_mean,
+            reduce_max,
+            reshape,
+            transpose,
+            broadcast,
+            slice,
+            exp,
+            erf,
+            sqrt,
+            rsqrt,
+            neg,
+            other,
+        },
+    );
+    compiledDiagGraphDetails(label, graph);
+}
+
+fn compiledDiagGraphDetails(label: []const u8, graph: *const Graph) void {
+    if (!platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE_DETAIL", false)) return;
+
+    const LinearKey = struct {
+        input: NodeId,
+        rows: u32,
+        in_dim: u32,
+    };
+    const LinearSummary = struct {
+        count: u32 = 0,
+        out_total: u32 = 0,
+    };
+
+    var linear_groups = std.AutoHashMapUnmanaged(LinearKey, LinearSummary).empty;
+    defer linear_groups.deinit(graph.allocator);
+
+    var transpose_count: u32 = 0;
+    var dot_count: u32 = 0;
+    for (0..graph.nodeCount()) |raw_id| {
+        const id: NodeId = @intCast(raw_id);
+        const node = graph.node(id);
+        switch (node.op) {
+            .dot_general => |attrs| {
+                if (dot_count < 24) {
+                    std.debug.print(
+                        "[compiled-train] detail {s} dot id={} lhs={} lhs_op={s} rhs={} rhs_op={s} lc0={} rc0={} nbatch={} ncontract={} out_rank={}\n",
+                        .{
+                            label,
+                            id,
+                            node.inputs[0],
+                            if (node.inputs[0] != null_node and node.inputs[0] < graph.nodeCount()) @tagName(std.meta.activeTag(graph.node(node.inputs[0]).op)) else "null",
+                            node.inputs[1],
+                            if (node.inputs[1] != null_node and node.inputs[1] < graph.nodeCount()) @tagName(std.meta.activeTag(graph.node(node.inputs[1]).op)) else "null",
+                            if (attrs.num_contracting > 0) attrs.lhs_contracting[0] else 255,
+                            if (attrs.num_contracting > 0) attrs.rhs_contracting[0] else 255,
+                            attrs.num_batch,
+                            attrs.num_contracting,
+                            node.output_shape.rank(),
+                        },
+                    );
+                }
+                dot_count += 1;
+            },
+            .fused_linear_no_bias => |attrs| {
+                const key = LinearKey{
+                    .input = node.inputs[0],
+                    .rows = attrs.rows,
+                    .in_dim = attrs.in_dim,
+                };
+                const gop = linear_groups.getOrPut(graph.allocator, key) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                gop.value_ptr.count += 1;
+                gop.value_ptr.out_total += attrs.out_dim;
+            },
+            .transpose => |attrs| {
+                if (transpose_count < 24) {
+                    const input_id = node.inputs[0];
+                    const input_tag = if (input_id != null_node and input_id < graph.nodeCount())
+                        @tagName(std.meta.activeTag(graph.node(input_id).op))
+                    else
+                        "null";
+                    std.debug.print(
+                        "[compiled-train] detail {s} transpose id={} input={} input_op={s} axes={} perm=[{d},{d},{d},{d}] rank={} out_rank={}\n",
+                        .{
+                            label,
+                            id,
+                            input_id,
+                            input_tag,
+                            attrs.num_axes,
+                            attrs.perm[0],
+                            attrs.perm[1],
+                            attrs.perm[2],
+                            attrs.perm[3],
+                            if (input_id != null_node and input_id < graph.nodeCount()) graph.node(input_id).output_shape.rank() else 0,
+                            node.output_shape.rank(),
+                        },
+                    );
+                }
+                transpose_count += 1;
+            },
+            else => {},
+        }
+    }
+
+    var printed_groups: u32 = 0;
+    var it = linear_groups.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const summary = entry.value_ptr.*;
+        if (printed_groups < 32 or summary.count > 1) {
+            const input_tag = if (key.input != null_node and key.input < graph.nodeCount())
+                @tagName(std.meta.activeTag(graph.node(key.input).op))
+            else
+                "null";
+            std.debug.print(
+                "[compiled-train] detail {s} lin_nb_group input={} input_op={s} rows={} in={} count={} out_total={}\n",
+                .{ label, key.input, input_tag, key.rows, key.in_dim, summary.count, summary.out_total },
+            );
+            printed_groups += 1;
+        }
+    }
 }
 
 fn nowNs() u64 {

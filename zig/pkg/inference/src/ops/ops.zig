@@ -827,6 +827,10 @@ pub const ComputeBackend = struct {
         /// Backends may return null to use the host-id embedding path.
         embeddingLookupTensor: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT = null,
 
+        /// Add deterministic uniform NEFTune noise to an embedding tensor.
+        /// Backends may return null to use the host-generated noise fallback.
+        addNeftuneNoise: ?*const fn (ctx: *anyopaque, input: CT, seed: u64, scale: f32) anyerror!?CT = null,
+
         /// DeBERTa-v3 embedding block: word lookup + row LayerNorm + attention-mask multiply.
         /// Backends may return null to use the generic embedding/layernorm/multiply path.
         debertaEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaEmbeddingsRequest) anyerror!?CT = null,
@@ -913,6 +917,11 @@ pub const ComputeBackend = struct {
         /// otherwise the wrapper falls back to no-bias pair + add or two
         /// independent `linear` calls.
         linearPair: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearPairResult = null,
+
+        /// Y = activation(gate) * value. Backends may fuse activation and
+        /// multiply to keep gated FFNs resident; callers fall back to the
+        /// explicit activation + multiply sequence.
+        activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, value: CT, activation: DecoderRuntimeActivationKind, rows: usize, dim: usize) anyerror!?CT = null,
 
         /// Compute three biased linears that share the same input shape.
         /// This is the Q/K/V fast path for encoders with separate projection
@@ -1118,6 +1127,11 @@ pub const ComputeBackend = struct {
         /// to scaledDotProductAttention with an all-ones mask, but lets
         /// backends avoid a host mask allocation/upload.
         scaledDotProductAttentionFull: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+
+        /// Optional bidirectional local-window attention for encoder layers.
+        /// window_half is symmetric: a query may attend keys where
+        /// abs(q_index - k_index) <= window_half.
+        scaledDotProductAttentionLocal: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, window_half: usize) anyerror!?CT = null,
 
         /// Causal self-attention for decoder layers.
         /// Q,K,V: [batch*seq_len, num_heads*head_dim].
@@ -1681,6 +1695,13 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn addNeftuneNoise(self: *const ComputeBackend, input: CT, seed: u64, scale: f32) !?CT {
+        if (self.vtable.addNeftuneNoise) |op| {
+            return op(self.ptr, input, seed, scale);
+        }
+        return null;
+    }
+
     pub fn debertaEmbeddings(self: *const ComputeBackend, request: DebertaEmbeddingsRequest) !?CT {
         if (self.vtable.debertaEmbeddings) |op| {
             return op(self.ptr, &request);
@@ -1882,6 +1903,20 @@ pub const ComputeBackend = struct {
         errdefer self.free(first);
         const second = try self.linear(input, weight_b, bias_b, rows, in_dim, out_dim);
         return .{ .first = first, .second = second };
+    }
+
+    pub fn activationMultiply(
+        self: *const ComputeBackend,
+        gate: CT,
+        value: CT,
+        activation: DecoderRuntimeActivationKind,
+        rows: usize,
+        dim: usize,
+    ) !?CT {
+        if (self.vtable.activationMultiply) |activation_multiply| {
+            return activation_multiply(self.ptr, gate, value, activation, rows, dim);
+        }
+        return null;
     }
 
     pub fn linearTriple(
@@ -2302,6 +2337,13 @@ pub const ComputeBackend = struct {
     pub fn scaledDotProductAttentionFull(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         if (self.vtable.scaledDotProductAttentionFull) |f| {
             return f(self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim);
+        }
+        return null;
+    }
+
+    pub fn scaledDotProductAttentionLocal(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, window_half: usize) !?CT {
+        if (self.vtable.scaledDotProductAttentionLocal) |f| {
+            return f(self.ptr, Q, K, V, mask, batch, seq_len, num_heads, head_dim, window_half);
         }
         return null;
     }

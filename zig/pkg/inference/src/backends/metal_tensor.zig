@@ -521,6 +521,17 @@ pub const MetalTensor = struct {
     /// if present, otherwise aliases the Shared-storage contents pointer
     /// when available, or allocates + downloads from Private storage.
     pub fn toHostSlice(self: *MetalTensor) ![]f32 {
+        return self.toHostSliceWithFrameSync(true);
+    }
+
+    /// Same as `toHostSlice`, but assumes the caller has already flushed the
+    /// active runtime frame. Used by backend batch downloads to avoid one
+    /// synchronization boundary per tensor.
+    pub fn toHostSliceAssumeFrameFlushed(self: *MetalTensor) ![]f32 {
+        return self.toHostSliceWithFrameSync(false);
+    }
+
+    fn toHostSliceWithFrameSync(self: *MetalTensor, flush_frame: bool) ![]f32 {
         memory_stats.to_host_calls += 1;
         if (self.device == null) return self.data[0..self.len];
         memory_stats.to_host_device_calls += 1;
@@ -551,7 +562,7 @@ pub const MetalTensor = struct {
         // materialization is an explicit synchronization boundary. Drain the
         // current frame and reopen it so higher-level frame ownership can
         // continue after the host read.
-        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+        if (flush_frame and termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
             return error.MetalFrameSyncFailed;
         }
 

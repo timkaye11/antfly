@@ -5466,7 +5466,7 @@ fn linearLoRAOp(
     }
     try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input_data, base_w_data, 1.0, output);
 
-    // LoRA residual: Y += alpha * (input @ A^T) @ B^T, where A is
+    // LoRA residual: Y += (alpha/rank) * (input @ A^T) @ B^T, where A is
     // [lora_rank, in_dim] and B is [out_dim, lora_rank].  The previous
     // implementation materialised a merged [out_dim, in_dim] f32 weight
     // per call (~9MB for DeBERTa-base intermediate.dense and freshly
@@ -5475,13 +5475,14 @@ fn linearLoRAOp(
     // `rows * lora_rank * 4` bytes (~8KB at typical shapes), and keeps
     // the LoRA tensors L2-resident.
     if (alpha != 0.0 and lora_rank > 0) {
+        const scale = alpha / @as(f32, @floatFromInt(lora_rank));
         const intermediate = try self.allocator.alloc(f32, rows * lora_rank);
         defer self.allocator.free(intermediate);
         // intermediate = input @ A^T  (sgemmTransB treats lora_a_data as B
         // with shape [n=lora_rank, k=in_dim] and transposes internally).
         try self.dispatchSgemmTransB(rows, lora_rank, in_dim, 1.0, input_data, lora_a_data, 0.0, intermediate);
-        // output += alpha * intermediate @ B^T  (B is [out_dim, lora_rank]).
-        try self.dispatchSgemmTransB(rows, out_dim, lora_rank, alpha, intermediate, lora_b_data, 1.0, output);
+        // output += scale * intermediate @ B^T  (B is [out_dim, lora_rank]).
+        try self.dispatchSgemmTransB(rows, out_dim, lora_rank, scale, intermediate, lora_b_data, 1.0, output);
     }
 
     const result = try self.makeBuf(output, true);
@@ -46843,6 +46844,42 @@ test "toFloat32Op returns valid empty temporary tensor data" {
     const converted = try toFloat32Op(&compute, ct, allocator);
     defer allocator.free(converted);
     try std.testing.expectEqual(@as(usize, 0), converted.len);
+}
+
+test "linearLoRA uses standard alpha over rank scaling" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const input_shape = [_]i32{ 2, 3 };
+    const weight_shape = [_]i32{ 2, 3 };
+    const bias_shape = [_]i32{2};
+    const lora_a_shape = [_]i32{ 2, 3 };
+    const lora_b_shape = [_]i32{ 2, 2 };
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const weight_data = [_]f32{ 1, 0, 0, 0, 1, 1 };
+    const bias_data = [_]f32{ 10, -1 };
+    const lora_a_data = [_]f32{ 1, 0, 1, 0, 1, 0 };
+    const lora_b_data = [_]f32{ 1, 2, -1, 1 };
+
+    const input = try cb.fromFloat32Shape(&input_data, &input_shape);
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&weight_data, &weight_shape);
+    defer cb.free(weight);
+    const bias = try cb.fromFloat32Shape(&bias_data, &bias_shape);
+    defer cb.free(bias);
+    const lora_a = try cb.fromFloat32Shape(&lora_a_data, &lora_a_shape);
+    defer cb.free(lora_a);
+    const lora_b = try cb.fromFloat32Shape(&lora_b_data, &lora_b_shape);
+    defer cb.free(lora_b);
+
+    const out = try cb.linearLoRA(input, weight, bias, lora_a, lora_b, 4.0, 2, 2, 3, 2);
+    defer cb.free(out);
+
+    const out_data = try cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 27, 0, 54, 0 }, out_data);
 }
 
 test "reduce mean materializes source-backed tensors" {

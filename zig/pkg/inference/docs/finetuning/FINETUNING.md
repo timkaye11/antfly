@@ -554,6 +554,22 @@ Threads through the same checkpoint configuration and checkpoint-analysis report
 
 The fused-chunker embedder (`src/finetune/fused_chunker_train.zig`) is the reference implementation; other model families (LayoutLMv3, Reranker, ColQwen2, GLiNER2, Gemma4) progressively share these features.
 
+### Fused Chunker Metal/MPSGraph Direction
+
+The Phase-20 Metal fused-chunker path intentionally uses MPSGraph as the
+compiled segment executor for ModernBERT encoder VJPs. The backend remains
+Metal-native: custom Metal kernels handle model IO, token/chunk plumbing,
+heads, optimizer work, and diagnostics, while fixed-shape encoder backward
+segments are compiled and executed through MPSGraph by default. This mirrors
+the Go path's compiled-graph training shape and avoids maintaining a separate
+hand-written backward implementation for every encoder op.
+
+The production runner (`scripts/run_fused_chunker_phase20_metal.sh`) should keep
+`ANTFLY_FUSED_CHUNKER_ENCODER_VJP_EXECUTION=mpsgraph_required` unless a run is
+explicitly diagnostic. Quality probes should report both F1 metrics and
+MPSGraph fallback counts; a production-parity run with interpreter fallback is
+not considered equivalent to the Go architecture.
+
 | Feature | Fused Chunker | LayoutLMv3 Seq | LayoutLMv3 Token | Reranker LoRA | ColQwen2 | GLiNER2 LoRA | Gemma4 LoRA |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | AdamW optimizer | yes | yes | yes | yes | yes | yes | yes |

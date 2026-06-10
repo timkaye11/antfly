@@ -1325,7 +1325,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn hostSliceForBuf(buf: *Buf) ![]f32 {
         if (buf.quantized_storage != null) return error.UnsupportedTensorType;
-        if (buf.lazy_multiply != null) return error.UnsupportedTensorType;
+        if (buf.lazy_multiply) |*lazy| {
+            var lhs = try lazy.lhs.retainedCopy();
+            defer lhs.deinit();
+            var rhs = try lazy.rhs.retainedCopy();
+            defer rhs.deinit();
+            const lhs_host = try lhs.toHostSlice();
+            const rhs_host = try rhs.toHostSlice();
+            if (lhs_host.len == 0 or rhs_host.len == 0) return error.InvalidTensorShape;
+            const out_len = if (lhs_host.len == rhs_host.len)
+                lhs_host.len
+            else if (lhs_host.len == 1)
+                rhs_host.len
+            else if (rhs_host.len == 1)
+                lhs_host.len
+            else
+                return error.ShapeMismatch;
+            if (buf.logical_shape) |shape| {
+                const expected_len = try shapeNumel(shape);
+                if (expected_len != out_len) return error.InvalidTensorShape;
+            }
+            const output = try buf.allocator.alloc(f32, out_len);
+            errdefer buf.allocator.free(output);
+            const refcount = try initOwnedHostRefcount(buf.allocator, true);
+            errdefer if (refcount) |rc| buf.allocator.destroy(rc);
+            for (output, 0..) |*dst, i| {
+                dst.* = lhs_host[i % lhs_host.len] * rhs_host[i % rhs_host.len];
+            }
+            lazy.deinit();
+            buf.lazy_multiply = null;
+            releaseOwnedHostData(buf);
+            buf.data = output;
+            buf.owned = true;
+            buf.shared_data_refcount = refcount;
+        }
         if (buf.metal_tensor) |*metal_tensor| {
             const limit = traceHostMaterializeLimit();
             if (host_materialize_trace_count < limit) {
@@ -1417,6 +1450,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         if (buf.metal_tensor) |*metal_tensor| return metal_tensor.elemCount();
+        if (buf.lazy_multiply) |lazy| return lazy.lhs.elemCount();
         return buf.data.len;
     }
 
@@ -1522,6 +1556,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (buf.metal_tensor) |metal_tensor| {
             var tensor_mut = metal_tensor;
             const host = try tensor_mut.toHostSlice();
+            if (host.len == 0) return error.InvalidTensorShape;
             return host[wrapRepeatedBufferIndex(flat, host.len)];
         }
         if (buf.view_index_map) |index_map| {
@@ -1547,6 +1582,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             return buf.data[wrapRepeatedBufferIndex(flat_in, buf.data.len)];
         }
+        if (buf.data.len == 0) return error.InvalidTensorShape;
         return buf.data[wrapRepeatedBufferIndex(flat, buf.data.len)];
     }
 
@@ -3718,17 +3754,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
-    fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const buf = toBuf(tensor);
-        if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
-        if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
-        if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
-        if (hasHostView(buf)) try materializeViewData(buf);
-        const data = if (buf.metal_tensor) |*metal_tensor|
-            try metal_tensor.toHostSlice()
-        else
-            buf.data;
+    fn copyHostFloat32RespectingLogicalShape(buf: *const Buf, data: []const f32, allocator: std.mem.Allocator) ![]f32 {
         if (buf.logical_shape) |logical_shape| {
             if (safeShapeNumel(logical_shape)) |logical_numel| {
                 if (logical_numel > data.len and data.len > 0 and logical_numel % data.len == 0) {
@@ -3741,6 +3767,57 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const out = try allocator.alloc(f32, data.len);
         @memcpy(out, data);
         return out;
+    }
+
+    fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        if (hasHostView(buf)) try materializeViewData(buf);
+        const data = if (buf.metal_tensor) |*metal_tensor|
+            try metal_tensor.toHostSlice()
+        else
+            buf.data;
+        return copyHostFloat32RespectingLogicalShape(buf, data, allocator);
+    }
+
+    fn toFloat32BatchOp(ctx: *anyopaque, cts: []const CT, allocator: std.mem.Allocator) anyerror![][]f32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.provider_impl.raw_decode_runtime) |runtime| {
+            metal_runtime.flushActiveFrame(runtime) catch |err| switch (err) {
+                error.FrameNotActive, error.RuntimeUnavailable => {},
+                else => return err,
+            };
+        }
+
+        const results = try allocator.alloc([]f32, cts.len);
+        var done: usize = 0;
+        errdefer {
+            for (results[0..done]) |r| allocator.free(r);
+            allocator.free(results);
+        }
+
+        for (cts, results) |ct, *result| {
+            const buf = toBuf(ct);
+            if (buf.quantized_storage) |storage| {
+                result.* = try self.dequantizeStorageToFloat32(ct, storage, allocator);
+            } else if (buf.runtime_quantized_storage) |storage| {
+                result.* = try self.dequantizeStorageToFloat32(ct, storage, allocator);
+            } else if (buf.owned_quantized_storage) |storage| {
+                result.* = try self.dequantizeStorageToFloat32(ct, storage, allocator);
+            } else {
+                if (hasHostView(buf)) try materializeViewData(buf);
+                const data = if (buf.metal_tensor) |*metal_tensor|
+                    try metal_tensor.toHostSliceAssumeFrameFlushed()
+                else
+                    buf.data;
+                result.* = try copyHostFloat32RespectingLogicalShape(buf, data, allocator);
+            }
+            done += 1;
+        }
+        return results;
     }
 
     fn dequantizeStorageToFloat32(
@@ -4766,8 +4843,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (a_buf.quantized_storage != null or b_buf.quantized_storage != null) return null;
-        const a_metal = a_buf.metal_tensor orelse return null;
-        const b_metal = b_buf.metal_tensor orelse return null;
+        var a_lazy_tensor: ?MetalTensor = null;
+        defer if (a_lazy_tensor) |*tensor| tensor.deinit();
+        var b_lazy_tensor: ?MetalTensor = null;
+        defer if (b_lazy_tensor) |*tensor| tensor.deinit();
+
+        const a_metal = a_buf.metal_tensor orelse blk: {
+            if (try self.materializeLazyMultiplyDevice(a_buf)) |tensor| {
+                a_lazy_tensor = tensor;
+                break :blk a_lazy_tensor.?;
+            }
+            return null;
+        };
+        const b_metal = b_buf.metal_tensor orelse blk: {
+            if (try self.materializeLazyMultiplyDevice(b_buf)) |tensor| {
+                b_lazy_tensor = tensor;
+                break :blk b_lazy_tensor.?;
+            }
+            return null;
+        };
         if (!a_metal.isDevice() or !b_metal.isDevice()) return null;
         const a_count = a_metal.elemCount();
         const b_count = b_metal.elemCount();
@@ -4793,6 +4887,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         if (maybe_tensor) |tensor| return self.ctFromOwnedMetalTensor(tensor);
         return null;
+    }
+
+    fn materializeLazyMultiplyDevice(self: *MetalCompute, buf: *const Buf) !?MetalTensor {
+        const lazy = buf.lazy_multiply orelse return null;
+        if (!lazy.lhs.isDevice() or !lazy.rhs.isDevice()) return null;
+        const count = lazy.lhs.elemCount();
+        if (count == 0 or lazy.rhs.elemCount() != count) return null;
+        var lhs = try lazy.lhs.retainedCopy();
+        defer lhs.deinit();
+        var rhs = try lazy.rhs.retainedCopy();
+        defer rhs.deinit();
+        return try metal_runtime.decoderRuntimeApplyMultiply(self.provider_impl, lhs, rhs, count);
     }
 
     fn tryLazyDeviceMultiply(self: *MetalCompute, a: CT, b: CT, a_len: usize, b_len: usize) !?CT {
@@ -6515,6 +6621,74 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
     }
 
+    fn scaledDotProductAttentionLocalOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        window_half: usize,
+    ) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (window_half == 0) return null;
+        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) resident_path: {
+            const q_buf = toBuf(q_ct);
+            const k_buf = toBuf(k_ct);
+            const v_buf = toBuf(v_ct);
+            if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) break :resident_path;
+            const total = batch * num_heads * seq_len * head_dim;
+            if (total == 0) break :resident_path;
+
+            var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
+            defer v_mt.deinit();
+            if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) break :resident_path;
+            if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) break :resident_path;
+
+            var mask_mt: ?MetalTensor = null;
+            defer if (mask_mt) |*tensor| tensor.deinit();
+            if (mask.len > 0) {
+                if (mask.len < batch * seq_len) break :resident_path;
+                const mask_values = try self.allocator.alloc(f32, batch * seq_len);
+                defer self.allocator.free(mask_values);
+                for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
+                const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
+                const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
+                var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
+                errdefer device_mask.deinit();
+                const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
+                try host_mask.copyInto(&device_mask);
+                mask_mt = device_mask;
+            }
+
+            const scope = self.beginActivePlannedComputeScopeIfPossible(.attention, .attention);
+            defer self.endActivePlannedComputeScope(scope);
+            if (try metal_runtime.decoderRuntimeSdpaF32Device(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .bias = null,
+                .mask = mask_mt,
+                .batch = batch,
+                .seq_len = seq_len,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+                .bias_mode = 0,
+                .local_window_half = window_half,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+        return null;
+    }
+
     fn disentangledRelativeAttentionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -7255,6 +7429,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, out, true, &out_shape);
     }
 
+    fn addNeftuneNoiseOp(ctx: *anyopaque, input: CT, seed: u64, scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (scale == 0.0) return null;
+        const input_buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(input_buf) or bufElemCount(input_buf) == 0) return null;
+
+        var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        const output = (try metal_runtime.decoderRuntimeApplyNeftuneNoise(
+            self.provider_impl,
+            input_mt,
+            seed,
+            scale,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
     fn debertaEmbeddingsOp(ctx: *anyopaque, request: *const ops.DebertaEmbeddingsRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const trace = traceGlinerStages();
@@ -7696,6 +7887,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return input.retainedView(0, input.deviceByteLen(), &shape);
     }
 
+    fn shouldUseDirectDeviceLinearDot(rows: usize, in_dim: usize, out_dim: usize) bool {
+        if (out_dim <= 64) return true;
+        if (rows < 16 or out_dim < 16 or in_dim < 64) return false;
+        if (rows > std.math.maxInt(usize) / out_dim) return false;
+        return rows * out_dim >= 4096;
+    }
+
     fn linearNoBiasOpWithPlannedDispatch(
         ctx: *anyopaque,
         input: CT,
@@ -7725,7 +7923,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (input_buf.metal_tensor) |*input_metal| {
             if (weight_buf.metal_tensor) |*weight_metal| {
-                if (out_dim <= 64 and
+                if (shouldUseDirectDeviceLinearDot(rows, in_dim, out_dim) and
                     deviceTensorMatchesLinearRows(input_metal, rows, in_dim) and
                     weight_metal.isDevice() and
                     weight_metal.elemCount() == out_dim * in_dim and
@@ -7891,6 +8089,128 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         out_dim: usize,
     ) anyerror!CT {
         return linearOpWithPlannedDispatch(ctx, input, weight, bias, rows, in_dim, out_dim, null);
+    }
+
+    fn linearLoRAOp(
+        ctx: *anyopaque,
+        input: CT,
+        base_weight: CT,
+        bias: CT,
+        lora_a: CT,
+        lora_b: CT,
+        alpha: f32,
+        rank: usize,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!CT {
+        const base = try linearOp(ctx, input, base_weight, bias, rows, in_dim, out_dim);
+        errdefer freeOp(ctx, base);
+        if (rank == 0 or alpha == 0.0) return base;
+
+        const a_proj = try linearNoBiasOp(ctx, input, lora_a, rows, in_dim, rank);
+        defer freeOp(ctx, a_proj);
+        const b_proj = try linearNoBiasOp(ctx, a_proj, lora_b, rows, rank, out_dim);
+        defer freeOp(ctx, b_proj);
+
+        const scale = alpha / @as(f32, @floatFromInt(rank));
+        if (scale == 0.0) return base;
+
+        const scaled_delta = if (scale == 1.0) b_proj else scaled_blk: {
+            const scale_shape = [_]i32{1};
+            const scale_tensor = try fromFloat32ShapeOp(ctx, &[_]f32{scale}, &scale_shape);
+            defer freeOp(ctx, scale_tensor);
+            break :scaled_blk try multiplyOp(ctx, b_proj, scale_tensor);
+        };
+        defer if (scaled_delta != b_proj) freeOp(ctx, scaled_delta);
+
+        const out = try addOp(ctx, base, scaled_delta);
+        freeOp(ctx, base);
+        return out;
+    }
+
+    fn accumulateLoRAGradsOp(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        grad_a: []f32,
+        grad_b: []f32,
+        inputs: []const f32,
+        output_grads: []const f32,
+        lora_a: []const f32,
+        lora_b: []const f32,
+        rows: usize,
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        scale: f32,
+    ) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        _ = allocator;
+
+        if (grad_a.len != rank * in_features or
+            grad_b.len != out_features * rank or
+            inputs.len != rows * in_features or
+            output_grads.len != rows * out_features or
+            lora_a.len != rank * in_features or
+            lora_b.len != out_features * rank)
+        {
+            return error.InvalidTensorShape;
+        }
+
+        if (rank == 0 or rows == 0 or in_features == 0 or out_features == 0 or scale == 0.0) {
+            @memset(grad_a, 0.0);
+            @memset(grad_b, 0.0);
+            return;
+        }
+
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const input_shape = [_]i32{ @intCast(rows), @intCast(in_features) };
+        const output_grad_shape = [_]i32{ @intCast(rows), @intCast(out_features) };
+        const lora_a_shape = [_]i32{ @intCast(rank), @intCast(in_features) };
+        const lora_b_shape = [_]i32{ @intCast(out_features), @intCast(rank) };
+        const factor_shape = [_]i32{ @intCast(rows), @intCast(rank) };
+
+        var input_mt = try self.deviceTensorFromF32Slice(inputs, &input_shape);
+        defer input_mt.deinit();
+        var output_grad_mt = try self.deviceTensorFromF32Slice(output_grads, &output_grad_shape);
+        defer output_grad_mt.deinit();
+        var lora_a_mt = try self.deviceTensorFromF32Slice(lora_a, &lora_a_shape);
+        defer lora_a_mt.deinit();
+        var lora_b_mt = try self.deviceTensorFromF32Slice(lora_b, &lora_b_shape);
+        defer lora_b_mt.deinit();
+
+        var low_rank_mt = try MetalTensor.deviceAllocate(@ptrCast(runtime), rows * rank * @sizeOf(f32), .private, &factor_shape);
+        defer low_rank_mt.deinit();
+        var back_rank_mt = try MetalTensor.deviceAllocate(@ptrCast(runtime), rows * rank * @sizeOf(f32), .private, &factor_shape);
+        defer back_rank_mt.deinit();
+        var grad_a_mt = try MetalTensor.deviceAllocate(@ptrCast(runtime), grad_a.len * @sizeOf(f32), .private, &lora_a_shape);
+        defer grad_a_mt.deinit();
+        var grad_b_mt = try MetalTensor.deviceAllocate(@ptrCast(runtime), grad_b.len * @sizeOf(f32), .private, &lora_b_shape);
+        defer grad_b_mt.deinit();
+
+        const ok = try metal_runtime.decoderRuntimeTrainingLoRAGradsF32(
+            self.provider_impl,
+            input_mt,
+            output_grad_mt,
+            lora_a_mt,
+            lora_b_mt,
+            low_rank_mt,
+            back_rank_mt,
+            grad_a_mt,
+            grad_b_mt,
+            rows,
+            in_features,
+            out_features,
+            rank,
+            scale,
+        );
+        if (!ok) return error.MetalTrainingLoRAGradsUnavailable;
+
+        const grad_a_host = try grad_a_mt.toHostSlice();
+        const grad_b_host = try grad_b_mt.toHostSlice();
+        if (grad_a_host.len != grad_a.len or grad_b_host.len != grad_b.len) return error.InvalidTensorShape;
+        @memcpy(grad_a, grad_a_host);
+        @memcpy(grad_b, grad_b_host);
     }
 
     fn linearOpWithPlannedDispatch(
@@ -14593,6 +14913,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, shape_i32);
     }
 
+    fn activationMultiplyOp(
+        ctx: *anyopaque,
+        gate: CT,
+        value: CT,
+        activation: ops.DecoderRuntimeActivationKind,
+        rows: usize,
+        dim: usize,
+    ) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        const gate_buf = toBuf(gate);
+        const value_buf = toBuf(value);
+        if (bufHasAnyQuantizedStorage(gate_buf) or bufHasAnyQuantizedStorage(value_buf)) return null;
+        const gate_metal = if (gate_buf.metal_tensor) |*tensor| tensor else return null;
+        const value_metal = if (value_buf.metal_tensor) |*tensor| tensor else return null;
+        if (!deviceTensorMatchesLinearRows(gate_metal, rows, dim)) return null;
+        if (!deviceTensorMatchesLinearRows(value_metal, rows, dim)) return null;
+
+        var gate_mt = try gate_metal.retainedCopy();
+        defer gate_mt.deinit();
+        var value_mt = try value_metal.retainedCopy();
+        defer value_mt.deinit();
+        const tensor = (try metal_runtime.decoderRuntimeApplyActivationMultiply(
+            self.provider_impl,
+            gate_mt,
+            value_mt,
+            activation,
+            rows,
+            dim,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
     fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         return applyUnaryActivationOp(ctx, input, .gelu, activations_mod.gelu);
     }
@@ -14653,7 +15006,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return cached_device_weight;
         }
 
-        if (self.dense_weight_cache.get(full_name)) |*cached| {
+        const is_lora_adapter_weight = std.mem.indexOf(u8, full_name, ".lora_") != null;
+        if (!is_lora_adapter_weight and self.dense_weight_cache.get(full_name) != null) {
+            const cached = self.dense_weight_cache.getPtr(full_name).?;
             return self.cachedDenseWeightBuf(cached);
         }
 
@@ -14669,6 +15024,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     errdefer self.allocator.free(host);
                     const shape = try self.logicalShapeFromTensor(&loaded.tensor);
                     errdefer self.allocator.free(shape);
+                    if (is_lora_adapter_weight) {
+                        const shape_i32 = try self.i32ShapeFromI64(shape);
+                        defer self.allocator.free(shape_i32);
+                        const tensor = try denseBuf(self.allocator, host, true, shape_i32);
+                        self.allocator.free(shape);
+                        return tensor;
+                    }
                     const runtime_storage = if (entry.quantized_storage) |*storage| storage else null;
                     const native_dense = try self.nativeDenseLinearBytesForRuntime(full_name, &loaded.tensor);
                     errdefer if (native_dense) |native_info| {
@@ -14715,6 +15077,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 else
                     try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
                 errdefer if (native_dense == null) self.allocator.free(host);
+                if (is_lora_adapter_weight) {
+                    const shape_i32 = try self.i32ShapeFromI64(shape);
+                    defer self.allocator.free(shape_i32);
+                    const tensor = try denseBuf(self.allocator, host, true, shape_i32);
+                    self.allocator.free(shape);
+                    return tensor;
+                }
                 const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, entry, runtime_storage, native_dense, native_dense_dtype);
                 return self.cachedDenseWeightBuf(cached);
             }
@@ -18691,7 +19060,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeApplyLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        var input = try self.ownedMetalTensorFromCt(request.input);
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer linear_input.deinit();
@@ -18942,7 +19311,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearPairRequest) anyerror!?ops.LinearNoBiasPairResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        var input = try self.ownedMetalTensorFromCt(request.input);
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer linear_input.deinit();
@@ -19008,7 +19377,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        var input = try self.ownedMetalTensorFromCt(request.input);
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer linear_input.deinit();
@@ -19216,6 +19585,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.fromFloat32Shape = fromFloat32ShapeOp;
         vt.convertDType = convertDTypeOp;
         vt.toFloat32 = toFloat32Op;
+        vt.toFloat32Batch = toFloat32BatchOp;
         vt.exportTensorData = null;
         vt.cloneTensorShape = cloneTensorShapeOp;
         vt.tensorShape = tensorShapeOp;
@@ -19251,6 +19621,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatPrimOp = concatPrimOp;
         vt.softmaxOp = softmaxOp;
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
+        vt.scaledDotProductAttentionLocal = scaledDotProductAttentionLocalOp;
         vt.disentangledRelativeAttention = disentangledRelativeAttentionOp;
         vt.causalSelfAttention = causalSelfAttentionOp;
         vt.logSoftmaxOp = logSoftmaxOp;
@@ -19273,6 +19644,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatRows2D = concatRows2DOp;
         vt.sliceRows2D = sliceRows2DOp;
         vt.embeddingLookup = embeddingLookupOp;
+        vt.addNeftuneNoise = addNeftuneNoiseOp;
         vt.debertaEmbeddings = debertaEmbeddingsOp;
         vt.takeRows = takeRowsOp;
         vt.glinerWordEmbeddings = glinerWordEmbeddingsOp;
@@ -19297,7 +19669,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
         vt.splitLastDim3 = splitLastDim3Op;
+        vt.linearLoRA = linearLoRAOp;
+        vt.accumulateLoRAGrads = accumulateLoRAGradsOp;
         vt.linearPair = linearPairOp;
+        vt.activationMultiply = activationMultiplyOp;
         vt.linearTriple = linearTripleOp;
         vt.rope = ropeOp;
         vt.ropePerItem = ropePerItemOp;
@@ -21339,6 +21714,71 @@ test "metal_compute: slice preserves full-range symbolic tensors" {
     try std.testing.expectEqualSlices(f32, &input_data, out_data);
 }
 
+test "metal_compute: GeGLU slice gelu multiply stays device resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const rows: usize = 2;
+    const dim: usize = 3;
+    const input_data = [_]f32{
+        -1.0, 0.0,  1.0, 2.0,  -3.0, 4.0,
+        0.5,  -0.5, 2.0, -1.0, 0.25, 3.0,
+    };
+    const input_host = try metal_cb.fromFloat32Shape(&input_data, &.{ rows, 2 * dim });
+    defer metal_cb.free(input_host);
+    const input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
+    const input = try metal_compute.ctFromOwnedMetalTensor(input_mt);
+    defer metal_cb.free(input);
+
+    const gate = try metal_cb.sliceLastDim(input, 0, dim);
+    defer metal_cb.free(gate);
+    const value = try metal_cb.sliceLastDim(input, dim, 2 * dim);
+    defer metal_cb.free(value);
+    const gate_gelu = try metal_cb.geluNew(gate);
+    defer metal_cb.free(gate_gelu);
+    const out = try metal_cb.multiply(gate_gelu, value);
+    defer metal_cb.free(out);
+    const fused_out = (try metal_cb.activationMultiply(gate, value, .gelu_new, rows, dim)) orelse return error.TestUnexpectedResult;
+    defer metal_cb.free(fused_out);
+
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, gate));
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, value));
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, gate_gelu));
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, fused_out));
+
+    var expected_gate = [_]f32{
+        -1.0, 0.0,  1.0,
+        0.5,  -0.5, 2.0,
+    };
+    activations_mod.gelu(&expected_gate);
+    const expected_value = [_]f32{
+        2.0,  -3.0, 4.0,
+        -1.0, 0.25, 3.0,
+    };
+    var expected: [rows * dim]f32 = undefined;
+    for (&expected, 0..) |*v, i| v.* = expected_gate[i] * expected_value[i];
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    const fused_data = try metal_cb.toFloat32(fused_out, allocator);
+    defer allocator.free(fused_data);
+    for (expected, out_data) |exp, got| {
+        try std.testing.expectApproxEqAbs(exp, got, 1e-4);
+    }
+    for (out_data, fused_data) |exp, got| {
+        try std.testing.expectApproxEqAbs(exp, got, 1e-4);
+    }
+}
+
 test "metal_compute: contiguousSliceRange recognizes only contiguous row-major slices" {
     if (!build_options.enable_metal) return error.SkipZigTest;
 
@@ -22175,6 +22615,52 @@ test "metal_compute: lazy multiply reduce last dim stays resident" {
     for (reduced_data) |value| try std.testing.expectApproxEqAbs(@as(f32, 72.0), value, 1e-5);
 }
 
+test "metal_compute: lazy multiply materializes for host fallback unary" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var lhs_data: [4096]f32 = undefined;
+    var rhs_data: [4096]f32 = undefined;
+    for (&lhs_data, &rhs_data, 0..) |*lhs_value, *rhs_value, idx| {
+        lhs_value.* = @floatFromInt((idx % 8) + 1);
+        rhs_value.* = 3.0;
+    }
+    const lhs_host = try metal_cb.fromFloat32Shape(&lhs_data, &.{ 64, 8, 8 });
+    defer metal_cb.free(lhs_host);
+    const rhs_host = try metal_cb.fromFloat32Shape(&rhs_data, &.{ 64, 8, 8 });
+    defer metal_cb.free(rhs_host);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+    const rhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(rhs_host);
+    const rhs = try metal_compute.ctFromOwnedMetalTensor(rhs_mt);
+    defer metal_cb.free(rhs);
+
+    const product = try metal_cb.multiply(lhs, rhs);
+    defer metal_cb.free(product);
+    try std.testing.expect(MetalCompute.toBuf(product).lazy_multiply != null);
+
+    const negated = try metal_cb.primNegate(product);
+    defer metal_cb.free(negated);
+    try std.testing.expect(MetalCompute.toBuf(product).lazy_multiply == null);
+
+    const negated_data = try metal_cb.toFloat32(negated, allocator);
+    defer allocator.free(negated_data);
+    try std.testing.expectEqual(@as(usize, 4096), negated_data.len);
+    for (negated_data, 0..) |value, idx| {
+        const expected = -@as(f32, @floatFromInt((idx % 8) + 1)) * 3.0;
+        try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+    }
+}
+
 test "metal_compute: batched dot_general keeps attention matmul resident" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -22432,6 +22918,229 @@ test "metal_compute: device linear applies bias through metal runtime slot" {
     const out_data = try metal_cb.toFloat32(out, allocator);
     defer allocator.free(out_data);
     try std.testing.expectEqualSlices(f32, &.{ 11, 4, 14, 10 }, out_data);
+}
+
+test "metal_compute: toFloat32Batch downloads device tensors" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const shape = [_]i32{ 2, 2 };
+    const a_data = [_]f32{ 1, 2, 3, 4 };
+    const b_data = [_]f32{ -1, 0.5, 7, 8 };
+
+    const a_host = try metal_cb.fromFloat32Shape(&a_data, &shape);
+    defer metal_cb.free(a_host);
+    const a_device_tensor = try metal_compute.ownedDeviceMetalTensorFromCt(a_host);
+    const a = try metal_compute.ctFromOwnedMetalTensor(a_device_tensor);
+    defer metal_cb.free(a);
+
+    const b_host = try metal_cb.fromFloat32Shape(&b_data, &shape);
+    defer metal_cb.free(b_host);
+    const b_device_tensor = try metal_compute.ownedDeviceMetalTensorFromCt(b_host);
+    const b = try metal_compute.ctFromOwnedMetalTensor(b_device_tensor);
+    defer metal_cb.free(b);
+
+    const tensors = [_]CT{ a, b };
+    const batch = try metal_cb.toFloat32Batch(&tensors, allocator);
+    defer {
+        for (batch) |item| allocator.free(item);
+        allocator.free(batch);
+    }
+    try std.testing.expectEqual(@as(usize, 2), batch.len);
+    try std.testing.expectEqualSlices(f32, &a_data, batch[0]);
+    try std.testing.expectEqualSlices(f32, &b_data, batch[1]);
+}
+
+test "metal_compute: linearLoRA applies low-rank delta with standard scaling" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_shape = [_]i32{ 2, 3 };
+    const weight_shape = [_]i32{ 2, 3 };
+    const bias_shape = [_]i32{2};
+    const lora_a_shape = [_]i32{ 2, 3 };
+    const lora_b_shape = [_]i32{ 2, 2 };
+    const input_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const weight_data = [_]f32{ 1, 0, 0, 0, 1, 1 };
+    const bias_data = [_]f32{ 10, -1 };
+    const lora_a_data = [_]f32{ 1, 0, 1, 0, 1, 0 };
+    const lora_b_data = [_]f32{ 1, 2, -1, 1 };
+
+    const input = try metal_cb.fromFloat32Shape(&input_data, &input_shape);
+    defer metal_cb.free(input);
+    const weight = try metal_cb.fromFloat32Shape(&weight_data, &weight_shape);
+    defer metal_cb.free(weight);
+    const bias = try metal_cb.fromFloat32Shape(&bias_data, &bias_shape);
+    defer metal_cb.free(bias);
+    const lora_a = try metal_cb.fromFloat32Shape(&lora_a_data, &lora_a_shape);
+    defer metal_cb.free(lora_a);
+    const lora_b = try metal_cb.fromFloat32Shape(&lora_b_data, &lora_b_shape);
+    defer metal_cb.free(lora_b);
+
+    const out = try metal_cb.linearLoRA(input, weight, bias, lora_a, lora_b, 4.0, 2, 2, 3, 2);
+    defer metal_cb.free(out);
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 27, 0, 54, 0 }, out_data);
+}
+
+fn fillExpectedLoRAGrads(
+    expected_a: []f32,
+    expected_b: []f32,
+    inputs: []const f32,
+    output_grads: []const f32,
+    lora_a: []const f32,
+    lora_b: []const f32,
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+    scale: f32,
+) void {
+    @memset(expected_a, 0.0);
+    @memset(expected_b, 0.0);
+    for (0..rows) |row| {
+        const x = inputs[row * in_features ..][0..in_features];
+        const dy = output_grads[row * out_features ..][0..out_features];
+
+        var low_rank_buf: [16]f32 = undefined;
+        std.debug.assert(rank <= low_rank_buf.len);
+        const low_rank = low_rank_buf[0..rank];
+        @memset(low_rank, 0.0);
+        for (0..rank) |r| {
+            for (0..in_features) |i| {
+                low_rank[r] += x[i] * lora_a[r * in_features + i];
+            }
+        }
+        for (0..out_features) |o| {
+            for (0..rank) |r| {
+                expected_b[o * rank + r] += scale * dy[o] * low_rank[r];
+            }
+        }
+
+        var back_rank_buf: [16]f32 = undefined;
+        std.debug.assert(rank <= back_rank_buf.len);
+        const back_rank = back_rank_buf[0..rank];
+        @memset(back_rank, 0.0);
+        for (0..rank) |r| {
+            for (0..out_features) |o| {
+                back_rank[r] += dy[o] * lora_b[o * rank + r];
+            }
+        }
+        for (0..rank) |r| {
+            for (0..in_features) |i| {
+                expected_a[r * in_features + i] += scale * back_rank[r] * x[i];
+            }
+        }
+    }
+}
+
+test "metal_compute: accumulateLoRAGrads matches direct LoRA gradient math" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const rows: usize = 2;
+    const in_features: usize = 3;
+    const out_features: usize = 2;
+    const rank: usize = 2;
+    const scale: f32 = 2.0;
+
+    var inputs = [_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    };
+    const output_grads = [_]f32{
+        0.5, -1.0,
+        2.0, 0.25,
+    };
+    const lora_a = [_]f32{
+        1, 0, 1,
+        0, 1, 0,
+    };
+    const lora_b = [_]f32{
+        1,  2,
+        -1, 1,
+    };
+
+    var grad_a = [_]f32{0.0} ** (rank * in_features);
+    var grad_b = [_]f32{0.0} ** (out_features * rank);
+    const ran = try metal_cb.accumulateLoRAGrads(
+        allocator,
+        &grad_a,
+        &grad_b,
+        &inputs,
+        &output_grads,
+        &lora_a,
+        &lora_b,
+        rows,
+        in_features,
+        out_features,
+        rank,
+        scale,
+    );
+    try std.testing.expect(ran);
+
+    var expected_a = [_]f32{0.0} ** (rank * in_features);
+    var expected_b = [_]f32{0.0} ** (out_features * rank);
+    fillExpectedLoRAGrads(&expected_a, &expected_b, &inputs, &output_grads, &lora_a, &lora_b, rows, in_features, out_features, rank, scale);
+
+    for (expected_a, grad_a) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+    for (expected_b, grad_b) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    inputs[0] = -7.0;
+    inputs[inputs.len - 1] = 11.0;
+    @memset(&grad_a, 0.0);
+    @memset(&grad_b, 0.0);
+    try std.testing.expect(try metal_cb.accumulateLoRAGrads(
+        allocator,
+        &grad_a,
+        &grad_b,
+        &inputs,
+        &output_grads,
+        &lora_a,
+        &lora_b,
+        rows,
+        in_features,
+        out_features,
+        rank,
+        scale,
+    ));
+    fillExpectedLoRAGrads(&expected_a, &expected_b, &inputs, &output_grads, &lora_a, &lora_b, rows, in_features, out_features, rank, scale);
+    for (expected_a, grad_a) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+    for (expected_b, grad_b) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
 }
 
 test "metal_compute: dynamic rms norm slot key distinguishes native dense buffers" {

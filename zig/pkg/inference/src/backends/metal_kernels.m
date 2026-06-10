@@ -16,6 +16,7 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -371,6 +372,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> argmax_axis_f32_pipeline;
     id<MTLComputePipelineState> convert_dtype_f32_pipeline;
     id<MTLComputePipelineState> sdpa_f32_pipeline;
+    id<MTLComputePipelineState> sdpa_f32_tg_pipeline;
     id<MTLComputePipelineState> disentangled_relative_attention_f32_pipeline;
     id<MTLComputePipelineState> disentangled_relative_attention_f32_tg_pipeline;
     id<MTLComputePipelineState> disentangled_relative_attention_f32_flash4_pipeline;
@@ -437,9 +439,12 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> add_pipeline;
     id<MTLComputePipelineState> add_scale_pipeline;
     id<MTLComputePipelineState> scaled_add_scale_pipeline;
+    id<MTLComputePipelineState> neftune_noise_pipeline;
     id<MTLComputePipelineState> training_accumulate_pipeline;
     id<MTLComputePipelineState> training_adamw_pipeline;
     id<MTLComputePipelineState> training_sumsq_pipeline;
+    id<MTLComputePipelineState> training_lora_factors_pipeline;
+    id<MTLComputePipelineState> training_lora_reduce_pipeline;
     id<MTLComputePipelineState> subtract_pipeline;
     id<MTLComputePipelineState> divide_pipeline;
     id<MTLComputePipelineState> less_than_pipeline;
@@ -1370,6 +1375,629 @@ int termite_metal_device_available(void) {
     }
 }
 
+int termite_mpsgraph_available(void) {
+    @autoreleasepool {
+        if (termite_metal_shared_device() == nil) return 0;
+        return NSClassFromString(@"MPSGraph") != nil ? 1 : 0;
+    }
+}
+
+int termite_mpsgraph_smoke_add_f32(float lhs, float rhs, float *out_value) {
+    if (out_value == NULL) return -1;
+    @autoreleasepool {
+        id<MTLDevice> device = termite_metal_shared_device();
+        if (device == nil || NSClassFromString(@"MPSGraph") == nil) return -2;
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (queue == nil) return -3;
+
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        NSArray<NSNumber *> *shape = @[@1];
+        MPSGraphTensor *input = [graph placeholderWithShape:shape dataType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *bias = [graph constantWithScalar:rhs shape:shape dataType:MPSDataTypeFloat32];
+        MPSGraphTensor *sum = [graph additionWithPrimaryTensor:input secondaryTensor:bias name:nil];
+        if (input == nil || bias == nil || sum == nil) return -4;
+
+        MPSGraphShapedType *input_type = [[MPSGraphShapedType alloc] initWithShape:shape dataType:MPSDataTypeFloat32];
+        MPSGraphCompilationDescriptor *compile_desc = [[MPSGraphCompilationDescriptor alloc] init];
+        MPSGraphExecutable *exec = nil;
+        @try {
+            exec = [graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:device]
+                                      feeds:@{ input: input_type }
+                              targetTensors:@[sum]
+                           targetOperations:nil
+                      compilationDescriptor:compile_desc];
+        } @catch (NSException *exception) {
+            return -5;
+        }
+        if (exec == nil) return -6;
+
+        NSData *input_data = [NSData dataWithBytes:&lhs length:sizeof(lhs)];
+        MPSGraphTensorData *input_tensor_data = [[MPSGraphTensorData alloc] initWithDevice:[MPSGraphDevice deviceWithMTLDevice:device]
+                                                                                      data:input_data
+                                                                                     shape:shape
+                                                                                  dataType:MPSDataTypeFloat32];
+        MPSCommandBuffer *command_buffer = [MPSCommandBuffer commandBufferFromCommandQueue:queue];
+        if (command_buffer == nil || input_tensor_data == nil) return -7;
+        MPSGraphExecutableExecutionDescriptor *execute_desc = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+        NSArray<MPSGraphTensorData *> *results = nil;
+        @try {
+            results = [exec encodeToCommandBuffer:command_buffer
+                                      inputsArray:@[input_tensor_data]
+                                     resultsArray:nil
+                              executionDescriptor:execute_desc];
+        } @catch (NSException *exception) {
+            return -8;
+        }
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.error != nil) return -9;
+        if (results == nil || results.count < 1) return -10;
+        MPSNDArray *ndarray = results[0].mpsndarray;
+        if (ndarray == nil) return -11;
+        [ndarray readBytes:out_value strideBytes:nil];
+        return 0;
+    }
+}
+
+typedef struct termite_mpsgraph_error {
+    int code;
+    const char *message;
+} termite_mpsgraph_error;
+
+@interface TermiteMPSGraphContext : NSObject
+@property (nonatomic, strong) MPSGraph *graph;
+@property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@end
+
+@implementation TermiteMPSGraphContext
+@end
+
+@interface TermiteMPSGraphExecutable : NSObject
+@property (nonatomic, strong) MPSGraphExecutable *executable;
+@property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@property (nonatomic, strong) NSArray<MPSGraphTensor *> *feedTensors;
+@property (nonatomic, strong) NSArray<MPSGraphTensor *> *targetTensors;
+@property (nonatomic, strong) NSArray<NSNumber *> *feedPermutation;
+@property (nonatomic, strong) NSArray<NSNumber *> *targetPermutation;
+@end
+
+@implementation TermiteMPSGraphExecutable
+@end
+
+static void termite_mpsgraph_clear_error(termite_mpsgraph_error *error) {
+    if (error == NULL) return;
+    error->code = 0;
+    error->message = NULL;
+}
+
+static void termite_mpsgraph_set_error(termite_mpsgraph_error *error, int code, NSString *message) {
+    if (error == NULL) return;
+    error->code = code;
+    error->message = strdup([message UTF8String]);
+}
+
+void termite_mpsgraph_error_message_free(const char *message) {
+    if (message != NULL) free((void *)message);
+}
+
+static NSArray<NSNumber *> *termite_mpsgraph_shape_array(const int64_t *shape, int rank) {
+    NSMutableArray<NSNumber *> *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)rank];
+    for (int i = 0; i < rank; i++) {
+        [arr addObject:@(shape[i])];
+    }
+    return arr;
+}
+
+static NSArray<NSNumber *> *termite_mpsgraph_int_array(const int *values, int count) {
+    NSMutableArray<NSNumber *> *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (int i = 0; i < count; i++) {
+        [arr addObject:@(values[i])];
+    }
+    return arr;
+}
+
+void *termite_mpsgraph_context_create(termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        id<MTLDevice> device = termite_metal_shared_device();
+        if (device == nil || NSClassFromString(@"MPSGraph") == nil) {
+            termite_mpsgraph_set_error(error, 1, @"MPSGraph/Metal device unavailable");
+            return NULL;
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (queue == nil) {
+            termite_mpsgraph_set_error(error, 2, @"Failed to create MPSGraph command queue");
+            return NULL;
+        }
+
+        TermiteMPSGraphContext *ctx = [[TermiteMPSGraphContext alloc] init];
+        ctx.device = device;
+        ctx.commandQueue = queue;
+        ctx.graph = [[MPSGraph alloc] init];
+        if (ctx.graph == nil) {
+            termite_mpsgraph_set_error(error, 3, @"Failed to create MPSGraph");
+            return NULL;
+        }
+        return (__bridge_retained void *)ctx;
+    }
+}
+
+void termite_mpsgraph_context_destroy(void *handle) {
+    if (handle == NULL) return;
+    @autoreleasepool {
+        TermiteMPSGraphContext *ctx = (__bridge_transfer TermiteMPSGraphContext *)handle;
+        (void)ctx;
+    }
+}
+
+void *termite_mpsgraph_placeholder_f32(void *handle, const int64_t *shape, int rank, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        if (ctx == nil || shape == NULL || rank < 0) {
+            termite_mpsgraph_set_error(error, 10, @"Invalid MPSGraph placeholder arguments");
+            return NULL;
+        }
+        MPSGraphTensor *tensor = [ctx.graph placeholderWithShape:termite_mpsgraph_shape_array(shape, rank)
+                                                        dataType:MPSDataTypeFloat32
+                                                            name:nil];
+        if (tensor == nil) {
+            termite_mpsgraph_set_error(error, 11, @"Failed to create MPSGraph placeholder");
+            return NULL;
+        }
+        return (__bridge void *)tensor;
+    }
+}
+
+void *termite_mpsgraph_constant_f32(void *handle, const float *data, int64_t elems, const int64_t *shape, int rank, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        if (ctx == nil || data == NULL || elems < 0 || shape == NULL || rank < 0) {
+            termite_mpsgraph_set_error(error, 20, @"Invalid MPSGraph constant arguments");
+            return NULL;
+        }
+        NSData *ns_data = [NSData dataWithBytes:data length:(NSUInteger)elems * sizeof(float)];
+        MPSGraphTensor *tensor = [ctx.graph constantWithData:ns_data
+                                                       shape:termite_mpsgraph_shape_array(shape, rank)
+                                                    dataType:MPSDataTypeFloat32];
+        if (tensor == nil) {
+            termite_mpsgraph_set_error(error, 21, @"Failed to create MPSGraph constant");
+            return NULL;
+        }
+        return (__bridge void *)tensor;
+    }
+}
+
+void *termite_mpsgraph_unary(void *handle, int op, void *x_handle, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *x = (__bridge MPSGraphTensor *)x_handle;
+        MPSGraphTensor *result = nil;
+        switch (op) {
+            case 1: result = [ctx.graph negativeWithTensor:x name:nil]; break;
+            case 2: result = [ctx.graph squareRootWithTensor:x name:nil]; break;
+            case 3: result = [ctx.graph reciprocalSquareRootWithTensor:x name:nil]; break;
+            case 4: result = [ctx.graph exponentWithTensor:x name:nil]; break;
+            case 5: result = [ctx.graph erfWithTensor:x name:nil]; break;
+            default:
+                termite_mpsgraph_set_error(error, 30, @"Unsupported MPSGraph unary op");
+                return NULL;
+        }
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 31, @"MPSGraph unary op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_binary(void *handle, int op, void *lhs_handle, void *rhs_handle, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *lhs = (__bridge MPSGraphTensor *)lhs_handle;
+        MPSGraphTensor *rhs = (__bridge MPSGraphTensor *)rhs_handle;
+        MPSGraphTensor *result = nil;
+        switch (op) {
+            case 1: result = [ctx.graph additionWithPrimaryTensor:lhs secondaryTensor:rhs name:nil]; break;
+            case 2: result = [ctx.graph multiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil]; break;
+            case 3: result = [ctx.graph subtractionWithPrimaryTensor:lhs secondaryTensor:rhs name:nil]; break;
+            case 4: result = [ctx.graph divisionWithPrimaryTensor:lhs secondaryTensor:rhs name:nil]; break;
+            case 5: result = [ctx.graph lessThanWithPrimaryTensor:lhs secondaryTensor:rhs name:nil]; break;
+            default:
+                termite_mpsgraph_set_error(error, 40, @"Unsupported MPSGraph binary op");
+                return NULL;
+        }
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 41, @"MPSGraph binary op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_where(void *handle, void *cond_handle, void *true_handle, void *false_handle, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *cond = (__bridge MPSGraphTensor *)cond_handle;
+        MPSGraphTensor *on_true = (__bridge MPSGraphTensor *)true_handle;
+        MPSGraphTensor *on_false = (__bridge MPSGraphTensor *)false_handle;
+        MPSGraphTensor *result = [ctx.graph selectWithPredicateTensor:cond
+                                                  truePredicateTensor:on_true
+                                                 falsePredicateTensor:on_false
+                                                                 name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 50, @"MPSGraph where op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_matmul(void *handle, void *lhs_handle, void *rhs_handle, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *lhs = (__bridge MPSGraphTensor *)lhs_handle;
+        MPSGraphTensor *rhs = (__bridge MPSGraphTensor *)rhs_handle;
+        MPSGraphTensor *result = [ctx.graph matrixMultiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 60, @"MPSGraph matmul op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_reduce(void *handle, int op, void *x_handle, const int *axes, int num_axes, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *x = (__bridge MPSGraphTensor *)x_handle;
+        NSArray<NSNumber *> *axes_array = termite_mpsgraph_int_array(axes, num_axes);
+        MPSGraphTensor *result = nil;
+        switch (op) {
+            case 1: result = [ctx.graph reductionSumWithTensor:x axes:axes_array name:nil]; break;
+            case 2: result = [ctx.graph meanOfTensor:x axes:axes_array name:nil]; break;
+            case 3: result = [ctx.graph reductionMaximumWithTensor:x axes:axes_array name:nil]; break;
+            default:
+                termite_mpsgraph_set_error(error, 70, @"Unsupported MPSGraph reduction op");
+                return NULL;
+        }
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 71, @"MPSGraph reduction op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_reshape(void *handle, void *x_handle, const int64_t *shape, int rank, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *x = (__bridge MPSGraphTensor *)x_handle;
+        MPSGraphTensor *result = [ctx.graph reshapeTensor:x withShape:termite_mpsgraph_shape_array(shape, rank) name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 80, @"MPSGraph reshape op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_transpose(void *handle, void *x_handle, const int *perm, int rank, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *result = (__bridge MPSGraphTensor *)x_handle;
+        int current[8];
+        if (rank < 0 || rank > 8 || perm == NULL) {
+            termite_mpsgraph_set_error(error, 90, @"Invalid MPSGraph transpose rank");
+            return NULL;
+        }
+        for (int i = 0; i < rank; i++) current[i] = i;
+        for (int i = 0; i < rank; i++) {
+            int target = perm[i];
+            if (current[i] == target) continue;
+            int j = -1;
+            for (int k = i; k < rank; k++) {
+                if (current[k] == target) {
+                    j = k;
+                    break;
+                }
+            }
+            if (j < 0) {
+                termite_mpsgraph_set_error(error, 91, @"Invalid MPSGraph transpose permutation");
+                return NULL;
+            }
+            result = [ctx.graph transposeTensor:result dimension:(NSUInteger)i withDimension:(NSUInteger)j name:nil];
+            int tmp = current[i];
+            current[i] = current[j];
+            current[j] = tmp;
+        }
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 92, @"MPSGraph transpose op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_broadcast(void *handle, void *x_handle, const int64_t *shape, int rank, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *x = (__bridge MPSGraphTensor *)x_handle;
+        MPSGraphTensor *result = [ctx.graph broadcastTensor:x toShape:termite_mpsgraph_shape_array(shape, rank) name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 100, @"MPSGraph broadcast op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_slice(void *handle, void *x_handle, const int64_t *starts, const int64_t *ends, const int64_t *strides, int rank, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *x = (__bridge MPSGraphTensor *)x_handle;
+        MPSGraphTensor *result = [ctx.graph sliceTensor:x
+                                                 starts:termite_mpsgraph_shape_array(starts, rank)
+                                                   ends:termite_mpsgraph_shape_array(ends, rank)
+                                                strides:termite_mpsgraph_shape_array(strides, rank)
+                                                   name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 110, @"MPSGraph slice op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_concat(void *handle, void **tensor_handles, int num_tensors, int axis, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        NSMutableArray<MPSGraphTensor *> *tensors = [NSMutableArray arrayWithCapacity:(NSUInteger)num_tensors];
+        for (int i = 0; i < num_tensors; i++) {
+            [tensors addObject:(__bridge MPSGraphTensor *)tensor_handles[i]];
+        }
+        MPSGraphTensor *result = [ctx.graph concatTensors:tensors dimension:axis name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 120, @"MPSGraph concat op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_softmax(void *handle, void *x_handle, int axis, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        MPSGraphTensor *x = (__bridge MPSGraphTensor *)x_handle;
+        MPSGraphTensor *result = [ctx.graph softMaxWithTensor:x axis:axis name:nil];
+        if (result == nil) {
+            termite_mpsgraph_set_error(error, 130, @"MPSGraph softmax op failed");
+            return NULL;
+        }
+        return (__bridge void *)result;
+    }
+}
+
+void *termite_mpsgraph_compile(void *handle, void **feed_handles, const int64_t *feed_shapes, const int *feed_ranks, int num_feeds, void **target_handles, int num_targets, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphContext *ctx = (__bridge TermiteMPSGraphContext *)handle;
+        if (ctx == nil || feed_handles == NULL || feed_shapes == NULL || feed_ranks == NULL || target_handles == NULL || num_feeds <= 0 || num_targets <= 0) {
+            termite_mpsgraph_set_error(error, 140, @"Invalid MPSGraph compile arguments");
+            return NULL;
+        }
+
+        NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)num_feeds];
+        NSMutableArray<MPSGraphTensor *> *feed_tensors = [NSMutableArray arrayWithCapacity:(NSUInteger)num_feeds];
+        int shape_offset = 0;
+        for (int i = 0; i < num_feeds; i++) {
+            int rank = feed_ranks[i];
+            MPSGraphTensor *tensor = (__bridge MPSGraphTensor *)feed_handles[i];
+            MPSGraphShapedType *type = [[MPSGraphShapedType alloc] initWithShape:termite_mpsgraph_shape_array(feed_shapes + shape_offset, rank)
+                                                                        dataType:MPSDataTypeFloat32];
+            shape_offset += rank;
+            feeds[tensor] = type;
+            [feed_tensors addObject:tensor];
+        }
+
+        NSMutableArray<MPSGraphTensor *> *target_tensors = [NSMutableArray arrayWithCapacity:(NSUInteger)num_targets];
+        for (int i = 0; i < num_targets; i++) {
+            [target_tensors addObject:(__bridge MPSGraphTensor *)target_handles[i]];
+        }
+
+        MPSGraphCompilationDescriptor *descriptor = [[MPSGraphCompilationDescriptor alloc] init];
+        MPSGraphExecutable *compiled = nil;
+        @try {
+            compiled = [ctx.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:ctx.device]
+                                              feeds:feeds
+                                      targetTensors:target_tensors
+                                   targetOperations:nil
+                              compilationDescriptor:descriptor];
+        } @catch (NSException *exception) {
+            termite_mpsgraph_set_error(error, 141, [NSString stringWithFormat:@"MPSGraph compile exception: %@ - %@", exception.name, exception.reason]);
+            return NULL;
+        }
+        if (compiled == nil) {
+            termite_mpsgraph_set_error(error, 142, @"MPSGraph compile returned nil executable");
+            return NULL;
+        }
+
+        TermiteMPSGraphExecutable *exec = [[TermiteMPSGraphExecutable alloc] init];
+        exec.executable = compiled;
+        exec.device = ctx.device;
+        exec.commandQueue = ctx.commandQueue;
+
+        NSArray<MPSGraphTensor *> *exec_feeds = compiled.feedTensors;
+        if (exec_feeds != nil && exec_feeds.count == (NSUInteger)num_feeds) {
+            NSMutableArray<NSNumber *> *perm = [NSMutableArray arrayWithCapacity:(NSUInteger)num_feeds];
+            BOOL needs_reorder = NO;
+            for (NSUInteger i = 0; i < exec_feeds.count; i++) {
+                NSUInteger original = [feed_tensors indexOfObjectIdenticalTo:exec_feeds[i]];
+                if (original == NSNotFound) {
+                    perm = nil;
+                    break;
+                }
+                [perm addObject:@(original)];
+                if (original != i) needs_reorder = YES;
+            }
+            exec.feedPermutation = needs_reorder && perm != nil ? [perm copy] : nil;
+            exec.feedTensors = [exec_feeds copy];
+        } else {
+            exec.feedPermutation = nil;
+            exec.feedTensors = [feed_tensors copy];
+        }
+
+        NSArray<MPSGraphTensor *> *exec_targets = compiled.targetTensors;
+        if (exec_targets != nil && exec_targets.count == (NSUInteger)num_targets) {
+            NSMutableArray<NSNumber *> *perm = [NSMutableArray arrayWithCapacity:(NSUInteger)num_targets];
+            BOOL needs_reorder = NO;
+            for (NSUInteger i = 0; i < exec_targets.count; i++) {
+                NSUInteger original = [target_tensors indexOfObjectIdenticalTo:exec_targets[i]];
+                if (original == NSNotFound) {
+                    perm = nil;
+                    break;
+                }
+                [perm addObject:@(original)];
+                if (original != i) needs_reorder = YES;
+            }
+            exec.targetPermutation = needs_reorder && perm != nil ? [perm copy] : nil;
+            exec.targetTensors = [exec_targets copy];
+        } else {
+            exec.targetPermutation = nil;
+            exec.targetTensors = [target_tensors copy];
+        }
+
+        return (__bridge_retained void *)exec;
+    }
+}
+
+void termite_mpsgraph_executable_destroy(void *handle) {
+    if (handle == NULL) return;
+    @autoreleasepool {
+        TermiteMPSGraphExecutable *exec = (__bridge_transfer TermiteMPSGraphExecutable *)handle;
+        (void)exec;
+    }
+}
+
+int termite_mpsgraph_execute_f32(void *handle, const float **input_data, const int64_t *input_elems, const int64_t *input_shapes, const int *input_ranks, int num_inputs, float **output_data, const int64_t *output_elems, const int64_t *output_shapes, const int *output_ranks, int num_outputs, termite_mpsgraph_error *error) {
+    @autoreleasepool {
+        termite_mpsgraph_clear_error(error);
+        TermiteMPSGraphExecutable *exec = (__bridge TermiteMPSGraphExecutable *)handle;
+        if (exec == nil || input_data == NULL || input_elems == NULL || input_shapes == NULL || input_ranks == NULL || output_data == NULL || output_elems == NULL || output_shapes == NULL || output_ranks == NULL) {
+            termite_mpsgraph_set_error(error, 150, @"Invalid MPSGraph execute arguments");
+            return -1;
+        }
+        if ((NSUInteger)num_inputs != exec.feedTensors.count || (NSUInteger)num_outputs != exec.targetTensors.count) {
+            termite_mpsgraph_set_error(error, 151, @"MPSGraph execute feed/target count mismatch");
+            return -2;
+        }
+
+        MPSGraphDevice *graph_device = [MPSGraphDevice deviceWithMTLDevice:exec.device];
+        NSMutableArray<MPSGraphTensorData *> *caller_inputs = [NSMutableArray arrayWithCapacity:(NSUInteger)num_inputs];
+        int shape_offset = 0;
+        for (int i = 0; i < num_inputs; i++) {
+            if (input_data[i] == NULL || input_elems[i] < 0) {
+                termite_mpsgraph_set_error(error, 152, @"MPSGraph execute input is null");
+                return -3;
+            }
+            int rank = input_ranks[i];
+            NSArray<NSNumber *> *shape = termite_mpsgraph_shape_array(input_shapes + shape_offset, rank);
+            shape_offset += rank;
+            NSData *data = [NSData dataWithBytes:input_data[i] length:(NSUInteger)input_elems[i] * sizeof(float)];
+            MPSGraphTensorData *tensor_data = [[MPSGraphTensorData alloc] initWithDevice:graph_device
+                                                                                    data:data
+                                                                                   shape:shape
+                                                                                dataType:MPSDataTypeFloat32];
+            if (tensor_data == nil) {
+                termite_mpsgraph_set_error(error, 153, @"Failed to create MPSGraph input tensor data");
+                return -4;
+            }
+            [caller_inputs addObject:tensor_data];
+        }
+
+        NSMutableArray<MPSGraphTensorData *> *exec_inputs = [NSMutableArray arrayWithCapacity:(NSUInteger)num_inputs];
+        if (exec.feedPermutation != nil) {
+            for (NSUInteger i = 0; i < (NSUInteger)num_inputs; i++) {
+                NSUInteger caller_index = [exec.feedPermutation[i] unsignedIntegerValue];
+                [exec_inputs addObject:caller_inputs[caller_index]];
+            }
+        } else {
+            [exec_inputs addObjectsFromArray:caller_inputs];
+        }
+
+        MPSCommandBuffer *command_buffer = [MPSCommandBuffer commandBufferFromCommandQueue:exec.commandQueue];
+        if (command_buffer == nil) {
+            termite_mpsgraph_set_error(error, 154, @"Failed to create MPSGraph command buffer");
+            return -5;
+        }
+
+        NSArray<MPSGraphTensorData *> *results = nil;
+        @try {
+            MPSGraphExecutableExecutionDescriptor *descriptor = [[MPSGraphExecutableExecutionDescriptor alloc] init];
+            results = [exec.executable encodeToCommandBuffer:command_buffer
+                                                 inputsArray:exec_inputs
+                                                resultsArray:nil
+                                         executionDescriptor:descriptor];
+        } @catch (NSException *exception) {
+            termite_mpsgraph_set_error(error, 155, [NSString stringWithFormat:@"MPSGraph execute exception: %@ - %@", exception.name, exception.reason]);
+            return -6;
+        }
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.error != nil) {
+            termite_mpsgraph_set_error(error, 156, [NSString stringWithFormat:@"MPSGraph command buffer error: %@", command_buffer.error]);
+            return -7;
+        }
+        if (results == nil || results.count < (NSUInteger)num_outputs) {
+            termite_mpsgraph_set_error(error, 157, @"MPSGraph executable returned too few outputs");
+            return -8;
+        }
+
+        int out_shape_offset = 0;
+        for (int i = 0; i < num_outputs; i++) {
+            NSUInteger exec_index = (NSUInteger)i;
+            if (exec.targetPermutation != nil) {
+                for (NSUInteger j = 0; j < exec.targetPermutation.count; j++) {
+                    if ([exec.targetPermutation[j] unsignedIntegerValue] == (NSUInteger)i) {
+                        exec_index = j;
+                        break;
+                    }
+                }
+            }
+            if (exec_index >= results.count || output_data[i] == NULL || output_elems[i] < 0) {
+                termite_mpsgraph_set_error(error, 158, @"MPSGraph execute output is invalid");
+                return -9;
+            }
+            // Shapes are passed for validation symmetry with inputs and future
+            // zero-copy variants. The MPSNDArray already carries the runtime shape.
+            out_shape_offset += output_ranks[i];
+            MPSNDArray *array = results[exec_index].mpsndarray;
+            if (array == nil) {
+                termite_mpsgraph_set_error(error, 159, @"MPSGraph output MPSNDArray is nil");
+                return -10;
+            }
+            [array readBytes:output_data[i] strideBytes:nil];
+        }
+        (void)output_shapes;
+        (void)out_shape_offset;
+        return 0;
+    }
+}
+
 typedef struct termite_metal_linear_params {
     uint32_t rows;
     uint32_t in_dim;
@@ -1624,6 +2252,17 @@ typedef struct termite_metal_training_sumsq_params {
     uint32_t reserved2;
 } termite_metal_training_sumsq_params;
 
+typedef struct termite_metal_training_lora_grad_params {
+    uint32_t rows;
+    uint32_t in_features;
+    uint32_t out_features;
+    uint32_t rank;
+    float scale;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} termite_metal_training_lora_grad_params;
+
 typedef struct termite_metal_apply_softmax_params {
     uint32_t rows;
     uint32_t dim;
@@ -1808,7 +2447,7 @@ typedef struct termite_metal_sdpa_f32_params {
     uint32_t head_dim;
     uint32_t bias_mode;
     uint32_t has_mask;
-    uint32_t reserved0;
+    uint32_t local_window_half;
     uint32_t reserved1;
 } termite_metal_sdpa_f32_params;
 
@@ -1924,6 +2563,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_training_accumulate_params { uint elem_count; float scale; uint first; uint reserved; };\n"
            "struct termite_metal_training_adamw_params { uint elem_count; float lr; float beta1; float beta2; float eps; float weight_decay; float bias_correction1; float bias_correction2; float grad_scale; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_training_sumsq_params { uint elem_count; uint reserved0; uint reserved1; uint reserved2; };\n"
+           "struct termite_metal_training_lora_grad_params { uint rows; uint in_features; uint out_features; uint rank; float scale; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_apply_softmax_params { uint rows; uint dim; uint log_softmax; uint reserved; };\n"
            "struct termite_metal_reduce_last_dim_params { uint rows; uint dim; uint kind; uint reserved; };\n"
            "struct termite_metal_broadcast_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint out_strides[8]; uint input_strides_for_out[8]; };\n"
@@ -1949,7 +2589,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_gliner_gru_combine_f32_params { uint rows; uint dim; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_argmax_axis_f32_params { uint outer; uint axis_dim; uint inner; uint reserved; };\n"
            "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint reserved0; uint reserved1; };\n"
+           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint local_window_half; uint reserved1; };\n"
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
@@ -3343,6 +3983,21 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    output[gid] = (lhs[gid] * scales.x + rhs[gid]) * scales.y;\n"
            "}\n"
+           "inline uint termite_neftune_hash_u32(uint x) {\n"
+           "    x ^= x >> 16u;\n"
+           "    x *= 0x7feb352du;\n"
+           "    x ^= x >> 15u;\n"
+           "    x *= 0x846ca68bu;\n"
+           "    x ^= x >> 16u;\n"
+           "    return x;\n"
+           "}\n"
+           "kernel void termite_apply_neftune_noise_1x(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_apply_add_params &p [[buffer(2)]], constant uint2 &seed [[buffer(3)]], constant float &scale [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
+           "    uint h = termite_neftune_hash_u32(gid ^ seed.x);\n"
+           "    h = termite_neftune_hash_u32(h + seed.y + 0x9e3779b9u);\n"
+           "    float u = (float(h) + 0.5f) * 2.3283064365386963e-10f;\n"
+           "    output[gid] = input[gid] + (u * 2.0f - 1.0f) * scale;\n"
+           "}\n"
            "kernel void termite_training_accumulate_f32(device float *accum [[buffer(0)]], device const float *grad [[buffer(1)]], constant termite_metal_training_accumulate_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.elem_count) return;\n"
            "    float g = grad[gid] * p.scale;\n"
@@ -3369,6 +4024,40 @@ static NSString *termite_metal_shader_source(void) {
            "        sum += v * v;\n"
            "    }\n"
            "    output[0] = sum;\n"
+           "}\n"
+           "kernel void termite_training_lora_factors_f32(device const float *inputs [[buffer(0)]], device const float *output_grads [[buffer(1)]], device const float *lora_a [[buffer(2)]], device const float *lora_b [[buffer(3)]], device float *low_rank [[buffer(4)]], device float *back_rank [[buffer(5)]], constant termite_metal_training_lora_grad_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total = p.rows * p.rank; if (gid >= total) return;\n"
+           "    uint row = gid / p.rank; uint r = gid - row * p.rank;\n"
+           "    float low = 0.0f;\n"
+           "    for (uint i = 0u; i < p.in_features; i += 1u) {\n"
+           "        low += inputs[row * p.in_features + i] * lora_a[r * p.in_features + i];\n"
+           "    }\n"
+           "    low_rank[gid] = low;\n"
+           "    float back = 0.0f;\n"
+           "    for (uint o = 0u; o < p.out_features; o += 1u) {\n"
+           "        back += output_grads[row * p.out_features + o] * lora_b[o * p.rank + r];\n"
+           "    }\n"
+           "    back_rank[gid] = back;\n"
+           "}\n"
+           "kernel void termite_training_lora_reduce_f32(device const float *inputs [[buffer(0)]], device const float *output_grads [[buffer(1)]], device const float *low_rank [[buffer(2)]], device const float *back_rank [[buffer(3)]], device float *grad_a [[buffer(4)]], device float *grad_b [[buffer(5)]], constant termite_metal_training_lora_grad_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint grad_a_count = p.rank * p.in_features;\n"
+           "    uint grad_b_count = p.out_features * p.rank;\n"
+           "    uint total = grad_a_count + grad_b_count; if (gid >= total) return;\n"
+           "    if (gid < grad_a_count) {\n"
+           "        uint r = gid / p.in_features; uint i = gid - r * p.in_features;\n"
+           "        float sum = 0.0f;\n"
+           "        for (uint row = 0u; row < p.rows; row += 1u) {\n"
+           "            sum += inputs[row * p.in_features + i] * back_rank[row * p.rank + r];\n"
+           "        }\n"
+           "        grad_a[gid] = sum * p.scale;\n"
+           "    } else {\n"
+           "        uint idx = gid - grad_a_count; uint o = idx / p.rank; uint r = idx - o * p.rank;\n"
+           "        float sum = 0.0f;\n"
+           "        for (uint row = 0u; row < p.rows; row += 1u) {\n"
+           "            sum += output_grads[row * p.out_features + o] * low_rank[row * p.rank + r];\n"
+           "        }\n"
+           "        grad_b[idx] = sum * p.scale;\n"
+           "    }\n"
            "}\n"
            "kernel void termite_apply_subtract_1x(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_add_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
@@ -3678,8 +4367,10 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.batch * p.num_heads * p.seq_len * p.head_dim; if (gid >= total || p.seq_len == 0u || p.head_dim == 0u) return;\n"
            "    uint d = gid % p.head_dim; uint tmp = gid / p.head_dim; uint qi = tmp % p.seq_len; uint bh = tmp / p.seq_len; uint b = bh / p.num_heads; uint h = bh - b * p.num_heads;\n"
            "    uint q_base = (bh * p.seq_len + qi) * p.head_dim;\n"
+           "    uint ki_begin = 0u; uint ki_end = p.seq_len;\n"
+           "    if (p.local_window_half != 0u) { ki_begin = qi > p.local_window_half ? qi - p.local_window_half : 0u; uint tail = p.seq_len - qi; uint span = p.local_window_half + 1u; ki_end = span < tail ? qi + span : p.seq_len; }\n"
            "    float scale = rsqrt(float(p.head_dim)); float best = -3.402823466e+38f;\n"
-           "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
+           "    for (uint ki = ki_begin; ki < ki_end; ++ki) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
            "        uint k_base = (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
            "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
@@ -3690,7 +4381,7 @@ static NSString *termite_metal_shader_source(void) {
            "        best = max(best, score);\n"
            "    }\n"
            "    float sum = 0.0f; float accum = 0.0f;\n"
-           "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
+           "    for (uint ki = ki_begin; ki < ki_end; ++ki) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
            "        uint k_base = (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
            "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
@@ -3701,6 +4392,32 @@ static NSString *termite_metal_shader_source(void) {
            "        float w = exp(score - best); sum += w; accum += w * v[(bh * p.seq_len + ki) * p.head_dim + d];\n"
            "    }\n"
            "    output[gid] = sum > 0.0f ? accum / sum : 0.0f;\n"
+           "}\n"
+           "kernel void termite_sdpa_f32_tg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u) return;\n"
+           "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
+           "    uint lid = uint(tid); uint width = uint(tpg.x); uint bh = b * p.num_heads + h; uint q_base = (bh * p.seq_len + qi) * p.head_dim; float scale = rsqrt(float(p.head_dim));\n"
+           "    uint ki_begin = 0u; uint ki_end = p.seq_len;\n"
+           "    if (p.local_window_half != 0u) { ki_begin = qi > p.local_window_half ? qi - p.local_window_half : 0u; uint tail = p.seq_len - qi; uint span = p.local_window_half + 1u; ki_end = span < tail ? qi + span : p.seq_len; }\n"
+           "    threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
+           "    float local_best = -3.402823466e+38f;\n"
+           "    for (uint ki = ki_begin + lid; ki < ki_end; ki += width) {\n"
+           "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; float score = -3.402823466e+38f;\n"
+           "        if (allowed) { uint k_base = (bh * p.seq_len + ki) * p.head_dim; float acc = 0.0f;\n"
+           "            if (p.head_dim == 64u) { const device float4 *q4 = reinterpret_cast<const device float4 *>(q + q_base); const device float4 *k4 = reinterpret_cast<const device float4 *>(k + k_base); for (uint x4 = 0u; x4 < 16u; ++x4) acc += dot(q4[x4], k4[x4]); }\n"
+           "            else { for (uint x = 0u; x < p.head_dim; ++x) acc += q[q_base + x] * k[k_base + x]; }\n"
+           "            score = acc * scale; if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki]; else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki]; else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki]; }\n"
+           "        scores[ki] = score; local_best = max(local_best, score);\n"
+           "    }\n"
+           "    partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float best = partials[0]; float local_sum = 0.0f;\n"
+           "    for (uint ki = ki_begin + lid; ki < ki_end; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); }\n"
+           "    partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
+           "    for (uint ki = ki_begin + lid; ki < ki_end; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = ki_begin; ki < ki_end; ++ki) accum += scores[ki] * v[(bh * p.seq_len + ki) * p.head_dim + d]; output[(bh * p.seq_len + qi) * p.head_dim + d] = accum; }\n"
            "}\n"
            "kernel void termite_disentangled_relative_attention_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *q_r [[buffer(3)]], device const float *k_r [[buffer(4)]], device const float *mask [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_disentangled_relative_attention_f32_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint hidden = p.num_heads * p.head_dim; uint total = p.batch * p.seq_len * hidden; if (gid >= total || p.seq_len == 0u || p.head_dim == 0u || hidden == 0u) return;\n"
@@ -10824,6 +11541,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->argmax_axis_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_argmax_axis_f32");
         runtime->convert_dtype_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_convert_dtype_f32");
         runtime->sdpa_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32");
+        runtime->sdpa_f32_tg_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_tg");
         runtime->disentangled_relative_attention_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_disentangled_relative_attention_f32");
         runtime->disentangled_relative_attention_f32_tg_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_disentangled_relative_attention_f32_tg");
         runtime->disentangled_relative_attention_f32_flash4_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_disentangled_relative_attention_f32_flash4");
@@ -10890,9 +11608,12 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->add_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_1x");
         runtime->add_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_scale_1x");
         runtime->scaled_add_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_scaled_add_scale_1x");
+        runtime->neftune_noise_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_neftune_noise_1x");
         runtime->training_accumulate_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_accumulate_f32");
         runtime->training_adamw_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_adamw_f32");
         runtime->training_sumsq_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_sumsq_f32");
+        runtime->training_lora_factors_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_lora_factors_f32");
+        runtime->training_lora_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_lora_reduce_f32");
         runtime->subtract_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_subtract_1x");
         runtime->divide_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_divide_1x");
         runtime->less_than_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_less_than_1x");
@@ -11219,6 +11940,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->argmax_axis_f32_pipeline = nil;
     runtime->convert_dtype_f32_pipeline = nil;
     runtime->sdpa_f32_pipeline = nil;
+    runtime->sdpa_f32_tg_pipeline = nil;
     runtime->disentangled_relative_attention_f32_pipeline = nil;
     runtime->disentangled_relative_attention_f32_tg_pipeline = nil;
     runtime->disentangled_relative_attention_f32_flash4_pipeline = nil;
@@ -11284,9 +12006,12 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->add_pipeline = nil;
     runtime->add_scale_pipeline = nil;
     runtime->scaled_add_scale_pipeline = nil;
+    runtime->neftune_noise_pipeline = nil;
     runtime->training_accumulate_pipeline = nil;
     runtime->training_adamw_pipeline = nil;
     runtime->training_sumsq_pipeline = nil;
+    runtime->training_lora_factors_pipeline = nil;
+    runtime->training_lora_reduce_pipeline = nil;
     runtime->subtract_pipeline = nil;
     runtime->divide_pipeline = nil;
     runtime->less_than_pipeline = nil;
@@ -21848,6 +22573,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
     size_t head_dim,
     uint32_t bias_mode,
     uint32_t has_mask,
+    uint32_t local_window_half,
     void *output_handle,
     size_t output_offset
 ) {
@@ -21890,7 +22616,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             .head_dim = (uint32_t)head_dim,
             .bias_mode = bias_mode,
             .has_mask = has_mask,
-            .reserved0 = 0,
+            .local_window_half = local_window_half,
             .reserved1 = 0,
         };
         bool frame_owned = true;
@@ -21910,6 +22636,29 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 6, -15) != 0)
         {
             return -15;
+        }
+        if (getenv("TERMITE_METAL_DISABLE_SDPA_TG") == NULL &&
+            runtime->sdpa_f32_tg_pipeline != nil &&
+            seq_len <= 1024 &&
+            head_dim <= 256)
+        {
+            BOOL tg_encoder_owned = YES;
+            id<MTLComputeCommandEncoder> tg_encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &tg_encoder_owned);
+            if (tg_encoder == nil) return -15;
+            [tg_encoder setComputePipelineState:runtime->sdpa_f32_tg_pipeline];
+            [tg_encoder setBuffer:q_buffer offset:q_offset atIndex:0];
+            [tg_encoder setBuffer:k_buffer offset:k_offset atIndex:1];
+            [tg_encoder setBuffer:v_buffer offset:v_offset atIndex:2];
+            [tg_encoder setBuffer:bias_buffer offset:bias_offset atIndex:3];
+            [tg_encoder setBuffer:mask_buffer offset:mask_offset atIndex:4];
+            [tg_encoder setBuffer:output_buffer offset:output_offset atIndex:5];
+            [tg_encoder setBytes:&params length:sizeof(params) atIndex:6];
+            const NSUInteger tg_width = 64u;
+            [tg_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + tg_width) * sizeof(float)) atIndex:0];
+            [tg_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
+                       threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+            termite_metal_end_scoped_compute_encoder(tg_encoder, tg_encoder_owned);
+            return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
         }
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
@@ -22256,6 +23005,37 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -8) != 0)
         {
             return -8;
+        }
+        const bool use_mps = m >= 16 && n >= 16 && k >= 64 && total >= 4096;
+        if (use_mps) {
+            termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+            MPSMatrixDescriptor *left_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                                   columns:k
+                                                                                  rowBytes:k * sizeof(float)
+                                                                                  dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *right_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:(rhs_contract_axis == 0u ? k : n)
+                                                                                    columns:(rhs_contract_axis == 0u ? n : k)
+                                                                                   rowBytes:(rhs_contract_axis == 0u ? n : k) * sizeof(float)
+                                                                                   dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *result_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:m
+                                                                                     columns:n
+                                                                                    rowBytes:n * sizeof(float)
+                                                                                    dataType:MPSDataTypeFloat32];
+            MPSMatrix *left = [[MPSMatrix alloc] initWithBuffer:lhs_buffer offset:lhs_offset descriptor:left_desc];
+            MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:rhs_buffer offset:rhs_offset descriptor:right_desc];
+            MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:output_buffer offset:output_offset descriptor:result_desc];
+            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:runtime->device
+                                                                            transposeLeft:NO
+                                                                           transposeRight:(rhs_contract_axis == 1u ? YES : NO)
+                                                                               resultRows:m
+                                                                            resultColumns:n
+                                                                          interiorColumns:k
+                                                                                    alpha:1.0
+                                                                                     beta:0.0];
+            if (left != nil && right != nil && result != nil && mm != nil) {
+                [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
+                return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+            }
         }
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL, &encoder_owned);
@@ -22705,6 +23485,110 @@ int termite_metal_decode_runtime_training_sumsq_f32(
     }
 }
 
+int termite_metal_decode_runtime_training_lora_grads_f32(
+    termite_metal_decode_runtime *runtime,
+    void *input_handle,
+    size_t input_offset,
+    void *output_grad_handle,
+    size_t output_grad_offset,
+    void *lora_a_handle,
+    size_t lora_a_offset,
+    void *lora_b_handle,
+    size_t lora_b_offset,
+    void *low_rank_handle,
+    size_t low_rank_offset,
+    void *back_rank_handle,
+    size_t back_rank_offset,
+    void *grad_a_handle,
+    size_t grad_a_offset,
+    void *grad_b_handle,
+    size_t grad_b_offset,
+    size_t rows,
+    size_t in_features,
+    size_t out_features,
+    size_t rank,
+    float scale
+) {
+    if (runtime == NULL || input_handle == NULL || output_grad_handle == NULL || lora_a_handle == NULL || lora_b_handle == NULL || low_rank_handle == NULL || back_rank_handle == NULL || grad_a_handle == NULL || grad_b_handle == NULL) return -1;
+    if (runtime->training_lora_factors_pipeline == nil || runtime->training_lora_reduce_pipeline == nil) return -2;
+    if (rows == 0 || in_features == 0 || out_features == 0 || rank == 0) return -3;
+    if (rows > UINT32_MAX || in_features > UINT32_MAX || out_features > UINT32_MAX || rank > UINT32_MAX) return -4;
+    if (rows > SIZE_MAX / in_features || rows > SIZE_MAX / out_features || rows > SIZE_MAX / rank) return -5;
+    if (rank > SIZE_MAX / in_features || out_features > SIZE_MAX / rank) return -6;
+    const size_t input_count = rows * in_features;
+    const size_t output_grad_count = rows * out_features;
+    const size_t factors_count = rows * rank;
+    const size_t grad_a_count = rank * in_features;
+    const size_t grad_b_count = out_features * rank;
+    if (input_count > SIZE_MAX / sizeof(float) || output_grad_count > SIZE_MAX / sizeof(float) || factors_count > SIZE_MAX / sizeof(float) || grad_a_count > SIZE_MAX / sizeof(float) || grad_b_count > SIZE_MAX / sizeof(float)) return -7;
+    if (factors_count > UINT32_MAX || grad_a_count > UINT32_MAX || grad_b_count > UINT32_MAX || grad_a_count + grad_b_count > UINT32_MAX) return -8;
+    @autoreleasepool {
+        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output_grad_buffer = (__bridge id<MTLBuffer>)output_grad_handle;
+        id<MTLBuffer> lora_a_buffer = (__bridge id<MTLBuffer>)lora_a_handle;
+        id<MTLBuffer> lora_b_buffer = (__bridge id<MTLBuffer>)lora_b_handle;
+        id<MTLBuffer> low_rank_buffer = (__bridge id<MTLBuffer>)low_rank_handle;
+        id<MTLBuffer> back_rank_buffer = (__bridge id<MTLBuffer>)back_rank_handle;
+        id<MTLBuffer> grad_a_buffer = (__bridge id<MTLBuffer>)grad_a_handle;
+        id<MTLBuffer> grad_b_buffer = (__bridge id<MTLBuffer>)grad_b_handle;
+        const size_t input_bytes = input_count * sizeof(float);
+        const size_t output_grad_bytes = output_grad_count * sizeof(float);
+        const size_t factors_bytes = factors_count * sizeof(float);
+        const size_t grad_a_bytes = grad_a_count * sizeof(float);
+        const size_t grad_b_bytes = grad_b_count * sizeof(float);
+        if (input_offset + input_bytes > input_buffer.length) return -9;
+        if (output_grad_offset + output_grad_bytes > output_grad_buffer.length) return -10;
+        if (lora_a_offset + grad_a_bytes > lora_a_buffer.length) return -11;
+        if (lora_b_offset + grad_b_bytes > lora_b_buffer.length) return -12;
+        if (low_rank_offset + factors_bytes > low_rank_buffer.length) return -13;
+        if (back_rank_offset + factors_bytes > back_rank_buffer.length) return -14;
+        if (grad_a_offset + grad_a_bytes > grad_a_buffer.length) return -15;
+        if (grad_b_offset + grad_b_bytes > grad_b_buffer.length) return -16;
+        termite_metal_training_lora_grad_params params = {
+            .rows = (uint32_t)rows,
+            .in_features = (uint32_t)in_features,
+            .out_features = (uint32_t)out_features,
+            .rank = (uint32_t)rank,
+            .scale = scale,
+            .reserved0 = 0u,
+            .reserved1 = 0u,
+            .reserved2 = 0u,
+        };
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -17;
+        id<MTLComputeCommandEncoder> factors_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (factors_encoder == nil) return -18;
+        [factors_encoder setComputePipelineState:runtime->training_lora_factors_pipeline];
+        [factors_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+        [factors_encoder setBuffer:output_grad_buffer offset:output_grad_offset atIndex:1];
+        [factors_encoder setBuffer:lora_a_buffer offset:lora_a_offset atIndex:2];
+        [factors_encoder setBuffer:lora_b_buffer offset:lora_b_offset atIndex:3];
+        [factors_encoder setBuffer:low_rank_buffer offset:low_rank_offset atIndex:4];
+        [factors_encoder setBuffer:back_rank_buffer offset:back_rank_offset atIndex:5];
+        [factors_encoder setBytes:&params length:sizeof(params) atIndex:6];
+        [factors_encoder dispatchThreads:MTLSizeMake(factors_count, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_lora_factors_pipeline, factors_count), 1, 1)];
+        [factors_encoder endEncoding];
+
+        const size_t reduce_count = grad_a_count + grad_b_count;
+        id<MTLComputeCommandEncoder> reduce_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (reduce_encoder == nil) return -19;
+        [reduce_encoder setComputePipelineState:runtime->training_lora_reduce_pipeline];
+        [reduce_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+        [reduce_encoder setBuffer:output_grad_buffer offset:output_grad_offset atIndex:1];
+        [reduce_encoder setBuffer:low_rank_buffer offset:low_rank_offset atIndex:2];
+        [reduce_encoder setBuffer:back_rank_buffer offset:back_rank_offset atIndex:3];
+        [reduce_encoder setBuffer:grad_a_buffer offset:grad_a_offset atIndex:4];
+        [reduce_encoder setBuffer:grad_b_buffer offset:grad_b_offset atIndex:5];
+        [reduce_encoder setBytes:&params length:sizeof(params) atIndex:6];
+        [reduce_encoder dispatchThreads:MTLSizeMake(reduce_count, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_lora_reduce_pipeline, reduce_count), 1, 1)];
+        [reduce_encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -20);
+    }
+}
+
 int termite_metal_decode_runtime_apply_add_device(
     termite_metal_decode_runtime *runtime,
     void *lhs_handle,
@@ -22765,6 +23649,67 @@ int termite_metal_decode_runtime_apply_add_device(
         [encoder dispatchThreads:MTLSizeMake(dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+int termite_metal_decode_runtime_apply_neftune_noise_device(
+    termite_metal_decode_runtime *runtime,
+    void *input_handle,
+    size_t input_offset,
+    size_t dim,
+    uint64_t seed,
+    float scale,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
+    if (runtime->neftune_noise_pipeline == nil) return -2;
+    if (dim == 0 || dim > UINT32_MAX) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        const size_t bytes = dim * sizeof(float);
+        if (input_offset + bytes > input_buffer.length) return -4;
+        if (output_offset + bytes > output_buffer.length) return -5;
+        if (termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(
+                runtime,
+                input_buffer,
+                input_offset,
+                bytes,
+                output_buffer,
+                output_offset,
+                bytes,
+                -8) != 0)
+        {
+            return -8;
+        }
+        termite_metal_apply_add_params params = {
+            .rows = 1,
+            .dim = (uint32_t)dim,
+        };
+        uint32_t seed_words[2] = {
+            (uint32_t)(seed & 0xffffffffu),
+            (uint32_t)((seed >> 32u) & 0xffffffffu),
+        };
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -9;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        const BOOL planned_encoder = (encoder != nil);
+        if (!planned_encoder) {
+            encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_PLE);
+        }
+        if (encoder == nil) return -10;
+        [encoder setComputePipelineState:runtime->neftune_noise_pipeline];
+        [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+        [encoder setBuffer:output_buffer offset:output_offset atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        [encoder setBytes:&seed_words length:sizeof(seed_words) atIndex:3];
+        [encoder setBytes:&scale length:sizeof(scale) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->neftune_noise_pipeline, dim), 1, 1)];
+        if (!planned_encoder) [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
     }
 }
 

@@ -115,6 +115,7 @@ pub const parallel_strategy = @import("parallel_strategy.zig");
 pub const training = @import("training.zig");
 pub const training_loop = @import("training_loop.zig");
 pub const segmented_encoder = @import("segmented_encoder.zig");
+pub const mpsgraph_executor = @import("mpsgraph_executor.zig");
 pub const distributed_training = @import("distributed_training.zig");
 pub const passes = @import("ml").graph.passes;
 
@@ -153,6 +154,7 @@ test {
     _ = training;
     _ = training_loop;
     _ = segmented_encoder;
+    _ = mpsgraph_executor;
     _ = distributed_training;
     if (build_options.enable_onnx) {
         _ = onnx_artifact_executor;

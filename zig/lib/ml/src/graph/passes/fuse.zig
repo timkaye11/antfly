@@ -452,6 +452,14 @@ fn isInversePerm(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+fn isBatchPreservingLastTwoSwap(attrs: node_mod.TransposeAttrs, rank: usize, num_batch: usize) bool {
+    if (rank < 2 or attrs.num_axes != rank or rank != num_batch + 2) return false;
+    for (0..num_batch) |axis| {
+        if (attrs.perm[axis] != axis) return false;
+    }
+    return attrs.perm[rank - 2] == rank - 1 and attrs.perm[rank - 1] == rank - 2;
+}
+
 // ── Graph Cloning ─────────────────────────────────────────────────────
 
 fn cloneForFusion(allocator: std.mem.Allocator, src: *const Graph) !Graph {
@@ -2042,8 +2050,10 @@ const TransposeAttrs = node_mod.TransposeAttrs;
 
 /// Fold `dot_general(x, transpose(W, [1,0]))` into a `dot_general` whose
 /// `rhs_contracting` is shifted to the other axis, eliminating the
-/// transpose entirely. This both saves a copy and lets `fuseLinearBias`
-/// / `fuseMatmulNoBias` see the bare matmul without the intermediary.
+/// transpose entirely. Also handles the batched matmul form where the
+/// transpose preserves batch axes and swaps only the final two axes. This
+/// both saves a copy and lets `fuseLinearBias` / `fuseMatmulNoBias` see
+/// the bare matmul without the intermediary.
 fn fuseTransposeIntoDot(allocator: std.mem.Allocator, work: *Graph, reachable: []const bool) !PairFusionResult {
     var redirects = std.ArrayListUnmanaged(Redirect).empty;
     errdefer redirects.deinit(allocator);
@@ -2059,10 +2069,7 @@ fn fuseTransposeIntoDot(allocator: std.mem.Allocator, work: *Graph, reachable: [
             .dot_general => |a| a,
             else => continue,
         };
-        // Only handle the simple 2-D matmul form (no batch, single
-        // contracting axis) — composing transposes through batched dot
-        // semantics needs care that's out of scope here.
-        if (dot_attrs.num_contracting != 1 or dot_attrs.num_batch != 0) continue;
+        if (dot_attrs.num_contracting != 1) continue;
 
         const rhs_id = dot.inputs[1];
         if (rhs_id == null_node or rhs_id >= count) continue;
@@ -2071,15 +2078,23 @@ fn fuseTransposeIntoDot(allocator: std.mem.Allocator, work: *Graph, reachable: [
             .transpose => |a| a,
             else => continue,
         };
-        if (rhs_t_attrs.num_axes != 2) continue;
-        if (rhs_t_attrs.perm[0] != 1 or rhs_t_attrs.perm[1] != 0) continue;
         const bare_w = rhs.inputs[0];
         if (bare_w == null_node or bare_w >= count) continue;
 
-        // Original rhs_contracting axis 0 means we contracted W^T's axis 0.
-        // After dropping the transpose, that's W's axis 1.
         const old_rhs_axis = dot_attrs.rhs_contracting[0];
-        const new_rhs_axis: u8 = if (old_rhs_axis == 0) 1 else 0;
+        const rhs_rank = rhs.output_shape.rank();
+        if (old_rhs_axis >= rhs_rank) continue;
+        if (!isBatchPreservingLastTwoSwap(rhs_t_attrs, rhs_rank, dot_attrs.num_batch)) continue;
+        var canonical_batch = true;
+        for (0..dot_attrs.num_batch) |batch_i| {
+            if (dot_attrs.rhs_batch[batch_i] != batch_i) {
+                canonical_batch = false;
+                break;
+            }
+        }
+        if (!canonical_batch) continue;
+
+        const new_rhs_axis: u8 = rhs_t_attrs.perm[old_rhs_axis];
 
         var new_attrs = dot_attrs;
         new_attrs.rhs_contracting[0] = new_rhs_axis;
@@ -4824,6 +4839,46 @@ test "fuse folds transpose into dot_general" {
     // The matmul-no-bias matcher promotes the dot to fused_linear_no_bias,
     // so a bare dot_general may not survive; if it does, axis is 1.
     try std.testing.expect(rhs_axis == 255 or rhs_axis == 1);
+}
+
+test "fuse folds batched rhs transpose into dot_general" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const q = try b.parameter("q", Shape.init(.f32, &.{ 2, 4, 8 }));
+    const k = try b.parameter("k", Shape.init(.f32, &.{ 2, 16, 8 }));
+    const kt = try b.transpose(k, &.{ 0, 2, 1 });
+    const out = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 1,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 2, 4, 16 }),
+        .inputs = .{ q, kt, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    var transpose_count: u32 = 0;
+    var rhs_axis: u8 = 255;
+    for (0..result.graph.nodeCount()) |i| {
+        switch (result.graph.node(@intCast(i)).op) {
+            .transpose => transpose_count += 1,
+            .dot_general => |a| rhs_axis = a.rhs_contracting[0],
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), transpose_count);
+    try std.testing.expectEqual(@as(u8, 2), rhs_axis);
 }
 
 test "fuse rewrites add(x, neg(y)) to sub(x, y)" {

@@ -14,26 +14,52 @@
 
 // Segmented backpropagation through the encoder for LoRA gradient computation.
 //
-// During training the boundary head is differentiated through autodiff on the
-// graph IR.  To also update the LoRA adapters inside the encoder we need
-// gradients with respect to the encoder's linear projections.
-//
-// Approach:
-//   1. During the encoder forward pass, capture the *input* to each targeted
-//      linear projection (query_proj, value_proj, etc.) as a LayerActivation.
-//   2. After the boundary-head autodiff step produces dL/d(encoder_output),
-//      call backwardLoRA to distribute that gradient signal back through every
-//      captured activation and accumulate grad_A / grad_B in each LoRALayer.
-//
-// This is a first-order approximation: the same output gradient is broadcast
-// to all captured (layer, module) pairs rather than being chained through all
-// intervening computations.  The approximation is cheap and works well with
-// low-rank adapters whose contribution is small relative to the base weights.
+// The production path mirrors GoMLX's compiled backward shape: build fixed-size
+// ModernBERT segment VJP graphs, compile them through MPSGraph by default, and
+// execute each segment from the output layer back toward the embeddings. The
+// older direct LoRA scatter path remains available when exact adapter gradients
+// are disabled, but the Phase-20 parity runner is intended to use MPSGraph
+// segment VJPs for the real backward pass.
 
 const std = @import("std");
+const ml = @import("ml");
+const platform = @import("antfly_platform");
+const modern_bert_graph = @import("../architectures/modern_bert_graph.zig");
 const lora = @import("../finetune/lora.zig");
 const fused_chunker_lora = @import("../finetune/lora_adapter_set.zig");
+const graph_input_binder = @import("../finetune/graph_input_binder.zig");
 const ops = @import("../ops/ops.zig");
+const training = @import("training.zig");
+
+const Graph = ml.graph.Graph;
+const Builder = ml.graph.Builder;
+const NodeId = ml.graph.NodeId;
+const Shape = ml.graph.Shape;
+const graph_lora = ml.graph.lora;
+const CT = ops.CT;
+const ComputeBackend = ops.ComputeBackend;
+
+const segment_lora_targets = [_][]const u8{
+    "attn.query_proj.weight",
+    "attn.key_proj.weight",
+    "attn.value_proj.weight",
+    "attn.Wo.weight",
+    "mlp.Wo.weight",
+};
+
+fn segmentVjpExecutionStrategy() training.CompiledExecutionStrategy {
+    // Full segment VJPs are intended to mirror GoMLX's compiled backward graph:
+    // MPSGraph is the primary path, with explicit overrides for diagnostics.
+    const raw = platform.env.getenv("ANTFLY_FUSED_CHUNKER_ENCODER_VJP_EXECUTION") orelse
+        platform.env.getenv("ANTFLY_FUSED_CHUNKER_ENCODER_VJP_BACKEND") orelse
+        return .mpsgraph_preferred;
+    if (std.mem.eql(u8, raw, "interpreter")) return .interpreter;
+    if (std.mem.eql(u8, raw, "partitioned") or std.mem.eql(u8, raw, "metal")) return .partitioned_preferred;
+    if (std.mem.eql(u8, raw, "partitioned_required") or std.mem.eql(u8, raw, "metal_required")) return .partitioned_required;
+    if (std.mem.eql(u8, raw, "mpsgraph")) return .mpsgraph_preferred;
+    if (std.mem.eql(u8, raw, "mpsgraph_required")) return .mpsgraph_required;
+    return .mpsgraph_preferred;
+}
 
 // ----------------------------------------------------------------------------
 // LayerActivation
@@ -120,6 +146,700 @@ pub const EncoderActivations = struct {
         });
     }
 };
+
+// ----------------------------------------------------------------------------
+// ModernBERT segmented VJP session
+// ----------------------------------------------------------------------------
+
+pub const SegmentVJPResult = struct {
+    allocator: std.mem.Allocator,
+    hidden_grad: ?[]f32 = null,
+    loss: f32,
+    profile: SegmentVJPProfile = .{},
+
+    pub fn deinit(self: *SegmentVJPResult) void {
+        if (self.hidden_grad) |buf| self.allocator.free(buf);
+        self.* = undefined;
+    }
+};
+
+pub const SegmentVJPProfile = struct {
+    runtime_input_ns: u64 = 0,
+    compiled_execute_ns: u64 = 0,
+    compiled_extract_ns: u64 = 0,
+    compiled_total_ns: u64 = 0,
+    accumulate_ns: u64 = 0,
+    total_ns: u64 = 0,
+    partitioned_runtime: bool = false,
+    mpsgraph_runtime: bool = false,
+    partitions_executed: u64 = 0,
+    backend_command_dispatches: u64 = 0,
+    planned_operator_dispatches: u64 = 0,
+    interpreter_fallbacks: u64 = 0,
+    graph_region_dispatches: u64 = 0,
+
+    pub fn add(self: *SegmentVJPProfile, other: SegmentVJPProfile) void {
+        self.runtime_input_ns += other.runtime_input_ns;
+        self.compiled_execute_ns += other.compiled_execute_ns;
+        self.compiled_extract_ns += other.compiled_extract_ns;
+        self.compiled_total_ns += other.compiled_total_ns;
+        self.accumulate_ns += other.accumulate_ns;
+        self.total_ns += other.total_ns;
+        self.partitioned_runtime = self.partitioned_runtime or other.partitioned_runtime;
+        self.mpsgraph_runtime = self.mpsgraph_runtime or other.mpsgraph_runtime;
+        self.partitions_executed += other.partitions_executed;
+        self.backend_command_dispatches += other.backend_command_dispatches;
+        self.planned_operator_dispatches += other.planned_operator_dispatches;
+        self.interpreter_fallbacks += other.interpreter_fallbacks;
+        self.graph_region_dispatches += other.graph_region_dispatches;
+    }
+};
+
+const ParamBinding = struct {
+    node_id: NodeId,
+    name: []const u8,
+
+    fn deinit(self: *ParamBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const AdapterBinding = struct {
+    base_name: []const u8,
+    lora_a_name: []const u8,
+    lora_b_name: []const u8,
+    lora_a_id: NodeId,
+    lora_b_id: NodeId,
+    lora_a_rows: usize,
+    lora_a_cols: usize,
+    lora_b_rows: usize,
+    lora_b_cols: usize,
+    layer_idx: u32,
+    module_name: []const u8,
+
+    fn deinit(self: *AdapterBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.base_name);
+        allocator.free(self.lora_a_name);
+        allocator.free(self.lora_b_name);
+        allocator.free(self.module_name);
+        self.* = undefined;
+    }
+};
+
+const SegmentLayerInputBinding = struct {
+    layer_idx: u32,
+    attn_bias_id: NodeId,
+    rope_cos_id: NodeId,
+    rope_sin_id: NodeId,
+    is_local_attention: bool,
+    rope_theta: f32,
+};
+
+/// Reusable compiled synthetic-loss VJP for a ModernBERT encoder segment.
+///
+/// This mirrors the Go trainer's segmented backward foundation:
+/// `loss = sum(segment_forward(hidden_in) * stop_gradient(upstream_grad))`.
+/// Differentiating this scalar wrt `hidden_in` returns the upstream VJP for the
+/// preceding segment, while differentiating wrt injected LoRA params returns
+/// exact adapter gradients for the segment.
+pub const ModernBertSegmentVJPSession = struct {
+    allocator: std.mem.Allocator,
+    config: modern_bert_graph.Config,
+    batch: u32,
+    seq_len: u32,
+    start_layer: u32,
+    end_layer: u32,
+    hidden_in_id: NodeId,
+    upstream_grad_id: NodeId,
+    attn_bias_id: NodeId,
+    rope_cos_id: NodeId,
+    rope_sin_id: NodeId,
+    layer_inputs: []SegmentLayerInputBinding,
+    base_params: []ParamBinding,
+    adapters: []AdapterBinding,
+    trainable_param_names: [][]const u8,
+    include_hidden_grad: bool,
+    include_adapter_grads: bool,
+    is_local_attention: bool,
+    session: training.CompiledTrainSession,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: modern_bert_graph.Config,
+        batch: u32,
+        seq_len: u32,
+        start_layer: u32,
+        end_layer: u32,
+        lora_rank: u32,
+        lora_alpha: f32,
+    ) !ModernBertSegmentVJPSession {
+        return initWithOptions(
+            allocator,
+            config,
+            batch,
+            seq_len,
+            start_layer,
+            end_layer,
+            lora_rank,
+            lora_alpha,
+            true,
+        );
+    }
+
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        config: modern_bert_graph.Config,
+        batch: u32,
+        seq_len: u32,
+        start_layer: u32,
+        end_layer: u32,
+        lora_rank: u32,
+        lora_alpha: f32,
+        include_hidden_grad: bool,
+    ) !ModernBertSegmentVJPSession {
+        return initWithGradientOptions(
+            allocator,
+            config,
+            batch,
+            seq_len,
+            start_layer,
+            end_layer,
+            lora_rank,
+            lora_alpha,
+            include_hidden_grad,
+            true,
+        );
+    }
+
+    pub fn initWithGradientOptions(
+        allocator: std.mem.Allocator,
+        config: modern_bert_graph.Config,
+        batch: u32,
+        seq_len: u32,
+        start_layer: u32,
+        end_layer: u32,
+        lora_rank: u32,
+        lora_alpha: f32,
+        include_hidden_grad: bool,
+        include_adapter_grads: bool,
+    ) !ModernBertSegmentVJPSession {
+        return initWithGradientOptionsAndStrategy(
+            allocator,
+            config,
+            batch,
+            seq_len,
+            start_layer,
+            end_layer,
+            lora_rank,
+            lora_alpha,
+            include_hidden_grad,
+            include_adapter_grads,
+            segmentVjpExecutionStrategy(),
+        );
+    }
+
+    pub fn initWithGradientOptionsAndStrategy(
+        allocator: std.mem.Allocator,
+        config: modern_bert_graph.Config,
+        batch: u32,
+        seq_len: u32,
+        start_layer: u32,
+        end_layer: u32,
+        lora_rank: u32,
+        lora_alpha: f32,
+        include_hidden_grad: bool,
+        include_adapter_grads: bool,
+        execution_strategy: training.CompiledExecutionStrategy,
+    ) !ModernBertSegmentVJPSession {
+        if (lora_rank == 0) return error.LoRARankRequired;
+        if (start_layer >= end_layer or end_layer > config.num_hidden_layers) return error.InvalidLayerRange;
+        const segment_len = end_layer - start_layer;
+
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var bld = Builder.init(&g);
+
+        const total: i64 = @intCast(batch * seq_len);
+        const hidden_i: i64 = @intCast(config.hidden_size);
+        const head_dim_i: i64 = @intCast(config.head_dim);
+        const bh_i: i64 = @intCast(batch * config.num_attention_heads);
+        const seq_i: i64 = @intCast(seq_len);
+
+        const hidden_in = try bld.parameter(
+            "__segment_hidden_in",
+            Shape.init(.f32, &.{ total, hidden_i }),
+        );
+        const upstream_grad = try bld.parameter(
+            "__segment_upstream_grad",
+            Shape.init(.f32, &.{ total, hidden_i }),
+        );
+
+        const layer_bindings = try allocator.alloc(SegmentLayerInputBinding, @intCast(segment_len));
+        errdefer allocator.free(layer_bindings);
+        const graph_layer_inputs = try allocator.alloc(modern_bert_graph.SegmentLayerInputs, @intCast(segment_len));
+        defer allocator.free(graph_layer_inputs);
+
+        var offset: u32 = 0;
+        while (offset < segment_len) : (offset += 1) {
+            const offset_usize: usize = @intCast(offset);
+            const layer_idx = start_layer + offset;
+            const layer_is_global = modern_bert_graph.isGlobalAttentionLayer(config, layer_idx);
+            const rope_theta = modern_bert_graph.ropeThetaForLayer(config, layer_idx);
+
+            var name_buf: [96]u8 = undefined;
+            const attn_bias_name = try std.fmt.bufPrint(&name_buf, "__segment_attn_bias_layer_{d}", .{layer_idx});
+            const attn_bias = try bld.parameter(
+                attn_bias_name,
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const rope_cos_name = try std.fmt.bufPrint(&name_buf, "__segment_rope_cos_layer_{d}", .{layer_idx});
+            const rope_cos = try bld.parameter(
+                rope_cos_name,
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            const rope_sin_name = try std.fmt.bufPrint(&name_buf, "__segment_rope_sin_layer_{d}", .{layer_idx});
+            const rope_sin = try bld.parameter(
+                rope_sin_name,
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+
+            const binding = SegmentLayerInputBinding{
+                .layer_idx = layer_idx,
+                .attn_bias_id = attn_bias,
+                .rope_cos_id = rope_cos,
+                .rope_sin_id = rope_sin,
+                .is_local_attention = !layer_is_global,
+                .rope_theta = rope_theta,
+            };
+            layer_bindings[offset_usize] = binding;
+            graph_layer_inputs[offset_usize] = .{
+                .attn_bias_node = attn_bias,
+                .rope_cos_node = rope_cos,
+                .rope_sin_node = rope_sin,
+            };
+        }
+
+        const segment = try modern_bert_graph.buildEncoderSegmentGraphWithLayerInputs(
+            &bld,
+            config,
+            hidden_in,
+            upstream_grad,
+            graph_layer_inputs,
+            batch,
+            seq_len,
+            start_layer,
+            end_layer,
+        );
+
+        var lora_result = try graph_lora.injectLoRA(allocator, &g, .{
+            .rank = lora_rank,
+            .alpha = lora_alpha,
+            .target_patterns = segment_lora_targets[0..],
+        });
+        defer lora_result.deinit();
+
+        var base_params_list: std.ArrayListUnmanaged(ParamBinding) = .empty;
+        errdefer {
+            for (base_params_list.items) |*p| p.deinit(allocator);
+            base_params_list.deinit(allocator);
+        }
+        for (lora_result.graph.parameters.items) |param_id| {
+            const n = lora_result.graph.node(param_id);
+            if (n.op != .parameter) continue;
+            const name = lora_result.graph.parameterName(n);
+            if (std.mem.startsWith(u8, name, "__")) continue;
+            if (std.mem.indexOf(u8, name, ".lora_A") != null or
+                std.mem.indexOf(u8, name, ".lora_B") != null)
+            {
+                continue;
+            }
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
+            try base_params_list.append(allocator, .{
+                .node_id = param_id,
+                .name = owned_name,
+            });
+        }
+
+        var adapter_list: std.ArrayListUnmanaged(AdapterBinding) = .empty;
+        errdefer {
+            for (adapter_list.items) |*a| a.deinit(allocator);
+            adapter_list.deinit(allocator);
+        }
+        for (lora_result.adapter.adapterNames()) |info| {
+            const stable_base_name = stripLoRASuffix(info.lora_a_name) orelse info.base_name;
+            const mapped = moduleFromModernBertBaseName(stable_base_name) catch continue;
+            const base_name = try allocator.dupe(u8, stable_base_name);
+            errdefer allocator.free(base_name);
+            const a_name = try allocator.dupe(u8, info.lora_a_name);
+            errdefer allocator.free(a_name);
+            const b_name = try allocator.dupe(u8, info.lora_b_name);
+            errdefer allocator.free(b_name);
+            const module_name = try allocator.dupe(u8, mapped.module_name);
+            errdefer allocator.free(module_name);
+            const a_shape = lora_result.graph.node(info.lora_a_id).output_shape;
+            const b_shape = lora_result.graph.node(info.lora_b_id).output_shape;
+            try adapter_list.append(allocator, .{
+                .base_name = base_name,
+                .lora_a_name = a_name,
+                .lora_b_name = b_name,
+                .lora_a_id = info.lora_a_id,
+                .lora_b_id = info.lora_b_id,
+                .lora_a_rows = @intCast(a_shape.dim(0)),
+                .lora_a_cols = @intCast(a_shape.dim(1)),
+                .lora_b_rows = @intCast(b_shape.dim(0)),
+                .lora_b_cols = @intCast(b_shape.dim(1)),
+                .layer_idx = mapped.layer_idx,
+                .module_name = module_name,
+            });
+        }
+
+        const hidden_grad_params: usize = if (include_hidden_grad) 1 else 0;
+        const adapter_grad_params: usize = if (include_adapter_grads) adapter_list.items.len * 2 else 0;
+        var trainable_names = try allocator.alloc([]const u8, hidden_grad_params + adapter_grad_params);
+        errdefer allocator.free(trainable_names);
+        var tn: usize = 0;
+        if (include_hidden_grad) {
+            trainable_names[tn] = "__segment_hidden_in";
+            tn += 1;
+        }
+        if (include_adapter_grads) {
+            for (adapter_list.items) |adapter| {
+                trainable_names[tn] = adapter.lora_a_name;
+                tn += 1;
+                trainable_names[tn] = adapter.lora_b_name;
+                tn += 1;
+            }
+        }
+
+        var session = try training.CompiledTrainSession.init(
+            allocator,
+            &lora_result.graph,
+            segment.loss_node,
+            .{
+                .trainable_params = trainable_names,
+                .execution_strategy = execution_strategy,
+            },
+        );
+        errdefer session.deinit();
+
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .batch = batch,
+            .seq_len = seq_len,
+            .start_layer = start_layer,
+            .end_layer = end_layer,
+            .hidden_in_id = hidden_in,
+            .upstream_grad_id = upstream_grad,
+            .attn_bias_id = layer_bindings[0].attn_bias_id,
+            .rope_cos_id = layer_bindings[0].rope_cos_id,
+            .rope_sin_id = layer_bindings[0].rope_sin_id,
+            .layer_inputs = layer_bindings,
+            .base_params = try base_params_list.toOwnedSlice(allocator),
+            .adapters = try adapter_list.toOwnedSlice(allocator),
+            .trainable_param_names = trainable_names,
+            .include_hidden_grad = include_hidden_grad,
+            .include_adapter_grads = include_adapter_grads,
+            .is_local_attention = segment_len == 1 and layer_bindings[0].is_local_attention,
+            .session = session,
+        };
+    }
+
+    pub fn deinit(self: *ModernBertSegmentVJPSession) void {
+        self.session.deinit();
+        self.allocator.free(self.layer_inputs);
+        for (self.base_params) |*p| p.deinit(self.allocator);
+        self.allocator.free(self.base_params);
+        for (self.adapters) |*adapter| adapter.deinit(self.allocator);
+        self.allocator.free(self.adapters);
+        self.allocator.free(self.trainable_param_names);
+        self.* = undefined;
+    }
+
+    pub fn execute(
+        self: *ModernBertSegmentVJPSession,
+        cb: *const ComputeBackend,
+        hidden_in: []const f32,
+        upstream_grad: []const f32,
+        attention_mask: []const f32,
+        lora_layers: []fused_chunker_lora.LoRALayer,
+    ) !SegmentVJPResult {
+        return self.executeWithOptions(
+            cb,
+            hidden_in,
+            upstream_grad,
+            attention_mask,
+            lora_layers,
+            true,
+        );
+    }
+
+    pub fn executeWithOptions(
+        self: *ModernBertSegmentVJPSession,
+        cb: *const ComputeBackend,
+        hidden_in: []const f32,
+        upstream_grad: []const f32,
+        attention_mask: []const f32,
+        lora_layers: []fused_chunker_lora.LoRALayer,
+        accumulate_adapter_grads: bool,
+    ) !SegmentVJPResult {
+        const total_start_ns = nowNs();
+        const total: usize = @as(usize, self.batch) * @as(usize, self.seq_len);
+        const H: usize = @intCast(self.config.hidden_size);
+        if (hidden_in.len != total * H or upstream_grad.len != total * H) return error.InvalidSegmentTensorShape;
+        if (attention_mask.len != total) return error.InvalidAttentionMaskShape;
+
+        var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+        defer rt.deinit(self.allocator);
+        var owned_cts: std.ArrayListUnmanaged(CT) = .empty;
+        defer {
+            for (owned_cts.items) |ct| cb.free(ct);
+            owned_cts.deinit(self.allocator);
+        }
+
+        try self.putOwnedTensor(cb, &rt, &owned_cts, self.hidden_in_id, hidden_in, &.{ @intCast(total), @intCast(H) });
+        try self.putOwnedTensor(cb, &rt, &owned_cts, self.upstream_grad_id, upstream_grad, &.{ @intCast(total), @intCast(H) });
+
+        for (self.layer_inputs) |binding| {
+            const attn_bias = try buildSegmentAttnBias(
+                self.allocator,
+                attention_mask,
+                self.batch,
+                self.seq_len,
+                self.config.num_attention_heads,
+                binding.is_local_attention,
+                self.config.local_attention_window,
+            );
+            defer self.allocator.free(attn_bias);
+            try self.putOwnedTensor(cb, &rt, &owned_cts, binding.attn_bias_id, attn_bias, &.{
+                @intCast(self.batch * self.config.num_attention_heads),
+                @intCast(self.seq_len),
+                @intCast(self.seq_len),
+            });
+
+            const rope = try graph_input_binder.QwenPlaceholderPrep.buildRopeCosSin(
+                self.allocator,
+                self.seq_len,
+                self.config.head_dim,
+                binding.rope_theta,
+            );
+            defer {
+                self.allocator.free(rope.cos);
+                self.allocator.free(rope.sin);
+            }
+            try self.putOwnedTensor(cb, &rt, &owned_cts, binding.rope_cos_id, rope.cos, &.{ @intCast(self.seq_len), @intCast(self.config.head_dim) });
+            try self.putOwnedTensor(cb, &rt, &owned_cts, binding.rope_sin_id, rope.sin, &.{ @intCast(self.seq_len), @intCast(self.config.head_dim) });
+        }
+
+        for (self.base_params) |binding| {
+            const weight = cb.getWeight(binding.name) catch |err| switch (err) {
+                error.MissingWeight => if (std.mem.endsWith(u8, binding.name, ".bias")) blk: {
+                    const zero_bias = try self.allocator.alloc(f32, self.config.hidden_size);
+                    defer self.allocator.free(zero_bias);
+                    @memset(zero_bias, 0);
+                    const dims = [_]i32{@intCast(self.config.hidden_size)};
+                    break :blk try cb.fromFloat32Shape(zero_bias, &dims);
+                } else {
+                    std.log.warn("segment VJP missing base weight: {s}", .{binding.name});
+                    return err;
+                },
+                else => return err,
+            };
+            errdefer cb.free(weight);
+            try rt.put(self.allocator, binding.node_id, weight);
+            try owned_cts.append(self.allocator, weight);
+        }
+
+        for (self.adapters) |adapter| {
+            if (findLoRALayer(lora_layers, adapter.layer_idx, adapter.module_name)) |layer| {
+                if (layer.A.len != adapter.lora_a_rows * adapter.lora_a_cols or
+                    layer.B.len != adapter.lora_b_rows * adapter.lora_b_cols)
+                {
+                    return error.InvalidLoRAAdapterShape;
+                }
+                try self.putOwnedTensor(cb, &rt, &owned_cts, adapter.lora_a_id, layer.A, &.{
+                    @intCast(adapter.lora_a_rows),
+                    @intCast(adapter.lora_a_cols),
+                });
+                try self.putOwnedTensor(cb, &rt, &owned_cts, adapter.lora_b_id, layer.B, &.{
+                    @intCast(adapter.lora_b_rows),
+                    @intCast(adapter.lora_b_cols),
+                });
+            } else {
+                std.log.warn("segment VJP missing LoRA adapter layer={d} module={s}; binding zero adapter tensors", .{ adapter.layer_idx, adapter.module_name });
+                try self.putZeroOwnedTensor(cb, &rt, &owned_cts, adapter.lora_a_id, adapter.lora_a_rows, adapter.lora_a_cols);
+                try self.putZeroOwnedTensor(cb, &rt, &owned_cts, adapter.lora_b_id, adapter.lora_b_rows, adapter.lora_b_cols);
+            }
+        }
+        const runtime_input_ns = elapsedNs(total_start_ns);
+
+        var step_result = try self.session.execute(cb, rt);
+        defer step_result.deinit();
+
+        const accumulate_start_ns = nowNs();
+        const hidden_grad = if (self.include_hidden_grad) blk: {
+            const hidden_grad_src = step_result.gradients.get("__segment_hidden_in") orelse return error.MissingHiddenGradient;
+            const copied = try self.allocator.dupe(f32, hidden_grad_src);
+            errdefer self.allocator.free(copied);
+            break :blk copied;
+        } else null;
+
+        if (accumulate_adapter_grads) {
+            for (self.adapters) |adapter| {
+                const layer = findLoRALayer(lora_layers, adapter.layer_idx, adapter.module_name) orelse continue;
+                if (step_result.gradients.get(adapter.lora_a_name)) |grad_a| {
+                    if (grad_a.len != layer.grad_A.len) return error.InvalidLoRAGradShape;
+                    for (layer.grad_A, grad_a) |*dst, gval| dst.* += gval;
+                }
+                if (step_result.gradients.get(adapter.lora_b_name)) |grad_b| {
+                    if (grad_b.len != layer.grad_B.len) return error.InvalidLoRAGradShape;
+                    for (layer.grad_B, grad_b) |*dst, gval| dst.* += gval;
+                }
+            }
+        }
+        const accumulate_ns = elapsedNs(accumulate_start_ns);
+
+        return .{
+            .allocator = self.allocator,
+            .hidden_grad = hidden_grad,
+            .loss = step_result.loss,
+            .profile = .{
+                .runtime_input_ns = runtime_input_ns,
+                .compiled_execute_ns = step_result.profile.execute_ns,
+                .compiled_extract_ns = step_result.profile.extract_ns,
+                .compiled_total_ns = step_result.profile.total_ns,
+                .accumulate_ns = accumulate_ns,
+                .total_ns = elapsedNs(total_start_ns),
+                .partitioned_runtime = step_result.profile.partitioned_runtime,
+                .mpsgraph_runtime = step_result.profile.mpsgraph_runtime,
+                .partitions_executed = step_result.profile.partitions_executed,
+                .backend_command_dispatches = step_result.profile.backend_command_dispatches,
+                .planned_operator_dispatches = step_result.profile.planned_operator_dispatches,
+                .interpreter_fallbacks = step_result.profile.interpreter_fallbacks,
+                .graph_region_dispatches = step_result.profile.graph_region_dispatches,
+            },
+        };
+    }
+
+    fn putOwnedTensor(
+        self: *ModernBertSegmentVJPSession,
+        cb: *const ComputeBackend,
+        rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+        owned_cts: *std.ArrayListUnmanaged(CT),
+        node_id: NodeId,
+        data: []const f32,
+        dims: []const i32,
+    ) !void {
+        const ct = try cb.fromFloat32Shape(data, dims);
+        errdefer cb.free(ct);
+        try rt.put(self.allocator, node_id, ct);
+        try owned_cts.append(self.allocator, ct);
+    }
+
+    fn putZeroOwnedTensor(
+        self: *ModernBertSegmentVJPSession,
+        cb: *const ComputeBackend,
+        rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+        owned_cts: *std.ArrayListUnmanaged(CT),
+        node_id: NodeId,
+        rows: usize,
+        cols: usize,
+    ) !void {
+        const zeros = try self.allocator.alloc(f32, rows * cols);
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0.0);
+        try self.putOwnedTensor(cb, rt, owned_cts, node_id, zeros, &.{
+            @intCast(rows),
+            @intCast(cols),
+        });
+    }
+};
+
+fn nowNs() u64 {
+    return platform.time.monotonicNs();
+}
+
+fn elapsedNs(start_ns: u64) u64 {
+    const end_ns = nowNs();
+    return if (end_ns > start_ns) end_ns - start_ns else 0;
+}
+
+fn buildSegmentAttnBias(
+    allocator: std.mem.Allocator,
+    attention_mask: []const f32,
+    batch: u32,
+    seq_len: u32,
+    num_heads: u32,
+    is_local_attention: bool,
+    local_attention_window: u32,
+) ![]f32 {
+    const sl: usize = @intCast(seq_len);
+    const b: usize = @intCast(batch);
+    const nh: usize = @intCast(num_heads);
+    if (attention_mask.len != b * sl) return error.InvalidAttentionMaskShape;
+
+    const total = b * nh * sl * sl;
+    const bias = try allocator.alloc(f32, total);
+    errdefer allocator.free(bias);
+
+    const window_half: usize = @intCast(local_attention_window / 2);
+    var idx: usize = 0;
+    for (0..b) |bi| {
+        for (0..nh) |_| {
+            for (0..sl) |qi| {
+                for (0..sl) |ki| {
+                    const mask_idx = bi * sl + ki;
+                    const diff = if (qi >= ki) qi - ki else ki - qi;
+                    const outside_window = is_local_attention and diff > window_half;
+                    bias[idx] = if (attention_mask[mask_idx] < 0.5 or outside_window) -1.0e9 else 0.0;
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    return bias;
+}
+
+const ModuleMapping = struct {
+    layer_idx: u32,
+    module_name: []const u8,
+};
+
+fn moduleFromModernBertBaseName(base_name: []const u8) !ModuleMapping {
+    const prefix = "model.layers.";
+    if (!std.mem.startsWith(u8, base_name, prefix)) return error.UnsupportedLoRABaseName;
+    var rest = base_name[prefix.len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.UnsupportedLoRABaseName;
+    const layer_idx = try std.fmt.parseInt(u32, rest[0..dot], 10);
+    rest = rest[dot + 1 ..];
+
+    if (std.mem.eql(u8, rest, "attn.query_proj.weight")) return .{ .layer_idx = layer_idx, .module_name = "query_proj" };
+    if (std.mem.eql(u8, rest, "attn.key_proj.weight")) return .{ .layer_idx = layer_idx, .module_name = "key_proj" };
+    if (std.mem.eql(u8, rest, "attn.value_proj.weight")) return .{ .layer_idx = layer_idx, .module_name = "value_proj" };
+    if (std.mem.eql(u8, rest, "attn.Wo.weight")) return .{ .layer_idx = layer_idx, .module_name = "out_proj" };
+    if (std.mem.eql(u8, rest, "mlp.Wo.weight")) return .{ .layer_idx = layer_idx, .module_name = "wo" };
+    return error.UnsupportedLoRABaseName;
+}
+
+fn stripLoRASuffix(name: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, name, ".lora_A")) return name[0 .. name.len - ".lora_A".len];
+    if (std.mem.endsWith(u8, name, ".lora_B")) return name[0 .. name.len - ".lora_B".len];
+    return null;
+}
+
+fn findLoRALayer(
+    lora_layers: []fused_chunker_lora.LoRALayer,
+    layer_idx: u32,
+    module_name: []const u8,
+) ?*fused_chunker_lora.LoRALayer {
+    for (lora_layers) |*layer| {
+        if (layer.layer_idx == layer_idx and std.mem.eql(u8, layer.module_name, module_name)) return layer;
+    }
+    return null;
+}
 
 // ----------------------------------------------------------------------------
 // backwardLoRA
@@ -365,6 +1085,67 @@ pub fn backwardLoRADirect(
     }
 }
 
+/// Backpropagate through a row-wise LayerNorm:
+/// y = ((x - mean) / sqrt(var + eps)) * gamma + beta.
+///
+/// Returns an owned [rows * hidden] gradient with respect to x. This is used
+/// as a cheap chain-rule correction before the current direct LoRA-gradient
+/// approximation consumes dL/d(final_encoder_output).
+pub fn backpropLayerNormInput(
+    allocator: std.mem.Allocator,
+    grad_out: []const f32,
+    input: []const f32,
+    gamma: []const f32,
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) ![]f32 {
+    if (grad_out.len != rows * hidden or input.len != rows * hidden or gamma.len != hidden) {
+        return error.InvalidLayerNormBackwardShape;
+    }
+
+    const grad_in = try allocator.alloc(f32, rows * hidden);
+    errdefer allocator.free(grad_in);
+    if (hidden == 0) return grad_in;
+
+    const hidden_f: f32 = @floatFromInt(hidden);
+    for (0..rows) |row| {
+        const base = row * hidden;
+        const x = input[base .. base + hidden];
+        const dy = grad_out[base .. base + hidden];
+        const dx = grad_in[base .. base + hidden];
+
+        var mean: f32 = 0.0;
+        for (x) |v| mean += v;
+        mean /= hidden_f;
+
+        var var_sum: f32 = 0.0;
+        for (x) |v| {
+            const centered = v - mean;
+            var_sum += centered * centered;
+        }
+        const variance = var_sum / hidden_f;
+        const inv_std = 1.0 / @sqrt(variance + eps);
+
+        var sum_dyg: f32 = 0.0;
+        var sum_dyg_xhat: f32 = 0.0;
+        for (0..hidden) |col| {
+            const xhat = (x[col] - mean) * inv_std;
+            const dyg = dy[col] * gamma[col];
+            sum_dyg += dyg;
+            sum_dyg_xhat += dyg * xhat;
+        }
+
+        for (0..hidden) |col| {
+            const xhat = (x[col] - mean) * inv_std;
+            const dyg = dy[col] * gamma[col];
+            dx[col] = (inv_std / hidden_f) * (hidden_f * dyg - sum_dyg - xhat * sum_dyg_xhat);
+        }
+    }
+
+    return grad_in;
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
@@ -404,6 +1185,198 @@ test "EncoderActivations addActivation copies data" {
     // Mutate the original buffer — the stored copy must be unaffected.
     input_buf[0] = 9999.0;
     try std.testing.expect(act.input[0] != 9999.0);
+}
+
+test "moduleFromModernBertBaseName maps checkpoint names to adapter modules" {
+    const q = try moduleFromModernBertBaseName("model.layers.21.attn.query_proj.weight");
+    try std.testing.expectEqual(@as(u32, 21), q.layer_idx);
+    try std.testing.expectEqualStrings("query_proj", q.module_name);
+
+    const out = try moduleFromModernBertBaseName("model.layers.21.attn.Wo.weight");
+    try std.testing.expectEqual(@as(u32, 21), out.layer_idx);
+    try std.testing.expectEqualStrings("out_proj", out.module_name);
+
+    const wo = try moduleFromModernBertBaseName("model.layers.21.mlp.Wo.weight");
+    try std.testing.expectEqual(@as(u32, 21), wo.layer_idx);
+    try std.testing.expectEqualStrings("wo", wo.module_name);
+
+    try std.testing.expectError(
+        error.UnsupportedLoRABaseName,
+        moduleFromModernBertBaseName("model.layers.21.mlp.Wi.weight"),
+    );
+}
+
+test "ModernBertSegmentVJPSession init compiles tiny global segment" {
+    const allocator = std.testing.allocator;
+    const config = modern_bert_graph.Config{
+        .vocab_size = 32,
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .head_dim = 4,
+        .intermediate_size = 16,
+        .max_position_embeddings = 8,
+        .global_attn_every_n_layers = 1,
+    };
+
+    var session = try ModernBertSegmentVJPSession.init(
+        allocator,
+        config,
+        1,
+        4,
+        0,
+        1,
+        2,
+        4.0,
+    );
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 14), session.base_params.len);
+    try std.testing.expectEqual(@as(usize, 5), session.adapters.len);
+    try std.testing.expectEqual(@as(usize, 11), session.trainable_param_names.len);
+    try std.testing.expectEqualStrings("__segment_hidden_in", session.trainable_param_names[0]);
+}
+
+test "ModernBertSegmentVJPSession can omit unused hidden gradient" {
+    const allocator = std.testing.allocator;
+    const config = modern_bert_graph.Config{
+        .vocab_size = 32,
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .head_dim = 4,
+        .intermediate_size = 16,
+        .max_position_embeddings = 8,
+        .global_attn_every_n_layers = 1,
+    };
+
+    var session = try ModernBertSegmentVJPSession.initWithOptions(
+        allocator,
+        config,
+        1,
+        4,
+        0,
+        1,
+        2,
+        4.0,
+        false,
+    );
+    defer session.deinit();
+
+    try std.testing.expect(!session.include_hidden_grad);
+    try std.testing.expectEqual(@as(usize, 10), session.trainable_param_names.len);
+    for (session.trainable_param_names) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "__segment_hidden_in"));
+    }
+}
+
+test "ModernBertSegmentVJPSession can request hidden gradient without adapter gradients" {
+    const allocator = std.testing.allocator;
+    const config = modern_bert_graph.Config{
+        .vocab_size = 32,
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .head_dim = 4,
+        .intermediate_size = 16,
+        .max_position_embeddings = 8,
+        .global_attn_every_n_layers = 1,
+    };
+
+    var session = try ModernBertSegmentVJPSession.initWithGradientOptions(
+        allocator,
+        config,
+        1,
+        4,
+        0,
+        1,
+        2,
+        4.0,
+        true,
+        false,
+    );
+    defer session.deinit();
+
+    try std.testing.expect(session.include_hidden_grad);
+    try std.testing.expect(!session.include_adapter_grads);
+    try std.testing.expectEqual(@as(usize, 1), session.trainable_param_names.len);
+    try std.testing.expectEqualStrings("__segment_hidden_in", session.trainable_param_names[0]);
+}
+
+test "ModernBertSegmentVJPSession accepts one-layer local-attention segments" {
+    const allocator = std.testing.allocator;
+    const config = modern_bert_graph.Config{
+        .vocab_size = 32,
+        .hidden_size = 8,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .head_dim = 4,
+        .intermediate_size = 16,
+        .max_position_embeddings = 8,
+        .global_attn_every_n_layers = 3,
+    };
+
+    var session = try ModernBertSegmentVJPSession.init(
+        allocator,
+        config,
+        1,
+        4,
+        1,
+        2,
+        2,
+        4.0,
+    );
+    defer session.deinit();
+
+    try std.testing.expect(session.is_local_attention);
+    try std.testing.expectEqual(config.local_rope_theta, session.layer_inputs[0].rope_theta);
+}
+
+test "ModernBertSegmentVJPSession accepts mixed local and global multi-layer segments" {
+    const allocator = std.testing.allocator;
+    const config = modern_bert_graph.Config{
+        .vocab_size = 32,
+        .hidden_size = 8,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 2,
+        .head_dim = 4,
+        .intermediate_size = 16,
+        .max_position_embeddings = 8,
+        .global_attn_every_n_layers = 3,
+    };
+
+    var session = try ModernBertSegmentVJPSession.init(
+        allocator,
+        config,
+        1,
+        4,
+        2,
+        4,
+        2,
+        4.0,
+    );
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), session.layer_inputs.len);
+    try std.testing.expect(session.layer_inputs[0].is_local_attention);
+    try std.testing.expect(!session.layer_inputs[1].is_local_attention);
+    try std.testing.expectEqual(config.local_rope_theta, session.layer_inputs[0].rope_theta);
+    try std.testing.expectEqual(config.rope_theta, session.layer_inputs[1].rope_theta);
+}
+
+test "buildSegmentAttnBias combines padding and local window masks" {
+    const allocator = std.testing.allocator;
+    const mask = [_]f32{ 1.0, 1.0, 0.0, 1.0 };
+    const bias = try buildSegmentAttnBias(allocator, &mask, 1, 4, 1, true, 2);
+    defer allocator.free(bias);
+
+    try std.testing.expectEqual(@as(usize, 16), bias.len);
+    try std.testing.expectEqual(@as(f32, 0.0), bias[0 * 4 + 0]);
+    try std.testing.expectEqual(@as(f32, 0.0), bias[0 * 4 + 1]);
+    try std.testing.expect(bias[0 * 4 + 2] < -1.0e8);
+    try std.testing.expect(bias[3 * 4 + 0] < -1.0e8);
+    try std.testing.expect(bias[3 * 4 + 2] < -1.0e8);
+    try std.testing.expectEqual(@as(f32, 0.0), bias[3 * 4 + 3]);
 }
 
 test "backwardLoRA smoke — grad_A and grad_B become non-zero" {
@@ -503,4 +1476,51 @@ test "backwardLoRA skips unmatched activations" {
     // Grads must remain zero because there was no matching layer.
     for (lora_layers[0].grad_A) |v| try std.testing.expectEqual(@as(f32, 0.0), v);
     for (lora_layers[0].grad_B) |v| try std.testing.expectEqual(@as(f32, 0.0), v);
+}
+
+test "backpropLayerNormInput matches finite differences" {
+    const allocator = std.testing.allocator;
+
+    const rows: usize = 1;
+    const hidden: usize = 4;
+    const eps: f32 = 1e-5;
+    var input = [_]f32{ 0.3, -0.7, 1.2, 0.5 };
+    const gamma = [_]f32{ 0.9, 1.1, -0.8, 0.7 };
+    const grad_out = [_]f32{ 0.2, -0.4, 0.6, -0.1 };
+
+    const grad = try backpropLayerNormInput(allocator, &grad_out, &input, &gamma, rows, hidden, eps);
+    defer allocator.free(grad);
+
+    const delta: f32 = 1e-3;
+    for (0..hidden) |i| {
+        input[i] += delta;
+        const plus = layerNormSyntheticLoss(&input, &gamma, &grad_out, hidden, eps);
+        input[i] -= 2.0 * delta;
+        const minus = layerNormSyntheticLoss(&input, &gamma, &grad_out, hidden, eps);
+        input[i] += delta;
+
+        const numeric = (plus - minus) / (2.0 * delta);
+        try std.testing.expectApproxEqAbs(numeric, grad[i], 2e-3);
+    }
+}
+
+fn layerNormSyntheticLoss(input: []const f32, gamma: []const f32, grad_out: []const f32, hidden: usize, eps: f32) f32 {
+    const hidden_f: f32 = @floatFromInt(hidden);
+    var mean: f32 = 0.0;
+    for (input) |v| mean += v;
+    mean /= hidden_f;
+
+    var var_sum: f32 = 0.0;
+    for (input) |v| {
+        const centered = v - mean;
+        var_sum += centered * centered;
+    }
+    const inv_std = 1.0 / @sqrt(var_sum / hidden_f + eps);
+
+    var loss: f32 = 0.0;
+    for (0..hidden) |i| {
+        const y = (input[i] - mean) * inv_std * gamma[i];
+        loss += grad_out[i] * y;
+    }
+    return loss;
 }

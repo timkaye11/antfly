@@ -22,6 +22,12 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 const commands = [_]common.CommandSpec{
     .{
+        .name = "count-fused-tokenization",
+        .root_source_file = "src/finetune/tools/count_fused_tokenization.zig",
+        .description = "Count fused-chunker tokenization labels and hashes for Go/Zig parity checks",
+        .imports = &.{.inference_internal},
+    },
+    .{
         .name = "inspect-layoutlmv3-bundle",
         .root_source_file = "src/finetune/tools/inspect_layoutlmv3_bundle.zig",
         .description = "Inspect a LayoutLMv3 runtime bundle",
@@ -164,9 +170,9 @@ const commands = [_]common.CommandSpec{
     },
     .{
         .name = "eval-fused-chunker",
-        .root_source_file = "src/finetune/eval/eval_fused_chunker.zig",
+        .root_source_file = "src/finetune_eval_fused_chunker_root.zig",
         .description = "Evaluate a fused chunker-embedder boundary head checkpoint",
-        .imports = &.{.ml},
+        .imports = &.{ .antfly_platform, .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
     .{
@@ -409,7 +415,7 @@ const commands = [_]common.CommandSpec{
         .name = "train-fused-chunker",
         .root_source_file = "src/finetune_train_fused_chunker_root.zig",
         .description = "End-to-end training for the fused chunker-embedder model",
-        .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
+        .imports = &.{ .antfly_platform, .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
 };

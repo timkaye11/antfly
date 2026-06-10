@@ -32,6 +32,7 @@ const partition_mod = @import("partition.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
 const webgpu_capabilities = @import("webgpu_capabilities.zig");
 const multi_executor = @import("multi_executor.zig");
+const executor_stats = @import("executor_stats.zig");
 const device_mesh_mod = @import("device_mesh.zig");
 const native_partition_executor = @import("native_partition_executor.zig");
 
@@ -53,8 +54,11 @@ pub const Strategy = enum {
 };
 
 pub const Result = struct {
+    pub const StatsType = executor_stats.ExecutionStats;
+
     outputs: []contracts.CT,
     output_devices: ?[]device_mesh_mod.DeviceId = null,
+    stats: StatsType = .{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Result, runtime: *const Runtime) void {
@@ -149,6 +153,7 @@ pub const Runtime = struct {
                 result.output_devices = &.{};
                 return .{
                     .outputs = outputs,
+                    .stats = result.stats,
                     .allocator = result.allocator,
                 };
             },
@@ -169,7 +174,7 @@ pub const Runtime = struct {
 
         var devices_buf: [2]device_mesh_mod.DeviceEntry = undefined;
         const device_count: usize = if (use_native_fallback) blk: {
-            const fallback = self.fallback_native orelse return error.MissingNativeFallback;
+            const fallback = if (self.fallback_native) |*fallback| fallback else return error.MissingNativeFallback;
             devices_buf[0] = .{
                 .id = 0,
                 .backend = backend,
@@ -177,7 +182,7 @@ pub const Runtime = struct {
             };
             devices_buf[1] = .{
                 .id = 1,
-                .backend = &fallback.backend,
+                .backend = fallback.backend,
                 .kind = .native,
             };
             break :blk 2;
@@ -299,10 +304,13 @@ pub const Runtime = struct {
         const compute = try self.allocator.create(NativeCompute);
         errdefer self.allocator.destroy(compute);
         compute.* = NativeCompute.init(self.allocator, weight_store, null);
+        const backend = try self.allocator.create(ComputeBackend);
+        errdefer self.allocator.destroy(backend);
+        backend.* = compute.computeBackend();
         self.fallback_native = .{
             .weight_store = weight_store,
             .compute = compute,
-            .backend = compute.computeBackend(),
+            .backend = backend,
         };
     }
 
@@ -327,10 +335,11 @@ pub const Runtime = struct {
 const FallbackNativeBackend = struct {
     weight_store: *WeightStore,
     compute: *NativeCompute,
-    backend: ComputeBackend,
+    backend: *ComputeBackend,
 
     fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
         self.backend.deinit();
+        allocator.destroy(self.backend);
         native_mod.deinitPrefetchQueue(self.weight_store);
         self.weight_store.resident_weights.deinit(allocator);
         self.weight_store.lazy_weights.deinit(allocator);

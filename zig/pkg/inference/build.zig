@@ -114,7 +114,7 @@ fn configureSystemBlas(
 }
 
 /// Link the Metal framework and compile the standalone Metal kernels.
-/// No MLX dependency — the `.m` file uses Foundation + Metal/MPS.
+/// No MLX dependency — the `.m` file uses Foundation + Metal/MPS/MPSGraph.
 fn configureMetal(
     b: *std.Build,
     module: *std.Build.Module,
@@ -127,6 +127,7 @@ fn configureMetal(
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
+    module.linkFramework("MetalPerformanceShadersGraph", .{});
     module.addCSourceFile(.{ .file = b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
 }
 

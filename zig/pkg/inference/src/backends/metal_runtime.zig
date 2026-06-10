@@ -3654,7 +3654,9 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
     const bias_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "bias")) request.bias else null;
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     const bias_mode: u32 = if (@hasField(@TypeOf(request), "bias_mode")) request.bias_mode else 0;
+    const local_window_half_usize: usize = if (@hasField(@TypeOf(request), "local_window_half")) request.local_window_half else 0;
     if (bias_mode > 3) return null;
+    if (local_window_half_usize >= std.math.maxInt(u32)) return null;
     if (bias_mode != 0 and (bias_tensor == null or !bias_tensor.?.isDevice())) return null;
     if (mask_tensor) |mask| {
         if (!mask.isDevice() or mask.elemCount() != request.batch * request.seq_len) return null;
@@ -3682,10 +3684,14 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         request.head_dim,
         bias_mode,
         if (mask_tensor != null) 1 else 0,
+        @intCast(local_window_half_usize),
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
     return output_device;
 }
 
@@ -4061,6 +4067,28 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
     return MetalTensor.owned(output, &shape);
 }
 
+pub fn decoderRuntimeApplyNeftuneNoise(self: anytype, input: MetalTensor, seed: u64, scale: f32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or input.elemCount() == 0) return null;
+    const elem_count = input.elemCount();
+    var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, input.shape());
+    errdefer output_device.deinit();
+    const device_rc = termite_metal_decode_runtime_apply_neftune_noise_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        elem_count,
+        seed,
+        scale,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (device_rc == 0) return output_device;
+    output_device.deinit();
+    return null;
+}
+
 pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -4264,6 +4292,39 @@ pub fn decoderRuntimeApplyMultiply(
     if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(dim) };
     return MetalTensor.owned(output, &shape);
+}
+
+pub fn decoderRuntimeApplyActivationMultiply(
+    self: anytype,
+    gate: MetalTensor,
+    value: MetalTensor,
+    activation: ops.DecoderRuntimeActivationKind,
+    rows: usize,
+    dim: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!gate.isDevice() or !value.isDevice()) return null;
+    if (rows == 0 or dim == 0) return null;
+    if (rows > std.math.maxInt(usize) / dim) return null;
+    if (gate.elemCount() != rows * dim or value.elemCount() != rows * dim) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, &shape);
+    errdefer output_device.deinit();
+    const device_rc = termite_metal_decode_runtime_apply_activation_multiply_device(
+        runtime,
+        @intFromEnum(activation),
+        gate.deviceHandle(),
+        gate.deviceByteOffset(),
+        value.deviceHandle(),
+        value.deviceByteOffset(),
+        rows,
+        dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (device_rc != 0) return null;
+    return output_device;
 }
 
 pub fn decoderRuntimeApplyMultiplyInto(
@@ -4479,6 +4540,65 @@ pub fn decoderRuntimeTrainingSumSquaresF32(
         output.deviceByteOffset(),
     );
     if (rc != 0) return error.MetalTrainingSumSquaresFailed;
+    return true;
+}
+
+pub fn decoderRuntimeTrainingLoRAGradsF32(
+    self: anytype,
+    inputs: MetalTensor,
+    output_grads: MetalTensor,
+    lora_a: MetalTensor,
+    lora_b: MetalTensor,
+    low_rank: MetalTensor,
+    back_rank: MetalTensor,
+    grad_a: MetalTensor,
+    grad_b: MetalTensor,
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+    scale: f32,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!inputs.isDevice() or !output_grads.isDevice() or !lora_a.isDevice() or !lora_b.isDevice() or
+        !low_rank.isDevice() or !back_rank.isDevice() or !grad_a.isDevice() or !grad_b.isDevice())
+    {
+        return false;
+    }
+    if (rows == 0 or in_features == 0 or out_features == 0 or rank == 0) return false;
+    if (inputs.elemCount() < rows * in_features or output_grads.elemCount() < rows * out_features or
+        lora_a.elemCount() < rank * in_features or lora_b.elemCount() < out_features * rank or
+        low_rank.elemCount() < rows * rank or back_rank.elemCount() < rows * rank or
+        grad_a.elemCount() < rank * in_features or grad_b.elemCount() < out_features * rank)
+    {
+        return false;
+    }
+    const rc = termite_metal_decode_runtime_training_lora_grads_f32(
+        runtime,
+        inputs.deviceHandle(),
+        inputs.deviceByteOffset(),
+        output_grads.deviceHandle(),
+        output_grads.deviceByteOffset(),
+        lora_a.deviceHandle(),
+        lora_a.deviceByteOffset(),
+        lora_b.deviceHandle(),
+        lora_b.deviceByteOffset(),
+        low_rank.deviceHandle(),
+        low_rank.deviceByteOffset(),
+        back_rank.deviceHandle(),
+        back_rank.deviceByteOffset(),
+        grad_a.deviceHandle(),
+        grad_a.deviceByteOffset(),
+        grad_b.deviceHandle(),
+        grad_b.deviceByteOffset(),
+        rows,
+        in_features,
+        out_features,
+        rank,
+        scale,
+    );
+    if (rc != 0) return error.MetalTrainingLoRAGradsFailed;
     return true;
 }
 
@@ -5632,6 +5752,8 @@ pub const RawRuntimeMemoryStats = extern struct {
 };
 
 pub extern fn termite_metal_device_available() c_int;
+pub extern fn termite_mpsgraph_available() c_int;
+pub extern fn termite_mpsgraph_smoke_add_f32(lhs: f32, rhs: f32, out_value: *f32) c_int;
 
 fn sleepMetalProbeRetry() void {
     var ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
@@ -5644,6 +5766,19 @@ pub fn metalDeviceAvailable() bool {
         if (attempt != 2) sleepMetalProbeRetry();
     }
     return false;
+}
+
+pub fn mpsGraphAvailable() bool {
+    for (0..3) |attempt| {
+        if (termite_mpsgraph_available() != 0) return true;
+        if (attempt != 2) sleepMetalProbeRetry();
+    }
+    return false;
+}
+
+pub fn mpsGraphSmokeAdd(lhs: f32, rhs: f32) ?f32 {
+    var out: f32 = 0;
+    return if (termite_mpsgraph_smoke_add_f32(lhs, rhs, &out) == 0) out else null;
 }
 
 pub extern fn termite_metal_provider_create() ?*RawMetalProvider;
@@ -7711,6 +7846,7 @@ pub extern fn termite_metal_decode_runtime_sdpa_f32_device(
     head_dim: usize,
     bias_mode: u32,
     has_mask: u32,
+    local_window_half: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -7851,6 +7987,16 @@ pub extern fn termite_metal_decode_runtime_apply_add_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_neftune_noise_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    dim: usize,
+    seed: u64,
+    scale: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_training_accumulate_f32(
     runtime: ?*RawMetalDecodeRuntime,
     accum_handle: ?*anyopaque,
@@ -7888,6 +8034,30 @@ pub extern fn termite_metal_decode_runtime_training_sumsq_f32(
     elem_count: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_training_lora_grads_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    output_grad_handle: ?*anyopaque,
+    output_grad_offset: usize,
+    lora_a_handle: ?*anyopaque,
+    lora_a_offset: usize,
+    lora_b_handle: ?*anyopaque,
+    lora_b_offset: usize,
+    low_rank_handle: ?*anyopaque,
+    low_rank_offset: usize,
+    back_rank_handle: ?*anyopaque,
+    back_rank_offset: usize,
+    grad_a_handle: ?*anyopaque,
+    grad_a_offset: usize,
+    grad_b_handle: ?*anyopaque,
+    grad_b_offset: usize,
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+    scale: f32,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_rms_norm_add_device(
     runtime: ?*RawMetalDecodeRuntime,

@@ -505,6 +505,24 @@ pub const Builder = struct {
         return fused;
     }
 
+    /// Exact GELU activation: x * 0.5 * (1 + erf(x / sqrt(2))).
+    ///
+    /// This intentionally returns the primitive erf-form graph instead of the
+    /// existing fused_gelu op, whose backend implementation is the tanh
+    /// approximation.
+    pub fn geluExact(self: *Builder, input: NodeId) !NodeId {
+        const dtype = self.graph.node(input).output_shape.dtype;
+        const half = try self.scalarConst(dtype, 0.5);
+        const one = try self.scalarConst(dtype, 1.0);
+        const inv_sqrt_2 = try self.scalarConst(dtype, 0.7071067811865475);
+
+        const scaled = try self.mul(input, inv_sqrt_2);
+        const erf_val = try self.erfOp(scaled);
+        const one_plus_erf = try self.add(one, erf_val);
+        const x_half = try self.mul(input, half);
+        return self.mul(x_half, one_plus_erf);
+    }
+
     /// Fused SiLU/Swish activation: x * sigmoid(x).
     pub fn silu(self: *Builder, input: NodeId) !NodeId {
         // Decomposed: x / (1 + exp(-x))
@@ -1040,6 +1058,29 @@ test "Builder.gelu emits fused + decomposed" {
 
     try std.testing.expect(result_node.op.isFused());
     try std.testing.expect(result_node.vjp_alternate != null_node);
+}
+
+test "Builder.geluExact emits primitive erf form" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("input", Shape.init(.f32, &.{ 4, 8 }));
+    const result = try b.geluExact(x);
+    const result_node = g.node(result);
+
+    try std.testing.expectEqual(OpCode.mul, std.meta.activeTag(result_node.op));
+    try std.testing.expect(result_node.vjp_alternate == null_node);
+
+    var saw_erf = false;
+    for (0..g.nodeCount()) |i| {
+        if (std.meta.activeTag(g.node(@intCast(i)).op) == .erf) {
+            saw_erf = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_erf);
 }
 
 test "Builder.softmax emits fused + decomposed" {

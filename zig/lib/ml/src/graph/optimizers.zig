@@ -43,11 +43,14 @@ pub const LearningRateSchedule = union(enum) {
             },
             .warmup_cosine => |wc| blk: {
                 if (step_num < wc.warmup_steps) {
-                    // Linear warmup: lr increases from 0 to initial_lr
-                    const warmup_progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wc.warmup_steps));
+                    // Linear warmup follows the Go fused trainer: first update uses
+                    // initial_lr / warmup_steps rather than a zero learning rate.
+                    const warmup_denom: u32 = @max(wc.warmup_steps, 1);
+                    const warmup_progress: f32 = @as(f32, @floatFromInt(step_num + 1)) / @as(f32, @floatFromInt(warmup_denom));
                     break :blk wc.initial_lr * warmup_progress;
                 }
                 // Cosine decay from initial_lr to min_lr over remaining steps
+                if (wc.total_steps <= wc.warmup_steps) break :blk wc.initial_lr;
                 const decay_steps = wc.total_steps - wc.warmup_steps;
                 const decay_step = step_num - wc.warmup_steps;
                 const progress: f32 = @as(f32, @floatFromInt(decay_step)) / @as(f32, @floatFromInt(decay_steps));
@@ -155,6 +158,28 @@ pub const OptimizerState = struct {
         return gop.value_ptr;
     }
 };
+
+pub fn sanitizeSlice(values: []f32) usize {
+    var repaired: usize = 0;
+    for (values) |*value| {
+        if (!std.math.isFinite(value.*)) {
+            value.* = 0.0;
+            repaired += 1;
+        }
+    }
+    return repaired;
+}
+
+pub fn sanitizeState(state: *OptimizerState) usize {
+    var repaired: usize = 0;
+    var it = state.param_states.iterator();
+    while (it.next()) |entry| {
+        repaired += sanitizeSlice(entry.value_ptr.m);
+        repaired += sanitizeSlice(entry.value_ptr.v);
+        if (entry.value_ptr.z) |z| repaired += sanitizeSlice(z);
+    }
+    return repaired;
+}
 
 // ─── Optimizer Step ────────────────────────────────────────────────────────────
 
@@ -535,6 +560,28 @@ test "AdamW weight decay" {
     _ = grad;
 }
 
+test "optimizer state sanitizer clears nonfinite moments" {
+    const allocator = std.testing.allocator;
+
+    var state = OptimizerState.init(allocator);
+    defer state.deinit();
+    const ps = try state.getOrCreate("p", 3, true);
+    ps.m[0] = std.math.nan(f32);
+    ps.m[1] = 1.0;
+    ps.v[0] = std.math.inf(f32);
+    ps.v[1] = -std.math.inf(f32);
+    ps.z = try allocator.alloc(f32, 3);
+    @memcpy(ps.z.?, &[_]f32{ 0.0, std.math.nan(f32), 2.0 });
+
+    try std.testing.expectEqual(@as(usize, 4), sanitizeState(&state));
+    try std.testing.expectEqual(@as(f32, 0.0), ps.m[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), ps.m[1]);
+    try std.testing.expectEqual(@as(f32, 0.0), ps.v[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), ps.v[1]);
+    try std.testing.expectEqual(@as(f32, 0.0), ps.z.?[1]);
+    try std.testing.expectEqual(@as(f32, 2.0), ps.z.?[2]);
+}
+
 test "AdamW SIMD slice path matches scalar reference with tail" {
     var param_simd = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
     var m_simd = [_]f32{ 0.0, 0.1, 0.2, 0.0, 0.1, 0.2, 0.0, 0.1, 0.2, 0.0, 0.1 };
@@ -593,11 +640,11 @@ test "warmup cosine LR schedule" {
         .total_steps = 110,
     } };
 
-    // Step 0: warmup start
-    try expectApproxEqAbs(0.0, schedule.lr(0), 1e-6);
+    // Step 0: first update uses initial_lr / warmup_steps.
+    try expectApproxEqAbs(0.01, schedule.lr(0), 1e-6);
 
-    // Step 5: halfway through warmup => 0.05
-    try expectApproxEqAbs(0.05, schedule.lr(5), 1e-6);
+    // Step 5: six warmup updates have elapsed => 0.06
+    try expectApproxEqAbs(0.06, schedule.lr(5), 1e-6);
 
     // Step 10: end of warmup => initial_lr = 0.1, start of cosine at cos(0)
     try expectApproxEqAbs(0.1, schedule.lr(10), 1e-4);

@@ -23,6 +23,8 @@ const compat = @import("../io/compat.zig");
 pub const FusedChunkBoundary = struct {
     start_char: u32,
     end_char: u32,
+    start_token: u32 = 0,
+    end_token: u32 = 0,
 };
 
 /// One training example: a document with pre-labeled chunk boundaries.
@@ -109,16 +111,95 @@ const RawChunk = struct {
     end_char: ?u32 = null,
     start: ?u32 = null,
     end: ?u32 = null,
+    start_token: ?u32 = null,
+    end_token: ?u32 = null,
 };
 
 const RawRecord = struct {
     text: []const u8,
     chunks: ?[]const RawChunk = null,
     chunk_boundaries: ?[]const RawChunk = null,
-    positives: ?[]const []const u8 = null,
-    /// Feature 7: flat array of hard negative strings at the sample level.
-    hard_negatives: ?[]const []const u8 = null,
+    /// Legacy flat positive strings, or a permissive JSON value for compatibility.
+    positives: ?std.json.Value = null,
+    /// Go production schema: [{"chunk_idx": 0, "positive_text": "..."}].
+    positive_pairs: ?std.json.Value = null,
+    /// Feature 7: accepts legacy flat strings or Go production objects:
+    /// [{"chunk_idx": 0, "negatives": ["...", "..."]}].
+    hard_negatives: ?std.json.Value = null,
 };
+
+fn appendPositiveTextsFromJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .string => |s| try out.append(allocator, s),
+        .array => |arr| {
+            for (arr.items) |item| try appendPositiveTextsFromJson(allocator, out, item);
+        },
+        .object => |obj| {
+            if (obj.get("positive_text")) |text_val| {
+                try appendPositiveTextsFromJson(allocator, out, text_val);
+            } else if (obj.get("text")) |text_val| {
+                try appendPositiveTextsFromJson(allocator, out, text_val);
+            } else if (obj.get("positives")) |texts_val| {
+                try appendPositiveTextsFromJson(allocator, out, texts_val);
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendHardNegativesFromJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .string => |s| try out.append(allocator, s),
+        .array => |arr| {
+            for (arr.items) |item| try appendHardNegativesFromJson(allocator, out, item);
+        },
+        .object => |obj| {
+            if (obj.get("negatives")) |texts_val| {
+                try appendHardNegativesFromJson(allocator, out, texts_val);
+            } else if (obj.get("negative_text")) |text_val| {
+                try appendHardNegativesFromJson(allocator, out, text_val);
+            } else if (obj.get("text")) |text_val| {
+                try appendHardNegativesFromJson(allocator, out, text_val);
+            }
+        },
+        else => {},
+    }
+}
+
+fn flattenPositiveTexts(
+    allocator: std.mem.Allocator,
+    rec: RawRecord,
+) ![]const []const u8 {
+    var texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer texts.deinit(allocator);
+
+    if (rec.positives) |value| try appendPositiveTextsFromJson(allocator, &texts, value);
+    if (rec.positive_pairs) |value| try appendPositiveTextsFromJson(allocator, &texts, value);
+
+    if (texts.items.len == 0) return &.{};
+    return try texts.toOwnedSlice(allocator);
+}
+
+fn flattenHardNegatives(
+    allocator: std.mem.Allocator,
+    rec: RawRecord,
+) ![]const []const u8 {
+    var texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer texts.deinit(allocator);
+
+    if (rec.hard_negatives) |value| try appendHardNegativesFromJson(allocator, &texts, value);
+
+    if (texts.items.len == 0) return &.{};
+    return try texts.toOwnedSlice(allocator);
+}
 
 // ---------------------------------------------------------------------------
 // File resolution (mirrors reranker_data.zig exactly)
@@ -184,12 +265,14 @@ fn lessThanString(_: void, lhs: []const u8, rhs: []const u8) bool {
 // JSONL loading
 // ---------------------------------------------------------------------------
 
+const max_fused_jsonl_file_bytes: usize = 1024 * 1024 * 1024;
+
 fn loadSamplesFromFile(
     allocator: std.mem.Allocator,
     path: []const u8,
     out: *std.ArrayListUnmanaged(FusedSample),
 ) !void {
-    const data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    const data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(max_fused_jsonl_file_bytes));
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -213,14 +296,18 @@ fn loadSamplesFromFile(
             boundaries[i] = .{
                 .start_char = rc.start_char orelse rc.start orelse 0,
                 .end_char = rc.end_char orelse rc.end orelse 0,
+                .start_token = rc.start_token orelse 0,
+                .end_token = rc.end_token orelse 0,
             };
         }
 
-        // Map optional positives.
-        const positives: []const []const u8 = rec.positives orelse &.{};
+        // Map optional positives from both the legacy flat schema and the Go
+        // production `positive_pairs` schema.
+        const positives = try flattenPositiveTexts(allocator, rec);
 
-        // Map optional hard negatives (Feature 7).
-        const hard_negs: []const []const u8 = rec.hard_negatives orelse &.{};
+        // Map optional hard negatives (Feature 7) from both flat strings and
+        // Go production chunk-scoped negative lists.
+        const hard_negs = try flattenHardNegatives(allocator, rec);
 
         try out.append(allocator, .{
             .text = rec.text,
@@ -320,13 +407,18 @@ pub fn charToTokenBoundary(
 
     // Find the last token whose byte range contains end_char (exclusive condition:
     // off[0] < end_char <= off[1] means end_char falls within or at the end of token t).
-    var end_tok: u32 = start_tok + 1; // exclusive; initialise to at least one token
+    var end_tok: u32 = start_tok;
+    var found_end = false;
     for (offsets, 0..) |off, t| {
         if (t > 0 and off[0] == 0 and off[1] == 0) continue;
         if (off[0] < end_char and end_char <= off[1]) {
             end_tok = @as(u32, @intCast(t)) + 1;
+            found_end = true;
             break;
         }
+    }
+    if (!found_end) {
+        return .{ .start_token = start_tok, .end_token = start_tok };
     }
 
     // Clamp end_tok to valid range.
@@ -416,14 +508,18 @@ pub fn assembleTokenBatch(
                 boundary.end_char,
                 active_offsets,
             );
-            chunk_starts[c_base + k] = @intCast(tok_span.start_token);
-            chunk_ends[c_base + k] = @intCast(tok_span.end_token);
-            chunk_mask[c_base + k] = 1.0;
+            const resolved_start = if (boundary.start_token > 0) boundary.start_token else tok_span.start_token;
+            const resolved_end = if (boundary.end_token > 0) boundary.end_token else tok_span.end_token;
+            const span_start = @min(resolved_start, @as(u32, @intCast(max_seq_len)));
+            const span_end = @min(resolved_end, @as(u32, @intCast(max_seq_len)));
+            chunk_starts[c_base + k] = @intCast(span_start);
+            chunk_ends[c_base + k] = @intCast(span_end);
+            chunk_mask[c_base + k] = if (span_end > span_start) 1.0 else 0.0;
 
             // Set boundary label at the first token of every chunk after the first.
             // This marks the positions where chunk splits occur in the sequence.
-            if (k > 0 and tok_span.start_token < max_seq_len) {
-                boundary_labels[i * max_seq_len + tok_span.start_token] = 1.0;
+            if (k > 0 and span_start < max_seq_len and span_end > span_start) {
+                boundary_labels[i * max_seq_len + span_start] = 1.0;
             }
         }
     }
@@ -483,6 +579,189 @@ pub fn assembleTokenBatch(
         .hard_neg_mask = hard_neg_mask_opt,
         .num_negatives = actual_num_negatives,
     };
+}
+
+/// Mean-pool token-level encoder features into one L2-normalized dense vector
+/// per chunk, matching the Go fused chunker late-chunking output.
+///
+/// features: [batch_size * max_seq_len * hidden_size]
+/// returns:  [batch_size * max_chunks * hidden_size]
+pub fn meanPoolChunkEmbeddings(
+    allocator: std.mem.Allocator,
+    features: []const f32,
+    batch: *const FusedBatch,
+    hidden_size: usize,
+) ![]f32 {
+    const B = batch.batch_size;
+    const S = batch.max_seq_len;
+    const C = batch.max_chunks;
+    if (features.len < B * S * hidden_size) return error.FeatureBufferTooSmall;
+
+    const out = try allocator.alloc(f32, B * C * hidden_size);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+
+    for (0..B) |b| {
+        for (0..C) |c| {
+            const chunk_idx = b * C + c;
+            if (batch.chunk_mask[chunk_idx] <= 0.5) continue;
+
+            var start_i = batch.chunk_starts[chunk_idx];
+            var end_i = batch.chunk_ends[chunk_idx];
+            if (start_i < 0) start_i = 0;
+            if (end_i < 0) end_i = 0;
+
+            const start = @min(@as(usize, @intCast(start_i)), S);
+            var end = @min(@as(usize, @intCast(end_i)), S);
+            if (end <= start and start < S) end = start + 1;
+            if (end <= start) continue;
+
+            const dst = out[chunk_idx * hidden_size .. (chunk_idx + 1) * hidden_size];
+            var count: usize = 0;
+            for (start..end) |t| {
+                if (batch.attention_mask[b * S + t] == 0) continue;
+                const src = features[(b * S + t) * hidden_size .. (b * S + t + 1) * hidden_size];
+                for (src, dst) |v, *acc| acc.* += v;
+                count += 1;
+            }
+            if (count == 0) {
+                @memset(dst, 0);
+                continue;
+            }
+            const inv_count = 1.0 / @as(f32, @floatFromInt(count));
+            for (dst) |*v| v.* *= inv_count;
+
+            var norm_sq: f32 = 0;
+            for (dst) |v| norm_sq += v * v;
+            const inv_norm = 1.0 / @sqrt(norm_sq + 1e-12);
+            for (dst) |*v| v.* *= inv_norm;
+        }
+    }
+
+    return out;
+}
+
+/// Scatter gradients from L2-normalized mean-pooled chunk embeddings back to
+/// token features.
+///
+/// `feature_grads` is updated in place and must be shaped
+/// [batch_size * max_seq_len * hidden_size]. `chunk_grads` is shaped
+/// [batch_size * max_chunks * hidden_size].
+pub fn addMeanPoolChunkEmbeddingGradToFeatures(
+    allocator: std.mem.Allocator,
+    feature_grads: []f32,
+    features: []const f32,
+    chunk_grads: []const f32,
+    chunk_starts: []const i32,
+    chunk_ends: []const i32,
+    chunk_mask: []const f32,
+    attention_mask: []const f32,
+    batch_size: usize,
+    max_seq_len: usize,
+    max_chunks: usize,
+    hidden_size: usize,
+) !void {
+    if (feature_grads.len < batch_size * max_seq_len * hidden_size) return error.FeatureGradBufferTooSmall;
+    if (features.len < batch_size * max_seq_len * hidden_size) return error.FeatureBufferTooSmall;
+    if (chunk_grads.len < batch_size * max_chunks * hidden_size) return error.ChunkGradBufferTooSmall;
+    if (chunk_starts.len < batch_size * max_chunks or
+        chunk_ends.len < batch_size * max_chunks or
+        chunk_mask.len < batch_size * max_chunks) return error.ChunkMetadataTooSmall;
+    if (attention_mask.len < batch_size * max_seq_len) return error.AttentionMaskTooSmall;
+
+    const pooled = try allocator.alloc(f32, hidden_size);
+    defer allocator.free(pooled);
+
+    for (0..batch_size) |b| {
+        for (0..max_chunks) |c| {
+            const chunk_idx = b * max_chunks + c;
+            if (chunk_mask[chunk_idx] <= 0.5) continue;
+
+            var start_i = chunk_starts[chunk_idx];
+            var end_i = chunk_ends[chunk_idx];
+            if (start_i < 0) start_i = 0;
+            if (end_i < 0) end_i = 0;
+
+            const start = @min(@as(usize, @intCast(start_i)), max_seq_len);
+            var end = @min(@as(usize, @intCast(end_i)), max_seq_len);
+            if (end <= start and start < max_seq_len) end = start + 1;
+            if (end <= start) continue;
+
+            var count: usize = 0;
+            for (start..end) |t| {
+                if (attention_mask[b * max_seq_len + t] > 0.5) count += 1;
+            }
+            if (count == 0) continue;
+
+            const inv_count = 1.0 / @as(f32, @floatFromInt(count));
+            const src = chunk_grads[chunk_idx * hidden_size .. (chunk_idx + 1) * hidden_size];
+            @memset(pooled, 0);
+            for (start..end) |t| {
+                if (attention_mask[b * max_seq_len + t] <= 0.5) continue;
+                const row = features[(b * max_seq_len + t) * hidden_size .. (b * max_seq_len + t + 1) * hidden_size];
+                for (row, pooled) |v, *acc| acc.* += v;
+            }
+            for (0..hidden_size) |h| {
+                pooled[h] *= inv_count;
+            }
+
+            var norm_sq: f32 = 0;
+            for (pooled) |v| {
+                norm_sq += v * v;
+            }
+            const norm = @sqrt(norm_sq + 1e-12);
+            const inv_norm = 1.0 / norm;
+
+            var dot_y_g: f32 = 0;
+            for (pooled, src) |p, g| {
+                const y = p * inv_norm;
+                dot_y_g += y * g;
+            }
+
+            for (start..end) |t| {
+                if (attention_mask[b * max_seq_len + t] <= 0.5) continue;
+                const dst = feature_grads[(b * max_seq_len + t) * hidden_size .. (b * max_seq_len + t + 1) * hidden_size];
+                for (0..hidden_size) |h| {
+                    const y = pooled[h] * inv_norm;
+                    const d_pooled = (src[h] - y * dot_y_g) * inv_norm;
+                    dst[h] += d_pooled * inv_count;
+                }
+            }
+        }
+    }
+}
+
+/// Mean-pool full sequence representations into one vector per sequence.
+pub fn meanPoolSequenceEmbeddings(
+    allocator: std.mem.Allocator,
+    features: []const f32,
+    attention_mask: []const i32,
+    num_sequences: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) ![]f32 {
+    if (features.len < num_sequences * seq_len * hidden_size) return error.FeatureBufferTooSmall;
+    if (attention_mask.len < num_sequences * seq_len) return error.AttentionMaskTooSmall;
+
+    const out = try allocator.alloc(f32, num_sequences * hidden_size);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+
+    for (0..num_sequences) |s| {
+        const dst = out[s * hidden_size .. (s + 1) * hidden_size];
+        var count: usize = 0;
+        for (0..seq_len) |t| {
+            if (attention_mask[s * seq_len + t] == 0) continue;
+            const src = features[(s * seq_len + t) * hidden_size .. (s * seq_len + t + 1) * hidden_size];
+            for (src, dst) |v, *acc| acc.* += v;
+            count += 1;
+        }
+        if (count == 0) continue;
+        const inv_count = 1.0 / @as(f32, @floatFromInt(count));
+        for (dst) |*v| v.* *= inv_count;
+    }
+
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,12 +842,203 @@ test "charToTokenBoundary: basic span mapping" {
         try std.testing.expectEqual(@as(u32, 4), r.start_token);
         try std.testing.expectEqual(@as(u32, 5), r.end_token);
     }
+    // Span starts inside the tokenized window but ends after it; match the Go
+    // trainer by returning an empty span so the chunk is masked out.
+    {
+        const r = charToTokenBoundary(12, 100, &offsets);
+        try std.testing.expectEqual(@as(u32, 4), r.start_token);
+        try std.testing.expectEqual(@as(u32, 4), r.end_token);
+    }
     // start_char beyond all tokens => clamped to end
     {
         const r = charToTokenBoundary(100, 110, &offsets);
         try std.testing.expectEqual(@as(u32, 6), r.start_token);
         try std.testing.expectEqual(@as(u32, 6), r.end_token);
     }
+}
+
+test "assembleTokenBatch masks chunks outside tokenized window" {
+    const allocator = std.testing.allocator;
+    const boundaries = [_]FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 3 },
+        .{ .start_char = 100, .end_char = 110 },
+    };
+    const samples = [_]FusedSample{.{
+        .text = "abc def",
+        .chunk_boundaries = &boundaries,
+        .positive_texts = &.{},
+    }};
+    const indices = [_]usize{0};
+
+    const token_fn = struct {
+        fn call(_: void, _: []const u8, out_ids: []i32, out_mask: []i32, out_offsets: ?[][2]u32) usize {
+            @memset(out_ids, 0);
+            @memset(out_mask, 0);
+            out_ids[0] = 10;
+            out_ids[1] = 11;
+            out_mask[0] = 1;
+            out_mask[1] = 1;
+            if (out_offsets) |offsets| {
+                @memset(offsets, .{ 0, 0 });
+                offsets[0] = .{ 0, 3 };
+                offsets[1] = .{ 4, 7 };
+            }
+            return 2;
+        }
+    }.call;
+
+    var batch = try assembleTokenBatch(allocator, &samples, &indices, 4, 2, {}, token_fn);
+    defer batch.deinit(allocator);
+
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, batch.chunk_mask);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2 }, batch.chunk_starts);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, batch.chunk_ends);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, batch.boundary_labels);
+}
+
+test "assembleTokenBatch honors provided token boundaries" {
+    const allocator = std.testing.allocator;
+    const boundaries = [_]FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 3 },
+        .{ .start_char = 100, .end_char = 110, .start_token = 1, .end_token = 2 },
+    };
+    const samples = [_]FusedSample{.{
+        .text = "abc def",
+        .chunk_boundaries = &boundaries,
+        .positive_texts = &.{},
+    }};
+    const indices = [_]usize{0};
+
+    const token_fn = struct {
+        fn call(_: void, _: []const u8, out_ids: []i32, out_mask: []i32, out_offsets: ?[][2]u32) usize {
+            @memset(out_ids, 0);
+            @memset(out_mask, 0);
+            out_ids[0] = 10;
+            out_ids[1] = 11;
+            out_mask[0] = 1;
+            out_mask[1] = 1;
+            if (out_offsets) |offsets| {
+                @memset(offsets, .{ 0, 0 });
+                offsets[0] = .{ 0, 3 };
+                offsets[1] = .{ 4, 7 };
+            }
+            return 2;
+        }
+    }.call;
+
+    var batch = try assembleTokenBatch(allocator, &samples, &indices, 4, 2, {}, token_fn);
+    defer batch.deinit(allocator);
+
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 1.0 }, batch.chunk_mask);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, batch.chunk_starts);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, batch.chunk_ends);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 0, 0 }, batch.boundary_labels);
+}
+
+test "meanPoolChunkEmbeddings averages and normalizes chunk token ranges with attention mask" {
+    const allocator = std.testing.allocator;
+    var input_ids = [_]i32{ 1, 2, 3, 4 };
+    var attention_mask = [_]i32{ 1, 1, 0, 1 };
+    var boundary_labels = [_]f32{ 0, 1, 0, 0 };
+    var chunk_starts = [_]i32{ 0, 1, 2 };
+    var chunk_ends = [_]i32{ 2, 4, 4 };
+    var chunk_mask = [_]f32{ 1, 1, 0 };
+    var sample_indices = [_]usize{0};
+    const batch = FusedBatch{
+        .batch_size = 1,
+        .max_seq_len = 4,
+        .max_chunks = 3,
+        .input_ids = &input_ids,
+        .attention_mask = &attention_mask,
+        .boundary_labels = &boundary_labels,
+        .chunk_starts = &chunk_starts,
+        .chunk_ends = &chunk_ends,
+        .chunk_mask = &chunk_mask,
+        .sample_indices = &sample_indices,
+    };
+    const features = [_]f32{
+        1,  10,
+        3,  30,
+        99, 99,
+        5,  50,
+    };
+
+    const pooled = try meanPoolChunkEmbeddings(allocator, &features, &batch, 2);
+    defer allocator.free(pooled);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / @sqrt(@as(f32, 404.0))), pooled[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0 / @sqrt(@as(f32, 404.0))), pooled[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0 / @sqrt(@as(f32, 1616.0))), pooled[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 40.0 / @sqrt(@as(f32, 1616.0))), pooled[3], 1e-6);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, pooled[4..6]);
+}
+
+test "addMeanPoolChunkEmbeddingGradToFeatures scatters pooled gradients" {
+    const allocator = std.testing.allocator;
+    var feature_grads = [_]f32{
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+    };
+    const chunk_grads = [_]f32{
+        2, 20,
+        3, 30,
+    };
+    const features = [_]f32{
+        1,  10,
+        3,  30,
+        99, 99,
+        5,  50,
+    };
+    const chunk_starts = [_]i32{ 0, 1 };
+    const chunk_ends = [_]i32{ 2, 4 };
+    const chunk_mask = [_]f32{ 1, 1 };
+    const attention_mask = [_]f32{ 1, 1, 0, 1 };
+
+    try addMeanPoolChunkEmbeddingGradToFeatures(
+        allocator,
+        &feature_grads,
+        &features,
+        &chunk_grads,
+        &chunk_starts,
+        &chunk_ends,
+        &chunk_mask,
+        &attention_mask,
+        1,
+        4,
+        2,
+        2,
+    );
+
+    for (feature_grads[0..6]) |value| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0), value, 1e-4);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, feature_grads[4..6]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), feature_grads[6], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), feature_grads[7], 1e-4);
+}
+
+test "meanPoolSequenceEmbeddings averages each valid sequence" {
+    const allocator = std.testing.allocator;
+    const features = [_]f32{
+        1,  10,
+        3,  30,
+        5,  50,
+        7,  70,
+        9,  90,
+        11, 110,
+    };
+    const mask = [_]i32{
+        1, 0, 1,
+        0, 1, 1,
+    };
+
+    const pooled = try meanPoolSequenceEmbeddings(allocator, &features, &mask, 2, 3, 2);
+    defer allocator.free(pooled);
+
+    try std.testing.expectEqualSlices(f32, &.{ 3, 30 }, pooled[0..2]);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 100 }, pooled[2..4]);
 }
 
 test "computeStats: hardcoded samples" {
@@ -641,6 +1111,46 @@ test "JSON parsing: both chunk field names and both coordinate field names" {
     try std.testing.expectEqual(@as(?u32, 3), rec_b.chunk_boundaries.?[0].end);
     try std.testing.expectEqual(@as(?u32, null), rec_b.chunk_boundaries.?[0].start_char);
     try std.testing.expect(rec_b.positives != null);
-    try std.testing.expectEqual(@as(usize, 1), rec_b.positives.?.len);
-    try std.testing.expectEqualStrings("alt text", rec_b.positives.?[0]);
+    const positives_b = try flattenPositiveTexts(aa, rec_b);
+    try std.testing.expectEqual(@as(usize, 1), positives_b.len);
+    try std.testing.expectEqualStrings("alt text", positives_b[0]);
+}
+
+test "JSON parsing: Go production positive_pairs and hard_negatives flatten" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const line =
+        \\{
+        \\  "text":"alpha beta gamma delta",
+        \\  "chunk_boundaries":[
+        \\    {"start_char":0,"end_char":10,"start_token":1,"end_token":3},
+        \\    {"start_char":11,"end_char":22,"start_token":3,"end_token":5}
+        \\  ],
+        \\  "positive_pairs":[
+        \\    {"chunk_idx":0,"positive_text":"related alpha beta"},
+        \\    {"chunk_idx":1,"positive_text":"related gamma delta"}
+        \\  ],
+        \\  "hard_negatives":[
+        \\    {"chunk_idx":0,"negatives":["unrelated finance","unrelated sports"]},
+        \\    {"chunk_idx":1,"negatives":["unrelated cooking"]}
+        \\  ]
+        \\}
+    ;
+    const rec = try std.json.parseFromSliceLeaky(RawRecord, aa, line, .{
+        .ignore_unknown_fields = true,
+    });
+
+    const positives = try flattenPositiveTexts(aa, rec);
+    try std.testing.expectEqual(@as(usize, 2), positives.len);
+    try std.testing.expectEqualStrings("related alpha beta", positives[0]);
+    try std.testing.expectEqualStrings("related gamma delta", positives[1]);
+
+    const negatives = try flattenHardNegatives(aa, rec);
+    try std.testing.expectEqual(@as(usize, 3), negatives.len);
+    try std.testing.expectEqualStrings("unrelated finance", negatives[0]);
+    try std.testing.expectEqualStrings("unrelated sports", negatives[1]);
+    try std.testing.expectEqualStrings("unrelated cooking", negatives[2]);
 }

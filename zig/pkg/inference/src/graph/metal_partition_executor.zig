@@ -4582,7 +4582,7 @@ fn executeRuntimeUnary(
         .erf => cb.primErf(input),
         .abs => cb.primAbs(input),
     } catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.InvalidTensorShape, error.ShapeMismatch => null,
         else => return err,
     };
 }
@@ -4721,10 +4721,8 @@ fn executeRuntimeConstant(
 
     var shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
     const rank = output_shape.rank();
-    const ct = if (rank > 1) blk: {
-        for (0..rank) |axis| shape_buf[axis] = @intCast(output_shape.dim(@intCast(axis)));
-        break :blk try cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
-    } else try cb.fromFloat32(constant.data);
+    for (0..rank) |axis| shape_buf[axis] = @intCast(output_shape.dim(@intCast(axis)));
+    const ct = try cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
     errdefer cb.free(ct);
 
     if (isMetalDeviceResident(cb, ct)) return ct;
@@ -5003,7 +5001,7 @@ fn executeRuntimeBroadcast(
         attrs.broadcast_axes[0..attrs.num_axes],
         in_shape_buf[0..in_rank],
     ) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.InvalidTensorShape, error.ShapeMismatch => null,
         else => return err,
     };
 }
@@ -5031,7 +5029,7 @@ fn executeRuntimeReduce(
         .max => cb.primReduceMax(input, axes, in_shape),
         .mean => cb.primReduceMean(input, axes, in_shape),
     } catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.InvalidTensorShape, error.ShapeMismatch => null,
         else => return err,
     };
 }
@@ -5057,7 +5055,7 @@ fn executeRuntimeBinary(
         .divide => cb.primDivide(lhs, rhs),
         .less_than => cb.primLessThan(lhs, rhs),
     } catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.InvalidTensorShape, error.ShapeMismatch => null,
         else => return err,
     };
 }
@@ -5555,7 +5553,7 @@ fn executeRuntimeActivation(
         .quick_gelu => cb.quickGelu(input),
         else => return null,
     } catch |err| switch (err) {
-        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
 }
@@ -5571,13 +5569,13 @@ fn executeRuntimeAdd(
     const dim = tensorElementCount(output_shape) orelse return null;
     if (isMetalDeviceResident(cb, lhs) or isMetalDeviceResident(cb, rhs)) {
         return cb.add(lhs, rhs) catch |err| switch (err) {
-            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch => null,
             else => return err,
         };
     }
     if (try cb.decoderRuntimeApplyAdd(&.{ .lhs = lhs, .rhs = rhs, .dim = dim })) |result| return result;
     return cb.add(lhs, rhs) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
 }
