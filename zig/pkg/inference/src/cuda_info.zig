@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const ops = @import("ops/ops.zig");
 const tensor_store_mod = @import("models/tensor_store.zig");
 const weight_source_mod = @import("models/weight_source.zig");
+const gguf_mod = @import("gguf/root.zig");
 
 const print = std.debug.print;
 
@@ -42,6 +43,10 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
     var smoke = false;
     var gemma4_parity_path: ?[]const u8 = null;
     var gemma4_hf_parity_path: ?[]const u8 = null;
+    var gemma4_cross_gguf_path: ?[]const u8 = null;
+    var gemma4_cross_hf_dir: ?[]const u8 = null;
+    var gemma4_cross_layer0_gguf_path: ?[]const u8 = null;
+    var gemma4_cross_layer0_hf_dir: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -63,6 +68,36 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             }
             gemma4_hf_parity_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--gemma4-cross-parity")) {
+            i += 1;
+            if (i >= args.len) {
+                print("missing GGUF value for --gemma4-cross-parity\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_cross_gguf_path = args[i];
+            i += 1;
+            if (i >= args.len) {
+                print("missing HF model-dir value for --gemma4-cross-parity\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_cross_hf_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--gemma4-cross-layer0")) {
+            i += 1;
+            if (i >= args.len) {
+                print("missing GGUF value for --gemma4-cross-layer0\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_cross_layer0_gguf_path = args[i];
+            i += 1;
+            if (i >= args.len) {
+                print("missing HF model-dir value for --gemma4-cross-layer0\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_cross_layer0_hf_dir = args[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -156,6 +191,20 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
             };
             print("gemma4_hf_parity: ok\n", .{});
         }
+        if (gemma4_cross_gguf_path) |gguf_path| {
+            runGemma4CrossParity(allocator, gguf_path, gemma4_cross_hf_dir orelse return error.InvalidArguments) catch |err| {
+                print("gemma4_cross_parity: failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("gemma4_cross_parity: ok\n", .{});
+        }
+        if (gemma4_cross_layer0_gguf_path) |gguf_path| {
+            runGemma4CrossLayer0(allocator, gguf_path, gemma4_cross_layer0_hf_dir orelse return error.InvalidArguments) catch |err| {
+                print("gemma4_cross_layer0: failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("gemma4_cross_layer0: ok\n", .{});
+        }
     }
 }
 
@@ -216,6 +265,10 @@ fn printUsage() void {
         \\            Compare real Gemma 4 GGUF projection tensors on CUDA against CPU dequantized matmul.
         \\  --gemma4-hf-parity <model-dir>
         \\            Compare real Gemma 4 HF safetensors tensors on CUDA against CPU BF16->F32 reference math.
+        \\  --gemma4-cross-parity <gguf> <model-dir>
+        \\            Compare selected Gemma 4 GGUF tensors against the source HF safetensors tensors.
+        \\  --gemma4-cross-layer0 <gguf> <model-dir>
+        \\            Compare a CPU layer-0 forward pass for GGUF dequantized weights against HF safetensors.
         \\
     , .{});
 }
@@ -238,6 +291,25 @@ const gemma4_parity_cases = [_]Gemma4ParityCase{
     .{ .name = "blk.5.ffn_gate.weight" },
     .{ .name = "blk.5.ffn_up.weight" },
     .{ .name = "blk.5.ffn_down.weight" },
+};
+
+const gemma4_cross_parity_cases = [_]Gemma4ParityCase{
+    .{ .name = "blk.0.attn_q.weight" },
+    .{ .name = "blk.0.attn_output.weight" },
+    .{ .name = "blk.0.ffn_gate.weight" },
+    .{ .name = "blk.0.ffn_down.weight" },
+    .{ .name = "blk.5.attn_q.weight" },
+    .{ .name = "blk.5.attn_k.weight" },
+    .{ .name = "blk.5.attn_output.weight" },
+    .{ .name = "blk.5.ffn_down.weight" },
+    .{ .name = "blk.11.attn_q.weight" },
+    .{ .name = "blk.11.attn_k.weight" },
+    .{ .name = "blk.11.attn_output.weight" },
+    .{ .name = "blk.12.ffn_down.weight" },
+    .{ .name = "blk.23.ffn_down.weight" },
+    .{ .name = "blk.35.ffn_down.weight" },
+    .{ .name = "blk.47.attn_q.weight" },
+    .{ .name = "blk.47.attn_output.weight" },
 };
 
 const DiffStats = struct {
@@ -272,6 +344,412 @@ fn runGemma4HfParity(allocator: std.mem.Allocator, model_dir: []const u8) !void 
     try runGemma4ParityOnStore(allocator, sharded.tensorStore());
 }
 
+fn runGemma4CrossParity(allocator: std.mem.Allocator, gguf_path: []const u8, model_dir: []const u8) !void {
+    const gguf_store = try tensor_store_mod.GgufStore.initAbsolute(allocator, gguf_path);
+    defer gguf_store.tensorStore().deinit();
+
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
+    const single = tensor_store_mod.SafetensorsStore.initAbsolute(allocator, safetensors_path) catch |single_err| blk: {
+        if (single_err != error.FileNotFound and single_err != error.NotFound and single_err != error.AccessDenied) return single_err;
+        break :blk null;
+    };
+    if (single) |hf_store| {
+        defer hf_store.tensorStore().deinit();
+        try runGemma4CrossParityOnStores(allocator, gguf_store.tensorStore(), hf_store.tensorStore());
+        return;
+    }
+
+    const index_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    const sharded = try tensor_store_mod.ShardedSafetensorsStore.initAbsolute(allocator, index_path);
+    defer sharded.tensorStore().deinit();
+    try runGemma4CrossParityOnStores(allocator, gguf_store.tensorStore(), sharded.tensorStore());
+}
+
+fn runGemma4CrossLayer0(allocator: std.mem.Allocator, gguf_path: []const u8, model_dir: []const u8) !void {
+    const gguf_store = try tensor_store_mod.GgufStore.initAbsolute(allocator, gguf_path);
+    defer gguf_store.tensorStore().deinit();
+
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
+    const single = tensor_store_mod.SafetensorsStore.initAbsolute(allocator, safetensors_path) catch |single_err| blk: {
+        if (single_err != error.FileNotFound and single_err != error.NotFound and single_err != error.AccessDenied) return single_err;
+        break :blk null;
+    };
+    if (single) |hf_store| {
+        defer hf_store.tensorStore().deinit();
+        try runGemma4CrossLayer0OnStores(allocator, gguf_store.tensorStore(), hf_store.tensorStore());
+        return;
+    }
+
+    const index_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    const sharded = try tensor_store_mod.ShardedSafetensorsStore.initAbsolute(allocator, index_path);
+    defer sharded.tensorStore().deinit();
+    try runGemma4CrossLayer0OnStores(allocator, gguf_store.tensorStore(), sharded.tensorStore());
+}
+
+const Gemma4Layer0CpuOutputs = struct {
+    attn_norm: []f32,
+    q: []f32,
+    k: []f32,
+    v: []f32,
+    q_rope: []f32,
+    k_rope: []f32,
+    v_norm: []f32,
+    attn_out: []f32,
+    attn_proj: []f32,
+    attn_post: []f32,
+    attn_residual: []f32,
+    ffn_norm: []f32,
+    ffn_gate: []f32,
+    ffn_up: []f32,
+    ffn_gated: []f32,
+    ffn_raw: []f32,
+    ffn_post: []f32,
+    out: []f32,
+
+    fn deinit(self: *Gemma4Layer0CpuOutputs, allocator: std.mem.Allocator) void {
+        allocator.free(self.attn_norm);
+        allocator.free(self.q);
+        allocator.free(self.k);
+        allocator.free(self.v);
+        allocator.free(self.q_rope);
+        allocator.free(self.k_rope);
+        allocator.free(self.v_norm);
+        allocator.free(self.attn_out);
+        allocator.free(self.attn_proj);
+        allocator.free(self.attn_post);
+        allocator.free(self.attn_residual);
+        allocator.free(self.ffn_norm);
+        allocator.free(self.ffn_gate);
+        allocator.free(self.ffn_up);
+        allocator.free(self.ffn_gated);
+        allocator.free(self.ffn_raw);
+        allocator.free(self.ffn_post);
+        allocator.free(self.out);
+        self.* = undefined;
+    }
+};
+
+fn runGemma4CrossLayer0OnStores(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+) !void {
+    const rows: usize = 15;
+    const hidden: usize = 3840;
+    const input = try makeParityInput(allocator, rows * hidden);
+    defer allocator.free(input);
+
+    var hf_weights = try loadGemma4Layer0WeightsHostOnly(allocator, hf_store);
+    defer hf_weights.deinit(allocator);
+    var hf = try computeGemma4Layer0Cpu(allocator, &hf_weights, input, rows, true);
+    defer hf.deinit(allocator);
+
+    var gguf_weights = try loadGemma4Layer0WeightsHostOnly(allocator, gguf_store);
+    defer gguf_weights.deinit(allocator);
+    var gguf = try computeGemma4Layer0Cpu(allocator, &gguf_weights, input, rows, false);
+    defer gguf.deinit(allocator);
+
+    printGemma4CrossLayerStage("attn_norm", gguf.attn_norm, hf.attn_norm);
+    printGemma4CrossLayerStage("q", gguf.q, hf.q);
+    printGemma4CrossLayerStage("k", gguf.k, hf.k);
+    printGemma4CrossLayerStage("v", gguf.v, hf.v);
+    printGemma4CrossLayerStage("q_rope", gguf.q_rope, hf.q_rope);
+    printGemma4CrossLayerStage("k_rope", gguf.k_rope, hf.k_rope);
+    printGemma4CrossLayerStage("v_norm", gguf.v_norm, hf.v_norm);
+    printGemma4CrossLayerStage("attn_out", gguf.attn_out, hf.attn_out);
+    printGemma4CrossLayerStage("attn_proj", gguf.attn_proj, hf.attn_proj);
+    printGemma4CrossLayerStage("attn_post", gguf.attn_post, hf.attn_post);
+    printGemma4CrossLayerStage("attn_residual", gguf.attn_residual, hf.attn_residual);
+    printGemma4CrossLayerStage("ffn_norm", gguf.ffn_norm, hf.ffn_norm);
+    printGemma4CrossLayerStage("ffn_gate", gguf.ffn_gate, hf.ffn_gate);
+    printGemma4CrossLayerStage("ffn_up", gguf.ffn_up, hf.ffn_up);
+    printGemma4CrossLayerStage("ffn_gated", gguf.ffn_gated, hf.ffn_gated);
+    printGemma4CrossLayerStage("ffn_raw", gguf.ffn_raw, hf.ffn_raw);
+    printGemma4CrossLayerStage("ffn_post", gguf.ffn_post, hf.ffn_post);
+    printGemma4CrossLayerStage("out", gguf.out, hf.out);
+}
+
+fn printGemma4CrossLayerStage(stage: []const u8, actual: []const f32, expected: []const f32) void {
+    if (actual.len != expected.len) {
+        print("gemma4_cross_layer0: stage={s} shape_mismatch actual={d} expected={d}\n", .{ stage, actual.len, expected.len });
+        return;
+    }
+    const stats = diffStats(actual, expected);
+    print(
+        "gemma4_cross_layer0: stage={s} max_abs={d:.6} mean_abs={d:.6} max_index={d} actual={d:.6} expected={d:.6}\n",
+        .{ stage, stats.max_abs, stats.mean_abs, stats.max_index, actual[stats.max_index], expected[stats.max_index] },
+    );
+}
+
+fn loadGemma4Layer0WeightsHostOnly(
+    allocator: std.mem.Allocator,
+    tensor_store: tensor_store_mod.TensorStore,
+) !Gemma4Layer0Weights {
+    return .{
+        .attn_norm = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_norm.weight"),
+        .q = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_q.weight"),
+        .k = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_k.weight"),
+        .v = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_v.weight"),
+        .q_norm = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_q_norm.weight"),
+        .k_norm = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_k_norm.weight"),
+        .attn_output = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.attn_output.weight"),
+        .post_attention_norm = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.post_attention_norm.weight"),
+        .ffn_norm = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.ffn_norm.weight"),
+        .ffn_gate = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.ffn_gate.weight"),
+        .ffn_up = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.ffn_up.weight"),
+        .ffn_down = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.ffn_down.weight"),
+        .post_ffw_norm = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.post_ffw_norm.weight"),
+        .layer_output_scale = try loadLayerWeightHostOnly(allocator, tensor_store, "blk.0.layer_output_scale.weight"),
+    };
+}
+
+fn loadLayerWeightHostOnly(
+    allocator: std.mem.Allocator,
+    tensor_store: tensor_store_mod.TensorStore,
+    name: []const u8,
+) ![]f32 {
+    const source_name = try resolveGemma4ParityTensorName(allocator, tensor_store, name);
+    defer allocator.free(source_name);
+    var tensor_ref = try tensor_store.describeTensor(allocator, source_name);
+    defer tensor_ref.deinit(allocator);
+    var loaded = try tensor_store.loadTensorRef(&tensor_ref);
+    defer loaded.deinit();
+    return try tensorToFloat32Owned(allocator, &loaded.tensor);
+}
+
+fn computeGemma4Layer0Cpu(
+    allocator: std.mem.Allocator,
+    weights: *const Gemma4Layer0Weights,
+    input: []const f32,
+    rows: usize,
+    bf16_linear_inputs: bool,
+) !Gemma4Layer0CpuOutputs {
+    const hidden: usize = 3840;
+    const q_dim: usize = 4096;
+    const kv_dim: usize = 2048;
+    const num_heads: usize = 16;
+    const num_kv_heads: usize = 8;
+    const head_dim: usize = 256;
+    const inter: usize = 15360;
+    const eps: f32 = 0.000001;
+    const theta: f32 = 10000.0;
+    if (input.len != rows * hidden) return error.InvalidTensorShape;
+
+    var out = Gemma4Layer0CpuOutputs{
+        .attn_norm = try allocator.alloc(f32, rows * hidden),
+        .q = try allocator.alloc(f32, rows * q_dim),
+        .k = try allocator.alloc(f32, rows * kv_dim),
+        .v = try allocator.alloc(f32, rows * kv_dim),
+        .q_rope = try allocator.alloc(f32, rows * q_dim),
+        .k_rope = try allocator.alloc(f32, rows * kv_dim),
+        .v_norm = try allocator.alloc(f32, rows * kv_dim),
+        .attn_out = try allocator.alloc(f32, rows * q_dim),
+        .attn_proj = try allocator.alloc(f32, rows * hidden),
+        .attn_post = try allocator.alloc(f32, rows * hidden),
+        .attn_residual = try allocator.alloc(f32, rows * hidden),
+        .ffn_norm = try allocator.alloc(f32, rows * hidden),
+        .ffn_gate = try allocator.alloc(f32, rows * inter),
+        .ffn_up = try allocator.alloc(f32, rows * inter),
+        .ffn_gated = try allocator.alloc(f32, rows * inter),
+        .ffn_raw = try allocator.alloc(f32, rows * hidden),
+        .ffn_post = try allocator.alloc(f32, rows * hidden),
+        .out = try allocator.alloc(f32, rows * hidden),
+    };
+    errdefer out.deinit(allocator);
+
+    cpuRmsNormRows(input, weights.attn_norm, out.attn_norm, rows, hidden, eps);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.attn_norm, weights.q, out.q, rows, hidden, q_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.attn_norm, weights.k, out.k, rows, hidden, kv_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.attn_norm, weights.v, out.v, rows, hidden, kv_dim);
+    cpuRmsNormHeadsRope(out.q, weights.q_norm, out.q_rope, rows, q_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, @sqrt(@as(f32, @floatFromInt(head_dim))));
+    cpuRmsNormHeadsRope(out.k, weights.k_norm, out.k_rope, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0);
+    cpuRmsNormBareRows(out.v, out.v_norm, rows * num_kv_heads, head_dim, eps);
+    cpuGqaCausalAttention(out.q_rope, out.k_rope, out.v_norm, out.attn_out, 1, rows, num_heads, num_kv_heads, head_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.attn_out, weights.attn_output, out.attn_proj, rows, q_dim, hidden);
+    cpuRmsNormRows(out.attn_proj, weights.post_attention_norm, out.attn_post, rows, hidden, eps);
+    cpuAdd(out.attn_post, input, out.attn_residual);
+    cpuRmsNormRows(out.attn_residual, weights.ffn_norm, out.ffn_norm, rows, hidden, eps);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.ffn_norm, weights.ffn_gate, out.ffn_gate, rows, hidden, inter);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.ffn_norm, weights.ffn_up, out.ffn_up, rows, hidden, inter);
+    cpuSiluMultiply(out.ffn_gate, out.ffn_up, out.ffn_gated);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, out.ffn_gated, weights.ffn_down, out.ffn_raw, rows, inter, hidden);
+    cpuRmsNormRows(out.ffn_raw, weights.post_ffw_norm, out.ffn_post, rows, hidden, eps);
+    cpuAddScaled(out.ffn_post, out.attn_residual, weights.layer_output_scale[0], out.out);
+    return out;
+}
+
+fn runGemma4CrossParityOnStores(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+) !void {
+    for (gemma4_cross_parity_cases) |case| {
+        try runGemma4CrossParityCase(allocator, gguf_store, hf_store, case);
+    }
+    try runGemma4EmbeddingRowCrossParity(allocator, gguf_store, hf_store);
+}
+
+fn runGemma4CrossParityCase(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+    case: Gemma4ParityCase,
+) !void {
+    var gguf_ref = try gguf_store.describeTensor(allocator, case.name);
+    defer gguf_ref.deinit(allocator);
+    var gguf_loaded = try gguf_store.loadTensorRef(&gguf_ref);
+    defer gguf_loaded.deinit();
+
+    const hf_name = try resolveGemma4ParityTensorName(allocator, hf_store, case.name);
+    defer allocator.free(hf_name);
+    var hf_ref = try hf_store.describeTensor(allocator, hf_name);
+    defer hf_ref.deinit(allocator);
+    var hf_loaded = try hf_store.loadTensorRef(&hf_ref);
+    defer hf_loaded.deinit();
+
+    if (gguf_loaded.tensor.shape.len != hf_loaded.tensor.shape.len) return error.InvalidTensorShape;
+    for (gguf_loaded.tensor.shape, hf_loaded.tensor.shape) |lhs, rhs| {
+        if (lhs != rhs) return error.InvalidTensorShape;
+    }
+    if (gguf_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
+    const out_dim: usize = @intCast(gguf_loaded.tensor.shape[0]);
+    const in_dim: usize = @intCast(gguf_loaded.tensor.shape[1]);
+
+    const gguf_values = try tensorToFloat32Owned(allocator, &gguf_loaded.tensor);
+    defer allocator.free(gguf_values);
+    const hf_values = try tensorToFloat32Owned(allocator, &hf_loaded.tensor);
+    defer allocator.free(hf_values);
+    if (gguf_values.len != hf_values.len) return error.InvalidTensorShape;
+
+    const weight_stats = diffStats(gguf_values, hf_values);
+
+    const input = try makeParityInput(allocator, in_dim);
+    defer allocator.free(input);
+    const gguf_out = try allocator.alloc(f32, out_dim);
+    defer allocator.free(gguf_out);
+    const hf_out = try allocator.alloc(f32, out_dim);
+    defer allocator.free(hf_out);
+    cpuLinearNoBias(input, gguf_values, gguf_out, in_dim, out_dim);
+    cpuLinearNoBias(input, hf_values, hf_out, in_dim, out_dim);
+    const linear_stats = diffStats(gguf_out, hf_out);
+
+    const quant_name = if (gguf_loaded.quantized_storage) |storage| storage.tensor_type.name() else "dense";
+    print(
+        "gemma4_cross_parity: {s} source={s} type={s} shape=[{d},{d}] weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_max_index={d} linear_max_abs={d:.6} linear_mean_abs={d:.6} linear_max_index={d}\n",
+        .{
+            case.name,
+            hf_name,
+            quant_name,
+            out_dim,
+            in_dim,
+            weight_stats.max_abs,
+            weight_stats.mean_abs,
+            weight_stats.max_index,
+            linear_stats.max_abs,
+            linear_stats.mean_abs,
+            linear_stats.max_index,
+        },
+    );
+}
+
+fn runGemma4EmbeddingRowCrossParity(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+) !void {
+    const gguf_name = "token_embd.weight";
+    const hf_name = try resolveGemma4ParityTensorName(allocator, hf_store, gguf_name);
+    defer allocator.free(hf_name);
+
+    var gguf_ref = try gguf_store.describeTensor(allocator, gguf_name);
+    defer gguf_ref.deinit(allocator);
+    var storage = (try gguf_store.loadQuantizedStorageRef(&gguf_ref)) orelse return error.UnsupportedTensorType;
+    defer storage.deinit();
+    if (storage.shape.len != 2) return error.InvalidTensorShape;
+    const vocab: usize = @intCast(storage.shape[0]);
+    const hidden: usize = @intCast(storage.shape[1]);
+    const values_per_block = gguf_mod.tensor_types.valuesPerBlock(storage.tensor_type) orelse return error.UnsupportedTensorType;
+    const bytes_per_block = gguf_mod.tensor_types.bytesPerBlock(storage.tensor_type) orelse return error.UnsupportedTensorType;
+    if (hidden == 0 or hidden % values_per_block != 0) return error.InvalidTensorShape;
+    const row_blocks = hidden / values_per_block;
+    const row_bytes = row_blocks * bytes_per_block;
+    if (storage.raw_bytes.len < vocab * row_bytes) return error.InvalidTensorShape;
+
+    var hf_ref = try hf_store.describeTensor(allocator, hf_name);
+    defer hf_ref.deinit(allocator);
+    var hf_loaded = try hf_store.loadTensorRef(&hf_ref);
+    defer hf_loaded.deinit();
+    if (hf_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
+    if (@as(usize, @intCast(hf_loaded.tensor.shape[0])) != vocab or @as(usize, @intCast(hf_loaded.tensor.shape[1])) != hidden) {
+        return error.InvalidTensorShape;
+    }
+
+    const sampled_ids = [_]usize{ 0, 1, 2, 100, 101, 105, 107, 14054, 45518, 236751, 236761, 236770, 258882 };
+    const gguf_row = try allocator.alloc(f32, hidden);
+    defer allocator.free(gguf_row);
+    const hf_row = try allocator.alloc(f32, hidden);
+    defer allocator.free(hf_row);
+    const probe = try makeParityInput(allocator, hidden);
+    defer allocator.free(probe);
+
+    for (sampled_ids) |token_id| {
+        if (token_id >= vocab) continue;
+        const raw = storage.raw_bytes[token_id * row_bytes ..][0..row_bytes];
+        try gguf_mod.quant_codec.dequantizeToFloat32(storage.tensor_type, raw, gguf_row);
+        try tensorRowToFloat32(&hf_loaded.tensor, token_id, hidden, hf_row);
+        const stats = diffStats(gguf_row, hf_row);
+        const gguf_dot = cpuEmbeddingRowDot(probe, gguf_row, 0, hidden);
+        const hf_dot = cpuEmbeddingRowDot(probe, hf_row, 0, hidden);
+        print(
+            "gemma4_cross_parity: token_embd.row token={d} source={s} type={s} weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_max_index={d} dot_abs={d:.6} gguf_dot={d:.6} hf_dot={d:.6}\n",
+            .{
+                token_id,
+                hf_name,
+                storage.tensor_type.name(),
+                stats.max_abs,
+                stats.mean_abs,
+                stats.max_index,
+                @abs(gguf_dot - hf_dot),
+                gguf_dot,
+                hf_dot,
+            },
+        );
+    }
+}
+
+fn tensorRowToFloat32(tensor: *const @import("backends/tensor.zig").Tensor, row: usize, dim: usize, output: []f32) !void {
+    if (output.len != dim) return error.InvalidTensorShape;
+    if (tensor.shape.len != 2) return error.InvalidTensorShape;
+    if (row >= @as(usize, @intCast(tensor.shape[0])) or dim != @as(usize, @intCast(tensor.shape[1]))) return error.InvalidTensorShape;
+    const row_offset = row * dim;
+    switch (tensor.dtype) {
+        .f32 => {
+            const values = tensor.asFloat32();
+            @memcpy(output, values[row_offset..][0..dim]);
+        },
+        .bf16 => {
+            for (0..dim) |col| {
+                const byte_offset = (row_offset + col) * @sizeOf(u16);
+                const bits = std.mem.readInt(u16, tensor.data[byte_offset..][0..@sizeOf(u16)], .little);
+                output[col] = bf16BitsToF32(bits);
+            }
+        },
+        .f16 => {
+            for (0..dim) |col| {
+                const byte_offset = (row_offset + col) * @sizeOf(u16);
+                const bits = std.mem.readInt(u16, tensor.data[byte_offset..][0..@sizeOf(u16)], .little);
+                const half: f16 = @bitCast(bits);
+                output[col] = @floatCast(half);
+            }
+        },
+        else => return error.UnsupportedTensorType,
+    }
+}
+
 fn runGemma4ParityOnStore(allocator: std.mem.Allocator, tensor_store: tensor_store_mod.TensorStore) !void {
     for (gemma4_parity_cases) |case| {
         try runGemma4LinearParityCase(allocator, tensor_store, case);
@@ -280,7 +758,7 @@ fn runGemma4ParityOnStore(allocator: std.mem.Allocator, tensor_store: tensor_sto
     try runGqaParity(allocator);
     try runGemma4Layer0Parity(allocator, tensor_store);
     try runGemma4Layer5AttentionParity(allocator, tensor_store);
-    if (tensor_store.kind() == .safetensors) try runGemma4FinalProjectionParity(allocator, tensor_store);
+    try runGemma4FinalProjectionParity(allocator, tensor_store);
 }
 
 fn runGemma4LinearParityCase(
@@ -879,10 +1357,14 @@ fn runGemma4FinalProjectionParity(
     defer embed_ref.deinit(allocator);
     var embed_loaded = try tensor_store.loadTensorRef(&embed_ref);
     defer embed_loaded.deinit();
-    if (embed_loaded.tensor.dtype != .bf16) return error.UnsupportedTensorType;
     if (embed_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
     if (@as(usize, @intCast(embed_loaded.tensor.shape[0])) != vocab) return error.InvalidTensorShape;
     if (@as(usize, @intCast(embed_loaded.tensor.shape[1])) != hidden) return error.InvalidTensorShape;
+    const embed_host = if (embed_loaded.tensor.dtype == .bf16)
+        @as(?[]f32, null)
+    else
+        try tensorToFloat32Owned(allocator, &embed_loaded.tensor);
+    defer if (embed_host) |host| allocator.free(host);
     const embed_key = try allocator.dupe(u8, "token_embd.weight");
     var inserted = false;
     errdefer if (!inserted) allocator.free(embed_key);
@@ -917,7 +1399,10 @@ fn runGemma4FinalProjectionParity(
     var max_expected: f32 = 0;
     var max_actual: f32 = 0;
     for (sampled_ids) |token_id| {
-        const expected = cpuEmbeddingRowDotBf16Input(expected_norm, embed_loaded.tensor.data, token_id, hidden);
+        const expected = if (embed_loaded.tensor.dtype == .bf16)
+            cpuEmbeddingRowDotBf16Input(expected_norm, embed_loaded.tensor.data, token_id, hidden)
+        else
+            cpuEmbeddingRowDot(expected_norm, embed_host orelse return error.UnsupportedTensorType, token_id, hidden);
         const actual = actual_logits[token_id];
         const diff = @abs(actual - expected);
         mean_abs += diff;
@@ -933,7 +1418,8 @@ fn runGemma4FinalProjectionParity(
         "gemma4_parity: final.tied_lm_head sampled={d} max_abs={d:.6} mean_abs={d:.6} token={d}\n",
         .{ sampled_ids.len, max_abs, mean_abs, max_token },
     );
-    if (max_abs > 0.02) {
+    const tolerance: f32 = if (embed_loaded.quantized) 0.05 else 0.02;
+    if (max_abs > tolerance) {
         print(
             "gemma4_parity: first_divergence stage=final.tied_lm_head got={d:.6} expected={d:.6}\n",
             .{ max_actual, max_expected },
@@ -1131,6 +1617,15 @@ fn cpuEmbeddingRowDotBf16Input(input: []const f32, bf16_weight_bytes: []const u8
         const bits = std.mem.readInt(u16, bf16_weight_bytes[(row_offset + col) * @sizeOf(u16) ..][0..@sizeOf(u16)], .little);
         const weight = bf16BitsToF32(bits);
         sum += roundF32ToBf16(input[col]) * weight;
+    }
+    return sum;
+}
+
+fn cpuEmbeddingRowDot(input: []const f32, weight: []const f32, row: usize, dim: usize) f32 {
+    var sum: f32 = 0;
+    const row_offset = row * dim;
+    for (0..dim) |col| {
+        sum += input[col] * weight[row_offset + col];
     }
     return sum;
 }

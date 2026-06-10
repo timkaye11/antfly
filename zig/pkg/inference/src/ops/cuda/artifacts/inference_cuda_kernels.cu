@@ -1624,6 +1624,13 @@ __device__ float termite_half_to_float(unsigned short h) {
     return sign ? -value : value;
 }
 
+__device__ float termite_q8_0_value(const unsigned char* bp, unsigned int lane) {
+    unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+    float d = termite_half_to_float(h);
+    signed char q = (signed char)bp[2u + lane];
+    return (float)q * d;
+}
+
 extern "C" __global__ void termite_linear_q8_0_f32(
     float* dst,
     const float* input,
@@ -2477,6 +2484,26 @@ extern "C" __global__ void termite_embedding_lookup_q4_k_f32(
     dst[idx] = termite_q4k_value(bp, value_index);
 }
 
+extern "C" __global__ void termite_embedding_lookup_q8_0_f32(
+    float* dst,
+    const unsigned char* weight,
+    const long long* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)ids[out_row];
+    unsigned int row_blocks = dim / 32u;
+    unsigned int block = col / 32u;
+    unsigned int lane = col - block * 32u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 34ull;
+    dst[idx] = termite_q8_0_value(bp, lane);
+}
+
 extern "C" __global__ void termite_embedding_lookup_i32_q4_k_f32(
     float* dst,
     const unsigned char* weight,
@@ -2495,6 +2522,26 @@ extern "C" __global__ void termite_embedding_lookup_i32_q4_k_f32(
     unsigned int value_index = col - block * 256u;
     const unsigned char* bp = weight + (src_row * row_blocks + block) * 144ull;
     dst[idx] = termite_q4k_value(bp, value_index);
+}
+
+extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(
+    float* dst,
+    const unsigned char* weight,
+    const int* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
+    unsigned int row_blocks = dim / 32u;
+    unsigned int block = col / 32u;
+    unsigned int lane = col - block * 32u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 34ull;
+    dst[idx] = termite_q8_0_value(bp, lane);
 }
 
 extern "C" __global__ void termite_deberta_attention_f32(

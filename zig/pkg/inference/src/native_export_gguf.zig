@@ -4800,7 +4800,7 @@ fn parseArgs(args: []const []const u8) !Options {
                 return error.InvalidArguments;
             };
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--quantize") and i + 1 < args.len) {
+        } else if ((std.mem.eql(u8, args[i], "--quantize") or std.mem.eql(u8, args[i], "--format")) and i + 1 < args.len) {
             opts.quantization = parseQuantizationMode(args[i + 1]) orelse {
                 printUsage();
                 return error.InvalidArguments;

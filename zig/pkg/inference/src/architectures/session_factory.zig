@@ -822,7 +822,9 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         var key_buf: [256]u8 = undefined;
         const key = try normalizeWeightKey(store.kind(), arch_config, base_key, &key_buf);
         const owned_key = try allocator.dupe(u8, key);
-        if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
+        const should_lazy = shouldLazyLoadWeight(store.kind(), arch_config, key) or
+            try shouldLazyLoadCudaGgufQuantDequantWeight(allocator, store, arch_config, key, full_name);
+        if (should_lazy) {
             if (lazy_weights.contains(key)) {
                 allocator.free(owned_key);
                 continue;
@@ -1081,7 +1083,9 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         var key_buf: [256]u8 = undefined;
         const key = try normalizeWeightKey(store.kind(), arch_config, base_key, &key_buf);
         const owned_key = try allocator.dupe(u8, key);
-        if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
+        const should_lazy = shouldLazyLoadWeight(store.kind(), arch_config, key) or
+            try shouldLazyLoadCudaGgufQuantDequantWeight(allocator, store, arch_config, key, full_name);
+        if (should_lazy) {
             if (lazy_weights.contains(key)) {
                 allocator.free(owned_key);
                 continue;
@@ -3039,6 +3043,34 @@ fn shouldLazyLoadWeight(store_kind: tensor_store_mod.StoreKind, arch_config: Arc
     };
 }
 
+fn cudaLazyGgufQuantDequantEnabled() bool {
+    if (comptime !build_options.enable_cuda) return false;
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_GGUF_QUANT_DEQUANT") or
+        platform.env.getenvBool("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS");
+}
+
+fn shouldLazyLoadCudaGgufQuantDequantWeight(
+    allocator: std.mem.Allocator,
+    store: tensor_store_mod.TensorStore,
+    arch_config: ArchConfig,
+    key: []const u8,
+    source_name: []const u8,
+) !bool {
+    if (!cudaLazyGgufQuantDequantEnabled()) return false;
+    if (store.kind() != .gguf) return false;
+    const cfg = switch (arch_config) {
+        .gpt => |value| value,
+        else => return false,
+    };
+    if (cfg.family != .gemma) return false;
+    if (isGptEmbeddingTableKey(key)) return false;
+    if (!isGptQuantizedMatmulWeightKey(key)) return false;
+
+    var tensor_ref = try store.describeTensor(allocator, source_name);
+    defer tensor_ref.deinit(allocator);
+    return tensor_ref.quantized;
+}
+
 fn shouldLazyLoadGemmaSafetensorsWeight(key: []const u8) bool {
     if (std.mem.startsWith(u8, key, "model.language_model.layers.")) return true;
     if (std.mem.startsWith(u8, key, "language_model.layers.")) return true;
@@ -3155,6 +3187,20 @@ fn isGptEmbeddingTableKey(key: []const u8) bool {
         std.mem.eql(u8, key, "model.per_layer_input.per_layer_token_embd.weight");
 }
 
+fn isGptQuantizedMatmulWeightKey(key: []const u8) bool {
+    if (isGptEmbeddingTableKey(key)) return true;
+    if (std.mem.eql(u8, key, "lm_head.weight")) return true;
+    if (std.mem.indexOf(u8, key, ".block_sparse_moe.experts.") != null) return false;
+    return std.mem.endsWith(u8, key, ".self_attn.q_proj.weight") or
+        std.mem.endsWith(u8, key, ".self_attn.k_proj.weight") or
+        std.mem.endsWith(u8, key, ".self_attn.v_proj.weight") or
+        std.mem.endsWith(u8, key, ".self_attn.o_proj.weight") or
+        std.mem.endsWith(u8, key, ".mlp.gate_proj.weight") or
+        std.mem.endsWith(u8, key, ".mlp.up_proj.weight") or
+        std.mem.endsWith(u8, key, ".mlp.down_proj.weight") or
+        std.mem.endsWith(u8, key, ".block_sparse_moe.gate.weight");
+}
+
 fn shouldKeepResidentGptEmbeddingQuantizedOnly(
     config: gpt_mod.Config,
     tensor_type: gguf_mod.tensor_types.TensorType,
@@ -3182,14 +3228,7 @@ fn shouldKeepResidentGptWeightQuantizedOnly(
             if (isGptEmbeddingTableKey(key)) break :blk is_q8_0;
             if (std.mem.eql(u8, key, "lm_head.weight")) break :blk true;
             if (std.mem.indexOf(u8, key, ".block_sparse_moe.experts.") != null) break :blk false;
-            break :blk std.mem.endsWith(u8, key, ".self_attn.q_proj.weight") or
-                std.mem.endsWith(u8, key, ".self_attn.k_proj.weight") or
-                std.mem.endsWith(u8, key, ".self_attn.v_proj.weight") or
-                std.mem.endsWith(u8, key, ".self_attn.o_proj.weight") or
-                std.mem.endsWith(u8, key, ".mlp.gate_proj.weight") or
-                std.mem.endsWith(u8, key, ".mlp.up_proj.weight") or
-                std.mem.endsWith(u8, key, ".mlp.down_proj.weight") or
-                std.mem.endsWith(u8, key, ".block_sparse_moe.gate.weight");
+            break :blk isGptQuantizedMatmulWeightKey(key);
         },
         else => false,
     };

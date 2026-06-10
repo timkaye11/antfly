@@ -1534,12 +1534,12 @@ fn cudaTensorDeviceBytes(tensor: *const CudaTensor) usize {
 }
 
 fn noteLazyDeviceAccess(self: *CudaCompute, name: []const u8, bytes: usize) !void {
-    if (bytes == 0) return;
     self.lazy_access_epoch +|= 1;
     if (self.lazy_device_epochs.getPtr(name)) |epoch| {
         epoch.* = self.lazy_access_epoch;
         return;
     }
+    if (bytes == 0) return;
     const owned_key = try self.allocator.dupe(u8, name);
     errdefer self.allocator.free(owned_key);
     try self.lazy_device_epochs.put(self.allocator, owned_key, self.lazy_access_epoch);
@@ -2204,6 +2204,10 @@ fn cudaDisableHeadNormRopeFusion() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_HEAD_NORM_ROPE_FUSION", false);
 }
 
+fn cudaDisableFusedQkv() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FUSED_QKV", false);
+}
+
 fn recordQuantMatmulPlan(self: *CudaCompute, weight_tensor: *const CudaTensor, op_plan: operator_plan.OperatorPlan) !void {
     switch (op_plan) {
         .quant_matmul => |plan| {
@@ -2307,6 +2311,7 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {
+                .Q8_0 => try self.kernels.launchEmbeddingLookupQ8_0F32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 .Q4_K => try self.kernels.launchEmbeddingLookupQ4KF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 else => return error.UnsupportedTensorType,
             },
@@ -2345,6 +2350,7 @@ fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim
     if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {
+                .Q8_0 => try self.kernels.launchEmbeddingLookupI32Q8_0F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 .Q4_K => try self.kernels.launchEmbeddingLookupI32Q4KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 else => return error.UnsupportedTensorType,
             },
@@ -2786,6 +2792,7 @@ fn gemma4MtpMaskedArgmax(ctx: *anyopaque, request: *const ops.Gemma4MtpMaskedArg
 
 fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_weight: CT, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) anyerror!?ops.LinearNoBiasTripleResult {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (cudaDisableFusedQkv()) return null;
     const input_tensor = tensorFromCt(input);
     const q_weight_tensor = tensorFromCt(q_weight);
     const k_weight_tensor = tensorFromCt(k_weight);

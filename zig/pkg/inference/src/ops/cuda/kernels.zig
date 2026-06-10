@@ -89,6 +89,8 @@ pub const KernelModule = struct {
     linear_bf16_weight_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
     linear_q4_k_qkv_nobias_f32_tiled: driver_mod.CUfunction = null,
     linear_q4_k_q4_k_f32_qkv_nobias_tiled: driver_mod.CUfunction = null,
+    embedding_lookup_q8_0_f32: driver_mod.CUfunction = null,
+    embedding_lookup_i32_q8_0_f32: driver_mod.CUfunction = null,
     embedding_lookup_q4_k_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_q4_k_f32: driver_mod.CUfunction = null,
 
@@ -228,6 +230,10 @@ pub const KernelModule = struct {
         const linear_bf16_weight_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_qkv_nobias_tiled");
         const linear_q4_k_qkv_nobias_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_qkv_nobias_f32_tiled");
         const linear_q4_k_q4_k_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled");
+        var embedding_lookup_q8_0_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q8_0_f32, module, "termite_embedding_lookup_q8_0_f32"));
+        var embedding_lookup_i32_q8_0_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_q8_0_f32, module, "termite_embedding_lookup_i32_q8_0_f32"));
         var embedding_lookup_q4_k_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q4_k_f32, module, "termite_embedding_lookup_q4_k_f32"));
         var embedding_lookup_i32_q4_k_f32: driver_mod.CUfunction = null;
@@ -302,6 +308,8 @@ pub const KernelModule = struct {
             .linear_bf16_weight_f32_qkv_nobias_tiled = linear_bf16_weight_f32_qkv_nobias_tiled,
             .linear_q4_k_qkv_nobias_f32_tiled = linear_q4_k_qkv_nobias_f32_tiled,
             .linear_q4_k_q4_k_f32_qkv_nobias_tiled = linear_q4_k_q4_k_f32_qkv_nobias_tiled,
+            .embedding_lookup_q8_0_f32 = embedding_lookup_q8_0_f32,
+            .embedding_lookup_i32_q8_0_f32 = embedding_lookup_i32_q8_0_f32,
             .embedding_lookup_q4_k_f32 = embedding_lookup_q4_k_f32,
             .embedding_lookup_i32_q4_k_f32 = embedding_lookup_i32_q4_k_f32,
         };
@@ -379,6 +387,8 @@ pub const KernelModule = struct {
             self.linear_bf16_weight_f32_qkv_nobias_tiled = null;
             self.linear_q4_k_qkv_nobias_f32_tiled = null;
             self.linear_q4_k_q4_k_f32_qkv_nobias_tiled = null;
+            self.embedding_lookup_q8_0_f32 = null;
+            self.embedding_lookup_i32_q8_0_f32 = null;
             self.embedding_lookup_q4_k_f32 = null;
             self.embedding_lookup_i32_q4_k_f32 = null;
         }
@@ -439,6 +449,7 @@ pub const KernelModule = struct {
             self.linear_q4_k_f32_tile8 != null and
             self.linear_q4_k_pair_bias_f32_tiled != null and
             self.linear_q4_k_triple_bias_f32_tiled != null and
+            self.embedding_lookup_q8_0_f32 != null and
             self.embedding_lookup_q4_k_f32 != null;
     }
 
@@ -1560,6 +1571,38 @@ pub const KernelModule = struct {
         try launch1d(self.embedding_lookup_q4_k_f32, ctx, count, &params);
     }
 
+    pub fn launchEmbeddingLookupQ8_0F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+    ) driver_mod.Error!void {
+        if (dim == 0 or dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(ids, try checkedTensorElements(total, @sizeOf(i64)));
+        const row_blocks = dim / q8_0_values_per_block;
+        try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q8_0_block_bytes));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+        };
+        try launch1d(self.embedding_lookup_q8_0_f32, ctx, count, &params);
+    }
+
     pub fn launchEmbeddingLookupI32Q4KF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -1588,6 +1631,38 @@ pub const KernelModule = struct {
             @ptrCast(&dim_u32),
         };
         try launch1d(self.embedding_lookup_i32_q4_k_f32, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingLookupI32Q8_0F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+    ) driver_mod.Error!void {
+        if (dim == 0 or dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(ids, try checkedTensorElements(total, @sizeOf(i32)));
+        const row_blocks = dim / q8_0_values_per_block;
+        try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q8_0_block_bytes));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+        };
+        try launch1d(self.embedding_lookup_i32_q8_0_f32, ctx, count, &params);
     }
 
     pub fn launchConcatLastDimF32(
@@ -4015,6 +4090,38 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
     for (expected, 0..) |want, i| {
         if (@abs(out[i] - want) > 0.01) return error.CudaSmokeMismatch;
     }
+
+    const ids_i64 = [_]i64{ 2, 0 };
+    const ids_i32 = [_]i32{ 2, 0 };
+    var ids64 = try buffer_mod.DeviceBuffer.alloc(&ctx, ids_i64.len * @sizeOf(i64));
+    defer ids64.free(&ctx);
+    var ids32 = try buffer_mod.DeviceBuffer.alloc(&ctx, ids_i32.len * @sizeOf(i32));
+    defer ids32.free(&ctx);
+    var embed_out = try buffer_mod.DeviceBuffer.alloc(&ctx, ids_i64.len * in_dim * @sizeOf(f32));
+    defer embed_out.free(&ctx);
+    try ids64.copyFromHost(&ctx, std.mem.sliceAsBytes(&ids_i64));
+    try ids32.copyFromHost(&ctx, std.mem.sliceAsBytes(&ids_i32));
+
+    const embed_expected = try allocator.alloc(f32, ids_i64.len * in_dim);
+    defer allocator.free(embed_expected);
+    for (0..in_dim) |i| {
+        embed_expected[i] = -2.0;
+        embed_expected[in_dim + i] = 1.0;
+    }
+    const embed_actual = try allocator.alloc(f32, ids_i64.len * in_dim);
+    defer allocator.free(embed_actual);
+
+    try module.launchEmbeddingLookupQ8_0F32(&ctx, embed_out, weight, ids64, ids_i64.len, in_dim);
+    try ctx.synchronize();
+    try embed_out.copyToHost(&ctx, std.mem.sliceAsBytes(embed_actual));
+    try ctx.synchronize();
+    try expectApproxSlice(embed_actual, embed_expected, 0.0001);
+
+    try module.launchEmbeddingLookupI32Q8_0F32(&ctx, embed_out, weight, ids32, ids_i32.len, in_dim);
+    try ctx.synchronize();
+    try embed_out.copyToHost(&ctx, std.mem.sliceAsBytes(embed_actual));
+    try ctx.synchronize();
+    try expectApproxSlice(embed_actual, embed_expected, 0.0001);
 }
 
 pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
