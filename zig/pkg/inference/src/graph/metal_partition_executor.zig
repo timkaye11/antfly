@@ -874,6 +874,23 @@ pub const MetalPartitionExecutor = struct {
         defer allocator.free(skipped_nodes);
         @memset(skipped_nodes, false);
 
+        // Graph outputs must always be written to their value slots: they
+        // escape the executor entirely (training extraction reads the loss
+        // and LoRA gradients after partition teardown), so a fused pattern
+        // or runtime region may never elide them as fused-interior nodes —
+        // even when they have no consumers in the partition (the final
+        // loss has none; many gradient outputs are leaves). The fusion
+        // matchers and markXxxSkipped sets only consider consumer edges,
+        // not `graph.outputs` membership, so the skip override below is
+        // the single chokepoint that restores materialization.
+        const graph_output_nodes = try allocator.alloc(bool, values.len);
+        defer allocator.free(graph_output_nodes);
+        @memset(graph_output_nodes, false);
+        for (graph.outputs.items) |output_id| {
+            const output_index: usize = @intCast(output_id);
+            if (output_index < graph_output_nodes.len) graph_output_nodes[output_index] = true;
+        }
+
         var transient_runtime_region_plan: ?RuntimeRegionPlan = null;
         defer if (transient_runtime_region_plan) |*plan| plan.deinit(allocator);
         const runtime_region_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
@@ -907,7 +924,38 @@ pub const MetalPartitionExecutor = struct {
             if (collect_loop_profile) loop_profile.nodes += 1;
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
-            if (i < skipped_nodes.len and skipped_nodes[i]) continue;
+            if (i < skipped_nodes.len and skipped_nodes[i]) {
+                if (i >= graph_output_nodes.len or !graph_output_nodes[i]) continue;
+                // A fused pattern / runtime region elided this node as
+                // fused-interior state, but it is a GRAPH OUTPUT: its slot
+                // must hold the node's value after the partition completes.
+                // Clear the skip and execute the node normally below;
+                // producers the fusion also elided are materialized on
+                // demand by the interpreter-fallback safety net. Any value
+                // a fused executor left behind cannot be trusted (it may be
+                // a plan-slot view no kernel writes), so drop it first —
+                // freeing only when this CT handle is not caller-owned and
+                // not aliased by another node's slot.
+                skipped_nodes[i] = false;
+                if (exec_ctx.stats) |stats| stats.graph_output_elision_overrides += 1;
+                const override_op = graph.node(node_id).op;
+                const caller_or_weight_owned = rt_map.contains(node_id) or
+                    override_op == .parameter or
+                    isPreMaterializedConstantOp(override_op);
+                if (!caller_or_weight_owned) {
+                    if (values[i]) |stale| {
+                        var stale_aliased = false;
+                        for (values, 0..) |maybe, other_index| {
+                            if (other_index != i and maybe == stale) {
+                                stale_aliased = true;
+                                break;
+                            }
+                        }
+                        if (!stale_aliased) cb.free(stale);
+                        values[i] = null;
+                    }
+                }
+            }
 
             if (rt_map.contains(node_id)) {
                 value_device[i] = device_id;
@@ -1146,6 +1194,19 @@ pub const MetalPartitionExecutor = struct {
 
         if (frame_active) {
             try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
+            // Drain BEFORE copying graph outputs to owned storage. The
+            // previous order encoded the owned-copy blits into the
+            // partition's frame ahead of the submit, but runtime region
+            // plans commit work through their own command buffers and
+            // recycle runtime-owned storage (graph-plan slots, frame
+            // scratch) on plan/frame boundaries, so a blit scheduled
+            // inside the frame could observe pre-completion (zeroed)
+            // bytes: the trainer read loss=0 and all-zero gradients even
+            // though per-node parity probes saw exact values. Submitting
+            // and waiting the frame first guarantees every device write
+            // for this partition has completed; the copies then run as
+            // synchronous one-shot blits (bounded: once per step over
+            // graph outputs only).
             if (trace_progress) std.debug.print("metal_partition_progress: phase=submit_frame_begin partition={d}\n", .{partition_index});
             const submit_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -1165,6 +1226,27 @@ pub const MetalPartitionExecutor = struct {
             try evalPartitionBoundaryOutputs(cb, values, partition_view);
             if (collect_loop_profile) loop_profile.boundary_outputs_ns += metalPartitionElapsedNs(boundary_outputs_start_ns, metalPartitionNowNs());
             if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_boundary_outputs_end partition={d}\n", .{partition_index});
+        } else {
+            // Metal-resident partitions skip boundary materialization for
+            // cross-partition outputs (downstream consumers read device
+            // storage directly), but GRAPH outputs escape the executor
+            // entirely: callers (e.g. training extraction) read them on the
+            // host after this partition's frame has been submitted and
+            // drained — and possibly after further device work (optimizer
+            // steps, the next training step) has recycled the runtime-owned
+            // plan-slot storage backing them. Deep-copy each graph output
+            // into device memory its CT owns (the frame was already
+            // submitted and waited above, so each copy is a synchronous
+            // one-shot blit ordered after every device write), then
+            // synchronize so a host mirror cached before the final device
+            // writes or an unmaterialized lazy product cannot serve
+            // stale/empty data.
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=sync_graph_outputs_begin partition={d}\n", .{partition_index});
+            const graph_outputs_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
+            try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, exec_ctx.stats);
+            try syncPartitionGraphOutputs(cb, values, partition_view);
+            if (collect_loop_profile) loop_profile.boundary_outputs_ns += metalPartitionElapsedNs(graph_outputs_start_ns, metalPartitionNowNs());
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=sync_graph_outputs_end partition={d}\n", .{partition_index});
         }
 
         if (exec_ctx.attention_layer) |layer| layer.* = exec_state.attention_layer;
@@ -10945,6 +11027,113 @@ fn evalPartitionBoundaryOutputs(
         const index: usize = @intCast(slot_view.slot.node_id);
         if (index >= values.len) return error.InvalidBufferPlan;
         if (values[index]) |ct| try cb.evalTensor(ct);
+    }
+}
+
+/// TERMITE_METAL_OUTPUT_LIFETIME_DEBUG=1 keeps the ORIGINAL (runtime-
+/// recycled) source value of each copied graph output alive in this
+/// registry so training extraction can compare it against the owned copy
+/// after a full device drain. Decisive diagnostic for copy-captured-zeros:
+/// source nonzero + copy zero => command-buffer ordering; both zero =>
+/// the slot was never written (or written elsewhere). Debug-only — the
+/// sources are leaked into this map until the caller clears it.
+var metal_output_lifetime_debug_sources = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+
+pub fn metalOutputLifetimeDebugEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_OUTPUT_LIFETIME_DEBUG", false);
+}
+
+/// Original (pre-copy) source value recorded for a graph-output node, if
+/// the lifetime debug env is set and the copier would otherwise have
+/// freed it. The CT stays owned by the registry.
+pub fn metalOutputLifetimeDebugSource(node_id: NodeId) ?CT {
+    return metal_output_lifetime_debug_sources.get(node_id);
+}
+
+/// Free all retained debug sources. Call after the extraction-time
+/// comparison so a long run does not accumulate device buffers.
+pub fn metalOutputLifetimeDebugClear(cb: *const ComputeBackend) void {
+    var it = metal_output_lifetime_debug_sources.valueIterator();
+    while (it.next()) |ct| cb.free(ct.*);
+    metal_output_lifetime_debug_sources.clearRetainingCapacity();
+}
+
+/// Deep-copy graph-output values out of runtime-recycled device storage.
+///
+/// Planned Metal commands return views of runtime-owned buffers
+/// (graph-plan slots reserved via `reserveGraphPlanSlots`, projection and
+/// frame scratch, hidden-state pairs). The runtime reuses those buffers
+/// on the next plan commit / frame begin — long before the caller reads
+/// the graph outputs (training extraction runs after partition teardown
+/// and, for gradients, around a device-resident optimizer step), so the
+/// aliased values would read back stale or zeroed data. Copy each
+/// graph-output value into a private device buffer its CT exclusively
+/// owns so it survives slot recycling. Bounded work: only graph outputs
+/// (e.g. a loss scalar plus per-parameter LoRA gradients) are copied,
+/// on-device with no host roundtrip. Callers must have drained the
+/// partition's frame first (submit + wait) so each copy — a synchronous
+/// one-shot blit — is ordered after every device write to its source.
+fn copyPartitionGraphOutputsToOwnedStorage(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    view: buffer_plan_mod.PartitionBufferView,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (cb.kind() != .metal) return;
+    for (view.slots) |slot_view| {
+        if (!slot_view.roles.graph_output) continue;
+        const index: usize = @intCast(slot_view.slot.node_id);
+        if (index >= values.len) return error.InvalidBufferPlan;
+        const ct = values[index] orelse continue;
+        const owned_ct = (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
+        values[index] = owned_ct;
+        if (stats) |s| s.graph_output_owned_copies += 1;
+        // Free the recyclable original unless the caller provided it
+        // (runtime input) or another node's value slot still aliases the
+        // same CT handle (metadata aliases share CTs across nodes).
+        if (rt_map.contains(slot_view.slot.node_id)) continue;
+        var aliased = false;
+        for (values) |maybe| {
+            if (maybe == ct) {
+                aliased = true;
+                break;
+            }
+        }
+        if (!aliased) {
+            if (metalOutputLifetimeDebugEnabled()) {
+                // Keep the original alive so extraction can compare it
+                // against the owned copy after a full device drain.
+                if (metal_output_lifetime_debug_sources.getOrPut(std.heap.c_allocator, slot_view.slot.node_id)) |entry| {
+                    if (entry.found_existing) cb.free(entry.value_ptr.*);
+                    entry.value_ptr.* = ct;
+                    continue;
+                } else |_| {}
+            }
+            cb.free(ct);
+        }
+    }
+}
+
+/// Synchronize graph-output values produced by a Metal partition so host
+/// extraction (which runs after the partition's frame completed) reads the
+/// final device contents: materializes pending lazy products and refreshes
+/// cached host mirrors. Cross-partition (`roles.output`) values stay
+/// device-resident — downstream Metal consumers read device storage.
+fn syncPartitionGraphOutputs(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    view: buffer_plan_mod.PartitionBufferView,
+) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (cb.kind() != .metal) return;
+    for (view.slots) |slot_view| {
+        if (!slot_view.roles.graph_output) continue;
+        const index: usize = @intCast(slot_view.slot.node_id);
+        if (index >= values.len) return error.InvalidBufferPlan;
+        const ct = values[index] orelse continue;
+        try metal_compute_mod.MetalCompute.syncOutputTensor(cb, ct);
     }
 }
 

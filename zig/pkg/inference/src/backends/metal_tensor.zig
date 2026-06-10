@@ -611,6 +611,35 @@ pub const MetalTensor = struct {
         noteHostMirrorAlloc(dev.byte_len);
         return buf;
     }
+
+    /// Synchronize host-visible state with the final device contents.
+    /// Drains any active runtime frame so queued GPU writes land, then
+    /// refreshes an owned (Private-storage) host mirror that may have
+    /// been snapshotted before later device writes. Shared-storage
+    /// mirrors alias device memory and are coherent once the frame is
+    /// drained; device tensors without a cached mirror need no refresh
+    /// (their first `toHostSlice` downloads fresh bytes). Host-only
+    /// tensors are a no-op. Used for values that escape an execution
+    /// scope (graph outputs read after the owning frame completed).
+    pub fn syncHostMirror(self: *MetalTensor) !void {
+        if (self.device) |*dev| {
+            if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+            if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+                return error.MetalFrameSyncFailed;
+            }
+            const count = dev.byte_len / @sizeOf(f32);
+            if (self.len == count and dev.mirror_owned) {
+                const rc = termite_metal_buffer_download(
+                    dev.ref.runtime,
+                    dev.ref.handle,
+                    dev.byte_offset,
+                    @ptrCast(self.data),
+                    dev.byte_len,
+                );
+                if (rc != 0) return error.MetalBufferDownloadFailed;
+            }
+        }
+    }
 };
 
 test "MetalTensor borrowed does not free" {

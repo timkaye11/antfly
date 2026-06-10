@@ -36,6 +36,7 @@ var aggregate_interpreter_fallbacks: AtomicU64 = .init(0);
 var aggregate_device_resident_outputs: AtomicU64 = .init(0);
 var aggregate_host_materialized_outputs: AtomicU64 = .init(0);
 var aggregate_boundary_output_materializations: AtomicU64 = .init(0);
+var aggregate_graph_output_owned_copies: AtomicU64 = .init(0);
 var aggregate_graph_plan_slots_reserved: AtomicU64 = .init(0);
 var aggregate_graph_plan_bytes_reserved: AtomicU64 = .init(0);
 
@@ -50,6 +51,7 @@ pub fn record(stats: ExecutionStats) void {
     _ = aggregate_device_resident_outputs.fetchAdd(stats.device_resident_outputs, .monotonic);
     _ = aggregate_host_materialized_outputs.fetchAdd(stats.host_materialized_outputs, .monotonic);
     _ = aggregate_boundary_output_materializations.fetchAdd(stats.boundary_output_materializations, .monotonic);
+    _ = aggregate_graph_output_owned_copies.fetchAdd(stats.graph_output_owned_copies, .monotonic);
     _ = aggregate_graph_plan_slots_reserved.fetchAdd(stats.graph_plan_slots_reserved, .monotonic);
     _ = aggregate_graph_plan_bytes_reserved.fetchAdd(stats.graph_plan_bytes_reserved, .monotonic);
 }
@@ -66,6 +68,7 @@ pub fn snapshot() ExecutionStats {
         .device_resident_outputs = aggregate_device_resident_outputs.load(.monotonic),
         .host_materialized_outputs = aggregate_host_materialized_outputs.load(.monotonic),
         .boundary_output_materializations = aggregate_boundary_output_materializations.load(.monotonic),
+        .graph_output_owned_copies = aggregate_graph_output_owned_copies.load(.monotonic),
         .graph_plan_slots_reserved = aggregate_graph_plan_slots_reserved.load(.monotonic),
         .graph_plan_bytes_reserved = aggregate_graph_plan_bytes_reserved.load(.monotonic),
     };
@@ -82,6 +85,7 @@ pub fn reset() void {
     aggregate_device_resident_outputs.store(0, .monotonic);
     aggregate_host_materialized_outputs.store(0, .monotonic);
     aggregate_boundary_output_materializations.store(0, .monotonic);
+    aggregate_graph_output_owned_copies.store(0, .monotonic);
     aggregate_graph_plan_slots_reserved.store(0, .monotonic);
     aggregate_graph_plan_bytes_reserved.store(0, .monotonic);
 }
@@ -95,7 +99,7 @@ pub fn enabled() bool {
 
 pub fn print(stats: ExecutionStats) void {
     std.debug.print(
-        "graph_executor_stats: partitions={d} transfers={d} runtime_input_transfers={d} device_resident_transfers={d} commands={d} planned_commands={d} metadata_aliases={d} descriptor_materializations={d} constant_materializations={d} graph_regions={d} graph_region_ops={d} graph_region_fallbacks={d} fused_patterns={d} fused_nodes_elided={d} interpreter_fallbacks={d} device_outputs={d} host_outputs={d} boundary_materializations={d} graph_plan_slots={d} graph_plan_bytes={d} runtime_plan_compiles={d} runtime_plan_regions={d} runtime_plan_dispatches={d} runtime_plan_reuses={d} runtime_prepare_slot_calls={d} runtime_prepare_slot_cache_hits={d} runtime_region_fallbacks={d}",
+        "graph_executor_stats: partitions={d} transfers={d} runtime_input_transfers={d} device_resident_transfers={d} commands={d} planned_commands={d} metadata_aliases={d} descriptor_materializations={d} constant_materializations={d} graph_regions={d} graph_region_ops={d} graph_region_fallbacks={d} fused_patterns={d} fused_nodes_elided={d} graph_output_elision_overrides={d} interpreter_fallbacks={d} device_outputs={d} host_outputs={d} boundary_materializations={d} graph_output_owned_copies={d} graph_plan_slots={d} graph_plan_bytes={d} runtime_plan_compiles={d} runtime_plan_regions={d} runtime_plan_dispatches={d} runtime_plan_reuses={d} runtime_prepare_slot_calls={d} runtime_prepare_slot_cache_hits={d} runtime_region_fallbacks={d}",
         .{
             stats.partitions_executed,
             stats.cross_device_transfers,
@@ -111,10 +115,12 @@ pub fn print(stats: ExecutionStats) void {
             stats.graph_region_fallbacks,
             stats.fused_graph_pattern_dispatches,
             stats.fused_graph_nodes_elided,
+            stats.graph_output_elision_overrides,
             stats.interpreter_fallbacks,
             stats.device_resident_outputs,
             stats.host_materialized_outputs,
             stats.boundary_output_materializations,
+            stats.graph_output_owned_copies,
             stats.graph_plan_slots_reserved,
             stats.graph_plan_bytes_reserved,
             stats.runtime_region_plan_compiles,

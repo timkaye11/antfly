@@ -795,6 +795,92 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             buf.owned_quantized_storage != null;
     }
 
+    /// Replace a pending lazy multiply with its concrete product. The Buf
+    /// keeps its identity (callers may hold the CT pointer); only the
+    /// storage transitions from deferred to materialized. Prefers the
+    /// device multiply; falls back to a host elementwise product when the
+    /// runtime declines.
+    fn materializeLazyMultiplyInPlace(self: *MetalCompute, buf: *Buf) !void {
+        if (buf.lazy_multiply == null) return;
+        const product = self.ownedMetalTensorFromCt(@ptrCast(buf)) catch |err| switch (err) {
+            error.UnsupportedTensorType => blk: {
+                const lazy = &buf.lazy_multiply.?;
+                const lhs = try lazy.lhs.toHostSlice();
+                const rhs = try lazy.rhs.toHostSlice();
+                if (lhs.len == 0 or lhs.len != rhs.len) return error.UnsupportedTensorType;
+                const out = try std.heap.c_allocator.alloc(f32, lhs.len);
+                errdefer std.heap.c_allocator.free(out);
+                for (out, lhs, rhs) |*o, a, b| o.* = a * b;
+                break :blk MetalTensor.owned(out, lazy.lhs.shape());
+            },
+            else => return err,
+        };
+        if (buf.lazy_multiply) |*lazy| lazy.deinit();
+        buf.lazy_multiply = null;
+        buf.metal_tensor = product;
+    }
+
+    /// Synchronize a tensor that escapes its execution scope (e.g. a graph
+    /// output read on the host after the executor's Metal frame finished):
+    /// materialize a pending lazy multiply into concrete storage and refresh
+    /// a cached host mirror so later host reads cannot observe bytes
+    /// snapshotted before the final device writes. No-op for non-Metal
+    /// backends and host-only tensors.
+    pub fn syncOutputTensor(cb: *const ops.ComputeBackend, tensor: CT) !void {
+        if (cb.kind() != .metal) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const buf = toBuf(tensor);
+        if (bufHasAnyQuantizedStorage(buf)) return;
+        if (buf.lazy_multiply != null) try self.materializeLazyMultiplyInPlace(buf);
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) try metal_tensor.syncHostMirror();
+        }
+    }
+
+    /// Deep-copy a device-resident tensor into a freshly allocated device
+    /// buffer exclusively owned by the returned CT. Values produced by
+    /// planned Metal commands alias runtime-recycled storage — graph-plan
+    /// slots, projection scratch, the frame scratch pool, hidden-state
+    /// pairs — which the runtime reuses on the next plan commit / frame
+    /// begin regardless of live tensor views. Values that escape their
+    /// execution scope (graph outputs read after the partition's frame
+    /// completed) must therefore own their memory. Returns null when no
+    /// copy is needed or possible: non-Metal backends, host-backed
+    /// tensors, and quantized descriptors. The copy stays device-resident
+    /// — no host roundtrip — so device-resident consumers (e.g. an
+    /// optimizer reading retained gradients) keep their fast path.
+    pub fn cloneOutputTensorOwned(cb: *const ops.ComputeBackend, tensor: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const buf = toBuf(tensor);
+        if (bufHasAnyQuantizedStorage(buf)) return null;
+        if (buf.lazy_multiply != null) try self.materializeLazyMultiplyInPlace(buf);
+        const metal_tensor = if (buf.metal_tensor) |*mt| mt else return null;
+        if (!metal_tensor.isDevice()) return null;
+        if (metal_tensor.deviceByteLen() == 0) return null;
+        var copied = try metal_tensor.copiedView(0, metal_tensor.deviceByteLen(), metal_tensor.shape());
+        const owned_ct = self.ctFromOwnedMetalTensor(copied) catch |err| {
+            copied.deinit();
+            return err;
+        };
+        errdefer freeOp(self, owned_ct);
+        // Preserve logical-view metadata so the copy reads back exactly
+        // like the original.
+        const owned_buf = toBuf(owned_ct);
+        if (buf.logical_shape) |shape| {
+            if (owned_buf.logical_shape) |old| {
+                self.allocator.free(old);
+                owned_buf.logical_shape = null;
+            }
+            owned_buf.logical_shape = try self.allocator.dupe(i64, shape);
+        }
+        if (buf.view_strides) |strides| owned_buf.view_strides = try self.allocator.dupe(usize, strides);
+        if (buf.logical_view_strides) |strides| owned_buf.logical_view_strides = try self.allocator.dupe(usize, strides);
+        if (buf.view_index_map) |map| owned_buf.view_index_map = try self.allocator.dupe(usize, map);
+        owned_buf.view_base_offset = buf.view_base_offset;
+        return owned_ct;
+    }
+
     pub fn makeDeviceResident(cb: *const ops.ComputeBackend, tensor: CT) !?CT {
         if (cb.kind() != .metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -3892,6 +3978,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
+        // A pending lazy multiply has no concrete storage (`data` is the
+        // empty placeholder); reading it through the generic host path
+        // would silently yield an empty/zero result. Force the product.
+        if (buf.lazy_multiply != null) try self.materializeLazyMultiplyInPlace(buf);
         if (hasHostView(buf)) try materializeViewData(buf);
         const data = if (buf.metal_tensor) |*metal_tensor|
             try metal_tensor.toHostSlice()

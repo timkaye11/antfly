@@ -465,6 +465,12 @@ pub fn executeMultiDevice(
     // Free remaining parameter handles (not outputs, not runtime inputs). Fused
     // executors may deliberately alias an intermediate value to a later graph
     // node so downstream consumers see the fused result; free each handle once.
+    // Deduplication is by CT handle: distinct CT wrappers may still share
+    // underlying device storage, but freeing one cannot pull memory out from
+    // under an output — Metal partitions deep-copy graph outputs into
+    // exclusively owned device buffers before returning (see
+    // copyPartitionGraphOutputsToOwnedStorage), and non-Metal partitions
+    // materialize boundary outputs into owned tensors.
     var freed_values = std.AutoHashMapUnmanaged(CT, void).empty;
     defer freed_values.deinit(allocator);
     for (0..count) |i| {
@@ -881,6 +887,92 @@ test "multi-executor keeps metal partition outputs resident until final readback
     const output = try metal_cb.toFloat32(result.outputs[0], allocator);
     defer allocator.free(output);
     for (input_data, output) |input_value, actual| {
+        const expected = input_value / (1.0 + @exp(-input_value));
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+}
+
+test "multi-executor metal graph outputs survive plan-slot reuse across executions" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4 }));
+    const out = try b.silu(x);
+    try g.markOutput(out);
+
+    const caps = [_]Capability{
+        .{ .backend = .metal, .priority = 10, .supports = &partition_mod.supportsAll },
+    };
+    const base_plan = try partition_fn(allocator, &g, &caps);
+    const dev_assign = try allocator.alloc(DeviceId, base_plan.partitions.len);
+    @memset(dev_assign, 1);
+    var dpp = DevicePartitionPlan{
+        .base = base_plan,
+        .device_assignment = dev_assign,
+        .allocator = allocator,
+    };
+    defer dpp.deinit();
+
+    var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
+    var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    var native_cb = native_compute_impl.computeBackend();
+
+    var metal_weight_store = initEmptyMetalWeightStore(allocator);
+    defer deinitEmptyMetalWeightStore(&metal_weight_store, allocator);
+    var metal_compute = try metal_compute_mod.MetalCompute.init(allocator, &metal_weight_store, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    if (!metal_cb.decoderRuntimeReady()) return error.SkipZigTest;
+
+    var mesh = try DeviceMesh.init(allocator, &.{
+        .{ .id = 0, .backend = &native_cb, .kind = .native },
+        .{ .id = 1, .backend = &metal_cb, .kind = .metal },
+    });
+    defer mesh.deinit();
+
+    const first_data = [_]f32{ -2.0, -0.5, 0.5, 2.0 };
+    const first_input = try native_cb.fromFloat32Shape(&first_data, &.{ 1, 4 });
+    defer native_cb.free(first_input);
+
+    var first_result = try executeMultiDevice(allocator, &g, &dpp, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = x, .value = first_input }},
+    });
+    defer first_result.deinit(&mesh);
+
+    // A second execution re-reserves the same graph-plan / scratch slots.
+    // Pre-fix, the first run's graph outputs aliased that recycled slot
+    // memory and read back the second run's data (or zeros) instead of
+    // their own values.
+    const second_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const second_input = try native_cb.fromFloat32Shape(&second_data, &.{ 1, 4 });
+    defer native_cb.free(second_input);
+
+    var second_result = try executeMultiDevice(allocator, &g, &dpp, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = x, .value = second_input }},
+    });
+    defer second_result.deinit(&mesh);
+
+    // The graph output must have been deep-copied out of recyclable
+    // plan-slot storage into memory the result owns.
+    try std.testing.expect(first_result.stats.graph_output_owned_copies >= 1);
+
+    const second_output = try metal_cb.toFloat32(second_result.outputs[0], allocator);
+    defer allocator.free(second_output);
+    for (second_data, second_output) |input_value, actual| {
+        const expected = input_value / (1.0 + @exp(-input_value));
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+
+    // The first run's outputs must still hold the FIRST run's values.
+    const first_output = try metal_cb.toFloat32(first_result.outputs[0], allocator);
+    defer allocator.free(first_output);
+    for (first_data, first_output) |input_value, actual| {
         const expected = input_value / (1.0 + @exp(-input_value));
         try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
     }

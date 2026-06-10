@@ -453,13 +453,39 @@ pub const CompiledTrainSession = struct {
         defer self.allocator.free(selected);
         if (selected.len == 0) return error.TrainingGraphExecutorParityNoNodes;
 
+        // Default mode replaces the graph outputs with the selected nodes,
+        // which restricts reachability (the backward subgraph is not
+        // executed when only forward nodes are selected). KEEP_OUTPUTS mode
+        // appends the selected nodes to the existing outputs instead so the
+        // parity run executes with the exact reachability/liveness of a real
+        // training step — required to reproduce bugs that only manifest with
+        // the full loss+gradient output set.
+        const keep_outputs = platform.env.getenvBoolDefault("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_KEEP_OUTPUTS", false);
         const saved_outputs = try self.allocator.dupe(NodeId, self.graph.outputs.items);
         defer self.allocator.free(saved_outputs);
-        self.graph.outputs.clearRetainingCapacity();
-        for (selected) |node_id| try self.graph.markOutput(node_id);
+        if (!keep_outputs) self.graph.outputs.clearRetainingCapacity();
         defer {
             self.graph.outputs.clearRetainingCapacity();
             self.graph.outputs.appendSlice(self.allocator, saved_outputs) catch {};
+        }
+        // Map each selected node to its output index (reusing an existing
+        // output entry when present so we never create duplicate outputs).
+        const selected_output_indices = try self.allocator.alloc(usize, selected.len);
+        defer self.allocator.free(selected_output_indices);
+        for (selected, selected_output_indices) |node_id, *output_index| {
+            var existing: ?usize = null;
+            for (self.graph.outputs.items, 0..) |out_id, oi| {
+                if (out_id == node_id) {
+                    existing = oi;
+                    break;
+                }
+            }
+            if (existing) |oi| {
+                output_index.* = oi;
+            } else {
+                output_index.* = self.graph.outputs.items.len;
+                try self.graph.markOutput(node_id);
+            }
         }
 
         var owned_execution_frame = try beginOwnedExecutionFrame(cb);
@@ -518,11 +544,11 @@ pub const CompiledTrainSession = struct {
         defer graph_result.deinit(&mesh);
 
         var passed = true;
-        for (selected, 0..) |node_id, idx| {
-            const direct_data = try cb.toFloat32(direct_result.outputs[idx], self.allocator);
+        for (selected, selected_output_indices) |node_id, output_idx| {
+            const direct_data = try cb.toFloat32(direct_result.outputs[output_idx], self.allocator);
             defer self.allocator.free(direct_data);
-            const graph_device = mesh.device(graph_result.output_devices[idx]) orelse return error.DeviceNotFound;
-            const graph_data = try graph_device.backend.toFloat32(graph_result.outputs[idx], self.allocator);
+            const graph_device = mesh.device(graph_result.output_devices[output_idx]) orelse return error.DeviceNotFound;
+            const graph_data = try graph_device.backend.toFloat32(graph_result.outputs[output_idx], self.allocator);
             defer self.allocator.free(graph_data);
             const diff = compareFloatSlices(direct_data, graph_data);
             if (diff.len_mismatch or (diff.max_abs > trainingGraphExecutorParityGradAbsTolerance() and diff.max_rel > trainingGraphExecutorParityGradRelTolerance())) {
@@ -946,6 +972,9 @@ pub const CompiledTrainSession = struct {
         const extract_start = nowNs();
         const outputs = multi_result.outputs;
         compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ outputs.len, retain_device_gradients, currentResidentBytes() });
+        if (metal_partition_executor.metalOutputLifetimeDebugEnabled()) {
+            try self.debugCompareGraphOutputLifetimes(cb, mesh, multi_result);
+        }
         const loss_device = mesh.device(multi_result.output_devices[self.loss_output_index]) orelse return error.DeviceNotFound;
         const loss_data = try loss_device.backend.toFloat32(outputs[self.loss_output_index], self.allocator);
         defer self.allocator.free(loss_data);
@@ -963,7 +992,7 @@ pub const CompiledTrainSession = struct {
             return error.EmptyLossOutput;
         }
         compiledDiag(
-            "graph executor loss output node={} op={s} shape={any} len={} value={d:.6} device={}",
+            "graph executor loss output node={} op={s} shape={any} len={} value={d:.6} device={} resident={}",
             .{
                 loss_output_node,
                 @tagName(std.meta.activeTag(self.graph.node(loss_output_node).op)),
@@ -971,6 +1000,7 @@ pub const CompiledTrainSession = struct {
                 loss_data.len,
                 loss_data[0],
                 multi_result.output_devices[self.loss_output_index],
+                metal_partition_executor.isMetalDeviceResident(loss_device.backend, outputs[self.loss_output_index]),
             },
         );
         const loss_value: f32 = loss_data[0];
@@ -1054,6 +1084,113 @@ pub const CompiledTrainSession = struct {
             .allocator = self.allocator,
             .compute_backend = if (retain_device_gradients) cb else null,
         };
+    }
+
+    /// TERMITE_METAL_OUTPUT_LIFETIME_DEBUG=1: after a full device drain,
+    /// read BOTH the owned graph-output copy the trainer extracts from and
+    /// the ORIGINAL source buffer it was copied out of (retained by the
+    /// partition executor's debug registry), printing the first values of
+    /// each. Interpretation: source nonzero + copy zero => the owned-copy
+    /// blit raced device work (command-buffer ordering); both zero after
+    /// the drain => the source slot was never written (wrong slot / value
+    /// kept internal to a fused region).
+    fn debugCompareGraphOutputLifetimes(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        mesh: *const device_mesh.DeviceMesh,
+        multi_result: *const multi_executor.MultiExecutionResult,
+    ) !void {
+        // Full drain: waits any submitted Metal frame and flushes pending
+        // active-frame work. Runtime one-shot command buffers commit and
+        // wait inline, so after this no device work is outstanding.
+        cb.decoderRuntimeFlushActiveFrame() catch |err| {
+            std.debug.print("[output-lifetime] drain failed: {s}\n", .{@errorName(err)});
+        };
+        var copy_zero: usize = 0;
+        var source_zero: usize = 0;
+        var source_missing: usize = 0;
+        var zeroness_mismatch: usize = 0;
+        // Sample of zero / nonzero outputs (node id + op) so a run can
+        // correlate never-written outputs with the executor's fused-pattern
+        // / runtime-region elision sets (elided interiors are never written
+        // to their slots; region boundaries are).
+        const OutputSample = struct { idx: usize, node: NodeId };
+        var zero_samples: [10]OutputSample = undefined;
+        var zero_sample_count: usize = 0;
+        var nonzero_samples: [5]OutputSample = undefined;
+        var nonzero_sample_count: usize = 0;
+        for (self.graph.outputs.items, 0..) |output_node, idx| {
+            if (idx >= multi_result.outputs.len) break;
+            const device = mesh.device(multi_result.output_devices[idx]) orelse continue;
+            const copy_data = device.backend.toFloat32(multi_result.outputs[idx], self.allocator) catch |err| {
+                std.debug.print(
+                    "[output-lifetime] idx={} node={} copy read failed: {s}\n",
+                    .{ idx, output_node, @errorName(err) },
+                );
+                continue;
+            };
+            defer self.allocator.free(copy_data);
+            const copy_is_zero = allValuesZeroF32(copy_data);
+            if (copy_is_zero) {
+                copy_zero += 1;
+                if (zero_sample_count < zero_samples.len) {
+                    zero_samples[zero_sample_count] = .{ .idx = idx, .node = output_node };
+                    zero_sample_count += 1;
+                }
+            } else if (nonzero_sample_count < nonzero_samples.len) {
+                nonzero_samples[nonzero_sample_count] = .{ .idx = idx, .node = output_node };
+                nonzero_sample_count += 1;
+            }
+            var source_data: ?[]f32 = null;
+            defer if (source_data) |data| self.allocator.free(data);
+            var source_is_zero: ?bool = null;
+            if (metal_partition_executor.metalOutputLifetimeDebugSource(output_node)) |source_ct| {
+                source_data = device.backend.toFloat32(source_ct, self.allocator) catch null;
+                if (source_data) |data| {
+                    const is_zero = allValuesZeroF32(data);
+                    source_is_zero = is_zero;
+                    if (is_zero) source_zero += 1;
+                    if (is_zero != copy_is_zero) zeroness_mismatch += 1;
+                } else {
+                    source_missing += 1;
+                }
+            } else {
+                source_missing += 1;
+            }
+            const is_loss = idx == self.loss_output_index;
+            const mismatch = if (source_is_zero) |src_zero| src_zero != copy_is_zero else false;
+            if (is_loss or mismatch) {
+                std.debug.print(
+                    "[output-lifetime] idx={} node={} loss={} copy_first4={any} source_first4={any}\n",
+                    .{
+                        idx,
+                        output_node,
+                        is_loss,
+                        copy_data[0..@min(copy_data.len, 4)],
+                        if (source_data) |data| data[0..@min(data.len, 4)] else null,
+                    },
+                );
+            }
+        }
+        std.debug.print(
+            "[output-lifetime] summary outputs={} copy_zero={} source_zero={} source_missing={} zeroness_mismatch={} (mismatch>0 => ordering; copy and source both zero => never written)\n",
+            .{ self.graph.outputs.items.len, copy_zero, source_zero, source_missing, zeroness_mismatch },
+        );
+        for (zero_samples[0..zero_sample_count]) |sample| {
+            const node = self.graph.node(sample.node);
+            std.debug.print(
+                "[output-lifetime] zero-sample idx={} node={} op={s} shape={any}\n",
+                .{ sample.idx, sample.node, @tagName(std.meta.activeTag(node.op)), node.output_shape },
+            );
+        }
+        for (nonzero_samples[0..nonzero_sample_count]) |sample| {
+            const node = self.graph.node(sample.node);
+            std.debug.print(
+                "[output-lifetime] nonzero-sample idx={} node={} op={s} shape={any}\n",
+                .{ sample.idx, sample.node, @tagName(std.meta.activeTag(node.op)), node.output_shape },
+            );
+        }
+        metal_partition_executor.metalOutputLifetimeDebugClear(cb);
     }
 
     const ParityReport = struct {
@@ -1282,6 +1419,13 @@ fn getenvF32(comptime name: [*:0]const u8, default: f32) f32 {
 
 fn absF32(value: f32) f32 {
     return if (value < 0) -value else value;
+}
+
+fn allValuesZeroF32(data: []const f32) bool {
+    for (data) |value| {
+        if (value != 0) return false;
+    }
+    return true;
 }
 
 fn relativeDiffF32(lhs: f32, rhs: f32) f32 {
