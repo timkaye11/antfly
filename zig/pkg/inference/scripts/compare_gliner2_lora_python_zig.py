@@ -652,6 +652,11 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
     total_host_outputs = sum(
         int(row.get("graph_executor_host_outputs") or 0) for row in zig_step_rows
     )
+    graph_executor_fallback_reasons = sorted({
+        str(row.get("graph_executor_fallback_reason"))
+        for row in zig_step_rows
+        if row.get("graph_executor_fallback_reason")
+    })
     manifest_backend = str(zig_manifest.get("backend") or "")
     manifest_objective = str(zig_manifest.get("objective") or "")
     zig_metrics = report.get("zig", {}).get("metrics", {})
@@ -666,8 +671,21 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         "device_trainables_resident": max_device_trainable_bytes > 0,
     }
     warnings: list[str] = []
-    if total_command_dispatches == 0 and total_planned_dispatches == 0:
+    zero_dispatches = total_command_dispatches == 0 and total_planned_dispatches == 0
+    graph_executor_requested = bool(
+        args.zig_backend == "metal" and getattr(args, "zig_training_graph_executor", False)
+    )
+    if graph_executor_requested and zig_step_rows:
+        # When the training graph executor was explicitly requested, zero
+        # dispatches means every step silently fell back to interpreter-only
+        # execution; that is a failing check (gated by --strict), not a warning.
+        checks["graph_executor_dispatches_nonzero"] = not zero_dispatches
+    elif zero_dispatches:
         warnings.append("Metal run reported no graph command/planned dispatches; check for interpreter-only execution")
+    if graph_executor_fallback_reasons:
+        warnings.append(
+            "Metal run reported graph executor fallback reasons: " + ", ".join(graph_executor_fallback_reasons)
+        )
     if total_interpreter_fallbacks > 0:
         warnings.append(f"Metal run reported {total_interpreter_fallbacks} interpreter fallbacks")
     if total_host_outputs > 0:
@@ -685,6 +703,7 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         "total_graph_planned_dispatches": total_planned_dispatches,
         "total_graph_interpreter_fallbacks": total_interpreter_fallbacks,
         "total_graph_host_outputs": total_host_outputs,
+        "graph_executor_fallback_reasons": graph_executor_fallback_reasons,
     }
 
 
@@ -2578,6 +2597,14 @@ def main() -> int:
     preprocess_applicable = both_sides_ran and args.dump_parity
     full_loss_applicable = both_sides_ran and is_total_loss_objective and not args.perf_target_only_python
     roundtrip_applicable = bool(adapter_roundtrip.get("ran"))
+    metal_readiness_summary = report["summary"].get("metal_readiness") or {}
+    metal_dispatch_check = metal_readiness_summary.get("checks", {}).get("graph_executor_dispatches_nonzero")
+    metal_dispatch_applicable = (
+        metal_dispatch_check is not None
+        and args.zig_backend == "metal"
+        and not args.skip_zig
+        and report.get("zig", {}).get("returncode") == 0
+    )
     strict_checks: dict[str, bool | None] = {
         "component_loss_parity_matches": component_loss_matches if component_loss_applicable else None,
         "classification_debug_matches": classification_debug_matches if classification_debug_applicable else None,
@@ -2586,6 +2613,7 @@ def main() -> int:
         "preprocess_parity_matches": preprocess_matches if preprocess_applicable else None,
         "valid_full_loss_parity": report["summary"]["valid_full_loss_parity"] if full_loss_applicable else None,
         "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
+        "metal_graph_executor_dispatches_nonzero": bool(metal_dispatch_check) if metal_dispatch_applicable else None,
     }
     report["summary"]["strict_mode"] = args.strict
     report["summary"]["strict_checks"] = strict_checks

@@ -1000,9 +1000,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.withLogicalShape(buf, logical_shape);
     }
 
-    fn logicalStridesOrContiguous(input: CT, resolved_shape: []const i64, scratch: []usize) []const usize {
+    // Returns the per-axis element strides of `input` when its logical
+    // layout can be described with strides, or null when it cannot.
+    // Index-map views (e.g. a reshape of a non-contiguous transpose view)
+    // have no stride representation: callers must NOT alias the raw
+    // backing buffer and should materialize via hostSliceForBuf instead.
+    fn logicalStridesOrContiguous(input: CT, resolved_shape: []const i64, scratch: []usize) ?[]const usize {
         const buf = toBuf(input);
-        if (buf.view_strides) |strides| return strides;
+        if (buf.view_index_map != null) return null;
+        if (buf.view_strides) |strides| {
+            // The stored strides describe buf.logical_shape; they are only
+            // valid if the caller-resolved shape matches it axis-for-axis.
+            if (strides.len != resolved_shape.len) return null;
+            if (buf.logical_shape) |logical_shape| {
+                if (logical_shape.len != resolved_shape.len) return null;
+                for (logical_shape, resolved_shape) |have, want| {
+                    if (have != want) return null;
+                }
+            }
+            return strides;
+        }
         computeStrides(resolved_shape, scratch[0..resolved_shape.len]);
         return scratch[0..resolved_shape.len];
     }
@@ -6345,12 +6362,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (input_buf.metal_tensor == null) {
             var in_stride_scratch: [metal_tensor_mod.max_dims]usize = undefined;
-            const logical_in_strides = logicalStridesOrContiguous(input, in_shape, in_stride_scratch[0..in_shape.len]);
-            var view_strides: [metal_tensor_mod.max_dims]usize = undefined;
-            for (0..perm.len) |d| view_strides[d] = logical_in_strides[perm[d]];
-            if (self.makeViewAlias(input, out_shape[0..perm.len], view_strides[0..perm.len], input_buf.view_base_offset)) |view| {
-                return view;
-            } else |_| {}
+            if (logicalStridesOrContiguous(input, in_shape, in_stride_scratch[0..in_shape.len])) |logical_in_strides| {
+                var view_strides: [metal_tensor_mod.max_dims]usize = undefined;
+                for (0..perm.len) |d| view_strides[d] = logical_in_strides[perm[d]];
+                if (self.makeViewAlias(input, out_shape[0..perm.len], view_strides[0..perm.len], input_buf.view_base_offset)) |view| {
+                    return view;
+                } else |_| {}
+            }
         }
 
         const input_host = try hostSliceForBuf(input_buf);
@@ -6420,37 +6438,38 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (try self.tryDeviceBroadcastGeneral(input, in_shape, out_shape, broadcast_axes)) |result| return result;
         if (input_buf.metal_tensor == null) {
             var in_strides: [metal_tensor_mod.max_dims]usize = undefined;
-            const logical_in_strides = logicalStridesOrContiguous(input, in_shape, in_strides[0..in_shape.len]);
-            var view_strides: [metal_tensor_mod.max_dims]usize = undefined;
-            var can_view = broadcast_axes.len == in_shape.len;
-            for (0..out_shape.len) |d| {
-                view_strides[d] = 0;
-                var mapped_input_dim: ?usize = null;
-                for (broadcast_axes, 0..) |ax, in_d| {
-                    if (ax == d) {
-                        mapped_input_dim = in_d;
-                        break;
+            if (logicalStridesOrContiguous(input, in_shape, in_strides[0..in_shape.len])) |logical_in_strides| {
+                var view_strides: [metal_tensor_mod.max_dims]usize = undefined;
+                var can_view = broadcast_axes.len == in_shape.len;
+                for (0..out_shape.len) |d| {
+                    view_strides[d] = 0;
+                    var mapped_input_dim: ?usize = null;
+                    for (broadcast_axes, 0..) |ax, in_d| {
+                        if (ax == d) {
+                            mapped_input_dim = in_d;
+                            break;
+                        }
                     }
-                }
-                if (mapped_input_dim) |in_d| {
-                    if (in_d >= in_shape.len) {
+                    if (mapped_input_dim) |in_d| {
+                        if (in_d >= in_shape.len) {
+                            can_view = false;
+                            break;
+                        }
+                        if (in_shape[in_d] > 1 and in_shape[in_d] != out_shape[d]) {
+                            can_view = false;
+                            break;
+                        }
+                        view_strides[d] = if (in_shape[in_d] > 1) logical_in_strides[in_d] else 0;
+                    } else if (out_shape[d] != 1) {
                         can_view = false;
                         break;
                     }
-                    if (in_shape[in_d] > 1 and in_shape[in_d] != out_shape[d]) {
-                        can_view = false;
-                        break;
-                    }
-                    view_strides[d] = if (in_shape[in_d] > 1) logical_in_strides[in_d] else 0;
-                } else if (out_shape[d] != 1) {
-                    can_view = false;
-                    break;
                 }
-            }
-            if (can_view) {
-                if (self.makeViewAlias(input, out_shape, view_strides[0..out_shape.len], input_buf.view_base_offset)) |view| {
-                    return view;
-                } else |_| {}
+                if (can_view) {
+                    if (self.makeViewAlias(input, out_shape, view_strides[0..out_shape.len], input_buf.view_base_offset)) |view| {
+                        return view;
+                    } else |_| {}
+                }
             }
         }
         const input_host = try hostSliceForBuf(input_buf);
@@ -23293,6 +23312,87 @@ test "metal_compute: large host broadcast uploads and stays resident" {
         const col = idx % 64;
         const expected: f32 = @floatFromInt(batch * 64 + col + 1);
         try std.testing.expectEqual(expected, value);
+    }
+}
+
+test "metal_compute: broadcast of index-map reshape view matches host reference" {
+    // Regression test for the GLiNER2 metal training-graph divergence at the
+    // DeBERTa relative-position batch-tile broadcast (tileRelEmbAcrossBatch):
+    //   gathered [S*S, nh*D] → reshape [S*S, nh, D] → transpose {1,0,2}
+    //   (strided host view) → reshape [nh, S, S, D] (index-map view)
+    //   → reshape [1, nh, S, S, D] → broadcast_in_dim to [B, nh, S, S, D].
+    // primBroadcastInDim previously aliased the raw backing buffer with
+    // dense contiguous strides, silently dropping the index-map permutation
+    // introduced by reshaping a non-contiguous transpose view: only the
+    // first innermost row survived, everything after diverged.
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const batch: usize = 2;
+    const nh: usize = 3;
+    const s: usize = 2;
+    const d: usize = 2;
+    const ss = s * s;
+    const h = nh * d;
+
+    // Host-resident dense base [S*S, nh*D] (the gathered rel embeddings).
+    // Built via denseBuf directly so the chain stays host-side regardless
+    // of upload env toggles, matching the failing training-graph run.
+    const base_data = try allocator.alloc(f32, ss * h);
+    for (base_data, 0..) |*value, idx| value.* = @floatFromInt(idx + 1);
+    const base = try MetalCompute.denseBuf(allocator, base_data, true, &.{ @intCast(ss), @intCast(h) });
+    defer metal_cb.free(base);
+
+    // [S*S, nh, D] → transpose {1,0,2} → [nh, S*S, D] (strided host view).
+    const snh = try metal_cb.primReshape(base, &.{ @intCast(ss), @intCast(nh), @intCast(d) });
+    defer metal_cb.free(snh);
+    const nhs = try metal_cb.primTranspose(snh, &.{ 1, 0, 2 }, &.{ @intCast(ss), @intCast(nh), @intCast(d) });
+    defer metal_cb.free(nhs);
+
+    // Reshape of the non-contiguous view → index-map view.
+    const nhqk = try metal_cb.primReshape(nhs, &.{ @intCast(nh), @intCast(s), @intCast(s), @intCast(d) });
+    defer metal_cb.free(nhqk);
+    const rel_5d = try metal_cb.primReshape(nhqk, &.{ 1, @intCast(nh), @intCast(s), @intCast(s), @intCast(d) });
+    defer metal_cb.free(rel_5d);
+
+    // Batch-tile broadcast: [1, nh, S, S, D] → [B, nh, S, S, D].
+    const bcast = try metal_cb.primBroadcastInDim(
+        rel_5d,
+        &.{ @intCast(batch), @intCast(nh), @intCast(s), @intCast(s), @intCast(d) },
+        &.{ 0, 1, 2, 3, 4 },
+        &.{ 1, @intCast(nh), @intCast(s), @intCast(s), @intCast(d) },
+    );
+    defer metal_cb.free(bcast);
+
+    const out_shape = try metal_cb.tensorShape(bcast, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 2, 2, 2 }, out_shape);
+
+    const out = try metal_cb.toFloat32(bcast, allocator);
+    defer allocator.free(out);
+    try std.testing.expectEqual(batch * nh * ss * d, out.len);
+
+    // Host reference: out[b, h, qi, ki, dd] = base[qi*S + ki, h*D + dd].
+    for (0..batch) |b_idx| {
+        for (0..nh) |h_idx| {
+            for (0..s) |qi| {
+                for (0..s) |ki| {
+                    for (0..d) |dd| {
+                        const expected = base_data[(qi * s + ki) * h + h_idx * d + dd];
+                        const got = out[(((b_idx * nh + h_idx) * s + qi) * s + ki) * d + dd];
+                        try std.testing.expectEqual(expected, got);
+                    }
+                }
+            }
+        }
     }
 }
 

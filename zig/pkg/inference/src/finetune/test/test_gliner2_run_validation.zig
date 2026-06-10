@@ -633,3 +633,149 @@ fn writeTaskHeadSafetensorsWithShape(allocator: std.mem.Allocator, path: []const
     for (0..weight_bytes + bias_bytes) |_| try buf.writer.writeByte(0);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = buf.written() });
 }
+
+// ── Partial-batch padding ────────────────────────────────────────────────────
+
+const gliner2_autodiff = @import("inference_internal").finetune.gliner2_real_autodiff;
+
+test "zeroPaddedSpanTargetRows masks padded total-loss rows and keeps gather indices in-bounds" {
+    const allocator = std.testing.allocator;
+    const E: usize = 2;
+    const max_spans: usize = 3;
+    const max_length: usize = 8;
+    const real_batch: usize = 1;
+    const padded_batch: usize = 2;
+    const width = gliner2_autodiff.gliner2TotalLossTargetWidth(E);
+
+    const schema_idx_offset = 2 * E;
+    const row_idx_offset = schema_idx_offset + E;
+    const count_idx_offset = row_idx_offset + E;
+    const start_idx_offset = count_idx_offset + E;
+    const cls_labels_offset = gliner2_autodiff.gliner2TotalLossClassificationLabelsOffset(E);
+    const cls_mask_offset = gliner2_autodiff.gliner2TotalLossClassificationMaskOffset(E);
+    const count_labels_offset = gliner2_autodiff.gliner2TotalLossCountLabelsOffset(E);
+    const count_mask_offset = gliner2_autodiff.gliner2TotalLossCountMaskOffset(E);
+    const parent_idx_offset = gliner2_autodiff.gliner2TotalLossParentIndexOffset(E);
+
+    const targets = try allocator.alloc(f32, padded_batch * max_spans * width);
+    defer allocator.free(targets);
+    // Pretend every supervision column is active, then write the packed
+    // gather-index columns exactly the way the trainer does for a duplicated
+    // padding example (sample_idx = 1 here): all indices reference the padded
+    // sample's own rows, which exist because input_ids/attention_mask are
+    // also padded to the full graph batch.
+    @memset(targets, 1.0);
+    for (0..padded_batch) |sample_idx| {
+        for (0..max_spans) |span_idx| {
+            const flat_span_idx = sample_idx * max_spans + span_idx;
+            const row = targets[flat_span_idx * width ..][0..width];
+            for (0..E) |e| {
+                row[schema_idx_offset + e] = @floatFromInt(sample_idx * max_length + e);
+                row[row_idx_offset + e] = @floatFromInt(flat_span_idx);
+                row[count_idx_offset + e] = @floatFromInt(sample_idx * E + e);
+            }
+            row[start_idx_offset] = @floatFromInt(sample_idx * max_length + 2);
+            row[start_idx_offset + 1] = @floatFromInt(sample_idx * max_length + 3);
+            row[parent_idx_offset] = @floatFromInt(sample_idx * max_length + 1);
+        }
+    }
+
+    try gliner2_autodiff.zeroPaddedSpanTargetRows(
+        targets,
+        .gliner2_total_loss,
+        E,
+        max_spans,
+        real_batch,
+        padded_batch,
+        false,
+    );
+
+    // Real rows keep their supervision values untouched.
+    for (0..real_batch * max_spans) |flat_span_idx| {
+        const row = targets[flat_span_idx * width ..][0..width];
+        for (0..2 * E) |i| try std.testing.expectEqual(@as(f32, 1.0), row[i]);
+        for (0..2 * E) |i| try std.testing.expectEqual(@as(f32, 1.0), row[cls_labels_offset + i]);
+        for (0..21) |i| try std.testing.expectEqual(@as(f32, 1.0), row[count_labels_offset + i]);
+    }
+
+    // Padded rows must be exact no-ops in every loss component: structure
+    // labels + valid-span mask, classification labels + mask, and the count
+    // one-hot labels + count mask are all zero.
+    for (real_batch * max_spans..padded_batch * max_spans) |flat_span_idx| {
+        const row = targets[flat_span_idx * width ..][0..width];
+        for (0..2 * E) |i| try std.testing.expectEqual(@as(f32, 0.0), row[i]);
+        for (0..E) |e| {
+            try std.testing.expectEqual(@as(f32, 0.0), row[cls_labels_offset + e]);
+            try std.testing.expectEqual(@as(f32, 0.0), row[cls_mask_offset + e]);
+        }
+        for (0..20) |i| try std.testing.expectEqual(@as(f32, 0.0), row[count_labels_offset + i]);
+        try std.testing.expectEqual(@as(f32, 0.0), row[count_mask_offset]);
+
+        // The gather-index columns survive masking and stay in-bounds for
+        // the graph's fixed shapes.
+        const sample_idx = flat_span_idx / max_spans;
+        for (0..E) |e| {
+            const schema_idx = row[schema_idx_offset + e];
+            try std.testing.expectEqual(@as(f32, @floatFromInt(sample_idx * max_length + e)), schema_idx);
+            try std.testing.expect(schema_idx < @as(f32, @floatFromInt(padded_batch * max_length)));
+            const row_idx = row[row_idx_offset + e];
+            try std.testing.expectEqual(@as(f32, @floatFromInt(flat_span_idx)), row_idx);
+            try std.testing.expect(row_idx < @as(f32, @floatFromInt(padded_batch * max_spans)));
+            const count_idx = row[count_idx_offset + e];
+            try std.testing.expect(count_idx < @as(f32, @floatFromInt(20 * padded_batch * E)));
+        }
+        try std.testing.expect(row[start_idx_offset] < @as(f32, @floatFromInt(padded_batch * max_length)));
+        try std.testing.expect(row[start_idx_offset + 1] < @as(f32, @floatFromInt(padded_batch * max_length)));
+        try std.testing.expect(row[parent_idx_offset] < @as(f32, @floatFromInt(padded_batch * max_length)));
+    }
+}
+
+test "zeroPaddedSpanTargetRows masks padded span-start rows and rejects bad shapes" {
+    const allocator = std.testing.allocator;
+    const E: usize = 3;
+    const max_spans: usize = 2;
+    const real_batch: usize = 1;
+    const padded_batch: usize = 4;
+    const width = gliner2_autodiff.spanStartTargetWidth(E);
+
+    const targets = try allocator.alloc(f32, padded_batch * max_spans * width);
+    defer allocator.free(targets);
+    @memset(targets, 1.0);
+
+    try gliner2_autodiff.zeroPaddedSpanTargetRows(
+        targets,
+        .span_start,
+        E,
+        max_spans,
+        real_batch,
+        padded_batch,
+        false,
+    );
+
+    for (0..padded_batch * max_spans) |flat_span_idx| {
+        const row = targets[flat_span_idx * width ..][0..width];
+        const expected: f32 = if (flat_span_idx < real_batch * max_spans) 1.0 else 0.0;
+        for (0..2 * E) |i| try std.testing.expectEqual(expected, row[i]);
+        // Index columns (schema/row/count/start/end) are always preserved.
+        for (2 * E..width) |i| try std.testing.expectEqual(@as(f32, 1.0), row[i]);
+    }
+
+    try std.testing.expectError(error.InvalidGlinerSpanTargetShape, gliner2_autodiff.zeroPaddedSpanTargetRows(
+        targets[0 .. targets.len - 1],
+        .span_start,
+        E,
+        max_spans,
+        real_batch,
+        padded_batch,
+        false,
+    ));
+    try std.testing.expectError(error.InvalidGlinerObjective, gliner2_autodiff.zeroPaddedSpanTargetRows(
+        targets,
+        .token,
+        E,
+        max_spans,
+        real_batch,
+        padded_batch,
+        false,
+    ));
+}

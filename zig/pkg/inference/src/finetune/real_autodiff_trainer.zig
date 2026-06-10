@@ -294,6 +294,9 @@ pub const StepProfile = struct {
     optimizer_backend: OptimizerBackend = .host,
     device_resident_transfer_count: u64 = 0,
     device_trainable_bytes: usize = 0,
+    /// Static string set when the Metal training graph executor was requested
+    /// but the step fell back to the regular compiled path.
+    graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
     graph_executor_planned_dispatches: u64 = 0,
@@ -739,6 +742,7 @@ pub const RealAutodiffTrainer = struct {
         profile.execute_ns = step_result.profile.execute_ns;
         profile.extract_ns = step_result.profile.extract_ns;
         profile.peak_resident_bytes = step_result.profile.peak_resident_bytes;
+        profile.graph_executor_fallback_reason = step_result.profile.graph_executor_fallback_reason;
         profile.graph_executor_partitions = step_result.profile.graph_executor_partitions;
         profile.graph_executor_command_dispatches = step_result.profile.graph_executor_command_dispatches;
         profile.graph_executor_planned_dispatches = step_result.profile.graph_executor_planned_dispatches;

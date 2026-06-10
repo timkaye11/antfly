@@ -147,6 +147,7 @@ extern fn termite_metal_buffer_download(
     length: usize,
 ) c_int;
 extern fn termite_metal_decode_runtime_flush_active_frame(runtime: *anyopaque) c_int;
+extern fn termite_metal_decode_runtime_has_active_frame(runtime: *anyopaque) c_int;
 extern fn termite_metal_decode_runtime_retain_active_frame_buffer(runtime: *anyopaque, handle: *anyopaque) c_int;
 extern fn termite_metal_buffer_upload(
     runtime: *anyopaque,
@@ -544,8 +545,33 @@ pub const MetalTensor = struct {
 
         // Mirror already populated by a prior call — host fields hold count
         // elements, either aliasing Shared contents or a downloaded Private
-        // mirror. Reuse it.
-        if (self.len == count) return self.data[0..self.len];
+        // mirror. Reuse it, but only after the same active-frame flush the
+        // first-read path performs below: a runtime frame may still be
+        // queuing GPU writes to this buffer (in-place updates, planned-frame
+        // commands), so returning the cached mirror without draining the
+        // frame is a stale-readback corruption class. The flush is a cheap
+        // no-op when no frame is active.
+        if (self.len == count) {
+            const frame_was_active = termite_metal_decode_runtime_has_active_frame(dev.ref.runtime) != 0;
+            if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+                return error.MetalFrameSyncFailed;
+            }
+            if (frame_was_active and dev.mirror_owned) {
+                // Owned mirrors are Private-storage snapshots (Shared
+                // mirrors alias device memory and are coherent after the
+                // flush). Refresh the snapshot so writes queued since it was
+                // taken become visible.
+                const rc = termite_metal_buffer_download(
+                    dev.ref.runtime,
+                    dev.ref.handle,
+                    dev.byte_offset,
+                    @ptrCast(self.data),
+                    dev.byte_len,
+                );
+                if (rc != 0) return error.MetalBufferDownloadFailed;
+            }
+            return self.data[0..self.len];
+        }
 
         // If this tensor was produced inside an active runtime frame, host
         // materialization is an explicit synchronization boundary. Drain the

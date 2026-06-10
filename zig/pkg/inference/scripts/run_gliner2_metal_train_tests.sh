@@ -338,7 +338,7 @@ json_log_value() {
 
 assert_production_summary_log() {
   local log_file="$1"
-  local status manifest_backend optimizer_backend optimizer_mismatch trainable_transfers resident_transfers adapter_tensors task_head_tensors steps supervised_tokens execute_ms
+  local status manifest_backend optimizer_backend optimizer_mismatch trainable_transfers resident_transfers adapter_tensors task_head_tensors steps supervised_tokens execute_ms graph_commands graph_planned
 
   status="$(json_log_value "${log_file}" "status")" || return 1
   [[ "${status}" == "passed" ]] || return 1
@@ -353,6 +353,8 @@ assert_production_summary_log() {
   steps="$(json_log_value "${log_file}" "step_record_count")" || return 1
   supervised_tokens="$(json_log_value "${log_file}" "supervised_token_count")" || return 1
   execute_ms="$(json_log_value "${log_file}" "total_execute_ms")" || return 1
+  graph_commands="$(json_log_value "${log_file}" "total_graph_command_dispatches")" || return 1
+  graph_planned="$(json_log_value "${log_file}" "total_graph_planned_dispatches")" || return 1
 
   if [[ "${manifest_backend}" != "Metal" ||
     "${optimizer_backend}" != "metal" ||
@@ -370,8 +372,14 @@ assert_production_summary_log() {
     return 1
   fi
 
-  printf 'production_profile_summary_assertions: status=%s manifest_backend=%s optimizer_backend=%s max_device_trainable_transfer_count=%s max_device_resident_transfer_count=%s peft_adapter_tensor_count=%s task_head_tensor_count=%s step_record_count=%s supervised_token_count=%s total_execute_ms=%s\n' \
-    "${status}" "${manifest_backend}" "${optimizer_backend}" "${trainable_transfers}" "${resident_transfers}" "${adapter_tensors}" "${task_head_tensors}" "${steps}" "${supervised_tokens}" "${execute_ms}"
+  if (( graph_commands == 0 && graph_planned == 0 )); then
+    echo "error: production profile summary reported zero graph executor command+planned dispatches (interpreter-only execution; check for silent graph executor fallbacks)" >&2
+    echo "       total_graph_command_dispatches=${graph_commands} total_graph_planned_dispatches=${graph_planned}" >&2
+    return 1
+  fi
+
+  printf 'production_profile_summary_assertions: status=%s manifest_backend=%s optimizer_backend=%s max_device_trainable_transfer_count=%s max_device_resident_transfer_count=%s peft_adapter_tensor_count=%s task_head_tensor_count=%s step_record_count=%s supervised_token_count=%s total_execute_ms=%s total_graph_command_dispatches=%s total_graph_planned_dispatches=%s\n' \
+    "${status}" "${manifest_backend}" "${optimizer_backend}" "${trainable_transfers}" "${resident_transfers}" "${adapter_tensors}" "${task_head_tensors}" "${steps}" "${supervised_tokens}" "${execute_ms}" "${graph_commands}" "${graph_planned}"
 }
 
 assert_graph_exec_profile_log() {

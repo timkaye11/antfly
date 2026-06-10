@@ -88,6 +88,8 @@ pub const RunValidationSummary = struct {
     max_device_resident_transfer_count: u64,
     max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
+    total_graph_command_dispatches: u64,
+    total_graph_planned_dispatches: u64,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
     all_step_losses_finite: bool,
@@ -240,6 +242,8 @@ pub fn validateRun(
         .max_device_resident_transfer_count = metrics.max_device_resident_transfer_count,
         .max_device_trainable_bytes = metrics.max_device_trainable_bytes,
         .max_peak_resident_bytes = metrics.max_peak_resident_bytes,
+        .total_graph_command_dispatches = metrics.total_graph_command_dispatches,
+        .total_graph_planned_dispatches = metrics.total_graph_planned_dispatches,
         .first_step_loss = metrics.first_step_loss,
         .final_step_loss = metrics.final_step_loss,
         .all_step_losses_finite = metrics.all_step_losses_finite,
@@ -279,6 +283,8 @@ const MetricsInspection = struct {
     max_device_resident_transfer_count: u64 = 0,
     max_device_trainable_bytes: usize = 0,
     max_peak_resident_bytes: usize = 0,
+    total_graph_command_dispatches: u64 = 0,
+    total_graph_planned_dispatches: u64 = 0,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
     first_loss_window_sum: f64 = 0,
@@ -456,6 +462,8 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     max_device_resident_transfer_count: u64,
     max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
+    total_graph_command_dispatches: u64,
+    total_graph_planned_dispatches: u64,
     first_step_loss: ?f64,
     final_step_loss: ?f64,
     all_step_losses_finite: bool,
@@ -537,6 +545,8 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.max_device_trainable_transfer_count = @max(inspection.max_device_trainable_transfer_count, device_trainable_transfer_count);
             inspection.max_device_resident_transfer_count = @max(inspection.max_device_resident_transfer_count, device_resident_transfer_count);
             inspection.max_device_trainable_bytes = @max(inspection.max_device_trainable_bytes, device_trainable_bytes);
+            inspection.total_graph_command_dispatches += jsonU64(obj.get("graph_executor_command_dispatches")) orelse 0;
+            inspection.total_graph_planned_dispatches += jsonU64(obj.get("graph_executor_planned_dispatches")) orelse 0;
             if (optimizer_backend) |backend| {
                 if (inspection.optimizer_backend) |first_backend| {
                     if (!std.mem.eql(u8, first_backend, backend)) inspection.optimizer_backend_mismatch = true;
@@ -574,6 +584,8 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .max_device_resident_transfer_count = inspection.max_device_resident_transfer_count,
         .max_device_trainable_bytes = inspection.max_device_trainable_bytes,
         .max_peak_resident_bytes = inspection.max_peak_resident_bytes,
+        .total_graph_command_dispatches = inspection.total_graph_command_dispatches,
+        .total_graph_planned_dispatches = inspection.total_graph_planned_dispatches,
         .first_step_loss = inspection.first_step_loss,
         .final_step_loss = inspection.final_step_loss,
         .all_step_losses_finite = inspection.all_step_losses_finite,

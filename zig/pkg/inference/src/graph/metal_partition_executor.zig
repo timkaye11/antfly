@@ -1027,8 +1027,17 @@ pub const MetalPartitionExecutor = struct {
                     } else {
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
-                        if (trace_nodes or collect_op_stats) printInterpreterFallbackNullInputs(graph, values, node_id, partition_index, node_pos);
-                        if (interpreterFallbackHasMissingInput(graph, values, node_id)) return error.MissingRuntimeInput;
+                        if (interpreterFallbackHasMissingInput(graph, values, node_id)) {
+                            // Safety net: a producer skipped by the defer
+                            // heuristics was not fused by this consumer.
+                            // Materialize it on demand instead of aborting the
+                            // whole partition with MissingRuntimeInput.
+                            try materializeDeferredSkippedInputs(allocator, graph, cb, values, value_device, device_id, node_id, skipped_nodes, &exec_state, 0);
+                        }
+                        if (interpreterFallbackHasMissingInput(graph, values, node_id)) {
+                            printInterpreterFallbackNullInputs(graph, values, node_id, partition_index, node_pos);
+                            return error.MissingRuntimeInput;
+                        }
                         values[i] = try interpreter.executeNode(graph, cb, values, node_id, &exec_state);
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_end partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     }
@@ -1505,6 +1514,53 @@ fn interpreterFallbackHasMissingInput(
         if (input_index >= values.len or values[input_index] == null) return true;
     }
     return false;
+}
+
+const max_deferred_input_materialization_depth: usize = 4;
+
+/// On-demand materialization safety net for the defer heuristics
+/// (shouldDeferScaleMulForAdd / shouldDeferElementwiseMulForAdd /
+/// shouldDeferTransposeForLinearDot). Those heuristics skip a producer node
+/// expecting its single consumer to fuse it; when the consumer ends up on an
+/// execution path that does not fuse (planned runtime region, fused graph
+/// pattern, or interpreter fallback), the deferred output is still null when
+/// the consumer executes. Execute such skipped producers here so the consumer
+/// can proceed, instead of aborting the whole partition (which previously
+/// forced an expensive full-step retry on the regular compiled path).
+///
+/// Inputs of a skipped node are never freed by last-use bookkeeping (the
+/// skipped node never "executes"), so its operands are still available.
+fn materializeDeferredSkippedInputs(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    node_id: NodeId,
+    skipped_nodes: []bool,
+    exec_state: *interpreter.ExecState,
+    depth: usize,
+) !void {
+    if (depth >= max_deferred_input_materialization_depth) return;
+    if (node_id == null_node or node_id >= graph.nodeCount()) return;
+    const node = graph.node(node_id);
+    for (node.getInputs()) |input_id| {
+        if (input_id == null_node) continue;
+        const input_index: usize = @intCast(input_id);
+        if (input_index >= values.len) continue;
+        if (values[input_index] != null) continue;
+        if (input_index >= skipped_nodes.len or !skipped_nodes[input_index]) continue;
+        // Deferred producers can chain (e.g. a deferred transpose feeding a
+        // deferred mul); resolve the producer's own skipped inputs first.
+        try materializeDeferredSkippedInputs(allocator, graph, cb, values, value_device, device_id, input_id, skipped_nodes, exec_state, depth + 1);
+        if (interpreterFallbackHasMissingInput(graph, values, input_id)) continue;
+        const materialized = (try tryExecuteMetalCommand(allocator, graph, cb, values, input_id, null, exec_state)) orelse
+            try interpreter.executeNode(graph, cb, values, input_id, exec_state);
+        values[input_index] = materialized;
+        if (input_index < value_device.len) value_device[input_index] = device_id;
+        skipped_nodes[input_index] = false;
+    }
 }
 
 fn metalPartitionOpStatsEnabled() bool {
@@ -2106,6 +2162,22 @@ fn rawLinearBiasPairRuntimeRegionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RAW_LINEAR_BIAS_PAIR_RUNTIME_REGION", true);
 }
 
+/// Training-graph-executor runs require bit-parity with the direct
+/// interpreter. The raw_linear_* runtime regions reroute raw
+/// `dot_general(x, transpose(W))` nodes through prepared dynamic linear
+/// slots (`decoderRuntimeApplyLinear`), a code path the interpreter never
+/// takes for these nodes and which diverged numerically on the GLiNER2 LoRA
+/// training graph (first at the [127,768] x [768,768]ᵀ relative-position
+/// projection). When the training graph executor is active, decline those
+/// region matches so the dots execute through the interpreter-equivalent
+/// dot_general command instead. `TERMITE_METAL_ENABLE_RAW_LINEAR_RUNTIME_REGIONS_IN_TRAINING=1`
+/// restores the previous behavior.
+fn rawLinearRuntimeRegionsSuppressedForTraining() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RAW_LINEAR_RUNTIME_REGIONS_IN_TRAINING", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+}
+
 fn gatedFfnGraphFusionDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION", false);
 }
@@ -2150,12 +2222,13 @@ fn buildRuntimeRegionPlan(
     @memset(skipped, false);
 
     var region_count: usize = 0;
+    const raw_linear_regions_suppressed = rawLinearRuntimeRegionsSuppressedForTraining();
     for (node_ids, 0..) |node_id, node_pos| {
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
 
-        if (rawLinearBiasPairRuntimeRegionEnabled()) {
+        if (!raw_linear_regions_suppressed and rawLinearBiasPairRuntimeRegionEnabled()) {
             if (matchRawLinearBiasPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
                 regions[node_pos] = .{ .raw_linear_bias_pair = pattern };
                 markRawLinearBiasPairSkipped(skipped, pattern);
@@ -2163,22 +2236,24 @@ fn buildRuntimeRegionPlan(
                 continue;
             }
         }
-        if (matchRawLinearBiasPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
-            regions[node_pos] = .{ .raw_linear_bias = pattern };
-            markRawLinearBiasSkipped(skipped, pattern);
-            region_count += 1;
-            continue;
-        }
-        if (matchRawLinearPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
-            regions[node_pos] = .{ .raw_linear_pair = pattern };
-            markRawLinearPairSkipped(skipped, pattern);
-            region_count += 1;
-            continue;
-        }
-        if (matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use)) |pattern| {
-            regions[node_pos] = .{ .raw_linear_dot = pattern };
-            region_count += 1;
-            continue;
+        if (!raw_linear_regions_suppressed) {
+            if (matchRawLinearBiasPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
+                regions[node_pos] = .{ .raw_linear_bias = pattern };
+                markRawLinearBiasSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+            if (matchRawLinearPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
+                regions[node_pos] = .{ .raw_linear_pair = pattern };
+                markRawLinearPairSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+            if (matchRawLinearDotPattern(graph, node_ids, node_pos, reachable, last_use)) |pattern| {
+                regions[node_pos] = .{ .raw_linear_dot = pattern };
+                region_count += 1;
+                continue;
+            }
         }
         if (matchLoraLinearQkvPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
             regions[node_pos] = .{ .lora_linear_qkv = pattern };
@@ -9526,11 +9601,46 @@ fn executeRuntimeLinearDotFromDeferredTranspose(
         };
         return try promoteMetalOutputIfNeeded(cb, output);
     }
+    // Unplanned dense weights: execute as `dot_general(input, weight)` with
+    // the weight's second axis contracted (X @ Wᵀ) instead of routing through
+    // `linearNoBias`. This is numerically identical to the interpreter's
+    // `dot_general(input, transpose(W))` device command (same reduce kernel,
+    // same accumulation order, device byte offsets forwarded for sub-buffer
+    // view operands) whereas the linear route goes through dynamic linear
+    // slot caches / MPS / host-mirror sub-paths that the regular interpreter
+    // never exercises for raw dot_general nodes. The GLiNER2 training graph
+    // executor diverged on exactly this configuration (rel-position
+    // projection, gather output [127,768] x transposed square [768,768]
+    // weight) while the interpreter was bit-exact; keeping the shortcut on
+    // the interpreter-equivalent command preserves parity by construction.
+    // Planned (quantized) dispatches keep the linear route below (their
+    // packed weight descriptors are only consumable by the planned kernels),
+    // as do host-resident inputs (the host sgemm linear route is exact and
+    // avoids demoting the whole product to the naive host dot fallback).
+    if (op_plan == null and isMetalDeviceResident(cb, input) and !weightRequiresPlannedLinear(cb, weight)) {
+        var weight_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+        const source_weight_shape = try fillShapeDims(weight_shape, &weight_shape_buf);
+        const dot_output = cb.primDotGeneral(input, weight, lhs_shape, source_weight_shape, lhs_contracting, &.{1}, lhs_batch, rhs_batch) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+            else => return err,
+        };
+        if (dot_output != null) return try promoteMetalOutputIfNeeded(cb, dot_output);
+    }
     const output = cb.linearNoBiasWithPlan(input, weight, rows, in_dim, out_dim, op_plan) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
     return try promoteMetalOutputIfNeeded(cb, output);
+}
+
+/// Quantized weight descriptors must stay on the planned `linearNoBias`
+/// route — `primDotGeneral` either rejects them or falls back to a slow host
+/// dequantization. Dense (f32 host or device-resident) weights are safe on
+/// the dot_general command path.
+fn weightRequiresPlannedLinear(cb: *const ComputeBackend, weight: CT) bool {
+    if (cb.kind() != .metal) return false;
+    if (comptime !build_options.enable_metal) return false;
+    return metal_compute_mod.MetalCompute.getQuantizedStorage(cb, weight) != null;
 }
 
 fn shouldDeferTransposeForLinearDot(
@@ -10085,8 +10195,8 @@ fn executeRuntimeScaledAddFromDeferredMul(
     dim: usize,
 ) !?CT {
     if (inputs.len < 2) return null;
-    if (deferredScaleMul(graph, inputs[0], output_shape)) |lhs_scaled| {
-        if (deferredScaleMul(graph, inputs[1], output_shape)) |rhs_scaled| {
+    if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |lhs_scaled| {
+        if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |rhs_scaled| {
             const lhs = (try executeDeferredScaleMulValue(cb, values, lhs_scaled)) orelse return null;
             defer cb.free(lhs);
             const rhs = (try executeDeferredScaleMulValue(cb, values, rhs_scaled)) orelse return null;
@@ -10098,7 +10208,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
             return try promoteMetalOutputIfNeeded(cb, output);
         }
     }
-    if (deferredScaleMul(graph, inputs[0], output_shape)) |scaled| {
+    if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |scaled| {
         const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
         const residual = valueFor(values, inputs[1]) orelse return null;
         const output = cb.decoderRuntimeApplyScaledAddScale(&.{
@@ -10114,7 +10224,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
         if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
-    if (deferredScaleMul(graph, inputs[1], output_shape)) |scaled| {
+    if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |scaled| {
         const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
         const residual = valueFor(values, inputs[0]) orelse return null;
         const output = cb.decoderRuntimeApplyScaledAddScale(&.{
@@ -10142,14 +10252,14 @@ fn executeRuntimeMultiplyAddFromDeferredMul(
     dim: usize,
 ) !?CT {
     if (inputs.len < 2) return null;
-    if (deferredElementwiseMul(graph, inputs[0], output_shape)) |mul| {
-        if (deferredElementwiseMul(graph, inputs[1], output_shape)) |rhs_mul| {
+    if (pendingDeferredElementwiseMul(graph, values, inputs[0], output_shape)) |mul| {
+        if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |rhs_mul| {
             return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim);
         }
         const addend = valueFor(values, inputs[1]) orelse return null;
         return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
     }
-    if (deferredElementwiseMul(graph, inputs[1], output_shape)) |mul| {
+    if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |mul| {
         const addend = valueFor(values, inputs[0]) orelse return null;
         return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
     }
@@ -10344,6 +10454,27 @@ fn executeDeferredScaleAddFallback(
         else => return err,
     };
     return try promoteMetalOutputIfNeeded(cb, output);
+}
+
+/// A mul input may only be consumed as a "deferred" (fused) producer when its
+/// value has NOT been materialized. The defer heuristics
+/// (shouldDeferScaleMulForAdd / shouldDeferElementwiseMulForAdd) additionally
+/// require single-use + last-use-at-consumer before skipping a node, so a mul
+/// that merely matches the structural pattern can still have been executed
+/// normally (e.g. multi-use gradient terms in backward graphs). Recomputing
+/// such a materialized mul from its sources is unsound: those sources may
+/// already have been freed by last-use bookkeeping, which previously made the
+/// whole fused-add path bail and leave the genuinely-deferred sibling input
+/// unmaterialized (error.MissingRuntimeInput, see gliner2 LoRA backward
+/// add(mul, mul) at node 4996).
+fn pendingDeferredScaleMul(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
+    if (valueFor(values, node_id) != null) return null;
+    return deferredScaleMul(graph, node_id, output_shape);
+}
+
+fn pendingDeferredElementwiseMul(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseMul {
+    if (valueFor(values, node_id) != null) return null;
+    return deferredElementwiseMul(graph, node_id, output_shape);
 }
 
 fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
@@ -11861,6 +11992,139 @@ test "metal partition executor recognizes raw transposed linear dot plus bias gr
     try std.testing.expectEqual(RuntimeRegion{ .none = {} }, plan.regionAt(@intCast(biased), biased, node_ids));
 }
 
+test "metal partition executor transposed linear dot with multi-use transpose matches host reference" {
+    // Regression test for the GLiNER2 training-graph-executor divergence at
+    // the relative-position projection: dot_general(x[127,K], transpose(W))
+    // where the transpose is ALSO consumed outside the dot (the autodiff
+    // backward graph transposes it again), so it is materialized rather than
+    // deferred and the raw_linear_dot runtime region declines. The dot must
+    // then execute through the interpreter-equivalent dot_general command —
+    // the dynamic-linear-slot shortcut diverged here. Uses 127 rows and a
+    // square, non-symmetric weight: an orientation (X@W vs X@Wᵀ) or
+    // row-stride bug is invisible to shape checks in this configuration.
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+    const rows: usize = 127;
+    const dim: usize = 192; // >=128 so the reduce-kernel dispatch path is used
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, dim }));
+    const w = try b.parameter("encoder.layer.0.attention.self.query_proj.weight", ml.graph.Shape.init(.f32, &.{ dim, dim }));
+    // Device-resident producer for the dot's lhs (mirrors the gather output).
+    const pre = try b.add(x, x);
+    const wt = try b.transpose(w, &.{ 1, 0 });
+    const dot = try b.matmul(pre, wt);
+    // Second consumer keeps the transpose from being deferred/region-fused,
+    // mirroring the training graph where backward nodes also consume it.
+    const wt_escape = try b.add(wt, wt);
+    try g.markOutput(dot);
+    try g.markOutput(wt_escape);
+
+    const caps = [_]partition_mod.Capability{
+        .{ .backend = .metal, .priority = 10, .supports = &partition_mod.supportsAll },
+    };
+    var partition_plan = try partition_mod.partition(allocator, &g, &caps);
+    defer partition_plan.deinit();
+    var buffer_plan = try buffer_plan_mod.build(allocator, &g, &partition_plan, .{});
+    defer buffer_plan.deinit();
+
+    var weight_store = initEmptyMetalWeightStore(allocator);
+    defer deinitEmptyMetalWeightStore(&weight_store, allocator);
+    var metal_compute = try metal_compute_mod.MetalCompute.init(allocator, &weight_store, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+
+    const count: usize = @intCast(g.nodeCount());
+    const values = try allocator.alloc(?CT, count);
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, count);
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const x_data = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(x_data);
+    const w_data = try allocator.alloc(f32, dim * dim);
+    defer allocator.free(w_data);
+    var lcg: u32 = 0x12345678;
+    for (x_data) |*value| {
+        lcg = lcg *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt((lcg >> 9) % 1024)) / 1024.0 - 0.5;
+    }
+    for (w_data) |*value| {
+        lcg = lcg *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt((lcg >> 9) % 1024)) / 1024.0 - 0.5;
+    }
+
+    const x_ct = try cb.fromFloat32Shape(x_data, &.{ @intCast(rows), @intCast(dim) });
+    defer cb.free(x_ct);
+    const w_ct = try cb.fromFloat32Shape(w_data, &.{ @intCast(dim), @intCast(dim) });
+    defer cb.free(w_ct);
+    values[@intCast(x)] = x_ct;
+    values[@intCast(w)] = w_ct;
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    var owned_runtime_transfers = std.AutoHashMapUnmanaged(NodeId, void).empty;
+    defer owned_runtime_transfers.deinit(allocator);
+    var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
+    const partition_index = partition_plan.node_assignment[dot];
+    try exec.partitionExecutor().execute(values, value_device, partition_plan.partitions[partition_index].node_ids, 0, .{
+        .allocator = allocator,
+        .graph = &g,
+        .backend = &cb,
+        .options = .{
+            .runtime_inputs = &.{
+                .{ .node_id = x, .value = x_ct },
+                .{ .node_id = w, .value = w_ct },
+            },
+        },
+        .reachable = reachable,
+        .last_use = last_use,
+        .partition_plan = &partition_plan,
+        .buffer_plan = &buffer_plan,
+        .owned_runtime_transfers = &owned_runtime_transfers,
+    });
+
+    const dot_index: usize = @intCast(dot);
+    const escape_index: usize = @intCast(wt_escape);
+    defer if (values[dot_index]) |ct| cb.free(ct);
+    defer if (values[escape_index]) |ct| cb.free(ct);
+    const raw = try cb.toFloat32(values[dot_index].?, allocator);
+    defer allocator.free(raw);
+    try std.testing.expectEqual(rows * dim, raw.len);
+
+    // Host reference: dot(pre, Wᵀ) = (2x) @ Wᵀ.
+    var max_abs_diff: f32 = 0;
+    for (0..rows) |r| {
+        for (0..dim) |c| {
+            var expected: f64 = 0;
+            for (0..dim) |k| {
+                expected += @as(f64, 2.0 * x_data[r * dim + k]) * @as(f64, w_data[c * dim + k]);
+            }
+            const got = raw[r * dim + c];
+            const diff = @abs(got - @as(f32, @floatCast(expected)));
+            if (diff > max_abs_diff) max_abs_diff = diff;
+            const tolerance = 1e-3 + 1e-3 * @abs(@as(f32, @floatCast(expected)));
+            if (diff > tolerance) {
+                std.debug.print(
+                    "transposed_linear_dot_mismatch: row={d} col={d} got={d:.6} expected={d:.6}\n",
+                    .{ r, c, got, expected },
+                );
+                return error.TransposedLinearDotMismatch;
+            }
+        }
+    }
+}
+
 test "metal partition executor defers scalar scale mul only for single add consumer" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -11966,6 +12230,59 @@ test "metal partition executor defers both same shape multiply add inputs" {
     try std.testing.expect(deferredElementwiseMul(&g, rhs, g.node(out).output_shape) != null);
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, lhs, reachable, last_use));
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, rhs, reachable, last_use));
+}
+
+test "metal partition executor only treats unmaterialized mul inputs as deferred" {
+    // Regression test for the gliner2 LoRA backward add(mul, mul) failure:
+    // one mul input of the add is materialized (multi-use, so the defer
+    // heuristic never skipped it) while the other was skipped expecting the
+    // add to fuse it. The consume side must treat the materialized mul as a
+    // plain operand (its sources may already be freed) and only recompute the
+    // genuinely deferred (null-valued) mul.
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const scale = try b.scalarConst(.f32, 0.5);
+    const materialized_mul = try b.mul(x, scale);
+    const deferred_mul = try b.mul(y, scale);
+    const out = try b.add(materialized_mul, deferred_mul);
+    // Second consumer keeps materialized_mul from being deferred.
+    const escaped = try b.add(materialized_mul, z);
+    try g.markOutput(out);
+    try g.markOutput(escaped);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    // Only the single-use mul is deferred by the heuristic.
+    try std.testing.expect(!shouldDeferScaleMulForAdd(&g, materialized_mul, reachable, last_use));
+    try std.testing.expect(shouldDeferScaleMulForAdd(&g, deferred_mul, reachable, last_use));
+
+    // Both muls match the structural pattern, which is what previously made
+    // the consume side treat the materialized one as deferred too.
+    const out_shape = g.node(out).output_shape;
+    try std.testing.expect(deferredScaleMul(&g, materialized_mul, out_shape) != null);
+    try std.testing.expect(deferredScaleMul(&g, deferred_mul, out_shape) != null);
+
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    var sentinel: u8 = 0;
+    values[@intCast(materialized_mul)] = @as(CT, @ptrCast(&sentinel));
+
+    // The materialized mul must be consumed as a plain operand...
+    try std.testing.expect(pendingDeferredScaleMul(&g, values, materialized_mul, out_shape) == null);
+    // ...while the skipped (null-valued) mul is still eligible for fusion.
+    try std.testing.expect(pendingDeferredScaleMul(&g, values, deferred_mul, out_shape) != null);
+    try std.testing.expect(pendingDeferredElementwiseMul(&g, values, materialized_mul, out_shape) == null);
 }
 
 test "metal partition executor does not defer nested same shape multiply add input" {

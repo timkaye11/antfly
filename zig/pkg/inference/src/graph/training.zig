@@ -87,6 +87,9 @@ pub const TrainStepProfile = struct {
     extract_ns: u64 = 0,
     total_ns: u64 = 0,
     peak_resident_bytes: usize = 0,
+    /// Non-null when the Metal training graph executor was requested but the
+    /// step fell back to the regular compiled path. Always a static string.
+    graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
     graph_executor_planned_dispatches: u64 = 0,
@@ -407,6 +410,8 @@ pub const CompiledTrainSession = struct {
                 currentResidentBytes(),
             },
         );
+        maybeDumpGraphNodes(&self.graph);
+
         if (trainingGraphExecutorParityNodeIds()) |node_ids_raw| {
             if (!try self.runSelectedNodeParityDiagnostic(cb, rt_slice, node_ids_raw)) {
                 return error.TrainingGraphExecutorParityMismatch;
@@ -414,7 +419,7 @@ pub const CompiledTrainSession = struct {
         }
 
         if (trainingGraphExecutorParityCheckEnabled() and cb.kind() == .metal and platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) {
-            var direct_result = try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, nowNs());
+            var direct_result = try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, nowNs(), .{});
             errdefer direct_result.deinit();
             const graph_result_opt = try self.executeWithSingleMetalGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile);
             var graph_result = graph_result_opt orelse return error.TrainingGraphExecutorUnavailable;
@@ -430,7 +435,9 @@ pub const CompiledTrainSession = struct {
             return result;
         }
 
-        return try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, total_start);
+        // Keep the partial profile (plan cache counters, fallback reason) so
+        // step rows still report why the graph executor was not used.
+        return try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, total_start, profile);
     }
 
     fn runSelectedNodeParityDiagnostic(
@@ -582,9 +589,10 @@ pub const CompiledTrainSession = struct {
         runtime_inputs: ?[]const RuntimeInput,
         retain_device_gradients: bool,
         total_start: u64,
+        initial_profile: TrainStepProfile,
     ) !TrainStepResult {
-        var profile: TrainStepProfile = .{};
-        profile.peak_resident_bytes = currentResidentBytes();
+        var profile = initial_profile;
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         const execute_start = nowNs();
 
         var owned_execution_frame = try beginOwnedExecutionFrame(cb);
@@ -608,7 +616,15 @@ pub const CompiledTrainSession = struct {
         compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ exec_result.outputs.len, retain_device_gradients, currentResidentBytes() });
         const loss_data = try cb.toFloat32(exec_result.outputs[self.loss_output_index], self.allocator);
         defer self.allocator.free(loss_data);
-        const loss_value: f32 = if (loss_data.len > 0) loss_data[0] else 0.0;
+        if (loss_data.len == 0) {
+            const loss_output_node = self.graph.outputs.items[self.loss_output_index];
+            std.debug.print(
+                "[compiled-train] ERROR: empty loss output node={} op={s} shape={any}\n",
+                .{ loss_output_node, @tagName(std.meta.activeTag(self.graph.node(loss_output_node).op)), self.graph.node(loss_output_node).output_shape },
+            );
+            return error.EmptyLossOutput;
+        }
+        const loss_value: f32 = loss_data[0];
 
         var gradients = std.StringHashMapUnmanaged([]f32){};
         var device_gradients = std.StringHashMapUnmanaged(CT){};
@@ -684,7 +700,11 @@ pub const CompiledTrainSession = struct {
 
         const cached = try self.cachedMetalGraphExecutorPlan(cb, profile);
         if (retain_device_gradients and !self.planKeepsGradientOutputsOnMetal(&cached.base_plan)) {
-            compiledDiag("graph executor fallback gradient output assigned to native partition unsupported_ops={}", .{cached.unsupported_ops});
+            profile.graph_executor_fallback_reason = "gradient_output_on_native_partition";
+            std.debug.print(
+                "[compiled-train] WARNING: graph executor fallback reason=gradient_output_on_native_partition unsupported_ops={}; retrying regular compiled Metal path\n",
+                .{cached.unsupported_ops},
+            );
             return null;
         }
 
@@ -720,7 +740,11 @@ pub const CompiledTrainSession = struct {
             },
         ) catch |err| switch (err) {
             error.MissingRuntimeInput => {
-                compiledDiag("graph executor fallback missing partition input; retrying regular compiled Metal path", .{});
+                profile.graph_executor_fallback_reason = "missing_partition_input";
+                std.debug.print(
+                    "[compiled-train] WARNING: graph executor fallback reason=missing_partition_input; retrying regular compiled Metal path\n",
+                    .{},
+                );
                 return null;
             },
             else => return err,
@@ -925,7 +949,31 @@ pub const CompiledTrainSession = struct {
         const loss_device = mesh.device(multi_result.output_devices[self.loss_output_index]) orelse return error.DeviceNotFound;
         const loss_data = try loss_device.backend.toFloat32(outputs[self.loss_output_index], self.allocator);
         defer self.allocator.free(loss_data);
-        const loss_value: f32 = if (loss_data.len > 0) loss_data[0] else 0.0;
+        const loss_output_node = self.graph.outputs.items[self.loss_output_index];
+        if (loss_data.len == 0) {
+            std.debug.print(
+                "[compiled-train] ERROR: graph executor produced empty loss output node={} op={s} shape={any} device={}\n",
+                .{
+                    loss_output_node,
+                    @tagName(std.meta.activeTag(self.graph.node(loss_output_node).op)),
+                    self.graph.node(loss_output_node).output_shape,
+                    multi_result.output_devices[self.loss_output_index],
+                },
+            );
+            return error.EmptyLossOutput;
+        }
+        compiledDiag(
+            "graph executor loss output node={} op={s} shape={any} len={} value={d:.6} device={}",
+            .{
+                loss_output_node,
+                @tagName(std.meta.activeTag(self.graph.node(loss_output_node).op)),
+                self.graph.node(loss_output_node).output_shape,
+                loss_data.len,
+                loss_data[0],
+                multi_result.output_devices[self.loss_output_index],
+            },
+        );
+        const loss_value: f32 = loss_data[0];
 
         var gradients = std.StringHashMapUnmanaged([]f32){};
         var device_gradients = std.StringHashMapUnmanaged(CT){};
@@ -945,11 +993,31 @@ pub const CompiledTrainSession = struct {
         }
 
         var grad_output_idx: usize = self.loss_output_index + 1;
+        var grad_diag_emitted = false;
         for (self.wrt_names, 0..) |name, i| {
             if (self.param_grads[i] == null_node) continue;
             const grad_ct = outputs[grad_output_idx];
             const grad_output_node = self.graph.outputs.items[grad_output_idx];
             const grad_device = mesh.device(multi_result.output_devices[grad_output_idx]) orelse return error.DeviceNotFound;
+            if (!grad_diag_emitted and platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE", false)) {
+                grad_diag_emitted = true;
+                const grad_data_diag = try grad_device.backend.toFloat32(grad_ct, self.allocator);
+                defer self.allocator.free(grad_data_diag);
+                var abs_sum: f64 = 0;
+                for (grad_data_diag) |v| abs_sum += @abs(v);
+                compiledDiag(
+                    "graph executor first grad output idx={} node={} op={s} shape={any} len={} abs_sum={d:.6} name={s}",
+                    .{
+                        grad_output_idx,
+                        grad_output_node,
+                        @tagName(std.meta.activeTag(self.graph.node(grad_output_node).op)),
+                        self.graph.node(grad_output_node).output_shape,
+                        grad_data_diag.len,
+                        abs_sum,
+                        name,
+                    },
+                );
+            }
             grad_output_idx += 1;
             const owned_name = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(owned_name);
@@ -1119,6 +1187,72 @@ fn trainingGraphExecutorSkipMetalFusedPatterns() bool {
 
 fn trainingGraphExecutorParityNodeIds() ?[]const u8 {
     return platform.env.getenv("TERMITE_TRAINING_GRAPH_EXECUTOR_PARITY_NODE_IDS");
+}
+
+var graph_node_dump_done: bool = false;
+
+/// Env-gated graph node dump for parity debugging. Set
+/// `TERMITE_DUMP_GRAPH_NODES="1030-1040"` (or a comma list like
+/// `"1031,1033,1035"`) to print, once per process, the definition of the
+/// selected nodes in the compiled training graph: op, output shape, inputs
+/// (id/op/shape, parameter names) and the full dot_general / transpose
+/// attribute configuration.
+fn maybeDumpGraphNodes(graph: *const Graph) void {
+    if (graph_node_dump_done) return;
+    const raw = platform.env.getenv("TERMITE_DUMP_GRAPH_NODES") orelse return;
+    graph_node_dump_done = true;
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+            const lo = std.fmt.parseUnsigned(NodeId, part[0..dash], 10) catch continue;
+            const hi = std.fmt.parseUnsigned(NodeId, part[dash + 1 ..], 10) catch continue;
+            var id = lo;
+            while (id <= hi) : (id += 1) dumpGraphNode(graph, id);
+        } else {
+            const id = std.fmt.parseUnsigned(NodeId, part, 10) catch continue;
+            dumpGraphNode(graph, id);
+        }
+    }
+}
+
+fn dumpGraphNode(graph: *const Graph, node_id: NodeId) void {
+    if (node_id >= graph.nodeCount()) return;
+    const node = graph.node(node_id);
+    std.debug.print(
+        "graph_node_dump: node={d} op={s} shape={any}",
+        .{ node_id, @tagName(std.meta.activeTag(node.op)), node.output_shape },
+    );
+    switch (node.op) {
+        .dot_general => |attrs| std.debug.print(
+            " lhs_contracting={any} rhs_contracting={any} lhs_batch={any} rhs_batch={any}",
+            .{
+                attrs.lhs_contracting[0..attrs.num_contracting],
+                attrs.rhs_contracting[0..attrs.num_contracting],
+                attrs.lhs_batch[0..attrs.num_batch],
+                attrs.rhs_batch[0..attrs.num_batch],
+            },
+        ),
+        .transpose => |attrs| std.debug.print(" perm={any}", .{attrs.perm[0..attrs.num_axes]}),
+        .parameter => std.debug.print(" name={s}", .{graph.parameterName(node)}),
+        .gather => |attrs| std.debug.print(" axis={d}", .{attrs.axis}),
+        else => {},
+    }
+    std.debug.print("\n", .{});
+    for (node.getInputs(), 0..) |input_id, idx| {
+        if (input_id == null_node) continue;
+        if (input_id >= graph.nodeCount()) continue;
+        const input = graph.node(input_id);
+        std.debug.print(
+            "graph_node_dump:   input[{d}]: node={d} op={s} shape={any}",
+            .{ idx, input_id, @tagName(std.meta.activeTag(input.op)), input.output_shape },
+        );
+        if (std.meta.activeTag(input.op) == .parameter) {
+            std.debug.print(" name={s}", .{graph.parameterName(input)});
+        }
+        std.debug.print("\n", .{});
+    }
 }
 
 fn trainingGraphExecutorParityMaxGradientValues() usize {

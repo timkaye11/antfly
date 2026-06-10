@@ -2041,6 +2041,62 @@ pub fn gliner2TotalLossTargetsShape(batch: u32, max_rows: u32, num_entity_types:
     });
 }
 
+// ── Partial-batch padding ────────────────────────────────────────────────────
+
+/// The autodiff graph is compiled once for a fixed `(batch, seq_len)`, so a
+/// final partial batch must be padded back up to the configured batch size
+/// (upstream GLiNER2 instead feeds the smaller batch through PyTorch's
+/// dynamic shapes). The trainer pads by repeating a real example so that
+/// every index column packed into the span targets (schema / row-repeat /
+/// count-state / start / end / parent token indices) stays in-bounds for the
+/// graph's baked gather constants, and then calls this helper to zero every
+/// supervision label and mask in the padded rows. With zero masks the padded
+/// rows contribute exactly nothing to the numerator (and, for `.mean`
+/// reduction, the mask-sum denominator) of the structure, classification,
+/// and count loss components, so `.sum`-reduced losses match upstream's
+/// smaller final batch bit-for-bit in exact arithmetic.
+pub fn zeroPaddedSpanTargetRows(
+    targets: []f32,
+    objective: GlinerObjective,
+    num_entity_types: usize,
+    max_spans: usize,
+    real_batch: usize,
+    padded_batch: usize,
+    has_label_positive_weights: bool,
+) !void {
+    if (objective == .token) return error.InvalidGlinerObjective;
+    if (real_batch > padded_batch or real_batch == 0) return error.InvalidGlinerBatchShape;
+    const E = num_entity_types;
+    const width = if (objective == .gliner2_total_loss)
+        gliner2TotalLossTargetWidth(E)
+    else if (has_label_positive_weights)
+        weightedSpanStartTargetWidth(E)
+    else
+        spanStartTargetWidth(E);
+    if (targets.len != padded_batch * max_spans * width) return error.InvalidGlinerSpanTargetShape;
+    var row = real_batch * max_spans;
+    const row_end = padded_batch * max_spans;
+    while (row < row_end) : (row += 1) {
+        const base = row * width;
+        // Structure loss: labels[0..E] and the valid-span mask[E..2E]. The
+        // per-label positive weights (weighted layout) may stay — a zero
+        // mask already makes the row inert.
+        @memset(targets[base .. base + 2 * E], 0.0);
+        if (objective == .gliner2_total_loss) {
+            const cls_labels_offset = gliner2TotalLossClassificationLabelsOffset(E);
+            const count_labels_offset = gliner2TotalLossCountLabelsOffset(E);
+            const count_mask_offset = gliner2TotalLossCountMaskOffset(E);
+            // Classification labels[E] and classification mask[E] are
+            // adjacent; zero both.
+            @memset(targets[base + cls_labels_offset .. base + cls_labels_offset + 2 * E], 0.0);
+            // Count one-hot labels[20] and the count mask[1] are adjacent;
+            // zero both. The parent token index that follows is left intact
+            // so the count-loss gather stays in-bounds.
+            @memset(targets[base + count_labels_offset .. base + count_mask_offset + 1], 0.0);
+        }
+    }
+}
+
 /// Shape for packed span-start targets:
 /// `[batch * max_spans, 5 * num_entity_types + 2]` f32.
 pub fn spanStartTargetsShape(batch: u32, max_spans: u32, num_entity_types: u32) Shape {

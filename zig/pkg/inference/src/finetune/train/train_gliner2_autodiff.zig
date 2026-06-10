@@ -900,6 +900,16 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // weights are packed into the target tensor.
     var targets_buf = try allocator.alloc(f32, target_buf_values);
     defer allocator.free(targets_buf);
+    // Staging windows for one batch. The autodiff graph is compiled once for
+    // a fixed (batch, seq_len), so a final partial batch is padded back up to
+    // `bs` by repeating the last real example; the padded rows then have all
+    // supervision labels/masks zeroed (see
+    // gliner2_autodiff.zeroPaddedSpanTargetRows) so they are exact no-ops in
+    // every loss component while keeping the packed gather indices in-bounds.
+    var batch_examples = try allocator.alloc(gliner2_data.Example, bs);
+    defer allocator.free(batch_examples);
+    var batch_records = try allocator.alloc(gliner2_data.UpstreamRecord, bs);
+    defer allocator.free(batch_records);
 
     if (opts.initial_adapter_checkpoint) |checkpoint_path| {
         try ensureTrainerGraphBuiltFromFirstBatch(
@@ -955,8 +965,17 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         var batch_start: usize = 0;
         while (batch_start < total_examples) {
             const batch_end = @min(batch_start + bs, total_examples);
-            const actual_batch: u32 = @intCast(batch_end - batch_start);
-            const ab: usize = actual_batch;
+            // Pad a partial final batch up to the fixed graph batch size by
+            // repeating the last real example; the padded targets are zero-
+            // masked below so they contribute nothing to any loss component.
+            const real_batch: usize = batch_end - batch_start;
+            for (0..bs) |slot| {
+                const src = batch_start + @min(slot, real_batch - 1);
+                batch_examples[slot] = examples[src];
+                if (opts.objective == .gliner2_total_loss) batch_records[slot] = training_records[src];
+            }
+            const actual_batch: u32 = @intCast(bs);
+            const ab: usize = bs;
 
             // Tokenize batch + build entity/span targets.
             const step_started_ns = monotonicNowNs();
@@ -969,7 +988,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         allocator,
                         &tokenizer,
                         entity_types,
-                        examples[batch_start..batch_end],
+                        batch_examples,
                         opts.seq_len,
                         opts.num_classes,
                         &label_map,
@@ -977,6 +996,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         attention_mask,
                         targets_buf[0 .. ab * sl * nc],
                     );
+                    // Padded duplicate examples become all-zero target rows,
+                    // which the masked token loss ignores entirely.
+                    if (real_batch < ab) @memset(targets_buf[real_batch * sl * nc .. ab * sl * nc], 0.0);
                     targets_shape = gliner2_autodiff.tokenTargetsShape(
                         actual_batch,
                         opts.seq_len,
@@ -989,7 +1011,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         try gliner2_data.buildUpstreamTaskBatch(
                             allocator,
                             &tokenizer,
-                            training_records[batch_start..batch_end],
+                            batch_records,
                             entity_types,
                             opts.seq_len,
                             opts.max_span_width,
@@ -999,7 +1021,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         try gliner2_data.buildSimpleBatch(
                             allocator,
                             &tokenizer,
-                            examples[batch_start..batch_end],
+                            batch_examples,
                             entity_types,
                             opts.seq_len,
                             opts.max_span_width,
@@ -1024,7 +1046,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         try fillGliner2TotalLossTargetsFromRecords(
                             allocator,
                             &encoded,
-                            training_records[batch_start..batch_end],
+                            batch_records,
                             entity_types,
                             targets_buf[0..target_len],
                         )
@@ -1047,6 +1069,15 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                             opts.seed ^ total_steps,
                         );
                     }
+                    if (real_batch < ab) try gliner2_autodiff.zeroPaddedSpanTargetRows(
+                        targets_buf[0..target_len],
+                        opts.objective,
+                        encoded.num_entity_types,
+                        encoded.max_spans,
+                        real_batch,
+                        ab,
+                        use_label_positive_weights,
+                    );
                     target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
                     targets_shape = if (opts.objective == .gliner2_total_loss)
                         gliner2_autodiff.gliner2TotalLossTargetsShape(
@@ -1324,6 +1355,7 @@ fn writeStepMetric(
         .device_trainable_transfer_count = timing.profile.device_resident_transfer_count,
         .device_resident_transfer_count = timing.profile.device_resident_transfer_count,
         .device_trainable_bytes = timing.profile.device_trainable_bytes,
+        .graph_executor_fallback_reason = timing.profile.graph_executor_fallback_reason,
         .graph_executor_partitions = timing.profile.graph_executor_partitions,
         .graph_executor_command_dispatches = timing.profile.graph_executor_command_dispatches,
         .graph_executor_planned_dispatches = timing.profile.graph_executor_planned_dispatches,
@@ -1584,10 +1616,24 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
     gliner_ctx: *gliner2_autodiff.GlinerAutodiffCtx,
 ) !void {
     if (examples.len == 0) return error.NoTrainingExamples;
-    const ab = @min(@as(usize, opts.batch_size), examples.len);
+    // The graph is compiled for the configured batch size, so pad a dataset
+    // smaller than one batch by repeating the last example — identical to
+    // the padding in the main training loop.
+    const ab: usize = opts.batch_size;
+    const real_batch = @min(ab, examples.len);
     const actual_batch: u32 = @intCast(ab);
     const sl: usize = opts.seq_len;
     const nc: usize = effective_num_classes;
+
+    var batch_examples = try allocator.alloc(gliner2_data.Example, ab);
+    defer allocator.free(batch_examples);
+    var batch_records = try allocator.alloc(gliner2_data.UpstreamRecord, ab);
+    defer allocator.free(batch_records);
+    for (0..ab) |slot| {
+        const src = @min(slot, real_batch - 1);
+        batch_examples[slot] = examples[src];
+        if (opts.objective == .gliner2_total_loss) batch_records[slot] = training_records[src];
+    }
 
     var targets_shape: ml.graph.Shape = undefined;
     var target_slice: []const f32 = undefined;
@@ -1597,7 +1643,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 allocator,
                 tokenizer,
                 entity_types,
-                examples[0..ab],
+                batch_examples,
                 opts.seq_len,
                 effective_num_classes,
                 label_map,
@@ -1605,6 +1651,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 attention_mask,
                 targets_buf[0 .. ab * sl * nc],
             );
+            if (real_batch < ab) @memset(targets_buf[real_batch * sl * nc .. ab * sl * nc], 0.0);
             targets_shape = gliner2_autodiff.tokenTargetsShape(actual_batch, opts.seq_len, effective_num_classes);
             target_slice = targets_buf[0 .. ab * sl * nc];
         },
@@ -1613,7 +1660,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 try gliner2_data.buildUpstreamTaskBatch(
                     allocator,
                     tokenizer,
-                    training_records[0..ab],
+                    batch_records,
                     entity_types,
                     opts.seq_len,
                     opts.max_span_width,
@@ -1623,7 +1670,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 try gliner2_data.buildSimpleBatch(
                     allocator,
                     tokenizer,
-                    examples[0..ab],
+                    batch_examples,
                     entity_types,
                     opts.seq_len,
                     opts.max_span_width,
@@ -1648,7 +1695,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 try fillGliner2TotalLossTargetsFromRecords(
                     allocator,
                     &encoded,
-                    training_records[0..ab],
+                    batch_records,
                     entity_types,
                     targets_buf[0..target_len],
                 )
@@ -1661,6 +1708,15 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                     },
                     targets_buf[0..target_len],
                 );
+            if (real_batch < ab) try gliner2_autodiff.zeroPaddedSpanTargetRows(
+                targets_buf[0..target_len],
+                opts.objective,
+                encoded.num_entity_types,
+                encoded.max_spans,
+                real_batch,
+                ab,
+                use_label_positive_weights,
+            );
             targets_shape = if (opts.objective == .gliner2_total_loss)
                 gliner2_autodiff.gliner2TotalLossTargetsShape(
                     actual_batch,
