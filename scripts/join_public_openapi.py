@@ -81,6 +81,14 @@ def prefixed_path(prefix: str, path: str) -> str:
     return f"{prefix.rstrip('/')}/{path.lstrip('/')}"
 
 
+def inference_public_path(path: str) -> str:
+    if path == "/predict":
+        return prefixed_path("/ml/v1", path)
+    if path == "/predictors":
+        return prefixed_path("/ml/v1", "/models")
+    return prefixed_path("/ai/v1", path)
+
+
 def antfly_public_path(path: str) -> str:
     if path.startswith("/auth/v1/"):
         return path
@@ -126,13 +134,65 @@ def inference_schema_name(name: str) -> str:
     return f"Inference{name}"
 
 
-def merge_components(antfly: dict, inference: dict) -> dict:
+PUBLIC_INFERENCE_SCHEMA_ROOTS = {
+    "Config",
+    "ContentPart",
+    "ImageURL",
+    "ImageURLContentPart",
+    "MediaContentPart",
+    "TextContentPart",
+}
+
+
+def collect_local_schema_refs(value: object) -> set[str]:
+    refs: set[str] = set()
+    prefix = "#/components/schemas/"
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "$ref" and isinstance(child, str) and child.startswith(prefix):
+                refs.add(child[len(prefix) :])
+                continue
+            refs.update(collect_local_schema_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.update(collect_local_schema_refs(child))
+
+    return refs
+
+
+def referenced_inference_schema_names(inference: dict) -> set[str]:
+    schemas = inference.get("components", {}).get("schemas", {})
+    if not isinstance(schemas, dict):
+        return set()
+
+    seen: set[str] = set()
+    pending = list(collect_local_schema_refs(inference.get("paths", {})) | PUBLIC_INFERENCE_SCHEMA_ROOTS)
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+
+        schema = schemas.get(name)
+        if schema is None:
+            continue
+        for child in collect_local_schema_refs(schema):
+            if child not in seen:
+                pending.append(child)
+
+    return seen
+
+
+def merge_components(antfly: dict, inference: dict, inference_schema_names: set[str]) -> dict:
     merged = copy.deepcopy(antfly.get("components", {}))
     inference_components = copy.deepcopy(inference.get("components", {}))
 
     inference_schemas = inference_components.pop("schemas", {})
     schemas = merged.setdefault("schemas", {})
     for name, schema in inference_schemas.items():
+        if name not in inference_schema_names:
+            continue
         schemas[inference_schema_name(name)] = walk_refs(schema, inference_schema_name)
 
     for section, section_map in inference_components.items():
@@ -154,12 +214,13 @@ def merge_components(antfly: dict, inference: dict) -> dict:
 def join_specs() -> dict:
     antfly = join_antfly_spec()
     inference = load_yaml(INFERENCE_SPEC)
+    inference_schema_names = referenced_inference_schema_names(inference)
 
     paths = {}
     for path, item in antfly.get("paths", {}).items():
         paths[antfly_public_path(path)] = copy.deepcopy(item)
     for path, item in inference.get("paths", {}).items():
-        paths[prefixed_path("/ai/v1", path)] = walk_refs(item, inference_schema_name)
+        paths[inference_public_path(path)] = walk_refs(item, inference_schema_name)
 
     tags = []
     seen_tags = set()
@@ -177,14 +238,15 @@ def join_specs() -> dict:
             "version": antfly.get("info", {}).get("version", "0.1.0"),
             "description": (
                 "Joined public contract for the Antfly server. Antfly APIs are served under "
-                "`/db/v1`, auth APIs under `/auth/v1`, and inference APIs under `/ai/v1`."
+                "`/db/v1`, auth APIs under `/auth/v1`, inference APIs under `/ai/v1`, "
+                "and ML prediction APIs under `/ml/v1`."
             ),
         },
         "servers": [{"url": "/"}],
         "tags": tags,
         "security": copy.deepcopy(antfly.get("security", [])),
         "paths": paths,
-        "components": merge_components(antfly, inference),
+        "components": merge_components(antfly, inference, inference_schema_names),
         "x-tagGroups": [
             {
                 "name": "Antfly",

@@ -133,10 +133,29 @@ pub fn resolveGroupForKey(
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
+    return resolveGroupForKeyFromRanges(ranges, key);
+}
+
+pub fn resolveGroupForKeyFromRanges(
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    key: []const u8,
+) ?u64 {
     for (ranges) |range| {
         if (rangeContainsKey(range.*, key)) return range.group_id;
     }
     return null;
+}
+
+/// Whether a table with this name currently exists in the catalog. Used by
+/// cross-table graph hydration to fail closed (skip) rather than error when a
+/// node references a dropped table.
+pub fn tableExists(
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    return tables_api.findTableByName(&snapshot, table_name) != null;
 }
 
 pub fn topologyEpoch(

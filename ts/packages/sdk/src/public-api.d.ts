@@ -1768,6 +1768,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ml/v1/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Traditional ML predictors
+         * @description Returns the Traditional ML predictor catalog for `/ml/v1/predict`.
+         *     Predictors are loaded from `<ml_dir>/<name>/` and exposed separately
+         *     from the AI model catalog.
+         */
+        get: operations["listPredictors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ml/v1/predict": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a traditional ML predictor
+         * @description Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
+         *     feature vectors. Models are loaded from `<ml_dir>/<name>/` and
+         *     identified by name. Use `/ml/v1/models` for the list of available
+         *     predictors and their feature schemas.
+         */
+        post: operations["predict"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2295,6 +2340,23 @@ export interface components {
             config: components["schemas"]["IndexConfig"];
             status: components["schemas"]["IndexStats"];
         };
+        /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
+        LsmStorageStatus: {
+            /** Format: uint64 */
+            run_count?: number;
+            /** Format: uint64 */
+            run_bytes?: number;
+            /** Format: uint64 */
+            l0_run_count?: number;
+            /** Format: uint64 */
+            l0_bytes?: number;
+            /** Format: uint64 */
+            wal_retained_bytes?: number;
+            /** Format: uint64 */
+            compaction_backlog_bytes?: number;
+            /** Format: uint64 */
+            active_readers?: number;
+        };
         StorageStatus: {
             /**
              * Format: uint64
@@ -2303,6 +2365,7 @@ export interface components {
             disk_usage?: number;
             /** @description Whether the table has received data. */
             empty?: boolean;
+            lsm?: components["schemas"]["LsmStorageStatus"];
         };
         TableStatus: components["schemas"]["Table"] & {
             storage_status: components["schemas"]["StorageStatus"];
@@ -2311,7 +2374,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -2319,7 +2382,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set, etc.) */
+            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
             value?: unknown;
         };
         /**
@@ -7861,6 +7924,49 @@ export interface components {
             /** @description Error message */
             error: string;
         };
+        InferencePredictRequest: {
+            /** @description Predictor name from the model catalog. */
+            model: string;
+            /** @description Batch of feature vectors. Max 10000 rows. */
+            input: number[][];
+        };
+        InferencePredictResponse: {
+            model: string;
+            task: components["schemas"]["InferencePredictorTask"];
+            /**
+             * @description Per-row prediction arrays. Length equals the model's `num_outputs`
+             *     (1 for regression / binary, `num_classes` for multiclass).
+             */
+            predictions: number[][];
+        };
+        /**
+         * @description Task type for tabular predictors.
+         * @enum {string}
+         */
+        InferencePredictorTask: "regression" | "binary_classification" | "multiclass" | "ranking";
+        /** @description Traditional ML predictor metadata. */
+        InferencePredictorInfo: {
+            task: components["schemas"]["InferencePredictorTask"];
+            /** @description Number of feature columns expected by the predictor. */
+            num_features: number;
+            /** @description Number of output values emitted per input row. */
+            num_outputs: number;
+            /** @description Optional feature names in input order. */
+            feature_names?: string[];
+            /** @description Source framework used to produce the predictor IR. */
+            source_framework?: string;
+        };
+        InferencePredictorsResponse: {
+            /**
+             * @description Response object type.
+             * @enum {string}
+             */
+            object: "list";
+            /** @description Traditional ML predictors keyed by predictor name. */
+            predictors: {
+                [key: string]: components["schemas"]["InferencePredictorInfo"];
+            };
+        };
         InferenceTextContentPart: components["schemas"]["TextContentPart"];
         InferenceImageURL: components["schemas"]["ImageURL"];
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
@@ -8100,159 +8206,6 @@ export interface components {
              */
             score: number;
         };
-        InferenceRecognizeEntity: {
-            /**
-             * @description The entity text
-             * @example John Smith
-             */
-            text: string;
-            /**
-             * @description Entity type (PER, ORG, LOC, MISC)
-             * @example PER
-             */
-            label: string;
-            /**
-             * @description Character offset where entity begins
-             * @example 0
-             */
-            start: number;
-            /**
-             * @description Character offset where entity ends (exclusive)
-             * @example 10
-             */
-            end: number;
-            /**
-             * Format: float
-             * @description Confidence score (0.0 to 1.0)
-             * @example 0.99
-             */
-            score: number;
-        };
-        InferenceRecognizeRequest: {
-            /**
-             * @description Name of recognizer model from models_dir/recognizers/
-             * @example dslim/bert-base-NER
-             */
-            model: string;
-            /**
-             * @description Texts to extract entities from
-             * @example [
-             *       "John Smith works at Google.",
-             *       "Apple Inc. is in Cupertino."
-             *     ]
-             */
-            texts: string[];
-            /**
-             * @description Custom entity labels to extract (GLiNER models only).
-             *     When using a GLiNER model, you can specify any entity types to extract,
-             *     enabling zero-shot NER without model retraining.
-             *     If not provided, the model's default labels are used.
-             * @example [
-             *       "person",
-             *       "company",
-             *       "product",
-             *       "date"
-             *     ]
-             */
-            labels?: string[];
-            /**
-             * @description Relation types to extract (for models with 'relations' capability).
-             *     Only used when the model supports relation extraction (GLiNER multitask, REBEL).
-             *     Relation extraction runs only when this array is provided and non-empty.
-             *     GLiNER labels may be relation names (works_for), head-qualified
-             *     labels (person::works_for), or head/tail-qualified labels
-             *     (person::works_for::organization).
-             * @example [
-             *       "founded",
-             *       "works_at",
-             *       "located_in"
-             *     ]
-             */
-            relation_labels?: string[];
-            resolver?: components["schemas"]["InferenceResolverConfig"];
-        };
-        /**
-         * @description Configuration for entity resolution. When present in a RecognizeRequest,
-         *     the response entities and relations are deduplicated via entity resolution
-         *     (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-         */
-        InferenceResolverConfig: {
-            /**
-             * Format: float
-             * @description Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-             * @default 0.85
-             */
-            similarity_threshold?: number;
-            /**
-             * @description Whether entity types must match for merging
-             * @default true
-             */
-            type_must_match?: boolean;
-            /**
-             * Format: float
-             * @description Minimum confidence score for entities to be included
-             * @default 0
-             */
-            min_entity_confidence?: number;
-            /**
-             * Format: float
-             * @description Minimum confidence score for relations to be included
-             * @default 0
-             */
-            min_relation_confidence?: number;
-            /**
-             * @description Whether to deduplicate relations after entity resolution
-             * @default true
-             */
-            deduplicate_relations?: boolean;
-            /**
-             * @description Whether to track mention provenance for resolved entities
-             * @default true
-             */
-            track_provenance?: boolean;
-        };
-        InferenceRelation: {
-            /** @description The subject/head entity in the relationship */
-            head: components["schemas"]["InferenceRecognizeEntity"];
-            /** @description The object/tail entity in the relationship */
-            tail: components["schemas"]["InferenceRecognizeEntity"];
-            /**
-             * @description The relationship type
-             * @example founded
-             */
-            label: string;
-            /**
-             * Format: float
-             * @description Confidence score for the relation (0.0 to 1.0)
-             * @example 0.95
-             */
-            score: number;
-        };
-        InferenceRecognizeResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            /** @description Recognition result objects, one per input text. */
-            data: components["schemas"]["InferenceRecognizeObject"][];
-            /** @description Name of model used for NER */
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceRecognizeObject: {
-            /** @enum {string} */
-            object: "recognition";
-            /** @description Original input text index. */
-            index: number;
-            /** @description Entities recognized for this input text. */
-            entities: components["schemas"]["InferenceRecognizeEntity"][];
-            /**
-             * @description Relations recognized for this input text. Only present when using
-             *     a model with 'relations' capability (GLiNER multitask, REBEL).
-             */
-            relations?: components["schemas"]["InferenceRelation"][];
-        };
         InferenceRewriteRequest: {
             /**
              * @description Name of Seq2Seq rewriter model from models_dir/rewriters/
@@ -8286,364 +8239,6 @@ export interface components {
             index: number;
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
-        };
-        InferenceClassifyRequest: {
-            /**
-             * @description Name of classifier model from models_dir/classifiers/
-             * @example MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
-             */
-            model: string;
-            /**
-             * @description Texts to classify
-             * @example [
-             *       "I love this product!",
-             *       "The service was terrible."
-             *     ]
-             */
-            texts: string[];
-            /**
-             * @description Candidate labels for zero-shot classification.
-             *     The model will predict which label(s) best describe each text.
-             * @example [
-             *       "positive",
-             *       "negative",
-             *       "neutral"
-             *     ]
-             */
-            labels: string[];
-            /**
-             * @description Custom hypothesis template for NLI-based classification.
-             *     Use "{}" as placeholder for the label.
-             *     Default: "This example is {}."
-             * @example This text expresses a {} sentiment.
-             */
-            hypothesis_template?: string;
-            /**
-             * @description If true, allows multiple labels per text (independent scoring).
-             *     If false (default), scores are normalized across labels.
-             * @default false
-             */
-            multi_label?: boolean;
-        };
-        InferenceClassifyResult: {
-            /**
-             * @description The predicted class/category
-             * @example positive
-             */
-            label: string;
-            /**
-             * Format: float
-             * @description Confidence score (0.0 to 1.0)
-             * @example 0.95
-             */
-            score: number;
-        };
-        InferenceClassifyResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            /** @description Classification result objects, one per input text. */
-            data: components["schemas"]["InferenceClassifyObject"][];
-            /** @description Name of model used for classification */
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceClassifyObject: {
-            /** @enum {string} */
-            object: "classification";
-            /** @description Original input text index. */
-            index: number;
-            /** @description Classification results for this input text. */
-            classifications: components["schemas"]["InferenceClassifyResult"][];
-        };
-        InferenceDocumentClassificationRequest: {
-            /**
-             * @description Name or path of the document classification model directory or checkpoint
-             * @example acme/layoutdoc-invoice-sequence
-             */
-            model: string;
-            /**
-             * @description Absolute or server-local path to the page image
-             * @example /tmp/page.png
-             */
-            image_path: string;
-            /**
-             * @description Number of OCR/text tokens associated with the page
-             * @example 42
-             */
-            num_tokens: number;
-            /**
-             * @description Labels in the same order expected by the checkpoint output head
-             * @example [
-             *       "invoice",
-             *       "form",
-             *       "email"
-             *     ]
-             */
-            labels: string[];
-            /**
-             * @description Optional tensor prefix inside the safetensors checkpoint
-             * @default layoutdoc_sequence_head
-             * @example layoutdoc_sequence_head
-             */
-            prefix?: string;
-        };
-        InferenceDocumentClassificationFeatures: {
-            num_tokens: number;
-            image_width: number;
-            image_height: number;
-            image_components: number;
-            /** Format: float */
-            mean_darkness: number;
-            /** Format: float */
-            std_darkness: number;
-            /** Format: float */
-            top_darkness: number;
-            /** Format: float */
-            bottom_darkness: number;
-            /** Format: float */
-            left_darkness: number;
-            /** Format: float */
-            right_darkness: number;
-            /** Format: float */
-            center_darkness: number;
-        };
-        InferenceDocumentClassificationResult: {
-            label: string;
-            /** Format: float */
-            score: number;
-        };
-        InferenceDocumentClassificationResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            data: components["schemas"]["InferenceDocumentClassificationObject"][];
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceDocumentClassificationObject: {
-            /** @enum {string} */
-            object: "document.classification";
-            index: number;
-            checkpoint_path: string;
-            prefix: string;
-            input: {
-                image_path: string;
-                num_tokens: number;
-            };
-            features: components["schemas"]["InferenceDocumentClassificationFeatures"];
-            best?: components["schemas"]["InferenceDocumentClassificationResult"] | null;
-            scores: components["schemas"]["InferenceDocumentClassificationResult"][];
-        };
-        InferenceDocumentTokenBox: {
-            text: string;
-            /**
-             * @description Bounding box normalized to the same 0-1000 layout space used by training
-             * @example [
-             *       0,
-             *       0,
-             *       120,
-             *       24
-             *     ]
-             */
-            bbox: number[];
-        };
-        InferenceDocumentTokenClassificationRequest: {
-            /**
-             * @description Name or path of the document token classification model directory or checkpoint
-             * @example acme/layoutdoc-token-tags
-             */
-            model: string;
-            /**
-             * @description Labels in the same order expected by the checkpoint output head
-             * @example [
-             *       "O",
-             *       "B-KEY",
-             *       "I-KEY"
-             *     ]
-             */
-            labels: string[];
-            tokens: components["schemas"]["InferenceDocumentTokenBox"][];
-            /**
-             * @description Optional tensor prefix inside the safetensors checkpoint
-             * @default layoutdoc_token_head
-             * @example layoutdoc_token_head
-             */
-            prefix?: string;
-        };
-        InferenceDocumentTokenClassificationFeatures: {
-            text_length: number;
-            bbox: number[];
-            /** Format: float */
-            width: number;
-            /** Format: float */
-            height: number;
-            /** Format: float */
-            relative_position: number;
-            /** Format: float */
-            bbox_phase_sin: number;
-        };
-        InferenceDocumentTokenClassificationResult: {
-            label: string;
-            /** Format: float */
-            score: number;
-        };
-        InferenceDocumentTokenClassificationPrediction: {
-            token_index: number;
-            text: string;
-            bbox: number[];
-            features: components["schemas"]["InferenceDocumentTokenClassificationFeatures"];
-            best?: components["schemas"]["InferenceDocumentTokenClassificationResult"] | null;
-            scores: components["schemas"]["InferenceDocumentTokenClassificationResult"][];
-        };
-        InferenceDocumentTokenClassificationResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            data: components["schemas"]["InferenceDocumentTokenClassificationObject"][];
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceDocumentTokenClassificationObject: {
-            /** @enum {string} */
-            object: "document.token_classification";
-            index: number;
-            checkpoint_path: string;
-            prefix: string;
-            num_tokens: number;
-            /** @description Each result is an array of ClassifyResult sorted by score descending. */
-            predictions: components["schemas"]["InferenceDocumentTokenClassificationPrediction"][];
-        };
-        /**
-         * @description Exactly one of `texts` or `images` must be provided.
-         *     When using `images`, the server selects a compatible reader internally
-         *     and processes the request as: read document text -> run structured extraction.
-         */
-        InferenceExtractRequest: {
-            /**
-             * @description Name of extractor model with 'extraction' capability
-             * @example fastino/gliner2-base-v1
-             */
-            model: string;
-            /**
-             * @description Texts to extract structured data from
-             * @example [
-             *       "John Smith is 30 years old and works at Google."
-             *     ]
-             */
-            texts?: string[];
-            /**
-             * @description Optional images to extract structured data from.
-             *     When provided, the server first reads document text with a compatible reader
-             *     and then runs schema extraction on the read text.
-             */
-            images?: components["schemas"]["InferenceImageURL"][];
-            /**
-             * @description Optional read-stage prompt used only when `images` are provided.
-             *     Passed through to the reader before schema extraction.
-             * @example <OCR>
-             */
-            prompt?: string;
-            /**
-             * @description Maximum tokens for the read stage when `images` are provided.
-             *     Ignored for text-only extraction requests.
-             * @default 256
-             */
-            max_tokens?: number;
-            /**
-             * @description Extraction schema mapping structure names to field definitions.
-             *     Each field is defined as "field_name::type" where type is "str" or "list".
-             *     Optional choice fields: "field_name::[opt1|opt2]::str".
-             *     If no type is specified, defaults to "str".
-             * @example {
-             *       "person": [
-             *         "name::str",
-             *         "age::str",
-             *         "company::str"
-             *       ]
-             *     }
-             */
-            schema: {
-                [key: string]: string[];
-            };
-            /**
-             * Format: float
-             * @description Score threshold for span extraction (0.0-1.0)
-             * @default 0.3
-             */
-            threshold?: number;
-            /**
-             * @description If true, don't allow nested/overlapping entities
-             * @default true
-             */
-            flat_ner?: boolean;
-            /**
-             * @description If true, include confidence scores in output
-             * @default false
-             */
-            include_confidence?: boolean;
-            /**
-             * @description If true, include character offset spans in output
-             * @default false
-             */
-            include_spans?: boolean;
-        };
-        InferenceExtractFieldValue: {
-            /**
-             * @description The extracted text value
-             * @example John Smith
-             */
-            value: string;
-            /**
-             * Format: float
-             * @description Confidence score (only present when include_confidence=true)
-             * @example 0.95
-             */
-            score?: number;
-            /**
-             * @description Character offset where value begins (only present when include_spans=true)
-             * @example 0
-             */
-            start?: number;
-            /**
-             * @description Character offset where value ends (only present when include_spans=true)
-             * @example 10
-             */
-            end?: number;
-        };
-        InferenceExtractResponse: {
-            /**
-             * @description Object type, always "list"
-             * @enum {string}
-             */
-            object: "list";
-            /** @description Extraction result objects, one per input. */
-            data: components["schemas"]["InferenceExtractObject"][];
-            /** @description Name of model used for extraction */
-            model: string;
-            usage: components["schemas"]["InferenceGenerateUsage"];
-        };
-        InferenceExtractObject: {
-            /** @enum {string} */
-            object: "extraction";
-            /** @description Original input index. */
-            index: number;
-            /**
-             * @description Extraction result for this input. Maps structure names to arrays of extracted instances.
-             *     Each instance maps field names to ExtractFieldValue (for ::str fields)
-             *     or arrays of ExtractFieldValue (for ::list fields).
-             */
-            results: {
-                [key: string]: {
-                    [key: string]: unknown;
-                }[];
-            };
         };
         InferenceReadRequest: {
             /**
@@ -8908,12 +8503,6 @@ export interface components {
          * @enum {string}
          */
         InferenceFinishReason: "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
-        /**
-         * @description Message content. Supports two formats:
-         *     - Simple string: "Hello, how are you?"
-         *     - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-         */
-        InferenceChatMessageContent: string | components["schemas"]["ContentPart"][];
         InferenceChatMessage: {
             role: components["schemas"]["InferenceRole"];
             content?: components["schemas"]["ChatMessageContent"];
@@ -12812,6 +12401,86 @@ export interface operations {
             };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listPredictors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predictors retrieved successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictorsResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    predict: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferencePredictRequest"];
+            };
+        };
+        responses: {
+            /** @description Predictions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferencePredictResponse"];
+                };
+            };
+            /** @description Invalid request (malformed body, feature-count mismatch) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Predictor not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Batch too large (> 10000 rows) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

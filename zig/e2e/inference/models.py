@@ -20,6 +20,7 @@ Models are stored in the flat default inference layout:
 When ANTFLY_INFERENCE_DOWNLOAD=1 is set, the E2E harness can lazily fetch missing models
 by shelling out to `antfly inference pull` instead of using huggingface_hub directly.
 Set ANTFLY_INFERENCE_MODELS_DIR to control where models are stored.
+Set ANTFLY_INFERENCE_ML_DIR to control where Traditional ML predictors are stored.
 """
 
 from __future__ import annotations
@@ -247,6 +248,19 @@ def models_dir() -> Path:
     return directory
 
 
+def ml_dir() -> Path:
+    """Return the Traditional ML directory, creating it if needed."""
+
+    configured = os.environ.get("ANTFLY_INFERENCE_ML_DIR")
+    if configured:
+        directory = Path(configured)
+    else:
+        home = os.environ.get("HOME")
+        directory = Path(home) / ".antfly" / "inference" / "ml" if home else Path("./ml")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def inference_download_enabled() -> bool:
     return os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1"
 
@@ -372,7 +386,9 @@ def default_generator_model_name(available_generators: set[str] | None = None) -
     if override:
         return override
 
-    if available_generators:
+    if available_generators is not None:
+        if not available_generators:
+            return None
         for candidate in (DEFAULT_GENERATOR_MODEL, DEFAULT_TOOL_GENERATOR_MODEL):
             if candidate in available_generators:
                 return candidate
@@ -431,9 +447,10 @@ def find_tool_model_name(available_generators: set[str] | None = None) -> str | 
                 if available_generators is None or model_name in available_generators:
                     return model_name
 
-    if available_generators:
+    if available_generators is not None:
         if DEFAULT_TOOL_GENERATOR_MODEL in available_generators:
             return DEFAULT_TOOL_GENERATOR_MODEL
+        return None
 
     return DEFAULT_TOOL_GENERATOR_MODEL
 
@@ -498,9 +515,10 @@ def find_multimodal_generator_model_name(available_generators: set[str] | None =
             if available_generators is None or model_name in available_generators:
                 return model_name
 
-    if available_generators:
+    if available_generators is not None:
         if DEFAULT_MULTIMODAL_GENERATOR_MODEL in available_generators:
             return DEFAULT_MULTIMODAL_GENERATOR_MODEL
+        return None
 
     return DEFAULT_MULTIMODAL_GENERATOR_MODEL
 

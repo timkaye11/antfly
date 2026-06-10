@@ -571,7 +571,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -584,7 +584,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, null, null, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -604,12 +604,14 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {
+    kind: ?db_mod.types.IndexKind = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
+    enrichment_failed: bool = false,
     table_doc_count: u64 = 0,
     doc_count: u64 = 0,
     term_count: u64 = 0,
@@ -628,6 +630,8 @@ const AggregatedIndexStatus = struct {
     hbc_posting: db_mod.types.HbcPostingStats = .{},
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
+    resolution: db_mod.types.ReplayStageStats = .{},
+    promotion: db_mod.types.ReplayStageStats = .{},
     expected_group_count: u64 = 0,
     reported_group_count: u64 = 0,
     fresh_group_count: u64 = 0,
@@ -717,6 +721,7 @@ fn aggregateIndexStatus(
         if (!expectedGroupAllowsStatus(expected_group_ids, runtime.group_id)) continue;
         const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
+        if (aggregate.kind == null) aggregate.kind = item.kind;
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -743,6 +748,7 @@ fn aggregateIndexStatus(
         aggregate.replay_applied_sequence += item.replay_applied_sequence;
         aggregate.replay_target_sequence += item.replay_target_sequence;
         if (item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
+        if (item.enrichment_failed) aggregate.enrichment_failed = true;
         aggregate.catch_up_applied_sequence += item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += item.catch_up_target_sequence;
         if (item.catch_up_active) aggregate.catch_up_active = true;
@@ -784,6 +790,8 @@ fn aggregateIndexStatus(
         }
         db_mod.types.accumulateAsyncIndexingStats(&aggregate.async_indexing, runtime.stats.async_indexing);
         aggregateEnrichmentStats(&aggregate.enrichment, runtime.stats.enrichment);
+        aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
+        aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
         if (item.backfill_active) {
             aggregate.backfill_active = true;
             active_count += 1;
@@ -803,7 +811,21 @@ fn aggregateIndexStatus(
     }
     if (!found and expected_group_ids.len == 0) return null;
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
+    normalizeReadyFullTextAggregate(&aggregate);
     return aggregate;
+}
+
+fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
+    const kind = aggregate.kind orelse return;
+    if (kind != .full_text) return;
+    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
+    if (aggregate.replay_target_sequence == 0 or aggregate.replay_applied_sequence < aggregate.replay_target_sequence) return;
+    if (aggregate.table_doc_count == 0 or aggregate.doc_count < aggregate.table_doc_count) return;
+
+    aggregate.replay_catch_up_required = false;
+    aggregate.catch_up_active = false;
+    aggregate.backfill_active = false;
+    aggregate.backfill_progress = 1.0;
 }
 
 fn algebraicProgressSummaryRanksHigher(
@@ -828,6 +850,16 @@ fn algebraicCapabilityLifecycleRank(status: []const u8) u8 {
     return 5;
 }
 
+fn aggregateReplayStageStats(dst: *db_mod.types.ReplayStageStats, src: db_mod.types.ReplayStageStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.target_sequence += src.target_sequence;
+    dst.applied_sequence += src.applied_sequence;
+    dst.catch_up_required = dst.catch_up_required or src.catch_up_required;
+    dst.blocked = dst.blocked or src.blocked;
+    if (dst.blocked_reason.len == 0 and src.blocked_reason.len > 0) dst.blocked_reason = src.blocked_reason;
+    dst.error_count += src.error_count;
+}
+
 fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.types.EnrichmentStats) void {
     dst.enabled = dst.enabled or src.enabled;
     dst.lease_owned = dst.lease_owned and src.lease_owned;
@@ -846,6 +878,21 @@ fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.type
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.skip_by_hash_count += src.skip_by_hash_count;
     dst.codec_decode_failures += src.codec_decode_failures;
+    dst.embed_batches_started += src.embed_batches_started;
+    dst.embed_batches_completed += src.embed_batches_completed;
+    dst.embed_items_started += src.embed_items_started;
+    dst.embed_items_completed += src.embed_items_completed;
+    dst.active_embed_batch_items += src.active_embed_batch_items;
+    dst.active_embed_batch_bytes += src.active_embed_batch_bytes;
+    dst.active_embed_batch_max_bytes = @max(dst.active_embed_batch_max_bytes, src.active_embed_batch_max_bytes);
+    dst.active_embed_batch_started_ms = @max(dst.active_embed_batch_started_ms, src.active_embed_batch_started_ms);
+    if (src.last_embed_batch_ns >= dst.last_embed_batch_ns) {
+        dst.last_embed_batch_items = src.last_embed_batch_items;
+        dst.last_embed_batch_bytes = src.last_embed_batch_bytes;
+        dst.last_embed_batch_max_bytes = src.last_embed_batch_max_bytes;
+        dst.last_embed_batch_ns = src.last_embed_batch_ns;
+    }
+    dst.total_embed_ns += src.total_embed_ns;
     dst.dense_artifact_bytes_written += src.dense_artifact_bytes_written;
     dst.sparse_artifact_bytes_written += src.sparse_artifact_bytes_written;
     dst.chunk_artifact_bytes_written += src.chunk_artifact_bytes_written;
@@ -856,11 +903,21 @@ fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.
     dst.pending_indexes += src.pending_indexes;
     dst.pending_segments += src.pending_segments;
     dst.pending_bytes += src.pending_bytes;
+    dst.pending_heap_bytes += src.pending_heap_bytes;
+    dst.pending_mmap_bytes += src.pending_mmap_bytes;
     dst.in_flight_merges += src.in_flight_merges;
     dst.in_flight_segments += src.in_flight_segments;
     dst.completed_merges += src.completed_merges;
     dst.skipped_stale_merges += src.skipped_stale_merges;
     dst.failed_merges += src.failed_merges;
+    dst.merge_input_segments_total += src.merge_input_segments_total;
+    dst.merge_input_bytes_total += src.merge_input_bytes_total;
+    dst.merge_output_segments_total += src.merge_output_segments_total;
+    dst.merge_output_bytes_total += src.merge_output_bytes_total;
+    dst.last_merge_input_segments = @max(dst.last_merge_input_segments, src.last_merge_input_segments);
+    dst.last_merge_input_bytes = @max(dst.last_merge_input_bytes, src.last_merge_input_bytes);
+    dst.last_merge_output_segments = @max(dst.last_merge_output_segments, src.last_merge_output_segments);
+    dst.last_merge_output_bytes = @max(dst.last_merge_output_bytes, src.last_merge_output_bytes);
     dst.quarantined_merges += src.quarantined_merges;
     dst.quarantined_segments += src.quarantined_segments;
     dst.deferred_for_pressure += src.deferred_for_pressure;
@@ -1009,10 +1066,11 @@ fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
 }
 
-fn backfillState(index_type: ApiIndexType, active: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
+fn backfillState(index_type: ApiIndexType, active: bool, enrichment_failed: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
     if (index_type == .embeddings) {
         _ = replay_applied_sequence;
         _ = replay_target_sequence;
+        if (enrichment_failed) return "failed";
         if (active) {
             if (enrichment) |stats| {
                 if (stats.worker_failed) return "failed";
@@ -1094,6 +1152,8 @@ fn appendSingleIndexRuntimeStatus(
     graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
+    resolution: ?db_mod.types.ReplayStageStats,
+    promotion: ?db_mod.types.ReplayStageStats,
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
@@ -1172,7 +1232,7 @@ fn appendSingleIndexRuntimeStatus(
     defer alloc.free(progress);
     try out.appendSlice(alloc, progress);
     try out.appendSlice(alloc, ",\"backfill_state\":");
-    try appendJsonString(alloc, out, backfillState(index_type, backfill_active, replay_applied_sequence, replay_target_sequence, enrichment));
+    try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
     try out.appendSlice(alloc, ",\"doc_count\":");
     try appendIntValue(alloc, out, item.doc_count);
     try out.appendSlice(alloc, ",\"term_count\":");
@@ -1247,6 +1307,8 @@ fn appendSingleIndexRuntimeStatus(
         false;
     try out.appendSlice(alloc, ",\"runtime_fresh\":");
     try out.appendSlice(alloc, if (runtime_fresh) "true" else "false");
+    if (resolution) |stats| try appendReplayStageStatus(alloc, out, "resolution", stats);
+    if (promotion) |stats| try appendReplayStageStatus(alloc, out, "promotion", stats);
     if (metadata) |md| {
         try out.appendSlice(alloc, ",\"runtime_source\":");
         try appendJsonString(alloc, out, statusSourceName(md.source));
@@ -1290,6 +1352,27 @@ fn appendSingleIndexRuntimeStatus(
     }
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
+    try out.append(alloc, '}');
+}
+
+fn appendReplayStageStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, stats: db_mod.types.ReplayStageStats) !void {
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, name);
+    try out.appendSlice(alloc, ":{");
+    try out.appendSlice(alloc, "\"enabled\":");
+    try out.appendSlice(alloc, if (stats.enabled) "true" else "false");
+    try out.appendSlice(alloc, ",\"target_sequence\":");
+    try appendIntValue(alloc, out, stats.target_sequence);
+    try out.appendSlice(alloc, ",\"applied_sequence\":");
+    try appendIntValue(alloc, out, stats.applied_sequence);
+    try out.appendSlice(alloc, ",\"catch_up_required\":");
+    try out.appendSlice(alloc, if (stats.catch_up_required) "true" else "false");
+    try out.appendSlice(alloc, ",\"blocked\":");
+    try out.appendSlice(alloc, if (stats.blocked) "true" else "false");
+    try out.appendSlice(alloc, ",\"blocked_reason\":");
+    try appendJsonString(alloc, out, stats.blocked_reason);
+    try out.appendSlice(alloc, ",\"error_count\":");
+    try appendIntValue(alloc, out, stats.error_count);
     try out.append(alloc, '}');
 }
 
@@ -1362,6 +1445,10 @@ fn appendDenseCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanag
     try appendIntValue(alloc, out, stats.current_scanned_entries);
     try out.appendSlice(alloc, ",\"current_applied_entries\":");
     try appendIntValue(alloc, out, stats.current_applied_entries);
+    try out.appendSlice(alloc, ",\"replay_scan_batches\":");
+    try appendIntValue(alloc, out, stats.replay_scan_batches);
+    try out.appendSlice(alloc, ",\"replay_hint_filter_skips\":");
+    try appendIntValue(alloc, out, stats.replay_hint_filter_skips);
     try out.appendSlice(alloc, ",\"progress_updates\":");
     try appendIntValue(alloc, out, stats.progress_updates);
     try out.appendSlice(alloc, ",\"bulk_finish_windows\":");
@@ -1437,6 +1524,20 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.wal_retained_segments);
     try out.appendSlice(alloc, ",\"wal_retained_bytes\":");
     try appendIntValue(alloc, out, stats.wal_retained_bytes);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_oldest_retained_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_oldest_retained_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_covered_through_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_covered_through_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_current_segment\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_current_segment);
+    try out.appendSlice(alloc, ",\"wal_checkpoint_lag_segments\":");
+    try appendIntValue(alloc, out, stats.wal_checkpoint_lag_segments);
+    try out.appendSlice(alloc, ",\"wal_replay_retained_segments\":");
+    try appendIntValue(alloc, out, stats.wal_replay_retained_segments);
+    try out.appendSlice(alloc, ",\"wal_replay_retained_bytes\":");
+    try appendIntValue(alloc, out, stats.wal_replay_retained_bytes);
+    try out.appendSlice(alloc, ",\"wal_replay_current_segment\":");
+    try appendIntValue(alloc, out, stats.wal_replay_current_segment);
     try out.appendSlice(alloc, ",\"configured_indexes\":");
     try appendIntValue(alloc, out, stats.configured_indexes);
     try out.appendSlice(alloc, ",\"configured_dense_indexes\":");
@@ -1453,6 +1554,32 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.db_open_ns);
     try out.appendSlice(alloc, ",\"load_indexes_ns\":");
     try appendIntValue(alloc, out, stats.load_indexes_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_stores\":");
+    try appendIntValue(alloc, out, stats.lsm_open_stores);
+    try out.appendSlice(alloc, ",\"lsm_open_completed\":");
+    try appendIntValue(alloc, out, stats.lsm_open_completed);
+    try out.appendSlice(alloc, ",\"lsm_open_failed\":");
+    try appendIntValue(alloc, out, stats.lsm_open_failed);
+    try out.appendSlice(alloc, ",\"lsm_open_total_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_total_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_initializing_storage_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_initializing_storage_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_manifest_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_manifest_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_ensuring_dirs_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_ensuring_dirs_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_wal_replay_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_wal_replay_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_mounting_runs_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_mounting_runs_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_loaded_runs\":");
+    try appendIntValue(alloc, out, stats.lsm_open_loaded_runs);
+    try out.appendSlice(alloc, ",\"lsm_open_obsolete_paths\":");
+    try appendIntValue(alloc, out, stats.lsm_open_obsolete_paths);
+    try out.appendSlice(alloc, ",\"lsm_open_mutable_entries_after_replay\":");
+    try appendIntValue(alloc, out, stats.lsm_open_mutable_entries_after_replay);
+    try out.appendSlice(alloc, ",\"lsm_open_immutable_memtables_after_replay\":");
+    try appendIntValue(alloc, out, stats.lsm_open_immutable_memtables_after_replay);
     try out.appendSlice(alloc, ",\"wal_replay_records\":");
     try appendIntValue(alloc, out, stats.wal_replay_records);
     try out.appendSlice(alloc, ",\"wal_replay_entries\":");
@@ -1461,6 +1588,8 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.wal_replay_bytes);
     try out.appendSlice(alloc, ",\"wal_replay_ns\":");
     try appendIntValue(alloc, out, stats.wal_replay_ns);
+    try out.appendSlice(alloc, ",\"wal_replay_truncated_tail_bytes\":");
+    try appendIntValue(alloc, out, stats.wal_replay_truncated_tail_bytes);
     try out.append(alloc, '}');
 }
 
@@ -1551,10 +1680,30 @@ fn appendTextMergeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     try appendIntValue(alloc, out, stats.pending_segments);
     try out.appendSlice(alloc, ",\"pending_bytes\":");
     try appendIntValue(alloc, out, stats.pending_bytes);
+    try out.appendSlice(alloc, ",\"pending_heap_bytes\":");
+    try appendIntValue(alloc, out, stats.pending_heap_bytes);
+    try out.appendSlice(alloc, ",\"pending_mmap_bytes\":");
+    try appendIntValue(alloc, out, stats.pending_mmap_bytes);
     try out.appendSlice(alloc, ",\"in_flight_merges\":");
     try appendIntValue(alloc, out, stats.in_flight_merges);
     try out.appendSlice(alloc, ",\"failed_merges\":");
     try appendIntValue(alloc, out, stats.failed_merges);
+    try out.appendSlice(alloc, ",\"merge_input_segments_total\":");
+    try appendIntValue(alloc, out, stats.merge_input_segments_total);
+    try out.appendSlice(alloc, ",\"merge_input_bytes_total\":");
+    try appendIntValue(alloc, out, stats.merge_input_bytes_total);
+    try out.appendSlice(alloc, ",\"merge_output_segments_total\":");
+    try appendIntValue(alloc, out, stats.merge_output_segments_total);
+    try out.appendSlice(alloc, ",\"merge_output_bytes_total\":");
+    try appendIntValue(alloc, out, stats.merge_output_bytes_total);
+    try out.appendSlice(alloc, ",\"last_merge_input_segments\":");
+    try appendIntValue(alloc, out, stats.last_merge_input_segments);
+    try out.appendSlice(alloc, ",\"last_merge_input_bytes\":");
+    try appendIntValue(alloc, out, stats.last_merge_input_bytes);
+    try out.appendSlice(alloc, ",\"last_merge_output_segments\":");
+    try appendIntValue(alloc, out, stats.last_merge_output_segments);
+    try out.appendSlice(alloc, ",\"last_merge_output_bytes\":");
+    try appendIntValue(alloc, out, stats.last_merge_output_bytes);
     try out.appendSlice(alloc, ",\"quarantined_merges\":");
     try appendIntValue(alloc, out, stats.quarantined_merges);
     try out.appendSlice(alloc, ",\"quarantined_segments\":");
@@ -1774,6 +1923,18 @@ test "index encoders expose local shard runtime status" {
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .wal_checkpoint_oldest_retained_segment = 2,
+                    .wal_checkpoint_covered_through_segment = 3,
+                    .wal_checkpoint_current_segment = 5,
+                    .wal_checkpoint_lag_segments = 2,
+                    .wal_replay_retained_segments = 1,
+                    .wal_replay_retained_bytes = 44,
+                    .wal_replay_current_segment = 6,
+                    .lsm_open_stores = 2,
+                    .lsm_open_wal_replay_ns = 123,
+                    .lsm_open_loaded_runs = 6,
+                    .wal_replay_bytes = 456,
+                    .wal_replay_truncated_tail_bytes = 7,
                 },
                 .dense_catch_up = .{
                     .active = true,
@@ -1825,6 +1986,18 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"phase\":\"opening_db\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_segments\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_oldest_retained_segment\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_covered_through_segment\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_current_segment\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_checkpoint_lag_segments\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_segments\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_bytes\":44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_stores\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_wal_replay_ns\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_loaded_runs\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_bytes\":456") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_truncated_tail_bytes\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_sequence\":41") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_target_sequence\":77") != null);
@@ -2195,6 +2368,41 @@ test "index encoders aggregate replay debt across local shards" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"8\":{") != null);
 }
 
+test "full text aggregate clears stale completed replay backfill flag" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = try std.testing.allocator.dupe(u8, "full_text_index_v1"),
+        .kind = .full_text,
+        .doc_count = 1000,
+        .term_count = 0,
+        .backfill_active = true,
+        .backfill_progress = 0.0,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+        .replay_catch_up_required = true,
+        .catch_up_applied_sequence = 1,
+        .catch_up_target_sequence = 1,
+    }};
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .stats = .{
+            .doc_count = 1000,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatus(runtimes[0..], "full_text_index_v1", &.{7}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.replay_target_sequence);
+    try std.testing.expect(!aggregate.replay_catch_up_required);
+    try std.testing.expect(!aggregate.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), aggregate.backfill_progress);
+}
+
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
@@ -2490,6 +2698,75 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"applied_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retryable_error_count\":2") != null);
+}
+
+test "single embeddings index encoder scopes isolated enrichment failure to one index" {
+    const alloc = std.testing.allocator;
+    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 2);
+    defer alloc.free(indexes);
+    indexes[0] = .{
+        .name = try alloc.dupe(u8, "visual_idx"),
+        .kind = .dense_vector,
+        .doc_count = 0,
+        .node_count = 0,
+        .enrichment_failed = true,
+    };
+    indexes[1] = .{
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+    };
+    defer alloc.free(indexes[0].name);
+    defer alloc.free(indexes[1].name);
+
+    const local_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer alloc.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 2,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 1,
+                .applied_sequence = 1,
+                .processed_requests = 1,
+                .error_count = 1,
+                .retryable_error_count = 0,
+                .worker_failed = false,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json =
+            \\{"visual_idx":{"type":"embeddings","field":"image","dimension":3},"semantic_idx":{"type":"embeddings","field":"body","dimension":3}}
+            ,
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer alloc.free(failed_encoded);
+    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"backfill_state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"worker_failed\":false") != null);
+
+    const healthy_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer alloc.free(healthy_encoded);
+    try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"failed\"") == null);
 }
 
 test "single embeddings index encoder keeps published visibility separate from replay debt" {

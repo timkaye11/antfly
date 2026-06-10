@@ -17,6 +17,7 @@ const std = @import("std");
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -40,6 +41,8 @@ pub const http_routes = @import("http_routes.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
 pub const table_writes = @import("table_writes.zig");
+pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
+pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
@@ -58,8 +61,11 @@ pub const BoundTableReadSource = table_reads.BoundTableReadSource;
 pub const ProvisionedGroupStorage = provisioned_storage.ProvisionedGroupStorage;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
-pub const GroupLsmGenerationSource = table_reads.GroupLsmGenerationSource;
+pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
+pub const backend_current_root_generation = table_reads.backend_current_root_generation;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
+pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;
+pub const DistributedEntitySink = distributed_entity_sink.DistributedEntitySink;
 pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
@@ -68,6 +74,27 @@ pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTabl
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
+
+test "linear merge request parser accepts raw payload value under public request cap" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"records\":{\"doc:a\":{\"raw_payload\":\"");
+    try writer.writeAll(payload);
+    try writer.writeAll("\"}}}");
+
+    var req = try linear_merge.parseRequest(alloc, out.written());
+    defer req.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+    try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
 
 test "join inequality: jsonValuesCompare all six operators on integers" {
     const three: std.json.Value = .{ .integer = 3 };
@@ -154,6 +181,8 @@ test "api module compiles" {
     _ = provisioned_storage;
     _ = table_reads;
     _ = table_writes;
+    _ = distributed_candidate_source;
+    _ = distributed_entity_sink;
     _ = distributed_join;
     _ = distributed_graph;
     _ = http_internal_group_read_routes;
@@ -188,6 +217,10 @@ test "distributed graph result_ref fail-closed guards are covered" {
 
 test "api distributed graph hydrate carries identity generation and clears cross-range ordinals" {
     try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
+}
+
+test "api distributed graph cross-table hydrate clears query scoped filter" {
+    try distributed_graph.testCrossTableHydrateClearsQueryScopedFilterAndOrdinals(std.testing.allocator);
 }
 
 test "public graph result_ref fail-closed guards are covered" {

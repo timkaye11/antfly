@@ -31,7 +31,11 @@ const supports_posix_fd_cache = supports_native_storage and
 // dirRealPathFile propagate openat's error.ReadOnlyFileSystem into std/Io/Dir.zig
 // error sets that do not include it.
 const supports_evented_runtime = false;
-const max_cached_native_fds: usize = 1024;
+// Keep this per-store cache comfortably below common macOS soft fd limits.
+// A table can own several native LSM stores (primary, dense, text, etc.),
+// and oversized per-store caches can starve HTTP listeners of descriptors
+// during large loads with hundreds of table files.
+const max_cached_native_fds: usize = 64;
 const fd_cache_shard_count: usize = if (builtin.os.tag == .freestanding) 1 else 16;
 const max_posix_io_chunk: usize = 64 * 1024 * 1024;
 
@@ -92,6 +96,84 @@ pub const AtomicWriteSink = struct {
     }
 };
 
+pub const RangeReadFuture = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        wait: *const fn (*anyopaque) anyerror![]u8,
+        cancel: *const fn (*anyopaque) void,
+    };
+
+    /// Complete this one-shot read and transfer the returned bytes to the
+    /// caller. After wait or cancel, the future must not be used again.
+    pub fn wait(self: *RangeReadFuture) ![]u8 {
+        return try self.vtable.wait(self.ptr);
+    }
+
+    /// Best-effort cancellation. Synchronous/completed futures just release
+    /// their owned bytes if the caller has not waited yet.
+    pub fn cancel(self: *RangeReadFuture) void {
+        self.vtable.cancel(self.ptr);
+    }
+};
+
+pub const ReadRuntime = if (builtin.os.tag == .freestanding)
+    struct {
+        pub fn init(_: anytype) ReadRuntime {
+            return .{};
+        }
+    }
+else
+    struct {
+        io: std.Io,
+
+        pub fn init(io: std.Io) ReadRuntime {
+            return .{ .io = io };
+        }
+    };
+
+const CompletedRangeReadFuture = struct {
+    allocator: Allocator,
+    bytes: ?[]u8 = null,
+    err: ?anyerror = null,
+
+    const vtable: RangeReadFuture.VTable = .{
+        .wait = wait,
+        .cancel = cancel,
+    };
+
+    fn create(storage: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        const self = try allocator.create(CompletedRangeReadFuture);
+        self.* = .{ .allocator = allocator };
+        self.bytes = storage.readFileRangeAlloc(allocator, path, offset, len) catch |err| blk: {
+            self.err = err;
+            break :blk null;
+        };
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn wait(ptr: *anyopaque) ![]u8 {
+        const self: *CompletedRangeReadFuture = @ptrCast(@alignCast(ptr));
+        const allocator = self.allocator;
+        defer allocator.destroy(self);
+        if (self.err) |err| return err;
+        const bytes = self.bytes orelse return error.CanceledRangeRead;
+        self.bytes = null;
+        return bytes;
+    }
+
+    fn cancel(ptr: *anyopaque) void {
+        const self: *CompletedRangeReadFuture = @ptrCast(@alignCast(ptr));
+        const allocator = self.allocator;
+        if (self.bytes) |bytes| allocator.free(bytes);
+        allocator.destroy(self);
+    }
+};
+
 pub const Storage = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -100,6 +182,8 @@ pub const Storage = struct {
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         read_file_alloc: *const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8,
         read_file_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
+        begin_read_file_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
+        begin_read_file_range_alloc_with_runtime: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
         read_file_range_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!void = null,
         read_file_range_at_most_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!usize = null,
         file_size: *const fn (*anyopaque, []const u8) anyerror!u64,
@@ -123,6 +207,20 @@ pub const Storage = struct {
 
     pub fn readFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
         return self.vtable.read_file_range_alloc(self.ptr, allocator, path, offset, len);
+    }
+
+    pub fn beginReadFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        if (self.vtable.begin_read_file_range_alloc) |begin_read_file_range_alloc| {
+            return try begin_read_file_range_alloc(self.ptr, allocator, path, offset, len);
+        }
+        return try CompletedRangeReadFuture.create(self, allocator, path, offset, len);
+    }
+
+    pub fn beginReadFileRangeAllocWithRuntime(self: Storage, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        if (self.vtable.begin_read_file_range_alloc_with_runtime) |begin_read_file_range_alloc_with_runtime| {
+            return try begin_read_file_range_alloc_with_runtime(self.ptr, read_runtime, allocator, path, offset, len);
+        }
+        return try self.beginReadFileRangeAlloc(allocator, path, offset, len);
     }
 
     pub fn readFileRangeInto(self: Storage, allocator: Allocator, path: []const u8, offset: u64, out: []u8) !void {
@@ -767,6 +865,90 @@ const NativeStorageState = struct {
     }
 };
 
+const NativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
+    struct {}
+else
+    struct {
+        allocator: Allocator,
+        state: *NativeStorageState,
+        path: []u8,
+        offset: u64,
+        len: usize,
+        io: std.Io,
+        future: std.Io.Future(void) = undefined,
+        bytes: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        const vtable: RangeReadFuture.VTable = .{
+            .wait = wait,
+            .cancel = cancel,
+        };
+
+        fn create(read_runtime: ReadRuntime, state: *NativeStorageState, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+            const retained = try state.retain();
+            errdefer retained.release();
+
+            const self = try allocator.create(NativeRangeReadFuture);
+            errdefer allocator.destroy(self);
+
+            const path_copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(path_copy);
+
+            self.* = .{
+                .allocator = allocator,
+                .state = retained,
+                .path = path_copy,
+                .offset = offset,
+                .len = len,
+                .io = read_runtime.io,
+            };
+            self.future = try read_runtime.io.concurrent(run, .{self});
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn run(self: *NativeRangeReadFuture) void {
+            self.bytes = read(self) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+
+        fn read(self: *NativeRangeReadFuture) ![]u8 {
+            if (comptime supports_posix_fd_cache) {
+                return try self.state.fd_cache.readRangeAlloc(self.allocator, self.path, self.offset, self.len);
+            }
+            return try readFileRangeWithIo(self.io, self.allocator, self.path, self.offset, self.len);
+        }
+
+        fn wait(ptr: *anyopaque) ![]u8 {
+            const self: *NativeRangeReadFuture = @ptrCast(@alignCast(ptr));
+            self.future.await(self.io);
+            const allocator = self.allocator;
+            defer {
+                allocator.free(self.path);
+                self.state.release();
+                allocator.destroy(self);
+            }
+            if (self.err) |err| return err;
+            const bytes = self.bytes orelse return error.CanceledRangeRead;
+            self.bytes = null;
+            return bytes;
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *NativeRangeReadFuture = @ptrCast(@alignCast(ptr));
+            self.future.await(self.io);
+            const allocator = self.allocator;
+            if (self.bytes) |bytes| allocator.free(bytes);
+            allocator.free(self.path);
+            self.state.release();
+            allocator.destroy(self);
+        }
+    };
+
 pub const NativeStorage = if (!supports_native_storage)
     struct {
         pub fn init(_: Allocator, _: RuntimeKind) !NativeStorage {
@@ -796,6 +978,7 @@ else blk: {
                 .create_dir_path = createDirPath,
                 .read_file_alloc = readFileAlloc,
                 .read_file_range_alloc = readFileRangeAlloc,
+                .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
                 .read_file_range_into = readFileRangeInto,
                 .read_file_range_at_most_into = readFileRangeAtMostInto,
                 .file_size = fileSize,
@@ -875,6 +1058,15 @@ else blk: {
                     .threaded => |*threaded| try readFileRangeWithIo(threaded.io(), allocator, path, offset, len),
                     .evented => |*evented| try readFileRangeWithIo(evented.io(), allocator, path, offset, len),
                 };
+            }
+
+            fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                const runtime = read_runtime orelse {
+                    const sync_storage: Storage = .{ .ptr = ptr, .vtable = &native_vtable };
+                    return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
+                };
+                return try NativeRangeReadFuture.create(runtime, self.state, allocator, path, offset, len);
             }
 
             fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
@@ -1002,6 +1194,7 @@ else blk: {
             .create_dir_path = createDirPath,
             .read_file_alloc = readFileAlloc,
             .read_file_range_alloc = readFileRangeAlloc,
+            .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
             .read_file_range_into = readFileRangeInto,
             .read_file_range_at_most_into = readFileRangeAtMostInto,
             .file_size = fileSize,
@@ -1057,6 +1250,15 @@ else blk: {
                 return try retained.fd_cache.readRangeAlloc(allocator, path, offset, len);
             }
             return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
+        }
+
+        fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const runtime = read_runtime orelse {
+                const sync_storage: Storage = .{ .ptr = ptr, .vtable = &threaded_only_vtable };
+                return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
+            };
+            return try NativeRangeReadFuture.create(runtime, state, allocator, path, offset, len);
         }
 
         fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
@@ -2105,6 +2307,22 @@ test "host storage delegates through callbacks" {
     try std.testing.expect(t1 > t0);
 }
 
+test "storage range read future fallback waits and cancels" {
+    var backing = MemoryStorage.init(std.testing.allocator);
+    defer backing.deinit();
+
+    const storage = backing.storage();
+    try storage.writeFileAbsolute("/future/a.txt", "hello");
+
+    var future = try storage.beginReadFileRangeAlloc(std.testing.allocator, "/future/a.txt", 1, 3);
+    const bytes = try future.wait();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("ell", bytes);
+
+    var canceled = try storage.beginReadFileRangeAlloc(std.testing.allocator, "/future/a.txt", 0, 5);
+    canceled.cancel();
+}
+
 test "native atomic write sink supports patching and crc before finish" {
     if (!supports_native_storage) return error.SkipZigTest;
 
@@ -2129,6 +2347,29 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native fd cache evicts to per-store budget" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+
+    const base_nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
+    for (0..max_cached_native_fds + 8) |i| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-fd-cache-{d}-{d}", .{ base_nonce, i });
+        try native.storage().writeFileAbsolute(path, "x");
+        defer native.storage().deleteFileAbsolute(path) catch {};
+
+        const bytes = try native.storage().readFileAlloc(std.testing.allocator, path, 8);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings("x", bytes);
+    }
+
+    const stats = native.snapshotStats();
+    try std.testing.expect(stats.fd_cache_entries < stats.fd_cache_capacity);
+    try std.testing.expectEqual(max_cached_native_fds, stats.fd_cache_capacity);
 }
 
 test "native copied storage handle fails closed after owner deinit" {

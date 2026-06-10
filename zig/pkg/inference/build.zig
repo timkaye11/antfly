@@ -84,7 +84,10 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    const sdk_root = b.sysroot orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+        b.graph.environ_map.get("SDK_PATH") orelse
+        return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
     module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
@@ -611,6 +614,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
     tests.root_module.addImport("antfly_image", antfly_image_mod);
     tests.root_module.addImport("ml", ml_mod);
+    tests.root_module.addImport("ml_tabular", runtime_graph.ml_tabular_mod);
     tests.root_module.addImport("onnx_graph", onnx_graph_mod);
     tests.root_module.addImport("pjrt", pjrt_mod);
     tests.root_module.addImport("prometheus", prometheus_mod);

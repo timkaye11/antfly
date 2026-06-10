@@ -52,6 +52,8 @@ pub const PendingWorkStats = struct {
     derived_target_sequence: u64,
     has_async_indexes: bool,
     enrichment: types.EnrichmentStats,
+    resolution: types.ReplayStageStats = .{},
+    promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
 };
 
@@ -150,6 +152,13 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PrimaryStoreOwner) ?u64 {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+        };
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *PrimaryStoreOwner) void {
         switch (self.*) {
             .none, .mem => {},
@@ -171,10 +180,31 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn snapshotLsmOpenStats(self: *const PrimaryStoreOwner) ?lsm_backend_mod.Backend.OpenStats {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend.snapshotOpenStats(),
+        };
+    }
+
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *PrimaryStoreOwner) !void {
+        switch (self.*) {
+            .none, .mem => {},
+            .lsm => |owner| try owner.handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const PrimaryStoreOwner) ?lsm_backend_mod.NativeStorageStats {
         return switch (self.*) {
             .none, .mem => null,
             .lsm => |owner| owner.handle.backend.snapshotNativeStorageStats(),
+        };
+    }
+
+    pub fn lsmBackend(self: *PrimaryStoreOwner) ?*lsm_backend_mod.Backend {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend,
         };
     }
 
@@ -183,6 +213,13 @@ pub const PrimaryStoreOwner = union(enum) {
             .none, .mem => false,
             .lsm => |owner| try owner.handle.backend.runMaintenanceStep(),
         };
+    }
+
+    pub fn runDueLsmObsoleteReclaim(self: *PrimaryStoreOwner) !bool {
+        const backend = self.lsmBackend() orelse return false;
+        if (backend.snapshotMaintenanceStats().obsolete_paths_reclaimable == 0) return false;
+        _ = try backend.runMaintenanceStep();
+        return true;
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PrimaryStoreOwner) !bool {
@@ -492,6 +529,22 @@ pub const DBCore = struct {
         try self.index_manager.addEnrichment(self.store, cfg);
     }
 
+    pub fn addResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !void {
+        try cfg.validate();
+        try self.index_manager.addResolver(self.store, cfg);
+    }
+
+    /// Add or replace a resolver; tells the caller whether existing extraction
+    /// artifacts need replay-driven re-resolution.
+    pub fn upsertResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        try cfg.validate();
+        return try self.index_manager.upsertResolver(self.store, cfg);
+    }
+
+    pub fn removeResolver(self: *DBCore, name: []const u8) !bool {
+        return try self.index_manager.removeResolver(self.store, name);
+    }
+
     pub fn hasIndex(self: *DBCore, name: []const u8) bool {
         return self.index_manager.has(name);
     }
@@ -538,6 +591,10 @@ pub const DBCore = struct {
 
     pub fn listEnrichments(self: *DBCore, alloc: Allocator) ![]types.EnrichmentConfig {
         return try self.index_manager.listEnrichmentsPublic(alloc);
+    }
+
+    pub fn listResolvers(self: *DBCore, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        return try self.index_manager.listResolvers(alloc);
     }
 
     pub fn deleteIndex(self: *DBCore, name: []const u8) !bool {

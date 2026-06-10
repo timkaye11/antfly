@@ -87,6 +87,7 @@ pub const BatchWrite = struct {
 
 pub const TransformOpType = enum {
     set,
+    set_on_insert,
     unset,
     inc,
     push,
@@ -1009,6 +1010,7 @@ pub const SearchHit = struct {
     id: []u8,
     doc_ordinal: ?u32 = null,
     score: ?f32 = null,
+    index_scores: []fusion_mod.IndexScore = &.{},
     stored_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
@@ -1018,12 +1020,14 @@ pub const SearchHit = struct {
             .id = try alloc.dupe(u8, self.id),
             .doc_ordinal = self.doc_ordinal,
             .score = self.score,
+            .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             .chunk_hits = &.{},
         };
         errdefer {
             alloc.free(cloned.id);
+            freeIndexScores(alloc, cloned.index_scores);
             if (cloned.stored_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
@@ -1045,6 +1049,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        freeIndexScores(alloc, self.index_scores);
         if (self.stored_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
@@ -1052,6 +1057,29 @@ pub const SearchHit = struct {
         self.* = undefined;
     }
 };
+
+pub fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
+    if (scores.len == 0) return &.{};
+    const cloned = try alloc.alloc(fusion_mod.IndexScore, scores.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(cloned);
+    }
+    for (scores, 0..) |score, i| {
+        cloned[i] = .{
+            .index_name = try alloc.dupe(u8, score.index_name),
+            .score = score.score,
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
+    for (scores) |score| alloc.free(score.index_name);
+    if (scores.len > 0) alloc.free(scores);
+}
 
 pub const ChunkHit = struct {
     id: []u8,
@@ -1200,6 +1228,16 @@ pub const EnrichmentStats = struct {
     artifact_bytes_written: u64 = 0,
 };
 
+pub const ReplayStageStats = struct {
+    enabled: bool = false,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    catch_up_required: bool = false,
+    blocked: bool = false,
+    blocked_reason: []const u8 = "",
+    error_count: u64 = 0,
+};
+
 pub const TransactionRecoveryStats = struct {
     enabled: bool = false,
     lease_owned: bool = false,
@@ -1227,11 +1265,21 @@ pub const TextMergeStats = struct {
     pending_indexes: u64 = 0,
     pending_segments: u64 = 0,
     pending_bytes: u64 = 0,
+    pending_heap_bytes: u64 = 0,
+    pending_mmap_bytes: u64 = 0,
     in_flight_merges: u64 = 0,
     in_flight_segments: u64 = 0,
     completed_merges: u64 = 0,
     skipped_stale_merges: u64 = 0,
     failed_merges: u64 = 0,
+    merge_input_segments_total: u64 = 0,
+    merge_input_bytes_total: u64 = 0,
+    merge_output_segments_total: u64 = 0,
+    merge_output_bytes_total: u64 = 0,
+    last_merge_input_segments: u64 = 0,
+    last_merge_input_bytes: u64 = 0,
+    last_merge_output_segments: u64 = 0,
+    last_merge_output_bytes: u64 = 0,
     quarantined_merges: u64 = 0,
     quarantined_segments: u64 = 0,
     last_merge_error: []const u8 = "",
@@ -1242,6 +1290,37 @@ pub const TextMergeStats = struct {
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
 };
+
+pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.pending_indexes +|= src.pending_indexes;
+    dst.pending_segments +|= src.pending_segments;
+    dst.pending_bytes +|= src.pending_bytes;
+    dst.pending_heap_bytes +|= src.pending_heap_bytes;
+    dst.pending_mmap_bytes +|= src.pending_mmap_bytes;
+    dst.in_flight_merges +|= src.in_flight_merges;
+    dst.in_flight_segments +|= src.in_flight_segments;
+    dst.completed_merges +|= src.completed_merges;
+    dst.skipped_stale_merges +|= src.skipped_stale_merges;
+    dst.failed_merges +|= src.failed_merges;
+    dst.merge_input_segments_total +|= src.merge_input_segments_total;
+    dst.merge_input_bytes_total +|= src.merge_input_bytes_total;
+    dst.merge_output_segments_total +|= src.merge_output_segments_total;
+    dst.merge_output_bytes_total +|= src.merge_output_bytes_total;
+    dst.last_merge_input_segments = @max(dst.last_merge_input_segments, src.last_merge_input_segments);
+    dst.last_merge_input_bytes = @max(dst.last_merge_input_bytes, src.last_merge_input_bytes);
+    dst.last_merge_output_segments = @max(dst.last_merge_output_segments, src.last_merge_output_segments);
+    dst.last_merge_output_bytes = @max(dst.last_merge_output_bytes, src.last_merge_output_bytes);
+    dst.quarantined_merges +|= src.quarantined_merges;
+    dst.quarantined_segments +|= src.quarantined_segments;
+    if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
+    dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
+    dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.backpressure_events +|= src.backpressure_events;
+    dst.backpressure_ns +|= src.backpressure_ns;
+    dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
+    dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
+}
 
 pub const DocIdentityStats = struct {
     namespace_table_id: u64 = 0,
@@ -1289,6 +1368,8 @@ pub const DBStats = struct {
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
+    resolution: ReplayStageStats = .{},
+    promotion: ReplayStageStats = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
@@ -1348,6 +1429,7 @@ pub const DBIndexStats = struct {
     root_node: u64 = 0,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
+    enrichment_failed: bool = false,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
@@ -1604,6 +1686,8 @@ pub const DenseCatchUpStats = struct {
     current_target_sequence: u64 = 0,
     current_scanned_entries: u64 = 0,
     current_applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
     progress_updates: u64 = 0,
     bulk_finish_windows: u64 = 0,
     bulk_finish_split_steps: u64 = 0,
@@ -1639,6 +1723,13 @@ pub const StartupCatchUpStats = struct {
     wal_retention_known: bool = false,
     wal_retained_segments: u64 = 0,
     wal_retained_bytes: u64 = 0,
+    wal_checkpoint_oldest_retained_segment: u64 = 0,
+    wal_checkpoint_covered_through_segment: u64 = 0,
+    wal_checkpoint_current_segment: u64 = 0,
+    wal_checkpoint_lag_segments: u64 = 0,
+    wal_replay_retained_segments: u64 = 0,
+    wal_replay_retained_bytes: u64 = 0,
+    wal_replay_current_segment: u64 = 0,
     configured_indexes: u32 = 0,
     configured_dense_indexes: u32 = 0,
     configured_sparse_indexes: u32 = 0,
@@ -1647,10 +1738,24 @@ pub const StartupCatchUpStats = struct {
     opened_indexes: u32 = 0,
     db_open_ns: u64 = 0,
     load_indexes_ns: u64 = 0,
+    lsm_open_stores: u64 = 0,
+    lsm_open_completed: u64 = 0,
+    lsm_open_failed: u64 = 0,
+    lsm_open_total_ns: u64 = 0,
+    lsm_open_initializing_storage_ns: u64 = 0,
+    lsm_open_manifest_ns: u64 = 0,
+    lsm_open_ensuring_dirs_ns: u64 = 0,
+    lsm_open_wal_replay_ns: u64 = 0,
+    lsm_open_mounting_runs_ns: u64 = 0,
+    lsm_open_loaded_runs: u64 = 0,
+    lsm_open_obsolete_paths: u64 = 0,
+    lsm_open_mutable_entries_after_replay: u64 = 0,
+    lsm_open_immutable_memtables_after_replay: u64 = 0,
     wal_replay_records: u64 = 0,
     wal_replay_entries: u64 = 0,
     wal_replay_bytes: u64 = 0,
     wal_replay_ns: u64 = 0,
+    wal_replay_truncated_tail_bytes: u64 = 0,
 };
 
 pub const AsyncIndexingStats = struct {
@@ -1709,6 +1814,8 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
     dst.current_target_sequence = @max(dst.current_target_sequence, src.current_target_sequence);
     dst.current_scanned_entries += src.current_scanned_entries;
     dst.current_applied_entries += src.current_applied_entries;
+    dst.replay_scan_batches += src.replay_scan_batches;
+    dst.replay_hint_filter_skips += src.replay_hint_filter_skips;
     dst.progress_updates += src.progress_updates;
     dst.bulk_finish_windows += src.bulk_finish_windows;
     dst.bulk_finish_split_steps += src.bulk_finish_split_steps;
@@ -1737,6 +1844,13 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.wal_retention_known = dst.wal_retention_known or src.wal_retention_known;
     dst.wal_retained_segments += src.wal_retained_segments;
     dst.wal_retained_bytes += src.wal_retained_bytes;
+    dst.wal_checkpoint_oldest_retained_segment = minNonZeroU64(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
+    dst.wal_checkpoint_covered_through_segment = @max(dst.wal_checkpoint_covered_through_segment, src.wal_checkpoint_covered_through_segment);
+    dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+    dst.wal_checkpoint_lag_segments += src.wal_checkpoint_lag_segments;
+    dst.wal_replay_retained_segments += src.wal_replay_retained_segments;
+    dst.wal_replay_retained_bytes += src.wal_replay_retained_bytes;
+    dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
     dst.configured_indexes = @max(dst.configured_indexes, src.configured_indexes);
     dst.configured_dense_indexes = @max(dst.configured_dense_indexes, src.configured_dense_indexes);
     dst.configured_sparse_indexes = @max(dst.configured_sparse_indexes, src.configured_sparse_indexes);
@@ -1745,10 +1859,30 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.opened_indexes = @max(dst.opened_indexes, src.opened_indexes);
     dst.db_open_ns = @max(dst.db_open_ns, src.db_open_ns);
     dst.load_indexes_ns = @max(dst.load_indexes_ns, src.load_indexes_ns);
+    dst.lsm_open_stores += src.lsm_open_stores;
+    dst.lsm_open_completed += src.lsm_open_completed;
+    dst.lsm_open_failed += src.lsm_open_failed;
+    dst.lsm_open_total_ns += src.lsm_open_total_ns;
+    dst.lsm_open_initializing_storage_ns += src.lsm_open_initializing_storage_ns;
+    dst.lsm_open_manifest_ns += src.lsm_open_manifest_ns;
+    dst.lsm_open_ensuring_dirs_ns += src.lsm_open_ensuring_dirs_ns;
+    dst.lsm_open_wal_replay_ns += src.lsm_open_wal_replay_ns;
+    dst.lsm_open_mounting_runs_ns += src.lsm_open_mounting_runs_ns;
+    dst.lsm_open_loaded_runs += src.lsm_open_loaded_runs;
+    dst.lsm_open_obsolete_paths += src.lsm_open_obsolete_paths;
+    dst.lsm_open_mutable_entries_after_replay += src.lsm_open_mutable_entries_after_replay;
+    dst.lsm_open_immutable_memtables_after_replay += src.lsm_open_immutable_memtables_after_replay;
     dst.wal_replay_records += src.wal_replay_records;
     dst.wal_replay_entries += src.wal_replay_entries;
     dst.wal_replay_bytes += src.wal_replay_bytes;
     dst.wal_replay_ns += src.wal_replay_ns;
+    dst.wal_replay_truncated_tail_bytes += src.wal_replay_truncated_tail_bytes;
+}
+
+fn minNonZeroU64(lhs: u64, rhs: u64) u64 {
+    if (lhs == 0) return rhs;
+    if (rhs == 0) return lhs;
+    return @min(lhs, rhs);
 }
 
 pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexingStats) void {

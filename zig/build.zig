@@ -77,7 +77,10 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    const sdk_root = b.sysroot orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+        b.graph.environ_map.get("SDK_PATH") orelse
+        return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
     module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
@@ -152,6 +155,7 @@ const DelegatedPackageStep = struct {
 
 const DelegatedInferenceBuildSteps = struct {
     inference_test: *std.Build.Step,
+    inference_finetune_test: *std.Build.Step,
 };
 
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
@@ -244,6 +248,7 @@ fn addDelegatedInferenceBuildSteps(
     blas_root: ?[]const u8,
 ) DelegatedInferenceBuildSteps {
     var test_step: ?*std.Build.Step = null;
+    var finetune_test_step: ?*std.Build.Step = null;
     for (inference_delegated_steps) |step_name| {
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
@@ -251,10 +256,13 @@ fn addDelegatedInferenceBuildSteps(
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
+        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
+            finetune_test_step = delegated.step;
         }
     }
     return .{
         .inference_test = test_step.?,
+        .inference_finetune_test = finetune_test_step.?,
     };
 }
 
@@ -462,6 +470,8 @@ const AntflyRootImports = struct {
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
     vectorindex: *std.Build.Module,
+    matcher: *std.Build.Module,
+    resolver: *std.Build.Module,
     casbin: *std.Build.Module,
     vellum: *std.Build.Module,
     regex: *std.Build.Module,
@@ -523,6 +533,8 @@ const AntflyRootImports = struct {
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
         .{ .name = "antfly_vectorindex", .field = "vectorindex" },
+        .{ .name = "antfly_matcher", .field = "matcher" },
+        .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
         .{ .name = "antfly_vellum", .field = "vellum" },
         .{ .name = "antfly_regex", .field = "regex" },
@@ -1388,6 +1400,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const matcher_mod = b.addModule("antfly_matcher", .{
+        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const resolver_mod = b.addModule("antfly_resolver", .{
+        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    resolver_mod.addImport("antfly_matcher", matcher_mod);
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
@@ -1485,6 +1508,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const ml_tabular_mod = b.addModule("ml_tabular", .{
+        .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const termite_onnx_graph_mod = b.addModule("termite_onnx_graph", .{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = target,
@@ -1552,6 +1580,7 @@ pub fn build(b: *std.Build) void {
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = termite_ml_mod,
+            .ml_tabular = ml_tabular_mod,
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
@@ -1634,6 +1663,8 @@ pub fn build(b: *std.Build) void {
         .bloom = bloom_mod,
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
+        .matcher = matcher_mod,
+        .resolver = resolver_mod,
         .casbin = casbin_mod,
         .vellum = vellum_mod,
         .regex = regex_mod,
@@ -2081,6 +2112,24 @@ pub fn build(b: *std.Build) void {
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
 
+    const lib_ml_tabular_tests = b.addTest(.{
+        .root_module = ml_tabular_mod,
+    });
+    const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
+    const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
+    lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
+
+    const fuzz_tabular_loader = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_fuzz_tabular_loader = b.addRunArtifact(fuzz_tabular_loader);
+    const fuzz_tabular_loader_step = b.step("fuzz-tabular-loader", "Fuzz the tabular_model.json loader (--fuzz to keep running)");
+    fuzz_tabular_loader_step.dependOn(&run_fuzz_tabular_loader.step);
+
     const lib_toon_tests = b.addTest(.{
         .root_module = toon_mod,
     });
@@ -2101,6 +2150,20 @@ pub fn build(b: *std.Build) void {
     const run_lib_a2a_tests = b.addRunArtifact(lib_a2a_tests);
     const lib_a2a_test_step = b.step("lib-a2a-test", "Run standalone lib/a2a tests");
     lib_a2a_test_step.dependOn(&run_lib_a2a_tests.step);
+
+    const lib_matcher_tests = b.addTest(.{
+        .root_module = matcher_mod,
+    });
+    const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
+
+    const lib_resolver_tests = b.addTest(.{
+        .root_module = resolver_mod,
+    });
+    const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
         .name = "lib-toon-conformance",
@@ -2572,8 +2635,12 @@ pub fn build(b: *std.Build) void {
     const lib_unit_default_filters = [_][]const u8{
         ".test_0",
         "module compiles",
+        "batch parser preserves oversized value errors",
+        "batch parser accepts raw payload value under public request cap",
+        "linear merge request parser accepts raw payload value under public request cap",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "provisioned table write cache retires stale db when index metadata changes",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -2742,6 +2809,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
     };
@@ -3213,6 +3281,7 @@ pub fn build(b: *std.Build) void {
         "api http server lists cluster backups through public route",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "public API request body limit matches Go linear merge contract",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
@@ -3226,6 +3295,18 @@ pub fn build(b: *std.Build) void {
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+
+    const lib_resolution_source_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "DistributedCandidateSource",
+            "prefixUpperBoundAlloc",
+            "DistributedEntitySink",
+        },
+    });
+    const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
+    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
+    lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
 
     const lib_api_auth_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3257,6 +3338,7 @@ pub fn build(b: *std.Build) void {
             "api table reads reject stale doc identity before multigroup fanout",
             "distributed table reads reject stale doc identity before multigroup fanout",
             "api public table query rejects only top-level internal fields",
+            "single embeddings index encoder scopes isolated enrichment failure to one index",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
@@ -3441,11 +3523,17 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "api auto bulk ingest does not open sessions for normal online writes",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache reserves retirement slots when pruning multiple leased generations",
+            "primary lookup adopts seeded write cache across visible generation bump",
+            "provisioned table write source coalesces same-group waiters",
+            "provisioned table write coalescer isolates failed waiters",
+            "provisioned table write source consistent visibility hook does not block on busy apply lock",
+            "provisioned table write source consistent visibility refreshes stale dense status",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3456,6 +3544,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
+            "parseRemoteSearchResult preserves fused index scores",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3892,11 +3981,14 @@ pub fn build(b: *std.Build) void {
             "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
             "swarm runtime registers internal group routes explicitly",
             "parse cli accepts config path",
+            "parse cli accepts secret store path",
             "parse cli accepts canonical host port and models dir flags",
-            "termite config uses cli override before common config",
+            "antfly config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
-            "parse cli accepts termite budget overrides",
-            "termite config falls back to common config",
+            "swarm public api body limit matches common http listener",
+            "swarm public HTTP server uses public API request body limit",
+            "parse cli accepts inference budget overrides",
+            "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
         },
     });
@@ -3942,6 +4034,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(delegated_inference_steps.inference_test);
+    unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_swarm_runtime_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
@@ -4154,6 +4248,8 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
     index_manager_test_mod.addImport("antfly_vector", vector_mod);
     index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
+    index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     const index_manager_unit_tests = b.addTest(.{
@@ -4213,6 +4309,8 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_vellum", vellum_mod);
     db_test_mod.addImport("antfly_vector", vector_mod);
     db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    db_test_mod.addImport("antfly_matcher", matcher_mod);
+    db_test_mod.addImport("antfly_resolver", resolver_mod);
     db_test_mod.addImport("antfly_chunking", chunking_mod);
     db_test_mod.addImport("antfly_regex", regex_mod);
     db_test_mod.addImport("raft_engine", raft_engine_mod);
@@ -5986,6 +6084,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_recall_harness = b.addRunArtifact(recall_harness);
+    run_recall_harness.stdio = .inherit;
     if (b.args) |args| {
         run_recall_harness.addArgs(args);
     }
@@ -6005,6 +6104,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("raft_engine", raft_engine_mod);
         mod.addImport("structlog", structlog_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("handlebars", handlebars_mod);
         mod.addOptions("build_options", build_options);
         break :blk mod;
     } else blk: {
@@ -6061,6 +6161,7 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&run_antfly.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
+    run_recall_harness_default.stdio = .inherit;
     run_recall_harness_default.addArgs(&.{
         "--dataset-dir",
         "testdata/vectorsets",
