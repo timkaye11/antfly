@@ -30,6 +30,7 @@ const quant_codec = @import("../../gguf/quant_codec.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
 const operator_plan = @import("../../graph/operator_plan.zig");
 const kv_storage_runtime = @import("../../runtime/kv/storage_runtime.zig");
+const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
 
@@ -53,11 +54,57 @@ pub const CapabilityProfile = enum {
 };
 
 const DenseStreamEntry = struct {
+    const Kind = enum { attention, mlp };
+
     name: []u8,
     tensor: *CudaTensor,
     byte_len: usize,
+    kind: Kind,
     last_access: u64 = 0,
 };
+
+const DenseHostRange = struct {
+    path: []u8,
+    byte_offset: u64,
+    byte_len: usize,
+    dtype: tensor_mod.DType,
+    shape: []i64,
+
+    fn deinit(self: *DenseHostRange, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.shape);
+        self.* = .{
+            .path = &.{},
+            .byte_offset = 0,
+            .byte_len = 0,
+            .dtype = .f32,
+            .shape = &.{},
+        };
+    }
+};
+
+const DenseHostPrefetchEntry = struct {
+    name: []u8,
+    range: DenseHostRange,
+    kind: DenseStreamEntry.Kind,
+    priority: u64 = 0,
+    pending: bool = false,
+    loading: bool = false,
+    ready: bool = false,
+    failed: bool = false,
+    host: []u8 = &.{},
+    read_ns: u64 = 0,
+    last_access: u64 = 0,
+
+    fn deinit(self: *DenseHostPrefetchEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.range.deinit(allocator);
+        if (self.host.len != 0) allocator.free(self.host);
+        self.* = undefined;
+    }
+};
+
+const DenseHostPrefetchQueue = prefetch_mod.Queue(*DenseHostPrefetchEntry);
 
 pub const RuntimeStats = struct {
     pub const top_transfer_size_count = 8;
@@ -190,6 +237,18 @@ pub const RuntimeStats = struct {
     dense_stream_fadvise_calls: usize = 0,
     dense_stream_attention_loads: usize = 0,
     dense_stream_mlp_loads: usize = 0,
+    dense_prefetch_enqueues: usize = 0,
+    dense_prefetch_duplicates: usize = 0,
+    dense_prefetch_ready_hits: usize = 0,
+    dense_prefetch_inflight_steals: usize = 0,
+    dense_prefetch_sync_reads: usize = 0,
+    dense_prefetch_evictions: usize = 0,
+    dense_prefetch_failures: usize = 0,
+    dense_prefetch_host_read_ns: u64 = 0,
+    dense_prefetch_demand_wait_ns: u64 = 0,
+    dense_prefetch_upload_ns: u64 = 0,
+    dense_prefetch_resident_bytes: usize = 0,
+    dense_prefetch_read_bytes: usize = 0,
 };
 
 fn noteTopTransferSize(sizes: *[RuntimeStats.top_transfer_size_count]usize, counts: *[RuntimeStats.top_transfer_size_count]usize, bytes: usize) void {
@@ -265,6 +324,10 @@ pub const CudaCompute = struct {
     run_budget: ?*run_memory.RunBudget = null,
     dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
     dense_stream_epoch: u64 = 1,
+    dense_host_prefetch_entries: std.StringHashMapUnmanaged(*DenseHostPrefetchEntry) = .{},
+    dense_host_prefetch: DenseHostPrefetchQueue = undefined,
+    dense_host_prefetch_initialized: bool = false,
+    dense_host_prefetch_epoch: u64 = 1,
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
@@ -298,6 +361,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        deinitDenseHostPrefetch(self);
         if (self.lazy_host_store) |store| {
             native_compute_mod.stopPrefetchWorker(store);
         }
@@ -365,6 +429,7 @@ pub const CudaCompute = struct {
             self.resident_weights.count() + store.lazy_weights.count() + 16,
         );
         try installCudaLazyHostPrefetch(self, store);
+        try initDenseHostPrefetch(self);
     }
 
     pub fn configureRunBudget(self: *CudaCompute, run_budget: ?*run_memory.RunBudget) void {
@@ -667,8 +732,14 @@ fn cudaFfnStreamProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_FFN_STREAM_PROFILE");
 }
 
-fn cudaDenseStreamEnabled() bool {
-    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_STREAM") or cudaFfnStreamEnabled();
+fn cudaAutoDenseStreamEnabled(self: *const CudaCompute) bool {
+    const store = self.lazy_host_store orelse return false;
+    const tensor_store = store.tensor_store orelse return false;
+    return tensor_store.kind() == .safetensors and store.lazy_weights.count() >= 128;
+}
+
+fn cudaDenseStreamEnabled(self: *const CudaCompute) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DENSE_STREAM", cudaAutoDenseStreamEnabled(self)) or cudaFfnStreamEnabled();
 }
 
 fn cudaDenseStreamProfileEnabled() bool {
@@ -676,7 +747,21 @@ fn cudaDenseStreamProfileEnabled() bool {
 }
 
 fn cudaDenseStreamBudgetBytes() usize {
-    const requested_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_BUDGET_MB") orelse 1536;
+    const requested_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_BUDGET_MB") orelse 2048;
+    const budget_mb = @max(@as(usize, 512), requested_mb);
+    return budget_mb * 1024 * 1024;
+}
+
+fn cudaDensePrefetchEnabled(self: *const CudaCompute) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DENSE_PREFETCH", cudaAutoDenseStreamEnabled(self));
+}
+
+fn cudaDensePrefetchProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_PREFETCH_PROFILE") or cudaDenseStreamProfileEnabled();
+}
+
+fn cudaDenseHostPrefetchBudgetBytes() usize {
+    const requested_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DENSE_HOST_PREFETCH_MB") orelse 4096;
     const budget_mb = @max(@as(usize, 512), requested_mb);
     return budget_mb * 1024 * 1024;
 }
@@ -767,6 +852,173 @@ fn deinitDenseStreamCache(self: *CudaCompute) void {
     self.stats.dense_stream_resident_bytes = 0;
 }
 
+fn initDenseHostPrefetch(self: *CudaCompute) !void {
+    if (!cudaDensePrefetchEnabled(self)) return;
+    if (self.dense_host_prefetch_initialized) return;
+    if (self.lazy_host_store == null) return;
+    self.dense_host_prefetch = DenseHostPrefetchQueue.initWithPriorityUnlocked(
+        self.allocator,
+        self,
+        &denseHostPrefetchProcess,
+        &denseHostPrefetchPriority,
+    );
+    self.dense_host_prefetch_initialized = true;
+    if (!disableCudaLazyHostPrefetchWorker()) {
+        try self.dense_host_prefetch.start();
+    }
+}
+
+fn deinitDenseHostPrefetch(self: *CudaCompute) void {
+    if (self.dense_host_prefetch_initialized) {
+        self.dense_host_prefetch.deinit();
+        self.dense_host_prefetch_initialized = false;
+    }
+    var it = self.dense_host_prefetch_entries.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.*.deinit(self.allocator);
+        self.allocator.destroy(entry.value_ptr.*);
+    }
+    self.dense_host_prefetch_entries.deinit(self.allocator);
+    self.stats.dense_prefetch_resident_bytes = 0;
+}
+
+fn cloneDenseHostRange(allocator: std.mem.Allocator, range: tensor_store_mod.TensorRangeRef) !DenseHostRange {
+    const path = try allocator.dupe(u8, range.path);
+    errdefer allocator.free(path);
+    const shape = try allocator.dupe(i64, range.shape);
+    errdefer allocator.free(shape);
+    return .{
+        .path = path,
+        .byte_offset = range.byte_offset,
+        .byte_len = range.byte_len,
+        .dtype = range.dtype,
+        .shape = shape,
+    };
+}
+
+fn createDenseHostPrefetchEntry(self: *CudaCompute, name: []const u8, priority: u64) !*DenseHostPrefetchEntry {
+    const store = self.lazy_host_store orelse return error.MissingWeight;
+    const tensor_store = store.tensor_store orelse return error.MissingWeight;
+    var tensor_range = (try tensor_store.describeTensorRange(self.allocator, name)) orelse return error.MissingWeight;
+    defer tensor_range.deinit(self.allocator);
+    if (tensor_range.dtype != .bf16 or tensor_range.shape.len < 2 or tensor_range.byte_len == 0) return error.UnsupportedTensorType;
+
+    const entry = try self.allocator.create(DenseHostPrefetchEntry);
+    errdefer self.allocator.destroy(entry);
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    const range = try cloneDenseHostRange(self.allocator, tensor_range);
+    errdefer {
+        var mutable_range = range;
+        mutable_range.deinit(self.allocator);
+    }
+    entry.* = .{
+        .name = owned_name,
+        .range = range,
+        .kind = if (isDenseAttentionStreamWeightName(name)) .attention else .mlp,
+        .priority = priority,
+        .pending = true,
+        .last_access = self.dense_host_prefetch_epoch,
+    };
+    return entry;
+}
+
+fn denseHostPrefetchPriority(entry: *DenseHostPrefetchEntry) u64 {
+    return entry.priority;
+}
+
+fn readDenseHostBytes(self: *CudaCompute, path: []const u8, byte_offset: u64, byte_len: usize) !struct { host: []u8, read_ns: u64 } {
+    self.stats.dense_stream_fadvise_calls += 1;
+    c_file.adviseFileRange(self.allocator, path, byte_offset, byte_len, .will_need);
+    const start = platform.time.monotonicNs();
+    const host = try self.allocator.alloc(u8, byte_len);
+    errdefer self.allocator.free(host);
+    try c_file.readRegionInto(self.allocator, path, byte_offset, host);
+    const read_ns = elapsedNsSince(start);
+    self.stats.dense_stream_fadvise_calls += 1;
+    c_file.adviseFileRange(self.allocator, path, byte_offset, byte_len, .dont_need);
+    return .{ .host = host, .read_ns = read_ns };
+}
+
+fn evictDenseHostPrefetchToBudgetLocked(self: *CudaCompute, protected_name: []const u8, incoming_bytes: usize) void {
+    const budget = cudaDenseHostPrefetchBudgetBytes();
+    while (self.stats.dense_prefetch_resident_bytes + incoming_bytes > budget) {
+        var victim_name: ?[]const u8 = null;
+        var victim_entry: ?*DenseHostPrefetchEntry = null;
+        var oldest_epoch: u64 = std.math.maxInt(u64);
+        var it = self.dense_host_prefetch_entries.iterator();
+        while (it.next()) |map_entry| {
+            const entry = map_entry.value_ptr.*;
+            if (!entry.ready or entry.host.len == 0) continue;
+            if (std.mem.eql(u8, entry.name, protected_name)) continue;
+            if (entry.last_access < oldest_epoch) {
+                oldest_epoch = entry.last_access;
+                victim_name = map_entry.key_ptr.*;
+                victim_entry = entry;
+            }
+        }
+        const entry = victim_entry orelse return;
+        _ = self.dense_host_prefetch_entries.remove(victim_name.?);
+        self.stats.dense_prefetch_resident_bytes -|= entry.host.len;
+        self.stats.dense_prefetch_evictions += 1;
+        entry.deinit(self.allocator);
+        self.allocator.destroy(entry);
+    }
+}
+
+fn removeDenseHostPrefetchQueueItemLocked(self: *CudaCompute, entry: *DenseHostPrefetchEntry) bool {
+    for (self.dense_host_prefetch.items.items, 0..) |queued, index| {
+        if (queued == entry) {
+            _ = self.dense_host_prefetch.items.orderedRemove(index);
+            entry.pending = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn denseHostPrefetchProcess(ctx: *anyopaque, entry: *DenseHostPrefetchEntry) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.dense_host_prefetch.lock();
+    if (!entry.pending) {
+        self.dense_host_prefetch.unlock();
+        return;
+    }
+    entry.pending = false;
+    entry.loading = true;
+    self.dense_host_prefetch.unlock();
+
+    const loaded = readDenseHostBytes(self, entry.range.path, entry.range.byte_offset, entry.range.byte_len) catch {
+        self.dense_host_prefetch.lock();
+        entry.loading = false;
+        entry.failed = true;
+        self.stats.dense_prefetch_failures += 1;
+        self.dense_host_prefetch.unlock();
+        return;
+    };
+
+    self.dense_host_prefetch.lock();
+    defer self.dense_host_prefetch.unlock();
+    entry.host = loaded.host;
+    entry.read_ns = loaded.read_ns;
+    entry.loading = false;
+    entry.ready = true;
+    self.stats.dense_prefetch_host_read_ns +|= loaded.read_ns;
+    self.stats.dense_prefetch_read_bytes += loaded.host.len;
+    evictDenseHostPrefetchToBudgetLocked(self, entry.name, loaded.host.len);
+    if (self.dense_host_prefetch_entries.get(entry.name) == entry) {
+        self.stats.dense_prefetch_resident_bytes += loaded.host.len;
+        if (cudaDensePrefetchProfileEnabled()) {
+            std.log.info("cuda_dense_prefetch: loaded name={s} mb={d} read_ms={d} resident_mb={d}", .{
+                entry.name,
+                loaded.host.len / (1024 * 1024),
+                loaded.read_ns / 1_000_000,
+                self.stats.dense_prefetch_resident_bytes / (1024 * 1024),
+            });
+        }
+    }
+}
+
 fn isDenseFfnStreamWeightName(name: []const u8) bool {
     if (std.mem.indexOf(u8, name, ".mlp.") == null) return false;
     return std.mem.endsWith(u8, name, ".mlp.gate_proj.weight") or
@@ -782,8 +1034,8 @@ fn isDenseAttentionStreamWeightName(name: []const u8) bool {
         std.mem.endsWith(u8, name, ".self_attn.o_proj.weight");
 }
 
-fn isDenseStreamWeightName(name: []const u8) bool {
-    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_STREAM")) {
+fn isDenseStreamWeightName(self: *const CudaCompute, name: []const u8) bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DENSE_STREAM", cudaAutoDenseStreamEnabled(self))) {
         return isDenseFfnStreamWeightName(name) or isDenseAttentionStreamWeightName(name);
     }
     return cudaFfnStreamEnabled() and isDenseFfnStreamWeightName(name);
@@ -813,10 +1065,12 @@ fn evictOneDenseStreamEntry(self: *CudaCompute, protected_name: []const u8) !voi
     const bytes = entry.byte_len;
     freeCudaTensorStorageUncached(self, entry.tensor);
     self.allocator.destroy(entry.tensor);
-    self.stats.ffn_stream_resident_bytes -|= bytes;
+    if (entry.kind == .mlp) {
+        self.stats.ffn_stream_resident_bytes -|= bytes;
+        self.stats.ffn_stream_evictions += 1;
+    }
     self.stats.dense_stream_resident_bytes -|= bytes;
     self.stats.resident_weight_bytes -|= bytes;
-    self.stats.ffn_stream_evictions += 1;
     self.stats.dense_stream_evictions += 1;
     self.allocator.free(entry.name);
 }
@@ -829,26 +1083,30 @@ fn ensureDenseStreamBudgetForInsert(self: *CudaCompute, protected_name: []const 
     }
 }
 
-fn streamDenseWeightFromRange(self: *CudaCompute, name: []const u8, range: tensor_store_mod.TensorRangeRef) !*CudaTensor {
-    if (range.dtype != .bf16) return error.UnsupportedTensorType;
-    if (range.shape.len < 2) return error.InvalidShape;
-    if (range.byte_len == 0) return error.InvalidShape;
-    try ensureDenseStreamBudgetForInsert(self, name, range.byte_len);
+fn uploadDenseWeightFromHost(
+    self: *CudaCompute,
+    name: []const u8,
+    dtype: tensor_mod.DType,
+    shape_src: []const i64,
+    byte_len: usize,
+    host: []const u8,
+    read_ns: u64,
+    from_prefetch: bool,
+) !*CudaTensor {
+    if (dtype != .bf16) return error.UnsupportedTensorType;
+    if (shape_src.len < 2) return error.InvalidShape;
+    if (byte_len == 0 or host.len != byte_len) return error.InvalidShape;
+    try ensureDenseStreamBudgetForInsert(self, name, byte_len);
+    const stream_kind: DenseStreamEntry.Kind = if (isDenseAttentionStreamWeightName(name)) .attention else .mlp;
 
-    self.stats.ffn_stream_fadvise_calls += 1;
-    self.stats.dense_stream_fadvise_calls += 1;
-    c_file.adviseFileRange(self.allocator, range.path, range.byte_offset, range.byte_len, .will_need);
-    const read_start = platform.time.monotonicNs();
-    const host = try self.allocator.alloc(u8, range.byte_len);
-    defer self.allocator.free(host);
-    try c_file.readRegionInto(self.allocator, range.path, range.byte_offset, host);
-    const read_ns = elapsedNsSince(read_start);
-    self.stats.ffn_stream_read_ns +|= read_ns;
-    self.stats.dense_stream_read_ns +|= read_ns;
-    self.stats.ffn_stream_read_bytes += host.len;
-    self.stats.dense_stream_read_bytes += host.len;
+    if (!from_prefetch) {
+        if (stream_kind == .mlp) self.stats.ffn_stream_read_ns +|= read_ns;
+        self.stats.dense_stream_read_ns +|= read_ns;
+        if (stream_kind == .mlp) self.stats.ffn_stream_read_bytes += host.len;
+        self.stats.dense_stream_read_bytes += host.len;
+    }
 
-    const shape = try self.allocator.dupe(i64, range.shape);
+    const shape = try self.allocator.dupe(i64, shape_src);
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, host.len);
     errdefer device.free(&self.ctx);
@@ -857,19 +1115,17 @@ fn streamDenseWeightFromRange(self: *CudaCompute, name: []const u8, range: tenso
     try self.ctx.synchronize();
     self.stats.upload_syncs += 1;
     const h2d_ns = elapsedNsSince(h2d_start);
-    self.stats.ffn_stream_h2d_ns +|= h2d_ns;
+    if (stream_kind == .mlp) self.stats.ffn_stream_h2d_ns +|= h2d_ns;
     self.stats.dense_stream_h2d_ns +|= h2d_ns;
-    self.stats.ffn_stream_uploaded_bytes += host.len;
+    if (from_prefetch) self.stats.dense_prefetch_upload_ns +|= h2d_ns;
+    if (stream_kind == .mlp) self.stats.ffn_stream_uploaded_bytes += host.len;
     self.stats.dense_stream_uploaded_bytes += host.len;
-    self.stats.ffn_stream_fadvise_calls += 1;
-    self.stats.dense_stream_fadvise_calls += 1;
-    c_file.adviseFileRange(self.allocator, range.path, range.byte_offset, range.byte_len, .dont_need);
 
     const owned_name = try self.allocator.dupe(u8, name);
     errdefer self.allocator.free(owned_name);
     const tensor = try self.allocator.create(CudaTensor);
     errdefer self.allocator.destroy(tensor);
-    const elem_count = range.byte_len / @sizeOf(u16);
+    const elem_count = byte_len / @sizeOf(u16);
     tensor.* = .{
         .buffer = device,
         .dtype = .bf16,
@@ -885,14 +1141,15 @@ fn streamDenseWeightFromRange(self: *CudaCompute, name: []const u8, range: tenso
         .name = owned_name,
         .tensor = tensor,
         .byte_len = host.len,
+        .kind = stream_kind,
         .last_access = self.dense_stream_epoch,
     });
-    self.stats.ffn_stream_resident_bytes += host.len;
+    if (stream_kind == .mlp) self.stats.ffn_stream_resident_bytes += host.len;
     self.stats.dense_stream_resident_bytes += host.len;
     self.stats.resident_weight_bytes += host.len;
-    if (isDenseAttentionStreamWeightName(name)) {
+    if (stream_kind == .attention) {
         self.stats.dense_stream_attention_loads += 1;
-    } else if (isDenseFfnStreamWeightName(name)) {
+    } else {
         self.stats.dense_stream_mlp_loads += 1;
     }
     if (cudaDenseStreamProfileEnabled()) {
@@ -908,22 +1165,147 @@ fn streamDenseWeightFromRange(self: *CudaCompute, name: []const u8, range: tenso
     return tensor;
 }
 
+fn streamDenseWeightFromRange(self: *CudaCompute, name: []const u8, range: tensor_store_mod.TensorRangeRef) !*CudaTensor {
+    if (range.dtype != .bf16) return error.UnsupportedTensorType;
+    if (range.shape.len < 2) return error.InvalidShape;
+    if (range.byte_len == 0) return error.InvalidShape;
+    const is_mlp = isDenseFfnStreamWeightName(name);
+    if (is_mlp) self.stats.ffn_stream_fadvise_calls += 2;
+    self.stats.dense_prefetch_sync_reads += 1;
+    const loaded = try readDenseHostBytes(self, range.path, range.byte_offset, range.byte_len);
+    defer self.allocator.free(loaded.host);
+    return try uploadDenseWeightFromHost(self, name, range.dtype, range.shape, range.byte_len, loaded.host, loaded.read_ns, false);
+}
+
+fn takeDenseHostPrefetchedWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
+    if (!cudaDensePrefetchEnabled(self) or !self.dense_host_prefetch_initialized) return null;
+    const wait_start = platform.time.monotonicNs();
+    var waited = false;
+    while (true) {
+        self.dense_host_prefetch.lock();
+        const entry = self.dense_host_prefetch_entries.get(name) orelse {
+            self.dense_host_prefetch.unlock();
+            if (waited) self.stats.dense_prefetch_demand_wait_ns +|= elapsedNsSince(wait_start);
+            return null;
+        };
+        self.dense_host_prefetch_epoch +|= 1;
+        entry.last_access = self.dense_host_prefetch_epoch;
+        if (entry.ready) {
+            _ = self.dense_host_prefetch_entries.remove(name);
+            self.stats.dense_prefetch_resident_bytes -|= entry.host.len;
+            const host = entry.host;
+            entry.host = &.{};
+            const read_ns = entry.read_ns;
+            self.dense_host_prefetch.unlock();
+            if (waited) self.stats.dense_prefetch_demand_wait_ns +|= elapsedNsSince(wait_start);
+            self.stats.dense_prefetch_ready_hits += 1;
+            defer self.allocator.free(host);
+            defer {
+                entry.deinit(self.allocator);
+                self.allocator.destroy(entry);
+            }
+            return try uploadDenseWeightFromHost(self, name, entry.range.dtype, entry.range.shape, entry.range.byte_len, host, read_ns, true);
+        }
+        if (entry.pending) {
+            _ = removeDenseHostPrefetchQueueItemLocked(self, entry);
+            _ = self.dense_host_prefetch_entries.remove(name);
+            self.dense_host_prefetch.unlock();
+            if (waited) self.stats.dense_prefetch_demand_wait_ns +|= elapsedNsSince(wait_start);
+            self.stats.dense_prefetch_inflight_steals += 1;
+            self.stats.dense_prefetch_sync_reads += 1;
+            if (entry.kind == .mlp) self.stats.ffn_stream_fadvise_calls += 2;
+            const loaded = try readDenseHostBytes(self, entry.range.path, entry.range.byte_offset, entry.range.byte_len);
+            defer self.allocator.free(loaded.host);
+            defer {
+                entry.deinit(self.allocator);
+                self.allocator.destroy(entry);
+            }
+            return try uploadDenseWeightFromHost(self, name, entry.range.dtype, entry.range.shape, entry.range.byte_len, loaded.host, loaded.read_ns, false);
+        }
+        if (entry.failed) {
+            _ = self.dense_host_prefetch_entries.remove(name);
+            self.dense_host_prefetch.unlock();
+            if (waited) self.stats.dense_prefetch_demand_wait_ns +|= elapsedNsSince(wait_start);
+            entry.deinit(self.allocator);
+            self.allocator.destroy(entry);
+            return null;
+        }
+        self.dense_host_prefetch.unlock();
+        waited = true;
+        platform.time.yieldBriefly();
+    }
+}
+
+fn enqueueDenseHostPrefetchHint(self: *CudaCompute, name: []const u8, hint: u32) void {
+    if (!cudaDensePrefetchEnabled(self) or !self.dense_host_prefetch_initialized) return;
+    if (self.resident_weights.contains(name)) return;
+    self.dense_host_prefetch.lock();
+    if (findDenseStreamEntry(self, name) != null) {
+        self.dense_host_prefetch.unlock();
+        return;
+    }
+    if (self.dense_host_prefetch_entries.get(name)) |entry| {
+        entry.priority +|= hint;
+        self.dense_host_prefetch_epoch +|= 1;
+        entry.last_access = self.dense_host_prefetch_epoch;
+        self.stats.dense_prefetch_duplicates += 1;
+        self.dense_host_prefetch.signal();
+        self.dense_host_prefetch.unlock();
+        return;
+    }
+    self.dense_host_prefetch.unlock();
+
+    const entry = createDenseHostPrefetchEntry(self, name, hint) catch {
+        self.stats.dense_prefetch_failures += 1;
+        return;
+    };
+    self.dense_host_prefetch.lock();
+    if (self.dense_host_prefetch_entries.get(name)) |existing| {
+        existing.priority +|= hint;
+        self.stats.dense_prefetch_duplicates += 1;
+        self.dense_host_prefetch.unlock();
+        entry.deinit(self.allocator);
+        self.allocator.destroy(entry);
+        return;
+    }
+    self.dense_host_prefetch_entries.put(self.allocator, entry.name, entry) catch {
+        self.dense_host_prefetch.unlock();
+        entry.deinit(self.allocator);
+        self.allocator.destroy(entry);
+        self.stats.dense_prefetch_failures += 1;
+        return;
+    };
+    self.dense_host_prefetch.items.append(self.allocator, entry) catch {
+        _ = self.dense_host_prefetch_entries.remove(entry.name);
+        self.dense_host_prefetch.unlock();
+        entry.deinit(self.allocator);
+        self.allocator.destroy(entry);
+        self.stats.dense_prefetch_failures += 1;
+        return;
+    };
+    self.stats.dense_prefetch_enqueues += 1;
+    self.dense_host_prefetch.signal();
+    self.dense_host_prefetch.unlock();
+}
+
 fn getDenseStreamWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
-    if (!cudaDenseStreamEnabled()) return null;
-    if (!isDenseStreamWeightName(name)) return null;
+    if (!cudaDenseStreamEnabled(self)) return null;
+    if (!isDenseStreamWeightName(self, name)) return null;
     const store = self.lazy_host_store orelse return null;
     const tensor_store = store.tensor_store orelse return null;
-    self.stats.ffn_stream_requests += 1;
+    const is_mlp = isDenseFfnStreamWeightName(name);
+    if (is_mlp) self.stats.ffn_stream_requests += 1;
     self.stats.dense_stream_requests += 1;
     self.dense_stream_epoch +|= 1;
     if (findDenseStreamEntry(self, name)) |entry| {
         entry.last_access = self.dense_stream_epoch;
-        self.stats.ffn_stream_hits += 1;
+        if (is_mlp) self.stats.ffn_stream_hits += 1;
         self.stats.dense_stream_hits += 1;
         return entry.tensor;
     }
-    self.stats.ffn_stream_misses += 1;
+    if (is_mlp) self.stats.ffn_stream_misses += 1;
     self.stats.dense_stream_misses += 1;
+    if (try takeDenseHostPrefetchedWeight(self, name)) |tensor| return tensor;
     var range = (try tensor_store.describeTensorRange(self.allocator, name)) orelse return null;
     defer range.deinit(self.allocator);
     return try streamDenseWeightFromRange(self, name, range);
@@ -1337,7 +1719,7 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     if (getDenseStreamWeight(self, name)) |maybe_tensor| {
         if (maybe_tensor) |tensor| return tensor;
     } else |err| {
-        self.stats.ffn_stream_fallbacks += 1;
+        if (isDenseFfnStreamWeightName(name)) self.stats.ffn_stream_fallbacks += 1;
         self.stats.dense_stream_fallbacks += 1;
         if (cudaDenseStreamProfileEnabled()) {
             std.log.warn("cuda_dense_stream: fallback name={s} err={s}", .{ name, @errorName(err) });
@@ -1352,12 +1734,17 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.resident_weights.contains(name)) return;
-    if (cudaDenseStreamEnabled() and isDenseStreamWeightName(name)) {
+    if (cudaDenseStreamEnabled(self) and isDenseStreamWeightName(self, name)) {
+        const is_mlp = isDenseFfnStreamWeightName(name);
         if (findDenseStreamEntry(self, name)) |entry| {
             self.dense_stream_epoch +|= 1;
             entry.last_access = self.dense_stream_epoch;
-            self.stats.ffn_stream_hits += 1;
+            if (is_mlp) self.stats.ffn_stream_hits += 1;
             self.stats.dense_stream_hits += 1;
+            return;
+        }
+        if (cudaDensePrefetchEnabled(self) and self.dense_host_prefetch_initialized) {
+            enqueueDenseHostPrefetchHint(self, name, hint);
             return;
         }
         if (self.lazy_host_store) |store| {
@@ -1365,7 +1752,7 @@ fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
                 if (tensor_store.describeTensorRange(self.allocator, name)) |maybe_range| {
                     if (maybe_range) |range_value| {
                         var range = range_value;
-                        self.stats.ffn_stream_fadvise_calls += 1;
+                        if (is_mlp) self.stats.ffn_stream_fadvise_calls += 1;
                         self.stats.dense_stream_fadvise_calls += 1;
                         c_file.adviseFileRange(self.allocator, range.path, range.byte_offset, range.byte_len, .will_need);
                         range.deinit(self.allocator);
@@ -1404,6 +1791,45 @@ fn drainPrefetchBudget(ctx: *anyopaque, max_items: usize) void {
     if (!store.prefetch_initialized) return;
     self.stats.lazy_prefetch_drain_calls += 1;
     store.prefetch.drainBudget(max_items);
+}
+
+fn debugProfileCheckpoint(ctx: *anyopaque, label: []const u8, layer: usize) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PREFILL_PROFILE")) return;
+    const stats = self.stats;
+    std.debug.print(
+        "cuda_prefill_profile: label={s} layer={d} lazy_demand={d} lazy_hits={d} lazy_host_ms={d} lazy_touch_ms={d} lazy_upload_ms={d} lazy_uploaded_mb={d} dense_req={d} dense_hits={d} dense_misses={d} dense_fallbacks={d} dense_read_ms={d} dense_h2d_ms={d} dense_read_mb={d} dense_uploaded_mb={d} dense_resident_mb={d} dense_prefetch_enq={d} dense_prefetch_ready={d} dense_prefetch_steals={d} dense_prefetch_sync_reads={d} dense_prefetch_wait_ms={d} dense_prefetch_host_read_ms={d} dense_prefetch_upload_ms={d} syncs={d} upload_syncs={d} alloc_calls={d} free_calls={d}\n",
+        .{
+            label,
+            layer,
+            stats.lazy_demand_loads,
+            stats.lazy_host_prefetch_hits,
+            stats.lazy_host_load_ns / 1_000_000,
+            stats.lazy_host_page_touch_ns / 1_000_000,
+            stats.lazy_upload_ns / 1_000_000,
+            stats.lazy_uploaded_bytes / (1024 * 1024),
+            stats.dense_stream_requests,
+            stats.dense_stream_hits,
+            stats.dense_stream_misses,
+            stats.dense_stream_fallbacks,
+            stats.dense_stream_read_ns / 1_000_000,
+            stats.dense_stream_h2d_ns / 1_000_000,
+            stats.dense_stream_read_bytes / (1024 * 1024),
+            stats.dense_stream_uploaded_bytes / (1024 * 1024),
+            stats.dense_stream_resident_bytes / (1024 * 1024),
+            stats.dense_prefetch_enqueues,
+            stats.dense_prefetch_ready_hits,
+            stats.dense_prefetch_inflight_steals,
+            stats.dense_prefetch_sync_reads,
+            stats.dense_prefetch_demand_wait_ns / 1_000_000,
+            stats.dense_prefetch_host_read_ns / 1_000_000,
+            stats.dense_prefetch_upload_ns / 1_000_000,
+            stats.stream_syncs,
+            stats.upload_syncs,
+            stats.device_alloc_calls,
+            stats.device_free_calls,
+        },
+    );
 }
 
 fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
@@ -3865,6 +4291,7 @@ const vtable = ops.ComputeBackend.VTable{
     .getWeight = &getWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
+    .debugProfileCheckpoint = &debugProfileCheckpoint,
     .embeddingLookup = &embeddingLookup,
     .embeddingLookupTensor = &embeddingLookupTensor,
     .takeRows = &takeRows,
@@ -3988,4 +4415,42 @@ test "cuda dense stream weight classifier covers gemma attention and mlp matrice
     try std.testing.expect(isDenseAttentionStreamWeightName("model.language_model.layers.0.self_attn.v_proj.weight"));
     try std.testing.expect(isDenseAttentionStreamWeightName("model.language_model.layers.0.self_attn.o_proj.weight"));
     try std.testing.expect(!isDenseAttentionStreamWeightName("model.language_model.layers.0.input_layernorm.weight"));
+}
+
+test "cuda dense host prefetch queue removal clears pending item" {
+    const allocator = std.testing.allocator;
+    const Dummy = struct {
+        fn process(_: *anyopaque, _: *DenseHostPrefetchEntry) void {}
+    };
+    var dummy_ctx: u8 = 0;
+    var compute = CudaCompute{
+        .allocator = allocator,
+        .ctx = undefined,
+        .kernels = undefined,
+        .dense_host_prefetch = DenseHostPrefetchQueue.init(allocator, &dummy_ctx, &Dummy.process),
+        .dense_host_prefetch_initialized = true,
+    };
+    defer compute.dense_host_prefetch.deinit();
+
+    var entry = DenseHostPrefetchEntry{
+        .name = try allocator.dupe(u8, "model.language_model.layers.0.self_attn.q_proj.weight"),
+        .range = .{
+            .path = try allocator.dupe(u8, "/tmp/model.safetensors"),
+            .byte_offset = 8,
+            .byte_len = 16,
+            .dtype = .bf16,
+            .shape = try allocator.dupe(i64, &.{ 2, 4 }),
+        },
+        .kind = .attention,
+        .pending = true,
+    };
+    defer entry.deinit(allocator);
+
+    compute.dense_host_prefetch.lock();
+    defer compute.dense_host_prefetch.unlock();
+    try compute.dense_host_prefetch.items.append(allocator, &entry);
+    try std.testing.expect(removeDenseHostPrefetchQueueItemLocked(&compute, &entry));
+    try std.testing.expect(!entry.pending);
+    try std.testing.expectEqual(@as(usize, 0), compute.dense_host_prefetch.items.items.len);
+    try std.testing.expect(!removeDenseHostPrefetchQueueItemLocked(&compute, &entry));
 }

@@ -3506,6 +3506,42 @@ fn smokeRmsNormHeadsRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.Cuda
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.0001);
+
+    {
+        const partial_rows: usize = 1;
+        const partial_total_dim: usize = 8;
+        const partial_head_dim: usize = 8;
+        const partial_rope_dim: usize = 4;
+        const partial_input = [_]f32{ 1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0 };
+        const partial_weight = [_]f32{ 1.0, 0.5, 1.25, -0.75, 0.25, 1.5, -0.5, 2.0 };
+        var partial_expected: [partial_input.len]f32 = undefined;
+        var sumsq: f32 = 0.0;
+        for (partial_input) |value| sumsq += value * value;
+        const partial_norm_scale = 1.0 / std.math.sqrt(sumsq / @as(f32, @floatFromInt(partial_head_dim)) + eps);
+        for (partial_input, 0..) |value, i| {
+            partial_expected[i] = value * partial_norm_scale * partial_weight[i];
+        }
+        applySplitHalfRopeExpected(partial_expected[0..], 1, partial_head_dim, partial_rope_dim, theta, 1.0);
+        for (&partial_expected) |*value| value.* *= output_scale;
+
+        var partial_in = try buffer_mod.DeviceBuffer.alloc(ctx, partial_input.len * @sizeOf(f32));
+        defer partial_in.free(ctx);
+        var partial_weight_device = try buffer_mod.DeviceBuffer.alloc(ctx, partial_weight.len * @sizeOf(f32));
+        defer partial_weight_device.free(ctx);
+        var partial_out = try buffer_mod.DeviceBuffer.alloc(ctx, partial_input.len * @sizeOf(f32));
+        defer partial_out.free(ctx);
+
+        try partial_in.copyFromHost(ctx, std.mem.sliceAsBytes(&partial_input));
+        try partial_weight_device.copyFromHost(ctx, std.mem.sliceAsBytes(&partial_weight));
+        try module.launchRmsNormHeadsRopeF32(ctx, partial_out, partial_in, partial_weight_device, partial_rows, partial_total_dim, partial_head_dim, partial_rope_dim, eps, theta, 1.0, 1, 1, false, output_scale);
+        try ctx.synchronize();
+
+        const partial_host = try allocator.alloc(f32, partial_input.len);
+        defer allocator.free(partial_host);
+        try partial_out.copyToHost(ctx, std.mem.sliceAsBytes(partial_host));
+        try ctx.synchronize();
+        try expectApproxSlice(partial_host, &partial_expected, 0.0001);
+    }
 }
 
 fn smokeGemma4MtpMaskedArgmaxF32(ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -3835,6 +3871,28 @@ fn smokeRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, mod
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.0001);
+
+    {
+        const partial_head_dim: usize = 8;
+        const partial_rope_dim: usize = 4;
+        const partial_input = [_]f32{ 1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0 };
+        var partial_expected = partial_input;
+        applySplitHalfRopeExpected(partial_expected[0..], 1, partial_head_dim, partial_rope_dim, theta, freq_scale);
+
+        var partial_in = try buffer_mod.DeviceBuffer.alloc(ctx, partial_input.len * @sizeOf(f32));
+        defer partial_in.free(ctx);
+        var partial_out = try buffer_mod.DeviceBuffer.alloc(ctx, partial_input.len * @sizeOf(f32));
+        defer partial_out.free(ctx);
+        try partial_in.copyFromHost(ctx, std.mem.sliceAsBytes(&partial_input));
+        try module.launchRopeF32(ctx, partial_out, partial_in, 1, partial_head_dim, partial_rope_dim, theta, freq_scale, 1, 1, 1, false);
+        try ctx.synchronize();
+
+        const partial_host = try allocator.alloc(f32, partial_input.len);
+        defer allocator.free(partial_host);
+        try partial_out.copyToHost(ctx, std.mem.sliceAsBytes(partial_host));
+        try ctx.synchronize();
+        try expectApproxSlice(partial_host, &partial_expected, 0.0001);
+    }
 }
 
 fn smokeRopePerItemF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -4174,6 +4232,27 @@ fn expectedRopePair(input: []const f32, dst: []f32, position: f32, theta: f32, f
     const c = std.math.cos(angle);
     dst[0] = input[0] * c - input[1] * s;
     dst[1] = input[0] * s + input[1] * c;
+}
+
+fn applySplitHalfRopeExpected(row: []f32, position: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32) void {
+    std.debug.assert(row.len == head_dim);
+    std.debug.assert(head_dim % 2 == 0);
+    std.debug.assert(rope_dim % 2 == 0);
+    std.debug.assert(rope_dim <= head_dim);
+    const active_pairs = rope_dim / 2;
+    const head_half = head_dim / 2;
+    const pos: f32 = @floatFromInt(position);
+    for (0..active_pairs) |j| {
+        const idx0 = j;
+        const idx1 = j + head_half;
+        const angle = pos * freq_scale / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim)));
+        const s = std.math.sin(angle);
+        const c = std.math.cos(angle);
+        const x0 = row[idx0];
+        const x1 = row[idx1];
+        row[idx0] = x0 * c - x1 * s;
+        row[idx1] = x0 * s + x1 * c;
+    }
 }
 
 fn bf16Bits(value: f32) u16 {

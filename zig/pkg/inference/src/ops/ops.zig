@@ -829,6 +829,7 @@ pub const ComputeBackend = struct {
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
+        debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
 
         /// Embedding table lookup: weight[ids[i]] for each i. Returns [total, dim].
         embeddingLookup: *const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT,
@@ -1726,6 +1727,11 @@ pub const ComputeBackend = struct {
 
     pub fn drainPrefetchBudget(self: *const ComputeBackend, max_items: usize) void {
         self.vtable.drainPrefetchBudget(self.ptr, max_items);
+    }
+
+    pub fn debugProfileCheckpoint(self: *const ComputeBackend, label: []const u8, layer: usize) void {
+        const op = self.vtable.debugProfileCheckpoint orelse return;
+        op(self.ptr, label, layer);
     }
 
     pub fn embeddingLookup(self: *const ComputeBackend, weight: CT, ids: []const i64, total: usize, dim: usize) !CT {

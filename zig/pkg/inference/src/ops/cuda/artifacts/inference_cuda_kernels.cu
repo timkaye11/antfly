@@ -1220,6 +1220,47 @@ __device__ float termite_rope_frequency(unsigned int pair_index, unsigned int ro
     return 1.0f / powf(theta, (2.0f * (float)pair_index) / (float)rope_dim);
 }
 
+__device__ unsigned int termite_rope_pair_info(
+    unsigned int d,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    unsigned int consecutive_pairs,
+    unsigned int* idx0,
+    unsigned int* idx1,
+    unsigned int* pair_index,
+    unsigned int* second
+) {
+    if (rope_dim < 2u || rope_dim > head_dim) return 0u;
+
+    if (consecutive_pairs) {
+        if (d >= rope_dim) return 0u;
+        *pair_index = d >> 1u;
+        *idx0 = *pair_index << 1u;
+        *idx1 = *idx0 + 1u;
+        *second = d & 1u;
+        return *idx1 < head_dim;
+    }
+
+    unsigned int active_pairs = rope_dim >> 1u;
+    unsigned int head_half = head_dim >> 1u;
+    if (head_half == 0u) return 0u;
+    if (d < active_pairs) {
+        *pair_index = d;
+        *idx0 = d;
+        *idx1 = d + head_half;
+        *second = 0u;
+        return *idx1 < head_dim;
+    }
+    if (d >= head_half && d < head_half + active_pairs) {
+        *pair_index = d - head_half;
+        *idx0 = *pair_index;
+        *idx1 = d;
+        *second = 1u;
+        return *idx1 < head_dim;
+    }
+    return 0u;
+}
+
 __device__ float termite_rope_value(
     const float* input,
     unsigned int base,
@@ -1231,33 +1272,11 @@ __device__ float termite_rope_value(
     float freq_scale,
     unsigned int consecutive_pairs
 ) {
-    if (d >= rope_dim || rope_dim < 2u) return input[base + d];
-
     unsigned int idx0;
     unsigned int idx1;
     unsigned int pair_index;
     unsigned int second;
-    if (consecutive_pairs) {
-        pair_index = d >> 1u;
-        idx0 = pair_index << 1u;
-        idx1 = idx0 + 1u;
-        second = d & 1u;
-    } else {
-        unsigned int half = rope_dim >> 1u;
-        if (d < half) {
-            pair_index = d;
-            idx0 = d;
-            idx1 = d + half;
-            second = 0u;
-        } else {
-            pair_index = d - half;
-            idx0 = d - half;
-            idx1 = d;
-            second = 1u;
-        }
-    }
-
-    if (idx1 >= head_dim) return input[base + d];
+    if (!termite_rope_pair_info(d, head_dim, rope_dim, consecutive_pairs, &idx0, &idx1, &pair_index, &second)) return input[base + d];
     float angle = ((float)position) * freq_scale * termite_rope_frequency(pair_index, rope_dim, theta);
     float s = sinf(angle);
     float c = cosf(angle);
@@ -1378,40 +1397,19 @@ extern "C" __global__ void termite_rms_norm_heads_rope_f32(
     float norm_scale = rsqrtf(sumsq / (float)head_dim + eps);
 
     float value = input[base + d] * norm_scale * weight[d];
-    if (d < rope_dim && rope_dim >= 2u) {
-        unsigned int idx0;
-        unsigned int idx1;
-        unsigned int pair_index;
-        unsigned int second;
-        if (consecutive_pairs) {
-            pair_index = d >> 1u;
-            idx0 = pair_index << 1u;
-            idx1 = idx0 + 1u;
-            second = d & 1u;
-        } else {
-            unsigned int half = rope_dim >> 1u;
-            if (d < half) {
-                pair_index = d;
-                idx0 = d;
-                idx1 = d + half;
-                second = 0u;
-            } else {
-                pair_index = d - half;
-                idx0 = d - half;
-                idx1 = d;
-                second = 1u;
-            }
-        }
-        if (idx1 < head_dim) {
-            unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
-            unsigned int position = position_offset + token_pos;
-            float angle = ((float)position) * freq_scale * termite_rope_frequency(pair_index, rope_dim, theta);
-            float s = sinf(angle);
-            float c = cosf(angle);
-            float x0 = input[base + idx0] * norm_scale * weight[idx0];
-            float x1 = input[base + idx1] * norm_scale * weight[idx1];
-            value = second ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
-        }
+    unsigned int idx0;
+    unsigned int idx1;
+    unsigned int pair_index;
+    unsigned int second;
+    if (termite_rope_pair_info(d, head_dim, rope_dim, consecutive_pairs, &idx0, &idx1, &pair_index, &second)) {
+        unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
+        unsigned int position = position_offset + token_pos;
+        float angle = ((float)position) * freq_scale * termite_rope_frequency(pair_index, rope_dim, theta);
+        float s = sinf(angle);
+        float c = cosf(angle);
+        float x0 = input[base + idx0] * norm_scale * weight[idx0];
+        float x1 = input[base + idx1] * norm_scale * weight[idx1];
+        value = second ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
     }
     dst[idx] = value * output_scale;
 }

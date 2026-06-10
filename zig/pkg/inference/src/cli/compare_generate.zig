@@ -48,6 +48,7 @@ const Options = struct {
     backend: BackendChoice = .auto,
     top_k: usize = 8,
     no_chat_template: bool = false,
+    raw_prompt: bool = false,
     image_features_only: bool = false,
     onnx_prompt_embeddings_only: bool = false,
     runtime_parity: bool = false,
@@ -456,7 +457,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
 
-    var native = try analyzeNativeModel(allocator, native_model, opts.prompt, opts.no_chat_template, opts.top_k);
+    var native = try analyzeNativeModel(allocator, native_model, opts.prompt, opts.no_chat_template, opts.raw_prompt, opts.top_k);
     defer native.deinit(allocator);
 
     print("native_model={s}\n", .{opts.native_model_dir});
@@ -529,7 +530,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
 
     const reference_model = try model_manager.loadFromDir(opts.reference_model_dir);
-    var reference = try analyzeNativeModel(allocator, reference_model, opts.prompt, opts.no_chat_template, opts.top_k);
+    var reference = try analyzeNativeModel(allocator, reference_model, opts.prompt, opts.no_chat_template, opts.raw_prompt, opts.top_k);
     defer reference.deinit(allocator);
 
     print("reference_backend={s}\n", .{reference.backend_name});
@@ -599,9 +600,9 @@ fn runRuntimeParity(
     const cuda_cfg = session_factory.getGptConfig(cuda_model.session) orelse return error.InvalidModelForGeneration;
     if (native_cfg.vocab_size != cuda_cfg.vocab_size or native_cfg.hidden_size != cuda_cfg.hidden_size) return error.IncompatibleRuntimeParityModels;
 
-    const rendered_prompt = try renderPrompt(allocator, native_model, opts.prompt, opts.no_chat_template);
+    const rendered_prompt = try renderPrompt(allocator, native_model, opts.prompt, opts.no_chat_template, opts.raw_prompt);
     defer allocator.free(rendered_prompt);
-    const rendered_cuda = try renderPrompt(allocator, cuda_model, opts.prompt, opts.no_chat_template);
+    const rendered_cuda = try renderPrompt(allocator, cuda_model, opts.prompt, opts.no_chat_template, opts.raw_prompt);
     defer allocator.free(rendered_cuda);
     print("runtime_parity: native_model={s} cuda_model={s}\n", .{ opts.native_model_dir, opts.native_model_dir });
     print("runtime_parity: native_backend={s} cuda_backend={s}\n", .{ @tagName(native_model.session.backend()), @tagName(cuda_model.session.backend()) });
@@ -966,8 +967,9 @@ fn renderPrompt(
     model: *model_manager_mod.LoadedModel,
     prompt: []const u8,
     no_chat_template: bool,
+    raw_prompt: bool,
 ) ![]u8 {
-    if (no_chat_template) {
+    if (raw_prompt or no_chat_template) {
         return allocator.dupe(u8, prompt);
     }
     const messages = [_]generation.Message{
@@ -1038,9 +1040,10 @@ fn analyzeNativeModel(
     model: *model_manager_mod.LoadedModel,
     prompt: []const u8,
     no_chat_template: bool,
+    raw_prompt: bool,
     top_k: usize,
 ) !NativeAnalysis {
-    const rendered_prompt = try renderPrompt(allocator, model, prompt, no_chat_template);
+    const rendered_prompt = try renderPrompt(allocator, model, prompt, no_chat_template, raw_prompt);
     errdefer allocator.free(rendered_prompt);
 
     const tok = model.getTokenizer();
@@ -1860,6 +1863,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.top_k = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--no-chat-template")) {
             opts.no_chat_template = true;
+        } else if (std.mem.eql(u8, arg, "--raw-prompt")) {
+            opts.raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--image-features-only")) {
             opts.image_features_only = true;
         } else if (std.mem.eql(u8, arg, "--onnx-prompt-embeddings-only")) {
@@ -1891,5 +1896,5 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 }
 
 fn printUsage() void {
-    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--runtime-parity] [--backend auto|native|cuda|mlx] [--top-k N] [--no-chat-template]\n", .{});
+    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--runtime-parity] [--backend auto|native|cuda|mlx] [--top-k N] [--no-chat-template] [--raw-prompt]\n", .{});
 }

@@ -90,6 +90,8 @@ pub const DeepseekV4MlpKind = enum {
 };
 
 pub const deepseek_v4_max_layers = 256;
+pub const max_extra_eos_token_ids = 16;
+pub const max_suppress_token_ids = 64;
 
 pub const Config = struct {
     family: ModelFamily = .gpt2,
@@ -173,6 +175,10 @@ pub const Config = struct {
     // Token IDs
     bos_token_id: i32 = -1,
     eos_token_id: i32 = -1,
+    extra_eos_token_ids_len: u8 = 0,
+    extra_eos_token_ids: [max_extra_eos_token_ids]i32 = [_]i32{-1} ** max_extra_eos_token_ids,
+    suppress_token_ids_len: u8 = 0,
+    suppress_token_ids: [max_suppress_token_ids]i32 = [_]i32{-1} ** max_suppress_token_ids,
     pad_token_id: i32 = -1,
     image_token_index: i32 = -1,
     boi_token_index: i32 = -1,
@@ -441,6 +447,18 @@ pub const Config = struct {
         const global_dim: usize = if (self.global_head_dim > 0) self.global_head_dim else self.headDim();
         const global_width = global_kv_heads * global_dim;
         return @max(sliding_width, global_width);
+    }
+
+    pub fn isEosToken(self: Config, token_id: usize) bool {
+        if (self.eos_token_id >= 0 and token_id == @as(usize, @intCast(self.eos_token_id))) return true;
+        for (self.extra_eos_token_ids[0..self.extra_eos_token_ids_len]) |eos| {
+            if (eos >= 0 and token_id == @as(usize, @intCast(eos))) return true;
+        }
+        return false;
+    }
+
+    pub fn suppressTokenIds(self: Config) []const i32 {
+        return self.suppress_token_ids[0..self.suppress_token_ids_len];
     }
 
     pub fn deepseekV4CompressRateForLayer(self: Config, layer_index: usize) u32 {
@@ -820,6 +838,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("eos_token_id")) |v| if (jsonI32(v)) |val| {
         config.eos_token_id = val;
     };
+    if (obj.get("eos_token_id")) |v| parseEosTokenIds(&config, v);
     if (text_obj.get("pad_token_id")) |v| if (jsonI32(v)) |val| {
         config.pad_token_id = val;
     };
@@ -1044,6 +1063,15 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     }
 
     return config;
+}
+
+pub fn applyGenerationConfigJson(allocator: std.mem.Allocator, config: *Config, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    if (obj.get("eos_token_id")) |value| parseEosTokenIds(config, value);
+    if (obj.get("suppress_tokens")) |value| parseSuppressTokenIds(config, value);
 }
 
 pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
@@ -1473,6 +1501,53 @@ fn jsonI32(val: std.json.Value) ?i32 {
         .integer => |i| @intCast(i),
         else => null,
     };
+}
+
+fn parseEosTokenIds(config: *Config, value: std.json.Value) void {
+    if (jsonI32(value)) |token_id| {
+        addEosTokenId(config, token_id);
+        return;
+    }
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (jsonI32(item)) |token_id| addEosTokenId(config, token_id);
+    }
+}
+
+fn addEosTokenId(config: *Config, token_id: i32) void {
+    if (token_id < 0) return;
+    if (config.eos_token_id < 0) {
+        config.eos_token_id = token_id;
+        return;
+    }
+    if (config.eos_token_id == token_id) return;
+    for (config.extra_eos_token_ids[0..config.extra_eos_token_ids_len]) |existing| {
+        if (existing == token_id) return;
+    }
+    if (config.extra_eos_token_ids_len >= max_extra_eos_token_ids) return;
+    config.extra_eos_token_ids[config.extra_eos_token_ids_len] = token_id;
+    config.extra_eos_token_ids_len += 1;
+}
+
+fn parseSuppressTokenIds(config: *Config, value: std.json.Value) void {
+    if (jsonI32(value)) |token_id| {
+        addSuppressTokenId(config, token_id);
+        return;
+    }
+    if (value != .array) return;
+    for (value.array.items) |item| {
+        if (jsonI32(item)) |token_id| addSuppressTokenId(config, token_id);
+    }
+}
+
+fn addSuppressTokenId(config: *Config, token_id: i32) void {
+    if (token_id < 0) return;
+    for (config.suppress_token_ids[0..config.suppress_token_ids_len]) |existing| {
+        if (existing == token_id) return;
+    }
+    if (config.suppress_token_ids_len >= max_suppress_token_ids) return;
+    config.suppress_token_ids[config.suppress_token_ids_len] = token_id;
+    config.suppress_token_ids_len += 1;
 }
 
 fn jsonBool(val: std.json.Value) ?bool {
@@ -2268,6 +2343,33 @@ test "parse gemma4 12b unified config aliases" {
     try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(5));
     try std.testing.expectEqual(@as(u32, 512), config.maxHeadDim());
     try std.testing.expect(config.weight_tying);
+}
+
+test "parse gemma4 multi eos and generation suppress tokens" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4_unified",
+        \\  "eos_token_id": [1, 106],
+        \\  "text_config": {
+        \\    "model_type": "gemma4_unified_text",
+        \\    "eos_token_id": 1
+        \\  }
+        \\}
+    ;
+    var config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
+    try std.testing.expect(config.isEosToken(1));
+    try std.testing.expect(config.isEosToken(106));
+    try std.testing.expect(!config.isEosToken(50));
+
+    try applyGenerationConfigJson(allocator, &config,
+        \\{"eos_token_id":[1,106,50],"suppress_tokens":[258883,258882,258883]}
+    );
+    try std.testing.expect(config.isEosToken(50));
+    try std.testing.expectEqual(@as(usize, 2), config.suppressTokenIds().len);
+    try std.testing.expectEqual(@as(i32, 258883), config.suppressTokenIds()[0]);
+    try std.testing.expectEqual(@as(i32, 258882), config.suppressTokenIds()[1]);
 }
 
 test "parse gemma4 moe fields from text_config" {

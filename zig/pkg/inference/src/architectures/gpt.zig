@@ -127,6 +127,25 @@ fn monotonicNowNs() u64 {
     }
 }
 
+fn cudaPrefillProfileEnabled() bool {
+    return !is_freestanding and platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PREFILL_PROFILE");
+}
+
+fn cudaPrefillStopLayer() ?usize {
+    if (is_freestanding) return null;
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_STOP_LAYER");
+}
+
+fn cudaPrefillProfileIntervalLayers() usize {
+    if (is_freestanding) return 1;
+    return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_PROFILE_INTERVAL_LAYERS") orelse 1);
+}
+
+fn gemmaCudaPrefetchLookaheadLayers() usize {
+    if (is_freestanding) return 4;
+    return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFETCH_LOOKAHEAD_LAYERS") orelse 4);
+}
+
 pub const Config = gpt_config.Config;
 pub const ModelFamily = gpt_config.ModelFamily;
 pub const NormType = gpt_config.NormType;
@@ -1155,14 +1174,16 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         hidden = carrier.active();
         owns_hidden = false;
     }
+    if (!isDecodeStep(decode_context)) {
+        try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "input", hidden, hidden_size);
+    }
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
-    prefetchGemmaCudaLayerWeights(cb, config, 0, 96);
-    prefetchGemmaCudaLayerWeights(cb, config, 1, 80);
+    prefetchGemmaCudaLayerWindow(cb, config, 0);
     for (0..config.num_hidden_layers) |layer| {
-        prefetchGemmaCudaLayerWeights(cb, config, layer + 1, 96);
-        prefetchGemmaCudaLayerWeights(cb, config, layer + 2, 64);
+        prefetchGemmaCudaLayerWindow(cb, config, layer + 1);
+        const layer_started_at = monotonicNowNs();
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} start\n", .{layer});
         }
@@ -1218,8 +1239,21 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         }
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "out", hidden, hidden_size);
         try maybeDebugLayerTensor(cb, allocator, layer, "out", hidden);
+        if (!isDecodeStep(decode_context)) {
+            try maybeGemma4PromptSnapshotLayer(cb, allocator, config, layer, "out", hidden, hidden_size);
+        }
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} done\n", .{layer});
+        }
+        if (cudaPrefillProfileEnabled() and cb.kind() == .cuda and ((layer + 1) % cudaPrefillProfileIntervalLayers() == 0 or layer + 1 == config.num_hidden_layers)) {
+            debugPrint("cuda_prefill_layer: layer={d} elapsed_ms={d}\n", .{ layer, (monotonicNowNs() - layer_started_at) / std.time.ns_per_ms });
+            cb.debugProfileCheckpoint("decoder_layer", layer);
+        }
+        if (cudaPrefillStopLayer()) |stop_layer| {
+            if (cb.kind() == .cuda and stop_layer > 0 and layer + 1 >= stop_layer) {
+                if (cudaPrefillProfileEnabled()) cb.debugProfileCheckpoint("stop_layer", layer);
+                return error.CudaPrefillStopLayerReached;
+            }
         }
     }
 
@@ -1230,6 +1264,9 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (pre_norm_out) |out| {
         out.* = try cloneTensorMaterialized(cb, allocator, hidden);
         captured_pre_norm = true;
+    }
+    if (!isDecodeStep(decode_context)) {
+        try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "pre_final_norm", hidden, hidden_size);
     }
 
     // 4. Final layer norm
@@ -1250,6 +1287,9 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     try maybeDebugTensorLastRow(cb, allocator, "final_norm", hidden, hidden_size);
     try maybeDebugTensor(cb, allocator, "final_norm_full", hidden);
+    if (!isDecodeStep(decode_context)) {
+        try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "final_norm", hidden, hidden_size);
+    }
 
     return .{
         .hidden = hidden,
@@ -1377,11 +1417,10 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
-    prefetchGemmaCudaLayerWeights(cb, config, 0, 96);
-    prefetchGemmaCudaLayerWeights(cb, config, 1, 80);
+    prefetchGemmaCudaLayerWindow(cb, config, 0);
     for (0..config.num_hidden_layers) |layer| {
-        prefetchGemmaCudaLayerWeights(cb, config, layer + 1, 96);
-        prefetchGemmaCudaLayerWeights(cb, config, layer + 2, 64);
+        prefetchGemmaCudaLayerWindow(cb, config, layer + 1);
+        const layer_started_at = monotonicNowNs();
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
         const new_hidden = try decoderBlock(
@@ -1412,6 +1451,16 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
         }
         if (shouldEvalDecoderLayer(eval_stride, layer, config.num_hidden_layers)) {
             try cb.evalTensor(hidden);
+        }
+        if (cudaPrefillProfileEnabled() and cb.kind() == .cuda and ((layer + 1) % cudaPrefillProfileIntervalLayers() == 0 or layer + 1 == config.num_hidden_layers)) {
+            debugPrint("cuda_prefill_layer: layer={d} elapsed_ms={d}\n", .{ layer, (monotonicNowNs() - layer_started_at) / std.time.ns_per_ms });
+            cb.debugProfileCheckpoint("decoder_layer", layer);
+        }
+        if (cudaPrefillStopLayer()) |stop_layer| {
+            if (cb.kind() == .cuda and stop_layer > 0 and layer + 1 >= stop_layer) {
+                if (cudaPrefillProfileEnabled()) cb.debugProfileCheckpoint("stop_layer", layer);
+                return error.CudaPrefillStopLayerReached;
+            }
         }
     }
 
@@ -3759,7 +3808,11 @@ fn decoderBlock(
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
 
                 var layer_result_output_scaled = false;
-                var layer_result = try cb.add(combined_normed, sa_out);
+                const use_branch_output_scale = config.family == .gemma and branchGemma4LayerOutputScaleDebug();
+                var layer_result = if (config.hasPle() or !use_branch_output_scale)
+                    try cb.add(combined_normed, sa_out)
+                else
+                    try addLayerOutputScaledBranch(cb, allocator, config, combined_normed, sa_out, total, hidden_size, layer);
                 cb.free(sa_out);
 
                 if (config.hasPle()) {
@@ -3772,7 +3825,7 @@ fn decoderBlock(
                         layer_result = ple_result;
                     }
                 }
-                const scaled = if (layer_result_output_scaled) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+                const scaled = if (layer_result_output_scaled or (!config.hasPle() and use_branch_output_scale)) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
                 try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
                 return scaled;
             }
@@ -3794,7 +3847,10 @@ fn decoderBlock(
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
-                break :residual_blk try cb.add(ffn_out, sa_out);
+                if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
+                    break :residual_blk try cb.add(ffn_out, sa_out);
+                }
+                break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
             } else ple_residual_blk: {
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
@@ -3816,7 +3872,7 @@ fn decoderBlock(
                 }
             }
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ple", layer_result, hidden_size);
-            const scaled = if (layer_result_output_scaled) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+            const scaled = if (layer_result_output_scaled or (!config.hasPle() and branchGemma4LayerOutputScaleDebug())) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
             try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
             return scaled;
@@ -4257,6 +4313,10 @@ pub fn maybeAdjustNormWeight(
 }
 
 fn applyFinalLogitSoftcap(config: Config, logits: []f32) void {
+    if (config.family == .gemma and config.weight_tying and scaleGemma4TiedLogitsDebug()) {
+        const scale = 1.0 / config.tokenEmbeddingScale();
+        for (logits) |*value| value.* *= scale;
+    }
     if (config.final_logit_softcapping <= 0.0) return;
     const softcap = config.final_logit_softcapping;
     for (logits) |*value| {
@@ -4374,6 +4434,41 @@ fn debugTopLogitRowsEnabled() bool {
 
 fn debugTensorStatsEnabled() bool {
     return getenvBool("TERMITE_DEBUG_GPT_STATS");
+}
+
+fn gemma4PromptSnapshotEnabled() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_PROMPT_SNAPSHOT");
+}
+
+fn shouldSnapshotGemma4PromptLayer(config: Config, layer: usize) bool {
+    if (!gemma4PromptSnapshotEnabled()) return false;
+    if (getenvUsize("ANTFLY_INFERENCE_GEMMA4_PROMPT_SNAPSHOT_LAYER")) |target| return layer == target;
+    if (getenvUsize("ANTFLY_INFERENCE_GEMMA4_PROMPT_SNAPSHOT_INTERVAL_LAYERS")) |interval| {
+        if (interval > 0 and (layer + 1) % interval == 0) return true;
+    }
+
+    return layer == 0 or
+        layer == 1 or
+        layer == 5 or
+        layer == 6 or
+        layer == 11 or
+        layer == 12 or
+        layer == 23 or
+        layer == 35 or
+        layer + 1 == config.num_hidden_layers;
+}
+
+fn disableGemma4LayerOutputScaleDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE") or
+        getenvBool("TERMITE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE");
+}
+
+fn branchGemma4LayerOutputScaleDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_BRANCH_LAYER_OUTPUT_SCALE");
+}
+
+fn scaleGemma4TiedLogitsDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_SCALE_TIED_LOGITS");
 }
 
 fn debugDenseFfnCompareEnabled() bool {
@@ -4559,6 +4654,90 @@ fn maybeDebugTensorLastRow(
         debugPrint(" {d:.6}", .{value});
     }
     debugPrint("\n", .{});
+}
+
+fn maybeGemma4PromptSnapshotTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    label: []const u8,
+    tensor: CT,
+    row_dim: usize,
+) !void {
+    if (is_freestanding) return;
+    if (config.family != .gemma or !gemma4PromptSnapshotEnabled()) return;
+
+    const values = try cb.toFloat32(tensor, allocator);
+    defer allocator.free(values);
+    if (row_dim == 0 or values.len < row_dim) return;
+    const row_count = values.len / row_dim;
+    if (row_count == 0) return;
+    const row = values[(row_count - 1) * row_dim ..][0..row_dim];
+
+    var min_value: f32 = row[0];
+    var max_value: f32 = row[0];
+    var max_abs: f32 = 0;
+    var max_abs_idx: usize = 0;
+    var sum: f64 = 0;
+    var l2: f64 = 0;
+    var nan_count: usize = 0;
+    var inf_count: usize = 0;
+    for (row, 0..) |value, idx| {
+        if (std.math.isNan(value)) {
+            nan_count += 1;
+            continue;
+        }
+        if (!std.math.isFinite(value)) {
+            inf_count += 1;
+            continue;
+        }
+        min_value = @min(min_value, value);
+        max_value = @max(max_value, value);
+        const abs_value = @abs(value);
+        if (abs_value > max_abs) {
+            max_abs = abs_value;
+            max_abs_idx = idx;
+        }
+        sum += value;
+        l2 += @as(f64, value) * @as(f64, value);
+    }
+
+    const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(row));
+    debugPrint(
+        "gemma4_prompt_snapshot: {s} rows={d} row_dim={d} hash=0x{x} min={d:.6} max={d:.6} mean={d:.6} l2={d:.6} max_abs={d:.6}@{d} nan={d} inf={d} first",
+        .{
+            label,
+            row_count,
+            row_dim,
+            hash,
+            min_value,
+            max_value,
+            sum / @as(f64, @floatFromInt(row.len)),
+            l2,
+            max_abs,
+            max_abs_idx,
+            nan_count,
+            inf_count,
+        },
+    );
+    const limit = @min(row.len, 8);
+    for (row[0..limit]) |value| debugPrint(" {d:.6}", .{value});
+    debugPrint("\n", .{});
+}
+
+fn maybeGemma4PromptSnapshotLayer(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    layer: usize,
+    suffix: []const u8,
+    tensor: CT,
+    row_dim: usize,
+) !void {
+    if (config.family != .gemma or !shouldSnapshotGemma4PromptLayer(config, layer)) return;
+    var label_buf: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "layer{d}_{s}", .{ layer, suffix }) catch return;
+    try maybeGemma4PromptSnapshotTensor(cb, allocator, config, label, tensor, row_dim);
 }
 
 fn maybeDebugTensorLastRowDiff(
@@ -7407,6 +7586,19 @@ fn prefetchGemmaCudaLayerWeights(cb: *const ComputeBackend, config: Config, laye
     prefetchFormattedModelWeight(cb, config, &buf, hint + 1, "model.layers.{d}.mlp.down_proj.weight", .{layer});
 }
 
+fn prefetchGemmaCudaLayerWindow(cb: *const ComputeBackend, config: Config, first_layer: usize) void {
+    if (cb.kind() != .cuda or config.family != .gemma or first_layer >= config.num_hidden_layers) return;
+    const lookahead = gemmaCudaPrefetchLookaheadLayers();
+    for (0..lookahead) |offset| {
+        const layer = first_layer + offset;
+        if (layer >= config.num_hidden_layers) break;
+        const offset_usize: usize = offset;
+        const priority_drop: usize = @min(offset_usize, @as(usize, 7)) * @as(usize, 12);
+        const base_hint: u32 = @intCast(@max(@as(usize, 16), @as(usize, 112) - priority_drop));
+        prefetchGemmaCudaLayerWeights(cb, config, layer, base_hint);
+    }
+}
+
 fn prefetchFormattedModelWeight(cb: *const ComputeBackend, config: Config, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
     const name = std.fmt.bufPrint(buf, fmt, args) catch return;
     if (config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model.")) {
@@ -7484,6 +7676,8 @@ pub fn applyLayerOutputScale(
     hidden_size: usize,
     layer: usize,
 ) !CT {
+    if (config.family == .gemma and disableGemma4LayerOutputScaleDebug()) return hidden;
+
     const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return hidden;
 
     if (cb.kind() == .graph) {
@@ -7523,6 +7717,49 @@ pub fn applyLayerOutputScale(
     const result = try cb.fromFloat32Shape(data, &shape);
     cb.free(hidden);
     return result;
+}
+
+pub fn addLayerOutputScaledBranch(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    branch: CT,
+    residual: CT,
+    total: usize,
+    hidden_size: usize,
+    layer: usize,
+) !CT {
+    if (config.family == .gemma and disableGemma4LayerOutputScaleDebug()) return cb.add(branch, residual);
+
+    const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return cb.add(branch, residual);
+    defer cb.free(scale_w);
+
+    if (try cb.addMultiplyScalarTensor(branch, residual, scale_w)) |scaled| return scaled;
+
+    if (cb.vtable.reshape2d != null or cb.kind() == .graph) {
+        const branch_scaled = try cb.multiply(branch, scale_w);
+        defer cb.free(branch_scaled);
+        return try cb.add(branch_scaled, residual);
+    }
+
+    const scale_data = try cb.toFloat32(scale_w, allocator);
+    defer allocator.free(scale_data);
+    const scale_val = scale_data[0];
+    if (std.math.approxEqAbs(f32, scale_val, 1.0, 1e-6)) return cb.add(branch, residual);
+
+    const branch_data = try cb.toFloat32(branch, allocator);
+    defer allocator.free(branch_data);
+    const residual_data = try cb.toFloat32(residual, allocator);
+    defer allocator.free(residual_data);
+    if (branch_data.len != residual_data.len) return error.InvalidTensorShape;
+    const output = try allocator.alloc(f32, branch_data.len);
+    defer allocator.free(output);
+    for (branch_data, residual_data, output) |branch_value, residual_value, *out| {
+        out.* = branch_value * scale_val + residual_value;
+    }
+
+    const shape = [_]i32{ @intCast(total), @intCast(hidden_size) };
+    return try cb.fromFloat32Shape(output, &shape);
 }
 
 // --- Per-Layer Embeddings (PLE) ---

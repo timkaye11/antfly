@@ -67,7 +67,7 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
-    "{{ '<|turn>model\\n' }}" ++
+    "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -799,13 +799,15 @@ fn applyGgufTokenizerMetadata(
     applyGgufSpecialTokenString(allocator, &parsed, "tokenizer.ggml.padding_token_id", &manifest.pad_token);
 }
 
-fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
-    if (!std.mem.eql(u8, model_name, "gemma4")) return false;
-
+fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
     return std.mem.indexOf(u8, chat_template, "macro format_parameters") != null or
         std.mem.indexOf(u8, chat_template, "namespace(") != null or
         std.mem.indexOf(u8, chat_template, "{% set captured_content") != null or
         std.mem.indexOf(u8, chat_template, "{%- set captured_content") != null;
+}
+
+fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
+    return std.mem.eql(u8, model_name, "gemma4") and gemma4ChatTemplateRequiresBuiltInFallback(chat_template);
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -1798,10 +1800,16 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
         }
     }
 
-    // Gemma 4 models may lack a chat_template field — detect by sot_token and apply built-in.
-    if (manifest.chat_template == null) {
-        if (obj.get("sot_token")) |v| {
-            if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
+    // Gemma 4 models use <|turn> and may ship a tool-capable upstream
+    // template that requires Jinja features outside our rendering subset.
+    if (obj.get("sot_token")) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
+            if (manifest.chat_template) |existing| {
+                if (gemma4ChatTemplateRequiresBuiltInFallback(existing)) {
+                    allocator.free(existing);
+                    manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
+                }
+            } else {
                 manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
             }
         }
@@ -2537,6 +2545,21 @@ test "manifest treats gemma4 unified config as generator" {
     try std.testing.expectEqualStrings("gemma4_unified", manifest.config_model_arch);
     try std.testing.expect(manifest.gguf_path != null);
     try std.testing.expect(manifest.gguf_projector_path != null);
+}
+
+test "gemma4 tokenizer config replaces unsupported upstream chat template" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    manifest.chat_template = try allocator.dupe(u8, "{%- macro format_parameters(properties, required) -%}{%- endmacro -%}");
+    defer manifest.deinit();
+
+    try parseTokenizerConfig(&manifest, allocator,
+        \\{"sot_token":"<|turn>","bos_token":"<bos>","eos_token":"<eos>","pad_token":"<pad>","unk_token":"<unk>"}
+    );
+
+    try std.testing.expect(manifest.chat_template != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "<|turn>model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
 }
 
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {

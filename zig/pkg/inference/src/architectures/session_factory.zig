@@ -1750,6 +1750,7 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
                 std.mem.eql(u8, model_type, "jina_embeddings_v5"))
             {
                 var cfg = try gpt_mod.parseConfig(allocator, config_bytes);
+                try applyGptGenerationConfigIfPresent(allocator, model_path, &cfg);
                 if (mf.gguf_path) |gguf_path| {
                     if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
                         switch (gguf_config) {
@@ -1786,6 +1787,17 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
 
     // Default: BERT
     return .{ .bert = makeBertConfig(mf) };
+}
+
+fn applyGptGenerationConfigIfPresent(allocator: std.mem.Allocator, model_path: []const u8, cfg: *gpt_mod.Config) !void {
+    const generation_config_path = try std.fs.path.join(allocator, &.{ model_path, "generation_config.json" });
+    defer allocator.free(generation_config_path);
+    const bytes = c_file.readFile(allocator, generation_config_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    try gpt_mod.applyGenerationConfigJson(allocator, cfg, bytes);
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {

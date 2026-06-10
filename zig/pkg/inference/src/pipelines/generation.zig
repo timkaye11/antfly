@@ -334,6 +334,22 @@ fn enableGenerationStageDebug() bool {
     return getenvBool("TERMITE_GEN_STAGE_DEBUG");
 }
 
+fn enableCudaPrefillFirstToken() bool {
+    return getenvBool("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN");
+}
+
+fn cudaPrefillFirstTokenCoalesceTokenLimit() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 8;
+}
+
+fn enableFirstTokenTrace() bool {
+    return getenvBool("ANTFLY_INFERENCE_GENERATE_FIRST_TOKEN_TRACE");
+}
+
+fn firstTokenTopKTraceCount() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_GENERATE_FIRST_TOKEN_TOP_K") orelse 0;
+}
+
 fn enableGemma4MtpDebug() bool {
     return gemma4_mtp_debug_override or getenvBool("ANTFLY_GEMMA4_MTP_DEBUG") or getenvBool("TERMITE_DEBUG_GEMMA4_MTP");
 }
@@ -345,6 +361,11 @@ fn traceGraphExecutorOutputs() bool {
 fn debugGenerationStage(comptime fmt: []const u8, args: anytype) void {
     if (!enableGenerationStageDebug()) return;
     std.debug.print("gen_debug: " ++ fmt ++ "\n", args);
+}
+
+fn debugFirstToken(comptime fmt: []const u8, args: anytype) void {
+    if (!enableFirstTokenTrace()) return;
+    std.debug.print("first_token_debug: " ++ fmt ++ "\n", args);
 }
 
 fn debugGemma4Mtp(comptime fmt: []const u8, args: anytype) void {
@@ -404,6 +425,24 @@ fn hasSamplingPenalties(config: GenerationConfig) bool {
     return config.repetition_penalty != 1.0 or
         config.frequency_penalty != 0 or
         config.presence_penalty != 0;
+}
+
+fn shouldUsePrefillFirstTokenPath(backend_kind: ops.BackendKind, max_tokens: usize, use_speculative: bool, enabled: bool) bool {
+    return enabled and backend_kind == .cuda and max_tokens == 1 and !use_speculative;
+}
+
+fn coalescedPrefillChunkSizeForFirstToken(
+    backend_kind: ops.BackendKind,
+    max_tokens: usize,
+    use_speculative: bool,
+    enabled: bool,
+    seq_len: usize,
+    current_chunk_size: usize,
+    coalesce_token_limit: usize,
+) usize {
+    if (!shouldUsePrefillFirstTokenPath(backend_kind, max_tokens, use_speculative, enabled)) return current_chunk_size;
+    if (coalesce_token_limit == 0 or seq_len > coalesce_token_limit) return current_chunk_size;
+    return @max(current_chunk_size, seq_len);
 }
 
 pub const DecoderRuntimeDebugStats = struct {
@@ -1660,6 +1699,30 @@ pub const NativeGenerationPipeline = struct {
             null;
         defer if (token_table) |*tt| tt.deinit(allocator);
 
+        var used_prefill_first_token = false;
+        if (!use_speculative) {
+            if (try self.tryReturnPrefillFirstToken(
+                token_ids,
+                &seq_len,
+                config,
+                &prefill_last_logits,
+                &prefill_greedy_token,
+                &penalty_state,
+                if (token_table) |*tt| tt else null,
+                &json_grammar,
+                if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
+                max_tokens,
+                prompt_token_count,
+                if (stream_enabled) on_token_fn else null,
+                if (stream_enabled) on_token_ctx else null,
+                if (stream_enabled) &emitted_text else null,
+            )) |decode_result| {
+                tokens_generated = decode_result.tokens_generated;
+                finish_reason = decode_result.finish_reason;
+                used_prefill_first_token = true;
+            }
+        }
+
         if (use_speculative) {
             const draft_cb = self.draft_cb.?;
             const draft_gpt_config = self.draft_gpt_config.?;
@@ -1758,8 +1821,7 @@ pub const NativeGenerationPipeline = struct {
                 }
             }
 
-            const first_is_eos = self.gpt_config.eos_token_id >= 0 and
-                @as(i32, @intCast(first_token)) == self.gpt_config.eos_token_id;
+            const first_is_eos = self.gpt_config.isEosToken(first_token);
             if (first_is_eos or first_outcome.grammar_complete) {
                 finish_reason = "stop";
             }
@@ -1940,7 +2002,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Standard autoregressive loop (skipped when speculative decoding was used above)
-        if (!use_speculative) {
+        if (!use_speculative and !used_prefill_first_token) {
             debugGenerationStage(
                 "entering standard decode max_tokens={d} prompt_token_count={d}",
                 .{ max_tokens, prompt_token_count },
@@ -2082,6 +2144,22 @@ pub const NativeGenerationPipeline = struct {
                 break :blk seq_len;
             };
             current_chunk_size = @max(@min(current_chunk_size, seq_len), 1);
+            const coalesced_chunk_size = coalescedPrefillChunkSizeForFirstToken(
+                self.cb.kind(),
+                @intCast(@max(config.max_tokens, 1)),
+                !allow_resident_greedy_token,
+                enableCudaPrefillFirstToken(),
+                seq_len,
+                current_chunk_size,
+                cudaPrefillFirstTokenCoalesceTokenLimit(),
+            );
+            if (coalesced_chunk_size != current_chunk_size) {
+                debugFirstToken(
+                    "prefill_first_token coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
+                    .{ current_chunk_size, coalesced_chunk_size, seq_len },
+                );
+                current_chunk_size = coalesced_chunk_size;
+            }
             var processed: usize = 0;
             while (processed < seq_len) {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
@@ -2267,6 +2345,144 @@ pub const NativeGenerationPipeline = struct {
         return on_token_fn(on_token_ctx, delta);
     }
 
+    fn tryReturnPrefillFirstToken(
+        self: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: *usize,
+        config: GenerationConfig,
+        prefill_last_logits: *?[]f32,
+        prefill_greedy_token: *?usize,
+        penalty_state: *SamplingPenaltyState,
+        token_table: ?*const grammar_mod.TokenByteTable,
+        json_grammar: *?grammar_mod.JsonGrammar,
+        gbnf_grammar: ?*grammar_mod.GbnfGrammar,
+        max_tokens: usize,
+        prompt_token_count: usize,
+        on_token_fn: ?TokenCallback,
+        on_token_ctx: ?*anyopaque,
+        emitted_text: ?*[]u8,
+    ) !?DecodeResult {
+        if (!shouldUsePrefillFirstTokenPath(self.cb.kind(), max_tokens, false, enableCudaPrefillFirstToken())) {
+            debugFirstToken(
+                "prefill_first_token disabled backend={s} max_tokens={d} enabled={}",
+                .{ @tagName(self.cb.kind()), max_tokens, enableCudaPrefillFirstToken() },
+            );
+            return null;
+        }
+
+        const has_grammar = json_grammar.* != null or gbnf_grammar != null;
+        const outcome: SampleOutcome = blk: {
+            if (!has_grammar) {
+                if (prefill_greedy_token.*) |token| {
+                    prefill_greedy_token.* = null;
+                    debugFirstToken("prefill_first_token source=greedy token={d}", .{token});
+                    break :blk .{ .token = token, .grammar_complete = false };
+                }
+            }
+            if (prefill_last_logits.*) |cached_logits| {
+                debugFirstToken(
+                    "prefill_first_token source=logits len={d} grammar={}",
+                    .{ cached_logits.len, has_grammar },
+                );
+                try self.debugFirstTokenTopLogits("first_token_top_logits_raw", cached_logits);
+                const suppress_token_ids = self.gpt_config.suppressTokenIds();
+                if (suppress_token_ids.len > 0 and firstTokenTopKTraceCount() > 0) {
+                    const masked_logits = try self.allocator.dupe(f32, cached_logits);
+                    defer self.allocator.free(masked_logits);
+                    applySuppressTokenMask(masked_logits, suppress_token_ids);
+                    try self.debugFirstTokenTopLogits("first_token_top_logits_post_suppress", masked_logits);
+                }
+                break :blk try self.sampleNextToken(
+                    cached_logits,
+                    config,
+                    penalty_state,
+                    token_table,
+                    json_grammar,
+                    gbnf_grammar,
+                );
+            }
+            debugFirstToken(
+                "prefill_first_token unavailable greedy={} logits={} grammar={}",
+                .{ prefill_greedy_token.* != null, prefill_last_logits.* != null, has_grammar },
+            );
+            return null;
+        };
+
+        const next_token = outcome.token;
+        if (self.gpt_config.isEosToken(next_token)) {
+            self.finishPrefillFirstTokenSchedulerTurn(0);
+            debugFirstToken("prefill_first_token eos token={d}", .{next_token});
+            return .{ .tokens_generated = 0, .finish_reason = "stop" };
+        }
+
+        token_ids[seq_len.*] = @intCast(next_token);
+        seq_len.* += 1;
+        try penalty_state.noteToken(self.allocator, @intCast(next_token));
+
+        var finish_reason: []const u8 = "length";
+        if (on_token_fn != null and on_token_ctx != null and emitted_text != null) {
+            const keep_streaming = try self.emitDecodedDelta(
+                token_ids[prompt_token_count..seq_len.*],
+                emitted_text.?,
+                on_token_fn.?,
+                on_token_ctx.?,
+            );
+            if (!keep_streaming) finish_reason = "stop";
+        }
+        if (outcome.grammar_complete) finish_reason = "stop";
+
+        self.finishPrefillFirstTokenSchedulerTurn(1);
+        debugFirstToken(
+            "prefill_first_token returned token={d} seq_len={d} finish_reason={s}",
+            .{ next_token, seq_len.*, finish_reason },
+        );
+        return .{ .tokens_generated = 1, .finish_reason = finish_reason };
+    }
+
+    fn finishPrefillFirstTokenSchedulerTurn(self: *NativeGenerationPipeline, tokens_generated: usize) void {
+        if (self.scheduler) |scheduler| {
+            if (self.scheduler_lease) |lease| {
+                scheduler.noteDecodeProgress(lease, tokens_generated);
+                scheduler.finishTurn(lease, .decode);
+            }
+        }
+    }
+
+    const FirstTokenTopLogit = struct {
+        id: usize,
+        logit: f32,
+    };
+
+    fn debugFirstTokenTopLogits(self: *NativeGenerationPipeline, label: []const u8, logits: []const f32) !void {
+        const requested = firstTokenTopKTraceCount();
+        if (requested == 0) return;
+        const count = @min(requested, logits.len);
+        var entries = try self.allocator.alloc(FirstTokenTopLogit, logits.len);
+        defer self.allocator.free(entries);
+        for (logits, 0..) |logit, idx| entries[idx] = .{ .id = idx, .logit = logit };
+        std.mem.sort(FirstTokenTopLogit, entries, {}, struct {
+            fn lessThan(_: void, lhs: FirstTokenTopLogit, rhs: FirstTokenTopLogit) bool {
+                return lhs.logit > rhs.logit;
+            }
+        }.lessThan);
+
+        std.debug.print("{s}:\n", .{label});
+        for (entries[0..count], 0..) |entry, rank| {
+            const token_id: i32 = @intCast(entry.id);
+            const decoded = self.tokenizer.decode(self.allocator, &.{token_id}) catch |err| {
+                std.debug.print("  rank={d} id={d} logit={d:.6} text=<decode_error:{s}>\n", .{
+                    rank + 1,
+                    entry.id,
+                    entry.logit,
+                    @errorName(err),
+                });
+                continue;
+            };
+            defer self.allocator.free(decoded);
+            std.debug.print("  rank={d} id={d} logit={d:.6} text={s}\n", .{ rank + 1, entry.id, entry.logit, decoded });
+        }
+    }
+
     /// Standard autoregressive decode loop: generate one token at a time
     /// with grammar masking, sampling, and scheduler coordination.
     fn standardDecode(
@@ -2314,19 +2530,22 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
 
-                if (try self.forwardGreedyDeviceDecodeToken(
-                    token_ids,
-                    seq_len.*,
-                    tokens_generated,
-                    decode_state,
-                    config,
-                    token_table,
-                    json_grammar,
-                    gbnf_grammar,
-                    device_token_tensor,
-                )) |token| {
-                    next_device_token_tensor = token.token_tensor;
-                    break :blk .{ .token = token.token, .grammar_complete = false };
+                const has_cached_prefill_logits = tokens_generated == 0 and prefill_last_logits.* != null;
+                if (!has_cached_prefill_logits) {
+                    if (try self.forwardGreedyDeviceDecodeToken(
+                        token_ids,
+                        seq_len.*,
+                        tokens_generated,
+                        decode_state,
+                        config,
+                        token_table,
+                        json_grammar,
+                        gbnf_grammar,
+                        device_token_tensor,
+                    )) |token| {
+                        next_device_token_tensor = token.token_tensor;
+                        break :blk .{ .token = token.token, .grammar_complete = false };
+                    }
                 }
 
                 var owns_last_logits = false;
@@ -2403,7 +2622,7 @@ pub const NativeGenerationPipeline = struct {
             );
 
             // Check EOS
-            if (self.gpt_config.eos_token_id >= 0 and @as(i32, @intCast(next_token)) == self.gpt_config.eos_token_id) {
+            if (self.gpt_config.isEosToken(next_token)) {
                 if (next_device_token_tensor) |tensor| {
                     self.cb.free(tensor);
                     next_device_token_tensor = null;
@@ -3403,15 +3622,18 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*grammar_mod.GbnfGrammar,
     ) !SampleOutcome {
         const has_grammar = json_grammar.* != null or gbnf_grammar != null;
-        const working_logits = if (has_grammar)
+        const suppress_token_ids = self.gpt_config.suppressTokenIds();
+        const needs_mutable_logits = has_grammar or suppress_token_ids.len > 0;
+        const working_logits = if (needs_mutable_logits)
             try self.allocator.dupe(f32, logits)
         else
             @constCast(logits);
-        defer if (has_grammar) self.allocator.free(working_logits);
+        defer if (needs_mutable_logits) self.allocator.free(working_logits);
 
         if (has_grammar) {
             try self.applyGrammarMask(working_logits, token_table, json_grammar, gbnf_grammar);
         }
+        applySuppressTokenMask(working_logits, suppress_token_ids);
 
         const next_token = sample(working_logits, config, penalty_state, self.allocator);
         const grammar_complete = if (has_grammar)
@@ -3423,6 +3645,15 @@ pub const NativeGenerationPipeline = struct {
             .token = next_token,
             .grammar_complete = grammar_complete,
         };
+    }
+
+    fn applySuppressTokenMask(logits: []f32, token_ids: []const i32) void {
+        for (token_ids) |token_id| {
+            if (token_id < 0) continue;
+            const idx: usize = @intCast(token_id);
+            if (idx >= logits.len) continue;
+            logits[idx] = -std.math.inf(f32);
+        }
     }
 
     fn acceptVerifiedDraftTokens(
@@ -3472,9 +3703,7 @@ pub const NativeGenerationPipeline = struct {
                 accepted += 1;
                 try round_penalties.noteToken(self.allocator, draft_tokens[i]);
 
-                if (self.gpt_config.eos_token_id >= 0 and
-                    @as(i32, @intCast(draft_tokens[i])) == self.gpt_config.eos_token_id)
-                {
+                if (self.gpt_config.isEosToken(@intCast(draft_tokens[i]))) {
                     hit_eos = true;
                     break;
                 }
@@ -3487,9 +3716,7 @@ pub const NativeGenerationPipeline = struct {
                 accepted = matched_drafts + 1;
                 correction_added = true;
 
-                if (self.gpt_config.eos_token_id >= 0 and
-                    @as(i32, @intCast(target_choice)) == self.gpt_config.eos_token_id)
-                {
+                if (self.gpt_config.isEosToken(target_choice)) {
                     hit_eos = true;
                 }
                 if (outcome.grammar_complete) {
@@ -3521,9 +3748,7 @@ pub const NativeGenerationPipeline = struct {
             token_ids[seq_len + accepted] = @intCast(bonus_token);
             accepted += 1;
 
-            if (self.gpt_config.eos_token_id >= 0 and
-                @as(i32, @intCast(bonus_token)) == self.gpt_config.eos_token_id)
-            {
+            if (self.gpt_config.isEosToken(bonus_token)) {
                 hit_eos = true;
             }
             if (outcome.grammar_complete) {
@@ -5004,6 +5229,33 @@ test "native generation pipeline rejects speculative decoding when draft require
 
     pipeline.draft_gpt_config = null;
     try std.testing.expect(!pipeline.speculativeUsesDeepSeekV4CompressedCache());
+}
+
+test "cuda prefill first token path is narrowly gated" {
+    try std.testing.expect(shouldUsePrefillFirstTokenPath(.cuda, 1, false, true));
+    try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 2, false, true));
+    try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 1, true, true));
+    try std.testing.expect(!shouldUsePrefillFirstTokenPath(.native, 1, false, true));
+    try std.testing.expect(!shouldUsePrefillFirstTokenPath(.metal, 1, false, true));
+    try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 1, false, false));
+}
+
+test "cuda prefill first token coalesces only short eligible prompts" {
+    try std.testing.expectEqual(@as(usize, 2), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, false, true, 2, 1, 8));
+    try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, false, true, 16, 1, 8));
+    try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, false, true, 2, 1, 0));
+    try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 2, false, true, 2, 1, 8));
+    try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, true, true, 2, 1, 8));
+    try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.native, 1, false, true, 2, 1, 8));
+}
+
+test "native generation suppress token mask removes configured logits" {
+    var logits = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    NativeGenerationPipeline.applySuppressTokenMask(&logits, &.{ 1, 3, 99, -1 });
+    try std.testing.expectEqual(@as(f32, 1.0), logits[0]);
+    try std.testing.expect(std.math.isInf(logits[1]) and logits[1] < 0);
+    try std.testing.expectEqual(@as(f32, 3.0), logits[2]);
+    try std.testing.expect(std.math.isInf(logits[3]) and logits[3] < 0);
 }
 
 test "native decode state deinit releases paged sequence" {

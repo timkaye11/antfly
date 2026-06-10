@@ -1130,6 +1130,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.dense_stream_mlp_loads,
                     },
                 );
+                print(
+                    "cuda_dense_prefetch_profile: enqueues={d} duplicates={d} ready_hits={d} inflight_steals={d} sync_reads={d} evictions={d} failures={d} host_read_ms={d} demand_wait_ms={d} upload_ms={d} resident_mb={d} read_mb={d}\n",
+                    .{
+                        cuda_stats.dense_prefetch_enqueues,
+                        cuda_stats.dense_prefetch_duplicates,
+                        cuda_stats.dense_prefetch_ready_hits,
+                        cuda_stats.dense_prefetch_inflight_steals,
+                        cuda_stats.dense_prefetch_sync_reads,
+                        cuda_stats.dense_prefetch_evictions,
+                        cuda_stats.dense_prefetch_failures,
+                        cuda_stats.dense_prefetch_host_read_ns / 1_000_000,
+                        cuda_stats.dense_prefetch_demand_wait_ns / 1_000_000,
+                        cuda_stats.dense_prefetch_upload_ns / 1_000_000,
+                        cuda_stats.dense_prefetch_resident_bytes / (1024 * 1024),
+                        cuda_stats.dense_prefetch_read_bytes / (1024 * 1024),
+                    },
+                );
                 const attributed_launches =
                     cuda_stats.launch_embedding +
                     cuda_stats.launch_linear +

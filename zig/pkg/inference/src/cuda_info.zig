@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const ops = @import("ops/ops.zig");
 const tensor_store_mod = @import("models/tensor_store.zig");
+const weight_source_mod = @import("models/weight_source.zig");
 
 const print = std.debug.print;
 
@@ -40,6 +41,7 @@ const NormRopeParityCase = struct {
 pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !void {
     var smoke = false;
     var gemma4_parity_path: ?[]const u8 = null;
+    var gemma4_hf_parity_path: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -53,6 +55,14 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             }
             gemma4_parity_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--gemma4-hf-parity")) {
+            i += 1;
+            if (i >= args.len) {
+                print("missing value for --gemma4-hf-parity\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_hf_parity_path = args[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -139,6 +149,13 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
             };
             print("gemma4_parity: ok\n", .{});
         }
+        if (gemma4_hf_parity_path) |path| {
+            runGemma4HfParity(allocator, path) catch |err| {
+                print("gemma4_hf_parity: failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("gemma4_hf_parity: ok\n", .{});
+        }
     }
 }
 
@@ -192,11 +209,13 @@ fn bf16Bits(value: f32) u16 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference cuda-info [--smoke] [--gemma4-parity <gguf>]
+        \\usage: antfly inference cuda-info [--smoke] [--gemma4-parity <gguf>] [--gemma4-hf-parity <model-dir>]
         \\
         \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, Q4_0, Q4_K, RoPE, and GQA.
         \\  --gemma4-parity <gguf>
         \\            Compare real Gemma 4 GGUF projection tensors on CUDA against CPU dequantized matmul.
+        \\  --gemma4-hf-parity <model-dir>
+        \\            Compare real Gemma 4 HF safetensors tensors on CUDA against CPU BF16->F32 reference math.
         \\
     , .{});
 }
@@ -230,8 +249,30 @@ const DiffStats = struct {
 fn runGemma4Parity(allocator: std.mem.Allocator, gguf_path: []const u8) !void {
     const store = try tensor_store_mod.GgufStore.initAbsolute(allocator, gguf_path);
     defer store.tensorStore().deinit();
-    const tensor_store = store.tensorStore();
+    try runGemma4ParityOnStore(allocator, store.tensorStore());
+}
 
+fn runGemma4HfParity(allocator: std.mem.Allocator, model_dir: []const u8) !void {
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
+    const single = tensor_store_mod.SafetensorsStore.initAbsolute(allocator, safetensors_path) catch |single_err| blk: {
+        if (single_err != error.FileNotFound and single_err != error.NotFound and single_err != error.AccessDenied) return single_err;
+        break :blk null;
+    };
+    if (single) |store| {
+        defer store.tensorStore().deinit();
+        try runGemma4ParityOnStore(allocator, store.tensorStore());
+        return;
+    }
+
+    const index_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    const sharded = try tensor_store_mod.ShardedSafetensorsStore.initAbsolute(allocator, index_path);
+    defer sharded.tensorStore().deinit();
+    try runGemma4ParityOnStore(allocator, sharded.tensorStore());
+}
+
+fn runGemma4ParityOnStore(allocator: std.mem.Allocator, tensor_store: tensor_store_mod.TensorStore) !void {
     for (gemma4_parity_cases) |case| {
         try runGemma4LinearParityCase(allocator, tensor_store, case);
     }
@@ -239,6 +280,7 @@ fn runGemma4Parity(allocator: std.mem.Allocator, gguf_path: []const u8) !void {
     try runGqaParity(allocator);
     try runGemma4Layer0Parity(allocator, tensor_store);
     try runGemma4Layer5AttentionParity(allocator, tensor_store);
+    if (tensor_store.kind() == .safetensors) try runGemma4FinalProjectionParity(allocator, tensor_store);
 }
 
 fn runGemma4LinearParityCase(
@@ -246,12 +288,13 @@ fn runGemma4LinearParityCase(
     tensor_store: tensor_store_mod.TensorStore,
     case: Gemma4ParityCase,
 ) !void {
-    var tensor_ref = try tensor_store.describeTensor(allocator, case.name);
+    const source_name = try resolveGemma4ParityTensorName(allocator, tensor_store, case.name);
+    defer allocator.free(source_name);
+    var tensor_ref = try tensor_store.describeTensor(allocator, source_name);
     defer tensor_ref.deinit(allocator);
 
     var loaded = try tensor_store.loadTensorRef(&tensor_ref);
     defer loaded.deinit();
-    if (loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
     if (loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
 
     const out_dim: usize = @intCast(loaded.tensor.shape[0]);
@@ -262,7 +305,12 @@ fn runGemma4LinearParityCase(
 
     const expected = try allocator.alloc(f32, out_dim);
     defer allocator.free(expected);
-    cpuLinearNoBias(input, loaded.tensor.asFloat32(), expected, in_dim, out_dim);
+    const weight_host = try tensorToFloat32Owned(allocator, &loaded.tensor);
+    defer allocator.free(weight_host);
+    if (loaded.tensor.dtype == .bf16)
+        cpuLinearNoBiasBf16Input(input, weight_host, expected, in_dim, out_dim)
+    else
+        cpuLinearNoBias(input, weight_host, expected, in_dim, out_dim);
 
     var compute = try cuda_compute.CudaCompute.init(allocator);
     defer compute.deinit();
@@ -284,11 +332,11 @@ fn runGemma4LinearParityCase(
     if (actual.len != expected.len) return error.InvalidTensorShape;
 
     const stats = diffStats(actual, expected);
-    const tolerance = toleranceForParityCase(loaded.quantized);
+    const tolerance = toleranceForLoadedParityCase(&loaded);
     const quant_name = if (loaded.quantized_storage) |storage| storage.tensor_type.name() else "F32";
     print(
-        "gemma4_parity: {s} type={s} shape=[{d},{d}] max_abs={d:.6} mean_abs={d:.6} max_index={d}\n",
-        .{ case.name, quant_name, out_dim, in_dim, stats.max_abs, stats.mean_abs, stats.max_index },
+        "gemma4_parity: {s} source={s} type={s} dtype={s} shape=[{d},{d}] max_abs={d:.6} mean_abs={d:.6} max_index={d}\n",
+        .{ case.name, source_name, quant_name, @tagName(loaded.tensor.dtype), out_dim, in_dim, stats.max_abs, stats.mean_abs, stats.max_index },
     );
     if (stats.max_abs > tolerance) return error.CudaParityMismatch;
 }
@@ -354,13 +402,16 @@ fn runNormRopeParityCase(
     tensor_store: tensor_store_mod.TensorStore,
     case: NormRopeParityCase,
 ) !void {
-    var tensor_ref = try tensor_store.describeTensor(allocator, case.weight_name);
+    const source_name = try resolveGemma4ParityTensorName(allocator, tensor_store, case.weight_name);
+    defer allocator.free(source_name);
+    var tensor_ref = try tensor_store.describeTensor(allocator, source_name);
     defer tensor_ref.deinit(allocator);
 
     var loaded = try tensor_store.loadTensorRef(&tensor_ref);
     defer loaded.deinit();
-    if (loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
     if (loaded.tensor.elementCount() != case.head_dim) return error.InvalidTensorShape;
+    const weight_host = try tensorToFloat32Owned(allocator, &loaded.tensor);
+    defer allocator.free(weight_host);
 
     const count = case.rows * case.total_dim;
     const input = try makeParityInput(allocator, count);
@@ -370,7 +421,7 @@ fn runNormRopeParityCase(
     defer allocator.free(expected);
     cpuRmsNormHeadsRope(
         input,
-        loaded.tensor.asFloat32(),
+        weight_host,
         expected,
         case.rows,
         case.total_dim,
@@ -420,10 +471,10 @@ fn runNormRopeParityCase(
     if (actual.len != expected.len) return error.InvalidTensorShape;
     const stats = diffStats(actual, expected);
     print(
-        "gemma4_parity: rms_norm_heads_rope layer={d} proj={s} shape=[{d},{d}] max_abs={d:.6} mean_abs={d:.6} max_index={d}\n",
-        .{ case.layer, case.proj, case.rows, case.total_dim, stats.max_abs, stats.mean_abs, stats.max_index },
+        "gemma4_parity: rms_norm_heads_rope layer={d} proj={s} source={s} shape=[{d},{d}] max_abs={d:.6} mean_abs={d:.6} max_index={d}\n",
+        .{ case.layer, case.proj, source_name, case.rows, case.total_dim, stats.max_abs, stats.mean_abs, stats.max_index },
     );
-    if (stats.max_abs > 0.001) return error.CudaParityMismatch;
+    if (stats.max_abs > toleranceForLoadedElementwiseCase(&loaded)) return error.CudaParityMismatch;
 }
 
 fn runGqaParity(allocator: std.mem.Allocator) !void {
@@ -522,6 +573,13 @@ fn runGemma4Layer0Parity(
     const inter: usize = 15360;
     const eps: f32 = 0.000001;
     const theta: f32 = 10000.0;
+    const bf16_linear_inputs = tensor_store.kind() == .safetensors;
+    const elem_tolerance = elementwiseStageTolerance(tensor_store, 0.001);
+    const linear_tolerance = linearStageTolerance(tensor_store, 0.001);
+    const ffn_linear_tolerance = linearStageTolerance(tensor_store, 0.005);
+    const activation_tolerance = activationStageTolerance(tensor_store, 0.005);
+    const ffn_down_tolerance = ffnDownStageTolerance(tensor_store, 0.005);
+    const ffn_post_tolerance = ffnPostStageTolerance(tensor_store, 0.001);
 
     var compute = try cuda_compute.CudaCompute.init(allocator);
     defer compute.deinit();
@@ -541,7 +599,7 @@ fn runGemma4Layer0Parity(
     const attn_norm_w = try cb.getWeight("blk.0.attn_norm.weight");
     const attn_norm_ct = try cb.rmsNorm(input_ct, attn_norm_w, hidden, eps);
     defer cb.free(attn_norm_ct);
-    try compareCudaStage(allocator, &cb, "layer0.attn_norm", attn_norm_ct, expected_attn_norm, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.attn_norm", attn_norm_ct, expected_attn_norm, elem_tolerance);
 
     const expected_q = try allocator.alloc(f32, rows * q_dim);
     defer allocator.free(expected_q);
@@ -549,9 +607,9 @@ fn runGemma4Layer0Parity(
     defer allocator.free(expected_k);
     const expected_v = try allocator.alloc(f32, rows * kv_dim);
     defer allocator.free(expected_v);
-    cpuLinearNoBiasRows(expected_attn_norm, weights.q, expected_q, rows, hidden, q_dim);
-    cpuLinearNoBiasRows(expected_attn_norm, weights.k, expected_k, rows, hidden, kv_dim);
-    cpuLinearNoBiasRows(expected_attn_norm, weights.v, expected_v, rows, hidden, kv_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn_norm, weights.q, expected_q, rows, hidden, q_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn_norm, weights.k, expected_k, rows, hidden, kv_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn_norm, weights.v, expected_v, rows, hidden, kv_dim);
     const q_w = try cb.getWeight("blk.0.attn_q.weight");
     const k_w = try cb.getWeight("blk.0.attn_k.weight");
     const v_w = try cb.getWeight("blk.0.attn_v.weight");
@@ -562,9 +620,9 @@ fn runGemma4Layer0Parity(
     defer cb.free(k_ct);
     const v_ct = qkv_ct.third;
     defer cb.free(v_ct);
-    try compareCudaStage(allocator, &cb, "layer0.q", q_ct, expected_q, 0.001);
-    try compareCudaStage(allocator, &cb, "layer0.k", k_ct, expected_k, 0.001);
-    try compareCudaStage(allocator, &cb, "layer0.v", v_ct, expected_v, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.q", q_ct, expected_q, linear_tolerance);
+    try compareCudaStage(allocator, &cb, "layer0.k", k_ct, expected_k, linear_tolerance);
+    try compareCudaStage(allocator, &cb, "layer0.v", v_ct, expected_v, linear_tolerance);
 
     const expected_q_rope = try allocator.alloc(f32, rows * q_dim);
     defer allocator.free(expected_q_rope);
@@ -601,11 +659,11 @@ fn runGemma4Layer0Parity(
 
     const expected_attn_proj = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_attn_proj);
-    cpuLinearNoBiasRows(expected_attn, weights.attn_output, expected_attn_proj, rows, q_dim, hidden);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn, weights.attn_output, expected_attn_proj, rows, q_dim, hidden);
     const attn_out_w = try cb.getWeight("blk.0.attn_output.weight");
     const attn_proj_ct = try cb.linearNoBias(attn_ct, attn_out_w, rows, q_dim, hidden);
     defer cb.free(attn_proj_ct);
-    try compareCudaStage(allocator, &cb, "layer0.attn_proj", attn_proj_ct, expected_attn_proj, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.attn_proj", attn_proj_ct, expected_attn_proj, linear_tolerance);
 
     const expected_attn_post = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_attn_post);
@@ -613,14 +671,14 @@ fn runGemma4Layer0Parity(
     const post_attn_w = try cb.getWeight("blk.0.post_attention_norm.weight");
     const attn_post_ct = try cb.rmsNorm(attn_proj_ct, post_attn_w, hidden, eps);
     defer cb.free(attn_post_ct);
-    try compareCudaStage(allocator, &cb, "layer0.attn_post", attn_post_ct, expected_attn_post, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.attn_post", attn_post_ct, expected_attn_post, elem_tolerance);
 
     const expected_sa = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_sa);
     cpuAdd(expected_attn_post, input, expected_sa);
     const sa_ct = try cb.add(attn_post_ct, input_ct);
     defer cb.free(sa_ct);
-    try compareCudaStage(allocator, &cb, "layer0.attn_residual", sa_ct, expected_sa, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.attn_residual", sa_ct, expected_sa, elem_tolerance);
 
     const expected_ffn_norm = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_ffn_norm);
@@ -628,7 +686,7 @@ fn runGemma4Layer0Parity(
     const ffn_norm_w = try cb.getWeight("blk.0.ffn_norm.weight");
     const ffn_norm_ct = try cb.rmsNorm(sa_ct, ffn_norm_w, hidden, eps);
     defer cb.free(ffn_norm_ct);
-    try compareCudaStage(allocator, &cb, "layer0.ffn_norm", ffn_norm_ct, expected_ffn_norm, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.ffn_norm", ffn_norm_ct, expected_ffn_norm, elem_tolerance);
 
     const expected_gate = try allocator.alloc(f32, rows * inter);
     defer allocator.free(expected_gate);
@@ -636,8 +694,8 @@ fn runGemma4Layer0Parity(
     defer allocator.free(expected_up);
     const expected_gated = try allocator.alloc(f32, rows * inter);
     defer allocator.free(expected_gated);
-    cpuLinearNoBiasRows(expected_ffn_norm, weights.ffn_gate, expected_gate, rows, hidden, inter);
-    cpuLinearNoBiasRows(expected_ffn_norm, weights.ffn_up, expected_up, rows, hidden, inter);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_ffn_norm, weights.ffn_gate, expected_gate, rows, hidden, inter);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_ffn_norm, weights.ffn_up, expected_up, rows, hidden, inter);
     cpuSiluMultiply(expected_gate, expected_up, expected_gated);
     const gate_w = try cb.getWeight("blk.0.ffn_gate.weight");
     const up_w = try cb.getWeight("blk.0.ffn_up.weight");
@@ -646,19 +704,19 @@ fn runGemma4Layer0Parity(
     defer cb.free(gate_ct);
     const up_ct = gate_up_ct.second;
     defer cb.free(up_ct);
-    try compareCudaStage(allocator, &cb, "layer0.ffn_gate", gate_ct, expected_gate, 0.001);
-    try compareCudaStage(allocator, &cb, "layer0.ffn_up", up_ct, expected_up, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.ffn_gate", gate_ct, expected_gate, ffn_linear_tolerance);
+    try compareCudaStage(allocator, &cb, "layer0.ffn_up", up_ct, expected_up, ffn_linear_tolerance);
     const gated_ct = (try cb.activationMultiply(gate_ct, up_ct, .silu)) orelse return error.CudaKernelUnavailable;
     defer cb.free(gated_ct);
-    try compareCudaStage(allocator, &cb, "layer0.ffn_gated", gated_ct, expected_gated, 0.005);
+    try compareCudaStage(allocator, &cb, "layer0.ffn_gated", gated_ct, expected_gated, activation_tolerance);
 
     const expected_ffn_raw = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_ffn_raw);
-    cpuLinearNoBiasRows(expected_gated, weights.ffn_down, expected_ffn_raw, rows, inter, hidden);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_gated, weights.ffn_down, expected_ffn_raw, rows, inter, hidden);
     const down_w = try cb.getWeight("blk.0.ffn_down.weight");
     const ffn_raw_ct = try cb.linearNoBias(gated_ct, down_w, rows, inter, hidden);
     defer cb.free(ffn_raw_ct);
-    try compareCudaStage(allocator, &cb, "layer0.ffn_raw", ffn_raw_ct, expected_ffn_raw, 0.005);
+    try compareCudaStage(allocator, &cb, "layer0.ffn_raw", ffn_raw_ct, expected_ffn_raw, ffn_down_tolerance);
 
     const expected_ffn_post = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_ffn_post);
@@ -666,7 +724,7 @@ fn runGemma4Layer0Parity(
     const post_ffw_w = try cb.getWeight("blk.0.post_ffw_norm.weight");
     const ffn_post_ct = try cb.rmsNorm(ffn_raw_ct, post_ffw_w, hidden, eps);
     defer cb.free(ffn_post_ct);
-    try compareCudaStage(allocator, &cb, "layer0.ffn_post", ffn_post_ct, expected_ffn_post, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.ffn_post", ffn_post_ct, expected_ffn_post, ffn_post_tolerance);
 
     const expected_out = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_out);
@@ -680,7 +738,7 @@ fn runGemma4Layer0Parity(
         break :blk try cb.add(scaled, sa_ct);
     };
     defer cb.free(out_ct);
-    try compareCudaStage(allocator, &cb, "layer0.out", out_ct, expected_out, 0.001);
+    try compareCudaStage(allocator, &cb, "layer0.out", out_ct, expected_out, ffn_post_tolerance);
 
     print("gemma4_parity: layer0_decoder_block ok\n", .{});
 }
@@ -698,6 +756,9 @@ fn runGemma4Layer5AttentionParity(
     const head_dim: usize = 512;
     const eps: f32 = 0.000001;
     const theta: f32 = 1000000.0;
+    const bf16_linear_inputs = tensor_store.kind() == .safetensors;
+    const elem_tolerance = elementwiseStageTolerance(tensor_store, 0.001);
+    const linear_tolerance = linearStageTolerance(tensor_store, 0.005);
 
     var compute = try cuda_compute.CudaCompute.init(allocator);
     defer compute.deinit();
@@ -729,22 +790,22 @@ fn runGemma4Layer5AttentionParity(
     const attn_norm_w = try cb.getWeight("blk.5.attn_norm.weight");
     const attn_norm_ct = try cb.rmsNorm(input_ct, attn_norm_w, hidden, eps);
     defer cb.free(attn_norm_ct);
-    try compareCudaStage(allocator, &cb, "layer5.attn_norm", attn_norm_ct, expected_attn_norm, 0.001);
+    try compareCudaStage(allocator, &cb, "layer5.attn_norm", attn_norm_ct, expected_attn_norm, elem_tolerance);
 
     const expected_q = try allocator.alloc(f32, rows * q_dim);
     defer allocator.free(expected_q);
     const expected_k = try allocator.alloc(f32, rows * kv_dim);
     defer allocator.free(expected_k);
-    cpuLinearNoBiasRows(expected_attn_norm, q_w_host, expected_q, rows, hidden, q_dim);
-    cpuLinearNoBiasRows(expected_attn_norm, k_w_host, expected_k, rows, hidden, kv_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn_norm, q_w_host, expected_q, rows, hidden, q_dim);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn_norm, k_w_host, expected_k, rows, hidden, kv_dim);
     const q_w = try cb.getWeight("blk.5.attn_q.weight");
     const k_w = try cb.getWeight("blk.5.attn_k.weight");
     const q_ct = try cb.linearNoBias(attn_norm_ct, q_w, rows, hidden, q_dim);
     defer cb.free(q_ct);
     const k_ct = try cb.linearNoBias(attn_norm_ct, k_w, rows, hidden, kv_dim);
     defer cb.free(k_ct);
-    try compareCudaStage(allocator, &cb, "layer5.q", q_ct, expected_q, 0.005);
-    try compareCudaStage(allocator, &cb, "layer5.k", k_ct, expected_k, 0.005);
+    try compareCudaStage(allocator, &cb, "layer5.q", q_ct, expected_q, linear_tolerance);
+    try compareCudaStage(allocator, &cb, "layer5.k", k_ct, expected_k, linear_tolerance);
 
     const expected_q_rope = try allocator.alloc(f32, rows * q_dim);
     defer allocator.free(expected_q_rope);
@@ -781,11 +842,11 @@ fn runGemma4Layer5AttentionParity(
 
     const expected_attn_proj = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_attn_proj);
-    cpuLinearNoBiasRows(expected_attn, attn_output, expected_attn_proj, rows, q_dim, hidden);
+    cpuLinearNoBiasRowsForCudaDense(bf16_linear_inputs, expected_attn, attn_output, expected_attn_proj, rows, q_dim, hidden);
     const attn_out_w = try cb.getWeight("blk.5.attn_output.weight");
     const attn_proj_ct = try cb.linearNoBias(attn_ct, attn_out_w, rows, q_dim, hidden);
     defer cb.free(attn_proj_ct);
-    try compareCudaStage(allocator, &cb, "layer5.attn_proj", attn_proj_ct, expected_attn_proj, 0.005);
+    try compareCudaStage(allocator, &cb, "layer5.attn_proj", attn_proj_ct, expected_attn_proj, linear_tolerance);
 
     const expected_attn_post = try allocator.alloc(f32, rows * hidden);
     defer allocator.free(expected_attn_post);
@@ -793,9 +854,92 @@ fn runGemma4Layer5AttentionParity(
     const post_attn_w = try cb.getWeight("blk.5.post_attention_norm.weight");
     const attn_post_ct = try cb.rmsNorm(attn_proj_ct, post_attn_w, hidden, eps);
     defer cb.free(attn_post_ct);
-    try compareCudaStage(allocator, &cb, "layer5.attn_post", attn_post_ct, expected_attn_post, 0.001);
+    try compareCudaStage(allocator, &cb, "layer5.attn_post", attn_post_ct, expected_attn_post, elem_tolerance);
 
     print("gemma4_parity: layer5_attention_omitted_v ok\n", .{});
+}
+
+fn runGemma4FinalProjectionParity(
+    allocator: std.mem.Allocator,
+    tensor_store: tensor_store_mod.TensorStore,
+) !void {
+    const hidden: usize = 3840;
+    const vocab: usize = 262144;
+    const eps: f32 = 0.000001;
+    const sampled_ids = [_]usize{ 0, 1, 2, 50, 100, 101, 106, 236761, 258882, 258883 };
+
+    var compute = try cuda_compute.CudaCompute.init(allocator);
+    defer compute.deinit();
+    const norm = try loadLayerWeight(allocator, tensor_store, &compute, "output_norm.weight");
+    defer allocator.free(norm);
+
+    const embed_source_name = try resolveGemma4ParityTensorName(allocator, tensor_store, "token_embd.weight");
+    defer allocator.free(embed_source_name);
+    var embed_ref = try tensor_store.describeTensor(allocator, embed_source_name);
+    defer embed_ref.deinit(allocator);
+    var embed_loaded = try tensor_store.loadTensorRef(&embed_ref);
+    defer embed_loaded.deinit();
+    if (embed_loaded.tensor.dtype != .bf16) return error.UnsupportedTensorType;
+    if (embed_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
+    if (@as(usize, @intCast(embed_loaded.tensor.shape[0])) != vocab) return error.InvalidTensorShape;
+    if (@as(usize, @intCast(embed_loaded.tensor.shape[1])) != hidden) return error.InvalidTensorShape;
+    const embed_key = try allocator.dupe(u8, "token_embd.weight");
+    var inserted = false;
+    errdefer if (!inserted) allocator.free(embed_key);
+    try compute.insertWeightFromLoaded(embed_key, &embed_loaded);
+    inserted = true;
+
+    const cb = compute.computeBackend();
+    const input = try makeParityInput(allocator, hidden);
+    defer allocator.free(input);
+    const expected_norm = try allocator.alloc(f32, hidden);
+    defer allocator.free(expected_norm);
+    cpuRmsNormRows(input, norm, expected_norm, 1, hidden, eps);
+
+    const input_shape = [_]i32{ 1, @intCast(hidden) };
+    const input_ct = try cb.fromFloat32Shape(input, &input_shape);
+    defer cb.free(input_ct);
+    const norm_w = try cb.getWeight("output_norm.weight");
+    const norm_ct = try cb.rmsNorm(input_ct, norm_w, hidden, eps);
+    defer cb.free(norm_ct);
+    try compareCudaStage(allocator, &cb, "final.norm", norm_ct, expected_norm, 0.005);
+
+    const embed_w = try cb.getWeight("token_embd.weight");
+    const logits_ct = try cb.linearNoBias(norm_ct, embed_w, 1, hidden, vocab);
+    defer cb.free(logits_ct);
+    const actual_logits = try cb.toFloat32(logits_ct, allocator);
+    defer allocator.free(actual_logits);
+    if (actual_logits.len != vocab) return error.InvalidTensorShape;
+
+    var max_abs: f32 = 0;
+    var mean_abs: f64 = 0;
+    var max_token: usize = 0;
+    var max_expected: f32 = 0;
+    var max_actual: f32 = 0;
+    for (sampled_ids) |token_id| {
+        const expected = cpuEmbeddingRowDotBf16Input(expected_norm, embed_loaded.tensor.data, token_id, hidden);
+        const actual = actual_logits[token_id];
+        const diff = @abs(actual - expected);
+        mean_abs += diff;
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_token = token_id;
+            max_expected = expected;
+            max_actual = actual;
+        }
+    }
+    mean_abs /= @as(f64, @floatFromInt(sampled_ids.len));
+    print(
+        "gemma4_parity: final.tied_lm_head sampled={d} max_abs={d:.6} mean_abs={d:.6} token={d}\n",
+        .{ sampled_ids.len, max_abs, mean_abs, max_token },
+    );
+    if (max_abs > 0.02) {
+        print(
+            "gemma4_parity: first_divergence stage=final.tied_lm_head got={d:.6} expected={d:.6}\n",
+            .{ max_actual, max_expected },
+        );
+        return error.CudaParityMismatch;
+    }
 }
 
 fn loadGemma4Layer0Weights(
@@ -827,12 +971,13 @@ fn loadLayerWeight(
     compute: *cuda_compute.CudaCompute,
     name: []const u8,
 ) ![]f32 {
-    var tensor_ref = try tensor_store.describeTensor(allocator, name);
+    const source_name = try resolveGemma4ParityTensorName(allocator, tensor_store, name);
+    defer allocator.free(source_name);
+    var tensor_ref = try tensor_store.describeTensor(allocator, source_name);
     defer tensor_ref.deinit(allocator);
     var loaded = try tensor_store.loadTensorRef(&tensor_ref);
     defer loaded.deinit();
-    if (loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
-    const host = try allocator.dupe(f32, loaded.tensor.asFloat32());
+    const host = try tensorToFloat32Owned(allocator, &loaded.tensor);
     errdefer allocator.free(host);
     const key = try allocator.dupe(u8, name);
     var inserted = false;
@@ -840,6 +985,52 @@ fn loadLayerWeight(
     try compute.insertWeightFromLoaded(key, &loaded);
     inserted = true;
     return host;
+}
+
+fn tensorToFloat32Owned(allocator: std.mem.Allocator, tensor: *const @import("backends/tensor.zig").Tensor) ![]f32 {
+    if (tensor.dtype == .f32) return try allocator.dupe(f32, tensor.asFloat32());
+    if (tensor.dtype == .f16 or tensor.dtype == .bf16) {
+        var converted = try weight_source_mod.convertToF32(allocator, tensor);
+        defer converted.deinit();
+        return try allocator.dupe(f32, converted.asFloat32());
+    }
+    return error.UnsupportedTensorType;
+}
+
+fn resolveGemma4ParityTensorName(
+    allocator: std.mem.Allocator,
+    tensor_store: tensor_store_mod.TensorStore,
+    gguf_name: []const u8,
+) ![]u8 {
+    if (tensor_store.kind() != .safetensors) return try allocator.dupe(u8, gguf_name);
+    if (std.mem.eql(u8, gguf_name, "output_norm.weight")) return try allocator.dupe(u8, "model.language_model.norm.weight");
+    if (std.mem.eql(u8, gguf_name, "token_embd.weight")) return try allocator.dupe(u8, "model.language_model.embed_tokens.weight");
+    if (!std.mem.startsWith(u8, gguf_name, "blk.")) return try allocator.dupe(u8, gguf_name);
+
+    const rest = gguf_name["blk.".len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.InvalidTensorName;
+    const layer = rest[0..dot];
+    const suffix = rest[dot + 1 ..];
+    const hf_suffix = gemma4HfLayerSuffixForGguf(suffix) orelse return error.TensorNotFound;
+    return try std.fmt.allocPrint(allocator, "model.language_model.layers.{s}.{s}", .{ layer, hf_suffix });
+}
+
+fn gemma4HfLayerSuffixForGguf(suffix: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, suffix, "attn_norm.weight")) return "input_layernorm.weight";
+    if (std.mem.eql(u8, suffix, "attn_q.weight")) return "self_attn.q_proj.weight";
+    if (std.mem.eql(u8, suffix, "attn_k.weight")) return "self_attn.k_proj.weight";
+    if (std.mem.eql(u8, suffix, "attn_v.weight")) return "self_attn.v_proj.weight";
+    if (std.mem.eql(u8, suffix, "attn_output.weight")) return "self_attn.o_proj.weight";
+    if (std.mem.eql(u8, suffix, "attn_q_norm.weight")) return "self_attn.q_norm.weight";
+    if (std.mem.eql(u8, suffix, "attn_k_norm.weight")) return "self_attn.k_norm.weight";
+    if (std.mem.eql(u8, suffix, "post_attention_norm.weight")) return "post_attention_layernorm.weight";
+    if (std.mem.eql(u8, suffix, "ffn_norm.weight")) return "pre_feedforward_layernorm.weight";
+    if (std.mem.eql(u8, suffix, "ffn_gate.weight")) return "mlp.gate_proj.weight";
+    if (std.mem.eql(u8, suffix, "ffn_up.weight")) return "mlp.up_proj.weight";
+    if (std.mem.eql(u8, suffix, "ffn_down.weight")) return "mlp.down_proj.weight";
+    if (std.mem.eql(u8, suffix, "post_ffw_norm.weight")) return "post_feedforward_layernorm.weight";
+    if (std.mem.eql(u8, suffix, "layer_output_scale.weight")) return "layer_scalar";
+    return null;
 }
 
 fn compareCudaStage(
@@ -888,12 +1079,64 @@ fn cpuLinearNoBias(input: []const f32, weight: []const f32, output: []f32, in_di
     }
 }
 
+fn cpuLinearNoBiasBf16Input(input: []const f32, weight: []const f32, output: []f32, in_dim: usize, out_dim: usize) void {
+    for (0..out_dim) |row| {
+        var sum: f32 = 0;
+        const w_row = weight[row * in_dim ..][0..in_dim];
+        for (0..in_dim) |col| {
+            sum += roundF32ToBf16(input[col]) * w_row[col];
+        }
+        output[row] = sum;
+    }
+}
+
 fn cpuLinearNoBiasRows(input: []const f32, weight: []const f32, output: []f32, rows: usize, in_dim: usize, out_dim: usize) void {
     for (0..rows) |row| {
         const in_row = input[row * in_dim ..][0..in_dim];
         const out_row = output[row * out_dim ..][0..out_dim];
         cpuLinearNoBias(in_row, weight, out_row, in_dim, out_dim);
     }
+}
+
+fn cpuLinearNoBiasRowsForCudaDense(
+    bf16_linear_inputs: bool,
+    input: []const f32,
+    weight: []const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) void {
+    for (0..rows) |row| {
+        const in_row = input[row * in_dim ..][0..in_dim];
+        const out_row = output[row * out_dim ..][0..out_dim];
+        if (bf16_linear_inputs) {
+            cpuLinearNoBiasBf16Input(in_row, weight, out_row, in_dim, out_dim);
+        } else {
+            cpuLinearNoBias(in_row, weight, out_row, in_dim, out_dim);
+        }
+    }
+}
+
+fn roundF32ToBf16(value: f32) f32 {
+    const bits: u32 = @bitCast(value);
+    const rounded = bits + 0x8000;
+    return @bitCast(rounded & 0xffff0000);
+}
+
+fn cpuEmbeddingRowDotBf16Input(input: []const f32, bf16_weight_bytes: []const u8, row: usize, dim: usize) f32 {
+    var sum: f32 = 0;
+    const row_offset = row * dim;
+    for (0..dim) |col| {
+        const bits = std.mem.readInt(u16, bf16_weight_bytes[(row_offset + col) * @sizeOf(u16) ..][0..@sizeOf(u16)], .little);
+        const weight = bf16BitsToF32(bits);
+        sum += roundF32ToBf16(input[col]) * weight;
+    }
+    return sum;
+}
+
+fn bf16BitsToF32(bits: u16) f32 {
+    return @bitCast(@as(u32, bits) << 16);
 }
 
 fn cpuRmsNormRows(input: []const f32, weight: []const f32, output: []f32, rows: usize, dim: usize, eps: f32) void {
@@ -1071,4 +1314,39 @@ fn diffStats(actual: []const f32, expected: []const f32) DiffStats {
 
 fn toleranceForParityCase(quantized: bool) f32 {
     return if (quantized) 0.05 else 0.001;
+}
+
+fn toleranceForLoadedParityCase(loaded: *const weight_source_mod.LoadedWeight) f32 {
+    if (loaded.quantized) return 0.05;
+    return switch (loaded.tensor.dtype) {
+        .bf16, .f16 => 0.25,
+        else => 0.001,
+    };
+}
+
+fn toleranceForLoadedElementwiseCase(loaded: *const weight_source_mod.LoadedWeight) f32 {
+    return switch (loaded.tensor.dtype) {
+        .bf16, .f16 => 0.005,
+        else => 0.001,
+    };
+}
+
+fn elementwiseStageTolerance(tensor_store: tensor_store_mod.TensorStore, base: f32) f32 {
+    return if (tensor_store.kind() == .safetensors) @max(base, 0.005) else base;
+}
+
+fn linearStageTolerance(tensor_store: tensor_store_mod.TensorStore, base: f32) f32 {
+    return if (tensor_store.kind() == .safetensors) @max(base, 0.02) else base;
+}
+
+fn activationStageTolerance(tensor_store: tensor_store_mod.TensorStore, base: f32) f32 {
+    return if (tensor_store.kind() == .safetensors) @max(base, 0.25) else base;
+}
+
+fn ffnDownStageTolerance(tensor_store: tensor_store_mod.TensorStore, base: f32) f32 {
+    return if (tensor_store.kind() == .safetensors) @max(base, 0.5) else base;
+}
+
+fn ffnPostStageTolerance(tensor_store: tensor_store_mod.TensorStore, base: f32) f32 {
+    return if (tensor_store.kind() == .safetensors) @max(base, 0.25) else base;
 }
