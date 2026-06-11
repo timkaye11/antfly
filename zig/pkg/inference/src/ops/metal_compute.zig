@@ -201,6 +201,10 @@ fn traceFlatBinaryRuntimeEnabled() bool {
     return getenvBool("TERMITE_METAL_TRACE_FLAT_BINARY");
 }
 
+fn traceGatherHostFallbackEnabled() bool {
+    return getenvBool("TERMITE_METAL_TRACE_GATHER_HOST_FALLBACK");
+}
+
 fn nsToMs(ns: u128) f64 {
     return @as(f64, @floatFromInt(ns)) / 1.0e6;
 }
@@ -7527,6 +7531,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         }
                     }
                 }
+            }
+            if (traceGatherHostFallbackEnabled()) {
+                const reason: [*:0]const u8 = blk: {
+                    if (input_buf.metal_tensor == null) break :blk "no_input_metal";
+                    if (indices_buf.metal_tensor == null) break :blk "no_indices_metal";
+                    if (!input_buf.metal_tensor.?.isDevice()) break :blk "input_not_device";
+                    if (!indices_buf.metal_tensor.?.isDevice()) break :blk "indices_not_device";
+                    if (indices_buf.metal_tensor.?.elemCount() == 0) break :blk "index_count_zero";
+                    break :blk "kernel_null";
+                };
+                std.debug.print("gather_host_fallback: axis0_2d reason={s} rows={d} cols={d}\n", .{ reason, rows, cols });
             }
             const input_host = try hostSliceForBuf(input_buf);
             const idx_data = try hostSliceForBuf(indices_buf);

@@ -2304,6 +2304,15 @@ fn debertaAttentionRuntimeRegionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_ENABLE_DEBERTA_ATTENTION_RUNTIME_REGION", false);
 }
 
+/// When set, promote a gather's input operand to device residency before the
+/// gather command. Frozen embedding-table gathers otherwise run the host
+/// fallback (no_input_metal) and force a host-output drain. Default OFF; this
+/// uploads the (possibly large) input per step, so it is an experiment knob
+/// pending a persistent frozen-parameter device cache.
+fn gatherPromoteInputEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_GATHER_PROMOTE_INPUT", false);
+}
+
 fn runtimeRegionPlanDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RUNTIME_REGION_PLAN", false);
 }
@@ -10271,6 +10280,11 @@ fn executeRuntimeGather(
     const indices_value = valueFor(values, inputs[1]) orelse return null;
     const indices = try temporaryMetalResidentValue(cb, indices_value);
     defer indices.deinit(cb);
+    const input_resident = if (gatherPromoteInputEnabled())
+        try temporaryMetalResidentValue(cb, input_value)
+    else
+        TemporaryMetalResidentValue{ .value = input_value };
+    defer input_resident.deinit(cb);
 
     if (attrs.axis == 0) gather_add_bias: {
         const input_node = graph.node(inputs[0]);
@@ -10314,7 +10328,7 @@ fn executeRuntimeGather(
         if (fused) |output| return output;
     }
 
-    return cb.primGather(input_value, indices.value, attrs.axis, input_shape) catch |err| switch (err) {
+    return cb.primGather(input_resident.value, indices.value, attrs.axis, input_shape) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch, error.InvalidTensorShape => null,
         else => return err,
     };
