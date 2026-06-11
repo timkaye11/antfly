@@ -1386,7 +1386,60 @@ pub const RealAutodiffTrainer = struct {
             try inputs.append(self.allocator, .{ .tensor = grad, .elem_count = slot.weights.len });
         }
         const sumsq = try metal.trainingSumSquaresManyF32(inputs.items);
-        return @sqrt(sumsq);
+        const kernel_norm: f32 = @sqrt(sumsq);
+        self.debugCompareDeviceGradNorm(result, kernel_norm);
+        return kernel_norm;
+    }
+
+    /// TERMITE_DEBUG_DEVICE_GRAD_NORM=1: once per process, recompute the
+    /// global gradient norm on the HOST (each device gradient read back via
+    /// `toFloat32`, the same view-aware path the lifetime diagnostic uses)
+    /// and print it next to the Metal sum-squares kernel result. Decisively
+    /// splits the "gradients nonzero but grad_norm=0" contradiction:
+    /// kernel=0 + host>0 => the sum-squares kernel (or its readback /
+    /// offsets) is broken; both 0 => zeros genuinely reached the trainer
+    /// and the bug is upstream in extraction.
+    fn debugCompareDeviceGradNorm(
+        self: *RealAutodiffTrainer,
+        result: *const training.TrainStepResult,
+        kernel_norm: f32,
+    ) void {
+        if (device_grad_norm_debug_done) return;
+        if (!platform.env.getenvBoolDefault("TERMITE_DEBUG_DEVICE_GRAD_NORM", false)) return;
+        device_grad_norm_debug_done = true;
+        var total: f64 = 0;
+        var tensors: usize = 0;
+        var nonzero_tensors: usize = 0;
+        var printed: usize = 0;
+        var it = result.device_gradients.iterator();
+        while (it.next()) |entry| {
+            tensors += 1;
+            const data = self.compute_backend.toFloat32(entry.value_ptr.*, self.allocator) catch |err| {
+                std.debug.print(
+                    "[grad-norm-debug] {s}: host read failed: {s}\n",
+                    .{ entry.key_ptr.*, @errorName(err) },
+                );
+                continue;
+            };
+            defer self.allocator.free(data);
+            var tensor_sumsq: f64 = 0;
+            for (data) |value| tensor_sumsq += @as(f64, value) * @as(f64, value);
+            total += tensor_sumsq;
+            if (tensor_sumsq > 0) {
+                nonzero_tensors += 1;
+                if (printed < 4) {
+                    printed += 1;
+                    std.debug.print(
+                        "[grad-norm-debug] nonzero sample name={s} len={} host_sumsq={d:.9}\n",
+                        .{ entry.key_ptr.*, data.len, tensor_sumsq },
+                    );
+                }
+            }
+        }
+        std.debug.print(
+            "[grad-norm-debug] kernel_norm={d:.9} host_norm={d:.9} tensors={} host_nonzero_tensors={} (kernel 0 + host >0 => sum-squares kernel/offset broken; both 0 => zeros reached the trainer)\n",
+            .{ kernel_norm, @sqrt(total), tensors, nonzero_tensors },
+        );
     }
 
     fn deviceSumSquares(self: *RealAutodiffTrainer, input: CT, elem_count: usize) !f32 {
@@ -1883,6 +1936,9 @@ fn allZero(values: []const f32) bool {
     }
     return true;
 }
+
+/// One-shot latch for `debugCompareDeviceGradNorm` (env-gated diagnostic).
+var device_grad_norm_debug_done: bool = false;
 
 fn monotonicNowNs() u64 {
     var ts: std.posix.timespec = undefined;

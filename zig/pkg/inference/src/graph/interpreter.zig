@@ -344,6 +344,40 @@ fn checkNodeFinite(
             return error.NonFiniteGraphNode;
         }
     }
+    if (platform.env.getenvBoolDefault("TERMITE_GRAPH_ABS_TRACE", false)) {
+        var abs_sum: f64 = 0;
+        for (data) |value| abs_sum += @abs(value);
+        std.debug.print("[abs] {d} {d:.6}\n", .{ node_id, abs_sum });
+    }
+    if (graphZeroTraceEnabled()) {
+        var abs_sum: f64 = 0;
+        for (data) |value| abs_sum += @abs(value);
+        if (abs_sum == 0 and data.len > 0) {
+            const node = graph.node(node_id);
+            std.debug.print(
+                "[graph-zero] node={} op={s} numel={} declared_shape={any}\n",
+                .{ node_id, @tagName(std.meta.activeTag(node.op)), data.len, node.output_shape },
+            );
+        }
+    }
+    if (platform.env.getenv("TERMITE_GRAPH_NODE_VALUES")) |spec| {
+        var it = std.mem.splitScalar(u8, spec, ',');
+        while (it.next()) |tok| {
+            const want = std.fmt.parseUnsigned(u32, std.mem.trim(u8, tok, " "), 10) catch continue;
+            if (want != node_id) continue;
+            var abs_sum: f64 = 0;
+            for (data) |value| abs_sum += @abs(value);
+            const node = graph.node(node_id);
+            std.debug.print(
+                "[node-values] node={} op={s} ct=0x{x} len={} first4={any} abs_sum={d:.6}\n",
+                .{ node_id, @tagName(std.meta.activeTag(node.op)), @intFromPtr(ct), data.len, data[0..@min(4, data.len)], abs_sum },
+            );
+        }
+    }
+}
+
+fn graphZeroTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_GRAPH_ZERO_TRACE", false);
 }
 
 fn graphExecDiag(comptime fmt: []const u8, args: anytype) void {

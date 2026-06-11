@@ -1428,7 +1428,7 @@ fn parseLoRAAdapterTensorName(tensor_name: []const u8) ?ParsedLoRAAdapterTensorN
     return null;
 }
 
-fn autodiffParamNameToPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+pub fn autodiffParamNameToPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (std.mem.endsWith(u8, name, ".lora_A")) {
         const base = name[0 .. name.len - ".lora_A".len];
         return autodiffParamBaseToPeftName(allocator, tensorBaseName(base), "lora_A");

@@ -73,6 +73,7 @@ const gliner2_data = inference.finetune.gliner2_data;
 const gliner2_bundle = inference.finetune.gliner2;
 const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
 const real_autodiff = inference.finetune.real_autodiff_trainer;
+const optimizers = ml.graph.optimizers;
 const run_validation = inference.finetune.gliner2_run_validation;
 const deberta_arch = inference.architectures.deberta;
 const deberta_graph = inference.architectures.deberta_graph;
@@ -115,6 +116,7 @@ const Options = struct {
     backend: Gliner2TrainBackend = .auto,
     compiled_required: bool = false,
     dump_span_parity: bool = false,
+    dump_optimizer_parity: bool = false,
     lora_only_trainables: bool = false,
     deterministic: bool = false,
     eval_strategy: EvalStrategy = .epoch,
@@ -184,6 +186,7 @@ pub fn main(init: std.process.Init) !void {
     var backend: Gliner2TrainBackend = .auto;
     var compiled_required: bool = false;
     var dump_span_parity: bool = false;
+    var dump_optimizer_parity: bool = false;
     var lora_only_trainables: bool = false;
     var deterministic: bool = false;
     var eval_strategy: EvalStrategy = .epoch;
@@ -279,6 +282,8 @@ pub fn main(init: std.process.Init) !void {
             compiled_required = true;
         } else if (std.mem.eql(u8, arg, "--dump-span-parity")) {
             dump_span_parity = true;
+        } else if (std.mem.eql(u8, arg, "--dump-optimizer-parity")) {
+            dump_optimizer_parity = true;
         } else if (std.mem.eql(u8, arg, "--lora-only-trainables")) {
             lora_only_trainables = true;
         } else if (std.mem.eql(u8, arg, "--deterministic")) {
@@ -373,6 +378,7 @@ pub fn main(init: std.process.Init) !void {
         .backend = backend,
         .compiled_required = compiled_required,
         .dump_span_parity = dump_span_parity,
+        .dump_optimizer_parity = dump_optimizer_parity,
         .lora_only_trainables = lora_only_trainables,
         .deterministic = deterministic,
         .eval_strategy = eval_strategy,
@@ -1215,6 +1221,12 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             epoch_target_stats.add(target_stats);
             run_target_stats.add(target_stats);
             total_steps += 1;
+            if (result.optimizer_stepped) {
+                try syncZeroGradLoraOptimizerSteps(allocator, &trainer, opts.learning_rate);
+                if (opts.dump_optimizer_parity) {
+                    try printOptimizerParityDump(allocator, &trainer, total_steps);
+                }
+            }
             eval_window_loss += result.loss;
             eval_window_steps += 1;
             try writeStepMetric(&metrics_jsonl.writer, epoch + 1, total_steps, epoch_steps, result.loss, result.grad_norm, result.optimizer_stepped, target_stats, timing);
@@ -1566,6 +1578,126 @@ fn writeTrainingManifest(
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
     try buffer.writer.writeByte('\n');
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = manifest_path, .data = buffer.written() });
+}
+
+/// Mirror torch AdamW per-parameter step semantics for LoRA pairs whose
+/// gradient is exactly zero while their module still participates in the
+/// loss.
+///
+/// With the standard LoRA init (lora_B = 0) the lora_A gradient is exactly
+/// zero on the first optimizer step (grad_A = B^T · δ · x^T with B = 0), but
+/// torch's autograd still materializes that zero gradient, so torch AdamW
+/// creates optimizer state for lora_A and advances its per-parameter `step`
+/// counter on step 1. The Zig trainer skips all-zero gradients entirely
+/// (matching torch's behavior for grad=None params whose module never ran),
+/// which leaves lora_A's step counter one behind its sibling lora_B. When the
+/// first nonzero lora_A gradient arrives on step 2, the two sides then apply
+/// different Adam bias corrections (t=1 vs t=2), producing ~0.25·lr per-element
+/// weight divergence that compounds every following step.
+///
+/// This sync replays the missed zero-gradient AdamW steps for any lora_A
+/// whose sibling lora_B has stepped (nonzero grad ⇒ the module participated
+/// in this batch's loss, which is exactly torch's grad-is-not-None criterion).
+/// A zero-gradient AdamW step leaves m/v at zero and only applies decoupled
+/// weight decay + the step-count increment — identical to what torch does.
+fn syncZeroGradLoraOptimizerSteps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    lr: f32,
+) !void {
+    // Diagnostic escape hatch: lets the parity harness reproduce the
+    // pre-fix divergence without a rebuild.
+    if (std.c.getenv("TERMITE_GLINER2_DISABLE_ZERO_GRAD_STEP_SYNC")) |raw| {
+        const value = std.mem.span(raw);
+        if (value.len > 0 and !std.mem.eql(u8, value, "0")) return;
+    }
+    const suffix_b = ".lora_B";
+    const suffix_a = ".lora_A";
+    for (trainer.lora_params.items) |*slot_b| {
+        if (!std.mem.endsWith(u8, slot_b.name, suffix_b)) continue;
+        // Device-resident optimizer paths (Metal/MLX) keep m/v on device and
+        // never consult the host OptimizerState; skip them here.
+        if (slot_b.device != null) continue;
+        const target_steps = blk: {
+            const state_b = trainer.optimizer_state.param_states.getPtr(slot_b.name) orelse continue;
+            break :blk state_b.step_count;
+        };
+        if (target_steps == 0) continue;
+        const base = slot_b.name[0 .. slot_b.name.len - suffix_b.len];
+        var sibling: ?*real_autodiff.RealAutodiffTrainer.ParamSlot = null;
+        for (trainer.lora_params.items) |*candidate| {
+            if (candidate.name.len != base.len + suffix_a.len) continue;
+            if (!std.mem.startsWith(u8, candidate.name, base)) continue;
+            if (!std.mem.endsWith(u8, candidate.name, suffix_a)) continue;
+            sibling = candidate;
+            break;
+        }
+        const slot_a = sibling orelse continue;
+        if (slot_a.device != null) continue;
+        const current_steps = if (trainer.optimizer_state.param_states.getPtr(slot_a.name)) |state_a|
+            state_a.step_count
+        else
+            0;
+        if (current_steps >= target_steps) continue;
+        const zero_grad = try allocator.alloc(f32, slot_a.weights.len);
+        defer allocator.free(zero_grad);
+        @memset(zero_grad, 0);
+        var remaining = target_steps - current_steps;
+        while (remaining > 0) : (remaining -= 1) {
+            try optimizers.step(
+                .{ .adamw = trainer.config.optimizer },
+                &trainer.optimizer_state,
+                lr,
+                slot_a.name,
+                slot_a.weights,
+                zero_grad,
+            );
+        }
+    }
+}
+
+/// Emit one `GLINER2_OPT_PARITY` JSON line per optimizer step with, for every
+/// host-resident LoRA parameter: the post-update weights, Adam m/v state and
+/// per-parameter step counter (first 8 elements + f64 abs-sum per tensor).
+/// Consumed by scripts/compare_gliner2_lora_python_zig.py --dump-optimizer-parity.
+fn printOptimizerParityDump(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    step: u64,
+) !void {
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    const w = &buffer.writer;
+    try w.print("GLINER2_OPT_PARITY {{\"step\":{d},\"tensors\":[", .{step});
+    var first = true;
+    for (trainer.lora_params.items) |slot| {
+        if (slot.device != null) continue;
+        const peft_name = gliner2_bundle.autodiffParamNameToPeftName(allocator, slot.name) catch continue;
+        defer allocator.free(peft_name);
+        if (!first) try w.writeAll(",");
+        first = false;
+        const state = trainer.optimizer_state.param_states.getPtr(slot.name);
+        const step_count: u32 = if (state) |s| s.step_count else 0;
+        try w.print("{{\"name\":\"{s}\",\"step_count\":{d}", .{ peft_name, step_count });
+        try writeOptParityTensor(w, "weight", slot.weights);
+        try writeOptParityTensor(w, "m", if (state) |s| s.m else &.{});
+        try writeOptParityTensor(w, "v", if (state) |s| s.v else &.{});
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}\n");
+    print("{s}", .{buffer.written()});
+}
+
+fn writeOptParityTensor(w: *std.Io.Writer, name: []const u8, values: []const f32) !void {
+    try w.print(",\"{s}\":[", .{name});
+    const head_len = @min(values.len, 8);
+    for (values[0..head_len], 0..) |v, idx| {
+        if (idx > 0) try w.writeAll(",");
+        try w.print("{e}", .{v});
+    }
+    var abs_sum: f64 = 0.0;
+    for (values) |v| abs_sum += @abs(@as(f64, v));
+    try w.print("],\"{s}_abs_sum\":{e}", .{ name, abs_sum });
 }
 
 fn collectAutodiffAdapterParams(
@@ -3110,6 +3242,8 @@ fn printUsage() void {
         \\  --save-best               Snapshot adapters to <out-dir>/best when the eval metric improves
         \\  --report-to <name>        stdout or jsonl; jsonl emits one JSON object per step/eval to stdout
         \\  --dump-span-parity        Print first span-start batch logits/label/mask BCE stats as JSON
+        \\  --dump-optimizer-parity   Print per-step LoRA weight/Adam m/v state heads as JSON
+        \\                            (GLINER2_OPT_PARITY lines, host optimizer paths only)
         \\
         \\notes:
         \\  Tokenization uses gliner2_data.Tokenizer.initGLiNER2HF and the

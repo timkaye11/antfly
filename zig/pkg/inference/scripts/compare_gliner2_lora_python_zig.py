@@ -312,6 +312,7 @@ def parse_zig_output(output: str) -> dict[str, Any]:
     component_debug = extract_prefixed_json(output, "SPAN_COMPONENT_DEBUG ")
     total_component_debug = extract_prefixed_json(output, "GLINER2_TOTAL_LOSS_COMPONENT_DEBUG ")
     classification_debug = extract_prefixed_json(output, "GLINER2_CLASSIFICATION_DEBUG ")
+    optimizer_parity_steps = extract_prefixed_json(output, "GLINER2_OPT_PARITY ")
     return {
         "step_loss": parse_float(step.group(1)) if step else None,
         "grad_norm": parse_float(step.group(2)) if step else None,
@@ -323,6 +324,7 @@ def parse_zig_output(output: str) -> dict[str, Any]:
         "span_component_debug": component_debug[-1] if component_debug else None,
         "gliner2_total_loss_components": total_component_debug[-1] if total_component_debug else None,
         "gliner2_classification_debug": classification_debug[-1] if classification_debug else None,
+        "optimizer_parity_steps": optimizer_parity_steps,
     }
 
 
@@ -579,6 +581,138 @@ def compare_classification_debug(py: dict[str, Any] | None, zig: dict[str, Any] 
         }
         ok = ok and field_ok
     return ok, deltas
+
+
+def canonical_adapter_param_name(name: str) -> str:
+    """Map Python PEFT and Zig PEFT-export parameter names onto one key.
+
+    Python (PEFT) trainable params look like
+    `base_model.model.<module>.lora_A.default.weight`; the Zig optimizer
+    parity dump emits the PEFT-export name `<module>.lora_A.weight`.
+    """
+    if name.startswith("base_model.model."):
+        name = name[len("base_model.model."):]
+    name = name.replace(".lora_A.default.", ".lora_A.").replace(".lora_B.default.", ".lora_B.")
+    if name.endswith(".weight"):
+        name = name[: -len(".weight")]
+    return name
+
+
+def _derived_grad_head(m_now: list[Any], m_prev: list[Any], beta1: float) -> list[float]:
+    """Recover the post-clip gradient head from the Adam first-moment update.
+
+    m_t = beta1 * m_{t-1} + (1 - beta1) * g_t  =>  g_t = (m_t - beta1*m_{t-1}) / (1-beta1)
+    """
+    out: list[float] = []
+    for idx, value in enumerate(m_now or []):
+        prev = float(m_prev[idx]) if m_prev and idx < len(m_prev) else 0.0
+        out.append((float(value) - beta1 * prev) / (1.0 - beta1))
+    return out
+
+
+def compare_optimizer_parity(
+    py_steps: list[dict[str, Any]] | None,
+    zig_steps: list[dict[str, Any]] | None,
+    beta1: float = 0.9,
+) -> dict[str, Any]:
+    """Per-step grad/m/v/weight comparison for the LoRA adapter tensors.
+
+    Localizes where multi-step divergence is born: a gradient delta points at
+    the forward/backward pass, an m/v delta (with matching gradients) points
+    at the optimizer formula or its per-parameter step bookkeeping, and a
+    weight delta with matching m/v points at the parameter update itself.
+    """
+    if not py_steps or not zig_steps:
+        return {
+            "ran": False,
+            "python_step_count": len(py_steps or []),
+            "zig_step_count": len(zig_steps or []),
+        }
+
+    def index_steps(steps: list[dict[str, Any]]) -> list[dict[str, dict[str, Any]]]:
+        indexed: list[dict[str, dict[str, Any]]] = []
+        for payload in steps:
+            indexed.append({
+                canonical_adapter_param_name(str(t.get("name"))): t
+                for t in payload.get("tensors", [])
+            })
+        return indexed
+
+    py_idx = index_steps(py_steps)
+    zig_idx = index_steps(zig_steps)
+    quantities = ("weight", "m", "v")
+    step_reports: list[dict[str, Any]] = []
+    for step_i in range(min(len(py_idx), len(zig_idx))):
+        py_tensors = py_idx[step_i]
+        zig_tensors = zig_idx[step_i]
+        common = sorted(set(py_tensors) & set(zig_tensors))
+        head_max = {q: {"max_abs_delta": 0.0, "tensor": None} for q in quantities}
+        abs_sum_max = {q: {"max_abs_delta": 0.0, "tensor": None} for q in quantities}
+        derived_grad_max = {"max_abs_delta": 0.0, "tensor": None}
+        true_vs_derived_grad_max = {"max_abs_delta": 0.0, "tensor": None}
+        step_count_mismatches: list[dict[str, Any]] = []
+        for name in common:
+            pt = py_tensors[name]
+            zt = zig_tensors[name]
+            py_step_count = int(pt.get("step_count") or 0)
+            zig_step_count = int(zt.get("step_count") or 0)
+            if py_step_count != zig_step_count:
+                step_count_mismatches.append({
+                    "tensor": name,
+                    "python": py_step_count,
+                    "zig": zig_step_count,
+                })
+            for q in quantities:
+                pv = pt.get(q) or []
+                zv = zt.get(q) or []
+                for a, b in zip(pv, zv):
+                    if not (finite_number(a) and finite_number(b)):
+                        continue
+                    delta = abs(float(a) - float(b))
+                    if delta > head_max[q]["max_abs_delta"]:
+                        head_max[q] = {"max_abs_delta": delta, "tensor": name}
+                pa = pt.get(f"{q}_abs_sum")
+                za = zt.get(f"{q}_abs_sum")
+                if finite_number(pa) and finite_number(za):
+                    delta = abs(float(pa) - float(za))
+                    if delta > abs_sum_max[q]["max_abs_delta"]:
+                        abs_sum_max[q] = {"max_abs_delta": delta, "tensor": name}
+            py_m_prev = (py_idx[step_i - 1].get(name, {}).get("m") or []) if step_i > 0 else []
+            zig_m_prev = (zig_idx[step_i - 1].get(name, {}).get("m") or []) if step_i > 0 else []
+            py_derived = _derived_grad_head(pt.get("m") or [], py_m_prev, beta1)
+            zig_derived = _derived_grad_head(zt.get("m") or [], zig_m_prev, beta1)
+            for a, b in zip(py_derived, zig_derived):
+                delta = abs(a - b)
+                if delta > derived_grad_max["max_abs_delta"]:
+                    derived_grad_max = {"max_abs_delta": delta, "tensor": name}
+            for a, b in zip(pt.get("grad") or [], zig_derived):
+                if not finite_number(a):
+                    continue
+                delta = abs(float(a) - b)
+                if delta > true_vs_derived_grad_max["max_abs_delta"]:
+                    true_vs_derived_grad_max = {"max_abs_delta": delta, "tensor": name}
+        step_reports.append({
+            "step": step_i + 1,
+            "tensors_compared": len(common),
+            "python_only_tensors": len(py_tensors) - len(common),
+            "zig_only_tensors": len(zig_tensors) - len(common),
+            "step_count_mismatch_count": len(step_count_mismatches),
+            "step_count_mismatches": step_count_mismatches[:10],
+            "weight_head_max_abs_delta": head_max["weight"],
+            "m_head_max_abs_delta": head_max["m"],
+            "v_head_max_abs_delta": head_max["v"],
+            "weight_abs_sum_max_abs_delta": abs_sum_max["weight"],
+            "m_abs_sum_max_abs_delta": abs_sum_max["m"],
+            "v_abs_sum_max_abs_delta": abs_sum_max["v"],
+            "derived_grad_head_max_abs_delta": derived_grad_max,
+            "python_true_grad_vs_zig_derived_max_abs_delta": true_vs_derived_grad_max,
+        })
+    return {
+        "ran": True,
+        "python_step_count": len(py_idx),
+        "zig_step_count": len(zig_idx),
+        "steps": step_reports,
+    }
 
 
 def summarize_preprocess_tasks(samples: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -878,6 +1012,7 @@ p.add_argument("--seed", type=int, required=True)
 p.add_argument("--span-negative-mask-rate", type=float, required=True)
 p.add_argument("--disable-model-dropout", action="store_true")
 p.add_argument("--dump-parity", action="store_true")
+p.add_argument("--dump-optimizer-parity", action="store_true")
 p.add_argument("--no-train-shuffle", action="store_true")
 args = p.parse_args()
 
@@ -1564,6 +1699,68 @@ if args.dump_parity:
             del classifier_forward_outputs[classifier_start:]
         return out
     debug_model._compute_sample_loss = types.MethodType(compute_sample_loss_with_debug, debug_model)
+optimizer_parity_steps = []
+if args.dump_optimizer_parity:
+    # Wrap the AdamW instance the trainer creates so each optimizer step
+    # records, for every trainable (LoRA) parameter: the post-clip gradient,
+    # the Adam exp_avg/exp_avg_sq state, the per-parameter step counter, and
+    # the post-update weights (first 8 elements + f64 abs-sum per tensor).
+    _orig_create_optimizer = trainer._create_optimizer
+
+    def _opt_head_abs(tensor):
+        flat = tensor.detach().to(torch.float32).reshape(-1)
+        head = [float(x) for x in flat[:8].tolist()]
+        abs_sum = float(flat.to(torch.float64).abs().sum().item())
+        return head, abs_sum
+
+    def _create_optimizer_with_dump():
+        opt = _orig_create_optimizer()
+        param_names = {id(prm): name for name, prm in trainer.model.named_parameters()}
+
+        _orig_opt_step = opt.step
+
+        def step_with_dump(_opt_self, *step_args, **step_kwargs):
+            grads = {}
+            for group in opt.param_groups:
+                for prm in group["params"]:
+                    if prm.grad is not None:
+                        grads[id(prm)] = prm.grad.detach().clone()
+            out_value = _orig_opt_step(*step_args, **step_kwargs)
+            tensors = []
+            for group in opt.param_groups:
+                for prm in group["params"]:
+                    name = param_names.get(id(prm))
+                    if name is None:
+                        continue
+                    state = opt.state.get(prm, {})
+                    raw_step = state.get("step")
+                    if hasattr(raw_step, "item"):
+                        step_count = int(raw_step.item())
+                    elif raw_step is None:
+                        step_count = 0
+                    else:
+                        step_count = int(raw_step)
+                    entry = {"name": name, "step_count": step_count}
+                    entry["weight"], entry["weight_abs_sum"] = _opt_head_abs(prm.data)
+                    for quantity, key in (("m", "exp_avg"), ("v", "exp_avg_sq")):
+                        if key in state:
+                            entry[quantity], entry[f"{quantity}_abs_sum"] = _opt_head_abs(state[key])
+                        else:
+                            entry[quantity], entry[f"{quantity}_abs_sum"] = [], 0.0
+                    grad = grads.get(id(prm))
+                    if grad is not None:
+                        entry["grad"], entry["grad_abs_sum"] = _opt_head_abs(grad)
+                    tensors.append(entry)
+            optimizer_parity_steps.append({"step": len(optimizer_parity_steps) + 1, "tensors": tensors})
+            return out_value
+
+        # Bind as a method: torch's LR schedulers patch optimizer.step via
+        # `step_fn.__func__`, which requires a bound method rather than a
+        # plain function attribute.
+        opt.step = types.MethodType(step_with_dump, opt)
+        return opt
+
+    trainer._create_optimizer = _create_optimizer_with_dump
 result = trainer.train(train_data=args.train_data)
 trainable = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in trainer.model.parameters())
@@ -1598,6 +1795,7 @@ payload = {
         if sample_loss_debug else None
     ),
     "gliner2_classification_debug": classification_debug[0] if classification_debug else None,
+    "optimizer_parity_steps": optimizer_parity_steps,
 }
 (out / "comparison_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 print("PYTHON_GLINER2_COMPARISON " + json.dumps(payload, sort_keys=True))
@@ -1625,7 +1823,9 @@ p.add_argument("--batch-size", type=int, required=True)
 p.add_argument("--max-span-width", type=int, required=True)
 p.add_argument("--seed", type=int, required=True)
 p.add_argument("--tolerance", type=float, required=True)
+p.add_argument("--weights-tolerance", type=float, default=None)
 args = p.parse_args()
+weights_tolerance = args.weights_tolerance if args.weights_tolerance is not None else args.tolerance
 
 torch.manual_seed(args.seed)
 
@@ -1850,7 +2050,7 @@ naming_ok = (
     and not weight_shape_mismatches
     and (not missing_keys or missing_keys_functionally_zero)
 )
-weights_ok = weights_max_abs_delta <= args.tolerance
+weights_ok = weights_max_abs_delta <= weights_tolerance
 logits_ok = (
     span_delta is not None
     and cls_delta is not None
@@ -1867,6 +2067,7 @@ result = {
     "logits_ok": bool(logits_ok),
     "adapter_format": "peft" if peft_format else "gliner2_legacy",
     "tolerance": args.tolerance,
+    "weights_tolerance": weights_tolerance,
     "span_scores_count_python": int(python_run["span_scores"].numel()),
     "span_scores_count_zig": int(zig_run["span_scores"].numel()),
     "span_scores_max_abs_delta": span_delta,
@@ -1926,6 +2127,8 @@ def run_adapter_roundtrip(args: argparse.Namespace, out_dir: Path, report: dict[
         "--seed", str(args.seed),
         "--tolerance", str(args.adapter_roundtrip_tolerance),
     ]
+    if args.adapter_roundtrip_weights_tolerance is not None:
+        cmd.extend(["--weights-tolerance", str(args.adapter_roundtrip_weights_tolerance)])
     command_result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env={"PYTHONHASHSEED": "0"})
     result["ran"] = True
     result["returncode"] = command_result.get("returncode")
@@ -1966,6 +2169,8 @@ def run_python_side(args: argparse.Namespace, py_train_data: Path, out_dir: Path
         cmd.append("--disable-model-dropout")
     if args.dump_parity:
         cmd.append("--dump-parity")
+    if args.dump_optimizer_parity:
+        cmd.append("--dump-optimizer-parity")
     if args.dump_preprocess_parity:
         cmd.append("--no-train-shuffle")
     result = run_command(cmd, repo_root(), timeout=args.timeout_seconds, env={"PYTHONHASHSEED": "0"})
@@ -2043,7 +2248,11 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         cmd.extend(["--initial-adapter-checkpoint", str(initial_adapter_checkpoint)])
     if args.dump_parity:
         cmd.append("--dump-span-parity")
+    if args.dump_optimizer_parity:
+        cmd.append("--dump-optimizer-parity")
     zig_env: dict[str, str] = {}
+    if args.zig_disable_zero_grad_step_sync:
+        zig_env["TERMITE_GLINER2_DISABLE_ZERO_GRAD_STEP_SYNC"] = "1"
     if args.zig_backend == "metal" and args.zig_training_graph_executor:
         zig_env["TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR"] = "1"
     result = run_command(cmd, inference_dir(), timeout=args.timeout_seconds, env=zig_env)
@@ -2118,6 +2327,16 @@ def main() -> int:
     p.add_argument("--dump-parity", action="store_true", help="Collect first-batch span objective logits/label/mask stats from both implementations")
     p.add_argument("--dump-preprocess-parity", action="store_true", help="Collect first-batch preprocessing metadata from both implementations")
     p.add_argument(
+        "--dump-optimizer-parity",
+        action="store_true",
+        help="Capture per-step adapter gradient/Adam-state/weight heads from both implementations and report per-step max-abs deltas (implies --dump-preprocess-parity for batch-order parity)",
+    )
+    p.add_argument(
+        "--zig-disable-zero-grad-step-sync",
+        action="store_true",
+        help="Diagnostic: set TERMITE_GLINER2_DISABLE_ZERO_GRAD_STEP_SYNC=1 for the Zig trainer to reproduce the pre-fix lora_A step-count lag",
+    )
+    p.add_argument(
         "--loss-parity-tolerance",
         type=float,
         default=1e-4,
@@ -2148,6 +2367,18 @@ def main() -> int:
         help="Maximum absolute logit delta for the adapter round-trip comparison",
     )
     p.add_argument(
+        "--adapter-roundtrip-weights-tolerance",
+        type=float,
+        default=None,
+        help=(
+            "Separate maximum absolute adapter-weight delta for the round-trip comparison "
+            "(default: same as --adapter-roundtrip-tolerance). For multi-step runs a principled "
+            "bound is ~2*lr*steps: Adam normalizes any sign-flipped f32-noise gradient element "
+            "to a ~lr-scale update, so two bit-different but correct implementations can diverge "
+            "by up to ~2*lr per element per step"
+        ),
+    )
+    p.add_argument(
         "--perf-target-only-python",
         action="store_true",
         help="Treat Python as a timing target only; report Python/Zig loss delta but mark loss parity invalid",
@@ -2163,6 +2394,8 @@ def main() -> int:
     p.add_argument("--skip-zig", action="store_true")
     p.add_argument("--keep-out-dir", action="store_true")
     args = p.parse_args()
+    if args.dump_optimizer_parity:
+        args.dump_preprocess_parity = True
     if args.dump_preprocess_parity:
         args.dump_parity = True
     if args.deterministic:
@@ -2225,12 +2458,14 @@ def main() -> int:
             "zig_optimize": args.zig_optimize,
             "dump_parity": args.dump_parity,
             "dump_preprocess_parity": args.dump_preprocess_parity,
+            "dump_optimizer_parity": args.dump_optimizer_parity,
             "loss_parity_tolerance": args.loss_parity_tolerance,
             "perf_target_only_python": args.perf_target_only_python,
             "strict": args.strict,
             "deterministic": args.deterministic,
             "adapter_roundtrip": args.adapter_roundtrip,
             "adapter_roundtrip_tolerance": args.adapter_roundtrip_tolerance,
+            "adapter_roundtrip_weights_tolerance": args.adapter_roundtrip_weights_tolerance,
         },
     }
 
@@ -2317,6 +2552,38 @@ def main() -> int:
         zig_classification_debug,
         args.loss_parity_tolerance,
     )
+    optimizer_parity: dict[str, Any] | None = None
+    if args.dump_optimizer_parity:
+        optimizer_parity = compare_optimizer_parity(
+            report.get("python", {}).get("metrics", {}).get("optimizer_parity_steps"),
+            report.get("zig", {}).get("metrics", {}).get("optimizer_parity_steps"),
+        )
+        report["optimizer_parity"] = optimizer_parity
+        if optimizer_parity.get("ran"):
+            print("optimizer parity (per-step max-abs deltas over common adapter tensors):")
+            for row in optimizer_parity.get("steps", []):
+                print(
+                    "  step {step}: tensors={tensors} step_count_mismatches={mismatches} "
+                    "grad(derived)={grad:.3e} m={m:.3e} v={v:.3e} weight={w:.3e}".format(
+                        step=row["step"],
+                        tensors=row["tensors_compared"],
+                        mismatches=row["step_count_mismatch_count"],
+                        grad=row["derived_grad_head_max_abs_delta"]["max_abs_delta"],
+                        m=row["m_head_max_abs_delta"]["max_abs_delta"],
+                        v=row["v_head_max_abs_delta"]["max_abs_delta"],
+                        w=row["weight_head_max_abs_delta"]["max_abs_delta"],
+                    )
+                )
+                if row["step_count_mismatches"]:
+                    first = row["step_count_mismatches"][0]
+                    print(
+                        f"    first step_count mismatch: {first['tensor']} python={first['python']} zig={first['zig']}"
+                    )
+        else:
+            print(
+                "optimizer parity: no dumps to compare "
+                f"(python_steps={optimizer_parity.get('python_step_count')} zig_steps={optimizer_parity.get('zig_step_count')})"
+            )
     zig_manifest = report.get("zig", {}).get("training_manifest", {})
     zig_warm_step_rows = zig_step_rows[1:] if len(zig_step_rows) > 1 else []
     zig_warm_total_trainer_ms = (

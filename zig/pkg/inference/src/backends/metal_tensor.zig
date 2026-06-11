@@ -640,6 +640,66 @@ pub const MetalTensor = struct {
             }
         }
     }
+
+    /// Diagnostic only: abs-sum of the RAW device bytes via a fresh
+    /// download (frame-flushed), bypassing any cached host mirror and
+    /// mutating no tensor state. Host-only tensors sum their host data.
+    pub fn debugRawDeviceAbsSum(self: *MetalTensor) !f64 {
+        const dev = if (self.device) |*d| d else {
+            var acc: f64 = 0;
+            for (self.data[0..self.len]) |v| acc += @abs(v);
+            return acc;
+        };
+        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+            return error.MetalFrameSyncFailed;
+        }
+        const count = dev.byte_len / @sizeOf(f32);
+        const buf = try std.heap.c_allocator.alloc(f32, count);
+        defer std.heap.c_allocator.free(buf);
+        const rc = termite_metal_buffer_download(
+            dev.ref.runtime,
+            dev.ref.handle,
+            dev.byte_offset,
+            @ptrCast(buf.ptr),
+            dev.byte_len,
+        );
+        if (rc != 0) return error.MetalBufferDownloadFailed;
+        var acc: f64 = 0;
+        for (buf) |v| acc += @abs(v);
+        return acc;
+    }
+
+    /// Diagnostic only: CPU reference for a last-dim row-sum reduce over
+    /// the RAW device bytes (fresh frame-flushed download). Returns the
+    /// sum of |row sums| so it is directly comparable with an abs-sum of
+    /// the reduce kernel's output.
+    pub fn debugRawDeviceRowSumAbs(self: *MetalTensor, row_count: usize, row_width: usize) !f64 {
+        const dev = if (self.device) |*d| d else return error.UnsupportedTensorType;
+        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+            return error.MetalFrameSyncFailed;
+        }
+        const count = dev.byte_len / @sizeOf(f32);
+        if (row_count * row_width > count) return error.InvalidTensorShape;
+        const buf = try std.heap.c_allocator.alloc(f32, count);
+        defer std.heap.c_allocator.free(buf);
+        const rc = termite_metal_buffer_download(
+            dev.ref.runtime,
+            dev.ref.handle,
+            dev.byte_offset,
+            @ptrCast(buf.ptr),
+            dev.byte_len,
+        );
+        if (rc != 0) return error.MetalBufferDownloadFailed;
+        var acc: f64 = 0;
+        for (0..row_count) |r| {
+            var row_sum: f64 = 0;
+            for (0..row_width) |c| row_sum += buf[r * row_width + c];
+            acc += @abs(row_sum);
+        }
+        return acc;
+    }
 };
 
 test "MetalTensor borrowed does not free" {

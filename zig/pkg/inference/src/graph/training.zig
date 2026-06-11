@@ -52,6 +52,7 @@ const metal_capabilities = @import("metal_capabilities.zig");
 const metal_partition_executor = @import("metal_partition_executor.zig");
 const device_mesh = @import("device_mesh.zig");
 const multi_executor = @import("multi_executor.zig");
+const io_compat = @import("../io/compat.zig");
 
 pub const TrainStepResult = struct {
     loss: f32,
@@ -640,6 +641,16 @@ pub const CompiledTrainSession = struct {
 
         const extract_start = nowNs();
         compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ exec_result.outputs.len, retain_device_gradients, currentResidentBytes() });
+        maybeDumpGraphOutputValues(
+            &self.graph,
+            self.allocator,
+            self.loss_output_index,
+            cb,
+            null,
+            null,
+            exec_result.outputs,
+            "interpreter",
+        );
         const loss_data = try cb.toFloat32(exec_result.outputs[self.loss_output_index], self.allocator);
         defer self.allocator.free(loss_data);
         if (loss_data.len == 0) {
@@ -975,6 +986,16 @@ pub const CompiledTrainSession = struct {
         if (metal_partition_executor.metalOutputLifetimeDebugEnabled()) {
             try self.debugCompareGraphOutputLifetimes(cb, mesh, multi_result);
         }
+        maybeDumpGraphOutputValues(
+            &self.graph,
+            self.allocator,
+            self.loss_output_index,
+            cb,
+            mesh,
+            multi_result.output_devices,
+            outputs,
+            "executor",
+        );
         const loss_device = mesh.device(multi_result.output_devices[self.loss_output_index]) orelse return error.DeviceNotFound;
         const loss_data = try loss_device.backend.toFloat32(outputs[self.loss_output_index], self.allocator);
         defer self.allocator.free(loss_data);
@@ -1390,6 +1411,127 @@ fn dumpGraphNode(graph: *const Graph, node_id: NodeId) void {
         }
         std.debug.print("\n", .{});
     }
+}
+
+// ── Graph-output truth-diff dump ───────────────────────────────────────
+//
+// TERMITE_DUMP_GRAPH_OUTPUT_VALUES=/path.jsonl writes, after every executed
+// training step, one JSON line per graph output:
+//   {"step":N,"mode":"executor|interpreter","idx":I,"node":ID,"op":"add",
+//    "shape":[..],"len":L,"first4":[..],"abs_sum":S}
+// Works on BOTH the Metal graph-executor path and the direct-interpreter
+// path, so an orchestrator can run each mode once (toggling
+// TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR) into two files and diff them:
+// outputs nonzero under the interpreter but zero (or differing beyond fp
+// tolerance) under the executor form the genuinely-broken set — outputs
+// zero in BOTH modes (e.g. step-1 LoRA grad_A with B=0 init) are
+// mathematically legitimate and need no fix.
+//
+// Lines accumulate in a process-global buffer and the whole file is
+// rewritten after each step (avoids append-mode IO; dump size is tiny).
+
+var graph_output_dump_buffer = std.ArrayListUnmanaged(u8).empty;
+var graph_output_dump_steps_executor: u64 = 0;
+var graph_output_dump_steps_interpreter: u64 = 0;
+
+fn appendGraphOutputDump(comptime fmt: []const u8, args: anytype) !void {
+    const gpa = std.heap.c_allocator;
+    const text = try std.fmt.allocPrint(gpa, fmt, args);
+    defer gpa.free(text);
+    try graph_output_dump_buffer.appendSlice(gpa, text);
+}
+
+fn dumpGraphOutputValuesJsonl(
+    graph: *const Graph,
+    allocator: std.mem.Allocator,
+    loss_output_index: usize,
+    default_backend: *const ComputeBackend,
+    mesh: ?*const device_mesh.DeviceMesh,
+    output_devices: ?[]const device_mesh.DeviceId,
+    outputs: []const CT,
+    mode: []const u8,
+    path: []const u8,
+    step: u64,
+) !void {
+    for (graph.outputs.items, 0..) |output_node, idx| {
+        if (idx >= outputs.len) break;
+        var backend = default_backend;
+        if (mesh) |m| {
+            if (output_devices) |devices| {
+                if (idx < devices.len) {
+                    if (m.device(devices[idx])) |entry| backend = entry.backend;
+                }
+            }
+        }
+        const node = graph.node(output_node);
+        const op_name = @tagName(std.meta.activeTag(node.op));
+        const data = backend.toFloat32(outputs[idx], allocator) catch |err| {
+            try appendGraphOutputDump(
+                "{{\"step\":{d},\"mode\":\"{s}\",\"idx\":{d},\"node\":{d},\"op\":\"{s}\",\"error\":\"{s}\"}}\n",
+                .{ step, mode, idx, output_node, op_name, @errorName(err) },
+            );
+            continue;
+        };
+        defer allocator.free(data);
+        var abs_sum: f64 = 0;
+        for (data) |value| abs_sum += @abs(value);
+        try appendGraphOutputDump(
+            "{{\"step\":{d},\"mode\":\"{s}\",\"idx\":{d},\"node\":{d},\"op\":\"{s}\",\"loss\":{},\"shape\":[",
+            .{ step, mode, idx, output_node, op_name, idx == loss_output_index },
+        );
+        const shape = node.output_shape;
+        var axis: u8 = 0;
+        while (axis < shape.rank()) : (axis += 1) {
+            if (axis > 0) try appendGraphOutputDump(",", .{});
+            try appendGraphOutputDump("{d}", .{shape.dim(axis)});
+        }
+        try appendGraphOutputDump("],\"len\":{d},\"first4\":[", .{data.len});
+        for (data[0..@min(data.len, 4)], 0..) |value, value_idx| {
+            if (value_idx > 0) try appendGraphOutputDump(",", .{});
+            try appendGraphOutputDump("{d}", .{value});
+        }
+        try appendGraphOutputDump("],\"abs_sum\":{d}}}\n", .{abs_sum});
+    }
+    try io_compat.cwd().writeFile(io_compat.io(), .{
+        .sub_path = path,
+        .data = graph_output_dump_buffer.items,
+    });
+}
+
+fn maybeDumpGraphOutputValues(
+    graph: *const Graph,
+    allocator: std.mem.Allocator,
+    loss_output_index: usize,
+    default_backend: *const ComputeBackend,
+    mesh: ?*const device_mesh.DeviceMesh,
+    output_devices: ?[]const device_mesh.DeviceId,
+    outputs: []const CT,
+    mode: []const u8,
+) void {
+    const path = platform.env.getenv("TERMITE_DUMP_GRAPH_OUTPUT_VALUES") orelse return;
+    const step_counter = if (std.mem.eql(u8, mode, "executor"))
+        &graph_output_dump_steps_executor
+    else
+        &graph_output_dump_steps_interpreter;
+    const step = step_counter.*;
+    step_counter.* += 1;
+    dumpGraphOutputValuesJsonl(
+        graph,
+        allocator,
+        loss_output_index,
+        default_backend,
+        mesh,
+        output_devices,
+        outputs,
+        mode,
+        path,
+        step,
+    ) catch |err| {
+        std.debug.print(
+            "[graph-output-dump] mode={s} step={} write to {s} failed: {s}\n",
+            .{ mode, step, path, @errorName(err) },
+        );
+    };
 }
 
 fn trainingGraphExecutorParityMaxGradientValues() usize {

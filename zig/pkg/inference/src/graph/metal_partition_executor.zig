@@ -51,6 +51,16 @@ const OperatorPlan = operator_plan_mod.OperatorPlan;
 
 const max_graph_plan_slots = 26;
 
+/// Upper element-count bound for the graph-output "scalar tail" elision
+/// protection. Nodes at most this many elements that feed a graph output
+/// (transitively, through equally tiny producers) are never left elided by
+/// fused patterns / runtime regions: they are re-executed as plain commands
+/// so the loss-reduction tail (scalar masked-BCE sums, the final loss add)
+/// always materializes. Large tensors terminate the upstream walk, so real
+/// fusion targets (hidden states, attention scores, per-element losses)
+/// keep their fused execution.
+const graph_output_scalar_tail_max_elems: i64 = 64;
+
 const MetalExecutionKind = enum {
     command,
     metadata_alias,
@@ -883,12 +893,53 @@ pub const MetalPartitionExecutor = struct {
         // matchers and markXxxSkipped sets only consider consumer edges,
         // not `graph.outputs` membership, so the skip override below is
         // the single chokepoint that restores materialization.
-        const graph_output_nodes = try allocator.alloc(bool, values.len);
-        defer allocator.free(graph_output_nodes);
-        @memset(graph_output_nodes, false);
-        for (graph.outputs.items) |output_id| {
-            const output_index: usize = @intCast(output_id);
-            if (output_index < graph_output_nodes.len) graph_output_nodes[output_index] = true;
+        //
+        // Protection extends past the outputs themselves to the tiny
+        // "scalar tail" feeding them: re-executing an elided OUTPUT node is
+        // useless when its INPUTS were also fused-pattern / runtime-region
+        // interiors whose slots were never written (the training loss is a
+        // scalar `add` of scalar loss-component reductions — exactly such a
+        // tail). Walking upstream from every graph output through producers
+        // whose total element count is tiny marks the whole tail
+        // override-protected, so each tail node executes as a plain command
+        // at its own (topologically ordered) loop position and the chain
+        // materializes bottom-up. The element-count bound keeps the walk
+        // from protecting real fusion targets: large interiors (hidden
+        // states, attention scores, per-element losses) terminate it.
+        const elision_protected_nodes = try allocator.alloc(bool, values.len);
+        defer allocator.free(elision_protected_nodes);
+        @memset(elision_protected_nodes, false);
+        // TERMITE_DISABLE_GRAPH_OUTPUT_ELISION_OVERRIDE=1 leaves the
+        // protection set empty, disabling every downstream use of the
+        // mechanism (skip override, defer-heuristic exemption) at its
+        // single source.
+        if (!graphOutputElisionOverrideDisabled()) {
+            var protect_worklist = std.ArrayListUnmanaged(NodeId).empty;
+            defer protect_worklist.deinit(allocator);
+            for (graph.outputs.items) |output_id| {
+                const output_index: usize = @intCast(output_id);
+                if (output_index >= elision_protected_nodes.len) continue;
+                if (elision_protected_nodes[output_index]) continue;
+                elision_protected_nodes[output_index] = true;
+                try protect_worklist.append(allocator, output_id);
+            }
+            while (protect_worklist.pop()) |protected_id| {
+                for (graph.node(protected_id).getInputs()) |input_id| {
+                    if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+                    const input_index: usize = @intCast(input_id);
+                    if (input_index >= elision_protected_nodes.len) continue;
+                    if (elision_protected_nodes[input_index]) continue;
+                    const input_node = graph.node(input_id);
+                    // Parameters / pre-materialized constants always have
+                    // values; protecting them would only widen the walk.
+                    if (input_node.op == .parameter) continue;
+                    if (isPreMaterializedConstantOp(input_node.op)) continue;
+                    const elems = input_node.output_shape.numElements() orelse continue;
+                    if (elems > graph_output_scalar_tail_max_elems) continue;
+                    elision_protected_nodes[input_index] = true;
+                    try protect_worklist.append(allocator, input_id);
+                }
+            }
         }
 
         var transient_runtime_region_plan: ?RuntimeRegionPlan = null;
@@ -925,15 +976,16 @@ pub const MetalPartitionExecutor = struct {
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
             if (i < skipped_nodes.len and skipped_nodes[i]) {
-                if (i >= graph_output_nodes.len or !graph_output_nodes[i]) continue;
+                if (i >= elision_protected_nodes.len or !elision_protected_nodes[i]) continue;
                 // A fused pattern / runtime region elided this node as
-                // fused-interior state, but it is a GRAPH OUTPUT: its slot
-                // must hold the node's value after the partition completes.
-                // Clear the skip and execute the node normally below;
-                // producers the fusion also elided are materialized on
-                // demand by the interpreter-fallback safety net. Any value
-                // a fused executor left behind cannot be trusted (it may be
-                // a plan-slot view no kernel writes), so drop it first —
+                // fused-interior state, but it is a GRAPH OUTPUT (or part of
+                // the tiny scalar tail feeding one): its slot must hold the
+                // node's value after the partition completes. Clear the skip
+                // and execute the node normally below; producers the fusion
+                // also elided are materialized on demand below and by the
+                // interpreter-fallback safety net. Any value a fused
+                // executor left behind cannot be trusted (it may be a
+                // plan-slot view no kernel writes), so drop it first —
                 // freeing only when this CT handle is not caller-owned and
                 // not aliased by another node's slot.
                 skipped_nodes[i] = false;
@@ -955,6 +1007,14 @@ pub const MetalPartitionExecutor = struct {
                         values[i] = null;
                     }
                 }
+                // Materialize still-elided (null + skipped) inputs BEFORE
+                // any execution attempt: the metal-command path consumes
+                // input slots directly, so an elided-interior producer that
+                // was never written must be computed first. The fallback
+                // safety net only runs when the command path already
+                // missed — too late for a command that silently read a
+                // null/absent input.
+                try materializeDeferredSkippedInputs(allocator, graph, cb, values, value_device, device_id, node_id, skipped_nodes, &exec_state, 0);
             }
 
             if (rt_map.contains(node_id)) {
@@ -969,11 +1029,17 @@ pub const MetalPartitionExecutor = struct {
 
             if (graph.node(node_id).op == .fused_from_float32) continue;
 
-            if (shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
+            // Defer heuristics may not skip override-protected nodes (graph
+            // outputs / scalar-tail producers): the loop never revisits a
+            // node's position, so a protected node deferred here would rely
+            // on a consumer fusing it — which writes the consumer's slot,
+            // not this one.
+            const node_elision_protected = i < elision_protected_nodes.len and elision_protected_nodes[i];
+            if (!node_elision_protected and shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
-            if (shouldDeferElementwiseMulForAdd(graph, node_id, reachable, last_use)) {
+            if (!node_elision_protected and shouldDeferElementwiseMulForAdd(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -995,7 +1061,7 @@ pub const MetalPartitionExecutor = struct {
                 }
             }
 
-            if (shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use)) {
+            if (!node_elision_protected and shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -1243,7 +1309,13 @@ pub const MetalPartitionExecutor = struct {
             // stale/empty data.
             if (trace_progress) std.debug.print("metal_partition_progress: phase=sync_graph_outputs_begin partition={d}\n", .{partition_index});
             const graph_outputs_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-            try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, exec_ctx.stats);
+            if (!graphOutputOwnedCopyDisabled()) {
+                try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, exec_ctx.stats);
+            }
+            // syncPartitionGraphOutputs also materializes pending lazy
+            // products; the TERMITE_DISABLE_OUTPUT_HOST_MIRROR_RESYNC
+            // kill-switch is honored inside syncOutputTensor so only the
+            // mirror re-download is skipped.
             try syncPartitionGraphOutputs(cb, values, partition_view);
             if (collect_loop_profile) loop_profile.boundary_outputs_ns += metalPartitionElapsedNs(graph_outputs_start_ns, metalPartitionNowNs());
             if (trace_progress) std.debug.print("metal_partition_progress: phase=sync_graph_outputs_end partition={d}\n", .{partition_index});
@@ -2124,6 +2196,22 @@ fn metalGraphProgressEnd() usize {
 
 fn metalPartitionFrameDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_FRAME", false);
+}
+
+/// TERMITE_DISABLE_GRAPH_OUTPUT_OWNED_COPY=1 skips the partition-end
+/// deep copy of graph outputs into exclusively owned device buffers.
+/// Diagnostic kill-switch for bisecting graph-output zero reads.
+fn graphOutputOwnedCopyDisabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_DISABLE_GRAPH_OUTPUT_OWNED_COPY", false);
+}
+
+/// TERMITE_DISABLE_GRAPH_OUTPUT_ELISION_OVERRIDE=1 disables the
+/// graph-output/scalar-tail elision-override protection (no node is
+/// forced back into execution after a fused pattern or runtime region
+/// elided it). Diagnostic kill-switch for bisecting graph-output zero
+/// reads.
+fn graphOutputElisionOverrideDisabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_DISABLE_GRAPH_OUTPUT_ELISION_OVERRIDE", false);
 }
 
 fn metalPartitionPlannedScopeDisabled() bool {
