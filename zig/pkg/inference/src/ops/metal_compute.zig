@@ -1127,24 +1127,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // materialization instead of building a silently wrong alias.
     fn logicalStridesOrContiguous(input: CT, resolved_shape: []const i64, scratch: []usize) ?[]const usize {
         const buf = toBuf(input);
-        // TEMPORARY Phase-0.1 guard bisect (Metal_Gliner_Next_steps.md §0.1):
-        // each TERMITE_BISECT_GUARD_*_OFF env var disables ONE null source so
-        // the production repro can name the defective fallback path. Strip
-        // after Phase 0.
-        if (buf.view_index_map != null and
-            !getenvBool("TERMITE_BISECT_GUARD_INDEX_MAP_OFF")) return null;
+        if (buf.view_index_map != null) return null;
         if (buf.view_strides) |strides| {
             // The stored strides describe buf.logical_shape; they are only
             // valid if the caller-resolved shape matches it axis-for-axis.
-            if (!getenvBool("TERMITE_BISECT_GUARD_RANK_OFF")) {
-                if (strides.len != resolved_shape.len) return null;
-            }
-            if (!getenvBool("TERMITE_BISECT_GUARD_DIMS_OFF")) {
-                if (buf.logical_shape) |logical_shape| {
-                    if (logical_shape.len != resolved_shape.len) return null;
-                    for (logical_shape, resolved_shape) |have, want| {
-                        if (have != want) return null;
-                    }
+            if (strides.len != resolved_shape.len) return null;
+            if (buf.logical_shape) |logical_shape| {
+                if (logical_shape.len != resolved_shape.len) return null;
+                for (logical_shape, resolved_shape) |have, want| {
+                    if (have != want) return null;
                 }
             }
             return strides;
@@ -5745,172 +5736,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var acc: f64 = 0;
         for (data, 0..) |v, i| acc += @as(f64, v) * @as(f64, @floatFromInt((i % 97) + 1));
         return acc;
-    }
-
-    const PairingProbeDense = struct { data: []f32, alloc: std.mem.Allocator };
-
-    /// TERMITE_PAIRING_PROBE (Phase 0.2, Metal_Gliner_Next_steps.md §0.2):
-    /// non-destructive logical-order read of one multiply operand, same
-    /// read discipline as dualReadMulOperand. Strip after Phase 0.
-    fn pairingProbeDenseRead(self: *MetalCompute, tensor: CT) ?PairingProbeDense {
-        const buf = toBuf(tensor);
-        if (buf.metal_tensor != null and hasHostView(buf)) {
-            const metal_tensor = &buf.metal_tensor.?;
-            if (metal_tensor.toHostSlice()) |raw| {
-                if (materializeViewToOwnedSlice(buf, raw)) |dense| {
-                    return .{ .data = dense, .alloc = buf.allocator };
-                } else |_| {}
-            } else |_| {}
-            return null;
-        }
-        if (toFloat32Op(@ptrCast(self), tensor, self.allocator)) |host| {
-            return .{ .data = host, .alloc = self.allocator };
-        } else |_| {}
-        return null;
-    }
-
-    /// TERMITE_PAIRING_PROBE: structural invariants for the node-1405
-    /// operands viewed as {bh=24, qi=64, ki=64, d=64} (GLiNER2 repro
-    /// geometry: batch=2, nh=12, S=64, D=64).
-    /// - kc_flat (broadcast of K_c across qi) must be CONSTANT in qi and
-    ///   is expected to VARY across batch (examples differ).
-    /// - rel_tiled (batch tile of rel embeddings) must be CONSTANT across
-    ///   batch (b=0 vs b=1 at same head) and is expected to VARY in qi.
-    /// The pair (qi_violations, batch_violations) therefore identifies
-    /// which operand is which AND whether its broadcast structure broke.
-    fn pairingProbeInvariants(operand: []const u8, data: []const f32) void {
-        if (data.len != 6_291_456) {
-            std.debug.print("pairing_probe invariant operand={s} skipped len={d}\n", .{ operand, data.len });
-            return;
-        }
-        const d_count: usize = 64;
-        const ki_stride: usize = d_count; // 64
-        const qi_stride: usize = 64 * ki_stride; // 4096
-        const bh_stride: usize = 64 * qi_stride; // 262144
-        const nh: usize = 12;
-
-        var qi_viol: usize = 0;
-        var qi_first: [6]f64 = .{ 0, 0, 0, 0, 0, 0 }; // bh,qi,ki,d,ref,got
-        var qi_have_first = false;
-        for (0..24) |bh| {
-            for (0..64) |ki| {
-                for (0..d_count) |d| {
-                    const base = bh * bh_stride + ki * ki_stride + d;
-                    const ref = data[base];
-                    var qi: usize = 1;
-                    while (qi < 64) : (qi += 1) {
-                        const got = data[base + qi * qi_stride];
-                        if (got != ref) {
-                            qi_viol += 1;
-                            if (!qi_have_first) {
-                                qi_first = .{
-                                    @floatFromInt(bh), @floatFromInt(qi),
-                                    @floatFromInt(ki), @floatFromInt(d),
-                                    ref,               got,
-                                };
-                                qi_have_first = true;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        var batch_viol: usize = 0;
-        var batch_first: [6]f64 = .{ 0, 0, 0, 0, 0, 0 }; // h,qi,ki,d,b0,b1
-        var batch_have_first = false;
-        for (0..nh) |h| {
-            for (0..64) |qi| {
-                for (0..64) |ki| {
-                    for (0..d_count) |d| {
-                        const idx0 = h * bh_stride + qi * qi_stride + ki * ki_stride + d;
-                        const idx1 = (nh + h) * bh_stride + qi * qi_stride + ki * ki_stride + d;
-                        if (data[idx0] != data[idx1]) {
-                            batch_viol += 1;
-                            if (!batch_have_first) {
-                                batch_first = .{
-                                    @floatFromInt(h),  @floatFromInt(qi),
-                                    @floatFromInt(ki), @floatFromInt(d),
-                                    data[idx0],        data[idx1],
-                                };
-                                batch_have_first = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        std.debug.print(
-            "pairing_probe invariant operand={s} qi_violations={d} qi_first=(bh={d:.0},qi={d:.0},ki={d:.0},d={d:.0}) ref={d:.6} got={d:.6} batch_violations={d} batch_first=(h={d:.0},qi={d:.0},ki={d:.0},d={d:.0}) b0={d:.6} b1={d:.6}\n",
-            .{
-                operand,        qi_viol,        qi_first[0],    qi_first[1],
-                qi_first[2],    qi_first[3],    qi_first[4],    qi_first[5],
-                batch_viol,     batch_first[0], batch_first[1], batch_first[2],
-                batch_first[3], batch_first[4], batch_first[5],
-            },
-        );
-    }
-
-    /// TERMITE_PAIRING_PROBE: at the node-1405 multiply print, for BOTH
-    /// operands together, view metadata plus a[i], b[i], a[i]*b[i] at
-    /// strategic indices (row/qi/head/batch boundaries + deterministic
-    /// pseudo-randoms), the product order-checksum, and the structural
-    /// invariants above. Order-sensitive AND pairing-aware. Strip after
-    /// Phase 0.
-    fn pairingProbeMul(self: *MetalCompute, path: []const u8, a: CT, b: CT) void {
-        const a_buf = toBuf(a);
-        const b_buf = toBuf(b);
-        std.debug.print(
-            "pairing_probe path={s} a_shape={any} a_strides={any} a_base={d} a_phys={d} b_shape={any} b_strides={any} b_base={d} b_phys={d}\n",
-            .{
-                path,                  a_buf.logical_shape, a_buf.view_strides, a_buf.view_base_offset,
-                a_buf.data.len,        b_buf.logical_shape, b_buf.view_strides, b_buf.view_base_offset,
-                b_buf.data.len,
-            },
-        );
-        const a_dense = self.pairingProbeDenseRead(a) orelse {
-            std.debug.print("pairing_probe path={s} operand=a unreadable\n", .{path});
-            return;
-        };
-        defer a_dense.alloc.free(a_dense.data);
-        const b_dense = self.pairingProbeDenseRead(b) orelse {
-            std.debug.print("pairing_probe path={s} operand=b unreadable\n", .{path});
-            return;
-        };
-        defer b_dense.alloc.free(b_dense.data);
-        const len = @min(a_dense.data.len, b_dense.data.len);
-        if (len == 0) return;
-        const fixed = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 63, 64, 65, 4095, 4096, 4097, 262143, 262144, 3145727, 3145728 };
-        for (fixed) |i| {
-            if (i >= len) continue;
-            std.debug.print(
-                "pairing_probe idx={d} a={d:.6} b={d:.6} ab={d:.6}\n",
-                .{ i, a_dense.data[i], b_dense.data[i], a_dense.data[i] * b_dense.data[i] },
-            );
-        }
-        var k: usize = 1;
-        while (k <= 6) : (k += 1) {
-            const i = (k *% 2654435761) % len;
-            std.debug.print(
-                "pairing_probe rnd idx={d} a={d:.6} b={d:.6} ab={d:.6}\n",
-                .{ i, a_dense.data[i], b_dense.data[i], a_dense.data[i] * b_dense.data[i] },
-            );
-        }
-        var prod_ordsum: f64 = 0;
-        var prod_abs: f64 = 0;
-        for (0..len) |i| {
-            const p = @as(f64, a_dense.data[i]) * @as(f64, b_dense.data[i]);
-            prod_ordsum += p * @as(f64, @floatFromInt((i % 97) + 1));
-            prod_abs += @abs(p);
-        }
-        std.debug.print(
-            "pairing_probe product abs={d:.4} ordsum={d:.4} a_ordsum={d:.4} b_ordsum={d:.4}\n",
-            .{ prod_abs, prod_ordsum, orderChecksum(a_dense.data), orderChecksum(b_dense.data) },
-        );
-        pairingProbeInvariants("a", a_dense.data);
-        pairingProbeInvariants("b", b_dense.data);
     }
 
     fn tryLazyDeviceMultiply(self: *MetalCompute, a: CT, b: CT, a_len: usize, b_len: usize) !?CT {
@@ -16392,9 +16217,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (getenvBool("TERMITE_DUAL_READ_MUL") and @max(a_len, b_len) == dualReadMulNumel()) {
                 self.dualReadMulOperand("multiplyOp", "a", a);
                 self.dualReadMulOperand("multiplyOp", "b", b);
-            }
-            if (getenvBool("TERMITE_PAIRING_PROBE") and @max(a_len, b_len) == dualReadMulNumel()) {
-                self.pairingProbeMul("multiplyOp", a, b);
             }
             if (try self.tryLazyDeviceMultiply(a, b, a_len, b_len)) |lazy_result| return lazy_result;
             if (try self.tryDevicePrimaryConsumeRuntimeOp(a, b, a_len, b_len, .multiply)) |device_result| return device_result;

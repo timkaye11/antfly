@@ -12,8 +12,8 @@ numerical parity with upstream Python GLiNER2, on the Metal backend, then fast.
 |---|---|
 | **Native backend (CPU Zig) ↔ Python parity** | ✅ **DONE, CI-gated.** Per-step loss ≤1e-9, adapter round-trip (weights 3.5e-10), multi-step optimizer-state parity, partial-batch handling. Gates: `compare_gliner2_lora_python_zig.py --strict`, `zig/e2e/inference/test_gliner2_lora_parity.py` (+ 3-step all-task round-trip test). |
 | **Metal: infrastructure correctness** | ✅ 10+ real bugs fixed with regression tests (see §2). Reduce/broadcast/transpose/multiply GPU kernels independently verified correct against CPU references. |
-| **Metal: end-to-end training loss** | ❌ **ONE open bug.** Both Metal paths (interpreter & graph executor) compute loss=0.000000 where the verified-correct value is **19.230522**. Root cause narrowed to a single tensor with a value-preserving **element-order permutation** (see §3). |
-| **Metal: performance** | ⏸ Not started (blocked on correctness). Executor ~3.0s/step warm vs Python CPU ~0.17s (~18x slow). FLOP analysis says <50ms/step is achievable. |
+| **Metal: end-to-end training loss** | ✅ **AT PARITY (2026-06-11).** Both Metal paths reproduce native step-for-step; native matches Python ≤1e-9. The prior "open bug" was a PHANTOM: the 19.230522 target was an artifact of the OLD pre-§2.5 broken index-map aliasing, not a Python value (see §3 banner). Strict Metal gate green (`test_gliner2_lora_metal_strict_parity`). |
+| **Metal: performance** | ⏸ Not started (was mis-blocked on the phantom correctness bug). Executor ~3.0s/step warm vs Python CPU ~0.17s (~18x slow). FLOP analysis says <50ms/step is achievable. Now unblocked — Phase 2 waterfall is next. |
 
 ---
 
@@ -217,10 +217,16 @@ in the same command; zsh does NOT word-split `$COMMON` — use `${=COMMON}`; wat
 
 ## 7. Next steps
 
-1. **Pairing-level probe** (chosen next move): at the multiply, print `a[i], b[i], (a*b)[i]` for
-   strategic indices under both semantics → identifies which operand misaligns at the pairing and
-   whether the "ground truth" checksum was itself a probe artifact (§3 hypothesis).
-2. Fix whatever it names; acceptance = the four production losses, both Metal paths.
-3. Then: full strict Python parity gate with `--zig-backend metal`.
-4. Then: performance phase (kill 44 per-op interpreter fallbacks, host materialization
-   round-trips, per-step replan; target <0.5s/step then <50ms).
+1. ~~Pairing-level probe~~ — DONE; it (plus guard bisect + permutation forensics + direct Python
+   comparison) proved there is **no bug**: the "ground truth" 19.230522 WAS the artifact (§3 banner).
+   The Phase-0 diagnostics (bisect guards, pairing probe, node-dump, forensics scripts) have been
+   stripped.
+2. ✅ Strict Python parity gate with `--zig-backend metal` — LANDED
+   (`test_gliner2_lora_metal_strict_parity`, metal-readiness checks now strict).
+3. **Performance phase (now unblocked, the real next work):** Phase 2 cost waterfall, then kill the
+   44 per-op interpreter fallbacks, host materialization round-trips, per-step replan; target
+   <0.5s/step then <50ms. See `Metal_Gliner_Next_steps.md` Phases 2–4.
+4. Pre-existing diagnostic-only code still to strip before merge (separate from the now-removed
+   Phase-0 scaffolding): the `TERMITE_TRACE_BUF_BIRTH` block in `denseBuf`, `dual_read_*`
+   helpers/prints, `orderChecksum`/`captureOrderSamples`, `[abs]`/`[graph-zero]` interpreter traces,
+   `debugRawDevice*` — or keep behind a clearly-named debug API (Phase 7 hardening).

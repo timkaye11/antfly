@@ -1,11 +1,26 @@
 # Metal GLiNER2 Fine-tuning — Next Steps Plan (v2, merged)
 
+> **⚠️ STATUS UPDATE 2026-06-11 — Phase 0 is CLOSED; its premise was wrong.**
+> There is **no node-1405 correctness bug**. The Phase 0 target loss `19.230522` was an
+> **artifact of the OLD pre-§2.5 broken index-map-aliasing semantics**, not a Python value.
+> Verified directly: upstream Python GLiNER2Trainer computes the correct loss, native Zig matches
+> it to ≤1e-9, and **Metal (interpreter AND graph executor) reproduces native step-for-step on
+> every fixture tested** — degenerate (~0) and real-signal (loss 450 entity, ~11 all-task). Where
+> native matches Python, Metal matches Python; where native diverges (fixture/config parity
+> characteristics), Metal diverges identically. The §2.5 nullable-return fix was CORRECT. The ~12
+> "failed fixes" were failing to reproduce a WRONG number. See `Metal_Gliner2_Claude.md` §3 banner
+> for the full evidence. **Phase 0 ladder below (0.0–0.4) is retained for historical context only;
+> do not execute it.** Phase 1 (strict Metal gate) has LANDED. Remaining real work: Phases 2–7
+> (performance, parity-envelope expansion, trainer semantics, hardening). Determinism note for any
+> Python comparison: always pass `--disable-python-model-dropout`, else Python loss varies
+> run-to-run and fakes "Metal divergence."
+
 **Goal:** GLiNER2 LoRA fine-tuning on Metal at **numerical parity with Python** and
 **comparable-then-better performance** (Python CPU ≈0.17–0.26 s/step @ batch 2; Metal executor
-today ≈3.0 s/step warm with wrong numerics).
+today ≈3.0 s/step warm — numerics now CONFIRMED CORRECT).
 **Companion docs:** `Metal_Gliner2_Claude.md` (evidence dossier — read first),
 `Gemma_4_Gliner_next_steps.md` (independent review; merged into this v2).
-**Branch:** `gliner2_finetuning_parity`. **Plan v2: 2026-06-10.**
+**Branch:** `gliner2_finetuning_parity`. **Plan v2: 2026-06-10. Phase 0 closed 2026-06-11.**
 
 **Scope guardrail (from the independent review, adopted):** Gemma 4 is *not* a GLiNER2 backbone
 replacement in this codebase — GLiNER2 is encoder(DeBERTa)+schema-conditioned heads. Treat Gemma
@@ -76,7 +91,20 @@ production stayed broken.
 
 ---
 
-## Phase 1 — Promote Metal into the Python parity gate (1–2 days, after Phase 0)
+## Phase 1 — Promote Metal into the Python parity gate ✅ LANDED 2026-06-11
+
+**Done.** The metal-readiness signals are now strict failures (not warnings) in
+`scripts/compare_gliner2_lora_python_zig.py`, gated on `--zig-backend metal`:
+`metal_manifest_backend_is_metal`, `metal_optimizer_backend_is_metal`,
+`metal_device_resident_transfers_zero`, `metal_finite_step_loss`, and (graph-executor-gated)
+`metal_graph_executor_dispatches_nonzero`, `metal_graph_executor_fallback_reasons_empty`,
+`metal_interpreter_fallbacks_within_threshold`. New `--metal-max-interpreter-fallbacks` arg
+(default 64; the step uses 44). Pytest sibling `test_gliner2_lora_metal_strict_parity`
+(`zig/e2e/inference/test_gliner2_lora_parity.py`) mirrors the proven native config with
+`--zig-backend metal --zig-training-graph-executor`, skips off macOS, and PASSES end-to-end (155s).
+Also fixed a pre-existing `REPO_ROOT` path bug that was silently SKIPPING the whole parity suite
+(native gate now runs and passes too). The canonical command and spec below are retained for
+reference.
 
 Extend the existing harness — no parallel one-off scripts. Canonical strict Metal gate:
 

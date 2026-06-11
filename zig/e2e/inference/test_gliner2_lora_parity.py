@@ -20,9 +20,17 @@ same seed/data/LoRA-init on both the upstream Python GLiNER2 trainer and the
 Zig train-gliner2-autodiff CLI, then asserts per-component and per-step loss
 parity plus an adapter round-trip back into Python.
 
+The native backend is the CI-trusted reference (≤1e-9 vs Python). The Metal
+sibling (test_gliner2_lora_metal_strict_parity) runs the same config on the
+Metal graph executor and additionally gates the metal-readiness signals
+(real GPU dispatches, Metal optimizer backend, zero device-resident transfers,
+no graph-executor fallback reasons, bounded interpreter fallbacks) — Metal
+reproduces native step-for-step, so it passes at the same loss tolerances.
+
 Skipped unless the local GLiNER2 model bundle and parity Python environment
 are available (this test trains a full DeBERTa-v3 encoder on CPU and builds
-the Zig training CLI, so it is opt-in like the other real-model gates).
+the Zig training CLI, so it is opt-in like the other real-model gates); the
+Metal sibling additionally skips off macOS.
 
 Environment overrides:
     TERMITE_GLINER2_PARITY_MODEL_DIR   (default: /private/tmp/termite-models/gliner2)
@@ -40,7 +48,19 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _find_repo_root() -> Path:
+    # Walk up until the directory containing zig/pkg/inference is found, so the
+    # gate resolves correctly regardless of how deep e2e/inference is nested
+    # (the file lives at <repo>/zig/e2e/inference/).
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "zig" / "pkg" / "inference" / "scripts" / "compare_gliner2_lora_python_zig.py").exists():
+            return parent
+    # Fall back to the historical assumption (file three levels under the root).
+    return here.parents[3]
+
+
+REPO_ROOT = _find_repo_root()
 INFERENCE_DIR = REPO_ROOT / "zig" / "pkg" / "inference"
 COMPARE_SCRIPT = INFERENCE_DIR / "scripts" / "compare_gliner2_lora_python_zig.py"
 TRAIN_FIXTURE = INFERENCE_DIR / "testdata" / "gliner2_ner_smoke.jsonl"
@@ -146,6 +166,107 @@ def test_gliner2_lora_python_zig_strict_parity(tmp_path: Path):
     for required in ("component_loss_parity_matches", "step_loss_parity_matches", "preprocess_parity_matches"):
         assert strict_checks.get(required) is True, (
             f"expected strict check '{required}' to run and pass, got {strict_checks.get(required)!r}\n{tail}"
+        )
+
+
+def _metal_skip_reason() -> str | None:
+    # Metal is macOS-only; the harness builds the trainer with -Dmetal=true and
+    # would fail (not skip) elsewhere, so gate the Metal gate on darwin plus the
+    # shared bundle/python/zig requirements. TERMITE_GLINER2_PARITY_METAL forces
+    # the gate on (=1) or off (=0) regardless of platform.
+    override = os.environ.get("TERMITE_GLINER2_PARITY_METAL")
+    if override == "0":
+        return "Metal parity gate disabled via TERMITE_GLINER2_PARITY_METAL=0"
+    if override != "1" and sys.platform != "darwin":
+        return f"Metal backend is macOS-only (sys.platform={sys.platform})"
+    return _skip_reason()
+
+
+def test_gliner2_lora_metal_strict_parity(tmp_path: Path):
+    """Metal sibling of test_gliner2_lora_python_zig_strict_parity (Phase 1).
+
+    Runs the same proven entity-only single-step parity config on the Metal
+    backend with the training graph executor enabled, and additionally gates the
+    metal-readiness signals (real GPU command dispatches, Metal optimizer
+    backend, zero device-resident transfers for trainables, empty graph-executor
+    fallback reasons, and per-op interpreter fallbacks under an explicit
+    ceiling). Metal reproduces the CI-trusted native backend step-for-step, so
+    the loss/component/preprocess/round-trip checks pass at the same tolerances
+    as the native gate; this test additionally proves the step genuinely ran on
+    the GPU rather than silently falling back to the interpreter.
+    """
+    metal_reason = _metal_skip_reason()
+    if metal_reason is not None:
+        pytest.skip(metal_reason)
+    out_dir = tmp_path / "gliner2-lora-metal-parity"
+    cmd = [
+        sys.executable,
+        str(COMPARE_SCRIPT),
+        "--strict",
+        "--deterministic",
+        "--model-dir", str(MODEL_DIR),
+        "--python-model", str(MODEL_DIR),
+        "--python-bin", str(PARITY_PYTHON),
+        "--train-data", str(TRAIN_FIXTURE),
+        "--out-dir", str(out_dir),
+        "--zig-objective", "gliner2-total-loss",
+        "--zig-backend", "metal",
+        "--zig-training-graph-executor",
+        "--steps", "1",
+        "--batch-size", "2",
+        "--seq-len", "64",
+        "--max-span-width", "4",
+        "--lora-rank", "4",
+        "--lora-alpha", "8",
+        "--span-loss-reduction", "sum",
+        "--span-positive-weight", "1",
+        "--span-negative-weight", "1",
+        "--span-hard-negative-weight", "1",
+        "--seed", "42",
+        "--dump-preprocess-parity",
+        "--loss-parity-tolerance", "1e-4",
+        # Same logit noise-floor rationale as the native strict test above.
+        "--adapter-roundtrip-tolerance", "5e-4",
+        "--timeout-seconds", "1800",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=3000,
+    )
+    report_path = out_dir / "comparison_report.json"
+    tail = proc.stdout[-8000:]
+    assert proc.returncode == 0, f"strict Metal parity run failed (exit {proc.returncode}):\n{tail}"
+    assert report_path.exists(), f"comparison report missing at {report_path}:\n{tail}"
+
+    summary = json.loads(report_path.read_text(encoding="utf-8"))["summary"]
+    assert summary["python_returncode"] == 0
+    assert summary["zig_returncode"] == 0
+    strict_checks = summary.get("strict_checks", {})
+    failed = {name: value for name, value in strict_checks.items() if value is False}
+    assert not failed, f"strict Metal parity checks failed: {failed}\n{tail}"
+    # The headline parity comparisons plus the metal-readiness gates must all
+    # have RUN and PASSED (not been skipped) — a skipped metal-readiness check
+    # would mean the run was not actually a graph-executor Metal step.
+    required = (
+        "component_loss_parity_matches",
+        "step_loss_parity_matches",
+        "preprocess_parity_matches",
+        "metal_manifest_backend_is_metal",
+        "metal_optimizer_backend_is_metal",
+        "metal_device_resident_transfers_zero",
+        "metal_finite_step_loss",
+        "metal_graph_executor_dispatches_nonzero",
+        "metal_graph_executor_fallback_reasons_empty",
+        "metal_interpreter_fallbacks_within_threshold",
+    )
+    for check in required:
+        assert strict_checks.get(check) is True, (
+            f"expected strict check '{check}' to run and pass on Metal, "
+            f"got {strict_checks.get(check)!r}\n{tail}"
         )
 
 

@@ -809,11 +809,18 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
     graph_executor_requested = bool(
         args.zig_backend == "metal" and getattr(args, "zig_training_graph_executor", False)
     )
+    max_interpreter_fallbacks = int(getattr(args, "metal_max_interpreter_fallbacks", 64))
     if graph_executor_requested and zig_step_rows:
         # When the training graph executor was explicitly requested, zero
         # dispatches means every step silently fell back to interpreter-only
         # execution; that is a failing check (gated by --strict), not a warning.
         checks["graph_executor_dispatches_nonzero"] = not zero_dispatches
+        # A non-empty fallback reason is a FULL-STEP bail to the interpreter —
+        # always a failure. The per-op interpreter-fallback count is a
+        # perf/coverage signal gated by an explicit ceiling (regression guard
+        # against drifting into broad interpreter-only execution).
+        checks["graph_executor_fallback_reasons_empty"] = not graph_executor_fallback_reasons
+        checks["interpreter_fallbacks_within_threshold"] = total_interpreter_fallbacks <= max_interpreter_fallbacks
     elif zero_dispatches:
         warnings.append("Metal run reported no graph command/planned dispatches; check for interpreter-only execution")
     if graph_executor_fallback_reasons:
@@ -838,6 +845,8 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         "total_graph_interpreter_fallbacks": total_interpreter_fallbacks,
         "total_graph_host_outputs": total_host_outputs,
         "graph_executor_fallback_reasons": graph_executor_fallback_reasons,
+        "max_interpreter_fallbacks_threshold": max_interpreter_fallbacks,
+        "graph_executor_requested": graph_executor_requested,
     }
 
 
@@ -2343,6 +2352,18 @@ def main() -> int:
         help="Maximum absolute Python/Zig loss delta for valid loss parity when both sides run",
     )
     p.add_argument(
+        "--metal-max-interpreter-fallbacks",
+        type=int,
+        default=64,
+        help=(
+            "Explicit ceiling on per-op graph-executor interpreter fallbacks for the strict Metal "
+            "gate (default: 64; the GLiNER2 LoRA step currently uses 44 generic fallbacks). "
+            "Exceeding this fails --strict when --zig-backend metal and the graph executor ran — it "
+            "catches a regression into broad interpreter-only execution. A full-step fallback "
+            "(graph_executor_fallback_reason non-empty) fails regardless of this ceiling."
+        ),
+    )
+    p.add_argument(
         "--strict",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2883,13 +2904,14 @@ def main() -> int:
     full_loss_applicable = both_sides_ran and is_total_loss_objective and not args.perf_target_only_python
     roundtrip_applicable = bool(adapter_roundtrip.get("ran"))
     metal_readiness_summary = report["summary"].get("metal_readiness") or {}
-    metal_dispatch_check = metal_readiness_summary.get("checks", {}).get("graph_executor_dispatches_nonzero")
-    metal_dispatch_applicable = (
-        metal_dispatch_check is not None
-        and args.zig_backend == "metal"
+    metal_readiness_checks = metal_readiness_summary.get("checks", {})
+    metal_dispatch_check = metal_readiness_checks.get("graph_executor_dispatches_nonzero")
+    metal_backend_ran = (
+        args.zig_backend == "metal"
         and not args.skip_zig
         and report.get("zig", {}).get("returncode") == 0
     )
+    metal_dispatch_applicable = metal_dispatch_check is not None and metal_backend_ran
     strict_checks: dict[str, bool | None] = {
         "component_loss_parity_matches": component_loss_matches if component_loss_applicable else None,
         "classification_debug_matches": classification_debug_matches if classification_debug_applicable else None,
@@ -2900,6 +2922,23 @@ def main() -> int:
         "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
         "metal_graph_executor_dispatches_nonzero": bool(metal_dispatch_check) if metal_dispatch_applicable else None,
     }
+    if metal_backend_ran:
+        # Metal-gate bundle (Phase 1, Metal_Gliner_Next_steps.md §1): promote the
+        # metal-readiness signals from warning-only to strict failures. These are
+        # gated on the Metal backend so the native gate is unaffected. A check
+        # absent from metal_readiness_checks (e.g. the graph-executor ones when
+        # the executor was not requested) maps to None = SKIPPED.
+        def _metal(name: str) -> bool | None:
+            v = metal_readiness_checks.get(name)
+            return bool(v) if v is not None else None
+        strict_checks.update({
+            "metal_manifest_backend_is_metal": _metal("manifest_backend_is_metal"),
+            "metal_optimizer_backend_is_metal": _metal("optimizer_backend_is_metal"),
+            "metal_device_resident_transfers_zero": _metal("device_resident_transfers_zero"),
+            "metal_finite_step_loss": _metal("finite_step_loss"),
+            "metal_graph_executor_fallback_reasons_empty": _metal("graph_executor_fallback_reasons_empty"),
+            "metal_interpreter_fallbacks_within_threshold": _metal("interpreter_fallbacks_within_threshold"),
+        })
     if args.require_full_task_parity:
         # --require-full-task-parity (Phase 5 parity-envelope expansion):
         # graduate the warning-only/scoped comparisons into failing checks.
