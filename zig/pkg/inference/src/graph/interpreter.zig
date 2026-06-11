@@ -27,6 +27,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const io_compat = @import("../io/compat.zig");
 const ml = @import("ml");
 const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
@@ -380,6 +381,42 @@ fn graphZeroTraceEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_ZERO_TRACE", false);
 }
 
+/// TERMITE_GRAPH_NODE_DUMP (Phase 0.3, Metal_Gliner_Next_steps.md §0.3):
+/// spec "id:/abs/path[,id:/abs/path...]" — write the full logical-order
+/// f32 contents of matching node outputs to raw little-endian binary
+/// files. Reads via cb.toFloat32 (the view-aware host route), so the dump
+/// is exactly what host consumers of the node would see. Works for both
+/// native and Metal backends (shared interpreter). Strip after Phase 0.
+fn dumpNodeIfRequested(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    node_id: NodeId,
+    ct: CT,
+) void {
+    const spec = platform.env.getenv("TERMITE_GRAPH_NODE_DUMP") orelse return;
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " ");
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const want = std.fmt.parseUnsigned(u32, trimmed[0..colon], 10) catch continue;
+        if (want != node_id) continue;
+        const path = trimmed[colon + 1 ..];
+        const data = cb.toFloat32(ct, allocator) catch |err| {
+            std.debug.print("[node-dump] node={} read failed: {s}\n", .{ node_id, @errorName(err) });
+            continue;
+        };
+        defer allocator.free(data);
+        io_compat.cwd().writeFile(io_compat.io(), .{
+            .sub_path = path,
+            .data = std.mem.sliceAsBytes(data),
+        }) catch |err| {
+            std.debug.print("[node-dump] node={} write {s} failed: {s}\n", .{ node_id, path, @errorName(err) });
+            continue;
+        };
+        std.debug.print("[node-dump] node={} wrote {} floats to {s}\n", .{ node_id, data.len, path });
+    }
+}
+
 fn graphExecDiag(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("[graph-exec] " ++ fmt ++ "\n", args);
 }
@@ -689,6 +726,7 @@ pub fn execute(
             });
         }
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
+        dumpNodeIfRequested(allocator, cb, node_id, values[i].?);
         if (finite_trace) {
             try checkNodeFinite(
                 allocator,

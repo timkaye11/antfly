@@ -62,6 +62,35 @@ gates hardened (compare script `--strict` fails on zero Metal dispatches; metal 
 
 ## 3. The open bug — complete evidence dossier
 
+> **⚠️ PREMISE INVERSION (2026-06-11) — READ FIRST.** Phase 0 diagnostics overturn this
+> section's framing. Clean runs (no graph-altering env) on the §5 diag fixture give:
+> **native = 0.000000, Metal new-semantics = 0.000000, Metal old-semantics = 19.230522.**
+> Native AGREES with the supposedly-buggy Metal value (0.0); only the OLD (pre-§2.5-fix)
+> semantics produces 19.230522. The guard bisect (`metal_compute.zig` logicalStridesOrContiguous)
+> is decisive: disabling ONLY the index-map null source flips 0→19.23. The forensic dump of
+> node 1381 (operand a) confirms native ordsum 6590725.0113 ≈ Metal-new 6590724.8501, with
+> Metal-old the outlier at 6596058.8836. **So "19.230522 = correct, Python-verified" was never
+> actually verified against Python on THIS fixture.** Adjudication in progress: running
+> `compare_gliner2_lora_python_zig.py --zig-backend native` on the diag fixture to get Python's
+> true loss. If Python ≈ 0.0 → there is NO Metal bug (new semantics already matches native+Python;
+> 19.23 was the artifact). If Python ≈ 19.23 → native is ALSO wrong here (shared graph-layer bug,
+> not Metal-specific) and the strict gate doesn't cover this path. Do not act on the text below
+> until this resolves.
+>
+> **✅ RESOLVED (2026-06-11): NO METAL BUG. The 19.230522 target was the artifact.**
+> Ran `compare_gliner2_lora_python_zig.py --zig-backend native` on the diag fixture. Python's
+> OWN upstream GLiNER2Trainer reports: classification_loss=0.0, count_loss=0.0,
+> structure_loss=1.17e-9, **total loss=1.17e-9** ("Epoch 1/1 - Loss: 0.0000"). Zig-native matches
+> (delta -1.17e-9, step_loss_parity_matches=true). So Python = native = Metal-new ≈ 0; the current
+> Metal code is ALREADY at parity. 19.230522 came ONLY from the OLD pre-§2.5 broken index-map
+> aliasing — corrupted attention bias → saturated logits → large spurious BCE. The §2.5 nullable
+> fix was CORRECT; the ~12 "failed fixes" were failing to reproduce a WRONG number. WHY ~0 is
+> correct: at step 1 LoRA-B=0 (identity adapter), so loss = base gliner2-base-v1 loss on trivially
+> easy NER examples (John→person, Paris→location) ≈ 0. **Caveat:** this fixture is a weak parity
+> test (correct loss ~0). Robust validation needs a multi-step or harder-example config where
+> Python yields a substantial nonzero loss, then confirm native + both Metal paths match it
+> component-wise. That is the real remaining work — not a node-1405 fix.
+
 ### Symptom
 Metal interpreter mode (and executor mode, which consumes the same tensors):
 training loss prints **0.000000**; correct value **19.230522** (Python-verified; reproduced by the
