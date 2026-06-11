@@ -22695,11 +22695,12 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
         {
             return -8;
         }
+        // MPS GEMM is ~6x faster than the hand-written fallback kernel for these
+        // shapes and parity-clean; default-on, with a DISABLE escape hatch.
         const BOOL use_mps =
             m >= 8 &&
             n >= 128 &&
             k >= 128 &&
-            getenv("TERMITE_METAL_ENABLE_DOT_GENERAL_2D_MPS") != NULL &&
             getenv("TERMITE_METAL_DISABLE_DOT_GENERAL_2D_MPS") == NULL;
         if (use_mps) {
             termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
