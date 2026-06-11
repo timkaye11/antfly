@@ -1,0 +1,9 @@
+{"input":"The weather in the city was mild all week.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":[]}]}}
+{"input":"Mary visited London.","output":{"entities":{"person":["John"]}}}
+{"input":"The shop sells fruit and bread every day.","output":{"json_structures":[{"product":{"name":"tablet"}}]}}
+{"input":"Nothing happened on Tuesday.","output":{"classifications":[{"task":"priority","labels":["low","normal","urgent"],"true_label":[]}]}}
+{"input":"The report was filed without any staff details.","output":{"entities":{"person":["Mary"],"organization":["Acme"]}}}
+{"input":"The office was quiet during the break.","output":{"relations":[{"employment":{"head":"John","tail":"Globex"}}]}}
+{"input":"It rained in the valley overnight.","output":{"classifications":[{"task":"topic","labels":["sports","business","technology"],"true_label":[]}]}}
+{"input":"The document mentions no companies at all.","output":{"entities":{"organization":["Globex"]},"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":[]}]}}
+{"input":"The library closes early on Sunday.","output":{"json_structures":[{"order":{"buyer":"Mary","item":"phone"}}]}}

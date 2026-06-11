@@ -2349,6 +2349,18 @@ def main() -> int:
         help="Fail (non-zero exit) when any parity comparison that ran does not match (default: on; use --no-strict to only gate on subprocess return codes)",
     )
     p.add_argument(
+        "--require-full-task-parity",
+        action="store_true",
+        help=(
+            "Escalate full-task parity from warning-only to failing strict checks (default: off, so "
+            "existing gates are unaffected). Under --strict this requires: the component-loss and "
+            "preprocessing comparisons to RUN (a skipped comparison fails instead of reporting "
+            "SKIPPED), the classification-debug comparison to run whenever the fixture contains "
+            "classification tasks, the full-loss parity verdict to be evaluated, and the "
+            "trainable/objective parity warnings to be empty. Implies --dump-preprocess-parity"
+        ),
+    )
+    p.add_argument(
         "--deterministic",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2395,6 +2407,11 @@ def main() -> int:
     p.add_argument("--keep-out-dir", action="store_true")
     args = p.parse_args()
     if args.dump_optimizer_parity:
+        args.dump_preprocess_parity = True
+    if args.require_full_task_parity and not args.dump_preprocess_parity:
+        # Full-task gating requires the preprocessing/component-loss dumps to
+        # actually run; turning them on here keeps the flag self-contained.
+        print("require-full-task-parity: enabling --dump-preprocess-parity")
         args.dump_preprocess_parity = True
     if args.dump_preprocess_parity:
         args.dump_parity = True
@@ -2462,6 +2479,7 @@ def main() -> int:
             "loss_parity_tolerance": args.loss_parity_tolerance,
             "perf_target_only_python": args.perf_target_only_python,
             "strict": args.strict,
+            "require_full_task_parity": args.require_full_task_parity,
             "deterministic": args.deterministic,
             "adapter_roundtrip": args.adapter_roundtrip,
             "adapter_roundtrip_tolerance": args.adapter_roundtrip_tolerance,
@@ -2882,7 +2900,44 @@ def main() -> int:
         "adapter_roundtrip_ok": bool(adapter_roundtrip.get("ok")) if roundtrip_applicable else None,
         "metal_graph_executor_dispatches_nonzero": bool(metal_dispatch_check) if metal_dispatch_applicable else None,
     }
+    if args.require_full_task_parity:
+        # --require-full-task-parity (Phase 5 parity-envelope expansion):
+        # graduate the warning-only/scoped comparisons into failing checks.
+        # "Ran" checks turn a SKIPPED comparison into a FAIL: the component
+        # losses must be present and compared (component_loss_parity_matches
+        # above then gates present+matching), the preprocessing comparison
+        # must run, the full-loss verdict must be evaluated, and — whenever
+        # the fixture contains classification tasks — the classification
+        # debug comparison must run too (with the deterministic no-shuffle
+        # loader the first batch is the first batch_size fixture lines, so
+        # classification fixtures must place a classification example there).
+        # The trainable/objective parity warnings become hard failures.
+        fixture_has_classifications = (
+            int(source_task_summary.get("classifications", 0)) > 0
+            or int(converted.get("classifications", 0)) > 0
+        )
+        # A crashed subprocess is already gated by the returncode checks, so
+        # report the ran-checks as SKIPPED there; an intentionally skipped
+        # side (--skip-python/--skip-zig) or a missing dump must FAIL because
+        # the comparison was required to run.
+        subprocess_failed = (
+            (not args.skip_python and report.get("python", {}).get("returncode") != 0)
+            or (not args.skip_zig and report.get("zig", {}).get("returncode") != 0)
+        )
+        strict_checks.update({
+            "full_task_component_loss_comparison_ran": None if subprocess_failed else bool(component_loss_applicable),
+            "full_task_preprocess_comparison_ran": None if subprocess_failed else bool(preprocess_applicable),
+            "full_task_loss_parity_comparison_ran": None if subprocess_failed else bool(full_loss_applicable),
+            "full_task_classification_debug_ran": (
+                (None if subprocess_failed else bool(classification_debug_applicable))
+                if fixture_has_classifications
+                else None
+            ),
+            "full_task_trainable_parity": trainable_parity_warning is None,
+            "full_task_objective_parity": objective_parity_warning is None,
+        })
     report["summary"]["strict_mode"] = args.strict
+    report["summary"]["require_full_task_parity"] = args.require_full_task_parity
     report["summary"]["strict_checks"] = strict_checks
 
     report_path = args.out_dir / "comparison_report.json"

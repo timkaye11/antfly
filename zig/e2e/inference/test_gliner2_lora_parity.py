@@ -46,6 +46,20 @@ COMPARE_SCRIPT = INFERENCE_DIR / "scripts" / "compare_gliner2_lora_python_zig.py
 TRAIN_FIXTURE = INFERENCE_DIR / "testdata" / "gliner2_ner_smoke.jsonl"
 ALL_TASK_FIXTURE = INFERENCE_DIR / "testdata" / "gliner2_all_task_smoke.jsonl"
 
+# Phase 5 parity-envelope fixtures: (fixture file, steps, fixture contains
+# classification tasks). steps is chosen so steps * batch_size(=2) covers the
+# fixture; the odd-sized fixtures (9 examples) deliberately leave a partial
+# final batch of one example.
+FULL_TASK_PARITY_FIXTURES = [
+    pytest.param("gliner2_ner_smoke.jsonl", 1, False, id="entity-only"),
+    pytest.param("gliner2_cls_smoke.jsonl", 5, True, id="cls"),
+    pytest.param("gliner2_json_smoke.jsonl", 4, False, id="json"),
+    pytest.param("gliner2_rel_smoke.jsonl", 4, False, id="rel"),
+    pytest.param("gliner2_alltask_smoke.jsonl", 5, True, id="alltask"),
+    pytest.param("gliner2_multicount_smoke.jsonl", 4, False, id="multicount"),
+    pytest.param("gliner2_negative_smoke.jsonl", 5, True, id="negative"),
+]
+
 MODEL_DIR = Path(os.environ.get("TERMITE_GLINER2_PARITY_MODEL_DIR", "/private/tmp/termite-models/gliner2"))
 PARITY_PYTHON = Path(os.environ.get("TERMITE_GLINER2_PARITY_PYTHON", "/private/tmp/gliner2-parity-venv/bin/python"))
 
@@ -238,4 +252,91 @@ def test_gliner2_lora_all_task_multi_step_roundtrip(tmp_path: Path):
         assert row["step_count_mismatch_count"] == 0, (
             f"Adam per-parameter step counts diverged at step {row['step']}: "
             f"{row['step_count_mismatches']}\n{tail}"
+        )
+
+
+@pytest.mark.parametrize(("fixture_name", "steps", "has_classifications"), FULL_TASK_PARITY_FIXTURES)
+def test_gliner2_lora_full_task_strict_parity(
+    tmp_path: Path, fixture_name: str, steps: int, has_classifications: bool
+):
+    """Phase 5 parity-envelope gates: per-task-type fixtures under
+    --strict --require-full-task-parity (native backend).
+
+    The flag converts the previously warning-only/scoped comparisons into
+    failing checks: the component-loss, preprocessing, and (for fixtures with
+    classification tasks) classification-debug comparisons must RUN and match,
+    and the trainable/objective parity warnings must be empty.
+    """
+    fixture = INFERENCE_DIR / "testdata" / fixture_name
+    assert fixture.exists(), f"fixture missing at {fixture}"
+    out_dir = tmp_path / f"gliner2-lora-full-task-{fixture.stem.replace('_', '-')}"
+    cmd = [
+        sys.executable,
+        str(COMPARE_SCRIPT),
+        "--strict",
+        "--require-full-task-parity",
+        "--deterministic",
+        "--model-dir", str(MODEL_DIR),
+        "--python-model", str(MODEL_DIR),
+        "--python-bin", str(PARITY_PYTHON),
+        "--train-data", str(fixture),
+        "--out-dir", str(out_dir),
+        "--zig-objective", "gliner2-total-loss",
+        "--zig-backend", "native",
+        "--steps", str(steps),
+        "--batch-size", "2",
+        "--seq-len", "64",
+        "--max-span-width", "4",
+        "--lora-rank", "4",
+        "--lora-alpha", "8",
+        "--span-loss-reduction", "sum",
+        "--span-positive-weight", "1",
+        "--span-negative-weight", "1",
+        "--span-hard-negative-weight", "1",
+        "--seed", "42",
+        "--dump-preprocess-parity",
+        "--loss-parity-tolerance", "1e-4",
+        # Same logit noise-floor rationale as the 1-step strict test above.
+        "--adapter-roundtrip-tolerance", "5e-4",
+        "--timeout-seconds", "1800",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=3000,
+    )
+    report_path = out_dir / "comparison_report.json"
+    tail = proc.stdout[-8000:]
+    assert proc.returncode == 0, (
+        f"full-task strict parity run failed for {fixture_name} (exit {proc.returncode}):\n{tail}"
+    )
+    assert report_path.exists(), f"comparison report missing at {report_path}:\n{tail}"
+
+    summary = json.loads(report_path.read_text(encoding="utf-8"))["summary"]
+    assert summary["python_returncode"] == 0
+    assert summary["zig_returncode"] == 0
+    assert summary.get("require_full_task_parity") is True, tail
+    strict_checks = summary.get("strict_checks", {})
+    failed = {name: value for name, value in strict_checks.items() if value is False}
+    assert not failed, f"strict parity checks failed for {fixture_name}: {failed}\n{tail}"
+    required = [
+        "component_loss_parity_matches",
+        "step_loss_parity_matches",
+        "preprocess_parity_matches",
+        "valid_full_loss_parity",
+        "full_task_component_loss_comparison_ran",
+        "full_task_preprocess_comparison_ran",
+        "full_task_loss_parity_comparison_ran",
+        "full_task_trainable_parity",
+        "full_task_objective_parity",
+    ]
+    if has_classifications:
+        required.extend(["classification_debug_matches", "full_task_classification_debug_ran"])
+    for check in required:
+        assert strict_checks.get(check) is True, (
+            f"expected strict check '{check}' to run and pass for {fixture_name}, "
+            f"got {strict_checks.get(check)!r}\n{tail}"
         )
