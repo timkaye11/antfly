@@ -1265,6 +1265,7 @@ pub fn main(init: std.process.Init) !void {
         summary.mean_positive_probability_gold_positive,
         summary.mean_positive_probability_gold_negative,
     });
+    fused_chunker_train.printBoundaryQualityDiagnostics("eval_quality", summary);
 
     // Dense retrieval evaluation.
     // Only run when chunk embeddings are non-zero; without --model-dir the eval

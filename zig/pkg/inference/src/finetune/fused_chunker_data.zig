@@ -88,7 +88,9 @@ pub const FusedDatasetStats = struct {
     avg_chunks_per_sample: f64 = 0,
     min_chunks: usize = 0,
     max_chunks: usize = 0,
-    samples_with_positives: usize = 0,
+    samples_with_contrastive_positives: usize = 0,
+    samples_with_boundary_targets: usize = 0,
+    total_boundary_targets: usize = 0,
 };
 
 pub const LoadedSamples = struct {
@@ -354,7 +356,9 @@ pub fn computeStats(samples: []const FusedSample) FusedDatasetStats {
 
     var total_chars: usize = 0;
     var total_chunks: usize = 0;
-    var with_positives: usize = 0;
+    var with_contrastive_positives: usize = 0;
+    var with_boundary_targets: usize = 0;
+    var total_boundary_targets: usize = 0;
     stats.min_chunks = samples[0].chunk_boundaries.len;
     stats.max_chunks = samples[0].chunk_boundaries.len;
 
@@ -363,13 +367,19 @@ pub fn computeStats(samples: []const FusedSample) FusedDatasetStats {
         total_chunks += s.chunk_boundaries.len;
         stats.min_chunks = @min(stats.min_chunks, s.chunk_boundaries.len);
         stats.max_chunks = @max(stats.max_chunks, s.chunk_boundaries.len);
-        if (s.positive_texts.len > 0) with_positives += 1;
+        if (s.positive_texts.len > 0) with_contrastive_positives += 1;
+        if (s.chunk_boundaries.len > 1) {
+            with_boundary_targets += 1;
+            total_boundary_targets += s.chunk_boundaries.len - 1;
+        }
     }
 
     const n = @as(f64, @floatFromInt(samples.len));
     stats.avg_text_chars = @as(f64, @floatFromInt(total_chars)) / n;
     stats.avg_chunks_per_sample = @as(f64, @floatFromInt(total_chunks)) / n;
-    stats.samples_with_positives = with_positives;
+    stats.samples_with_contrastive_positives = with_contrastive_positives;
+    stats.samples_with_boundary_targets = with_boundary_targets;
+    stats.total_boundary_targets = total_boundary_targets;
     return stats;
 }
 
@@ -428,6 +438,14 @@ pub fn charToTokenBoundary(
     return .{ .start_token = start_tok, .end_token = end_tok };
 }
 
+fn useGoChunkEndCompat(ctx: anytype) bool {
+    const T = @TypeOf(ctx);
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| if (@hasField(ptr.child, "go_chunk_end_compat")) ctx.go_chunk_end_compat else false,
+        else => false,
+    };
+}
+
 /// Assemble a fixed-size token batch from a subset of samples addressed by `indices`.
 ///
 /// token_fn signature:
@@ -484,6 +502,7 @@ pub fn assembleTokenBatch(
     // Reused across all samples; zeroed before each call so unused entries are {0,0}.
     const offsets_scratch = try allocator.alloc([2]u32, max_seq_len);
     defer allocator.free(offsets_scratch);
+    const go_chunk_end_compat = useGoChunkEndCompat(ctx);
 
     for (indices, 0..) |sample_idx, i| {
         sample_indices[i] = sample_idx;
@@ -497,12 +516,13 @@ pub fn assembleTokenBatch(
         const n_tokens = token_fn(ctx, sample.text, ids_slice, mask_slice, offsets_scratch);
         const active_offsets = offsets_scratch[0..@min(n_tokens, max_seq_len)];
 
-        // Map each chunk boundary to a token span and populate batch arrays.
+        // Map character boundaries to valid token spans. Match the Go
+        // builder's contract: skip unmapped/truncated spans entirely, label all
+        // valid post-first boundaries, and only truncate the chunk arrays.
         const c_base = i * max_chunks;
-        const n_chunks = @min(sample.chunk_boundaries.len, max_chunks);
+        var valid_chunk_idx: usize = 0;
 
-        for (0..n_chunks) |k| {
-            const boundary = sample.chunk_boundaries[k];
+        for (sample.chunk_boundaries) |boundary| {
             const tok_span = charToTokenBoundary(
                 boundary.start_char,
                 boundary.end_char,
@@ -510,17 +530,29 @@ pub fn assembleTokenBatch(
             );
             const resolved_start = if (boundary.start_token > 0) boundary.start_token else tok_span.start_token;
             const resolved_end = if (boundary.end_token > 0) boundary.end_token else tok_span.end_token;
-            const span_start = @min(resolved_start, @as(u32, @intCast(max_seq_len)));
-            const span_end = @min(resolved_end, @as(u32, @intCast(max_seq_len)));
-            chunk_starts[c_base + k] = @intCast(span_start);
-            chunk_ends[c_base + k] = @intCast(span_end);
-            chunk_mask[c_base + k] = if (span_end > span_start) 1.0 else 0.0;
+            if (resolved_end <= resolved_start) continue;
 
             // Set boundary label at the first token of every chunk after the first.
             // This marks the positions where chunk splits occur in the sequence.
-            if (k > 0 and span_start < max_seq_len and span_end > span_start) {
-                boundary_labels[i * max_seq_len + span_start] = 1.0;
+            if (valid_chunk_idx > 0 and resolved_start < max_seq_len) {
+                boundary_labels[i * max_seq_len + resolved_start] = 1.0;
             }
+
+            if (valid_chunk_idx < max_chunks) {
+                var stored_end = resolved_end;
+                if (go_chunk_end_compat and boundary.end_token == 0) {
+                    var trim_end_for_go = false;
+                    if (tok_span.end_token > 0 and tok_span.end_token - 1 < active_offsets.len) {
+                        const prev_off = active_offsets[tok_span.end_token - 1];
+                        trim_end_for_go = prev_off[1] == boundary.end_char and prev_off[0] + 1 == prev_off[1];
+                    }
+                    if (trim_end_for_go and stored_end > resolved_start) stored_end -= 1;
+                }
+                chunk_starts[c_base + valid_chunk_idx] = @intCast(resolved_start);
+                chunk_ends[c_base + valid_chunk_idx] = @intCast(stored_end);
+                chunk_mask[c_base + valid_chunk_idx] = 1.0;
+            }
+            valid_chunk_idx += 1;
         }
     }
 
@@ -891,8 +923,8 @@ test "assembleTokenBatch masks chunks outside tokenized window" {
     defer batch.deinit(allocator);
 
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, batch.chunk_mask);
-    try std.testing.expectEqualSlices(i32, &.{ 0, 2 }, batch.chunk_starts);
-    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, batch.chunk_ends);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0 }, batch.chunk_starts);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 0 }, batch.chunk_ends);
     try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, batch.boundary_labels);
 }
 
@@ -1070,7 +1102,9 @@ test "computeStats: hardcoded samples" {
     try std.testing.expectEqual(@as(usize, 2), stats.num_samples);
     try std.testing.expectEqual(@as(usize, 2), stats.min_chunks);
     try std.testing.expectEqual(@as(usize, 3), stats.max_chunks);
-    try std.testing.expectEqual(@as(usize, 1), stats.samples_with_positives);
+    try std.testing.expectEqual(@as(usize, 1), stats.samples_with_contrastive_positives);
+    try std.testing.expectEqual(@as(usize, 2), stats.samples_with_boundary_targets);
+    try std.testing.expectEqual(@as(usize, 3), stats.total_boundary_targets);
     // avg_chunks: (3 + 2) / 2 = 2.5
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), stats.avg_chunks_per_sample, 1e-6);
     // avg_text_chars: (20 + 13) / 2 = 16.5

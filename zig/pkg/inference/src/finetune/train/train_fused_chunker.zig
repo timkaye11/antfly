@@ -800,6 +800,49 @@ fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
 }
 
+fn enabledName(enabled: bool) []const u8 {
+    return if (enabled) "enabled" else "disabled";
+}
+
+fn printPhase20ParityReport(opts: Options) void {
+    print("phase20_parity_contract source=\"gopeft Phase 20 best boundary run\" f1=0.786 scope=\"boundary+dense\" splade={s}\n", .{
+        enabledName(opts.splade),
+    });
+    print("phase20_parity_hparams epochs={d} batch_size={d} max_seq_len={d} max_chunks={d} lr={d} warmup_steps={d} lr_total_steps={d} weight_decay={d} max_grad_norm={d}\n", .{
+        opts.epochs,
+        opts.batch_size,
+        opts.max_seq_len,
+        opts.max_chunks,
+        opts.learning_rate,
+        opts.warmup_steps,
+        opts.lr_total_steps,
+        opts.weight_decay,
+        opts.max_grad_norm,
+    });
+    print("phase20_parity_lora rank={d} alpha={d} go_targets=query_proj,value_proj,key_proj,Wo zig_targets=query_proj,key_proj,value_proj,out_proj,wo\n", .{
+        opts.lora_rank,
+        opts.lora_alpha,
+    });
+    print("phase20_parity_loss lambda_chunk={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} boundary_dropout={d} neftune_alpha={d} mrl={s} mrl_dims={s} loss_type={s} pos_weight={d}\n", .{
+        opts.lambda_chunk,
+        opts.lambda_embed,
+        opts.boundary_focus_epochs,
+        opts.boundary_focus_lambda_embed,
+        opts.boundary_dropout,
+        opts.neftune_alpha,
+        enabledName(opts.mrl),
+        opts.mrl_dims_str,
+        @tagName(opts.boundary_loss_type),
+        opts.boundary_pos_weight,
+    });
+    print("phase20_parity_note go_cli_default_pos_weight=5.0 phase20_best_pos_weight=1.0\n", .{});
+    if (opts.model_dir) |mdir| {
+        print("phase20_parity_artifacts model_dir={s} tokenizer_path={s}/tokenizer.json sha256=see_phase20_runner_if_available\n", .{ mdir, mdir });
+    } else {
+        print("phase20_parity_artifacts model_dir=none tokenizer_path=none sha256=unavailable\n", .{});
+    }
+}
+
 fn avgMs(ns: u64, steps: u64) f64 {
     if (steps == 0) return 0.0;
     return nsToMs(ns) / @as(f64, @floatFromInt(steps));
@@ -2075,6 +2118,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     print("contrastive_grad_path={s}\n", .{fused_chunker_train.contrastive_gradient_path});
     print("step_eval_max_examples={d}\n", .{opts.step_eval_max_examples});
     print("max_steps={d}\n", .{opts.max_steps});
+    printPhase20ParityReport(opts);
 
     if (opts.model_dir) |mdir| {
         print("model_dir={s}\n", .{mdir});
@@ -2351,13 +2395,15 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     }
 
     const stats = fused_chunker_data.computeStats(samples);
-    print("loaded {d} samples  avg_chars={d:.0}  avg_chunks={d:.1}  min_chunks={d}  max_chunks={d}  with_positives={d}\n", .{
+    print("loaded {d} samples  avg_chars={d:.0}  avg_chunks={d:.1}  min_chunks={d}  max_chunks={d}  contrastive_pos_samples={d}  boundary_target_samples={d}  boundary_targets={d}\n", .{
         stats.num_samples,
         stats.avg_text_chars,
         stats.avg_chunks_per_sample,
         stats.min_chunks,
         stats.max_chunks,
-        stats.samples_with_positives,
+        stats.samples_with_contrastive_positives,
+        stats.samples_with_boundary_targets,
+        stats.total_boundary_targets,
     });
 
     var val_loaded_opt: ?fused_chunker_data.LoadedSamples = null;
@@ -2374,13 +2420,15 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             val_samples = &.{};
         } else {
             const val_stats = fused_chunker_data.computeStats(val_samples);
-            print("loaded {d} validation samples  avg_chars={d:.0}  avg_chunks={d:.1}  min_chunks={d}  max_chunks={d}  with_positives={d}\n", .{
+            print("loaded {d} validation samples  avg_chars={d:.0}  avg_chunks={d:.1}  min_chunks={d}  max_chunks={d}  contrastive_pos_samples={d}  boundary_target_samples={d}  boundary_targets={d}\n", .{
                 val_stats.num_samples,
                 val_stats.avg_text_chars,
                 val_stats.avg_chunks_per_sample,
                 val_stats.min_chunks,
                 val_stats.max_chunks,
-                val_stats.samples_with_positives,
+                val_stats.samples_with_contrastive_positives,
+                val_stats.samples_with_boundary_targets,
+                val_stats.total_boundary_targets,
             });
         }
     }
@@ -2539,8 +2587,9 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     var prng = std.Random.DefaultPrng.init(opts.seed);
     const rng = prng.random();
 
-    // Global step counter for NEFTune PRNG seeding — never resets across epochs.
-    var global_neft_step: u64 = 0;
+    // Global step counter for NEFTune PRNG seeding - never resets across epochs
+    // or checkpoint resumes.
+    var global_neft_step: u64 = trainer.step_count;
 
     if (tokenizer_opt == null) {
         print("warning: tokenizer not loaded — using dummy zero-fill token_fn; boundary labels will be inactive until encoder is wired\n", .{});
@@ -2552,6 +2601,29 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     var best_val_f1: f32 = -std.math.inf(f32);
     var best_val_epoch: u32 = 0;
     var best_val_step: u32 = 0;
+
+    const resume_step_count: u32 = trainer.step_count;
+    const resume_epoch: usize = if (steps_per_epoch == 0)
+        0
+    else
+        @min(@as(usize, @intCast(resume_step_count / steps_per_epoch)), @as(usize, @intCast(opts.epochs)));
+    const resume_step_in_epoch: u32 = if (steps_per_epoch == 0)
+        0
+    else
+        resume_step_count % steps_per_epoch;
+    const resume_batch_offset: usize = @min(@as(usize, @intCast(resume_step_in_epoch)) * batch_sz, samples.len);
+    if (resume_step_count > 0) {
+        print(
+            "resume_position global_step={d} steps_per_epoch={d} resume_epoch={d} resume_step_in_epoch={d} resume_batch_offset={d}\n",
+            .{
+                resume_step_count,
+                steps_per_epoch,
+                resume_epoch + 1,
+                resume_step_in_epoch,
+                resume_batch_offset,
+            },
+        );
+    }
 
     var stop_training = false;
     for (0..opts.epochs) |epoch| {
@@ -2591,8 +2663,21 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         } else indices;
 
         var epoch_timing = TimingTotals{};
-        var step: u32 = 0;
-        var batch_start: usize = 0;
+        if (epoch < resume_epoch) {
+            if (resume_step_count > 0) {
+                print("resume_skip_epoch epoch={d}/{d} already_covered_by_global_step={d}\n", .{ epoch + 1, opts.epochs, resume_step_count });
+            }
+            continue;
+        }
+
+        var step: u32 = if (epoch == resume_epoch) resume_step_in_epoch else 0;
+        var batch_start: usize = if (epoch == resume_epoch) resume_batch_offset else 0;
+        if (resume_step_count > 0 and epoch == resume_epoch and batch_start > 0) {
+            print(
+                "resume_epoch_start epoch={d}/{d} local_step={d} batch_start={d}/{d}\n",
+                .{ epoch + 1, opts.epochs, step, batch_start, active_indices.len },
+            );
+        }
 
         while (batch_start < active_indices.len) {
             const step_start_ns = nowNs();
@@ -3776,6 +3861,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         nsToMs(elapsedNs(val_eval_start_ns)),
                     },
                 );
+                fused_chunker_train.printBoundaryQualityDiagnostics("validation_step_quality", val_summary);
 
                 if (step_eval_is_full and val_summary.boundary_f1 > best_val_f1) {
                     best_val_f1 = val_summary.boundary_f1;
@@ -3880,6 +3966,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     nsToMs(elapsedNs(val_eval_start_ns)),
                 },
             );
+            fused_chunker_train.printBoundaryQualityDiagnostics("validation_epoch_quality", val_summary);
 
             if (val_summary.boundary_f1 > best_val_f1) {
                 best_val_f1 = val_summary.boundary_f1;

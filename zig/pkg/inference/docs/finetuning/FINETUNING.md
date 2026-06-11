@@ -570,6 +570,26 @@ explicitly diagnostic. Quality probes should report both F1 metrics and
 MPSGraph fallback counts; a production-parity run with interpreter fallback is
 not considered equivalent to the Go architecture.
 
+For quality parity, the source of truth is the Go Phase-20 best-boundary run,
+not the generic Go CLI defaults. That recipe used `pos_weight=1.0` with CE
+loss, even though the Go CLI default is `5.0`; it also used batch `8`, sequence
+length `384`, LR `2e-5`, warmup `200`, max grad norm `1`, LoRA rank `16` /
+alpha `32`, boundary focus for `3` epochs with embed lambda `0.1`, boundary
+dropout `0.1`, NEFTune alpha `5.0`, and MRL dims `768,256,128`. The Phase-20
+runner prints these values as a compact parity contract, along with the model
+directory, tokenizer path, and artifact hashes when hashing is enabled.
+
+Current quality debugging should start with deterministic supervision parity
+before longer runs. Use `zig build count-fused-tokenization -- --data <jsonl>
+--model-dir <modernbert-dir> --split val --limit 8 --json --dump-first` to
+emit machine-diffable token IDs, masks, chunk spans, boundary-label hashes, and
+first-sample boundary positions. Training and standalone eval print compact
+threshold-sweep and probability-histogram diagnostics after each validation
+summary. Short Metal/MPSGraph probes can be gated with
+`scripts/verify_fused_chunker_probe_log.sh <log>`; controlled quality sweeps
+from a stable checkpoint are launched by
+`scripts/run_fused_chunker_quality_ablations.sh`.
+
 | Feature | Fused Chunker | LayoutLMv3 Seq | LayoutLMv3 Token | Reranker LoRA | ColQwen2 | GLiNER2 LoRA | Gemma4 LoRA |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | AdamW optimizer | yes | yes | yes | yes | yes | yes | yes |

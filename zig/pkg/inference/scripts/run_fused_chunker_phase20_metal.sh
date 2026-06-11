@@ -51,11 +51,16 @@ lambda_embed="${ANTFLY_FUSED_CHUNKER_LAMBDA_EMBED:-0.3}"
 boundary_focus_epochs="${ANTFLY_FUSED_CHUNKER_BOUNDARY_FOCUS_EPOCHS:-3}"
 boundary_focus_lambda_embed="${ANTFLY_FUSED_CHUNKER_BOUNDARY_FOCUS_LAMBDA_EMBED:-0.1}"
 boundary_dropout="${ANTFLY_FUSED_CHUNKER_BOUNDARY_DROPOUT:-0.1}"
-# Go Phase 20 uses NEFTune alpha 5.0 while keeping dropout off in the
-# segmented encoder path.
+# Go Phase 20 best-boundary recipe uses NEFTune alpha 5.0 with encoder
+# dropout disabled and boundary-head dropout at 0.1.
 neftune_alpha="${ANTFLY_FUSED_CHUNKER_NEFTUNE_ALPHA:-5.0}"
 mrl_dims="${ANTFLY_FUSED_CHUNKER_MRL_DIMS:-768,256,128}"
+# The Go CLI default is 5.0, but the Phase 20 best F1=0.786 run explicitly
+# used plain CE with pos_weight=1.0.
 pos_weight="${ANTFLY_FUSED_CHUNKER_POS_WEIGHT:-1.0}"
+boundary_loss_type="${ANTFLY_FUSED_CHUNKER_LOSS_TYPE:-ce}"
+boundary_focal_gamma="${ANTFLY_FUSED_CHUNKER_FOCAL_GAMMA:-2.0}"
+boundary_focal_alpha="${ANTFLY_FUSED_CHUNKER_FOCAL_ALPHA:-0.75}"
 log_every="${ANTFLY_FUSED_CHUNKER_LOG_EVERY:-100}"
 eval_every="${ANTFLY_FUSED_CHUNKER_EVAL_EVERY:-1}"
 checkpoint_every_steps="${ANTFLY_FUSED_CHUNKER_CHECKPOINT_EVERY_STEPS:-0}"
@@ -74,6 +79,22 @@ enable_splade="${ANTFLY_FUSED_CHUNKER_SPLADE:-0}"
 lambda_splade="${ANTFLY_FUSED_CHUNKER_LAMBDA_SPLADE:-0.15}"
 lambda_flops="${ANTFLY_FUSED_CHUNKER_LAMBDA_FLOPS:-3e-5}"
 splade_focus_epoch="${ANTFLY_FUSED_CHUNKER_SPLADE_FOCUS_EPOCH:-4}"
+hash_model_artifacts="${ANTFLY_FUSED_CHUNKER_HASH_MODEL_ARTIFACTS:-1}"
+
+sha256_or_skip() {
+  local path="$1"
+  case "$hash_model_artifacts" in
+    1|true|TRUE|yes|YES) ;;
+    *) echo "disabled"; return 0 ;;
+  esac
+  if command -v shasum >/dev/null 2>&1; then
+    local line
+    line="$(shasum -a 256 "$path")"
+    echo "${line%% *}"
+  else
+    echo "unavailable"
+  fi
+}
 
 if [[ ! -f "$train_data" ]]; then
   echo "missing training data at $train_data" >&2
@@ -95,17 +116,35 @@ if [[ ! -f "$model_dir/tokenizer.json" ]]; then
   exit 1
 fi
 
+model_sha256="$(sha256_or_skip "$model_dir/model.safetensors")"
+tokenizer_sha256="$(sha256_or_skip "$model_dir/tokenizer.json")"
+
 cd "$pkg_root"
 export ANTFLY_FUSED_CHUNKER_ENCODER_VJP_EXECUTION="$segment_vjp_execution"
 export TERMITE_MPSGRAPH_SMOKE="$mpsgraph_smoke"
 
 echo "training Zig fused chunker Phase-20 Metal/MPSGraph parity run"
+echo "Phase 20 best-boundary parity contract"
+echo "  source=gopeft Phase 20 best F1=0.786 boundary run"
+echo "  scope=boundary+dense only; SPLADE disabled unless explicitly requested"
+echo "  epochs=$epochs batch_size=$batch_size max_seq_len=$max_seq_len max_chunks=$max_chunks"
+echo "  lr=$learning_rate warmup_steps=$warmup_steps lr_total_steps=$lr_total_steps weight_decay=$weight_decay max_grad_norm=$max_grad_norm"
+echo "  lora_rank=$lora_rank lora_alpha=$lora_alpha targets=go(query_proj,value_proj,key_proj,Wo) zig(query_proj,key_proj,value_proj,out_proj,wo)"
+echo "  lambda_chunk=$lambda_chunk lambda_embed=$lambda_embed boundary_focus_epochs=$boundary_focus_epochs boundary_focus_lambda_embed=$boundary_focus_lambda_embed"
+echo "  boundary_dropout=$boundary_dropout neftune_alpha=$neftune_alpha mrl_dims=$mrl_dims loss_type=$boundary_loss_type pos_weight=$pos_weight"
+echo "  note=Go CLI default pos_weight is 5.0; Phase 20 best run uses 1.0"
 echo "  train_data=$train_data"
 echo "  val_data=$val_data"
 echo "  model_dir=$model_dir"
+echo "  tokenizer_path=$model_dir/tokenizer.json"
+echo "  model_sha256=$model_sha256"
+echo "  tokenizer_sha256=$tokenizer_sha256"
 echo "  output_dir=$output_dir"
 echo "  zig=$zig_bin"
 echo "  pos_weight=$pos_weight"
+echo "  boundary_loss_type=$boundary_loss_type"
+echo "  focal_gamma=$boundary_focal_gamma"
+echo "  focal_alpha=$boundary_focal_alpha"
 echo "  neftune_alpha=$neftune_alpha"
 echo "  encoder_vjp=$encoder_vjp"
 echo "  segment_vjp_execution=$segment_vjp_execution"
@@ -182,7 +221,9 @@ exec "$zig_bin" build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false train-fuse
   --mrl \
   --mrl-dims "$mrl_dims" \
   --pos-weight "$pos_weight" \
-  --loss-type ce \
+  --loss-type "$boundary_loss_type" \
+  --focal-gamma "$boundary_focal_gamma" \
+  --focal-alpha "$boundary_focal_alpha" \
   --checkpoint-every 1 \
   --log-every "$log_every" \
   --eval-every "$eval_every" \

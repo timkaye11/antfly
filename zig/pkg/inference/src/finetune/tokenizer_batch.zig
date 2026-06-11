@@ -67,6 +67,7 @@ pub const TokenizerBatch = struct {
 
 pub const TokenFnCtx = struct {
     tb: *TokenizerBatch,
+    go_chunk_end_compat: bool = true,
 
     /// token_fn contract:
     ///   fn(ctx: *TokenFnCtx, text: []const u8, out_ids: []i32, out_mask: []i32, out_offsets: ?[][2]u32) usize

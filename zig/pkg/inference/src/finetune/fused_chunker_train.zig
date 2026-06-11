@@ -466,6 +466,20 @@ pub const BoundaryStepDebugSummary = struct {
 // ----------------------------------------------------------------------------
 
 pub const EvalSummary = struct {
+    pub const diagnostic_threshold_count = 9;
+    pub const histogram_bucket_count = 10;
+
+    pub const ThresholdPoint = struct {
+        threshold: f32 = 0,
+        f1: f32 = 0,
+        precision: f32 = 0,
+        recall: f32 = 0,
+        tp: u64 = 0,
+        fp: u64 = 0,
+        fn_: u64 = 0,
+        predicted_positive_rate: f32 = 0,
+    };
+
     boundary_f1: f32 = 0,
     boundary_precision: f32 = 0,
     boundary_recall: f32 = 0,
@@ -489,10 +503,14 @@ pub const EvalSummary = struct {
     mean_positive_probability_gold_positive: f32 = 0,
     mean_positive_probability_gold_negative: f32 = 0,
     num_batches: u32 = 0,
+    threshold_points: [diagnostic_threshold_count]ThresholdPoint = [_]ThresholdPoint{.{}} ** diagnostic_threshold_count,
+    probability_histogram_gold_positive: [histogram_bucket_count]u64 = [_]u64{0} ** histogram_bucket_count,
+    probability_histogram_gold_negative: [histogram_bucket_count]u64 = [_]u64{0} ** histogram_bucket_count,
 };
 
 pub const BoundaryEvalAccumulator = struct {
     pub const sweep_count = 101;
+    pub const diagnostic_thresholds = [_]f32{ 0.01, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50 };
 
     agg: fused_chunker_loss.BoundaryMetrics = .{ .tp = 0, .fp = 0, .fn_ = 0 },
     sweep_metrics: [sweep_count]fused_chunker_loss.BoundaryMetrics = [_]fused_chunker_loss.BoundaryMetrics{.{ .tp = 0, .fp = 0, .fn_ = 0 }} ** sweep_count,
@@ -500,7 +518,15 @@ pub const BoundaryEvalAccumulator = struct {
     gold_positives: u64 = 0,
     prob_sum_gold_positive: f64 = 0,
     prob_sum_gold_negative: f64 = 0,
+    probability_histogram_gold_positive: [EvalSummary.histogram_bucket_count]u64 = [_]u64{0} ** EvalSummary.histogram_bucket_count,
+    probability_histogram_gold_negative: [EvalSummary.histogram_bucket_count]u64 = [_]u64{0} ** EvalSummary.histogram_bucket_count,
     num_batches: u32 = 0,
+
+    fn probabilityBucket(prob: f32) usize {
+        if (!std.math.isFinite(prob) or prob <= 0) return 0;
+        if (prob >= 1) return EvalSummary.histogram_bucket_count - 1;
+        return @min(@as(usize, @intFromFloat(prob * @as(f32, @floatFromInt(EvalSummary.histogram_bucket_count)))), EvalSummary.histogram_bucket_count - 1);
+    }
 
     pub fn addLogits(
         self: *BoundaryEvalAccumulator,
@@ -523,11 +549,14 @@ pub const BoundaryEvalAccumulator = struct {
             }
             self.valid_tokens += 1;
             const prob = fused_chunker_loss.positiveBoundaryProbability(logits[i * 2], logits[i * 2 + 1]);
+            const bucket = probabilityBucket(prob);
             if (scalar_labels[i] > 0.5) {
                 self.gold_positives += 1;
                 self.prob_sum_gold_positive += prob;
+                self.probability_histogram_gold_positive[bucket] += 1;
             } else {
                 self.prob_sum_gold_negative += prob;
+                self.probability_histogram_gold_negative[bucket] += 1;
             }
         }
 
@@ -583,6 +612,22 @@ pub const BoundaryEvalAccumulator = struct {
             0.0
         else
             @as(f32, @floatCast(self.prob_sum_gold_negative / @as(f64, @floatFromInt(gold_negatives))));
+        var threshold_points: [EvalSummary.diagnostic_threshold_count]EvalSummary.ThresholdPoint = [_]EvalSummary.ThresholdPoint{.{}} ** EvalSummary.diagnostic_threshold_count;
+        for (diagnostic_thresholds, 0..) |threshold, i| {
+            const sweep_idx = @min(@as(usize, @intFromFloat(@round(threshold * @as(f32, @floatFromInt(sweep_count - 1))))), sweep_count - 1);
+            const metrics = self.sweep_metrics[sweep_idx];
+            const predicted = metrics.tp + metrics.fp;
+            threshold_points[i] = .{
+                .threshold = @as(f32, @floatFromInt(sweep_idx)) / @as(f32, @floatFromInt(sweep_count - 1)),
+                .f1 = metrics.f1(),
+                .precision = metrics.precision(),
+                .recall = metrics.recall(),
+                .tp = metrics.tp,
+                .fp = metrics.fp,
+                .fn_ = metrics.fn_,
+                .predicted_positive_rate = if (self.valid_tokens == 0) 0.0 else @as(f32, @floatFromInt(predicted)) / valid_f,
+            };
+        }
 
         return EvalSummary{
             .boundary_f1 = self.agg.f1(),
@@ -608,9 +653,44 @@ pub const BoundaryEvalAccumulator = struct {
             .mean_positive_probability_gold_positive = mean_pos_prob_gold_positive,
             .mean_positive_probability_gold_negative = mean_pos_prob_gold_negative,
             .num_batches = self.num_batches,
+            .threshold_points = threshold_points,
+            .probability_histogram_gold_positive = self.probability_histogram_gold_positive,
+            .probability_histogram_gold_negative = self.probability_histogram_gold_negative,
         };
     }
 };
+
+pub fn printBoundaryQualityDiagnostics(label: []const u8, summary: EvalSummary) void {
+    std.debug.print("{s} threshold_sweep", .{label});
+    for (summary.threshold_points) |point| {
+        std.debug.print(" t={d:.2}:f1={d:.4},p={d:.4},r={d:.4},pred={d:.6}", .{
+            point.threshold,
+            point.f1,
+            point.precision,
+            point.recall,
+            point.predicted_positive_rate,
+        });
+    }
+    std.debug.print("\n", .{});
+
+    std.debug.print("{s} prob_hist gold_pos", .{label});
+    for (summary.probability_histogram_gold_positive, 0..) |count, i| {
+        std.debug.print(" [{d:.1},{d:.1})={d}", .{
+            @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(EvalSummary.histogram_bucket_count)),
+            @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(EvalSummary.histogram_bucket_count)),
+            count,
+        });
+    }
+    std.debug.print(" | gold_neg", .{});
+    for (summary.probability_histogram_gold_negative, 0..) |count, i| {
+        std.debug.print(" [{d:.1},{d:.1})={d}", .{
+            @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(EvalSummary.histogram_bucket_count)),
+            @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(EvalSummary.histogram_bucket_count)),
+            count,
+        });
+    }
+    std.debug.print("\n", .{});
+}
 
 // ----------------------------------------------------------------------------
 // FusedTrainer
@@ -2862,6 +2942,11 @@ test "BoundaryEvalAccumulator reports boundary rate and probability diagnostics"
     const p2 = fused_chunker_loss.positiveBoundaryProbability(0.0, 0.0);
     try std.testing.expectApproxEqAbs((p0 + p2) * 0.5, summary.mean_positive_probability_gold_positive, 1e-6);
     try std.testing.expectApproxEqAbs(p1, summary.mean_positive_probability_gold_negative, 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.01), summary.threshold_points[0].threshold);
+    try std.testing.expectEqual(@as(f32, 0.5), summary.threshold_points[summary.threshold_points.len - 1].threshold);
+    try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_positive[5]);
+    try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_positive[7]);
+    try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_negative[2]);
 }
 
 test "trainStep treats max_grad_norm zero as clipping disabled" {
