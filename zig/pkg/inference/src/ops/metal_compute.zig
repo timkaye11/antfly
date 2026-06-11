@@ -1156,7 +1156,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         base_offset: usize,
     ) !CT {
         const source = toBuf(input);
-        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null) {
+        // A pending lazy_multiply has no concrete `data` to alias — copying the
+        // empty slice and dropping the deferred product orphans the buffer
+        // (data.len=0, lazy_multiply lost). Reject so the caller materializes
+        // the product instead of building a corrupt zero-length view.
+        if (source.metal_tensor != null or source.quantized_storage != null or source.owned_quantized_storage != null or source.lazy_entry != null or source.lazy_multiply != null) {
             return error.UnsupportedTensorType;
         }
 
@@ -7181,6 +7185,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var owned_input_host: ?[]f32 = null;
         defer if (owned_input_host) |slice| self.allocator.free(slice);
         const input_host = blk: {
+            // A pending lazy_multiply has no concrete storage; materialize its
+            // product in logical order (toFloat32Op handles wrap-repeat) so the
+            // transpose reads real data instead of an empty slice.
+            if (input_buf.lazy_multiply != null) {
+                const owned = try toFloat32Op(@ptrCast(self), input, self.allocator);
+                owned_input_host = owned;
+                break :blk owned;
+            }
             if (try self.materializeStrideViewWithResolvedShape(input_buf, in_shape)) |owned| {
                 owned_input_host = owned;
                 break :blk owned;

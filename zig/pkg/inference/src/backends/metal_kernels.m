@@ -22675,12 +22675,6 @@ int termite_metal_decode_runtime_transpose_f32_device(
         }
     }
 
-    if (getenv("TERMITE_METAL_TRACE_TRANSPOSE") != NULL) {
-        char dbuf[128]; char pbuf[64]; int dn = 0; int pn = 0;
-        for (size_t i = 0; i < rank && dn < 110; ++i) dn += snprintf(dbuf + dn, sizeof(dbuf) - dn, "%u,", dims[i]);
-        for (size_t i = 0; i < rank && pn < 56; ++i) pn += snprintf(pbuf + pn, sizeof(pbuf) - pn, "%u,", perm[i]);
-        fprintf(stderr, "transpose: rank=%zu total=%zu dims=[%s] perm=[%s] tiled=%d\n", rank, total, dbuf, pbuf, use_tiled ? 1 : 0);
-    }
     @autoreleasepool {
         id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
@@ -22777,20 +22771,12 @@ int termite_metal_decode_runtime_dot_general_2d_f32_device(
         {
             return -8;
         }
-        if (getenv("TERMITE_METAL_TRACE_DOT_GENERAL") != NULL) {
-            const char *path;
-            if (m >= 8 && n >= 128 && k >= 128 && getenv("TERMITE_METAL_DISABLE_DOT_GENERAL_2D_MPS") == NULL) path = "mps";
-            else if (m <= 32 && n >= 128 && k >= 128) path = "small_m_tile";
-            else if (k >= 128) path = "reduce";
-            else path = "naive";
-            fprintf(stderr, "dotgen: m=%zu n=%zu k=%zu rca=%u path=%s\n", m, n, k, rhs_contract_axis, path);
-        }
         // MPS GEMM is ~6x faster than the hand-written fallback kernel for these
         // shapes and parity-clean; default-on, with a DISABLE escape hatch.
-        const BOOL force_mps = getenv("TERMITE_METAL_FORCE_DOT_GENERAL_MPS") != NULL;
         const BOOL use_mps =
-            ((force_mps && m >= 1 && n >= 1 && k >= 1) ||
-             (m >= 8 && n >= 128 && k >= 128)) &&
+            m >= 8 &&
+            n >= 128 &&
+            k >= 128 &&
             getenv("TERMITE_METAL_DISABLE_DOT_GENERAL_2D_MPS") == NULL;
         if (use_mps) {
             termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
