@@ -30,6 +30,7 @@ const gemma3_vision = @import("../architectures/gemma3_vision.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const c_file = @import("../util/c_file.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
+const compat = @import("../io/compat.zig");
 
 const print = std.debug.print;
 
@@ -56,8 +57,12 @@ const Options = struct {
     onnx_prompt_embeddings_only: bool = false,
     runtime_parity: bool = false,
     sequential_compare: bool = false,
+    quality_eval: bool = false,
     weight_binding_audit: bool = false,
     activation_trace: bool = false,
+    prompt_file: ?[]const u8 = null,
+    max_prompts: usize = 0,
+    json_out_path: ?[]const u8 = null,
     binding_audit_layer_limit: usize = 0,
     activation_trace_layer_limit: usize = 8,
     activation_trace_layer: ?usize = null,
@@ -429,6 +434,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
     if (opts.activation_trace) {
         try runActivationTraceCompare(allocator, opts);
+        return;
+    }
+    if (opts.quality_eval) {
+        try runQualityEval(allocator, io, opts);
         return;
     }
     if (opts.sequential_compare) {
@@ -868,6 +877,285 @@ fn runSequentialTextCompare(allocator: std.mem.Allocator, opts: Options) !void {
         print("reference_prompt:\n{s}\n", .{reference.prompt});
     }
     try printNativeReferenceTopComparison(allocator, reference_model, native, reference, opts.top_k);
+}
+
+const QualityEvalItem = struct {
+    prompt: []u8,
+    native_top1: i32,
+    reference_top1: i32,
+    native_text: []u8,
+    reference_text: []u8,
+    top1_match: bool,
+    topk_overlap: usize,
+    topk_limit: usize,
+    native_rank_in_reference: usize,
+    reference_rank_in_native: usize,
+    native_empty_or_special: bool,
+    reference_empty_or_special: bool,
+
+    fn deinit(self: *QualityEvalItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        allocator.free(self.native_text);
+        allocator.free(self.reference_text);
+        self.* = undefined;
+    }
+};
+
+fn runQualityEval(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    if (opts.image_count > 0) return error.QualityEvalTextOnly;
+
+    var prompts = try loadQualityEvalPrompts(allocator, io, opts);
+    defer {
+        for (prompts.items) |prompt| allocator.free(prompt);
+        prompts.deinit(allocator);
+    }
+    if (prompts.items.len == 0) return error.EmptyPromptFile;
+
+    var items = std.ArrayListUnmanaged(QualityEvalItem).empty;
+    defer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+
+    var top1_matches: usize = 0;
+    var empty_or_special_failures: usize = 0;
+    var overlap_sum: usize = 0;
+    var reference_rank_sum: usize = 0;
+    var candidate_rank_sum: usize = 0;
+
+    for (prompts.items, 0..) |prompt, idx| {
+        var prompt_opts = opts;
+        prompt_opts.prompt = prompt;
+        prompt_opts.image_count = 0;
+
+        var native = blk: {
+            var session_manager = backends.SessionManager.init(allocator);
+            configureBackendPreference(&session_manager, opts.native_backend orelse opts.backend);
+            var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
+            defer model_manager.deinit();
+
+            const model = try model_manager.loadFromDir(opts.native_model_dir);
+            var analysis = try analyzeNativeModel(allocator, model, prompt_opts);
+            errdefer analysis.deinit(allocator);
+            break :blk analysis;
+        };
+        defer native.deinit(allocator);
+
+        var session_manager = backends.SessionManager.init(allocator);
+        configureBackendPreference(&session_manager, opts.reference_backend orelse opts.backend);
+        var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
+        defer model_manager.deinit();
+
+        const reference_model = try model_manager.loadFromDir(opts.reference_model_dir);
+        var reference = try analyzeNativeModel(allocator, reference_model, prompt_opts);
+        defer reference.deinit(allocator);
+
+        if (native.last_logits.len != reference.last_logits.len) return error.QualityEvalVocabMismatch;
+        if (!std.mem.eql(u8, native.prompt, reference.prompt)) return error.QualityEvalPromptMismatch;
+
+        const top1_match = native.top1 == reference.top1;
+        if (top1_match) top1_matches += 1;
+        const overlap = topLogitOverlap(native.top_logits, reference.top_logits);
+        overlap_sum += overlap;
+        const topk_limit = @min(opts.top_k, @min(native.top_logits.len, reference.top_logits.len));
+        const native_rank_in_reference = rankOfToken(reference.last_logits, native.top1) orelse 0;
+        const reference_rank_in_native = rankOfToken(native.last_logits, reference.top1) orelse 0;
+        reference_rank_sum += reference_rank_in_native;
+        candidate_rank_sum += native_rank_in_reference;
+        const native_text = try decodeTokenText(allocator, reference_model.getTokenizer(), native.top1);
+        errdefer allocator.free(native_text);
+        const reference_text = try decodeTokenText(allocator, reference_model.getTokenizer(), reference.top1);
+        errdefer allocator.free(reference_text);
+        const native_empty_or_special = native_text.len == 0 or isManifestSpecialText(reference_model, native_text);
+        const reference_empty_or_special = reference_text.len == 0 or isManifestSpecialText(reference_model, reference_text);
+        if (native_empty_or_special) empty_or_special_failures += 1;
+
+        print(
+            "quality_eval_prompt: index={d} native_top1={d} reference_top1={d} match={} topk_overlap={d}/{d} native_rank_in_reference={d} reference_rank_in_native={d} native_empty_or_special={} reference_empty_or_special={}\n",
+            .{
+                idx,
+                native.top1,
+                reference.top1,
+                top1_match,
+                overlap,
+                topk_limit,
+                native_rank_in_reference,
+                reference_rank_in_native,
+                native_empty_or_special,
+                reference_empty_or_special,
+            },
+        );
+
+        const prompt_copy = try allocator.dupe(u8, prompt);
+        errdefer allocator.free(prompt_copy);
+        try items.append(allocator, .{
+            .prompt = prompt_copy,
+            .native_top1 = native.top1,
+            .reference_top1 = reference.top1,
+            .native_text = native_text,
+            .reference_text = reference_text,
+            .top1_match = top1_match,
+            .topk_overlap = overlap,
+            .topk_limit = topk_limit,
+            .native_rank_in_reference = native_rank_in_reference,
+            .reference_rank_in_native = reference_rank_in_native,
+            .native_empty_or_special = native_empty_or_special,
+            .reference_empty_or_special = reference_empty_or_special,
+        });
+    }
+
+    const prompt_count = items.items.len;
+    const top1_pct = percent(top1_matches, prompt_count);
+    const overlap_avg = if (prompt_count == 0) 0.0 else @as(f64, @floatFromInt(overlap_sum)) / @as(f64, @floatFromInt(prompt_count));
+    const candidate_rank_avg = if (prompt_count == 0) 0.0 else @as(f64, @floatFromInt(candidate_rank_sum)) / @as(f64, @floatFromInt(prompt_count));
+    const reference_rank_avg = if (prompt_count == 0) 0.0 else @as(f64, @floatFromInt(reference_rank_sum)) / @as(f64, @floatFromInt(prompt_count));
+    const min_top1_pct = inferredQualityTop1Threshold(opts.native_model_dir);
+    const passed = empty_or_special_failures == 0 and top1_pct >= min_top1_pct;
+
+    print(
+        "quality_eval_summary: prompts={d} top1_matches={d} top1_pct={d:.2} min_top1_pct={d:.2} empty_or_special_failures={d} avg_topk_overlap={d:.3} avg_native_rank_in_reference={d:.3} avg_reference_rank_in_native={d:.3} passed={}\n",
+        .{
+            prompt_count,
+            top1_matches,
+            top1_pct,
+            min_top1_pct,
+            empty_or_special_failures,
+            overlap_avg,
+            candidate_rank_avg,
+            reference_rank_avg,
+            passed,
+        },
+    );
+
+    if (opts.json_out_path) |path| {
+        try writeQualityEvalJson(allocator, io, path, opts, items.items, top1_matches, top1_pct, min_top1_pct, empty_or_special_failures, overlap_avg, candidate_rank_avg, reference_rank_avg, passed);
+    }
+    if (!passed) return error.QualityEvalGateFailed;
+}
+
+fn loadQualityEvalPrompts(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayListUnmanaged([]u8) {
+    var prompts = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (prompts.items) |prompt| allocator.free(prompt);
+        prompts.deinit(allocator);
+    }
+    if (opts.prompt_file) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
+        defer allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line_raw| {
+            if (opts.max_prompts > 0 and prompts.items.len >= opts.max_prompts) break;
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+            if (line[0] == '#') continue;
+            try prompts.append(allocator, try allocator.dupe(u8, line));
+        }
+    } else {
+        try prompts.append(allocator, try allocator.dupe(u8, opts.prompt));
+    }
+    return prompts;
+}
+
+fn percent(count: usize, total: usize) f64 {
+    if (total == 0) return 0.0;
+    return @as(f64, @floatFromInt(count)) * 100.0 / @as(f64, @floatFromInt(total));
+}
+
+fn inferredQualityTop1Threshold(model_dir: []const u8) f64 {
+    if (std.mem.indexOf(u8, model_dir, "q4") != null or std.mem.indexOf(u8, model_dir, "Q4") != null) return 75.0;
+    if (std.mem.indexOf(u8, model_dir, "q8") != null or std.mem.indexOf(u8, model_dir, "Q8") != null) return 90.0;
+    return 0.0;
+}
+
+fn writeQualityEvalJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    opts: Options,
+    items: []const QualityEvalItem,
+    top1_matches: usize,
+    top1_pct: f64,
+    min_top1_pct: f64,
+    empty_or_special_failures: usize,
+    overlap_avg: f64,
+    candidate_rank_avg: f64,
+    reference_rank_avg: f64,
+    passed: bool,
+) !void {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    const header = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"native_model":{f},
+        \\"reference_model":{f},
+        \\"prompt_count":{d},
+        \\"top1_matches":{d},
+        \\"top1_pct":{d:.6},
+        \\"min_top1_pct":{d:.6},
+        \\"empty_or_special_failures":{d},
+        \\"avg_topk_overlap":{d:.6},
+        \\"avg_native_rank_in_reference":{d:.6},
+        \\"avg_reference_rank_in_native":{d:.6},
+        \\"passed":{},
+        \\"items":[
+        \\
+    ,
+        .{
+            std.json.fmt(opts.native_model_dir, .{}),
+            std.json.fmt(opts.reference_model_dir, .{}),
+            items.len,
+            top1_matches,
+            top1_pct,
+            min_top1_pct,
+            empty_or_special_failures,
+            overlap_avg,
+            candidate_rank_avg,
+            reference_rank_avg,
+            passed,
+        },
+    );
+    defer allocator.free(header);
+    try out.appendSlice(allocator, header);
+    for (items, 0..) |item, idx| {
+        const row = try std.fmt.allocPrint(
+            allocator,
+            \\{s}{{
+            \\"prompt":{f},
+            \\"native_top1":{d},
+            \\"reference_top1":{d},
+            \\"native_text":{f},
+            \\"reference_text":{f},
+            \\"top1_match":{},
+            \\"topk_overlap":{d},
+            \\"topk_limit":{d},
+            \\"native_rank_in_reference":{d},
+            \\"reference_rank_in_native":{d},
+            \\"native_empty_or_special":{},
+            \\"reference_empty_or_special":{}
+            \\}}
+        ,
+            .{
+                if (idx == 0) "" else ",",
+                std.json.fmt(item.prompt, .{}),
+                item.native_top1,
+                item.reference_top1,
+                std.json.fmt(item.native_text, .{}),
+                std.json.fmt(item.reference_text, .{}),
+                item.top1_match,
+                item.topk_overlap,
+                item.topk_limit,
+                item.native_rank_in_reference,
+                item.reference_rank_in_native,
+                item.native_empty_or_special,
+                item.reference_empty_or_special,
+            },
+        );
+        defer allocator.free(row);
+        try out.appendSlice(allocator, row);
+    }
+    try out.appendSlice(allocator, "\n]}\n");
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
 fn runActivationTraceCompare(allocator: std.mem.Allocator, opts: Options) !void {
@@ -3366,10 +3654,24 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.runtime_parity = true;
         } else if (std.mem.eql(u8, arg, "--sequential")) {
             opts.sequential_compare = true;
+        } else if (std.mem.eql(u8, arg, "--quality-eval")) {
+            opts.quality_eval = true;
         } else if (std.mem.eql(u8, arg, "--weight-binding-audit")) {
             opts.weight_binding_audit = true;
         } else if (std.mem.eql(u8, arg, "--activation-trace")) {
             opts.activation_trace = true;
+        } else if (std.mem.eql(u8, arg, "--prompt-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPromptFile;
+            opts.prompt_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--max-prompts")) {
+            i += 1;
+            if (i >= args.len) return error.MissingMaxPrompts;
+            opts.max_prompts = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--json-out")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonOutPath;
+            opts.json_out_path = args[i];
         } else if (std.mem.eql(u8, arg, "--activation-trace-all-rows")) {
             opts.activation_trace_all_rows = true;
         } else if (std.mem.eql(u8, arg, "--binding-audit-layer-limit")) {
@@ -3433,5 +3735,5 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 }
 
 fn printUsage() void {
-    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--runtime-parity] [--sequential] [--weight-binding-audit] [--binding-audit-layer-limit N] [--activation-trace] [--activation-trace-all-rows] [--activation-trace-layer-limit N] [--activation-trace-layer N] [--activation-trace-row N] [--backend auto|native|cuda|mlx] [--native-backend auto|native|cuda|mlx] [--reference-backend auto|native|cuda|mlx] [--top-k N] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--no-chat-template] [--raw-prompt]\n", .{});
+    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--runtime-parity] [--sequential] [--quality-eval] [--prompt-file PATH] [--max-prompts N] [--json-out PATH] [--weight-binding-audit] [--binding-audit-layer-limit N] [--activation-trace] [--activation-trace-all-rows] [--activation-trace-layer-limit N] [--activation-trace-layer N] [--activation-trace-row N] [--backend auto|native|cuda|mlx] [--native-backend auto|native|cuda|mlx] [--reference-backend auto|native|cuda|mlx] [--top-k N] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--no-chat-template] [--raw-prompt]\n", .{});
 }

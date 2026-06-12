@@ -202,6 +202,7 @@ pub const GenerationResult = struct {
     prompt_tokens: usize = 0,
     tokens_used: usize,
     finish_reason: []const u8,
+    timing_ms: ?GenerationTimingMs = null,
     speculative: ?SpeculativeDecodeStats = null,
     allocator: std.mem.Allocator,
 
@@ -209,6 +210,15 @@ pub const GenerationResult = struct {
         self.allocator.free(self.text);
         if (self.token_ids) |ids| self.allocator.free(ids);
     }
+};
+
+pub const GenerationTimingMs = struct {
+    prompt_format: u64 = 0,
+    tokenize: u64 = 0,
+    runtime_prepare: u64 = 0,
+    prefill: u64 = 0,
+    decode: u64 = 0,
+    total: u64 = 0,
 };
 
 pub const SpeculativeDecodeStats = struct {
@@ -2038,17 +2048,26 @@ pub const NativeGenerationPipeline = struct {
         for (0..gen_ids.len) |i| gen_ids[i] = @intCast(token_ids[gen_start + i]);
 
         const text = try self.tokenizer.decode(allocator, gen_ids);
-        if (self.print_timing and self.io != null) {
-            const finished_generate_at = std.Io.Timestamp.now(self.io.?, .awake);
+        const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
+            .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
+            .tokenize = timestampDurationMillis(formatted_prompt_at, encoded_prompt_at),
+            .runtime_prepare = timestampDurationMillis(runtime_prepare_started_at, prefill_started_at),
+            .prefill = timestampDurationMillis(prefill_started_at, finished_prefill_at),
+            .decode = timestampDurationMillis(finished_prefill_at, finished_generate_at),
+            .total = timestampDurationMillis(started_at, finished_generate_at),
+        } else null;
+        if (self.print_timing and timing_ms != null) {
+            const timing = timing_ms.?;
             std.debug.print(
                 "generate_timing_ms: prompt_format={d} tokenize={d} runtime_prepare={d} prefill={d} decode={d} total={d}\n",
                 .{
-                    timestampDurationMillis(started_at, formatted_prompt_at),
-                    timestampDurationMillis(formatted_prompt_at, encoded_prompt_at),
-                    timestampDurationMillis(runtime_prepare_started_at, prefill_started_at),
-                    timestampDurationMillis(prefill_started_at, finished_prefill_at),
-                    timestampDurationMillis(finished_prefill_at, finished_generate_at),
-                    timestampDurationMillis(started_at, finished_generate_at),
+                    timing.prompt_format,
+                    timing.tokenize,
+                    timing.runtime_prepare,
+                    timing.prefill,
+                    timing.decode,
+                    timing.total,
                 },
             );
         }
@@ -2058,6 +2077,7 @@ pub const NativeGenerationPipeline = struct {
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
+            .timing_ms = timing_ms,
             .speculative = if (use_speculative or draft_requested) speculative_stats else null,
             .allocator = allocator,
         };

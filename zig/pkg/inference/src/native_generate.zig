@@ -32,6 +32,7 @@ const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
+const compat = @import("io/compat.zig");
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
@@ -96,6 +97,7 @@ const Options = struct {
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
+    json_timing_path: ?[]const u8 = null,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -720,6 +722,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(started_at, finished_generate_at),
             },
         );
+        const decode_ms = if (result.timing_ms) |timing| timing.decode else durationMillis(created_decode_state_at, finished_generate_at);
+        print("decode_tok_per_s={d:.3}\n", .{tokensPerSecond(result.tokens_used, decode_ms)});
         if ((build_options.enable_mlx or build_options.enable_metal) and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
             printGpuHostedTimingDetails(&cb);
             const quant_stats = cb.debugTimingSnapshot().quant;
@@ -1323,6 +1327,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             }
         }
     }
+    if (opts.json_timing_path) |path| {
+        try writeJsonTiming(
+            allocator,
+            io,
+            path,
+            opts.model_dir,
+            @tagName(model.session.backend()),
+            &result,
+            durationMillis(started_at, loaded_model_at),
+            durationMillis(loaded_model_at, encoded_prompt_at),
+            durationMillis(encoded_prompt_at, acquired_scheduler_at),
+            durationMillis(acquired_scheduler_at, created_backend_at),
+            durationMillis(created_backend_at, created_decode_state_at),
+            durationMillis(created_decode_state_at, finished_generate_at),
+            durationMillis(started_at, finished_generate_at),
+            session_factory.getCudaRuntimeStats(model.session),
+        );
+    }
 }
 
 fn warmInitCudaBeforeLargeModelScan(backend: BackendChoice) !void {
@@ -1341,6 +1363,261 @@ fn nanosToMillis(nanos: i128) u64 {
 
 fn durationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
     return nanosToMillis(std.Io.Timestamp.durationTo(from, to).nanoseconds);
+}
+
+fn tokensPerSecond(tokens: usize, millis: u64) f64 {
+    if (tokens == 0 or millis == 0) return 0.0;
+    return @as(f64, @floatFromInt(tokens)) * 1000.0 / @as(f64, @floatFromInt(millis));
+}
+
+fn appendFmt(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const chunk = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(chunk);
+    try out.appendSlice(allocator, chunk);
+}
+
+fn writeJsonTiming(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    model_dir: []const u8,
+    backend_name: []const u8,
+    result: *const generation.GenerationResult,
+    load_model_ms: u64,
+    prompt_prep_ms: u64,
+    scheduler_ms: u64,
+    backend_setup_ms: u64,
+    decode_setup_ms: u64,
+    generate_ms: u64,
+    total_ms: u64,
+    cuda_stats_opt: ?session_factory.CudaRuntimeStats,
+) !void {
+    const inner_timing = result.timing_ms orelse generation.GenerationTimingMs{};
+    const decode_ms = if (inner_timing.decode != 0) inner_timing.decode else generate_ms;
+    const cuda_json = if (comptime build_options.enable_cuda) blk: {
+        if (cuda_stats_opt) |cuda_stats| {
+            var cuda_out = std.ArrayListUnmanaged(u8).empty;
+            errdefer cuda_out.deinit(allocator);
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\{{
+                \\"kernel_launches":{d},
+                \\"stream_syncs":{d},
+                \\"upload_syncs":{d},
+                \\"download_syncs":{d},
+                \\"eval_syncs":{d},
+                \\"h2d_bytes":{d},
+                \\"d2h_bytes":{d},
+                \\"d2d_bytes":{d},
+                \\"temp_buffer_hits":{d},
+                \\"temp_buffer_misses":{d},
+                \\"temp_buffer_releases":{d},
+                \\"temp_buffer_evictions":{d},
+                \\"temp_buffer_cached_bytes":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.kernel_launches,
+                    cuda_stats.stream_syncs,
+                    cuda_stats.upload_syncs,
+                    cuda_stats.download_syncs,
+                    cuda_stats.eval_syncs,
+                    cuda_stats.h2d_bytes,
+                    cuda_stats.d2h_bytes,
+                    cuda_stats.d2d_bytes,
+                    cuda_stats.temp_buffer_hits,
+                    cuda_stats.temp_buffer_misses,
+                    cuda_stats.temp_buffer_releases,
+                    cuda_stats.temp_buffer_evictions,
+                    cuda_stats.temp_buffer_cached_bytes,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"launch_embedding":{d},
+                \\"launch_linear":{d},
+                \\"launch_linear_qkv":{d},
+                \\"launch_norm":{d},
+                \\"launch_rope":{d},
+                \\"launch_attention":{d},
+                \\"launch_elementwise":{d},
+                \\"launch_scalar":{d},
+                \\"launch_argmax":{d},
+                \\"qkv_fused_q4":{d},
+                \\"qkv_fused_q4_q4_f32":{d},
+                \\"qkv_fused_f32":{d},
+                \\"qkv_fallback_unsupported":{d},
+                \\"qkv_kernel_unavailable":{d},
+                \\"q4k_decode_fast_hits":{d},
+                \\"q4k_decode_fast_fallbacks":{d},
+                \\"bf16_cublaslt_linear_calls":{d},
+                \\"bf16_cublaslt_qkv_calls":{d},
+                \\"bf16_cublaslt_activation_staging_calls":{d},
+                \\"bf16_cublaslt_fallbacks":{d},
+                \\"bf16_scalar_linear_calls":{d},
+                \\"bf16_scalar_qkv_calls":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_embedding,
+                    cuda_stats.launch_linear,
+                    cuda_stats.launch_linear_qkv,
+                    cuda_stats.launch_norm,
+                    cuda_stats.launch_rope,
+                    cuda_stats.launch_attention,
+                    cuda_stats.launch_elementwise,
+                    cuda_stats.launch_scalar,
+                    cuda_stats.launch_argmax,
+                    cuda_stats.qkv_fused_q4,
+                    cuda_stats.qkv_fused_q4_q4_f32,
+                    cuda_stats.qkv_fused_f32,
+                    cuda_stats.qkv_fallback_unsupported,
+                    cuda_stats.qkv_kernel_unavailable,
+                    cuda_stats.q4k_decode_fast_hits,
+                    cuda_stats.q4k_decode_fast_fallbacks,
+                    cuda_stats.bf16_cublaslt_linear_calls,
+                    cuda_stats.bf16_cublaslt_qkv_calls,
+                    cuda_stats.bf16_cublaslt_activation_staging_calls,
+                    cuda_stats.bf16_cublaslt_fallbacks,
+                    cuda_stats.bf16_scalar_linear_calls,
+                    cuda_stats.bf16_scalar_qkv_calls,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"dense_stream_requests":{d},
+                \\"dense_stream_hits":{d},
+                \\"dense_stream_misses":{d},
+                \\"dense_stream_fallbacks":{d},
+                \\"dense_stream_evictions":{d},
+                \\"dense_stream_read_ms":{d},
+                \\"dense_stream_h2d_ms":{d},
+                \\"dense_stream_read_bytes":{d},
+                \\"dense_stream_uploaded_bytes":{d},
+                \\"dense_stream_resident_bytes":{d},
+                \\"dense_prefetch_enqueues":{d},
+                \\"dense_prefetch_ready_hits":{d},
+                \\"dense_prefetch_inflight_steals":{d},
+                \\"dense_prefetch_sync_reads":{d},
+                \\"dense_prefetch_host_read_ms":{d},
+                \\"dense_prefetch_upload_ms":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.dense_stream_requests,
+                    cuda_stats.dense_stream_hits,
+                    cuda_stats.dense_stream_misses,
+                    cuda_stats.dense_stream_fallbacks,
+                    cuda_stats.dense_stream_evictions,
+                    cuda_stats.dense_stream_read_ns / std.time.ns_per_ms,
+                    cuda_stats.dense_stream_h2d_ns / std.time.ns_per_ms,
+                    cuda_stats.dense_stream_read_bytes,
+                    cuda_stats.dense_stream_uploaded_bytes,
+                    cuda_stats.dense_stream_resident_bytes,
+                    cuda_stats.dense_prefetch_enqueues,
+                    cuda_stats.dense_prefetch_ready_hits,
+                    cuda_stats.dense_prefetch_inflight_steals,
+                    cuda_stats.dense_prefetch_sync_reads,
+                    cuda_stats.dense_prefetch_host_read_ns / std.time.ns_per_ms,
+                    cuda_stats.dense_prefetch_upload_ns / std.time.ns_per_ms,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"device_kv_attempts":{d},
+                \\"device_kv_successes":{d},
+                \\"device_kv_writes":{d},
+                \\"device_kv_reads":{d},
+                \\"device_kv_fail_batch":{d},
+                \\"device_kv_fail_no_cache":{d},
+                \\"device_kv_fail_no_storage":{d},
+                \\"device_kv_fail_no_hook":{d},
+                \\"device_kv_fail_write":{d},
+                \\"device_kv_fail_read":{d},
+                \\"device_kv_fail_shape":{d}
+                \\}}
+                \\
+            ,
+                .{
+                    cuda_stats.device_kv_attempts,
+                    cuda_stats.device_kv_successes,
+                    cuda_stats.device_kv_writes,
+                    cuda_stats.device_kv_reads,
+                    cuda_stats.device_kv_fail_batch,
+                    cuda_stats.device_kv_fail_no_cache,
+                    cuda_stats.device_kv_fail_no_storage,
+                    cuda_stats.device_kv_fail_no_hook,
+                    cuda_stats.device_kv_fail_write,
+                    cuda_stats.device_kv_fail_read,
+                    cuda_stats.device_kv_fail_shape,
+                },
+            );
+            break :blk try cuda_out.toOwnedSlice(allocator);
+        }
+        break :blk try allocator.dupe(u8, "null");
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_json);
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"model_dir":{f},
+        \\"backend":{f},
+        \\"tokens":{d},
+        \\"finish_reason":{f},
+        \\"decode_tok_per_s":{d:.6},
+        \\"timing_ms":{{
+        \\"load_model":{d},
+        \\"prompt_prep":{d},
+        \\"scheduler":{d},
+        \\"backend_setup":{d},
+        \\"decode_setup":{d},
+        \\"generate":{d},
+        \\"total":{d},
+        \\"prompt_format_inner":{d},
+        \\"tokenize_inner":{d},
+        \\"runtime_prepare_inner":{d},
+        \\"prefill_inner":{d},
+        \\"decode_inner":{d},
+        \\"total_inner":{d}
+        \\}},
+        \\"cuda":{s}
+        \\}}
+        \\
+    ,
+        .{
+            std.json.fmt(model_dir, .{}),
+            std.json.fmt(backend_name, .{}),
+            result.tokens_used,
+            std.json.fmt(result.finish_reason, .{}),
+            tokensPerSecond(result.tokens_used, decode_ms),
+            load_model_ms,
+            prompt_prep_ms,
+            scheduler_ms,
+            backend_setup_ms,
+            decode_setup_ms,
+            generate_ms,
+            total_ms,
+            inner_timing.prompt_format,
+            inner_timing.tokenize,
+            inner_timing.runtime_prepare,
+            inner_timing.prefill,
+            inner_timing.decode,
+            inner_timing.total,
+            cuda_json,
+        },
+    );
+    defer allocator.free(json);
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
@@ -2278,6 +2555,10 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.print_chat_template_status = true;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--json-timing")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonTimingPath;
+            opts.json_timing_path = args[i];
         } else if (std.mem.eql(u8, arg, "--debug-mtp")) {
             opts.debug_mtp = true;
         } else if (std.mem.eql(u8, arg, "--debug-gemma4-target")) {
@@ -2617,7 +2898,7 @@ fn enableMlxRawMetalWholeTokenDebug() bool {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
