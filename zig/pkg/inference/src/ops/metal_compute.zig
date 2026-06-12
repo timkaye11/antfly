@@ -7138,6 +7138,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return cached;
         }
 
+        // Device-side materialization of a deferred lazy_multiply: the operands
+        // are device-resident MetalTensors, so compute the product on-device and
+        // transpose it with the device kernel below, instead of the host
+        // toFloat32Op fallback (which round-trips the large S^2 attention tensor
+        // through host memory — slow and memory-heavy at long sequences). Falls
+        // through to that host path if the device multiply is unavailable
+        // (e.g. wrap-repeat lazy buffers), which remains correct.
+        if (input_buf.lazy_multiply != null) {
+            if (self.ownedDeviceMetalTensorFromCt(input)) |product| {
+                const product_ct = self.ctFromOwnedMetalTensor(product) catch |err| {
+                    var owned = product;
+                    owned.deinit();
+                    return err;
+                };
+                defer freeOp(@ptrCast(self), product_ct);
+                return primTransposeOp(@ptrCast(self), product_ct, perm, input_shape);
+            } else |_| {}
+        }
+
         if (input_buf.metal_tensor) |*metal_tensor| {
             // A metal-backed view's raw bytes are not in logical in_shape
             // order; both the relabel view and the device transpose kernel
