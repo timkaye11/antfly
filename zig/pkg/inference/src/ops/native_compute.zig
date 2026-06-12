@@ -34275,7 +34275,7 @@ fn disentangledRelativeAttentionBackwardOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, 
     const rel_h = (seq_len * 2 - 1) * H;
     const packed_grads = try self.allocator.alloc(f32, 3 * bs_h + 2 * rel_h);
     errdefer self.allocator.free(packed_grads);
-    @memcpy(packed_grads[0 .. bs_h], grads.dQ[0..bs_h]);
+    @memcpy(packed_grads[0..bs_h], grads.dQ[0..bs_h]);
     @memcpy(packed_grads[bs_h .. 2 * bs_h], grads.dK[0..bs_h]);
     @memcpy(packed_grads[2 * bs_h .. 3 * bs_h], grads.dV[0..bs_h]);
     @memcpy(packed_grads[3 * bs_h .. 3 * bs_h + rel_h], grads.dQ_r[0..rel_h]);
@@ -34640,7 +34640,18 @@ test "DeBERTa backward matches finite differences (all keys valid)" {
     const mask = [_]i64{ 1, 1, 1, 1 };
 
     const grads = try debertaDisentangledAttentionBackwardHost(
-        allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim,
+        allocator,
+        q,
+        k,
+        v,
+        q_r,
+        k_r,
+        &mask,
+        d_o,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
     );
     defer allocator.free(grads.dQ);
     defer allocator.free(grads.dK);
@@ -34726,7 +34737,18 @@ test "DeBERTa backward matches finite differences (with padded key)" {
     const mask = [_]i64{ 1, 1, 0, 1 };
 
     const grads = try debertaDisentangledAttentionBackwardHost(
-        allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim,
+        allocator,
+        q,
+        k,
+        v,
+        q_r,
+        k_r,
+        &mask,
+        d_o,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
     );
     defer allocator.free(grads.dQ);
     defer allocator.free(grads.dK);

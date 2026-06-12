@@ -3959,6 +3959,72 @@ pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, reque
     return output_device;
 }
 
+pub fn decoderRuntimeDisentangledRelativeAttentionBackwardF32Device(self: anytype, request: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!request.q.isDevice() or !request.k.isDevice() or !request.v.isDevice() or
+        !request.q_r.isDevice() or !request.k_r.isDevice() or !request.d_out.isDevice()) return null;
+    if (request.batch == 0 or request.seq_len == 0 or request.num_heads == 0 or request.head_dim == 0) return null;
+    if (request.seq_len > std.math.maxInt(usize) / 2) return null;
+    const hidden = request.num_heads * request.head_dim;
+    const total = request.batch * request.seq_len * hidden;
+    const num_rel = request.seq_len * 2 - 1;
+    const rel_total = num_rel * hidden;
+    if (request.q.elemCount() != total or request.k.elemCount() != total or request.v.elemCount() != total or request.d_out.elemCount() != total) return null;
+    if (request.q_r.elemCount() < rel_total or request.k_r.elemCount() < rel_total) return null;
+
+    const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
+    if (mask_tensor) |mask| {
+        if (!mask.isDevice() or mask.elemCount() != request.batch * request.seq_len) return null;
+    }
+
+    // One packed_out output [dQ; dK; dV; dQ_r; dK_r] = [3*B*S + 2*num_rel, H]; the
+    // dispatch writes each region via a byte sub-offset into this buffer.
+    const packed_rows: i32 = @intCast(3 * request.batch * request.seq_len + 2 * num_rel);
+    const packed_shape = [_]i32{ packed_rows, @intCast(hidden) };
+    const packed_elems = 3 * total + 2 * rel_total;
+    var packed_out = try MetalTensor.deviceAllocate(runtime, packed_elems * @sizeOf(f32), .private, &packed_shape);
+    errdefer packed_out.deinit();
+
+    const base = packed_out.deviceByteOffset();
+    const f: usize = @sizeOf(f32);
+    var mask_mut: ?MetalTensor = if (mask_tensor) |t| t else null;
+    const rc = termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_device(
+        runtime,
+        request.q.deviceHandle(),
+        request.q.deviceByteOffset(),
+        request.k.deviceHandle(),
+        request.k.deviceByteOffset(),
+        request.v.deviceHandle(),
+        request.v.deviceByteOffset(),
+        request.q_r.deviceHandle(),
+        request.q_r.deviceByteOffset(),
+        request.k_r.deviceHandle(),
+        request.k_r.deviceByteOffset(),
+        if (mask_mut) |*t| t.deviceHandle() else null,
+        if (mask_mut) |*t| t.deviceByteOffset() else 0,
+        if (mask_tensor != null) 1 else 0,
+        request.d_out.deviceHandle(),
+        request.d_out.deviceByteOffset(),
+        request.batch,
+        request.seq_len,
+        request.num_heads,
+        request.head_dim,
+        packed_out.deviceHandle(),
+        base + 0 * total * f,
+        packed_out.deviceHandle(),
+        base + 1 * total * f,
+        packed_out.deviceHandle(),
+        base + 2 * total * f,
+        packed_out.deviceHandle(),
+        base + 3 * total * f,
+        packed_out.deviceHandle(),
+        base + (3 * total + rel_total) * f,
+    );
+    if (rc != 0) return null;
+    return packed_out;
+}
+
 pub fn decoderRuntimeTransposeF32Device(
     self: anytype,
     input: MetalTensor,
@@ -8459,6 +8525,38 @@ pub extern fn termite_metal_decode_runtime_disentangled_relative_attention_f32_d
     has_mask: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    q_r_handle: ?*anyopaque,
+    q_r_offset: usize,
+    k_r_handle: ?*anyopaque,
+    k_r_offset: usize,
+    mask_handle: ?*anyopaque,
+    mask_offset: usize,
+    has_mask: u32,
+    d_out_handle: ?*anyopaque,
+    d_out_offset: usize,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    dq_handle: ?*anyopaque,
+    dq_offset: usize,
+    dk_handle: ?*anyopaque,
+    dk_offset: usize,
+    dv_handle: ?*anyopaque,
+    dv_offset: usize,
+    dq_r_handle: ?*anyopaque,
+    dq_r_offset: usize,
+    dk_r_handle: ?*anyopaque,
+    dk_r_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_transpose_f32_device(
     runtime: ?*RawMetalDecodeRuntime,

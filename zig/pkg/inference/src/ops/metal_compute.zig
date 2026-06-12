@@ -8094,8 +8094,72 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         head_dim: usize,
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        // Correctness-first: route through the validated native host backward.
-        // A device kernel can replace this once it matches the host reference.
+
+        // Device path: the fused backward kernel. Falls through to the host
+        // reference if any operand can't be made device-resident.
+        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) resident_path: {
+            const hidden = num_heads * head_dim;
+            const total = batch * seq_len * hidden;
+            const rel_total = (seq_len * 2 - 1) * hidden;
+            if (total == 0 or rel_total == 0) break :resident_path;
+            var q_mt = self.ownedDeviceMetalTensorFromCt(q_ct) catch break :resident_path;
+            defer q_mt.deinit();
+            var k_mt = self.ownedDeviceMetalTensorFromCt(k_ct) catch break :resident_path;
+            defer k_mt.deinit();
+            var v_mt = self.ownedDeviceMetalTensorFromCt(v_ct) catch break :resident_path;
+            defer v_mt.deinit();
+            var q_r_mt = self.ownedDeviceMetalTensorFromCt(q_r_ct) catch break :resident_path;
+            defer q_r_mt.deinit();
+            var k_r_mt = self.ownedDeviceMetalTensorFromCt(k_r_ct) catch break :resident_path;
+            defer k_r_mt.deinit();
+            var dO_mt = self.ownedDeviceMetalTensorFromCt(dO_ct) catch break :resident_path;
+            defer dO_mt.deinit();
+            if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice() or !q_r_mt.isDevice() or !k_r_mt.isDevice() or !dO_mt.isDevice()) break :resident_path;
+            if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total or dO_mt.elemCount() != total) break :resident_path;
+            if (q_r_mt.elemCount() < rel_total or k_r_mt.elemCount() < rel_total) break :resident_path;
+
+            var mask_mt: ?MetalTensor = null;
+            defer if (mask_mt) |*t| t.deinit();
+            if (mask.len >= batch * seq_len) {
+                var has_padding = false;
+                for (mask[0 .. batch * seq_len]) |val| {
+                    if (val == 0) {
+                        has_padding = true;
+                        break;
+                    }
+                }
+                if (has_padding) {
+                    const mvals = try self.allocator.alloc(f32, batch * seq_len);
+                    defer self.allocator.free(mvals);
+                    for (mvals, 0..) |*x, i| x.* = if (mask[i] != 0) 1.0 else 0.0;
+                    const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
+                    const mshape = [_]i32{ @intCast(batch), @intCast(seq_len) };
+                    var dmask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mvals.len * @sizeOf(f32), uploadStorageMode(mvals.len * @sizeOf(f32)), &mshape);
+                    errdefer dmask.deinit();
+                    const hmask = MetalTensor.borrowed(mvals.ptr, mvals.len, &mshape);
+                    try hmask.copyInto(&dmask);
+                    mask_mt = dmask;
+                }
+            }
+
+            if (try metal_runtime.decoderRuntimeDisentangledRelativeAttentionBackwardF32Device(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .q_r = q_r_mt,
+                .k_r = k_r_mt,
+                .mask = mask_mt,
+                .d_out = dO_mt,
+                .batch = batch,
+                .seq_len = seq_len,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+            })) |tensor| {
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+
+        // Correctness-first fallback: route through the validated native host backward.
         var native_ctx = try HostFallbackNative.init(self.allocator);
         defer native_ctx.deinit();
 
