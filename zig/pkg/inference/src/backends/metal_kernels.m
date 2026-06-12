@@ -22469,10 +22469,16 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         {
             return -16;
         }
-        const BOOL gemm_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_GEMM_ATTENTION") == NULL &&
-            ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256));
-        const BOOL flash4_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION") == NULL &&
-            ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256)) &&
+        // flash4 is the default disentangled-attention kernel: it is bit-exact
+        // against the host reference AND the fastest variant (the legacy `_tg`
+        // kernel is numerically WRONG — ~0.2% off — and is now opt-in only via
+        // TERMITE_METAL_FORCE_DEBERTA_TG for debugging; scalar is the correct
+        // fallback when flash4 is unavailable, e.g. seq>512 or head_dim>256).
+        const BOOL force_scalar = getenv("TERMITE_METAL_FORCE_DEBERTA_SCALAR") != NULL;
+        const BOOL force_tg = getenv("TERMITE_METAL_FORCE_DEBERTA_TG") != NULL;
+        const BOOL gemm_attention_requested = false;
+        const BOOL flash4_attention_requested = !force_scalar && !force_tg &&
+            getenv("TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION") == NULL &&
             seq_len <= 512 && head_dim <= 256;
         if (flash4_attention_requested &&
             runtime->disentangled_relative_attention_f32_flash4_pipeline != nil)
@@ -22571,7 +22577,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             }
             runtime->deberta_attention_gemm_fallbacks += 1;
         }
-        if (getenv("TERMITE_METAL_DISABLE_DEBERTA_TG_ATTENTION") == NULL &&
+        if (force_tg &&
             runtime->disentangled_relative_attention_f32_tg_pipeline != nil &&
             seq_len <= 512 &&
             head_dim <= 256)
