@@ -8079,6 +8079,59 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
     }
 
+    fn disentangledRelativeAttentionBackwardOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        q_r_ct: CT,
+        k_r_ct: CT,
+        mask: []const i64,
+        dO_ct: CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        // Correctness-first: route through the validated native host backward.
+        // A device kernel can replace this once it matches the host reference.
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const n_q = try self.importCtToHostNative(&native_ctx, q_ct, toBuf(q_ct).logical_shape);
+        defer native_ctx.cb.free(n_q);
+        const n_k = try self.importCtToHostNative(&native_ctx, k_ct, toBuf(k_ct).logical_shape);
+        defer native_ctx.cb.free(n_k);
+        const n_v = try self.importCtToHostNative(&native_ctx, v_ct, toBuf(v_ct).logical_shape);
+        defer native_ctx.cb.free(n_v);
+        const n_q_r = try self.importCtToHostNative(&native_ctx, q_r_ct, toBuf(q_r_ct).logical_shape);
+        defer native_ctx.cb.free(n_q_r);
+        const n_k_r = try self.importCtToHostNative(&native_ctx, k_r_ct, toBuf(k_r_ct).logical_shape);
+        defer native_ctx.cb.free(n_k_r);
+        const n_dO = try self.importCtToHostNative(&native_ctx, dO_ct, toBuf(dO_ct).logical_shape);
+        defer native_ctx.cb.free(n_dO);
+
+        const n_output = try native_ctx.cb.disentangledRelativeAttentionBackward(
+            n_q,
+            n_k,
+            n_v,
+            n_q_r,
+            n_k_r,
+            mask,
+            n_dO,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+        defer native_ctx.cb.free(n_output);
+        const H: i64 = @intCast(num_heads * head_dim);
+        const rows: i64 = @intCast(3 * batch * seq_len + 2 * (2 * seq_len - 1));
+        const out_shape = [_]i64{ rows, H };
+        return self.exportCtFromHostNative(&native_ctx, n_output, &out_shape);
+    }
+
     fn disentangledRelativeAttentionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -21164,6 +21217,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.softmaxOp = softmaxOp;
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
         vt.disentangledRelativeAttention = disentangledRelativeAttentionOp;
+        vt.disentangledRelativeAttentionBackward = disentangledRelativeAttentionBackwardOp;
         vt.causalSelfAttention = causalSelfAttentionOp;
         vt.logSoftmaxOp = logSoftmaxOp;
         vt.conv1d = conv1dOp;

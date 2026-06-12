@@ -642,12 +642,58 @@ fn applyVjp(
             // cos/sin are treated as frozen position embeddings; no grad.
         },
 
+        // ── Fused disentangled attention (hand-written VJP) ──────────
+        // Forward inputs: ins[0]=qkv_packed [3*B*S, H], ins[1]=qr_kr_packed
+        // [2*num_rel, H], ins[2]=attn_bias. The backward op recomputes the
+        // softmax and emits packed grads [dQ;dK;dV;dQ_r;dK_r] =
+        // [3*B*S + 2*num_rel, H]; two row-slices feed the packed-input
+        // adjoints, and the upstream concat VJPs split those into the real
+        // q/k/v/q_r/k_r gradients.
+        .fused_disentangled_attention => |attrs| {
+            const bs: i64 = @intCast(@as(usize, attrs.batch) * @as(usize, attrs.seq_len));
+            const num_rel: i64 = @intCast(2 * @as(usize, attrs.seq_len) - 1);
+            const hh: i64 = @intCast(@as(usize, attrs.num_heads) * @as(usize, attrs.head_dim));
+            const dtype = g.node(ins[0]).output_shape.dtype;
+
+            const grad_packed = try b.graph.addNode(.{
+                .op = .{ .fused_disentangled_attention_backward = attrs },
+                .output_shape = Shape.init(dtype, &.{ 3 * bs + 2 * num_rel, hh }),
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+
+            const d_qkv = try sliceRows(b, grad_packed, 0, 3 * bs, hh, dtype);
+            const d_qr_kr = try sliceRows(b, grad_packed, 3 * bs, 3 * bs + 2 * num_rel, hh, dtype);
+            try accumulate(b, adjoints, ins[0], d_qkv);
+            try accumulate(b, adjoints, ins[1], d_qr_kr);
+            // attn_bias (ins[2]) is a frozen padding mask — no gradient.
+        },
+
         // ── Fused ops should not appear after lowering ───────────────
         else => {
             // Fused ops should have been lowered. If we hit one, it had
             // no vjp_alternate — no gradient can flow through it.
         },
     }
+}
+
+/// Slice rows [start, end) of a 2-D [N, cols] tensor (axis-0 slice).
+fn sliceRows(b: *Builder, input: NodeId, start: i64, end: i64, cols: i64, dtype: shape_mod.DType) !NodeId {
+    var attrs = node_mod.SliceAttrs{};
+    attrs.num_axes = 2;
+    attrs.starts[0] = start;
+    attrs.starts[1] = 0;
+    attrs.limits[0] = end;
+    attrs.limits[1] = cols;
+    attrs.strides[0] = 1;
+    attrs.strides[1] = 1;
+    return b.graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(dtype, &.{ end - start, cols }),
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 /// Emit a 3D batched matmul: C[b] = A[b] @ B[b] with batch dim 0,

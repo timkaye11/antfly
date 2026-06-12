@@ -4418,6 +4418,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .crossAttention = &crossAttentionOp,
     .relativePositionBias = &relativePositionBiasOp,
     .disentangledRelativeAttention = &disentangledRelativeAttentionOp,
+    .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
     .windowedSelfAttention = &windowedSelfAttentionOp,
     .channelSelfAttention = &channelSelfAttentionOp,
     .tokenGridConv2d = &tokenGridConv2dOp,
@@ -34246,6 +34247,42 @@ fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT
     return self.makeBuf(output, true);
 }
 
+fn disentangledRelativeAttentionBackwardOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, dO_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const grads = try debertaDisentangledAttentionBackwardHost(
+        self.allocator,
+        getData(q_ct),
+        getData(k_ct),
+        getData(v_ct),
+        getData(q_r_ct),
+        getData(k_r_ct),
+        mask,
+        getData(dO_ct),
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    defer self.allocator.free(grads.dQ);
+    defer self.allocator.free(grads.dK);
+    defer self.allocator.free(grads.dV);
+    defer self.allocator.free(grads.dQ_r);
+    defer self.allocator.free(grads.dK_r);
+
+    // Pack [dQ ; dK ; dV ; dQ_r ; dK_r] along axis 0 → [3*B*S + 2*num_rel, H].
+    const H = num_heads * head_dim;
+    const bs_h = batch * seq_len * H;
+    const rel_h = (seq_len * 2 - 1) * H;
+    const packed_grads = try self.allocator.alloc(f32, 3 * bs_h + 2 * rel_h);
+    errdefer self.allocator.free(packed_grads);
+    @memcpy(packed_grads[0 .. bs_h], grads.dQ[0..bs_h]);
+    @memcpy(packed_grads[bs_h .. 2 * bs_h], grads.dK[0..bs_h]);
+    @memcpy(packed_grads[2 * bs_h .. 3 * bs_h], grads.dV[0..bs_h]);
+    @memcpy(packed_grads[3 * bs_h .. 3 * bs_h + rel_h], grads.dQ_r[0..rel_h]);
+    @memcpy(packed_grads[3 * bs_h + rel_h .. 3 * bs_h + 2 * rel_h], grads.dK_r[0..rel_h]);
+    return self.makeBuf(packed_grads, true);
+}
+
 fn debertaDisentangledAttentionBlasMaterialized(
     allocator: std.mem.Allocator,
     Q: []const f32,
@@ -34380,6 +34417,371 @@ test "materialized DeBERTa attention matches shared linalg reference" {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |a, b| {
         try std.testing.expectApproxEqAbs(a, b, 1e-4);
+    }
+}
+
+/// Host/CPU reference for the BACKWARD pass (VJP) of DeBERTa disentangled
+/// relative attention. Correctness anchor: recomputes the softmax probs p_ij
+/// exactly like the forward host reference, then backpropagates dO through
+/// O = P V, P = softmax(S), S = scale*(c2c + c2p + p2c).
+///   dV[b,j,h]  = sum_i p_ij dO[b,i,h]
+///   dP_ij      = dO[b,i,h] . V[b,j,h]
+///   dscore_ij  = p_ij (dP_ij - sum_j' p_ij' dP_ij')
+///   dQ[b,i,h]  = scale sum_j dscore_ij (K[b,j,h] + K_r[r,h])
+///   dK[b,j,h]  = scale sum_i dscore_ij (Q[b,i,h] + Q_r[r,h])
+///   dK_r[r,h] += scale sum_{(b,i,j):i-j+seq-1=r} dscore_ij Q[b,i,h]
+///   dQ_r[r,h] += scale sum_{(b,i,j):i-j+seq-1=r} dscore_ij K[b,j,h]
+pub const DebertaBackwardGrads = struct {
+    dQ: []f32,
+    dK: []f32,
+    dV: []f32,
+    dQ_r: []f32,
+    dK_r: []f32,
+};
+
+pub fn debertaDisentangledAttentionBackwardHost(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    Q_r: []const f32,
+    K_r: []const f32,
+    mask: []const i64,
+    dO: []const f32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !DebertaBackwardGrads {
+    if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+
+    const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const tokens = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    const output_len = std.math.mul(usize, tokens, H) catch return error.InvalidAttentionShape;
+
+    const rel_len = std.math.sub(usize, std.math.mul(usize, seq_len, 2) catch return error.InvalidAttentionShape, 1) catch return error.InvalidAttentionShape;
+    const rel_expected = std.math.mul(usize, rel_len, H) catch return error.InvalidAttentionShape;
+
+    const dQ = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(dQ);
+    const dK = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(dK);
+    const dV = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(dV);
+    const dQ_r = try allocator.alloc(f32, rel_expected);
+    errdefer allocator.free(dQ_r);
+    const dK_r = try allocator.alloc(f32, rel_expected);
+    errdefer allocator.free(dK_r);
+    @memset(dQ, 0.0);
+    @memset(dK, 0.0);
+    @memset(dV, 0.0);
+    @memset(dQ_r, 0.0);
+    @memset(dK_r, 0.0);
+
+    if (batch == 0 or seq_len == 0) {
+        return .{ .dQ = dQ, .dK = dK, .dV = dV, .dQ_r = dQ_r, .dK_r = dK_r };
+    }
+
+    if (Q.len < output_len or K.len < output_len or V.len < output_len or dO.len < output_len) return error.InvalidAttentionShape;
+    if (Q_r.len < rel_expected or K_r.len < rel_expected) return error.InvalidAttentionShape;
+    const mask_expected = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    if (mask.len < mask_expected) return error.InvalidAttentionShape;
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0);
+
+    const probs = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(probs);
+    const dscore = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(dscore);
+
+    for (0..batch) |b| {
+        const mask_base = b * seq_len;
+        var all_keys_valid = true;
+        for (mask[mask_base..][0..seq_len]) |m| {
+            if (m == 0) {
+                all_keys_valid = false;
+                break;
+            }
+        }
+
+        for (0..num_heads) |h| {
+            const head_off = h * head_dim;
+
+            for (0..seq_len) |qi| {
+                const q_base = (b * seq_len + qi) * H + head_off;
+                const rel_base = qi + seq_len - 1;
+                const row = probs[qi * seq_len ..][0..seq_len];
+
+                var row_max: f32 = -std.math.inf(f32);
+                for (0..seq_len) |ki| {
+                    if (!all_keys_valid and mask[mask_base + ki] == 0) {
+                        row[ki] = -std.math.inf(f32);
+                        continue;
+                    }
+                    const k_base = (b * seq_len + ki) * H + head_off;
+                    const rel_idx = rel_base - ki;
+                    const qr_base = rel_idx * H + head_off;
+                    var c2c: f32 = 0.0;
+                    var c2p: f32 = 0.0;
+                    var p2c: f32 = 0.0;
+                    for (0..head_dim) |d| {
+                        const qd = Q[q_base + d];
+                        const kd = K[k_base + d];
+                        c2c += qd * kd;
+                        c2p += qd * K_r[qr_base + d];
+                        p2c += Q_r[qr_base + d] * kd;
+                    }
+                    const s = scale * (c2c + c2p + p2c);
+                    row[ki] = s;
+                    if (s > row_max) row_max = s;
+                }
+
+                var sum: f32 = 0.0;
+                for (0..seq_len) |ki| {
+                    if (row[ki] == -std.math.inf(f32)) {
+                        row[ki] = 0.0;
+                    } else {
+                        const e = @exp(row[ki] - row_max);
+                        row[ki] = e;
+                        sum += e;
+                    }
+                }
+                if (sum > 0.0) {
+                    const inv = 1.0 / sum;
+                    for (0..seq_len) |ki| row[ki] *= inv;
+                }
+            }
+
+            for (0..seq_len) |qi| {
+                const o_base = (b * seq_len + qi) * H + head_off;
+                const p_row = probs[qi * seq_len ..][0..seq_len];
+                const ds_row = dscore[qi * seq_len ..][0..seq_len];
+
+                var dot_pdP: f32 = 0.0;
+                for (0..seq_len) |ki| {
+                    const p = p_row[ki];
+                    const v_base = (b * seq_len + ki) * H + head_off;
+                    var dP: f32 = 0.0;
+                    for (0..head_dim) |d| {
+                        dP += dO[o_base + d] * V[v_base + d];
+                    }
+                    ds_row[ki] = dP;
+                    dot_pdP += p * dP;
+
+                    for (0..head_dim) |d| {
+                        dV[v_base + d] += p * dO[o_base + d];
+                    }
+                }
+                for (0..seq_len) |ki| {
+                    ds_row[ki] = p_row[ki] * (ds_row[ki] - dot_pdP);
+                }
+            }
+
+            for (0..seq_len) |qi| {
+                const q_base = (b * seq_len + qi) * H + head_off;
+                const rel_base = qi + seq_len - 1;
+                const ds_row = dscore[qi * seq_len ..][0..seq_len];
+                for (0..seq_len) |ki| {
+                    const g = ds_row[ki];
+                    if (g == 0.0) continue;
+                    const sg = scale * g;
+                    const k_base = (b * seq_len + ki) * H + head_off;
+                    const rel_idx = rel_base - ki;
+                    const r_base = rel_idx * H + head_off;
+                    for (0..head_dim) |d| {
+                        const kd = K[k_base + d];
+                        const qd = Q[q_base + d];
+                        dQ[q_base + d] += sg * (kd + K_r[r_base + d]);
+                        dK[k_base + d] += sg * (qd + Q_r[r_base + d]);
+                        dK_r[r_base + d] += sg * qd;
+                        dQ_r[r_base + d] += sg * kd;
+                    }
+                }
+            }
+        }
+    }
+
+    return .{ .dQ = dQ, .dK = dK, .dV = dV, .dQ_r = dQ_r, .dK_r = dK_r };
+}
+
+test "DeBERTa backward matches finite differences (all keys valid)" {
+    const allocator = std.testing.allocator;
+    const batch = 1;
+    const seq_len = 4;
+    const num_heads = 1;
+    const head_dim = 4;
+    const H = num_heads * head_dim;
+    const rel_len = seq_len * 2 - 1;
+    const tok = batch * seq_len;
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+
+    const q = try allocator.alloc(f32, tok * H);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, tok * H);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, tok * H);
+    defer allocator.free(v);
+    const q_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(q_r);
+    const k_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(k_r);
+    const d_o = try allocator.alloc(f32, tok * H);
+    defer allocator.free(d_o);
+
+    for (q) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (v) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (q_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (d_o) |*x| x.* = rnd.floatNorm(f32);
+
+    const mask = [_]i64{ 1, 1, 1, 1 };
+
+    const grads = try debertaDisentangledAttentionBackwardHost(
+        allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim,
+    );
+    defer allocator.free(grads.dQ);
+    defer allocator.free(grads.dK);
+    defer allocator.free(grads.dV);
+    defer allocator.free(grads.dQ_r);
+    defer allocator.free(grads.dK_r);
+
+    const eps: f32 = 1e-3;
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, qq: []const f32, kk: []const f32, vv: []const f32, qr: []const f32, kr: []const f32, m: []const i64, dgo: []const f32, bb: usize, sl: usize, nh: usize, hd: usize) !f32 {
+            const out = try linalg.debertaDisentangledAttentionHost(a, qq, kk, vv, qr, kr, m, bb, sl, nh, hd);
+            defer a.free(out);
+            var s: f32 = 0.0;
+            for (out, dgo) |o, gg| s += o * gg;
+            return s;
+        }
+    }.f;
+
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = q, .grad = grads.dQ, .name = "dQ" },
+        .{ .buf = k, .grad = grads.dK, .name = "dK" },
+        .{ .buf = v, .grad = grads.dV, .name = "dV" },
+        .{ .buf = q_r, .grad = grads.dQ_r, .name = "dQ_r" },
+        .{ .buf = k_r, .grad = grads.dK_r, .name = "dK_r" },
+    };
+
+    for (params) |p| {
+        for (p.buf, 0..) |*elem, idx| {
+            const orig = elem.*;
+            elem.* = orig + eps;
+            const lp = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig - eps;
+            const lm = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig;
+
+            const num_grad = (lp - lm) / (2.0 * eps);
+            const ana_grad = p.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(num_grad), @abs(ana_grad)));
+            const rel_err = @abs(num_grad - ana_grad) / denom;
+            std.testing.expect(rel_err < 1e-2) catch |e| {
+                std.debug.print("{s}[{d}] num={d} ana={d} rel={d}\n", .{ p.name, idx, num_grad, ana_grad, rel_err });
+                return e;
+            };
+        }
+    }
+}
+
+test "DeBERTa backward matches finite differences (with padded key)" {
+    const allocator = std.testing.allocator;
+    const batch = 1;
+    const seq_len = 4;
+    const num_heads = 1;
+    const head_dim = 4;
+    const H = num_heads * head_dim;
+    const rel_len = seq_len * 2 - 1;
+    const tok = batch * seq_len;
+
+    var prng = std.Random.DefaultPrng.init(0xBADF00D);
+    const rnd = prng.random();
+
+    const q = try allocator.alloc(f32, tok * H);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, tok * H);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, tok * H);
+    defer allocator.free(v);
+    const q_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(q_r);
+    const k_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(k_r);
+    const d_o = try allocator.alloc(f32, tok * H);
+    defer allocator.free(d_o);
+
+    for (q) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (v) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (q_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (d_o) |*x| x.* = rnd.floatNorm(f32);
+
+    const mask = [_]i64{ 1, 1, 0, 1 };
+
+    const grads = try debertaDisentangledAttentionBackwardHost(
+        allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim,
+    );
+    defer allocator.free(grads.dQ);
+    defer allocator.free(grads.dK);
+    defer allocator.free(grads.dV);
+    defer allocator.free(grads.dQ_r);
+    defer allocator.free(grads.dK_r);
+
+    {
+        const j_pad = 2;
+        const base = (0 * seq_len + j_pad) * H;
+        for (0..head_dim) |d| {
+            try std.testing.expectEqual(@as(f32, 0.0), grads.dK[base + d]);
+            try std.testing.expectEqual(@as(f32, 0.0), grads.dV[base + d]);
+        }
+    }
+
+    const eps: f32 = 1e-3;
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, qq: []const f32, kk: []const f32, vv: []const f32, qr: []const f32, kr: []const f32, m: []const i64, dgo: []const f32, bb: usize, sl: usize, nh: usize, hd: usize) !f32 {
+            const out = try linalg.debertaDisentangledAttentionHost(a, qq, kk, vv, qr, kr, m, bb, sl, nh, hd);
+            defer a.free(out);
+            var s: f32 = 0.0;
+            for (out, dgo) |o, gg| s += o * gg;
+            return s;
+        }
+    }.f;
+
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = q, .grad = grads.dQ, .name = "dQ" },
+        .{ .buf = k, .grad = grads.dK, .name = "dK" },
+        .{ .buf = v, .grad = grads.dV, .name = "dV" },
+        .{ .buf = q_r, .grad = grads.dQ_r, .name = "dQ_r" },
+        .{ .buf = k_r, .grad = grads.dK_r, .name = "dK_r" },
+    };
+
+    for (params) |p| {
+        for (p.buf, 0..) |*elem, idx| {
+            const orig = elem.*;
+            elem.* = orig + eps;
+            const lp = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig - eps;
+            const lm = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig;
+
+            const num_grad = (lp - lm) / (2.0 * eps);
+            const ana_grad = p.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(num_grad), @abs(ana_grad)));
+            const rel_err = @abs(num_grad - ana_grad) / denom;
+            std.testing.expect(rel_err < 1e-2) catch |e| {
+                std.debug.print("{s}[{d}] num={d} ana={d} rel={d}\n", .{ p.name, idx, num_grad, ana_grad, rel_err });
+                return e;
+            };
+        }
     }
 }
 

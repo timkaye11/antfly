@@ -63,6 +63,9 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     for (0..count) |i| {
         const n = graph.node(@intCast(i));
         if (n.op == .fused_gelu or n.op == .fused_softmax) continue;
+        // Fused disentangled attention keeps its fused forward kernel and is
+        // differentiated by a custom VJP rule (not vjp_alternate lowering).
+        if (n.op == .fused_disentangled_attention or n.op == .fused_disentangled_attention_backward) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             redirect[i] = n.vjp_alternate;
         }

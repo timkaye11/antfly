@@ -297,6 +297,15 @@ fn relScoreGatherEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_DEBERTA_REL_SCORE_GATHER", true);
 }
 
+// Fused disentangled attention: replaces the c2c/c2p/p2c + softmax + context
+// block with a single flash-style kernel (forward) + a custom-VJP backward
+// kernel, avoiding the [bh,S,S] score materialization. Default-OFF until the
+// kernel parity gates pass; set TERMITE_DEBERTA_FUSED_ATTENTION=1 to enable.
+fn fusedDisentangledAttentionEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    return platform.env.getenvBoolDefault("TERMITE_DEBERTA_FUSED_ATTENTION", false);
+}
+
 const RelScoreIndices = struct {
     /// [S*S] i64: c2p_flat[qi*S+ki] = qi*num_rel + (qi-ki+S-1)
     c2p: NodeId,
@@ -679,31 +688,6 @@ fn encoderLayer(
     const Q_r = try bld.linear(rel_emb_gathered, q_w, q_b, num_rel, H, H);
     const K_r = try bld.linear(rel_emb_gathered, k_w, k_b, num_rel, H, H);
 
-    // ──────── Multi-head reshape: [total, H] → [bh, seq, head_dim] ────────
-    const q_bsnh = try bld.reshape(Q, Shape.init(.f32, &.{
-        @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim),
-    }));
-    const k_bsnh = try bld.reshape(K, Shape.init(.f32, &.{
-        @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim),
-    }));
-    const v_bsnh = try bld.reshape(V, Shape.init(.f32, &.{
-        @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim),
-    }));
-    // [batch, seq, num_heads, head_dim] → [batch, num_heads, seq, head_dim]
-    const q_bnsh = try bld.transpose(q_bsnh, &.{ 0, 2, 1, 3 });
-    const k_bnsh = try bld.transpose(k_bsnh, &.{ 0, 2, 1, 3 });
-    const v_bnsh = try bld.transpose(v_bsnh, &.{ 0, 2, 1, 3 });
-    // Flatten batch*num_heads → [bh, seq, head_dim]
-    const q_bhsd = try bld.reshape(q_bnsh, Shape.init(.f32, &.{
-        @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
-    }));
-    const k_bhsd = try bld.reshape(k_bnsh, Shape.init(.f32, &.{
-        @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
-    }));
-    const v_bhsd = try bld.reshape(v_bnsh, Shape.init(.f32, &.{
-        @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
-    }));
-
     // ──────── Disentangled attention: C2C + C2P + P2C ────────
     //
     // C2C: Q_c @ K_c^T (standard content-to-content)
@@ -711,33 +695,82 @@ fn encoderLayer(
     // P2C: Q_r[qi-ki+S-1] · K_c (position-to-content)
     //
     // scores = (C2C + C2P + P2C) / sqrt(3 * head_dim) + attn_bias
-    const k_t = try bld.transpose(k_bhsd, &.{ 0, 2, 1 });
-    const c2c = try bld.matmul3D(q_bhsd, k_t);
+    const attn_merged = if (fusedDisentangledAttentionEnabled()) blk: {
+        // Single fused kernel over the [batch*seq, H] content projections and
+        // the [num_rel, H] relative projections. Inputs are packed to fit the
+        // 4-slot node: qkv_packed = [Q;K;V] ([3*total, H]),
+        // qr_kr_packed = [Q_r;K_r] ([2*num_rel, H]). Output [total, H] matches
+        // attn_merged below. The custom VJP (autodiff.zig) emits the backward
+        // kernel; the concat VJPs split the packed grads back to Q/K/V/Q_r/K_r.
+        const qk = try bld.concat(Q, K, 0);
+        const qkv_packed = try bld.concat(qk, V, 0);
+        const qr_kr_packed = try bld.concat(Q_r, K_r, 0);
+        break :blk try bld.graph.addNode(.{
+            .op = .{ .fused_disentangled_attention = .{
+                .batch = batch,
+                .seq_len = seq_len,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+            } },
+            .output_shape = Shape.init(.f32, &.{ @intCast(total), @intCast(H) }),
+            .inputs = .{ qkv_packed, qr_kr_packed, attn_bias, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    } else blk: {
+        // ──────── Multi-head reshape: [total, H] → [bh, seq, head_dim] ────────
+        const q_bsnh = try bld.reshape(Q, Shape.init(.f32, &.{
+            @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim),
+        }));
+        const k_bsnh = try bld.reshape(K, Shape.init(.f32, &.{
+            @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim),
+        }));
+        const v_bsnh = try bld.reshape(V, Shape.init(.f32, &.{
+            @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim),
+        }));
+        // [batch, seq, num_heads, head_dim] → [batch, num_heads, seq, head_dim]
+        const q_bnsh = try bld.transpose(q_bsnh, &.{ 0, 2, 1, 3 });
+        const k_bnsh = try bld.transpose(k_bsnh, &.{ 0, 2, 1, 3 });
+        const v_bnsh = try bld.transpose(v_bsnh, &.{ 0, 2, 1, 3 });
+        // Flatten batch*num_heads → [bh, seq, head_dim]
+        const q_bhsd = try bld.reshape(q_bnsh, Shape.init(.f32, &.{
+            @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
+        }));
+        const k_bhsd = try bld.reshape(k_bnsh, Shape.init(.f32, &.{
+            @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
+        }));
+        const v_bhsd = try bld.reshape(v_bnsh, Shape.init(.f32, &.{
+            @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
+        }));
 
-    const c2p = if (rel_score_indices) |indices|
-        try contentToPositionGather(bld, q_bhsd, K_r, indices, batch, seq_len, num_heads, head_dim)
-    else
-        try contentToPosition(bld, q_bhsd, K_r, pair_indices, batch, seq_len, num_heads, head_dim);
-    const p2c = if (rel_score_indices) |indices|
-        try positionToContentGather(bld, k_bhsd, Q_r, indices, batch, seq_len, num_heads, head_dim)
-    else
-        try positionToContent(bld, k_bhsd, Q_r, pair_indices, batch, seq_len, num_heads, head_dim);
+        const k_t = try bld.transpose(k_bhsd, &.{ 0, 2, 1 });
+        const c2c = try bld.matmul3D(q_bhsd, k_t);
 
-    const scores_sum = try bld.add(c2c, try bld.add(c2p, p2c));
-    const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0));
-    const scores_scaled = try bld.mul(scores_sum, scale);
-    const scores_masked = try bld.add(scores_scaled, attn_bias);
-    const probs = try bld.softmax(scores_masked);
-    const attn_bhsd = try bld.matmul3D(probs, v_bhsd);
+        const c2p = if (rel_score_indices) |indices|
+            try contentToPositionGather(bld, q_bhsd, K_r, indices, batch, seq_len, num_heads, head_dim)
+        else
+            try contentToPosition(bld, q_bhsd, K_r, pair_indices, batch, seq_len, num_heads, head_dim);
+        const p2c = if (rel_score_indices) |indices|
+            try positionToContentGather(bld, k_bhsd, Q_r, indices, batch, seq_len, num_heads, head_dim)
+        else
+            try positionToContent(bld, k_bhsd, Q_r, pair_indices, batch, seq_len, num_heads, head_dim);
 
-    // Reshape back: [bh, seq, head_dim] → [total, H]
-    const attn_bnsh = try bld.reshape(attn_bhsd, Shape.init(.f32, &.{
-        @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(head_dim),
-    }));
-    const attn_bsnh = try bld.transpose(attn_bnsh, &.{ 0, 2, 1, 3 });
-    const attn_merged = try bld.reshape(attn_bsnh, Shape.init(.f32, &.{
-        @intCast(total), @intCast(H),
-    }));
+        const scores_sum = try bld.add(c2c, try bld.add(c2p, p2c));
+        const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0));
+        const scores_scaled = try bld.mul(scores_sum, scale);
+        const scores_masked = try bld.add(scores_scaled, attn_bias);
+        const probs = try bld.softmax(scores_masked);
+        const attn_bhsd = try bld.matmul3D(probs, v_bhsd);
+
+        // Reshape back: [bh, seq, head_dim] → [total, H]
+        const attn_bnsh = try bld.reshape(attn_bhsd, Shape.init(.f32, &.{
+            @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(head_dim),
+        }));
+        const attn_bsnh = try bld.transpose(attn_bnsh, &.{ 0, 2, 1, 3 });
+        break :blk try bld.reshape(attn_bsnh, Shape.init(.f32, &.{
+            @intCast(total), @intCast(H),
+        }));
+    };
 
     // ──────── Attention output projection + residual + LayerNorm ────────
     const o_w = try layerParam2D(bld, layer, "attention.output.dense", ".weight", H, H);

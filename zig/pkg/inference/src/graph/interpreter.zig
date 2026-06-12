@@ -1744,6 +1744,34 @@ fn isNonDonatedRuntimeInput(options: ExecuteOptions, node_id: NodeId) bool {
 
 /// Dispatch a single node to the backend, using side channels from
 /// ExecState for stateful ops.
+/// Derive the [batch*seq] 0/1 key mask from the additive attn_bias [bh,S,S]
+/// (bias < -1e8 at padded keys). Mirrors metal_partition_executor's
+/// attentionMaskFromBias so the fused-attention path matches the decomposed one.
+fn disentangledMaskFromBias(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    attn_bias: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+) ![]i64 {
+    const bias = try cb.toFloat32(attn_bias, allocator);
+    defer allocator.free(bias);
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    errdefer allocator.free(mask);
+    if (bias.len < batch * num_heads * seq_len * seq_len) {
+        @memset(mask, 1);
+        return mask;
+    }
+    for (0..batch) |b| {
+        for (0..seq_len) |k| {
+            const idx = ((b * num_heads) * seq_len + 0) * seq_len + k;
+            mask[b * seq_len + k] = if (bias[idx] < -1.0e8) 0 else 1;
+        }
+    }
+    return mask;
+}
+
 pub fn executeNode(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -2052,6 +2080,58 @@ pub fn executeNode(
                 attrs.num_kv_heads,
                 attrs.head_dim,
             );
+        },
+
+        .fused_disentangled_attention => |attrs| {
+            // input0 = qkv_packed [3*B*S, H]; input1 = qr_kr_packed [2*num_rel, H];
+            // input2 = attn_bias [bh, S, S]. Slice the packed inputs back into
+            // q/k/v and q_r/k_r, derive the padding mask from attn_bias, then
+            // call the fused attention op (device kernel / host fallback).
+            const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
+            const h: i64 = @intCast(attrs.num_heads * attrs.head_dim);
+            const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
+            const qkv = V.get(ins[0]);
+            const qkv_shape = [_]i64{ 3 * bs, h };
+            const q = try cb.primSlice(qkv, &.{ 0, 0 }, &.{ bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(q);
+            const k = try cb.primSlice(qkv, &.{ bs, 0 }, &.{ 2 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(k);
+            const v = try cb.primSlice(qkv, &.{ 2 * bs, 0 }, &.{ 3 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(v);
+            const qr_kr = V.get(ins[1]);
+            const qr_shape = [_]i64{ 2 * num_rel, h };
+            const q_r = try cb.primSlice(qr_kr, &.{ 0, 0 }, &.{ num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(q_r);
+            const k_r = try cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(k_r);
+            const mask = try disentangledMaskFromBias(graph.allocator, cb, V.get(ins[2]), attrs.batch, attrs.seq_len, attrs.num_heads);
+            defer graph.allocator.free(mask);
+            return cb.disentangledRelativeAttention(q, k, v, q_r, k_r, mask, attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim);
+        },
+
+        .fused_disentangled_attention_backward => |attrs| {
+            // input0/1/2 as forward; input3 = dOut [B*S, H]. Returns packed
+            // grads [dQ;dK;dV;dQ_r;dK_r] = [3*B*S + 2*num_rel, H].
+            const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
+            const h: i64 = @intCast(attrs.num_heads * attrs.head_dim);
+            const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
+            const qkv = V.get(ins[0]);
+            const qkv_shape = [_]i64{ 3 * bs, h };
+            const q = try cb.primSlice(qkv, &.{ 0, 0 }, &.{ bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(q);
+            const k = try cb.primSlice(qkv, &.{ bs, 0 }, &.{ 2 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(k);
+            const v = try cb.primSlice(qkv, &.{ 2 * bs, 0 }, &.{ 3 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(v);
+            const qr_kr = V.get(ins[1]);
+            const qr_shape = [_]i64{ 2 * num_rel, h };
+            const q_r = try cb.primSlice(qr_kr, &.{ 0, 0 }, &.{ num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(q_r);
+            const k_r = try cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(k_r);
+            const mask = try disentangledMaskFromBias(graph.allocator, cb, V.get(ins[2]), attrs.batch, attrs.seq_len, attrs.num_heads);
+            defer graph.allocator.free(mask);
+            return cb.disentangledRelativeAttentionBackward(q, k, v, q_r, k_r, mask, V.get(ins[3]), attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim);
         },
 
         .fused_relative_position_bias => |attrs| {

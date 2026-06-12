@@ -2194,6 +2194,7 @@ const vtable_impl = ComputeBackend.VTable{
     .crossAttention = &crossAttentionOp,
     .relativePositionBias = &relativePositionBiasOp,
     .disentangledRelativeAttention = &disentangledRelativeAttentionOp,
+    .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
     .windowedSelfAttention = &windowedSelfAttentionOp,
     .channelSelfAttention = &channelSelfAttentionOp,
     .tokenGridConv2d = &tokenGridConv2dOp,
@@ -6021,6 +6022,11 @@ fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usiz
     try mlx.check(c.mlx_reshape(&result, gathered_t, &out_shape, 3, s));
 
     return self.makeArr(result, true);
+}
+
+fn disentangledRelativeAttentionBackwardOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, dO_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    _ = .{ ctx, q_ct, k_ct, v_ct, q_r_ct, k_r_ct, mask, dO_ct, batch, seq_len, num_heads, head_dim };
+    return error.UnsupportedOperation;
 }
 
 fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {

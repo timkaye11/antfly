@@ -1198,6 +1198,13 @@ pub const ComputeBackend = struct {
         /// Returns [batch*seq_len, num_heads*head_dim].
         disentangledRelativeAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// VJP of disentangledRelativeAttention. Given the same inputs plus the
+        /// upstream gradient dO ([batch*seq_len, num_heads*head_dim]), returns
+        /// the packed gradients stacked on axis 0:
+        ///   [dQ (batch*seq rows) ; dK (batch*seq) ; dV (batch*seq) ;
+        ///    dQ_r (2*seq-1) ; dK_r (2*seq-1)]  → [3*batch*seq + 2*(2*seq-1), H].
+        disentangledRelativeAttentionBackward: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
         /// callers must only use it when `input` is at last use.
@@ -2407,6 +2414,10 @@ pub const ComputeBackend = struct {
 
     pub fn relativePositionBias(self: *const ComputeBackend, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) !CT {
         return self.vtable.relativePositionBias(self.ptr, weight, q_len, k_len, num_heads, num_buckets, max_distance, bidirectional);
+    }
+
+    pub fn disentangledRelativeAttentionBackward(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        return self.vtable.disentangledRelativeAttentionBackward(self.ptr, Q, K, V, Q_r, K_r, mask, dO, batch, seq_len, num_heads, head_dim);
     }
 
     pub fn disentangledRelativeAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {

@@ -411,6 +411,8 @@ pub const OpCode = union(enum) {
     fused_causal_self_attention: AttentionAttrs,
     fused_cross_attention: CrossAttentionAttrs,
     fused_gqa_causal_attention: AttentionAttrs,
+    fused_disentangled_attention: AttentionAttrs,
+    fused_disentangled_attention_backward: AttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_conv1d: Conv1dAttrs,
