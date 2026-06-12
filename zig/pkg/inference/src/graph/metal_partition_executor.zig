@@ -130,6 +130,14 @@ const ExecutorLoopProfile = struct {
     begin_frame_ns: u64 = 0,
     runtime_region_plan_ns: u64 = 0,
     execution_ns: u64 = 0,
+    planned_region_ns: u64 = 0,
+    planned_region_hits: usize = 0,
+    fused_pattern_ns: u64 = 0,
+    fused_pattern_hits: usize = 0,
+    command_path_ns: u64 = 0,
+    command_path_hits: usize = 0,
+    interpreter_ns: u64 = 0,
+    interpreter_hits: usize = 0,
     stats_ns: u64 = 0,
     alias_clone_ns: u64 = 0,
     free_expired_ns: u64 = 0,
@@ -138,7 +146,7 @@ const ExecutorLoopProfile = struct {
 
     fn print(self: ExecutorLoopProfile, label: []const u8) void {
         std.debug.print(
-            "{s}: nodes={d}:executed={d}:partition_view_ms={d:.3}:graph_plan_ms={d:.3}:runtime_inputs_ms={d:.3}:parameters_ms={d:.3}:constants_ms={d:.3}:begin_frame_ms={d:.3}:runtime_plan_ms={d:.3}:execution_ms={d:.3}:stats_ms={d:.3}:alias_clone_ms={d:.3}:free_expired_ms={d:.3}:submit_frame_ms={d:.3}:boundary_outputs_ms={d:.3}:accounted_ms={d:.3}\n",
+            "{s}: nodes={d}:executed={d}:partition_view_ms={d:.3}:graph_plan_ms={d:.3}:runtime_inputs_ms={d:.3}:parameters_ms={d:.3}:constants_ms={d:.3}:begin_frame_ms={d:.3}:runtime_plan_ms={d:.3}:execution_ms={d:.3}:planned_region_ms={d:.3}(hits={d}):fused_pattern_ms={d:.3}(hits={d}):command_path_ms={d:.3}(hits={d}):interpreter_ms={d:.3}(hits={d}):stats_ms={d:.3}:alias_clone_ms={d:.3}:free_expired_ms={d:.3}:submit_frame_ms={d:.3}:boundary_outputs_ms={d:.3}:accounted_ms={d:.3}\n",
             .{
                 label,
                 self.nodes,
@@ -151,6 +159,14 @@ const ExecutorLoopProfile = struct {
                 nsToMs(self.begin_frame_ns),
                 nsToMs(self.runtime_region_plan_ns),
                 nsToMs(self.execution_ns),
+                nsToMs(self.planned_region_ns),
+                self.planned_region_hits,
+                nsToMs(self.fused_pattern_ns),
+                self.fused_pattern_hits,
+                nsToMs(self.command_path_ns),
+                self.command_path_hits,
+                nsToMs(self.interpreter_ns),
+                self.interpreter_hits,
                 nsToMs(self.stats_ns),
                 nsToMs(self.alias_clone_ns),
                 nsToMs(self.free_expired_ns),
@@ -1080,6 +1096,7 @@ pub const MetalPartitionExecutor = struct {
             if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
             const runtime_region = runtime_region_plan.regionAt(node_pos, node_id, node_ids);
             const region_start_ns = if (collect_op_stats) metalPartitionNowNs() else 0;
+            const planned_region_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             if (try tryExecutePlannedRuntimeRegion(
                 runtime_region,
                 runtime_region_plan.preparedPtrAt(node_pos, node_id, node_ids),
@@ -1100,14 +1117,20 @@ pub const MetalPartitionExecutor = struct {
                 donated,
             )) {
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                if (collect_loop_profile) {
+                    loop_profile.planned_region_ns += metalPartitionElapsedNs(planned_region_start_ns, metalPartitionNowNs());
+                    loop_profile.planned_region_hits += 1;
+                }
                 execution_kind = .command;
                 if (exec_ctx.stats) |stats| stats.runtime_region_plan_dispatches += 1;
                 if (collect_op_stats) {
                     op_execution_stats.recordRuntimeRegion(@tagName(runtime_region), metalPartitionElapsedNs(region_start_ns, metalPartitionNowNs()));
                 }
             } else {
+                if (collect_loop_profile) loop_profile.planned_region_ns += metalPartitionElapsedNs(planned_region_start_ns, metalPartitionNowNs());
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=planned_region_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                 if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                const fused_pattern_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
                 if (try tryExecuteFusedMetalGraphPattern(
                     allocator,
                     graph,
@@ -1126,10 +1149,16 @@ pub const MetalPartitionExecutor = struct {
                     donated,
                 )) {
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                    if (collect_loop_profile) {
+                        loop_profile.fused_pattern_ns += metalPartitionElapsedNs(fused_pattern_start_ns, metalPartitionNowNs());
+                        loop_profile.fused_pattern_hits += 1;
+                    }
                     execution_kind = .command;
                 } else {
+                    if (collect_loop_profile) loop_profile.fused_pattern_ns += metalPartitionElapsedNs(fused_pattern_start_ns, metalPartitionNowNs());
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
+                    const command_path_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
                     const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
                         try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state)
                     else
@@ -1138,6 +1167,10 @@ pub const MetalPartitionExecutor = struct {
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         values[i] = command_output;
                         execution_kind = classifyMetalExecutionKind(graph, cb, values, node_id);
+                        if (collect_loop_profile) {
+                            loop_profile.command_path_ns += metalPartitionElapsedNs(command_path_start_ns, metalPartitionNowNs());
+                            loop_profile.command_path_hits += 1;
+                        }
                     } else {
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
@@ -1153,6 +1186,10 @@ pub const MetalPartitionExecutor = struct {
                             return error.MissingRuntimeInput;
                         }
                         values[i] = try interpreter.executeNode(graph, cb, values, node_id, &exec_state);
+                        if (collect_loop_profile) {
+                            loop_profile.interpreter_ns += metalPartitionElapsedNs(command_path_start_ns, metalPartitionNowNs());
+                            loop_profile.interpreter_hits += 1;
+                        }
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=interpreter_end partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     }
                 }
@@ -9094,6 +9131,62 @@ fn tryExecuteMetalCommand(
     const inputs = n.getInputs();
     return switch (n.op) {
         .constant => |attrs| try executeRuntimeConstant(graph, cb, n.output_shape, attrs),
+        // Fused disentangled attention forward/backward: run in-frame (instead of
+        // the interpreter fallback's separate command buffer) by slicing the
+        // packed device inputs and dispatching the fused kernels directly.
+        .fused_disentangled_attention => |attrs| blk: {
+            const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
+            const hh: i64 = @intCast(attrs.num_heads * attrs.head_dim);
+            const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
+            const qkv = valueFor(values, inputs[0]) orelse break :blk null;
+            const qr_kr = valueFor(values, inputs[1]) orelse break :blk null;
+            const bias = valueFor(values, inputs[2]) orelse break :blk null;
+            const qkv_shape = [_]i64{ 3 * bs, hh };
+            const qr_shape = [_]i64{ 2 * num_rel, hh };
+            const q = cb.primSlice(qkv, &.{ 0, 0 }, &.{ bs, hh }, &.{ 1, 1 }, &qkv_shape) catch break :blk null;
+            defer cb.free(q);
+            const k = cb.primSlice(qkv, &.{ bs, 0 }, &.{ 2 * bs, hh }, &.{ 1, 1 }, &qkv_shape) catch break :blk null;
+            defer cb.free(k);
+            const v = cb.primSlice(qkv, &.{ 2 * bs, 0 }, &.{ 3 * bs, hh }, &.{ 1, 1 }, &qkv_shape) catch break :blk null;
+            defer cb.free(v);
+            const q_r = cb.primSlice(qr_kr, &.{ 0, 0 }, &.{ num_rel, hh }, &.{ 1, 1 }, &qr_shape) catch break :blk null;
+            defer cb.free(q_r);
+            const k_r = cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, hh }, &.{ 1, 1 }, &qr_shape) catch break :blk null;
+            defer cb.free(k_r);
+            const mask = attentionMaskFromBias(allocator, cb, bias, attrs.batch, attrs.seq_len, attrs.num_heads) catch break :blk null;
+            defer allocator.free(mask);
+            break :blk cb.disentangledRelativeAttention(q, k, v, q_r, k_r, mask, attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim) catch |err| switch (err) {
+                error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
+        .fused_disentangled_attention_backward => |attrs| blk: {
+            const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
+            const hh: i64 = @intCast(attrs.num_heads * attrs.head_dim);
+            const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
+            const qkv = valueFor(values, inputs[0]) orelse break :blk null;
+            const qr_kr = valueFor(values, inputs[1]) orelse break :blk null;
+            const bias = valueFor(values, inputs[2]) orelse break :blk null;
+            const d_out = valueFor(values, inputs[3]) orelse break :blk null;
+            const qkv_shape = [_]i64{ 3 * bs, hh };
+            const qr_shape = [_]i64{ 2 * num_rel, hh };
+            const q = cb.primSlice(qkv, &.{ 0, 0 }, &.{ bs, hh }, &.{ 1, 1 }, &qkv_shape) catch break :blk null;
+            defer cb.free(q);
+            const k = cb.primSlice(qkv, &.{ bs, 0 }, &.{ 2 * bs, hh }, &.{ 1, 1 }, &qkv_shape) catch break :blk null;
+            defer cb.free(k);
+            const v = cb.primSlice(qkv, &.{ 2 * bs, 0 }, &.{ 3 * bs, hh }, &.{ 1, 1 }, &qkv_shape) catch break :blk null;
+            defer cb.free(v);
+            const q_r = cb.primSlice(qr_kr, &.{ 0, 0 }, &.{ num_rel, hh }, &.{ 1, 1 }, &qr_shape) catch break :blk null;
+            defer cb.free(q_r);
+            const k_r = cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, hh }, &.{ 1, 1 }, &qr_shape) catch break :blk null;
+            defer cb.free(k_r);
+            const mask = attentionMaskFromBias(allocator, cb, bias, attrs.batch, attrs.seq_len, attrs.num_heads) catch break :blk null;
+            defer allocator.free(mask);
+            break :blk cb.disentangledRelativeAttentionBackward(q, k, v, q_r, k_r, mask, d_out, attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim) catch |err| switch (err) {
+                error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
         .reshape => |attrs| blk: {
             const input = valueFor(values, inputs[0]) orelse break :blk null;
             var dims_buf: [ml.graph.shape.max_rank]i64 = undefined;

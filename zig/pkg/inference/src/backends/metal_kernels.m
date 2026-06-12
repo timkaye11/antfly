@@ -24156,7 +24156,18 @@ int termite_metal_decode_runtime_training_sumsq_many_f32(
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -5;
-        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        // The per-input dispatches are mutually independent: each reads a
+        // distinct input buffer and writes a distinct output[idx] slot. Under
+        // the default (serial) dispatch type Metal hazard-tracks the shared
+        // output buffer at buffer granularity and inserts a barrier between
+        // every one of the (up to 256) 1-thread dispatches, serializing them
+        // into ~0.27ms each. A concurrent-dispatch encoder lets them overlap;
+        // the lack of cross-dispatch dependencies makes this safe without
+        // explicit barriers. Only used on a frame-owned command buffer (this
+        // kernel runs at optimizer time, outside any active planned frame).
+        id<MTLComputeCommandEncoder> encoder = frame_owned
+            ? [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+            : termite_metal_tracked_compute_command_encoder(command_buffer);
         if (encoder == nil) return -6;
         [encoder setComputePipelineState:runtime->training_sumsq_pipeline];
         for (size_t idx = 0; idx < input_count; idx += 1) {
