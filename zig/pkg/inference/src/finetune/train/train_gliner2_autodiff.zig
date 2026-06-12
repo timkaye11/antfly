@@ -47,6 +47,7 @@
 //   --lora-only-trainables       Freeze regular task-head params; train LoRA only
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const inference = @import("inference_internal");
 const ml = @import("ml");
@@ -123,6 +124,7 @@ const Options = struct {
     eval_steps: u32 = 0,
     save_best: bool = false,
     report_to: ReportTo = .stdout,
+    allow_large_memory: bool = false,
 };
 
 const Gliner2TrainBackend = enum {
@@ -193,6 +195,7 @@ pub fn main(init: std.process.Init) !void {
     var eval_steps: u32 = 0;
     var save_best: bool = false;
     var report_to: ReportTo = .stdout;
+    var allow_large_memory: bool = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -299,6 +302,8 @@ pub fn main(init: std.process.Init) !void {
             eval_steps = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--save-best")) {
             save_best = true;
+        } else if (std.mem.eql(u8, arg, "--allow-large-memory")) {
+            allow_large_memory = true;
         } else if (std.mem.eql(u8, arg, "--report-to")) {
             const val = args.next() orelse return error.MissingReportTo;
             report_to = parseReportTo(val) orelse {
@@ -385,6 +390,7 @@ pub fn main(init: std.process.Init) !void {
         .eval_steps = eval_steps,
         .save_best = save_best,
         .report_to = report_to,
+        .allow_large_memory = allow_large_memory,
     };
 
     try runTraining(allocator, opts);
@@ -766,6 +772,75 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     });
 
     // ------------------------------------------------------------------
+    // 6c. Fit-to-data sequence length. The DeBERTa graph bakes in seq_len
+    // (relative-position tables) and is built+cached once, so padding every
+    // batch to the fixed --seq-len wastes S^2-proportional attention compute
+    // (and can OOM) on padding. Scan the ACTUAL encoded token length of the
+    // data (via the same batch builders the training loop uses) and size the
+    // single graph to that, capped by --seq-len (upper bound) and the
+    // relative-position table limit (512). Matches upstream GLiNER2Trainer's
+    // dynamic padding. The .token objective keeps the fixed length.
+    // ------------------------------------------------------------------
+    const effective_seq_len: usize = blk: {
+        if (opts.objective == .token) break :blk opts.seq_len;
+        // Escape hatch: force the fixed --seq-len (e.g. to reproduce a
+        // fixed-padding baseline or match another runner's seq length).
+        if (std.c.getenv("TERMITE_GLINER2_DISABLE_FIT_SEQ_LEN") != null) break :blk opts.seq_len;
+        var scanned_max: usize = 0;
+        var i: usize = 0;
+        while (i < examples.len) : (i += 1) {
+            var enc = switch (opts.objective) {
+                .gliner2_total_loss => try gliner2_data.buildUpstreamTaskBatch(allocator, &tokenizer, training_records[i .. i + 1], entity_types, opts.seq_len, opts.max_span_width, 1),
+                else => try gliner2_data.buildSimpleBatch(allocator, &tokenizer, examples[i .. i + 1], entity_types, opts.seq_len, opts.max_span_width, 1),
+            };
+            defer enc.deinit();
+            var used: usize = 0;
+            for (enc.attention_mask) |m| {
+                if (m != 0) used += 1;
+            }
+            if (used > scanned_max) scanned_max = used;
+        }
+        const floor_len: usize = @as(usize, @intCast(opts.max_span_width)) + 8;
+        const rounded = (@max(scanned_max, floor_len) + 7) / 8 * 8;
+        break :blk @min(@as(usize, 512), @min(opts.seq_len, rounded));
+    };
+    print("  effective seq_len: {d} (cap --seq-len={d})\n", .{ effective_seq_len, opts.seq_len });
+
+    // ------------------------------------------------------------------
+    // 6d. Memory pre-flight. The disentangled-attention intermediates scale
+    // batch*S^2 and have previously hard-OOMed the whole machine (not just
+    // this process) on 16GB hosts. Estimate the peak fp32 footprint and
+    // refuse configs that would exceed a safe fraction of physical RAM
+    // unless --allow-large-memory is passed.
+    // ------------------------------------------------------------------
+    {
+        const est = estimateTrainingPeakBytes(
+            @intCast(deberta_config.vocab_size),
+            @intCast(deberta_config.hidden_size),
+            @intCast(deberta_config.intermediate_size),
+            @intCast(deberta_config.num_hidden_layers),
+            @intCast(deberta_config.num_attention_heads),
+            opts.batch_size,
+            effective_seq_len,
+        );
+        if (physicalMemoryBytes()) |total| {
+            const budget = total * 6 / 10;
+            print("  estimated peak memory: {d:.2} GiB (budget {d:.2} GiB of {d:.2} GiB physical)\n", .{
+                @as(f64, @floatFromInt(est)) / (1024.0 * 1024.0 * 1024.0),
+                @as(f64, @floatFromInt(budget)) / (1024.0 * 1024.0 * 1024.0),
+                @as(f64, @floatFromInt(total)) / (1024.0 * 1024.0 * 1024.0),
+            });
+            if (est > budget and !opts.allow_large_memory) {
+                print("error: estimated peak memory exceeds the safe budget; lower --batch-size or --seq-len (attention intermediates scale batch*seq^2), or pass --allow-large-memory to proceed anyway\n", .{});
+                return error.EstimatedMemoryExceedsBudget;
+            }
+            if (est > budget) {
+                print("warning: --allow-large-memory set; proceeding past the safe memory budget\n", .{});
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 7. Parse LoRA target patterns
     // ------------------------------------------------------------------
     var target_patterns = std.ArrayListUnmanaged([]const u8).empty;
@@ -803,7 +878,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             allocator,
             preplan_config,
             opts.batch_size,
-            opts.seq_len,
+            effective_seq_len,
         ) catch |err| blk: {
             print("warning: Metal DeBERTa encoder frame preplan failed: {s}; continuing with graph runtime fallback\n", .{@errorName(err)});
             break :blk false;
@@ -880,8 +955,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         total_examples,
     });
 
-    // Pre-allocate batch buffers.
-    const sl: usize = opts.seq_len;
+    // Pre-allocate batch buffers (sized to the fit-to-data effective length).
+    const sl: usize = effective_seq_len;
     const bs: usize = opts.batch_size;
     const nc: usize = effective_num_classes;
     const batch_tokens = bs * sl;
@@ -921,6 +996,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         try ensureTrainerGraphBuiltFromFirstBatch(
             allocator,
             opts,
+            effective_seq_len,
             &tokenizer,
             entity_types,
             examples,
@@ -995,7 +1071,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         &tokenizer,
                         entity_types,
                         batch_examples,
-                        opts.seq_len,
+                        @intCast(sl),
                         opts.num_classes,
                         &label_map,
                         input_ids,
@@ -1007,7 +1083,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     if (real_batch < ab) @memset(targets_buf[real_batch * sl * nc .. ab * sl * nc], 0.0);
                     targets_shape = gliner2_autodiff.tokenTargetsShape(
                         actual_batch,
-                        opts.seq_len,
+                        @intCast(sl),
                         opts.num_classes,
                     );
                     target_slice = targets_buf[0 .. ab * sl * nc];
@@ -1019,7 +1095,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                             &tokenizer,
                             batch_records,
                             entity_types,
-                            opts.seq_len,
+                            sl,
                             opts.max_span_width,
                             ab,
                         )
@@ -1029,7 +1105,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                             &tokenizer,
                             batch_examples,
                             entity_types,
-                            opts.seq_len,
+                            sl,
                             opts.max_span_width,
                             ab,
                         );
@@ -1119,7 +1195,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 target_slice,
                 targets_shape,
                 actual_batch,
-                opts.seq_len,
+                @intCast(sl),
             );
 
             if (opts.dump_span_parity and opts.objective == .span_start and total_steps == 0) {
@@ -1132,7 +1208,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     target_slice,
                     targets_shape,
                     actual_batch,
-                    opts.seq_len,
+                    @intCast(sl),
                 );
                 defer allocator.free(logits);
                 try printSpanParityDebug(logits, target_slice, targets_shape, entity_types.len, use_label_positive_weights, opts);
@@ -1145,7 +1221,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     target_slice,
                     targets_shape,
                     actual_batch,
-                    opts.seq_len,
+                    @intCast(sl),
                     entity_types.len,
                 );
                 printSpanComponentDebug(components);
@@ -1160,7 +1236,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     target_slice,
                     targets_shape,
                     actual_batch,
-                    opts.seq_len,
+                    @intCast(sl),
                 );
                 defer allocator.free(logits);
                 try printSpanParityDebug(logits, target_slice, targets_shape, entity_types.len, false, opts);
@@ -1173,7 +1249,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     target_slice,
                     targets_shape,
                     actual_batch,
-                    opts.seq_len,
+                    @intCast(sl),
                     entity_types.len,
                 )) |span_components| {
                     printSpanComponentDebug(span_components);
@@ -1190,7 +1266,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     target_slice,
                     targets_shape,
                     actual_batch,
-                    opts.seq_len,
+                    @intCast(sl),
                 );
                 printGliner2TotalLossComponentDebug(components);
                 const classification_logits = try gliner2_autodiff.gliner2ClassificationLogitsForBatch(
@@ -1202,7 +1278,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     target_slice,
                     targets_shape,
                     actual_batch,
-                    opts.seq_len,
+                    @intCast(sl),
                 );
                 defer allocator.free(classification_logits);
                 try printGliner2ClassificationDebug(classification_logits, target_slice, targets_shape, entity_types.len);
@@ -1733,6 +1809,7 @@ fn collectRegularTrainableParams(
 fn ensureTrainerGraphBuiltFromFirstBatch(
     allocator: std.mem.Allocator,
     opts: Options,
+    effective_seq_len: usize,
     tokenizer: *const gliner2_data.Tokenizer,
     entity_types: []const []const u8,
     examples: []const gliner2_data.Example,
@@ -1754,7 +1831,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
     const ab: usize = opts.batch_size;
     const real_batch = @min(ab, examples.len);
     const actual_batch: u32 = @intCast(ab);
-    const sl: usize = opts.seq_len;
+    const sl: usize = effective_seq_len;
     const nc: usize = effective_num_classes;
 
     var batch_examples = try allocator.alloc(gliner2_data.Example, ab);
@@ -1776,7 +1853,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 tokenizer,
                 entity_types,
                 batch_examples,
-                opts.seq_len,
+                @intCast(sl),
                 effective_num_classes,
                 label_map,
                 input_ids,
@@ -1784,7 +1861,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 targets_buf[0 .. ab * sl * nc],
             );
             if (real_batch < ab) @memset(targets_buf[real_batch * sl * nc .. ab * sl * nc], 0.0);
-            targets_shape = gliner2_autodiff.tokenTargetsShape(actual_batch, opts.seq_len, effective_num_classes);
+            targets_shape = gliner2_autodiff.tokenTargetsShape(actual_batch, @intCast(sl), effective_num_classes);
             target_slice = targets_buf[0 .. ab * sl * nc];
         },
         .span_start, .gliner2_total_loss => {
@@ -1794,7 +1871,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                     tokenizer,
                     batch_records,
                     entity_types,
-                    opts.seq_len,
+                    sl,
                     opts.max_span_width,
                     ab,
                 )
@@ -1804,7 +1881,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                     tokenizer,
                     batch_examples,
                     entity_types,
-                    opts.seq_len,
+                    sl,
                     opts.max_span_width,
                     ab,
                 );
@@ -1878,7 +1955,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
         target_slice,
         targets_shape,
         actual_batch,
-        opts.seq_len,
+        @intCast(sl),
     );
     try trainer.ensureGraphBuilt(trainer_input);
 }
@@ -3195,6 +3272,55 @@ fn stableBceWithLogits(logit: f64, label: f64) f64 {
     return @max(logit, 0.0) - logit * label + @log(1.0 + @exp(-@abs(logit)));
 }
 
+// ---------------------------------------------------------------------------
+// Memory pre-flight
+// ---------------------------------------------------------------------------
+
+const macos_sysctl = if (builtin.os.tag == .macos) struct {
+    pub extern fn sysctlbyname(
+        name: [*:0]const u8,
+        oldp: ?*anyopaque,
+        oldlenp: ?*usize,
+        newp: ?*anyopaque,
+        newlen: usize,
+    ) c_int;
+} else struct {};
+
+fn physicalMemoryBytes() ?u64 {
+    if (builtin.os.tag != .macos) return null;
+    var total: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (macos_sysctl.sysctlbyname("hw.memsize", @ptrCast(&total), &len, null, 0) != 0 or total == 0) return null;
+    return total;
+}
+
+/// Conservative fp32 peak-footprint estimate for a GLiNER2 LoRA training run.
+/// Dominant terms: frozen weights, and the disentangled-attention
+/// intermediates — the [batch*heads, S, S, head_dim] C2P/P2C products and the
+/// [S^2, H] Toeplitz-gathered relative embeddings — held live across forward
+/// and backward for every layer. The x2 live-copy factor is calibrated
+/// against measured peaks (~1.4 GiB RSS at batch 2 / seq 64 / DeBERTa-base,
+/// where this formula yields ~1.6 GiB) and reproduces the observed 16 GiB
+/// OOM boundary at batch 1 / seq 256.
+fn estimateTrainingPeakBytes(
+    vocab_size: u64,
+    hidden_size: u64,
+    intermediate_size: u64,
+    num_layers: u64,
+    num_heads: u64,
+    batch_size: u64,
+    seq_len: u64,
+) u64 {
+    const f32_size: u64 = 4;
+    const head_dim = hidden_size / @max(num_heads, 1);
+    const bh = batch_size * num_heads;
+    const ss = seq_len * seq_len;
+    const weights = (vocab_size * hidden_size +
+        num_layers * (4 * hidden_size * hidden_size + 2 * hidden_size * intermediate_size)) * f32_size;
+    const attn_per_layer = (bh * ss * head_dim + ss * hidden_size) * f32_size;
+    return weights + 2 * num_layers * attn_per_layer;
+}
+
 fn printUsage() void {
     // Zig 0.16: std.debug.print requires a format tuple. For plain string
     // output, use a no-arg format with the text inlined.
@@ -3240,6 +3366,8 @@ fn printUsage() void {
         \\  --eval-strategy <name>    epoch, steps, or none (default: epoch; eval metric is avg train loss)
         \\  --eval-steps <n>          Eval every N steps when --eval-strategy steps
         \\  --save-best               Snapshot adapters to <out-dir>/best when the eval metric improves
+        \\  --allow-large-memory      Proceed even when the estimated peak memory exceeds the safe
+        \\                            budget (~60% of physical RAM); risks a system-wide OOM
         \\  --report-to <name>        stdout or jsonl; jsonl emits one JSON object per step/eval to stdout
         \\  --dump-span-parity        Print first span-start batch logits/label/mask BCE stats as JSON
         \\  --dump-optimizer-parity   Print per-step LoRA weight/Adam m/v state heads as JSON
