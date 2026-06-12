@@ -1,5 +1,30 @@
 # Metal GLiNER2 Fine-tuning — Next Steps Plan (v2, merged)
 
+> **✅ PRODUCTION PUSH 2026-06-11 — OOM FIXED + restructure shipped (default-on).**
+> The machine-OOM (Metal at realistic seq≥128 exhausting 16GB) was the
+> **`[bh,S,S,D]` disentangled-attention materialization**. Replaced C2P/P2C with
+> the HF contraction-over-`num_rel` + Toeplitz score-gather form
+> (`deberta_graph.zig`: `relScoreGatherEnabled`/`buildRelScoreIndices`/
+> `contentToPositionGather`/`positionToContentGather`), now **default-ON**
+> (escape: `TERMITE_DEBERTA_REL_SCORE_GATHER=0`). Validated: native+metal entity
+> strict Python gates **PASS** with it on (all 7 metal-readiness checks green);
+> native==metal, graph==direct exact, legacy==restructured 8-step trajectory
+> bit-identical; metal now runs at s128 **and** s256 (the original crash config)
+> where the legacy path OOMed; ~28% faster GPU at b2s64. Also landed:
+> **fit-to-data effective seq-len** (pads to actual tokens, not fixed `--seq-len`;
+> loss-neutral — seq40==seq64 bit-identical; escape:
+> `TERMITE_GLINER2_DISABLE_FIT_SEQ_LEN=1`), **memory pre-flight rails**
+> (`--allow-large-memory` + `estimateTrainingPeakBytes`, refuses configs >60% RAM),
+> a **memory-pressure watchdog** (`scripts/gliner2_memory_watchdog.sh`) and
+> **validation ladder** (`scripts/run_gliner2_validation_ladder.sh`), plus the
+> device-side `lazy_multiply` materialization in `metal_compute.zig`. Known
+> remaining gap (out of scope here): 6 **multi-schema** full-task parity fixtures
+> (cls/json/rel/alltask/multicount/negative) still FAIL on `structure_loss` — the
+> documented Phase 5 envelope-expansion work, pre-existing (native backend,
+> rel-gather off, fit-to-data isolated out). Wall-clock at b1 s128 (~2.1s GPU) is
+> still slower than Python CPU (~167ms) — the known kernel-efficiency gap.
+
+
 > **⚠️ STATUS UPDATE 2026-06-11 — Phase 0 is CLOSED; its premise was wrong.**
 > There is **no node-1405 correctness bug**. The Phase 0 target loss `19.230522` was an
 > **artifact of the OLD pre-§2.5 broken index-map-aliasing semantics**, not a Python value.
