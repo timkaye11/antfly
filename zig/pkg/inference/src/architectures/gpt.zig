@@ -169,6 +169,35 @@ const FinalAndPreNormHiddenTensorResult = struct {
     total_rows: usize,
 };
 
+pub const ActivationTraceSink = struct {
+    ptr: *anyopaque,
+    captureFn: *const fn (*anyopaque, *const ComputeBackend, std.mem.Allocator, []const u8, ?usize, CT, usize) anyerror!void,
+
+    pub fn capture(
+        self: *ActivationTraceSink,
+        cb: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        label: []const u8,
+        layer: ?usize,
+        tensor: CT,
+        row_dim: usize,
+    ) !void {
+        try self.captureFn(self.ptr, cb, allocator, label, layer, tensor, row_dim);
+    }
+};
+
+fn maybeCaptureActivationTrace(
+    trace_sink: ?*ActivationTraceSink,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    layer: ?usize,
+    tensor: CT,
+    row_dim: usize,
+) !void {
+    if (trace_sink) |sink| try sink.capture(cb, allocator, label, layer, tensor, row_dim);
+}
+
 const ReservedHiddenCarrier = struct {
     front: CT,
     back: CT,
@@ -977,6 +1006,57 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !HiddenTensorResult {
+    return forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        overrides,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        null,
+    );
+}
+
+pub fn forwardFinalHiddenTensorFromEmbeddingsWithTrace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    trace_sink: ?*ActivationTraceSink,
+) !HiddenTensorResult {
+    return forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        .{},
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        trace_sink,
+    );
+}
+
+fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    trace_sink: ?*ActivationTraceSink,
+) !HiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -1003,7 +1083,7 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
     }
 
     owns_hidden = false;
-    return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
+    return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
         cb,
         allocator,
         config,
@@ -1013,6 +1093,7 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
         seq_len,
         decode_context,
         ple_vectors,
+        trace_sink,
     );
 }
 
@@ -1065,6 +1146,7 @@ pub fn forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
         decode_context,
         ple_vectors,
         &pre_norm_hidden,
+        null,
     );
     errdefer cb.free(final_result.hidden);
     errdefer cb.free(pre_norm_hidden);
@@ -1110,6 +1192,32 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !HiddenTensorResult {
+    return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        overrides,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        null,
+    );
+}
+
+fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    trace_sink: ?*ActivationTraceSink,
+) !HiddenTensorResult {
     return forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         cb,
         allocator,
@@ -1121,6 +1229,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
         decode_context,
         ple_vectors,
         null,
+        trace_sink,
     );
 }
 
@@ -1135,6 +1244,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
     pre_norm_out: ?*CT,
+    trace_sink: ?*ActivationTraceSink,
 ) !HiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -1177,6 +1287,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (!isDecodeStep(decode_context)) {
         try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "input", hidden, hidden_size);
     }
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "input", null, hidden, hidden_size);
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
@@ -1207,6 +1318,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             layer0_q_pending,
             layer0_k_pending,
             layer0_v_pending,
+            trace_sink,
         );
         if (layer == 0) layer0_attn_norm_pending = null;
         if (layer == 0) layer0_fused_qkv_pending = null;
@@ -1242,6 +1354,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         if (!isDecodeStep(decode_context)) {
             try maybeGemma4PromptSnapshotLayer(cb, allocator, config, layer, "out", hidden, hidden_size);
         }
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "out", layer, hidden, hidden_size);
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} done\n", .{layer});
         }
@@ -1268,6 +1381,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (!isDecodeStep(decode_context)) {
         try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "pre_final_norm", hidden, hidden_size);
     }
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "pre_final_norm", null, hidden, hidden_size);
 
     // 4. Final layer norm
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
@@ -1290,6 +1404,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (!isDecodeStep(decode_context)) {
         try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "final_norm", hidden, hidden_size);
     }
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "final_norm", null, hidden, hidden_size);
 
     return .{
         .hidden = hidden,
@@ -1436,6 +1551,7 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             decode_context,
             ple_vectors,
             raw_overrides,
+            null,
             null,
             null,
             null,
@@ -3123,6 +3239,7 @@ fn decoderBlock(
     layer0_q_override: ?CT,
     layer0_k_override: ?CT,
     layer0_v_override: ?CT,
+    trace_sink: ?*ActivationTraceSink,
 ) !CT {
     const attn_started_at = monotonicNowNs();
     const hidden_size = config.hidden_size;
@@ -3188,6 +3305,7 @@ fn decoderBlock(
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_norm", normed, hidden_size);
     try maybeDebugLayerTensor(cb, allocator, layer, "attn_norm", normed);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-norm", normed, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_norm", layer, normed, hidden_size);
     if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill and layer == 0) {
         debugPrint("prefill-trace: gpt layer0 attn norm done\n", .{});
     }
@@ -3481,7 +3599,7 @@ fn decoderBlock(
             defer cb.free(reshaped);
             if (try cb.rmsNormBare(reshaped, v_dim, config.norm_eps)) |normed_flat| {
                 defer cb.free(normed_flat);
-                const result = (try cb.reshape2d(normed_flat, total, kv_dim)) orelse return error.ReshapeFailed;
+                const result = try reshape2dOwned(cb, allocator, normed_flat, total, kv_dim);
                 if (!v_omitted) cb.free(V); // V = K when omitted, don't double-free
                 break :blk result;
             }
@@ -3499,7 +3617,7 @@ fn decoderBlock(
             defer cb.free(reshaped);
             const normed_flat = try cb.rmsNorm(reshaped, ones_ct, v_dim, config.norm_eps);
             defer cb.free(normed_flat);
-            const result = (try cb.reshape2d(normed_flat, total, kv_dim)) orelse return error.ReshapeFailed;
+            const result = try reshape2dOwned(cb, allocator, normed_flat, total, kv_dim);
             if (!v_omitted) cb.free(V); // V = K when omitted, don't double-free
             break :blk result;
         }
@@ -3516,6 +3634,9 @@ fn decoderBlock(
     try maybeDebugLayerTensor(cb, allocator, layer, "q", Q);
     try maybeDebugLayerTensor(cb, allocator, layer, "k", K);
     try maybeDebugLayerTensor(cb, allocator, layer, "v", V_normed);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_raw", layer, Q, num_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_raw", layer, K, num_kv_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_norm", layer, V_normed, num_kv_heads * head_dim);
 
     var qk_already_roped = false;
     var fused_q_rope: ?CT = null;
@@ -3588,6 +3709,9 @@ fn decoderBlock(
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "q", Q_for_attn, num_heads * head_dim);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "k", K_attn, num_kv_heads * head_dim);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "v", V_normed, num_kv_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_attn", layer, Q_for_attn, num_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_attn", layer, K_attn, num_kv_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_attn", layer, V_normed, num_kv_heads * head_dim);
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
     if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
@@ -3725,6 +3849,7 @@ fn decoderBlock(
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_out", gated_attn_out, num_heads * head_dim);
         try maybeDebugLayerTensor(cb, allocator, layer, "attn_out", gated_attn_out);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-out", gated_attn_out, num_heads * head_dim);
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_out", layer, gated_attn_out, num_heads * head_dim);
 
         const attn_proj_input = if (config.family == .bitnet)
             if (attn_sub_norm_slot != null)
@@ -3756,15 +3881,18 @@ fn decoderBlock(
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_proj", proj, hidden_size);
         try maybeDebugLayerTensor(cb, allocator, layer, "attn_proj", proj);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-proj", proj, hidden_size);
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_proj", layer, proj, hidden_size);
         debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
 
         if (config.family == .gemma) {
             const attn_post = try applyGemmaPostAttentionNorm(cb, allocator, config, proj, layer, &name_buf);
             defer if (attn_post != proj) cb.free(attn_post);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-post", attn_post, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_post", layer, attn_post, hidden_size);
 
             const sa_out = try cb.add(attn_post, hidden);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-residual", sa_out, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_residual", layer, sa_out, hidden_size);
 
             if (config.usesMoe() and config.hasSharedExpert()) {
                 // Gemma 4 three-sublayer block: attention → shared expert FFN → MoE routed experts.
@@ -3833,6 +3961,7 @@ fn decoderBlock(
             const ffn_normed = try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
             defer cb.free(ffn_normed);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-norm", ffn_normed, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_norm", layer, ffn_normed, hidden_size);
 
             const ffn_started_at = monotonicNowNs();
             const ffn_out_raw = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
@@ -3840,6 +3969,7 @@ fn decoderBlock(
             try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_raw", ffn_out_raw, hidden_size);
             try maybeDebugLayerTensor(cb, allocator, layer, "ffn_raw", ffn_out_raw);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-raw", ffn_out_raw, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_raw", layer, ffn_out_raw, hidden_size);
             debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
             var layer_result_output_scaled = false;
@@ -3847,6 +3977,7 @@ fn decoderBlock(
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
                 if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
                     break :residual_blk try cb.add(ffn_out, sa_out);
                 }
@@ -3855,10 +3986,12 @@ fn decoderBlock(
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
                 break :ple_residual_blk try cb.add(ffn_out, sa_out);
             };
             cb.free(sa_out);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_residual", layer, ffn_residual, hidden_size);
 
             var layer_result = ffn_residual;
             if (config.hasPle()) {
@@ -3872,8 +4005,10 @@ fn decoderBlock(
                 }
             }
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ple", layer_result, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ple", layer, layer_result, hidden_size);
             const scaled = if (layer_result_output_scaled or (!config.hasPle() and branchGemma4LayerOutputScaleDebug())) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "output_scale", layer, scaled, hidden_size);
             try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
             return scaled;
         }
@@ -4019,6 +4154,7 @@ fn decoderBlock(
     defer if (free_ffn_out) cb.free(ffn_out);
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_out", ffn_out, hidden_size);
     try maybeDebugLayerTensor(cb, allocator, layer, "ffn_out", ffn_out);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_out", layer, ffn_out, hidden_size);
     debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
     // Residual
@@ -4029,6 +4165,7 @@ fn decoderBlock(
     cb.free(attn_res);
 
     try dumpLayerLastRowStats(cb, allocator, layer, result, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "result", layer, result, hidden_size);
     return result;
 }
 
@@ -4058,6 +4195,7 @@ pub fn debugDecoderBlockNoOverrides(
         decode_context,
         ple_vectors,
         .{},
+        null,
         null,
         null,
         null,
@@ -4173,7 +4311,7 @@ pub fn maybeApplyQKHeadNorm(
         defer cb.free(reshaped);
         const normed_flat = try cb.rmsNorm(reshaped, adjusted_weight, head_dim, config.norm_eps);
         defer cb.free(normed_flat);
-        return (try cb.reshape2d(normed_flat, total_rows, total_dim)) orelse return error.ReshapeFailed;
+        return try reshape2dOwned(cb, allocator, normed_flat, total_rows, total_dim);
     }
 
     // CPU fallback (native — rmsNorm handles chunked dim natively).
@@ -4781,6 +4919,15 @@ fn maybeDebugTensorLastRowDiff(
     debugPrint("{s} rhs:", .{label});
     for (rhs_row[0..limit]) |value| debugPrint(" {d:.6}", .{value});
     debugPrint("\n", .{});
+}
+
+pub fn reshape2dOwned(cb: *const ComputeBackend, allocator: std.mem.Allocator, tensor: CT, rows: usize, cols: usize) !CT {
+    const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+    if (try cb.cloneTensorShape(tensor, &shape)) |cloned| return cloned;
+
+    const reshaped = (try cb.reshape2d(tensor, rows, cols)) orelse return error.ReshapeFailed;
+    defer cb.free(reshaped);
+    return try cloneTensorMaterialized(cb, allocator, reshaped);
 }
 
 fn cloneTensorMaterialized(cb: *const ComputeBackend, allocator: std.mem.Allocator, tensor: CT) !CT {

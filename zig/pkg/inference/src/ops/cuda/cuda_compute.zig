@@ -1513,6 +1513,7 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     }
     self.stats.temp_buffer_evictions += 1;
     self.stats.device_free_calls += 1;
+    self.ctx.synchronize() catch {};
     buffer.free(&self.ctx);
 }
 
@@ -2068,6 +2069,29 @@ fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT
         return error.InvalidShape;
     }
     return reshape2DOp(ctx, input, input_tensor.elem_count, 1, rows, cols);
+}
+
+fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape_i32: []const i32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+
+    var elem_count: usize = 1;
+    for (shape_i32) |dim| {
+        if (dim <= 0) return error.InvalidShape;
+        elem_count = try std.math.mul(usize, elem_count, @as(usize, @intCast(dim)));
+    }
+    if (elem_count != input_tensor.elem_count) return error.InvalidShape;
+
+    const shape = try self.allocator.alloc(i64, shape_i32.len);
+    errdefer self.allocator.free(shape);
+    for (shape_i32, 0..) |dim, idx| shape[idx] = @intCast(dim);
+
+    const byte_len = input_tensor.elem_count * @sizeOf(f32);
+    var device = try allocDeviceBuffer(self, byte_len);
+    errdefer device.free(&self.ctx);
+    try copyFromDeviceTracked(self, device, input_tensor.buffer, byte_len);
+    return try createTensor(self, device, shape, input_tensor.elem_count);
 }
 
 fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
@@ -3541,6 +3565,10 @@ fn cudaAllowHostAttentionFallback() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_ALLOW_HOST_ATTENTION_FALLBACK", false);
 }
 
+fn cudaForceHostGqaAttention() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_FORCE_HOST_GQA_ATTENTION", false);
+}
+
 fn usizeSliceToU32(allocator: std.mem.Allocator, values: []const usize) ![]u32 {
     const out = try allocator.alloc(u32, values.len);
     errdefer allocator.free(out);
@@ -3718,6 +3746,25 @@ fn gqaDenseAttention(
     const bias_tensor: ?*CudaTensor = if (attn_bias_ct) |bct| tensorFromCt(bct) else null;
     const bias_mode = try biasModeFor(bias_tensor, batch, num_heads, q_seq_len, kv_seq_len);
     const bias_buffer = if (bias_tensor) |bt| bt.buffer else buffer_mod.DeviceBuffer{};
+    if (cudaForceHostGqaAttention()) {
+        return gqaDenseAttentionHostFallback(
+            self,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            bias_tensor,
+            attn_or_mask,
+            sliding_window,
+            batch,
+            q_seq_len,
+            kv_seq_len,
+            query_position_offset,
+            kv_position_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+    }
 
     const mask_device = if (attn_or_mask) |mask| try uploadTempU8(self, mask) else buffer_mod.DeviceBuffer{};
     const mask_len = if (attn_or_mask) |mask| mask.len else 0;
@@ -4339,6 +4386,7 @@ const vtable = ops.ComputeBackend.VTable{
     .reshapeOp = &reshapeOp,
     .reshape2D = &reshape2DOp,
     .reshape2d = &reshape2dOp,
+    .cloneTensorShape = &cloneTensorShapeOp,
     .transposeOp = &transposeOp,
     .splitLastDim3 = &splitLastDim3,
     .concat = &concat,

@@ -577,7 +577,7 @@ fn prepareGemmaValueForAttention(
         defer cb.free(reshaped);
         const normed_flat = try cb.rmsNorm(reshaped, ones_ct, head_dim, gpt_config.norm_eps);
         defer cb.free(normed_flat);
-        return (try cb.reshape2d(normed_flat, rows, kv_dim)) orelse error.ReshapeFailed;
+        return try gpt_arch.reshape2dOwned(cb, allocator, normed_flat, rows, kv_dim);
     }
     return cb.rmsNorm(v_input, ones_ct, head_dim, gpt_config.norm_eps);
 }

@@ -18,6 +18,7 @@ const ops = @import("ops/ops.zig");
 const tensor_store_mod = @import("models/tensor_store.zig");
 const weight_source_mod = @import("models/weight_source.zig");
 const gguf_mod = @import("gguf/root.zig");
+const gpt_mod = @import("models/gpt.zig");
 
 const print = std.debug.print;
 
@@ -45,13 +46,24 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
     var gemma4_hf_parity_path: ?[]const u8 = null;
     var gemma4_cross_gguf_path: ?[]const u8 = null;
     var gemma4_cross_hf_dir: ?[]const u8 = null;
+    var gemma4_cross_rmse_gguf_path: ?[]const u8 = null;
+    var gemma4_cross_rmse_hf_dir: ?[]const u8 = null;
     var gemma4_cross_layer0_gguf_path: ?[]const u8 = null;
     var gemma4_cross_layer0_hf_dir: ?[]const u8 = null;
+    var gguf_meta_path: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--smoke")) {
             smoke = true;
+        } else if (std.mem.eql(u8, arg, "--gguf-meta")) {
+            i += 1;
+            if (i >= args.len) {
+                print("missing value for --gguf-meta\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gguf_meta_path = args[i];
         } else if (std.mem.eql(u8, arg, "--gemma4-parity")) {
             i += 1;
             if (i >= args.len) {
@@ -83,6 +95,21 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             }
             gemma4_cross_hf_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--gemma4-cross-rmse")) {
+            i += 1;
+            if (i >= args.len) {
+                print("missing GGUF value for --gemma4-cross-rmse\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_cross_rmse_gguf_path = args[i];
+            i += 1;
+            if (i >= args.len) {
+                print("missing HF model-dir value for --gemma4-cross-rmse\n", .{});
+                printUsage();
+                std.process.exit(1);
+            }
+            gemma4_cross_rmse_hf_dir = args[i];
         } else if (std.mem.eql(u8, arg, "--gemma4-cross-layer0")) {
             i += 1;
             if (i >= args.len) {
@@ -198,12 +225,22 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
             };
             print("gemma4_cross_parity: ok\n", .{});
         }
+        if (gemma4_cross_rmse_gguf_path) |gguf_path| {
+            runGemma4CrossRmse(allocator, gguf_path, gemma4_cross_rmse_hf_dir orelse return error.InvalidArguments) catch |err| {
+                print("gemma4_cross_rmse: failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("gemma4_cross_rmse: ok\n", .{});
+        }
         if (gemma4_cross_layer0_gguf_path) |gguf_path| {
             runGemma4CrossLayer0(allocator, gguf_path, gemma4_cross_layer0_hf_dir orelse return error.InvalidArguments) catch |err| {
                 print("gemma4_cross_layer0: failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
             print("gemma4_cross_layer0: ok\n", .{});
+        }
+        if (gguf_meta_path) |path| {
+            try runGgufMetaDump(allocator, path);
         }
     }
 }
@@ -259,18 +296,123 @@ fn bf16Bits(value: f32) u16 {
 fn printUsage() void {
     print(
         \\usage: antfly inference cuda-info [--smoke] [--gemma4-parity <gguf>] [--gemma4-hf-parity <model-dir>]
+        \\                                      [--gguf-meta <gguf>]
         \\
         \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, Q4_0, Q4_K, RoPE, and GQA.
+        \\  --gguf-meta <gguf>
+        \\            Dump raw GGUF header metadata and reconstructed GPT config.
         \\  --gemma4-parity <gguf>
         \\            Compare real Gemma 4 GGUF projection tensors on CUDA against CPU dequantized matmul.
         \\  --gemma4-hf-parity <model-dir>
         \\            Compare real Gemma 4 HF safetensors tensors on CUDA against CPU BF16->F32 reference math.
         \\  --gemma4-cross-parity <gguf> <model-dir>
         \\            Compare selected Gemma 4 GGUF tensors against the source HF safetensors tensors.
+        \\  --gemma4-cross-rmse <gguf> <model-dir>
+        \\            Sweep Gemma 4 GGUF tensors against HF safetensors and print grouped RMSE/relative error.
         \\  --gemma4-cross-layer0 <gguf> <model-dir>
         \\            Compare a CPU layer-0 forward pass for GGUF dequantized weights against HF safetensors.
         \\
     , .{});
+}
+
+fn runGgufMetaDump(allocator: std.mem.Allocator, gguf_path: []const u8) !void {
+    const store = try tensor_store_mod.GgufStore.initAbsolute(allocator, gguf_path);
+    defer store.tensorStore().deinit();
+
+    const file = store.tensorStore().ggufFile() orelse return error.InvalidTensorStore;
+    print("gguf_meta: path={s}\n", .{gguf_path});
+    print("gguf_meta: version={d} tensors={d} metadata={d} alignment={d} data_region_offset={d}\n", .{
+        file.header.version,
+        file.header.tensor_count,
+        file.header.metadata_count,
+        file.alignment,
+        file.data_region_offset,
+    });
+    for (file.metadata) |entry| {
+        print("gguf_meta: key={s} type={s} value=", .{ entry.key, @tagName(entry.value) });
+        printGgufMetadataValue(entry.value, 0);
+        print("\n", .{});
+    }
+
+    const view = gguf_mod.metadata.View.init(file);
+    if (gpt_mod.parseGgufMetadata(view)) |cfg| {
+        print("gguf_meta_reconstructed_config: family={s} hidden={d} layers={d} heads={d} kv_heads={d} head_dim={d} global_head_dim={d} global_kv_heads={d} intermediate={d} shared_intermediate={d} vocab={d} context={d} sliding_window={d} sliding_pattern={d} kv_shared_layers={d} rope_theta={d:.9} rope_local_theta={d:.9} rope_partial_factor={d:.9} rope_dim_override={d} norm_eps={d:.9} norm_offset={d:.9} softcap={d:.9} ple_hidden={d} weight_tying={}\n", .{
+            @tagName(cfg.family),
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.attention_head_dim,
+            cfg.global_head_dim,
+            cfg.num_global_key_value_heads,
+            cfg.intermediate_size,
+            cfg.shared_layer_intermediate_size,
+            cfg.vocab_size,
+            cfg.max_position_embeddings,
+            cfg.sliding_window,
+            cfg.sliding_window_pattern,
+            cfg.num_kv_shared_layers,
+            cfg.rope_theta,
+            cfg.rope_local_theta,
+            cfg.rope_partial_factor,
+            cfg.rope_dim_override,
+            cfg.norm_eps,
+            cfg.norm_weight_offset,
+            cfg.final_logit_softcapping,
+            cfg.ple_hidden_size,
+            cfg.weight_tying,
+        });
+    } else {
+        print("gguf_meta_reconstructed_config: unavailable\n", .{});
+    }
+}
+
+fn printGgufMetadataValue(value: gguf_mod.format.MetadataValue, depth: usize) void {
+    switch (value) {
+        .u8 => |v| print("{d}", .{v}),
+        .i8 => |v| print("{d}", .{v}),
+        .u16 => |v| print("{d}", .{v}),
+        .i16 => |v| print("{d}", .{v}),
+        .u32 => |v| print("{d}", .{v}),
+        .i32 => |v| print("{d}", .{v}),
+        .u64 => |v| print("{d}", .{v}),
+        .i64 => |v| print("{d}", .{v}),
+        .f32 => |v| print("{d:.9}", .{v}),
+        .f64 => |v| print("{d:.9}", .{v}),
+        .bool_ => |v| print("{}", .{v}),
+        .string => |v| printStringPreview(v),
+        .array => |arr| {
+            print("[type={s} len={d}", .{ @tagName(arr.element_type), arr.values.len });
+            const limit = @min(arr.values.len, 64);
+            for (arr.values[0..limit]) |item| {
+                print(" ", .{});
+                if (depth >= 2) {
+                    print("...", .{});
+                } else {
+                    printGgufMetadataValue(item, depth + 1);
+                }
+            }
+            if (arr.values.len > limit) print(" ...", .{});
+            print("]", .{});
+        },
+    }
+}
+
+fn printStringPreview(value: []const u8) void {
+    const limit = @min(value.len, 256);
+    print("\"", .{});
+    for (value[0..limit]) |ch| {
+        switch (ch) {
+            '\n' => print("\\n", .{}),
+            '\r' => print("\\r", .{}),
+            '\t' => print("\\t", .{}),
+            '"' => print("\\\"", .{}),
+            '\\' => print("\\\\", .{}),
+            else => print("{c}", .{ch}),
+        }
+    }
+    if (value.len > limit) print("...", .{});
+    print("\"", .{});
 }
 
 const Gemma4ParityCase = struct {
@@ -294,6 +436,7 @@ const gemma4_parity_cases = [_]Gemma4ParityCase{
 };
 
 const gemma4_cross_parity_cases = [_]Gemma4ParityCase{
+    .{ .name = "output_norm.weight" },
     .{ .name = "blk.0.attn_q.weight" },
     .{ .name = "blk.0.attn_output.weight" },
     .{ .name = "blk.0.ffn_gate.weight" },
@@ -315,6 +458,16 @@ const gemma4_cross_parity_cases = [_]Gemma4ParityCase{
 const DiffStats = struct {
     max_abs: f32 = 0,
     mean_abs: f64 = 0,
+    rmse: f64 = 0,
+    rel_rmse: f64 = 0,
+    rel_mean_abs: f64 = 0,
+    actual_rms: f64 = 0,
+    expected_rms: f64 = 0,
+    sum_abs: f64 = 0,
+    sum_sq: f64 = 0,
+    expected_abs_sum: f64 = 0,
+    expected_sq_sum: f64 = 0,
+    actual_sq_sum: f64 = 0,
     max_index: usize = 0,
 };
 
@@ -367,6 +520,29 @@ fn runGemma4CrossParity(allocator: std.mem.Allocator, gguf_path: []const u8, mod
     try runGemma4CrossParityOnStores(allocator, gguf_store.tensorStore(), sharded.tensorStore());
 }
 
+fn runGemma4CrossRmse(allocator: std.mem.Allocator, gguf_path: []const u8, model_dir: []const u8) !void {
+    const gguf_store = try tensor_store_mod.GgufStore.initAbsolute(allocator, gguf_path);
+    defer gguf_store.tensorStore().deinit();
+
+    const safetensors_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(safetensors_path);
+    const single = tensor_store_mod.SafetensorsStore.initAbsolute(allocator, safetensors_path) catch |single_err| blk: {
+        if (single_err != error.FileNotFound and single_err != error.NotFound and single_err != error.AccessDenied) return single_err;
+        break :blk null;
+    };
+    if (single) |hf_store| {
+        defer hf_store.tensorStore().deinit();
+        try runGemma4CrossRmseOnStores(allocator, gguf_store.tensorStore(), hf_store.tensorStore());
+        return;
+    }
+
+    const index_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    const sharded = try tensor_store_mod.ShardedSafetensorsStore.initAbsolute(allocator, index_path);
+    defer sharded.tensorStore().deinit();
+    try runGemma4CrossRmseOnStores(allocator, gguf_store.tensorStore(), sharded.tensorStore());
+}
+
 fn runGemma4CrossLayer0(allocator: std.mem.Allocator, gguf_path: []const u8, model_dir: []const u8) !void {
     const gguf_store = try tensor_store_mod.GgufStore.initAbsolute(allocator, gguf_path);
     defer gguf_store.tensorStore().deinit();
@@ -388,6 +564,452 @@ fn runGemma4CrossLayer0(allocator: std.mem.Allocator, gguf_path: []const u8, mod
     const sharded = try tensor_store_mod.ShardedSafetensorsStore.initAbsolute(allocator, index_path);
     defer sharded.tensorStore().deinit();
     try runGemma4CrossLayer0OnStores(allocator, gguf_store.tensorStore(), sharded.tensorStore());
+}
+
+const Gemma4RmseCategory = enum {
+    token_embd,
+    output_norm,
+    norm,
+    layer_scale,
+    attn_q,
+    attn_k,
+    attn_v,
+    attn_output,
+    ffn_gate,
+    ffn_up,
+    ffn_down,
+    other,
+};
+
+const gemma4_rmse_category_count = @typeInfo(Gemma4RmseCategory).@"enum".fields.len;
+
+const RmseAccumulator = struct {
+    tensor_count: usize = 0,
+    sample_count: usize = 0,
+    elem_count: usize = 0,
+    sum_abs: f64 = 0,
+    sum_sq: f64 = 0,
+    expected_sq_sum: f64 = 0,
+    actual_sq_sum: f64 = 0,
+    max_abs: f32 = 0,
+    max_tensor: []const u8 = "",
+    max_index: usize = 0,
+
+    fn add(self: *RmseAccumulator, tensor_name: []const u8, stats: DiffStats, elem_count: usize, sampled: bool) void {
+        self.elem_count += elem_count;
+        self.sum_abs += stats.sum_abs;
+        self.sum_sq += stats.sum_sq;
+        self.expected_sq_sum += stats.expected_sq_sum;
+        self.actual_sq_sum += stats.actual_sq_sum;
+        if (sampled) {
+            self.sample_count += 1;
+        } else {
+            self.tensor_count += 1;
+        }
+        if (stats.max_abs > self.max_abs) {
+            self.max_abs = stats.max_abs;
+            self.max_tensor = tensor_name;
+            self.max_index = stats.max_index;
+        }
+    }
+};
+
+fn runGemma4CrossRmseOnStores(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+) !void {
+    const gguf_file = gguf_store.ggufFile() orelse return error.InvalidTensorStore;
+    var groups = [_]RmseAccumulator{.{}} ** gemma4_rmse_category_count;
+    var skipped: usize = 0;
+    const verbose = envFlag("ANTFLY_INFERENCE_CUDA_RMSE_VERBOSE");
+    const max_full_elements = envUsize("ANTFLY_INFERENCE_CUDA_RMSE_MAX_ELEMENTS") orelse 40_000_000;
+    print("gemma4_cross_rmse: tensors={d} verbose={} max_full_elements={d}\n", .{ gguf_file.tensors.len, verbose, max_full_elements });
+
+    for (gguf_file.tensors) |tensor| {
+        const category = gemma4RmseCategoryForName(tensor.name);
+        if (std.mem.eql(u8, tensor.name, "token_embd.weight")) {
+            try runGemma4EmbeddingRowRmse(allocator, gguf_store, hf_store, &groups[@intFromEnum(category)], verbose);
+            continue;
+        }
+
+        const hf_name = resolveGemma4ParityTensorName(allocator, hf_store, tensor.name) catch |err| switch (err) {
+            error.TensorNotFound, error.InvalidTensorName => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(hf_name);
+
+        const elem_count = try ggufTensorElementCount(tensor.dimensions);
+        if (elem_count > max_full_elements) {
+            if (try runGemma4LargeTensorSampleRmse(
+                allocator,
+                gguf_store,
+                hf_store,
+                tensor.name,
+                hf_name,
+                @tagName(category),
+                tensor.tensor_type.name(),
+                elem_count,
+                &groups[@intFromEnum(category)],
+                verbose,
+            )) {
+                print(
+                    "gemma4_cross_rmse_tensor: name={s} source={s} category={s} type={s} status=sampled reason=too_large elems={d} max_full_elements={d}\n",
+                    .{ tensor.name, hf_name, @tagName(category), tensor.tensor_type.name(), elem_count, max_full_elements },
+                );
+            } else {
+                print(
+                    "gemma4_cross_rmse_tensor: name={s} source={s} category={s} type={s} status=skipped reason=too_large elems={d} max_full_elements={d}\n",
+                    .{ tensor.name, hf_name, @tagName(category), tensor.tensor_type.name(), elem_count, max_full_elements },
+                );
+                skipped += 1;
+            }
+            continue;
+        }
+
+        var hf_range_opt = hf_store.describeTensorRange(allocator, hf_name) catch |err| switch (err) {
+            error.TensorNotFound => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+        defer if (hf_range_opt) |*hf_range| hf_range.deinit(allocator);
+        if (hf_range_opt) |hf_range| {
+            if (!sameGgufDimensionsShape(tensor.dimensions, hf_range.shape)) {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        var gguf_ref = gguf_store.describeTensor(allocator, tensor.name) catch |err| switch (err) {
+            error.TensorNotFound, error.UnsupportedTensorType => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+        defer gguf_ref.deinit(allocator);
+        var hf_ref = hf_store.describeTensor(allocator, hf_name) catch |err| switch (err) {
+            error.TensorNotFound => {
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+        defer hf_ref.deinit(allocator);
+
+        var gguf_loaded = try gguf_store.loadTensorRef(&gguf_ref);
+        defer gguf_loaded.deinit();
+        var hf_loaded = try hf_store.loadTensorRef(&hf_ref);
+        defer hf_loaded.deinit();
+        const gguf_values = try tensorToFloat32Owned(allocator, &gguf_loaded.tensor);
+        defer allocator.free(gguf_values);
+        const hf_values = try tensorToFloat32Owned(allocator, &hf_loaded.tensor);
+        defer allocator.free(hf_values);
+        if (gguf_values.len != hf_values.len) return error.InvalidTensorShape;
+        const stats = diffStats(gguf_values, hf_values);
+        groups[@intFromEnum(category)].add(tensor.name, stats, elem_count, false);
+        if (verbose) {
+            print(
+                "gemma4_cross_rmse_tensor: name={s} source={s} category={s} type={s} elems={d} max_abs={d:.6} mean_abs={d:.6} rmse={d:.6} rel_rmse={d:.6} actual_rms={d:.6} expected_rms={d:.6} max_index={d}\n",
+                .{
+                    tensor.name,
+                    hf_name,
+                    @tagName(category),
+                    tensor.tensor_type.name(),
+                    elem_count,
+                    stats.max_abs,
+                    stats.mean_abs,
+                    stats.rmse,
+                    stats.rel_rmse,
+                    stats.actual_rms,
+                    stats.expected_rms,
+                    stats.max_index,
+                },
+            );
+        }
+    }
+
+    for (&groups, 0..) |*group, idx| {
+        if (group.elem_count == 0) continue;
+        const category: Gemma4RmseCategory = @enumFromInt(idx);
+        const count: f64 = @floatFromInt(group.elem_count);
+        const mean_abs = group.sum_abs / count;
+        const rmse = @sqrt(group.sum_sq / count);
+        const rel_rmse = if (group.expected_sq_sum > 1e-24) @sqrt(group.sum_sq) / @sqrt(group.expected_sq_sum) else 0;
+        const actual_rms = @sqrt(group.actual_sq_sum / count);
+        const expected_rms = @sqrt(group.expected_sq_sum / count);
+        print(
+            "gemma4_cross_rmse_group: category={s} tensors={d} samples={d} elems={d} max_abs={d:.6} max_tensor={s} max_index={d} mean_abs={d:.6} rmse={d:.6} rel_rmse={d:.6} actual_rms={d:.6} expected_rms={d:.6}\n",
+            .{
+                @tagName(category),
+                group.tensor_count,
+                group.sample_count,
+                group.elem_count,
+                group.max_abs,
+                group.max_tensor,
+                group.max_index,
+                mean_abs,
+                rmse,
+                rel_rmse,
+                actual_rms,
+                expected_rms,
+            },
+        );
+    }
+    print("gemma4_cross_rmse: skipped={d}\n", .{skipped});
+}
+
+fn runGemma4EmbeddingRowRmse(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+    group: *RmseAccumulator,
+    verbose: bool,
+) !void {
+    const gguf_name = "token_embd.weight";
+    const hf_name = try resolveGemma4ParityTensorName(allocator, hf_store, gguf_name);
+    defer allocator.free(hf_name);
+
+    var gguf_ref = try gguf_store.describeTensor(allocator, gguf_name);
+    defer gguf_ref.deinit(allocator);
+    var hf_ref = try hf_store.describeTensor(allocator, hf_name);
+    defer hf_ref.deinit(allocator);
+    var hf_loaded = try hf_store.loadTensorRef(&hf_ref);
+    defer hf_loaded.deinit();
+    if (hf_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
+    const vocab: usize = @intCast(hf_loaded.tensor.shape[0]);
+    const hidden: usize = @intCast(hf_loaded.tensor.shape[1]);
+
+    const sampled_ids = [_]usize{ 0, 1, 2, 100, 101, 105, 107, 14054, 45518, 236751, 236761, 236770, 258882 };
+    const gguf_row = try allocator.alloc(f32, hidden);
+    defer allocator.free(gguf_row);
+    const hf_row = try allocator.alloc(f32, hidden);
+    defer allocator.free(hf_row);
+
+    if (try gguf_store.loadQuantizedStorageRef(&gguf_ref)) |storage_value| {
+        var storage = storage_value;
+        defer storage.deinit();
+        if (storage.shape.len != 2) return error.InvalidTensorShape;
+        if (@as(usize, @intCast(storage.shape[0])) != vocab or @as(usize, @intCast(storage.shape[1])) != hidden) return error.InvalidTensorShape;
+        const values_per_block = gguf_mod.tensor_types.valuesPerBlock(storage.tensor_type) orelse return error.UnsupportedTensorType;
+        const bytes_per_block = gguf_mod.tensor_types.bytesPerBlock(storage.tensor_type) orelse return error.UnsupportedTensorType;
+        if (hidden == 0 or hidden % values_per_block != 0) return error.InvalidTensorShape;
+        const row_bytes = (hidden / values_per_block) * bytes_per_block;
+        if (storage.raw_bytes.len < vocab * row_bytes) return error.InvalidTensorShape;
+        for (sampled_ids) |token_id| {
+            if (token_id >= vocab) continue;
+            const raw = storage.raw_bytes[token_id * row_bytes ..][0..row_bytes];
+            try gguf_mod.quant_codec.dequantizeToFloat32(storage.tensor_type, raw, gguf_row);
+            try tensorRowToFloat32(&hf_loaded.tensor, token_id, hidden, hf_row);
+            const stats = diffStats(gguf_row, hf_row);
+            group.add(gguf_name, stats, hidden, true);
+            if (verbose) printGemma4EmbeddingRmseRow(token_id, hf_name, storage.tensor_type.name(), hidden, stats);
+        }
+        return;
+    }
+
+    var gguf_loaded = try gguf_store.loadTensorRef(&gguf_ref);
+    defer gguf_loaded.deinit();
+    if (gguf_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
+    if (@as(usize, @intCast(gguf_loaded.tensor.shape[0])) != vocab or @as(usize, @intCast(gguf_loaded.tensor.shape[1])) != hidden) return error.InvalidTensorShape;
+    for (sampled_ids) |token_id| {
+        if (token_id >= vocab) continue;
+        try tensorRowToFloat32(&gguf_loaded.tensor, token_id, hidden, gguf_row);
+        try tensorRowToFloat32(&hf_loaded.tensor, token_id, hidden, hf_row);
+        const stats = diffStats(gguf_row, hf_row);
+        group.add(gguf_name, stats, hidden, true);
+        if (verbose) printGemma4EmbeddingRmseRow(token_id, hf_name, "dense", hidden, stats);
+    }
+}
+
+fn runGemma4LargeTensorSampleRmse(
+    allocator: std.mem.Allocator,
+    gguf_store: tensor_store_mod.TensorStore,
+    hf_store: tensor_store_mod.TensorStore,
+    gguf_name: []const u8,
+    hf_name: []const u8,
+    category_name: []const u8,
+    tensor_type_name: []const u8,
+    full_elem_count: usize,
+    group: *RmseAccumulator,
+    verbose: bool,
+) !bool {
+    var gguf_ref = gguf_store.describeTensor(allocator, gguf_name) catch |err| switch (err) {
+        error.TensorNotFound, error.UnsupportedTensorType => return false,
+        else => return err,
+    };
+    defer gguf_ref.deinit(allocator);
+    var storage = (try gguf_store.loadQuantizedStorageRef(&gguf_ref)) orelse return false;
+    defer storage.deinit();
+    if (storage.shape.len != 2) return false;
+    const rows: usize = @intCast(storage.shape[0]);
+    const cols: usize = @intCast(storage.shape[1]);
+    if (rows == 0 or cols == 0) return false;
+
+    const values_per_block = gguf_mod.tensor_types.valuesPerBlock(storage.tensor_type) orelse return false;
+    const bytes_per_block = gguf_mod.tensor_types.bytesPerBlock(storage.tensor_type) orelse return false;
+    if (cols % values_per_block != 0) return false;
+    const row_bytes = (cols / values_per_block) * bytes_per_block;
+    if (storage.raw_bytes.len < rows * row_bytes) return false;
+
+    var hf_ref = hf_store.describeTensor(allocator, hf_name) catch |err| switch (err) {
+        error.TensorNotFound => return false,
+        else => return err,
+    };
+    defer hf_ref.deinit(allocator);
+    var hf_loaded = try hf_store.loadTensorRef(&hf_ref);
+    defer hf_loaded.deinit();
+    if (hf_loaded.tensor.shape.len != 2) return false;
+    if (@as(usize, @intCast(hf_loaded.tensor.shape[0])) != rows or @as(usize, @intCast(hf_loaded.tensor.shape[1])) != cols) return false;
+
+    const gguf_row = try allocator.alloc(f32, cols);
+    defer allocator.free(gguf_row);
+    const hf_row = try allocator.alloc(f32, cols);
+    defer allocator.free(hf_row);
+
+    const candidates = [_]usize{
+        0,
+        1,
+        2,
+        rows / 8,
+        rows / 4,
+        rows / 2,
+        (rows * 3) / 4,
+        rows - 2,
+        rows - 1,
+    };
+    var sampled: usize = 0;
+    for (candidates) |row| {
+        if (row >= rows) continue;
+        var duplicate = false;
+        for (candidates[0..sampled]) |prev| {
+            if (prev == row) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        const raw = storage.raw_bytes[row * row_bytes ..][0..row_bytes];
+        try gguf_mod.quant_codec.dequantizeToFloat32(storage.tensor_type, raw, gguf_row);
+        try tensorRowToFloat32(&hf_loaded.tensor, row, cols, hf_row);
+        const stats = diffStats(gguf_row, hf_row);
+        group.add(gguf_name, stats, cols, true);
+        sampled += 1;
+        if (verbose) {
+            print(
+                "gemma4_cross_rmse_tensor: name={s} row={d} source={s} category={s} type={s} elems={d} full_elems={d} sampled=true max_abs={d:.6} mean_abs={d:.6} rmse={d:.6} rel_rmse={d:.6} actual_rms={d:.6} expected_rms={d:.6} max_index={d}\n",
+                .{
+                    gguf_name,
+                    row,
+                    hf_name,
+                    category_name,
+                    tensor_type_name,
+                    cols,
+                    full_elem_count,
+                    stats.max_abs,
+                    stats.mean_abs,
+                    stats.rmse,
+                    stats.rel_rmse,
+                    stats.actual_rms,
+                    stats.expected_rms,
+                    stats.max_index,
+                },
+            );
+        }
+    }
+    return sampled > 0;
+}
+
+fn envFlag(comptime name: [:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.span(raw);
+    if (value.len == 0) return false;
+    return !(std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "off"));
+}
+
+fn envUsize(comptime name: [:0]const u8) ?usize {
+    const raw = std.c.getenv(name) orelse return null;
+    const value = std.mem.span(raw);
+    if (value.len == 0) return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+fn printGemma4EmbeddingRmseRow(token_id: usize, hf_name: []const u8, tensor_type: []const u8, hidden: usize, stats: DiffStats) void {
+    print(
+        "gemma4_cross_rmse_tensor: name=token_embd.weight token={d} source={s} category=token_embd type={s} elems={d} sampled=true max_abs={d:.6} mean_abs={d:.6} rmse={d:.6} rel_rmse={d:.6} actual_rms={d:.6} expected_rms={d:.6} max_index={d}\n",
+        .{
+            token_id,
+            hf_name,
+            tensor_type,
+            hidden,
+            stats.max_abs,
+            stats.mean_abs,
+            stats.rmse,
+            stats.rel_rmse,
+            stats.actual_rms,
+            stats.expected_rms,
+            stats.max_index,
+        },
+    );
+}
+
+fn gemma4RmseCategoryForName(name: []const u8) Gemma4RmseCategory {
+    if (std.mem.eql(u8, name, "token_embd.weight")) return .token_embd;
+    if (std.mem.eql(u8, name, "output_norm.weight")) return .output_norm;
+    if (std.mem.indexOf(u8, name, "_norm.weight") != null or std.mem.indexOf(u8, name, "norm.weight") != null) return .norm;
+    if (std.mem.indexOf(u8, name, "layer_output_scale.weight") != null) return .layer_scale;
+    if (std.mem.indexOf(u8, name, ".attn_q.weight") != null) return .attn_q;
+    if (std.mem.indexOf(u8, name, ".attn_k.weight") != null) return .attn_k;
+    if (std.mem.indexOf(u8, name, ".attn_v.weight") != null) return .attn_v;
+    if (std.mem.indexOf(u8, name, ".attn_output.weight") != null) return .attn_output;
+    if (std.mem.indexOf(u8, name, ".ffn_gate.weight") != null) return .ffn_gate;
+    if (std.mem.indexOf(u8, name, ".ffn_up.weight") != null) return .ffn_up;
+    if (std.mem.indexOf(u8, name, ".ffn_down.weight") != null) return .ffn_down;
+    return .other;
+}
+
+fn sameShape(lhs: []const i64, rhs: []const i64) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |l, r| {
+        if (l != r) return false;
+    }
+    return true;
+}
+
+fn sameGgufDimensionsShape(dimensions: []const u64, shape: []const i64) bool {
+    if (dimensions.len != shape.len) return false;
+    for (shape, 0..) |dim, idx| {
+        if (dim < 0) return false;
+        const gguf_dim = dimensions[dimensions.len - 1 - idx];
+        if (gguf_dim != @as(u64, @intCast(dim))) return false;
+    }
+    return true;
+}
+
+fn tensorElementCount(shape: []const i64) !usize {
+    var count: usize = 1;
+    for (shape) |dim| {
+        if (dim < 0) return error.InvalidTensorShape;
+        count = try std.math.mul(usize, count, @intCast(dim));
+    }
+    return count;
+}
+
+fn ggufTensorElementCount(dimensions: []const u64) !usize {
+    var count: usize = 1;
+    for (dimensions) |dim| {
+        count = try std.math.mul(usize, count, @intCast(dim));
+    }
+    return count;
 }
 
 const Gemma4Layer0CpuOutputs = struct {
@@ -480,8 +1102,20 @@ fn printGemma4CrossLayerStage(stage: []const u8, actual: []const f32, expected: 
     }
     const stats = diffStats(actual, expected);
     print(
-        "gemma4_cross_layer0: stage={s} max_abs={d:.6} mean_abs={d:.6} max_index={d} actual={d:.6} expected={d:.6}\n",
-        .{ stage, stats.max_abs, stats.mean_abs, stats.max_index, actual[stats.max_index], expected[stats.max_index] },
+        "gemma4_cross_layer0: stage={s} max_abs={d:.6} mean_abs={d:.6} rmse={d:.6} rel_rmse={d:.6} rel_mean_abs={d:.6} actual_rms={d:.6} expected_rms={d:.6} max_index={d} actual={d:.6} expected={d:.6}\n",
+        .{
+            stage,
+            stats.max_abs,
+            stats.mean_abs,
+            stats.rmse,
+            stats.rel_rmse,
+            stats.rel_mean_abs,
+            stats.actual_rms,
+            stats.expected_rms,
+            stats.max_index,
+            actual[stats.max_index],
+            expected[stats.max_index],
+        },
     );
 }
 
@@ -615,6 +1249,30 @@ fn runGemma4CrossParityCase(
     for (gguf_loaded.tensor.shape, hf_loaded.tensor.shape) |lhs, rhs| {
         if (lhs != rhs) return error.InvalidTensorShape;
     }
+    if (gguf_loaded.tensor.shape.len == 1) {
+        const gguf_values = try tensorToFloat32Owned(allocator, &gguf_loaded.tensor);
+        defer allocator.free(gguf_values);
+        const hf_values = try tensorToFloat32Owned(allocator, &hf_loaded.tensor);
+        defer allocator.free(hf_values);
+        if (gguf_values.len != hf_values.len) return error.InvalidTensorShape;
+        const weight_stats = diffStats(gguf_values, hf_values);
+        const quant_name = if (gguf_loaded.quantized_storage) |storage| storage.tensor_type.name() else "dense";
+        print(
+            "gemma4_cross_parity: {s} source={s} type={s} shape=[{d}] weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_rmse={d:.6} weight_rel_rmse={d:.6} weight_max_index={d}\n",
+            .{
+                case.name,
+                hf_name,
+                quant_name,
+                gguf_values.len,
+                weight_stats.max_abs,
+                weight_stats.mean_abs,
+                weight_stats.rmse,
+                weight_stats.rel_rmse,
+                weight_stats.max_index,
+            },
+        );
+        return;
+    }
     if (gguf_loaded.tensor.shape.len != 2) return error.InvalidTensorShape;
     const out_dim: usize = @intCast(gguf_loaded.tensor.shape[0]);
     const in_dim: usize = @intCast(gguf_loaded.tensor.shape[1]);
@@ -639,7 +1297,7 @@ fn runGemma4CrossParityCase(
 
     const quant_name = if (gguf_loaded.quantized_storage) |storage| storage.tensor_type.name() else "dense";
     print(
-        "gemma4_cross_parity: {s} source={s} type={s} shape=[{d},{d}] weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_max_index={d} linear_max_abs={d:.6} linear_mean_abs={d:.6} linear_max_index={d}\n",
+        "gemma4_cross_parity: {s} source={s} type={s} shape=[{d},{d}] weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_rmse={d:.6} weight_rel_rmse={d:.6} weight_max_index={d} linear_max_abs={d:.6} linear_mean_abs={d:.6} linear_rmse={d:.6} linear_rel_rmse={d:.6} linear_max_index={d}\n",
         .{
             case.name,
             hf_name,
@@ -648,9 +1306,13 @@ fn runGemma4CrossParityCase(
             in_dim,
             weight_stats.max_abs,
             weight_stats.mean_abs,
+            weight_stats.rmse,
+            weight_stats.rel_rmse,
             weight_stats.max_index,
             linear_stats.max_abs,
             linear_stats.mean_abs,
+            linear_stats.rmse,
+            linear_stats.rel_rmse,
             linear_stats.max_index,
         },
     );
@@ -705,13 +1367,15 @@ fn runGemma4EmbeddingRowCrossParity(
         const gguf_dot = cpuEmbeddingRowDot(probe, gguf_row, 0, hidden);
         const hf_dot = cpuEmbeddingRowDot(probe, hf_row, 0, hidden);
         print(
-            "gemma4_cross_parity: token_embd.row token={d} source={s} type={s} weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_max_index={d} dot_abs={d:.6} gguf_dot={d:.6} hf_dot={d:.6}\n",
+            "gemma4_cross_parity: token_embd.row token={d} source={s} type={s} weight_max_abs={d:.6} weight_mean_abs={d:.6} weight_rmse={d:.6} weight_rel_rmse={d:.6} weight_max_index={d} dot_abs={d:.6} gguf_dot={d:.6} hf_dot={d:.6}\n",
             .{
                 token_id,
                 hf_name,
                 storage.tensor_type.name(),
                 stats.max_abs,
                 stats.mean_abs,
+                stats.rmse,
+                stats.rel_rmse,
                 stats.max_index,
                 @abs(gguf_dot - hf_dot),
                 gguf_dot,
@@ -1794,16 +2458,31 @@ fn cpuGqaCausalAttention(
 
 fn diffStats(actual: []const f32, expected: []const f32) DiffStats {
     var stats: DiffStats = .{};
-    var sum_abs: f64 = 0;
-    for (actual, 0..) |got, idx| {
-        const diff = @abs(got - expected[idx]);
-        sum_abs += diff;
+    for (actual, expected, 0..) |got, want, idx| {
+        const diff_f32 = got - want;
+        const diff = @abs(diff_f32);
+        const diff_f64: f64 = @floatCast(diff_f32);
+        const got_f64: f64 = @floatCast(got);
+        const want_f64: f64 = @floatCast(want);
+        stats.sum_abs += diff;
+        stats.sum_sq += diff_f64 * diff_f64;
+        stats.actual_sq_sum += got_f64 * got_f64;
+        stats.expected_sq_sum += want_f64 * want_f64;
+        stats.expected_abs_sum += @abs(want_f64);
         if (diff > stats.max_abs) {
             stats.max_abs = diff;
             stats.max_index = idx;
         }
     }
-    stats.mean_abs = sum_abs / @as(f64, @floatFromInt(actual.len));
+    const count: f64 = @floatFromInt(actual.len);
+    stats.mean_abs = stats.sum_abs / count;
+    stats.rmse = @sqrt(stats.sum_sq / count);
+    stats.actual_rms = @sqrt(stats.actual_sq_sum / count);
+    stats.expected_rms = @sqrt(stats.expected_sq_sum / count);
+    const expected_l2 = @sqrt(stats.expected_sq_sum);
+    const expected_mean_abs = stats.expected_abs_sum / count;
+    stats.rel_rmse = if (expected_l2 > 1e-12) @sqrt(stats.sum_sq) / expected_l2 else 0;
+    stats.rel_mean_abs = if (expected_mean_abs > 1e-12) stats.mean_abs / expected_mean_abs else 0;
     return stats;
 }
 

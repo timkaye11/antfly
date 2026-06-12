@@ -1148,6 +1148,13 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     if (metaF32(view, &key_buf, arch, "rope.freq_base_swa")) |value| config.rope_local_theta = value;
 
+    // Gemma 4: shared KV cache and per-layer GQA. Apply explicit global head
+    // metadata before deriving rope_partial_factor from rope.dimension_count.
+    if (metaU32(view, &key_buf, arch, "attention.kv_shared_layer_count")) |value| config.num_kv_shared_layers = value;
+    if (metaU32(view, &key_buf, arch, "attention.shared_kv_layers")) |value| config.num_kv_shared_layers = value;
+    if (metaU32(view, &key_buf, arch, "attention.global_head_dim")) |value| config.global_head_dim = value;
+    if (metaU32(view, &key_buf, arch, "attention.global_head_count_kv")) |value| config.num_global_key_value_heads = value;
+
     // Gemma 4: partial rotary for full attention layers.
     // rope.dimension_count gives the number of dims to rotate for full-attn layers.
     // Derive partial_rotary_factor from it: factor = rope_dim / head_dim.
@@ -1158,12 +1165,6 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
             config.rope_partial_factor = @as(f32, @floatFromInt(rope_dim)) / @as(f32, @floatFromInt(config.attention_head_dim));
         }
     }
-
-    // Gemma 4: shared KV cache and per-layer GQA.
-    if (metaU32(view, &key_buf, arch, "attention.kv_shared_layer_count")) |value| config.num_kv_shared_layers = value;
-    if (metaU32(view, &key_buf, arch, "attention.shared_kv_layers")) |value| config.num_kv_shared_layers = value;
-    if (metaU32(view, &key_buf, arch, "attention.global_head_dim")) |value| config.global_head_dim = value;
-    if (metaU32(view, &key_buf, arch, "attention.global_head_count_kv")) |value| config.num_global_key_value_heads = value;
 
     // Gemma 4: Per-Layer Embeddings (PLE).
     if (metaU32(view, &key_buf, arch, "embedding_length_per_layer_input")) |value| config.ple_hidden_size = value;
@@ -2051,7 +2052,7 @@ test "parse gguf metadata for llama config" {
     try data.appendSlice(allocator, "GGUF");
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
-    try appendLe(u64, allocator, &data, 8);
+    try appendLe(u64, allocator, &data, 10);
 
     try appendMetadataString(allocator, &data, "general.architecture", "llama");
     try appendMetadataU32(allocator, &data, "llama.embedding_length", 4096);
@@ -2480,6 +2481,8 @@ test "parse gguf gemma4 per-layer head_count_kv array" {
     try appendMetadataU32(allocator, &data, "gemma4.attention.sliding_window", 1024);
     try appendMetadataBoolArray(allocator, &data, "gemma4.attention.sliding_window_pattern", &.{ true, true, true, true, true, false });
     try appendMetadataU32(allocator, &data, "gemma4.attention.key_length_swa", 256);
+    try appendMetadataU32(allocator, &data, "gemma4.attention.global_head_dim", 512);
+    try appendMetadataU32(allocator, &data, "gemma4.rope.dimension_count", 128);
 
     var parsed = try @import("../gguf/format.zig").parse(allocator, data.items);
     defer parsed.deinit(allocator);
@@ -2492,6 +2495,9 @@ test "parse gguf gemma4 per-layer head_count_kv array" {
     try std.testing.expectEqual(@as(u32, 2), config.num_global_key_value_heads);
     // sliding_window_pattern derived correctly
     try std.testing.expectEqual(@as(u32, 6), config.sliding_window_pattern);
+    try std.testing.expectEqual(@as(u32, 512), config.global_head_dim);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), config.rope_partial_factor, 0.000001);
+    try std.testing.expectEqual(@as(u32, 128), config.layerRopeDim(5));
 }
 
 test "parse gemma4 e2b config with layer_types and shared kv" {

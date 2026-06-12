@@ -1755,13 +1755,28 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
             {
                 var cfg = try gpt_mod.parseConfig(allocator, config_bytes);
                 try applyGptGenerationConfigIfPresent(allocator, model_path, &cfg);
+                if (printEffectiveGptConfigEnabled()) {
+                    printGptConfigDump("config_json", model_path, mf.gguf_path, cfg);
+                }
                 if (mf.gguf_path) |gguf_path| {
                     if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
                         switch (gguf_config) {
-                            .gpt => |gguf_cfg| overlayGptStructuralConfig(&cfg, gguf_cfg),
+                            .gpt => |gguf_cfg| {
+                                if (printEffectiveGptConfigEnabled()) {
+                                    printGptConfigDump("gguf_metadata", gguf_path, gguf_path, gguf_cfg);
+                                }
+                                if (disableGgufConfigOverlay()) {
+                                    std.debug.print("gemma4_effective_config: stage=gguf_overlay status=skipped env=ANTFLY_INFERENCE_DISABLE_GGUF_CONFIG_OVERLAY model={s} gguf={s}\n", .{ model_path, gguf_path });
+                                } else {
+                                    overlayGptStructuralConfig(&cfg, gguf_cfg);
+                                }
+                            },
                             else => {},
                         }
                     }
+                }
+                if (printEffectiveGptConfigEnabled()) {
+                    printGptConfigDump("effective", model_path, mf.gguf_path, cfg);
                 }
                 return .{ .gpt = cfg };
             }
@@ -1785,6 +1800,12 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
 
     if (mf.gguf_path) |gguf_path| {
         if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
+            if (printEffectiveGptConfigEnabled()) {
+                switch (gguf_config) {
+                    .gpt => |cfg| printGptConfigDump("effective_gguf_only", model_path, gguf_path, cfg),
+                    else => {},
+                }
+            }
             return gguf_config;
         }
     }
@@ -1802,6 +1823,104 @@ fn applyGptGenerationConfigIfPresent(allocator: std.mem.Allocator, model_path: [
     };
     defer allocator.free(bytes);
     try gpt_mod.applyGenerationConfigJson(allocator, cfg, bytes);
+}
+
+fn printEffectiveGptConfigEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_PRINT_EFFECTIVE_CONFIG");
+}
+
+fn disableGgufConfigOverlay() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_GGUF_CONFIG_OVERLAY");
+}
+
+fn printGptConfigDump(stage: []const u8, model_path: []const u8, gguf_path: ?[]const u8, cfg: gpt_mod.Config) void {
+    const gguf = gguf_path orelse "";
+    std.debug.print("gemma4_effective_config: stage={s} model={s} gguf={s}\n", .{ stage, model_path, gguf });
+    printGptConfigField(stage, "family", @tagName(cfg.family));
+    printGptConfigField(stage, "hidden_size", cfg.hidden_size);
+    printGptConfigField(stage, "num_hidden_layers", cfg.num_hidden_layers);
+    printGptConfigField(stage, "num_attention_heads", cfg.num_attention_heads);
+    printGptConfigField(stage, "num_key_value_heads", cfg.num_key_value_heads);
+    printGptConfigField(stage, "effective_kv_heads", cfg.effectiveKVHeads());
+    printGptConfigField(stage, "attention_head_dim", cfg.attention_head_dim);
+    printGptConfigField(stage, "head_dim", cfg.headDim());
+    printGptConfigField(stage, "global_head_dim", cfg.global_head_dim);
+    printGptConfigField(stage, "num_global_key_value_heads", cfg.num_global_key_value_heads);
+    printGptConfigField(stage, "max_kv_heads", cfg.maxKvHeads());
+    printGptConfigField(stage, "max_head_dim", cfg.maxHeadDim());
+    printGptConfigField(stage, "intermediate_size", cfg.intermediate_size);
+    printGptConfigField(stage, "shared_layer_intermediate_size", cfg.shared_layer_intermediate_size);
+    printGptConfigField(stage, "vocab_size", cfg.vocab_size);
+    printGptConfigField(stage, "max_position_embeddings", cfg.max_position_embeddings);
+    printGptConfigField(stage, "sliding_window", cfg.sliding_window);
+    printGptConfigField(stage, "sliding_window_pattern", cfg.sliding_window_pattern);
+    printGptConfigField(stage, "num_kv_shared_layers", cfg.num_kv_shared_layers);
+    printGptConfigField(stage, "ple_hidden_size", cfg.ple_hidden_size);
+    printGptConfigField(stage, "norm_type", @tagName(cfg.norm_type));
+    printGptConfigField(stage, "position_encoding", @tagName(cfg.position_encoding));
+    printGptConfigField(stage, "activation", @tagName(cfg.activation));
+    printGptConfigField(stage, "norm_eps", cfg.norm_eps);
+    printGptConfigField(stage, "norm_weight_offset", cfg.norm_weight_offset);
+    printGptConfigField(stage, "rope_theta", cfg.rope_theta);
+    printGptConfigField(stage, "rope_local_theta", cfg.rope_local_theta);
+    printGptConfigField(stage, "rope_freq_scale", cfg.rope_freq_scale);
+    printGptConfigField(stage, "rope_layout", @tagName(cfg.rope_layout));
+    printGptConfigField(stage, "rope_partial_factor", cfg.rope_partial_factor);
+    printGptConfigField(stage, "rope_dim_override", cfg.rope_dim_override);
+    printGptConfigField(stage, "final_logit_softcapping", cfg.final_logit_softcapping);
+    printGptConfigField(stage, "disable_token_embedding_scale", cfg.disable_token_embedding_scale);
+    printGptConfigField(stage, "weight_tying", cfg.weight_tying);
+    printGptConfigField(stage, "weight_prefix", cfg.weight_prefix);
+    printGptConfigField(stage, "bos_token_id", cfg.bos_token_id);
+    printGptConfigField(stage, "eos_token_id", cfg.eos_token_id);
+    printGptConfigField(stage, "pad_token_id", cfg.pad_token_id);
+    printGptConfigField(stage, "image_token_index", cfg.image_token_index);
+    printGptConfigField(stage, "mm_tokens_per_image", cfg.mm_tokens_per_image);
+    printGptConfigField(stage, "gemma4_mtp_assistant", cfg.gemma4_mtp_assistant);
+    printGptConfigField(stage, "mtp_backbone_hidden_size", cfg.mtp_backbone_hidden_size);
+    printGptConfigField(stage, "mtp_num_centroids", cfg.mtp_num_centroids);
+    printGptConfigField(stage, "mtp_centroid_intermediate_top_k", cfg.mtp_centroid_intermediate_top_k);
+    printGptConfigLayerSummary(stage, cfg);
+}
+
+fn printGptConfigField(stage: []const u8, field: []const u8, value: anytype) void {
+    const Value = @TypeOf(value);
+    switch (@typeInfo(Value)) {
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) {
+                std.debug.print("gemma4_effective_config: stage={s} field={s} value={s}\n", .{ stage, field, value });
+            } else {
+                std.debug.print("gemma4_effective_config: stage={s} field={s} value={any}\n", .{ stage, field, value });
+            }
+        },
+        .float => std.debug.print("gemma4_effective_config: stage={s} field={s} value={d:.9}\n", .{ stage, field, value }),
+        else => std.debug.print("gemma4_effective_config: stage={s} field={s} value={any}\n", .{ stage, field, value }),
+    }
+}
+
+fn printGptConfigLayerSummary(stage: []const u8, cfg: gpt_mod.Config) void {
+    const max_layers: usize = @min(@as(usize, @intCast(cfg.num_hidden_layers)), 64);
+    for (0..max_layers) |layer| {
+        const donor = cfg.kvDonorLayerIndex(layer);
+        const donor_value: isize = if (donor) |value| @intCast(value) else -1;
+        std.debug.print(
+            "gemma4_effective_config: stage={s} layer={d} sliding={} shares_kv={} kv_heads={d} head_dim={d} rope_theta={d:.9} rope_dim={d} rope_active_dim={d} rope_freq_dim={d} intermediate_size={d} donor={d}\n",
+            .{
+                stage,
+                layer,
+                cfg.layerUsesSlidingAttention(layer),
+                cfg.layerSharesKv(layer),
+                cfg.effectiveKVHeadsForLayer(layer),
+                cfg.effectiveHeadDimForLayer(layer),
+                cfg.layerRopeTheta(layer),
+                cfg.layerRopeDim(layer),
+                cfg.layerRopeActiveDim(layer),
+                cfg.layerRopeFrequencyDim(layer),
+                cfg.intermediateSize(layer),
+                donor_value,
+            },
+        );
+    }
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
@@ -3049,6 +3168,12 @@ fn cudaLazyGgufQuantDequantEnabled() bool {
         platform.env.getenvBool("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS");
 }
 
+fn cudaLazyGgufQuantDequantEmbeddingEnabled() bool {
+    if (comptime !build_options.enable_cuda) return false;
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_GGUF_QUANT_EMBEDDING") or
+        platform.env.getenvBool("TERMITE_CUDA_DEQUANTIZE_QUANT_EMBEDDING");
+}
+
 fn shouldLazyLoadCudaGgufQuantDequantWeight(
     allocator: std.mem.Allocator,
     store: tensor_store_mod.TensorStore,
@@ -3063,7 +3188,7 @@ fn shouldLazyLoadCudaGgufQuantDequantWeight(
         else => return false,
     };
     if (cfg.family != .gemma) return false;
-    if (isGptEmbeddingTableKey(key)) return false;
+    if (isGptEmbeddingTableKey(key) and !cudaLazyGgufQuantDequantEmbeddingEnabled()) return false;
     if (!isGptQuantizedMatmulWeightKey(key)) return false;
 
     var tensor_ref = try store.describeTensor(allocator, source_name);
