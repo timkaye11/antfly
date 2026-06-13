@@ -812,7 +812,11 @@ pub fn applyFinalLogitSoftcapInPlace(config: Config, logits: []f32) void {
 }
 
 pub fn canUseFastGreedyArgmaxForConfig(config: Config) bool {
-    return config.final_logit_softcapping <= 0.0;
+    if (config.final_logit_softcapping <= 0.0) return true;
+    // Gemma's final softcap is monotonic for normal logits, so the greedy argmax
+    // can stay on device. Keep non-Gemma configs conservative because extreme
+    // saturation can collapse distinct logits into ties.
+    return config.family == .gemma;
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddings(
@@ -8180,12 +8184,17 @@ test "gemma4 q attention scale is not duplicated for rope attention" {
     try std.testing.expect(!shouldScaleGemma4QBeforeAttention(gemma4_absolute_cfg, true));
 }
 
-test "final logit softcap disables pre-softcap greedy argmax fast paths" {
+test "final logit softcap greedy argmax fast path policy is Gemma-only" {
     const uncapped: Config = .{};
     try std.testing.expect(canUseFastGreedyArgmaxForConfig(uncapped));
 
     const capped: Config = .{ .final_logit_softcapping = 30.0 };
     try std.testing.expect(!canUseFastGreedyArgmaxForConfig(capped));
+    const gemma_capped: Config = .{
+        .family = .gemma,
+        .final_logit_softcapping = 30.0,
+    };
+    try std.testing.expect(canUseFastGreedyArgmaxForConfig(gemma_capped));
 
     var logits = [_]f32{ 1.0e20, 2.0e20 };
     try std.testing.expectEqual(@as(usize, 1), activations.argmax(&logits));

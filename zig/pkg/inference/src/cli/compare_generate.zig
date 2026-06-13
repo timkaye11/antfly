@@ -186,6 +186,7 @@ const NativeAnalysis = struct {
     top1: i32,
     last_logits: []f32,
     top_logits: []TopLogit,
+    elapsed_ms: u64 = 0,
 
     fn deinit(self: *NativeAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
@@ -885,6 +886,8 @@ const QualityEvalItem = struct {
     reference_top1: i32,
     native_text: []u8,
     reference_text: []u8,
+    native_elapsed_ms: u64,
+    reference_elapsed_ms: u64,
     top1_match: bool,
     topk_overlap: usize,
     topk_limit: usize,
@@ -923,31 +926,50 @@ fn runQualityEval(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void
     var reference_rank_sum: usize = 0;
     var candidate_rank_sum: usize = 0;
 
+    var native_results = std.ArrayListUnmanaged(NativeAnalysis).empty;
+    defer {
+        for (native_results.items) |*analysis| analysis.deinit(allocator);
+        native_results.deinit(allocator);
+    }
+    {
+        var session_manager = backends.SessionManager.init(allocator);
+        configureBackendPreference(&session_manager, opts.native_backend orelse opts.backend);
+        var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
+        defer model_manager.deinit();
+
+        const native_model = try model_manager.loadFromDir(opts.native_model_dir);
+        print("quality_eval_phase: side=native prompts={d}\n", .{prompts.items.len});
+        for (prompts.items) |prompt| {
+            var prompt_opts = opts;
+            prompt_opts.prompt = prompt;
+            prompt_opts.image_count = 0;
+
+            const started_ns = platform.time.monotonicNs();
+            var analysis = try analyzeNativeModel(allocator, native_model, prompt_opts);
+            analysis.elapsed_ms = elapsedMillisSince(started_ns);
+            native_results.append(allocator, analysis) catch |err| {
+                analysis.deinit(allocator);
+                return err;
+            };
+        }
+    }
+
+    var session_manager = backends.SessionManager.init(allocator);
+    configureBackendPreference(&session_manager, opts.reference_backend orelse opts.backend);
+    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
+    defer model_manager.deinit();
+
+    const reference_model = try model_manager.loadFromDir(opts.reference_model_dir);
+    print("quality_eval_phase: side=reference prompts={d}\n", .{prompts.items.len});
     for (prompts.items, 0..) |prompt, idx| {
         var prompt_opts = opts;
         prompt_opts.prompt = prompt;
         prompt_opts.image_count = 0;
 
-        var native = blk: {
-            var session_manager = backends.SessionManager.init(allocator);
-            configureBackendPreference(&session_manager, opts.native_backend orelse opts.backend);
-            var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-            defer model_manager.deinit();
-
-            const model = try model_manager.loadFromDir(opts.native_model_dir);
-            var analysis = try analyzeNativeModel(allocator, model, prompt_opts);
-            errdefer analysis.deinit(allocator);
-            break :blk analysis;
-        };
-        defer native.deinit(allocator);
-
-        var session_manager = backends.SessionManager.init(allocator);
-        configureBackendPreference(&session_manager, opts.reference_backend orelse opts.backend);
-        var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-        defer model_manager.deinit();
-
-        const reference_model = try model_manager.loadFromDir(opts.reference_model_dir);
+        const native = &native_results.items[idx];
+        const reference_started_ns = platform.time.monotonicNs();
         var reference = try analyzeNativeModel(allocator, reference_model, prompt_opts);
+        const reference_elapsed_ms = elapsedMillisSince(reference_started_ns);
         defer reference.deinit(allocator);
 
         if (native.last_logits.len != reference.last_logits.len) return error.QualityEvalVocabMismatch;
@@ -971,7 +993,7 @@ fn runQualityEval(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void
         if (native_empty_or_special) empty_or_special_failures += 1;
 
         print(
-            "quality_eval_prompt: index={d} native_top1={d} reference_top1={d} match={} topk_overlap={d}/{d} native_rank_in_reference={d} reference_rank_in_native={d} native_empty_or_special={} reference_empty_or_special={}\n",
+            "quality_eval_prompt: index={d} native_top1={d} reference_top1={d} match={} topk_overlap={d}/{d} native_rank_in_reference={d} reference_rank_in_native={d} native_empty_or_special={} reference_empty_or_special={} native_ms={d} reference_ms={d}\n",
             .{
                 idx,
                 native.top1,
@@ -983,6 +1005,8 @@ fn runQualityEval(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void
                 reference_rank_in_native,
                 native_empty_or_special,
                 reference_empty_or_special,
+                native.elapsed_ms,
+                reference_elapsed_ms,
             },
         );
 
@@ -994,6 +1018,8 @@ fn runQualityEval(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void
             .reference_top1 = reference.top1,
             .native_text = native_text,
             .reference_text = reference_text,
+            .native_elapsed_ms = native.elapsed_ms,
+            .reference_elapsed_ms = reference_elapsed_ms,
             .top1_match = top1_match,
             .topk_overlap = overlap,
             .topk_limit = topk_limit,
@@ -1061,6 +1087,12 @@ fn percent(count: usize, total: usize) f64 {
     return @as(f64, @floatFromInt(count)) * 100.0 / @as(f64, @floatFromInt(total));
 }
 
+fn elapsedMillisSince(start_ns: u64) u64 {
+    const end_ns = platform.time.monotonicNs();
+    if (end_ns <= start_ns) return 0;
+    return (end_ns - start_ns) / std.time.ns_per_ms;
+}
+
 fn inferredQualityTop1Threshold(model_dir: []const u8) f64 {
     if (std.mem.indexOf(u8, model_dir, "q4") != null or std.mem.indexOf(u8, model_dir, "Q4") != null) return 75.0;
     if (std.mem.indexOf(u8, model_dir, "q8") != null or std.mem.indexOf(u8, model_dir, "Q8") != null) return 90.0;
@@ -1126,6 +1158,8 @@ fn writeQualityEvalJson(
             \\"reference_top1":{d},
             \\"native_text":{f},
             \\"reference_text":{f},
+            \\"native_elapsed_ms":{d},
+            \\"reference_elapsed_ms":{d},
             \\"top1_match":{},
             \\"topk_overlap":{d},
             \\"topk_limit":{d},
@@ -1142,6 +1176,8 @@ fn writeQualityEvalJson(
                 item.reference_top1,
                 std.json.fmt(item.native_text, .{}),
                 std.json.fmt(item.reference_text, .{}),
+                item.native_elapsed_ms,
+                item.reference_elapsed_ms,
                 item.top1_match,
                 item.topk_overlap,
                 item.topk_limit,

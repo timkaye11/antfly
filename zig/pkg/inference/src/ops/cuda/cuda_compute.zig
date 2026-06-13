@@ -185,9 +185,13 @@ pub const RuntimeStats = struct {
     device_kv_fail_write: usize = 0,
     device_kv_fail_read: usize = 0,
     device_kv_fail_shape: usize = 0,
+    qkv_fused_q8: usize = 0,
     qkv_fused_q4: usize = 0,
     qkv_fused_q4_q4_f32: usize = 0,
     qkv_fused_f32: usize = 0,
+    linear_pair_fused_q8: usize = 0,
+    linear_pair_fused_q4: usize = 0,
+    linear_pair_fallbacks: usize = 0,
     bf16_cublaslt_linear_calls: usize = 0,
     bf16_cublaslt_qkv_calls: usize = 0,
     bf16_cublaslt_activation_staging_calls: usize = 0,
@@ -746,10 +750,24 @@ fn cudaDenseStreamProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_PROFILE") or cudaFfnStreamProfileEnabled();
 }
 
-fn cudaDenseStreamBudgetBytes() usize {
-    const requested_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_BUDGET_MB") orelse 2048;
-    const budget_mb = @max(@as(usize, 512), requested_mb);
-    return budget_mb * 1024 * 1024;
+fn cudaDenseStreamBudgetBytes(self: *const CudaCompute) usize {
+    const mib: usize = 1024 * 1024;
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DENSE_STREAM_BUDGET_MB")) |requested_mb| {
+        const budget_mb = @max(@as(usize, 512), requested_mb);
+        return budget_mb * mib;
+    }
+
+    const min_auto_mb: usize = 2048;
+    const max_auto_mb: usize = 12000;
+    const budget = self.run_budget orelse return min_auto_mb * mib;
+    const backend_limit = budget.limits.backend_limit_bytes;
+    if (backend_limit == 0) return min_auto_mb * mib;
+    const reserved = budget.backend_kv_bytes + budget.backend_scratch_bytes;
+    if (backend_limit <= reserved) return min_auto_mb * mib;
+    const available_mb = (backend_limit - reserved) / mib;
+    const derived_mb = (available_mb * 2) / 3;
+    const budget_mb = @min(max_auto_mb, @max(min_auto_mb, derived_mb));
+    return budget_mb * mib;
 }
 
 fn cudaDensePrefetchEnabled(self: *const CudaCompute) bool {
@@ -1076,7 +1094,7 @@ fn evictOneDenseStreamEntry(self: *CudaCompute, protected_name: []const u8) !voi
 }
 
 fn ensureDenseStreamBudgetForInsert(self: *CudaCompute, protected_name: []const u8, byte_len: usize) !void {
-    const budget = cudaDenseStreamBudgetBytes();
+    const budget = cudaDenseStreamBudgetBytes(self);
     if (byte_len > budget) return error.MemoryBudgetExceeded;
     while (self.stats.dense_stream_resident_bytes + byte_len > budget) {
         try evictOneDenseStreamEntry(self, protected_name);
@@ -2221,7 +2239,7 @@ fn cudaForceEvalSync() bool {
 }
 
 fn cudaEnableQ4KDecodeFast() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_Q4K_DECODE_FAST", false);
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_Q4K_DECODE_FAST", true);
 }
 
 fn cudaDisableHeadNormRopeFusion() bool {
@@ -2691,7 +2709,16 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {
-                .Q8_0 => try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                .Q8_0 => {
+                    if (rows == 1) {
+                        self.kernels.launchLinearQ8_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |err| switch (err) {
+                            error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                            else => return err,
+                        };
+                    } else {
+                        try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                    }
+                },
                 .Q4_0 => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 .Q4_K => {
                     if (rows == 1 and cudaEnableQ4KDecodeFast()) {
@@ -2706,7 +2733,6 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                         };
                         if (!used_fallback) self.stats.q4k_decode_fast_hits += 1;
                     } else {
-                        if (rows == 1) self.stats.q4k_decode_fast_fallbacks += 1;
                         try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     }
                 },
@@ -2822,6 +2848,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const k_weight_tensor = tensorFromCt(k_weight);
     const v_weight_tensor = tensorFromCt(v_weight);
     try ensureF32(input_tensor);
+    const use_q8 = isKnownQuant(q_weight_tensor, .Q8_0) and isKnownQuant(k_weight_tensor, .Q8_0) and isKnownQuant(v_weight_tensor, .Q8_0);
     const use_q4 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and isKnownQuant(v_weight_tensor, .Q4_K);
     const use_q4_q4_f32 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and
         v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
@@ -2829,7 +2856,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
         k_weight_tensor.dtype == .f32 and k_weight_tensor.quant_type == null and
         v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
     const use_bf16 = isBf16Weight(q_weight_tensor) and isBf16Weight(k_weight_tensor) and isBf16Weight(v_weight_tensor);
-    if (!use_q4 and !use_q4_q4_f32 and !use_f32 and !use_bf16) {
+    if (!use_q8 and !use_q4 and !use_q4_q4_f32 and !use_f32 and !use_bf16) {
         self.stats.qkv_fallback_unsupported += 1;
         return null;
     }
@@ -2841,6 +2868,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
         try ensureF32(v_weight_tensor);
     }
     if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0) return null;
+    if (use_q8 and in_dim % 32 != 0) return null;
     if ((use_q4 or use_q4_q4_f32) and in_dim % 256 != 0) return null;
     try ensureCount(input_tensor, try checkedMul(rows, in_dim));
     try ensureCount(q_weight_tensor, try checkedMul(q_out_dim, in_dim));
@@ -2868,7 +2896,30 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     var v_device_owned = false;
     errdefer if (!v_device_owned) v_device.free(&self.ctx);
 
-    if (use_q4) {
+    if (use_q8) {
+        self.kernels.launchLinearQ8_0QkvNoBiasTile4F32(
+            &self.ctx,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor.buffer,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => {
+                self.stats.qkv_kernel_unavailable += 1;
+                return null;
+            },
+            else => return err,
+        };
+        self.stats.qkv_fused_q8 += 1;
+        self.stats.launch_linear_qkv += 1;
+    } else if (use_q4) {
         self.kernels.launchLinearQ4KQkvNoBiasTiledF32(
             &self.ctx,
             q_device,
@@ -3074,6 +3125,116 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
     errdefer freeTensor(ctx, second);
     const third = try linear(ctx, input, weight_c, bias_c, rows, in_dim, out_dim);
     return .{ .first = first, .second = second, .third = third };
+}
+
+fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearNoBiasPairResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const weight_a_tensor = tensorFromCt(weight_a);
+    const weight_b_tensor = tensorFromCt(weight_b);
+
+    try ensureF32(input_tensor);
+    try ensureCount(input_tensor, try checkedMul(rows, in_dim));
+    try ensureCount(weight_a_tensor, try checkedMul(out_dim, in_dim));
+    try ensureCount(weight_b_tensor, try checkedMul(out_dim, in_dim));
+
+    const use_q8 = isKnownQuant(weight_a_tensor, .Q8_0) and isKnownQuant(weight_b_tensor, .Q8_0);
+    const use_q4 = isKnownQuant(weight_a_tensor, .Q4_K) and isKnownQuant(weight_b_tensor, .Q4_K);
+    if (!use_q8 and !use_q4) {
+        self.stats.linear_pair_fallbacks += 1;
+        const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, first);
+        const second = try linearNoBias(ctx, input, weight_b, rows, in_dim, out_dim);
+        return .{ .first = first, .second = second };
+    }
+    if (use_q8 and in_dim % 32 != 0) return error.InvalidShape;
+    if (use_q4 and in_dim % 256 != 0) return error.InvalidShape;
+
+    const out_count = try checkedMul(rows, out_dim);
+    const shape_a = try allocShape2(self.allocator, rows, out_dim);
+    var shape_a_owned = false;
+    errdefer if (!shape_a_owned) self.allocator.free(shape_a);
+    const shape_b = try allocShape2(self.allocator, rows, out_dim);
+    var shape_b_owned = false;
+    errdefer if (!shape_b_owned) self.allocator.free(shape_b);
+    var device_a = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    var device_a_owned = false;
+    errdefer if (!device_a_owned) device_a.free(&self.ctx);
+    var device_b = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    var device_b_owned = false;
+    errdefer if (!device_b_owned) device_b.free(&self.ctx);
+
+    if (use_q8) {
+        self.kernels.launchLinearQ8_0PairNoBiasTile4F32(
+            &self.ctx,
+            device_a,
+            device_b,
+            input_tensor.buffer,
+            weight_a_tensor.buffer,
+            weight_b_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => {
+                self.stats.linear_pair_fallbacks += 1;
+                device_a.free(&self.ctx);
+                device_a_owned = true;
+                device_b.free(&self.ctx);
+                device_b_owned = true;
+                self.allocator.free(shape_a);
+                shape_a_owned = true;
+                self.allocator.free(shape_b);
+                shape_b_owned = true;
+                const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
+                errdefer freeTensor(ctx, first);
+                const second = try linearNoBias(ctx, input, weight_b, rows, in_dim, out_dim);
+                return .{ .first = first, .second = second };
+            },
+            else => return err,
+        };
+        self.stats.linear_pair_fused_q8 += 1;
+    } else {
+        self.kernels.launchLinearQ4KPairNoBiasTile4F32(
+            &self.ctx,
+            device_a,
+            device_b,
+            input_tensor.buffer,
+            weight_a_tensor.buffer,
+            weight_b_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => {
+                self.stats.linear_pair_fallbacks += 1;
+                device_a.free(&self.ctx);
+                device_a_owned = true;
+                device_b.free(&self.ctx);
+                device_b_owned = true;
+                self.allocator.free(shape_a);
+                shape_a_owned = true;
+                self.allocator.free(shape_b);
+                shape_b_owned = true;
+                const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
+                errdefer freeTensor(ctx, first);
+                const second = try linearNoBias(ctx, input, weight_b, rows, in_dim, out_dim);
+                return .{ .first = first, .second = second };
+            },
+            else => return err,
+        };
+        self.stats.linear_pair_fused_q4 += 1;
+    }
+
+    self.stats.launch_linear += 1;
+    const first = try createTensor(self, device_a, shape_a, out_count);
+    shape_a_owned = true;
+    device_a_owned = true;
+    errdefer freeTensor(ctx, first);
+    const second = try createTensor(self, device_b, shape_b, out_count);
+    shape_b_owned = true;
+    device_b_owned = true;
+    return .{ .first = first, .second = second };
 }
 
 fn linearPair(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearPairResult {
@@ -4359,6 +4520,7 @@ const vtable = ops.ComputeBackend.VTable{
     .linearPlanned = &linearPlanned,
     .linearNoBias = &linearNoBias,
     .linearNoBiasPlanned = &linearNoBiasPlanned,
+    .linearNoBiasPair = &linearNoBiasPair,
     .argmaxLastRow = &argmaxLastRow,
     .linearNoBiasArgmaxLastRow = &linearNoBiasArgmaxLastRow,
     .linearNoBiasArgmaxLastRowTensor = &linearNoBiasArgmaxLastRowTensor,

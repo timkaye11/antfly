@@ -1067,6 +1067,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_runtime_rates: launches_per_token={d:.3} syncs_per_token={d:.3}\n",
+                    .{
+                        perToken(cuda_stats.kernel_launches, result.tokens_used),
+                        perToken(cuda_stats.stream_syncs, result.tokens_used),
+                    },
+                );
+                print(
                     "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
                     .{
                         cuda_stats.eval_requests,
@@ -1248,13 +1255,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_qkv_counts: fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
+                    "cuda_qkv_counts: fused_q8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
                     .{
+                        cuda_stats.qkv_fused_q8,
                         cuda_stats.qkv_fused_q4,
                         cuda_stats.qkv_fused_q4_q4_f32,
                         cuda_stats.qkv_fused_f32,
                         cuda_stats.qkv_fallback_unsupported,
                         cuda_stats.qkv_kernel_unavailable,
+                    },
+                );
+                print(
+                    "cuda_linear_pair_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    .{
+                        cuda_stats.linear_pair_fused_q8,
+                        cuda_stats.linear_pair_fused_q4,
+                        cuda_stats.linear_pair_fallbacks,
                     },
                 );
                 print(
@@ -1370,6 +1386,11 @@ fn tokensPerSecond(tokens: usize, millis: u64) f64 {
     return @as(f64, @floatFromInt(tokens)) * 1000.0 / @as(f64, @floatFromInt(millis));
 }
 
+fn perToken(count: usize, tokens: usize) f64 {
+    if (tokens == 0) return 0.0;
+    return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(tokens));
+}
+
 fn appendFmt(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1408,7 +1429,9 @@ fn writeJsonTiming(
                 &cuda_out,
                 \\{{
                 \\"kernel_launches":{d},
+                \\"launches_per_token":{d:.6},
                 \\"stream_syncs":{d},
+                \\"syncs_per_token":{d:.6},
                 \\"upload_syncs":{d},
                 \\"download_syncs":{d},
                 \\"eval_syncs":{d},
@@ -1424,7 +1447,9 @@ fn writeJsonTiming(
             ,
                 .{
                     cuda_stats.kernel_launches,
+                    perToken(cuda_stats.kernel_launches, result.tokens_used),
                     cuda_stats.stream_syncs,
+                    perToken(cuda_stats.stream_syncs, result.tokens_used),
                     cuda_stats.upload_syncs,
                     cuda_stats.download_syncs,
                     cuda_stats.eval_syncs,
@@ -1450,11 +1475,15 @@ fn writeJsonTiming(
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
+                \\"qkv_fused_q8":{d},
                 \\"qkv_fused_q4":{d},
                 \\"qkv_fused_q4_q4_f32":{d},
                 \\"qkv_fused_f32":{d},
                 \\"qkv_fallback_unsupported":{d},
                 \\"qkv_kernel_unavailable":{d},
+                \\"linear_pair_fused_q8":{d},
+                \\"linear_pair_fused_q4":{d},
+                \\"linear_pair_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
                 \\"bf16_cublaslt_linear_calls":{d},
@@ -1475,11 +1504,15 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                    cuda_stats.qkv_fused_q8,
                     cuda_stats.qkv_fused_q4,
                     cuda_stats.qkv_fused_q4_q4_f32,
                     cuda_stats.qkv_fused_f32,
                     cuda_stats.qkv_fallback_unsupported,
                     cuda_stats.qkv_kernel_unavailable,
+                    cuda_stats.linear_pair_fused_q8,
+                    cuda_stats.linear_pair_fused_q4,
+                    cuda_stats.linear_pair_fallbacks,
                     cuda_stats.q4k_decode_fast_hits,
                     cuda_stats.q4k_decode_fast_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
