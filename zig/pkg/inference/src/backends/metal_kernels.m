@@ -707,6 +707,19 @@ typedef struct termite_metal_decode_runtime {
     id<MTLCommandBuffer> submitted_frame_cb;
     CFMutableArrayRef active_frame_retained_resources;
     CFMutableArrayRef submitted_frame_retained_resources;
+    // In-frame device-buffer reuse pool (TERMITE_METAL_BUFFER_REUSE). Holds
+    // private buffers released (refcount 0, no live tensor) during the active
+    // frame, each retaining its +1 ownership. A new same-or-larger allocation
+    // reuses one instead of growing memory; Metal's default hazard tracking
+    // serializes the reuse-write after prior reads. Bounds peak device memory
+    // to the live working set instead of the sum of all intermediates.
+    void **frame_reuse_pool;
+    size_t frame_reuse_pool_len;
+    size_t frame_reuse_pool_cap;
+    int buffer_reuse_enabled; // -1 uninit, else 0/1
+    uint64_t reuse_hit_count;   // in-frame private allocs served from the pool
+    uint64_t reuse_alloc_count; // in-frame private allocs total (hit + new)
+    size_t reuse_pool_peak_len; // max pooled buffers held at once
     uint64_t frame_cb_count;
     uint64_t last_frame_gpu_nanos;
     uint64_t compute_encoder_count;
@@ -924,6 +937,11 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t scratch_pool_slots;
     uint64_t scratch_pool_in_use_slots;
     uint64_t scratch_pool_pending_slots;
+    uint64_t reuse_pool_bytes;
+    uint64_t reuse_pool_slots;
+    uint64_t reuse_pool_peak_slots;
+    uint64_t reuse_alloc_count;
+    uint64_t reuse_hit_count;
     uint64_t attention_span_bytes;
     uint64_t hidden_state_bytes;
     uint64_t frame_retained_bytes;
@@ -11196,6 +11214,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
 
         termite_metal_decode_runtime *runtime = calloc(1, sizeof(termite_metal_decode_runtime));
         if (runtime == NULL) return NULL;
+        runtime->buffer_reuse_enabled = -1;
         runtime->device = device;
         runtime->queue = queue;
         runtime->library = library;
@@ -11628,6 +11647,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
     }
 }
 
+static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime, int keep_alive);
+
 void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL) return;
     @autoreleasepool {
@@ -11643,6 +11664,26 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     }
     termite_metal_decode_runtime_clear_frame_resources(&runtime->active_frame_retained_resources);
     termite_metal_decode_runtime_clear_frame_resources(&runtime->submitted_frame_retained_resources);
+    termite_metal_decode_runtime_drain_reuse_pool(runtime, 0);
+    if (runtime->frame_reuse_pool != NULL) {
+        free(runtime->frame_reuse_pool);
+        runtime->frame_reuse_pool = NULL;
+        runtime->frame_reuse_pool_cap = 0;
+    }
+    {
+        const char *stats_env = getenv("TERMITE_METAL_BUFFER_REUSE_STATS");
+        if (stats_env != NULL && stats_env[0] == '1') {
+            double rate = runtime->reuse_alloc_count > 0
+                ? (100.0 * (double)runtime->reuse_hit_count / (double)runtime->reuse_alloc_count)
+                : 0.0;
+            fprintf(stderr,
+                "metal_buffer_reuse_stats: in_frame_private_allocs=%llu hits=%llu hit_rate=%.1f%% pool_peak=%zu\n",
+                (unsigned long long)runtime->reuse_alloc_count,
+                (unsigned long long)runtime->reuse_hit_count,
+                rate,
+                runtime->reuse_pool_peak_len);
+        }
+    }
     runtime->embed_absolute_position_pipeline = nil;
     runtime->embedding_lookup_pipeline = nil;
     runtime->embedding_lookup_bf16_pipeline = nil;
@@ -35172,6 +35213,25 @@ static int termite_metal_decode_runtime_retain_frame_resource(termite_metal_deco
     return 0;
 }
 
+// Empty the in-frame reuse pool. Pooled buffers may still be read by encoded
+// (not-yet-completed) commands, so when `keep_alive` they are moved into the
+// in-flight frame's retained set (active if present, else submitted) to stay
+// alive until the GPU finishes; otherwise their +1 is released immediately.
+static void termite_metal_decode_runtime_drain_reuse_pool(termite_metal_decode_runtime *runtime, int keep_alive) {
+    if (runtime == NULL || runtime->frame_reuse_pool == NULL) return;
+    for (size_t i = 0; i < runtime->frame_reuse_pool_len; ++i) {
+        void *handle = runtime->frame_reuse_pool[i];
+        if (handle == NULL) continue;
+        @autoreleasepool {
+            id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle; // reclaim the +1
+            if (keep_alive && buffer != nil) {
+                (void)termite_metal_decode_runtime_retain_frame_resource(runtime, buffer);
+            }
+        }
+    }
+    runtime->frame_reuse_pool_len = 0;
+}
+
 int termite_metal_decode_runtime_retain_active_frame_buffer(termite_metal_decode_runtime *runtime, void *handle) {
     if (runtime == NULL || handle == NULL) return -1;
     if (runtime->active_frame_cb == nil) return 0;
@@ -35280,7 +35340,21 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     }
     runtime->submitted_frame_retained_resources = runtime->active_frame_retained_resources;
     runtime->active_frame_retained_resources = NULL;
+    // Buffers still pooled (not reused) are referenced by this committed
+    // frame's commands; keep them alive (now under submitted) until wait_frame.
+    termite_metal_decode_runtime_drain_reuse_pool(runtime, 1);
     runtime->frame_cb_count += 1;
+    {
+        const char *stats_env = getenv("TERMITE_METAL_BUFFER_REUSE_STATS");
+        if (stats_env != NULL && stats_env[0] == '1' && runtime->reuse_alloc_count > 0) {
+            fprintf(stderr,
+                "metal_buffer_reuse_stats: in_frame_private_allocs=%llu hits=%llu hit_rate=%.1f%% pool_peak=%zu\n",
+                (unsigned long long)runtime->reuse_alloc_count,
+                (unsigned long long)runtime->reuse_hit_count,
+                100.0 * (double)runtime->reuse_hit_count / (double)runtime->reuse_alloc_count,
+                runtime->reuse_pool_peak_len);
+        }
+    }
     return 0;
 }
 
@@ -35304,6 +35378,8 @@ int termite_metal_decode_runtime_cancel_frame(termite_metal_decode_runtime *runt
     termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
     runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
     runtime->planned_compute_barrier_suppression_depth = 0;
+    // Cancelled frame: its commands never execute, so release pooled buffers.
+    termite_metal_decode_runtime_drain_reuse_pool(runtime, 0);
     runtime->active_frame_cb = nil;
     runtime->active_frame_compute_encoder_count = 0;
     runtime->active_frame_blit_encoder_count = 0;
@@ -35558,6 +35634,18 @@ int termite_metal_decode_runtime_memory_snapshot(
         if (runtime->scratch_pool_in_use[slot] != 0) snapshot->scratch_pool_in_use_slots += 1;
         if (runtime->scratch_pool_pending_frame_release[slot] != 0) snapshot->scratch_pool_pending_slots += 1;
     }
+    if (runtime->frame_reuse_pool != NULL) {
+        for (size_t i = 0; i < runtime->frame_reuse_pool_len; ++i) {
+            id<MTLBuffer> b = (__bridge id<MTLBuffer>)runtime->frame_reuse_pool[i];
+            if (b == nil) continue;
+            snapshot->reuse_pool_slots += 1;
+            snapshot->reuse_pool_bytes += (uint64_t)b.length;
+            termite_metal_decode_runtime_memory_add_buffer(snapshot, b, &snapshot->scratch_bytes);
+        }
+    }
+    snapshot->reuse_pool_peak_slots = runtime->reuse_pool_peak_len;
+    snapshot->reuse_alloc_count = runtime->reuse_alloc_count;
+    snapshot->reuse_hit_count = runtime->reuse_hit_count;
 
     if (!termite_metal_decode_runtime_graph_alias(runtime, runtime->attention_span_encoded_key_buffer)) {
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->attention_span_encoded_key_buffer, &snapshot->attention_span_bytes);
@@ -35685,8 +35773,43 @@ int termite_metal_decode_runtime_reserve(termite_metal_decode_runtime *runtime, 
     }
 }
 
+static int termite_metal_buffer_reuse_enabled(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return 0;
+    if (runtime->buffer_reuse_enabled < 0) {
+        const char *env = getenv("TERMITE_METAL_BUFFER_REUSE");
+        runtime->buffer_reuse_enabled = (env != NULL && (env[0] == '0' || env[0] == 'f' || env[0] == 'F')) ? 0 : 1;
+    }
+    return runtime->buffer_reuse_enabled;
+}
+
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode) {
     if (runtime == NULL || runtime->device == nil || length == 0) return NULL;
+    // In-frame reuse: serve a same-or-larger released private buffer from the
+    // pool (best-fit) instead of allocating. The returned handle keeps the
+    // pooled buffer's +1 ownership (transferred to the caller).
+    if (storage_mode == 1 && runtime->active_frame_cb != nil &&
+        termite_metal_buffer_reuse_enabled(runtime)) {
+        runtime->reuse_alloc_count += 1;
+        if (runtime->frame_reuse_pool_len > 0) {
+            size_t best_idx = (size_t)-1;
+            size_t best_len = (size_t)-1;
+            for (size_t i = 0; i < runtime->frame_reuse_pool_len; ++i) {
+                id<MTLBuffer> b = (__bridge id<MTLBuffer>)runtime->frame_reuse_pool[i];
+                size_t blen = (size_t)b.length;
+                if (blen >= length && blen < best_len) {
+                    best_len = blen;
+                    best_idx = i;
+                }
+            }
+            if (best_idx != (size_t)-1) {
+                void *handle = runtime->frame_reuse_pool[best_idx];
+                runtime->frame_reuse_pool[best_idx] =
+                    runtime->frame_reuse_pool[--runtime->frame_reuse_pool_len];
+                runtime->reuse_hit_count += 1;
+                return handle;
+            }
+        }
+    }
     @autoreleasepool {
         MTLResourceOptions options = (storage_mode == 1)
             ? MTLResourceStorageModePrivate
@@ -35705,6 +35828,29 @@ void termite_metal_buffer_release(void *handle) {
 
 void termite_metal_decode_runtime_release_buffer(termite_metal_decode_runtime *runtime, void *handle) {
     if (handle == NULL) return;
+    // During the active frame, pool the (now dead, refcount-0) buffer for
+    // reuse instead of just frame-retaining it. The pool keeps the handle's
+    // +1, so the buffer stays alive for the in-flight frame AND is available
+    // to satisfy a later same-frame allocation.
+    if (runtime != NULL && runtime->active_frame_cb != nil &&
+        termite_metal_buffer_reuse_enabled(runtime)) {
+        if (runtime->frame_reuse_pool_len >= runtime->frame_reuse_pool_cap) {
+            size_t new_cap = runtime->frame_reuse_pool_cap == 0 ? 256 : runtime->frame_reuse_pool_cap * 2;
+            void **grown = realloc(runtime->frame_reuse_pool, new_cap * sizeof(void *));
+            if (grown != NULL) {
+                runtime->frame_reuse_pool = grown;
+                runtime->frame_reuse_pool_cap = new_cap;
+            }
+        }
+        if (runtime->frame_reuse_pool_len < runtime->frame_reuse_pool_cap) {
+            runtime->frame_reuse_pool[runtime->frame_reuse_pool_len++] = handle;
+            if (runtime->frame_reuse_pool_len > runtime->reuse_pool_peak_len) {
+                runtime->reuse_pool_peak_len = runtime->frame_reuse_pool_len;
+            }
+            return;
+        }
+        // realloc failed: fall through to the normal frame-retain path.
+    }
     @autoreleasepool {
         id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)handle;
         if (runtime != NULL && (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil)) {

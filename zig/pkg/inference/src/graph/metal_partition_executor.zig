@@ -985,11 +985,16 @@ pub const MetalPartitionExecutor = struct {
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
-        const planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
+        var planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
             try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
         else
             metal_compute_mod.MetalCompute.PlannedGraphScope{};
         errdefer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+
+        // Coarse frame chunking: split the single frame every `chunk_ops`
+        // executed nodes so dead/pooled device buffers release mid-step.
+        const chunk_ops = frameChunkOps();
+        var chunk_executed: usize = 0;
 
         var exec_state = interpreter.ExecState{
             .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
@@ -1159,11 +1164,12 @@ pub const MetalPartitionExecutor = struct {
             // on a consumer fusing it — which writes the consumer's slot,
             // not this one.
             const node_elision_protected = i < elision_protected_nodes.len and elision_protected_nodes[i];
-            if (!node_elision_protected and shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
+            const defer_allowed = chunk_ops == 0;
+            if (defer_allowed and !node_elision_protected and shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
-            if (!node_elision_protected and shouldDeferElementwiseMulForAdd(graph, node_id, reachable, last_use)) {
+            if (defer_allowed and !node_elision_protected and shouldDeferElementwiseMulForAdd(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -1185,7 +1191,7 @@ pub const MetalPartitionExecutor = struct {
                 }
             }
 
-            if (!node_elision_protected and shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use)) {
+            if (defer_allowed and !node_elision_protected and shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use)) {
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -1414,6 +1420,26 @@ pub const MetalPartitionExecutor = struct {
             }
             if (trace_node_progress) {
                 printMetalProgressNode("node_end", graph, partition_index, node_pos, node_ids.len, node_id);
+            }
+
+            // Coarse frame chunking boundary: after every `chunk_ops` executed
+            // nodes, submit+wait the current frame (releasing its dead/pooled
+            // device buffers) and reopen a fresh frame + scope. Cross-chunk
+            // live values survive via their owned device CTs (last_use later,
+            // so freeExpiredInputs left them in `values`). Skip the very last
+            // node — the post-loop block submits that final chunk.
+            if (chunk_ops > 0 and frame_active and node_pos + 1 < node_ids.len) {
+                chunk_executed += 1;
+                if (chunk_executed >= chunk_ops) {
+                    chunk_executed = 0;
+                    metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                    try cb.decoderRuntimeSubmitAndWaitFrame();
+                    frame_active = try cb.decoderRuntimeBeginFrame();
+                    planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
+                        try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
+                    else
+                        metal_compute_mod.MetalCompute.PlannedGraphScope{};
+                }
             }
         }
 
@@ -2377,6 +2403,20 @@ fn metalGraphProgressEnd() usize {
 
 fn metalPartitionFrameDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_PARTITION_DISABLE_FRAME", false);
+}
+
+/// Coarse frame chunking: when `TERMITE_METAL_FRAME_CHUNK_OPS=N` (N>0), the
+/// partition's single command-buffer frame is split — after every N executed
+/// nodes the executor closes the planned scope, submits+waits the frame (which
+/// releases that chunk's dead/pooled device buffers), then reopens a new frame
+/// and scope. Cross-chunk live values survive via their owned device CTs; only
+/// the dead working set frees, bounding peak device memory to the live set
+/// instead of the sum of every intermediate. Defer fusion is disabled while
+/// chunking so no deferred/lazy value straddles a boundary (regions already
+/// execute atomically within one iteration, so a node-boundary == a region
+/// boundary). 0 = disabled (single-frame, current behavior).
+fn frameChunkOps() usize {
+    return platform.env.getenvUsize("TERMITE_METAL_FRAME_CHUNK_OPS") orelse 0;
 }
 
 /// TERMITE_DISABLE_GRAPH_OUTPUT_OWNED_COPY=1 skips the partition-end

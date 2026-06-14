@@ -299,11 +299,14 @@ fn relScoreGatherEnabled() bool {
 
 // Fused disentangled attention: replaces the c2c/c2p/p2c + softmax + context
 // block with a single flash-style kernel (forward) + a custom-VJP backward
-// kernel, avoiding the [bh,S,S] score materialization. Default-OFF until the
-// kernel parity gates pass; set TERMITE_DEBERTA_FUSED_ATTENTION=1 to enable.
+// kernel, avoiding the [bh,S,S] score materialization. Default-ON (2026-06-14):
+// validated Python-exact on native AND Metal across b2/s64, b2/s128, b4/s128
+// (the score-gather path additionally has a latent Metal correctness bug at
+// seq>=128 that the fused path avoids), and ~2x lower GPU frame time. Set
+// TERMITE_DEBERTA_FUSED_ATTENTION=0 to fall back to the score-gather path.
 fn fusedDisentangledAttentionEnabled() bool {
     if (@import("builtin").target.cpu.arch.isWasm()) return false;
-    return platform.env.getenvBoolDefault("TERMITE_DEBERTA_FUSED_ATTENTION", false);
+    return platform.env.getenvBoolDefault("TERMITE_DEBERTA_FUSED_ATTENTION", true);
 }
 
 pub fn fuseLayerNormBackwardEnabled() bool {

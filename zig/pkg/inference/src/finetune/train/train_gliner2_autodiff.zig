@@ -914,10 +914,26 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         print("  metal deberta encoder frame preplan: {s}\n", .{if (preplanned) "ready" else "not-ready"});
     }
 
-    const structure_max_instances: u32 = if (opts.objective == .gliner2_total_loss)
-        computeMaxStructureInstances(training_records)
-    else
-        1;
+    const structure_max_instances: u32 = blk: {
+        var n: u32 = if (opts.objective == .gliner2_total_loss)
+            computeMaxStructureInstances(training_records)
+        else
+            1;
+        // Perf-A/B override: force the structure-loss path width regardless of
+        // data (e.g. =1 forces the legacy single-instance path on multi-instance
+        // data for a same-fixture baseline). Loss is not meaningful when forced
+        // below the data's real max; intended only for timing comparisons.
+        if (std.c.getenv("TERMITE_GLINER2_STRUCT_MAX_INSTANCES")) |cstr| {
+            const val = std.mem.span(cstr);
+            if (std.fmt.parseInt(u32, std.mem.trim(u8, val, " \t\r\n"), 10)) |forced| {
+                if (forced >= 1) {
+                    print("  [override] structure_max_instances forced to {d} (was {d})\n", .{ forced, n });
+                    n = forced;
+                }
+            } else |_| {}
+        }
+        break :blk n;
+    };
     if (structure_max_instances > 1) {
         print("  structure max instances (per-instance struct loss): {d}\n", .{structure_max_instances});
     }
@@ -976,6 +992,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 else => .interpreter,
             },
             .compiled_required = opts.compiled_required,
+            .checkpoint_config = activationCheckpointConfig(),
         },
     );
     defer trainer.deinit();
@@ -3534,6 +3551,26 @@ fn shuffleExamplesAndRecords(prng: *std.Random, examples: []gliner2_data.Example
         std.mem.swap(gliner2_data.Example, &examples[i], &examples[j]);
         std.mem.swap(gliner2_data.UpstreamRecord, &records[i], &records[j]);
     }
+}
+
+/// Activation (gradient) checkpointing config, env-gated. Enable with
+/// `TERMITE_GLINER2_ACTIVATION_CHECKPOINTING=1` to recompute non-checkpoint
+/// forward activations during backward instead of keeping them live — bounds
+/// peak activation memory (trades ~1.3-2x forward compute for memory), needed
+/// for large batch/seq where the full activation tape OOMs the GPU. Optional
+/// `TERMITE_GLINER2_CHECKPOINT_INTERVAL=N` (default 1) saves every N layers.
+fn activationCheckpointConfig() ?ml.graph.checkpoint.CheckpointConfig {
+    const cstr = std.c.getenv("TERMITE_GLINER2_ACTIVATION_CHECKPOINTING") orelse return null;
+    const val = std.mem.span(cstr);
+    if (val.len == 0 or val[0] == '0') return null;
+    var interval: u32 = 1;
+    if (std.c.getenv("TERMITE_GLINER2_CHECKPOINT_INTERVAL")) |ic| {
+        if (std.fmt.parseInt(u32, std.mem.trim(u8, std.mem.span(ic), " \t\r\n"), 10)) |n| {
+            if (n >= 1) interval = n;
+        } else |_| {}
+    }
+    print("  activation checkpointing: ON (every {d} layer(s))\n", .{interval});
+    return .{ .strategy = .every_n_layers, .layer_interval = interval };
 }
 
 /// Max structure `gold_count` (capped at upstream's 19) across all

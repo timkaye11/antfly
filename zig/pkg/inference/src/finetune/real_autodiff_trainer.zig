@@ -201,6 +201,12 @@ pub const TrainerConfig = struct {
     /// When true, fail instead of silently falling back to interpreter if the
     /// requested compiled engine cannot be prepared.
     compiled_required: bool = false,
+    /// Activation (gradient) checkpointing. When set, the backward graph
+    /// recomputes non-checkpoint forward activations from the nearest
+    /// checkpoint boundary instead of keeping them live, bounding peak
+    /// activation memory (trades ~1.3-2x forward compute for memory). null =
+    /// disabled. Applies to both the interpreter and compiled (Metal) paths.
+    checkpoint_config: ?ml.graph.checkpoint.CheckpointConfig = null,
 };
 
 pub const TrainingExecutionEngine = enum {
@@ -521,7 +527,7 @@ pub const RealAutodiffTrainer = struct {
                 self.allocator,
                 &gs.graph,
                 gs.loss_node,
-                .{ .trainable_params = trainable },
+                .{ .trainable_params = trainable, .checkpoint_config = self.config.checkpoint_config },
             );
             compiledDiag(
                 "compiled session build done compiled_nodes={} outputs={} compile_ms={d:.3} peak_rss={}",
@@ -728,7 +734,7 @@ pub const RealAutodiffTrainer = struct {
                 gs.loss_node,
                 self.compute_backend,
                 rt,
-                .{ .trainable_params = trainable },
+                .{ .trainable_params = trainable, .checkpoint_config = self.config.checkpoint_config },
             );
         profile.train_step_ns = elapsedNs(train_step_start_ns, monotonicNowNs());
         if (use_compiled) {
