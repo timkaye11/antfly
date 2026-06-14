@@ -448,6 +448,34 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     if (!std.math.isFinite(opts.span_hard_negative_weight) or opts.span_hard_negative_weight <= 0.0) return error.InvalidSpanHardNegativeWeight;
     if (!std.math.isFinite(opts.span_negative_mask_rate) or opts.span_negative_mask_rate < 0.0 or opts.span_negative_mask_rate > 1.0) return error.InvalidSpanNegativeMaskRate;
 
+    // Bounds-check integer CLI args before they feed size/shape math downstream.
+    // A 0 here causes div-by-zero, cast/underflow, or a silent no-op; num_classes
+    // must be >= 2 because the entity-type count is num_classes - 1.
+    if (opts.batch_size < 1) {
+        print("error: --batch-size must be >= 1 (got {d})\n", .{opts.batch_size});
+        return error.InvalidBatchSize;
+    }
+    if (opts.seq_len < 1) {
+        print("error: --seq-len must be >= 1 (got {d})\n", .{opts.seq_len});
+        return error.InvalidSeqLen;
+    }
+    if (opts.lora_rank < 1) {
+        print("error: --lora-rank must be >= 1 (got {d})\n", .{opts.lora_rank});
+        return error.InvalidLoRARank;
+    }
+    if (opts.num_classes < 2) {
+        print("error: --num-classes must be >= 2 (entity types = num_classes - 1; got {d})\n", .{opts.num_classes});
+        return error.InvalidNumClasses;
+    }
+    if (opts.grad_accum < 1) {
+        print("error: --grad-accum must be >= 1 (got {d})\n", .{opts.grad_accum});
+        return error.InvalidGradAccum;
+    }
+    if (opts.epochs < 1) {
+        print("error: --epochs must be >= 1 (got {d})\n", .{opts.epochs});
+        return error.InvalidEpochs;
+    }
+
     // ------------------------------------------------------------------
     // 2. Load DeBERTa config — GLiNER2 stores the encoder config under
     //    encoder_config/config.json, falling back to config.json.

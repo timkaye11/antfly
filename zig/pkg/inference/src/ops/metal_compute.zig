@@ -1112,20 +1112,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
-    /// Phase 2 ICB de-risk: run the self-contained ICB lifecycle smoke once when
-    /// `TERMITE_METAL_ICB_SMOKE` is set. Prints PASS/FAIL + the C status code.
-    pub fn runIcbSmokeIfRequested(cb: *const ops.ComputeBackend) void {
-        if (cb.kind() != .metal) return;
-        if (!getenvBool("TERMITE_METAL_ICB_SMOKE")) return;
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        if (metal_runtime.decoderRuntimeIcbSmokeTest(self.provider_impl)) |rc| {
-            std.debug.print("metal_icb_smoke: result={d} ({s})\n", .{ rc, if (rc == 0) @as([]const u8, "PASS") else @as([]const u8, "FAIL") });
-            if (rc == 0) metal_runtime.decoderRuntimeIcbBench(self.provider_impl);
-        } else {
-            std.debug.print("metal_icb_smoke: no runtime\n", .{});
-        }
-    }
-
     /// Apply fused activation `kind` ([rows,dim] device input) written into the pooled `out_ct`.
     pub fn activationInto(cb: *const ops.ComputeBackend, input: CT, kind: u32, dim: usize, out_ct: CT) !?CT {
         if (cb.kind() != .metal) return null;
@@ -21726,6 +21712,46 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     pub fn copyTensorInto(_: *const ops.ComputeBackend, _: CT, _: CT) !bool {
         return false;
+    }
+
+    // Phase-0 slot-bound output pool helpers: no-ops on the non-Metal build.
+    // The executor references these unconditionally; they are only reached at
+    // runtime on the Metal backend, so the native stubs just satisfy the compiler.
+    pub fn poolAllocateOutputCt(_: *const ops.ComputeBackend, _: usize) !CT {
+        return error.MetalUnsupported;
+    }
+    pub fn ctFromPoolCtView(_: *const ops.ComputeBackend, _: CT, _: []const i32) !CT {
+        return error.MetalUnsupported;
+    }
+    pub fn multiplyInto(_: *const ops.ComputeBackend, _: CT, _: CT, _: CT, _: bool) !?CT {
+        return null;
+    }
+    pub fn addInto(_: *const ops.ComputeBackend, _: CT, _: CT, _: CT, _: bool) !?CT {
+        return null;
+    }
+    pub fn subtractInto(_: *const ops.ComputeBackend, _: CT, _: CT, _: CT) !?CT {
+        return null;
+    }
+    pub fn divideInto(_: *const ops.ComputeBackend, _: CT, _: CT, _: CT) !?CT {
+        return null;
+    }
+    pub fn dotGeneral2DInto(_: *const ops.ComputeBackend, _: CT, _: CT, _: usize, _: usize, _: usize, _: u32, _: CT) !?CT {
+        return null;
+    }
+    pub fn reduceLastDimInto(_: *const ops.ComputeBackend, _: CT, _: []const u8, _: []const i64, _: u32, _: CT) !?CT {
+        return null;
+    }
+    pub fn transposeInto(_: *const ops.ComputeBackend, _: CT, _: []const u8, _: []const i64, _: CT) !?CT {
+        return null;
+    }
+    pub fn broadcastLastDimInto(_: *const ops.ComputeBackend, _: CT, _: []const i64, _: []const i64, _: CT) !?CT {
+        return null;
+    }
+    pub fn activationInto(_: *const ops.ComputeBackend, _: CT, _: u32, _: usize, _: CT) !?CT {
+        return null;
+    }
+    pub fn unaryInto(_: *const ops.ComputeBackend, _: CT, _: u32, _: CT) !?CT {
+        return null;
     }
 
     pub fn beginPlannedGraphScope(_: *const ops.ComputeBackend, _: PlannedGraphScopeKind) !PlannedGraphScope {

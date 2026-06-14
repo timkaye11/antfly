@@ -901,12 +901,6 @@ pub const MetalPartitionExecutor = struct {
         const slot_bound_outputs = self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
         if (slot_bound_outputs) self.ensureOutputPool(cb, graph) catch {};
 
-        // Phase 2 ICB de-risk smoke (one-shot, gated by TERMITE_METAL_ICB_SMOKE).
-        if (!icb_smoke_done and cb.kind() == .metal) {
-            icb_smoke_done = true;
-            metal_compute_mod.MetalCompute.runIcbSmokeIfRequested(cb);
-        }
-
         const options = exec_ctx.options orelse interpreter.ExecuteOptions{
             .attention = if (exec_ctx.attention) |attention| attention.* else null,
             .embedding_ids = exec_ctx.embedding_ids,
@@ -2357,7 +2351,6 @@ fn slotBoundOutputsEnabled() bool {
 // Phase-0 coverage counters (process-wide; executor runs single-threaded).
 var slot_bound_consumed_total: usize = 0;
 var slot_bound_fallback_total: usize = 0;
-var icb_smoke_done: bool = false;
 
 /// Ops whose device path can write into a caller-provided output buffer
 /// (Phase-0 slice coverage). Elementwise multiply is the first; more ops gain

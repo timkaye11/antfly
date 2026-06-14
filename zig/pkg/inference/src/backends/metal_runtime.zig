@@ -9213,25 +9213,6 @@ pub extern fn termite_metal_decode_runtime_apply_multiply_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_icb_smoke_test(runtime: ?*RawMetalDecodeRuntime) c_int;
-pub extern fn termite_metal_decode_runtime_icb_bench(runtime: ?*RawMetalDecodeRuntime) void;
-
-/// Phase 2 ROI gate: host-encode micro-benchmark (eager re-encode vs ICB replay).
-/// Prints per-op nanos + win ratio to stderr. No-op if no runtime.
-pub fn decoderRuntimeIcbBench(self: anytype) void {
-    const runtime = self.raw_decode_runtime orelse return;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return;
-    termite_metal_decode_runtime_icb_bench(runtime);
-}
-
-/// Phase 2 ICB de-risk: run the self-contained ICB lifecycle smoke (encode one
-/// multiply into an MTLIndirectCommandBuffer, replay it, verify the result).
-/// Returns the C status (0 = pass, negative = failure code), or null if no runtime.
-pub fn decoderRuntimeIcbSmokeTest(self: anytype) ?c_int {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    return termite_metal_decode_runtime_icb_smoke_test(runtime);
-}
 pub extern fn termite_metal_decode_runtime_apply_multiply_device_rhs_repeat(
     runtime: ?*RawMetalDecodeRuntime,
     lhs_handle: ?*anyopaque,

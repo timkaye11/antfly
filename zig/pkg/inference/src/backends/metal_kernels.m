@@ -5701,29 +5701,6 @@ static id<MTLComputePipelineState> termite_metal_make_pipeline(id<MTLDevice> dev
     return pipeline;
 }
 
-// Build a compute PSO that is usable inside an MTLIndirectCommandBuffer (requires
-// supportIndirectCommandBuffers=YES, which termite_metal_make_pipeline does NOT set).
-static id<MTLComputePipelineState> termite_metal_make_pipeline_icb(id<MTLDevice> device, id<MTLLibrary> library, NSString *name) {
-    if (device == nil || library == nil) return nil;
-    id<MTLFunction> function = [library newFunctionWithName:name];
-    if (function == nil) {
-        fprintf(stderr, "metal-make-pipeline-icb missing-function name=%s\n", name.UTF8String);
-        return nil;
-    }
-    MTLComputePipelineDescriptor *pd = [[MTLComputePipelineDescriptor alloc] init];
-    pd.computeFunction = function;
-    pd.supportIndirectCommandBuffers = YES;
-    NSError *error = nil;
-    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithDescriptor:pd
-                                                                                 options:MTLPipelineOptionNone
-                                                                              reflection:nil
-                                                                                   error:&error];
-    if (pipeline == nil && error != nil) {
-        fprintf(stderr, "metal-make-pipeline-icb name=%s error=%s\n", name.UTF8String, error.localizedDescription.UTF8String);
-    }
-    return pipeline;
-}
-
 static MPSMatrixMultiplication *termite_metal_decode_runtime_cached_mps_mm(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -12015,6 +11992,10 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
         runtime->graph_plan_capacities[slot] = 0;
         runtime->graph_plan_requested_bytes[slot] = 0;
     }
+    runtime->attn_bwd_p_scratch = nil;
+    runtime->attn_bwd_p_scratch_capacity = 0;
+    runtime->attn_bwd_dscore_scratch = nil;
+    runtime->attn_bwd_dscore_scratch_capacity = 0;
     runtime->graph_plan_active = 0;
     runtime->graph_plan_count = 0;
     runtime->graph_plan_allocations = 0;
@@ -25685,204 +25666,6 @@ int termite_metal_decode_runtime_apply_multiply(
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
-    }
-}
-
-// Phase 2 ROI gate: host-encode micro-benchmark. Compares the STEADY-STATE
-// per-step host encode cost of the two replay models over N independent dispatches:
-//   Path A (current): re-encode N eager dispatches each step
-//     (setComputePipelineState + setBuffer x4 + dispatchThreadgroups per op).
-//   Path B (ICB): ICB built ONCE (amortized), replay each step as
-//     N x (executeCommandsInBuffer(range 1) + memoryBarrier) — the worst case for a
-//     deep dependency chain where every op needs a barrier from its predecessor.
-// The Path A / Path B ratio is the ICB win CEILING (GPU time is identical; this
-// isolates host encode). Prints per-op nanos for each. NOT correctness — buffers
-// are shared across all N (host-encode cost is shape/data-independent).
-void termite_metal_decode_runtime_icb_bench(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL || runtime->device == nil || runtime->queue == nil || runtime->library == nil) return;
-    @autoreleasepool {
-        id<MTLComputePipelineState> icb_pso = termite_metal_make_pipeline_icb(runtime->device, runtime->library, @"termite_apply_multiply_1x");
-        id<MTLComputePipelineState> eager_pso = runtime->multiply_pipeline;
-        if (icb_pso == nil || eager_pso == nil) { fprintf(stderr, "icb_bench: missing pso\n"); return; }
-        const uint32_t N = 2000u;
-        const uint32_t dim = 256u;
-        const size_t bytes = dim * sizeof(float);
-        id<MTLBuffer> a = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        termite_metal_apply_add_params params = { .rows = 1u, .dim = dim, .flags = 0u, .reserved = 0u };
-        id<MTLBuffer> params_buf = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
-        if (a == nil || b == nil || out == nil || params_buf == nil) return;
-        NSUInteger tw = eager_pso.maxTotalThreadsPerThreadgroup;
-        if (tw == 0) tw = 64; if (tw > dim) tw = dim;
-        const NSUInteger tg = (dim + tw - 1) / tw;
-
-        // ---- Path A: eager re-encode of N dispatches (host encode only) ----
-        const uint64_t a_start = termite_metal_clock_monotonic_nanos();
-        id<MTLCommandBuffer> cbA = [runtime->queue commandBuffer];
-        id<MTLComputeCommandEncoder> encA = [cbA computeCommandEncoder];
-        for (uint32_t i = 0; i < N; ++i) {
-            [encA setComputePipelineState:eager_pso];
-            [encA setBuffer:a offset:0 atIndex:0];
-            [encA setBuffer:b offset:0 atIndex:1];
-            [encA setBuffer:out offset:0 atIndex:2];
-            [encA setBytes:&params length:sizeof(params) atIndex:3];
-            [encA dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-        }
-        [encA endEncoding];
-        const uint64_t a_end = termite_metal_clock_monotonic_nanos();
-        [cbA commit];
-
-        // ---- Path B build: ICB with N commands (one-time, amortized) ----
-        const uint64_t bld_start = termite_metal_clock_monotonic_nanos();
-        MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO; desc.inheritPipelineState = NO; desc.maxKernelBufferBindCount = 4;
-        id<MTLIndirectCommandBuffer> icb = [runtime->device newIndirectCommandBufferWithDescriptor:desc maxCommandCount:N options:0];
-        if (icb == nil) { fprintf(stderr, "icb_bench: icb alloc failed\n"); return; }
-        for (uint32_t i = 0; i < N; ++i) {
-            id<MTLIndirectComputeCommand> cmd = [icb indirectComputeCommandAtIndex:i];
-            [cmd setComputePipelineState:icb_pso];
-            [cmd setKernelBuffer:a offset:0 atIndex:0];
-            [cmd setKernelBuffer:b offset:0 atIndex:1];
-            [cmd setKernelBuffer:out offset:0 atIndex:2];
-            [cmd setKernelBuffer:params_buf offset:0 atIndex:3];
-            [cmd concurrentDispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-        }
-        const uint64_t bld_end = termite_metal_clock_monotonic_nanos();
-
-        // ---- Path B replay: N x (executeCommandsInBuffer(1) + barrier) ----
-        const uint64_t b_start = termite_metal_clock_monotonic_nanos();
-        id<MTLCommandBuffer> cbB = [runtime->queue commandBuffer];
-        id<MTLComputeCommandEncoder> encB = [cbB computeCommandEncoder];
-        [encB useResource:a usage:MTLResourceUsageRead];
-        [encB useResource:b usage:MTLResourceUsageRead];
-        [encB useResource:params_buf usage:MTLResourceUsageRead];
-        [encB useResource:out usage:MTLResourceUsageWrite];
-        for (uint32_t i = 0; i < N; ++i) {
-            [encB executeCommandsInBuffer:icb withRange:NSMakeRange(i, 1)];
-            [encB memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        }
-        [encB endEncoding];
-        const uint64_t b_end = termite_metal_clock_monotonic_nanos();
-        [cbB commit];
-
-        const double a_per = (double)(a_end - a_start) / (double)N;
-        const double b_per = (double)(b_end - b_start) / (double)N;
-        const double bld_per = (double)(bld_end - bld_start) / (double)N;
-        fprintf(stderr,
-            "icb_bench: N=%u eager_encode=%.1f ns/op  icb_replay=%.1f ns/op  icb_build(amortized)=%.1f ns/op  win_ratio=%.2fx  per_op_saving=%.1f ns\n",
-            N, a_per, b_per, bld_per, b_per > 0.0 ? a_per / b_per : 0.0, a_per - b_per);
-    }
-}
-
-// Phase 2 ICB de-risk smoke: encode ONE multiply dispatch into an
-// MTLIndirectCommandBuffer, replay it via executeCommandsInBuffer, and verify
-// out[i] == a[i]*b[i]. Returns 0 on success, negative on any failure. Proves the
-// ICB lifecycle (descriptor -> indirectComputeCommand -> executeCommandsInBuffer
-// + useResource residency) works for our compute PSOs before the full hybrid
-// integration. Standalone: owns its own buffers + command buffer, no frame state.
-int termite_metal_decode_runtime_icb_smoke_test(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL) return -1;
-    if (runtime->device == nil || runtime->queue == nil) return -2;
-    if (runtime->library == nil) return -3;
-    @autoreleasepool {
-        // Dependent 2-op chain in ONE ICB run: out1 = a*b (cmd 0), out2 = out1 + c
-        // (cmd 1). cmd 1 READS cmd 0's output → tests whether executeCommandsInBuffer
-        // orders dependent commands and makes cmd 0's writes visible to cmd 1.
-        // MTLIndirectCommandTypeConcurrentDispatch + useResource (untracked) inserts
-        // NO automatic barriers, so this is the key architecture question for the
-        // hybrid replay: can a contiguous icb_ok run contain a producer->consumer
-        // chain, or must runs break (or insert barriers) at every dependency?
-        id<MTLComputePipelineState> mul_pso = termite_metal_make_pipeline_icb(runtime->device, runtime->library, @"termite_apply_multiply_1x");
-        id<MTLComputePipelineState> add_pso = termite_metal_make_pipeline_icb(runtime->device, runtime->library, @"termite_apply_add_1x");
-        if (mul_pso == nil || add_pso == nil) return -13;
-
-        const uint32_t dim = 8u;
-        const size_t bytes = dim * sizeof(float);
-        id<MTLBuffer> a = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> c = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out1 = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> out2 = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        if (a == nil || b == nil || c == nil || out1 == nil || out2 == nil) return -4;
-        float *ap = (float *)a.contents;
-        float *bp = (float *)b.contents;
-        float *cp = (float *)c.contents;
-        float *o1 = (float *)out1.contents;
-        float *o2 = (float *)out2.contents;
-        for (uint32_t i = 0; i < dim; ++i) { ap[i] = (float)(i + 1u); bp[i] = 2.0f; cp[i] = 100.0f; o1[i] = -1.0f; o2[i] = -1.0f; }
-        termite_metal_apply_add_params params = { .rows = 1u, .dim = dim, .flags = 0u, .reserved = 0u };
-        id<MTLBuffer> params_buf = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
-        if (params_buf == nil) return -5;
-
-        MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
-        desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        desc.inheritBuffers = NO;
-        desc.inheritPipelineState = NO;
-        desc.maxKernelBufferBindCount = 4;
-        id<MTLIndirectCommandBuffer> icb = [runtime->device newIndirectCommandBufferWithDescriptor:desc maxCommandCount:2 options:0];
-        if (icb == nil) return -6;
-
-        NSUInteger tw = mul_pso.maxTotalThreadsPerThreadgroup;
-        if (tw == 0) tw = 64;
-        if (tw > dim) tw = dim;
-        const NSUInteger tg = (dim + tw - 1) / tw;
-
-        // cmd 0: out1 = a * b
-        id<MTLIndirectComputeCommand> cmd0 = [icb indirectComputeCommandAtIndex:0];
-        if (cmd0 == nil) return -7;
-        [cmd0 setComputePipelineState:mul_pso];
-        [cmd0 setKernelBuffer:a offset:0 atIndex:0];
-        [cmd0 setKernelBuffer:b offset:0 atIndex:1];
-        [cmd0 setKernelBuffer:out1 offset:0 atIndex:2];
-        [cmd0 setKernelBuffer:params_buf offset:0 atIndex:3];
-        [cmd0 concurrentDispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-
-        // cmd 1: out2 = out1 + c  (depends on cmd 0's out1)
-        id<MTLIndirectComputeCommand> cmd1 = [icb indirectComputeCommandAtIndex:1];
-        if (cmd1 == nil) return -7;
-        [cmd1 setComputePipelineState:add_pso];
-        [cmd1 setKernelBuffer:out1 offset:0 atIndex:0];
-        [cmd1 setKernelBuffer:c offset:0 atIndex:1];
-        [cmd1 setKernelBuffer:out2 offset:0 atIndex:2];
-        [cmd1 setKernelBuffer:params_buf offset:0 atIndex:3];
-        [cmd1 concurrentDispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-
-        id<MTLCommandBuffer> command_buffer = [runtime->queue commandBuffer];
-        if (command_buffer == nil) return -8;
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) return -9;
-        [encoder useResource:a usage:MTLResourceUsageRead];
-        [encoder useResource:b usage:MTLResourceUsageRead];
-        [encoder useResource:c usage:MTLResourceUsageRead];
-        [encoder useResource:params_buf usage:MTLResourceUsageRead];
-        [encoder useResource:out1 usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-        [encoder useResource:out2 usage:MTLResourceUsageWrite];
-        // CORRECT replay pattern (validated by the failure of the naive single-range
-        // version: ConcurrentDispatch commands race; cmd1 read out1's stale init).
-        // Split the dependency: producer range, memory barrier, consumer range. This
-        // is the model for the hybrid replay — break icb runs at dependencies and
-        // emit a memoryBarrierWithScope:Buffers between dependent groups.
-        [encoder executeCommandsInBuffer:icb withRange:NSMakeRange(0, 1)];
-        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [encoder executeCommandsInBuffer:icb withRange:NSMakeRange(1, 1)];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -10;
-        int races = 0;
-        for (uint32_t i = 0; i < dim; ++i) {
-            const float expected = ap[i] * bp[i] + cp[i];
-            const float got = o2[i];
-            const float diff = got > expected ? got - expected : expected - got;
-            if (diff > 1e-4f) {
-                if (races == 0) fprintf(stderr, "icb_smoke: barrier-separated chain STILL wrong at %u: got=%f expected=%f (out1=%f)\n", i, (double)got, (double)expected, (double)o1[i]);
-                races++;
-            }
-        }
-        if (races > 0) return -11;
-        return 0;
     }
 }
 
