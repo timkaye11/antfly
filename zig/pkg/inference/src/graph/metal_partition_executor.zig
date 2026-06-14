@@ -593,6 +593,50 @@ pub const MetalPartitionGraphPlan = struct {
     }
 };
 
+/// Phase-0 slot-bound output pool: one persistent device buffer per
+/// `buffer_plan` tensor `AllocationId`, reused across steps (same address every
+/// step). Lives on the persistent (owned) executor. Rebuilt when the
+/// allocation fingerprint changes (shape/batch change).
+/// Per-NODE persistent output buffers (NOT reused across nodes). Each bound
+/// node gets its own device buffer with a stable address across steps. This
+/// deliberately forgoes the buffer_plan's lifetime-reuse (which introduced a
+/// data-dependent corruption when pooled add outputs shared a reused buffer) —
+/// trading memory for correctness, and giving exactly the stable-address model
+/// ICB needs. Buffers are allocated lazily (only for nodes that actually bind)
+/// and sized to the node's output_shape; reallocated if the byte size changes.
+const OutputBufferPool = struct {
+    buffers: []?CT = &.{}, // indexed by NodeId
+    byte_sizes: []u64 = &.{},
+    built: bool = false,
+
+    fn deinit(self: *OutputBufferPool, allocator: std.mem.Allocator, cb: *const ComputeBackend) void {
+        for (self.buffers) |b| {
+            if (b) |ct| cb.free(ct);
+        }
+        allocator.free(self.buffers);
+        allocator.free(self.byte_sizes);
+        self.buffers = &.{};
+        self.byte_sizes = &.{};
+        self.built = false;
+    }
+
+    /// Lazily allocate (or resize) node `node_id`'s buffer to `byte_len`,
+    /// returning the owning pool CT (the pool keeps ownership).
+    fn ensureBuffer(self: *OutputBufferPool, cb: *const ComputeBackend, node_id: NodeId, byte_len: u64) ?CT {
+        const idx: usize = @intCast(node_id);
+        if (idx >= self.buffers.len) return null;
+        if (self.buffers[idx]) |existing| {
+            if (self.byte_sizes[idx] == byte_len) return existing;
+            cb.free(existing);
+            self.buffers[idx] = null;
+        }
+        const ct = metal_compute_mod.MetalCompute.poolAllocateOutputCt(cb, @intCast(byte_len)) catch return null;
+        self.buffers[idx] = ct;
+        self.byte_sizes[idx] = byte_len;
+        return ct;
+    }
+};
+
 pub const MetalPartitionExecutor = struct {
     allocator: std.mem.Allocator,
     graph: *const Graph,
@@ -601,6 +645,7 @@ pub const MetalPartitionExecutor = struct {
     owned: bool = false,
     partition_view: ?CachedPartitionBufferView = null,
     runtime_region_plan: ?RuntimeRegionPlan = null,
+    output_pool: OutputBufferPool = .{},
 
     const vtable = PartitionExecutor.VTable{
         .execute = &executeFn,
@@ -662,7 +707,60 @@ pub const MetalPartitionExecutor = struct {
             view.deinit(self.allocator);
             self.partition_view = null;
         }
+        self.output_pool.deinit(self.allocator, self.backend);
         if (self.owned) self.allocator.destroy(self);
+    }
+
+    fn ensureOutputPool(
+        self: *MetalPartitionExecutor,
+        cb: *const ComputeBackend,
+        graph: *const Graph,
+    ) !void {
+        const node_count = graph.nodeCount();
+        if (self.output_pool.built and self.output_pool.buffers.len == node_count) return;
+        self.output_pool.deinit(self.allocator, cb);
+        const buffers = try self.allocator.alloc(?CT, node_count);
+        errdefer self.allocator.free(buffers);
+        @memset(buffers, null);
+        const byte_sizes = try self.allocator.alloc(u64, node_count);
+        errdefer self.allocator.free(byte_sizes);
+        @memset(byte_sizes, 0);
+        self.output_pool = .{ .buffers = buffers, .byte_sizes = byte_sizes, .built = true };
+    }
+
+    /// Borrowed PER-NODE pool view for `node_id`'s output, or null if not
+    /// eligible (flag off, op unsupported, graph output, unsized). With
+    /// per-node buffers there is NO reuse and NO aliasing-with-inputs (each
+    /// node owns a distinct buffer), so the reuse/alias guards are gone.
+    /// Caller owns the returned CT and frees it if the op doesn't consume it.
+    fn outputHintForNode(
+        self: *MetalPartitionExecutor,
+        cb: *const ComputeBackend,
+        graph: *const Graph,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        node_id: NodeId,
+    ) ?CT {
+        if (!self.output_pool.built) return null;
+        const node = graph.node(node_id);
+        if (!opSupportsOutputHint(node.op)) return null;
+        // Keep the owned-copy path for graph outputs (host readback after frame).
+        if (buffer_plan.slotForNode(node_id)) |slot| {
+            if (slot.roles.graph_output) return null;
+        }
+        const out_shape = node.output_shape;
+        const rank = out_shape.rank();
+        if (rank == 0 or rank > ml.graph.shape.max_rank) return null;
+        const numel = out_shape.numElements() orelse return null;
+        if (numel == 0) return null;
+        const byte_len: u64 = @as(u64, @intCast(numel)) * @sizeOf(f32);
+        const pool_ct = self.output_pool.ensureBuffer(cb, node_id, byte_len) orelse return null;
+        var dims_buf: [ml.graph.shape.max_rank]i32 = undefined;
+        for (0..rank) |ax| {
+            const d = out_shape.dim(@intCast(ax));
+            if (d <= 0) return null;
+            dims_buf[ax] = @intCast(d);
+        }
+        return metal_compute_mod.MetalCompute.ctFromPoolCtView(cb, pool_ct, dims_buf[0..rank]) catch null;
     }
 
     fn partitionBufferView(
@@ -798,6 +896,17 @@ pub const MetalPartitionExecutor = struct {
             for (metal_graph_plan.slots) |slot| stats.graph_plan_bytes_reserved += slot.bytes;
         }
 
+        // Phase-0 slot-bound output pool (persistent executor only). Binds
+        // node outputs to fixed device buffers reused across steps.
+        const slot_bound_outputs = self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
+        if (slot_bound_outputs) self.ensureOutputPool(cb, graph) catch {};
+
+        // Phase 2 ICB de-risk smoke (one-shot, gated by TERMITE_METAL_ICB_SMOKE).
+        if (!icb_smoke_done and cb.kind() == .metal) {
+            icb_smoke_done = true;
+            metal_compute_mod.MetalCompute.runIcbSmokeIfRequested(cb);
+        }
+
         const options = exec_ctx.options orelse interpreter.ExecuteOptions{
             .attention = if (exec_ctx.attention) |attention| attention.* else null,
             .embedding_ids = exec_ctx.embedding_ids,
@@ -894,6 +1003,11 @@ pub const MetalPartitionExecutor = struct {
             .last_use = last_use,
             .pair_second = if (exec_ctx.pair_second) |pair| pair.* else null,
         };
+
+        // Per-step disentangled-attention padding-mask cache (computed once,
+        // reused across all attention calls this step — see AttnMaskCache).
+        var attn_mask_cache: AttnMaskCache = .{};
+        defer if (attn_mask_cache.mask) |m| allocator.free(m);
         defer exec_state.freeMoeState();
 
         const skipped_nodes = try allocator.alloc(bool, values.len);
@@ -1159,10 +1273,24 @@ pub const MetalPartitionExecutor = struct {
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     const command_path_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-                    const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
-                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state)
+                    const output_hint: ?CT = if (slot_bound_outputs)
+                        self.outputHintForNode(cb, graph, buffer_plan, node_id)
                     else
                         null;
+                    const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
+                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache)
+                    else
+                        null;
+                    // Free an unconsumed pooled-output view (op didn't take the hint).
+                    if (output_hint) |hint| {
+                        const consumed = if (command_output_opt) |co| co == hint else false;
+                        if (consumed) {
+                            slot_bound_consumed_total += 1;
+                        } else {
+                            slot_bound_fallback_total += 1;
+                            cb.free(hint);
+                        }
+                    }
                     if (command_output_opt) |command_output| {
                         if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_hit partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                         values[i] = command_output;
@@ -1370,6 +1498,9 @@ pub const MetalPartitionExecutor = struct {
             printOpExecutionStats("metal_partition_host_output_reasons", &op_execution_stats.host_output_reason_counts, op_execution_stats.host_output_reason_used);
         }
         if (collect_loop_profile) loop_profile.print("metal_partition_loop_profile");
+        if (slot_bound_outputs and collect_loop_profile) {
+            std.debug.print("metal_slot_bound_outputs: consumed={d} fallback={d} pool_allocs={d}\n", .{ slot_bound_consumed_total, slot_bound_fallback_total, self.output_pool.buffers.len });
+        }
         if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_end partition={d}\n", .{partition_index});
     }
 };
@@ -1746,7 +1877,7 @@ fn materializeDeferredSkippedInputs(
         // deferred mul); resolve the producer's own skipped inputs first.
         try materializeDeferredSkippedInputs(allocator, graph, cb, values, value_device, device_id, input_id, skipped_nodes, exec_state, depth + 1);
         if (interpreterFallbackHasMissingInput(graph, values, input_id)) continue;
-        const materialized = (try tryExecuteMetalCommand(allocator, graph, cb, values, input_id, null, exec_state)) orelse
+        const materialized = (try tryExecuteMetalCommand(allocator, graph, cb, values, input_id, null, exec_state, null, null)) orelse
             try interpreter.executeNode(graph, cb, values, input_id, exec_state);
         values[input_index] = materialized;
         if (input_index < value_device.len) value_device[input_index] = device_id;
@@ -2217,6 +2348,26 @@ fn nsToMs(ns: u64) f64 {
 
 fn traceMetalGraphNodesEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_NODES", false);
+}
+
+fn slotBoundOutputsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_SLOT_BOUND_OUTPUTS", false);
+}
+
+// Phase-0 coverage counters (process-wide; executor runs single-threaded).
+var slot_bound_consumed_total: usize = 0;
+var slot_bound_fallback_total: usize = 0;
+var icb_smoke_done: bool = false;
+
+/// Ops whose device path can write into a caller-provided output buffer
+/// (Phase-0 slice coverage). Elementwise multiply is the first; more ops gain
+/// `*Into` variants in later slices.
+fn opSupportsOutputHint(op: anytype) bool {
+    return switch (op) {
+        // Per-node buffers (no reuse) make these safe.
+        .mul, .fused_elem_multiply, .add, .fused_elem_add, .transpose, .dot_general, .reduce_sum, .reduce_max, .reduce_mean, .broadcast_in_dim, .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs, .sub, .div, .fused_gelu, .fused_relu, .fused_silu, .fused_quick_gelu => true,
+        else => false,
+    };
 }
 
 fn metalGraphProgressInterval() usize {
@@ -5797,6 +5948,41 @@ fn traceDebertaAttentionExecutionDecline(reason: []const u8, pattern: DebertaAtt
     );
 }
 
+// Per-step cache for the disentangled-attention padding mask. The mask is
+// derived from `attn_bias < -1e8` (padding only) and is IDENTICAL across every
+// attention layer and the fwd/bwd of a step — a standard transformer property.
+// Without this, each of the ~24 attention calls/step does a full device->host
+// readback of the [B,H,S,S] bias (toFloat32) just to recover B*S padding bits,
+// forcing a frame sync each time. Cached, the readback happens once per step.
+const AttnMaskCache = struct {
+    mask: ?[]i64 = null,
+    batch: usize = 0,
+    seq_len: usize = 0,
+    num_heads: usize = 0,
+};
+
+fn cachedAttentionMaskFromBias(
+    cache: ?*AttnMaskCache,
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    attn_bias: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+) ![]i64 {
+    if (cache) |c| {
+        if (c.mask) |m| {
+            if (c.batch == batch and c.seq_len == seq_len and c.num_heads == num_heads) return m;
+            allocator.free(m);
+            c.mask = null;
+        }
+        const m = try attentionMaskFromBias(allocator, cb, attn_bias, batch, seq_len, num_heads);
+        c.* = .{ .mask = m, .batch = batch, .seq_len = seq_len, .num_heads = num_heads };
+        return m;
+    }
+    return attentionMaskFromBias(allocator, cb, attn_bias, batch, seq_len, num_heads);
+}
+
 fn attentionMaskFromBias(
     allocator: std.mem.Allocator,
     cb: *const ComputeBackend,
@@ -5912,7 +6098,7 @@ fn executeFfnGeluBackwardPattern(
     value_device[@intCast(pattern.second_branch_dot_id)] = device_id;
 
     const add_node = graph.node(pattern.upstream_add_id);
-    const upstream = (try executeRuntimeAdd(graph, cb, values, add_node.getInputs(), add_node.output_shape)) orelse {
+    const upstream = (try executeRuntimeAdd(graph, cb, values, add_node.getInputs(), add_node.output_shape, null)) orelse {
         values[@intCast(pattern.second_branch_dot_id)] = null;
         values[@intCast(pattern.first_dot_id)] = null;
         cb.free(second_branch);
@@ -9094,13 +9280,35 @@ const RuntimeUnaryOp = enum {
     abs,
 };
 
+fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
+    return switch (op) {
+        .negate => 6,
+        .sqrt => 7,
+        .rsqrt => 8,
+        .exp => 9,
+        .log => 10,
+        .sin => 11,
+        .cos => 12,
+        .tanh => 13,
+        .erf => 14,
+        .abs => 15,
+    };
+}
+
 fn executeRuntimeUnary(
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
     op: RuntimeUnaryOp,
+    output_hint: ?CT,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
+    // Slot-bound output: write the unary result directly into the pooled buffer.
+    if (output_hint) |hint| {
+        if (isMetalDeviceResident(cb, input)) {
+            if (try metal_compute_mod.MetalCompute.unaryInto(cb, input, runtimeUnaryActivationKind(op), hint)) |out| return out;
+        }
+    }
     return switch (op) {
         .negate => cb.primNegate(input),
         .sqrt => cb.primSqrt(input),
@@ -9126,6 +9334,8 @@ fn tryExecuteMetalCommand(
     node_id: NodeId,
     op_plan: ?OperatorPlan,
     exec_state: *interpreter.ExecState,
+    output_hint: ?CT,
+    attn_mask_cache: ?*AttnMaskCache,
 ) !?CT {
     const n = graph.node(node_id);
     const inputs = n.getInputs();
@@ -9153,8 +9363,8 @@ fn tryExecuteMetalCommand(
             defer cb.free(q_r);
             const k_r = cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, hh }, &.{ 1, 1 }, &qr_shape) catch break :blk null;
             defer cb.free(k_r);
-            const mask = attentionMaskFromBias(allocator, cb, bias, attrs.batch, attrs.seq_len, attrs.num_heads) catch break :blk null;
-            defer allocator.free(mask);
+            const mask = cachedAttentionMaskFromBias(attn_mask_cache, allocator, cb, bias, attrs.batch, attrs.seq_len, attrs.num_heads) catch break :blk null;
+            defer if (attn_mask_cache == null) allocator.free(mask);
             break :blk cb.disentangledRelativeAttention(q, k, v, q_r, k_r, mask, attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim) catch |err| switch (err) {
                 error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
                 else => return err,
@@ -9180,8 +9390,8 @@ fn tryExecuteMetalCommand(
             defer cb.free(q_r);
             const k_r = cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, hh }, &.{ 1, 1 }, &qr_shape) catch break :blk null;
             defer cb.free(k_r);
-            const mask = attentionMaskFromBias(allocator, cb, bias, attrs.batch, attrs.seq_len, attrs.num_heads) catch break :blk null;
-            defer allocator.free(mask);
+            const mask = cachedAttentionMaskFromBias(attn_mask_cache, allocator, cb, bias, attrs.batch, attrs.seq_len, attrs.num_heads) catch break :blk null;
+            defer if (attn_mask_cache == null) allocator.free(mask);
             break :blk cb.disentangledRelativeAttentionBackward(q, k, v, q_r, k_r, mask, d_out, attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim) catch |err| switch (err) {
                 error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
                 else => return err,
@@ -9221,6 +9431,12 @@ fn tryExecuteMetalCommand(
             const in_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &in_shape_buf);
             var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
             const perm = transpose_utils.effectivePerm(attrs, graph.node(inputs[0]).output_shape.rank(), &perm_buf);
+            // Slot-bound output: transpose directly into the per-node pool buffer.
+            if (output_hint) |hint| {
+                if (input_source_resident) {
+                    if (try metal_compute_mod.MetalCompute.transposeInto(cb, input, perm, in_shape, hint)) |out| break :blk out;
+                }
+            }
             const transposed = cb.primTranspose(input, perm, in_shape) catch |err| switch (err) {
                 error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
                 else => return err,
@@ -9235,42 +9451,42 @@ fn tryExecuteMetalCommand(
             }
             break :blk transposed;
         },
-        .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs),
-        .neg => try executeRuntimeUnary(cb, values, inputs, .negate),
-        .sqrt => try executeRuntimeUnary(cb, values, inputs, .sqrt),
-        .rsqrt => try executeRuntimeUnary(cb, values, inputs, .rsqrt),
-        .exp => try executeRuntimeUnary(cb, values, inputs, .exp),
-        .log => try executeRuntimeUnary(cb, values, inputs, .log),
-        .sin => try executeRuntimeUnary(cb, values, inputs, .sin),
-        .cos => try executeRuntimeUnary(cb, values, inputs, .cos),
-        .tanh => try executeRuntimeUnary(cb, values, inputs, .tanh),
-        .erf => try executeRuntimeUnary(cb, values, inputs, .erf),
-        .abs => try executeRuntimeUnary(cb, values, inputs, .abs),
+        .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs, output_hint),
+        .neg => try executeRuntimeUnary(cb, values, inputs, .negate, output_hint),
+        .sqrt => try executeRuntimeUnary(cb, values, inputs, .sqrt, output_hint),
+        .rsqrt => try executeRuntimeUnary(cb, values, inputs, .rsqrt, output_hint),
+        .exp => try executeRuntimeUnary(cb, values, inputs, .exp, output_hint),
+        .log => try executeRuntimeUnary(cb, values, inputs, .log, output_hint),
+        .sin => try executeRuntimeUnary(cb, values, inputs, .sin, output_hint),
+        .cos => try executeRuntimeUnary(cb, values, inputs, .cos, output_hint),
+        .tanh => try executeRuntimeUnary(cb, values, inputs, .tanh, output_hint),
+        .erf => try executeRuntimeUnary(cb, values, inputs, .erf, output_hint),
+        .abs => try executeRuntimeUnary(cb, values, inputs, .abs, output_hint),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
         .gather => |attrs| try executeRuntimeGather(graph, cb, values, inputs, attrs),
         .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, inputs, attrs),
-        .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape),
+        .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape, output_hint),
         .fused_gelu_backward => try executeRuntimeGeluBackward(cb, values, inputs, n.output_shape),
-        .fused_relu => try executeRuntimeActivation(cb, values, inputs, .relu, n.output_shape),
-        .fused_silu => try executeRuntimeActivation(cb, values, inputs, .silu, n.output_shape),
-        .fused_quick_gelu => try executeRuntimeActivation(cb, values, inputs, .quick_gelu, n.output_shape),
+        .fused_relu => try executeRuntimeActivation(cb, values, inputs, .relu, n.output_shape, output_hint),
+        .fused_silu => try executeRuntimeActivation(cb, values, inputs, .silu, n.output_shape, output_hint),
+        .fused_quick_gelu => try executeRuntimeActivation(cb, values, inputs, .quick_gelu, n.output_shape, output_hint),
         .fused_sigmoid => try executeRuntimeFusedUnary(cb, values, inputs, .sigmoid),
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
-        .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape),
-        .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply),
-        .sub => try executeRuntimeBinary(cb, values, inputs, .subtract),
-        .div => try executeRuntimeBinary(cb, values, inputs, .divide),
-        .less_than => try executeRuntimeBinary(cb, values, inputs, .less_than),
+        .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape, output_hint),
+        .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply, output_hint),
+        .sub => try executeRuntimeBinary(cb, values, inputs, .subtract, output_hint),
+        .div => try executeRuntimeBinary(cb, values, inputs, .divide, output_hint),
+        .less_than => try executeRuntimeBinary(cb, values, inputs, .less_than, null),
         .where_select => try executeRuntimeWhereSelect(cb, values, inputs),
-        .reduce_sum => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .sum),
-        .reduce_max => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .max),
-        .reduce_mean => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .mean),
+        .reduce_sum => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .sum, output_hint),
+        .reduce_max => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .max, output_hint),
+        .reduce_mean => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .mean, output_hint),
         .fused_softmax => |attrs| try executeRuntimeSoftmax(cb, values, inputs, attrs.dim),
         .fused_log_softmax => |attrs| try executeRuntimeLogSoftmax(cb, values, inputs, attrs.dim),
         .fused_sdpa => |attrs| try executeRuntimeSdpa(cb, values, inputs, attrs, op_plan, exec_state),
         .fused_gqa_causal_attention => |attrs| try executeRuntimeGqaCausalAttention(cb, values, inputs, attrs, n.num_inputs, exec_state),
-        .dot_general => |attrs| try executeRuntimeDotGeneral(graph, cb, values, inputs, attrs, op_plan),
+        .dot_general => |attrs| try executeRuntimeDotGeneralHinted(graph, cb, values, inputs, attrs, op_plan, output_hint),
         .conv_general => |attrs| try executeRuntimeConvGeneral(graph, cb, values, inputs, attrs),
         .fused_conv1d => |attrs| try executeRuntimeConv1d(graph, cb, values, inputs, attrs),
         .fused_conv2d => |attrs| try executeRuntimeConv2d(graph, cb, values, inputs, attrs),
@@ -9294,6 +9510,16 @@ fn tryExecuteMetalCommand(
         .fused_zero_tensor => |attrs| try executeRuntimeZeroTensor(cb, attrs.rows, attrs.out_dim),
         .fused_rope => |attrs| try executeRuntimeRope(cb, values, inputs, attrs, exec_state),
         .fused_layer_norm => |attrs| try executeRuntimeLayerNorm(cb, values, inputs, attrs.dim, attrs.eps, n.output_shape),
+        .fused_layer_norm_backward => |attrs| blk: {
+            const input = valueFor(values, inputs[0]) orelse break :blk null;
+            const gamma = valueFor(values, inputs[1]) orelse break :blk null;
+            const beta = valueFor(values, inputs[2]) orelse break :blk null;
+            const dy = valueFor(values, inputs[3]) orelse break :blk null;
+            break :blk cb.layerNormBackward(input, gamma, beta, dy, attrs.dim, attrs.eps) catch |err| switch (err) {
+                error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
         .fused_rms_norm => |attrs| try executeRuntimeRmsNorm(cb, values, inputs, attrs.dim, attrs.eps, n.output_shape),
         else => null,
     };
@@ -9594,6 +9820,7 @@ fn executeRuntimeBroadcast(
     inputs: []const NodeId,
     input_shape: ml.graph.Shape,
     attrs: anytype,
+    output_hint: ?CT,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     var in_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
@@ -9605,6 +9832,19 @@ fn executeRuntimeBroadcast(
     const target_rank = attrs.target_shape.rank();
     if (target_rank > target_shape_buf.len) return error.UnsupportedShape;
     for (0..target_rank) |axis| target_shape_buf[axis] = attrs.target_shape.dim(@intCast(axis));
+
+    // Slot-bound output: identity-axis last-dim broadcast directly into the pooled buffer.
+    if (output_hint) |hint| {
+        if (isMetalDeviceResident(cb, input) and in_rank == target_rank) {
+            var identity = true;
+            for (attrs.broadcast_axes[0..attrs.num_axes], 0..) |axis, i| {
+                if (axis != i) identity = false;
+            }
+            if (identity and attrs.num_axes == in_rank) {
+                if (try metal_compute_mod.MetalCompute.broadcastLastDimInto(cb, input, in_shape_buf[0..in_rank], target_shape_buf[0..target_rank], hint)) |out| return out;
+            }
+        }
+    }
 
     return cb.primBroadcastInDim(
         input,
@@ -9630,11 +9870,23 @@ fn executeRuntimeReduce(
     inputs: []const NodeId,
     attrs: anytype,
     comptime op: RuntimeReduceOp,
+    output_hint: ?CT,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     var in_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
     const in_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &in_shape_buf);
     const axes = attrs.axes[0..attrs.num_axes];
+    // Slot-bound output: last-axis reduce directly into the pooled buffer.
+    if (output_hint) |hint| {
+        if (isMetalDeviceResident(cb, input)) {
+            const kind_id: u32 = switch (op) {
+                .sum => 0,
+                .max => 1,
+                .mean => 2,
+            };
+            if (try metal_compute_mod.MetalCompute.reduceLastDimInto(cb, input, axes, in_shape, kind_id, hint)) |out| return out;
+        }
+    }
     return switch (op) {
         .sum => cb.primReduceSum(input, axes, in_shape),
         .max => cb.primReduceMax(input, axes, in_shape),
@@ -9657,6 +9909,7 @@ fn executeRuntimeBinary(
     values: []?CT,
     inputs: []const NodeId,
     op: RuntimeBinaryOp,
+    output_hint: ?CT,
 ) !?CT {
     var lhs = valueFor(values, inputs[0]) orelse return null;
     var rhs = valueFor(values, inputs[1]) orelse return null;
@@ -9675,6 +9928,17 @@ fn executeRuntimeBinary(
             if (try makeMetalDeviceResident(cb, rhs)) |device_rhs| {
                 if (device_rhs != rhs) owned_rhs = device_rhs;
                 rhs = device_rhs;
+            }
+        }
+        // Slot-bound output: write a*b directly into the pooled buffer.
+        // force_barrier guards reused pooled buffers against non-declaring
+        // consumer reads (conservative: barrier on every pooled write).
+        if (output_hint) |hint| {
+            switch (op) {
+                .multiply => if (try metal_compute_mod.MetalCompute.multiplyInto(cb, lhs, rhs, hint, false)) |out| return out,
+                .subtract => if (try metal_compute_mod.MetalCompute.subtractInto(cb, lhs, rhs, hint)) |out| return out,
+                .divide => if (try metal_compute_mod.MetalCompute.divideInto(cb, lhs, rhs, hint)) |out| return out,
+                .less_than => {},
             }
         }
     }
@@ -9787,6 +10051,40 @@ fn executeRuntimeLinearNoBiasGrouped(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+/// Command-path wrapper: try the slot-bound 2D matmul-into for the simple
+/// (single-contracting, no-batch, 2D, device-resident) case before falling
+/// back to the general dot_general path. Region executors call
+/// `executeRuntimeDotGeneral` directly (no hint).
+fn executeRuntimeDotGeneralHinted(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    attrs: anytype,
+    op_plan: ?OperatorPlan,
+    output_hint: ?CT,
+) !?CT {
+    if (output_hint) |hint| try_hint: {
+        if (attrs.num_contracting != 1 or attrs.num_batch != 0) break :try_hint;
+        const lhs = valueFor(values, inputs[0]) orelse break :try_hint;
+        const rhs = valueFor(values, inputs[1]) orelse break :try_hint;
+        if (!isMetalDeviceResident(cb, lhs) or !isMetalDeviceResident(cb, rhs)) break :try_hint;
+        const lhs_shape = graph.node(inputs[0]).output_shape;
+        const rhs_shape = graph.node(inputs[1]).output_shape;
+        if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2) break :try_hint;
+        const lc = attrs.lhs_contracting[0];
+        const rc = attrs.rhs_contracting[0];
+        if (lc != 1 or rc > 1) break :try_hint;
+        const m = positiveI64ToUsize(lhs_shape.dim(0)) orelse break :try_hint;
+        const k = positiveI64ToUsize(lhs_shape.dim(1)) orelse break :try_hint;
+        const rhs_k = positiveI64ToUsize(rhs_shape.dim(@intCast(rc))) orelse break :try_hint;
+        const n = positiveI64ToUsize(rhs_shape.dim(@intCast(1 - @as(usize, rc)))) orelse break :try_hint;
+        if (k != rhs_k) break :try_hint;
+        if (try metal_compute_mod.MetalCompute.dotGeneral2DInto(cb, lhs, rhs, m, n, k, rc, hint)) |out| return out;
+    }
+    return executeRuntimeDotGeneral(graph, cb, values, inputs, attrs, op_plan);
 }
 
 fn executeRuntimeDotGeneral(
@@ -10320,9 +10618,18 @@ fn executeRuntimeActivation(
     inputs: []const NodeId,
     kind: ops_mod.DecoderRuntimeActivationKind,
     output_shape: ml.graph.Shape,
+    output_hint: ?CT,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const dim = tensorElementCount(output_shape) orelse return null;
+    // Slot-bound output: write the activation directly into the pooled buffer.
+    // gelu/relu/silu/quick_gelu are elementwise, so the rows/dim split is
+    // immaterial — pass the full element count (rows=1) like the eager path.
+    if (output_hint) |hint| {
+        if (isMetalDeviceResident(cb, input)) {
+            if (try metal_compute_mod.MetalCompute.activationInto(cb, input, @intFromEnum(kind), dim, hint)) |out| return out;
+        }
+    }
     if (try cb.decoderRuntimeApplyActivation(&.{
         .input = input,
         .kind = kind,
@@ -10433,12 +10740,20 @@ fn executeRuntimeAdd(
     values: []?CT,
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
+    output_hint: ?CT,
 ) !?CT {
     const dim = tensorElementCount(output_shape) orelse return null;
     if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     const lhs = valueFor(values, inputs[0]) orelse return null;
     const rhs = valueFor(values, inputs[1]) orelse return null;
+    // Slot-bound output: same-shape elementwise add into the pooled buffer
+    // (both operands already device-resident; addInto self-checks equal sizes).
+    if (output_hint) |hint| {
+        if (isMetalDeviceResident(cb, lhs) and isMetalDeviceResident(cb, rhs)) {
+            if (try metal_compute_mod.MetalCompute.addInto(cb, lhs, rhs, hint, false)) |out| return out;
+        }
+    }
     if (isMetalDeviceResident(cb, lhs) or isMetalDeviceResident(cb, rhs)) {
         return cb.add(lhs, rhs) catch |err| switch (err) {
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
@@ -13551,7 +13866,7 @@ test "metal partition executor runtime add keeps resident input device backed" {
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 
@@ -13601,7 +13916,7 @@ test "metal partition executor runtime rms norm supports row-wise resident shape
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 

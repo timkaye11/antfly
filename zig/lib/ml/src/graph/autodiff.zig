@@ -670,6 +670,36 @@ fn applyVjp(
             // attn_bias (ins[2]) is a frozen padding mask — no gradient.
         },
 
+        .fused_layer_norm => |attrs| {
+            // Only reached when the fused op survived lowering (the
+            // `fuse_layer_norm_backward` builder flag was on, so it carries no
+            // vjp_alternate). Backward yields gradients for input, gamma, beta.
+            const in_shape = g.node(ins[0]).output_shape;
+            const dtype = in_shape.dtype;
+            const dim: i64 = @intCast(attrs.dim);
+            const rank = in_shape.rank();
+            var rows: i64 = 1;
+            for (0..rank - 1) |ax| rows *= in_shape.dim(@intCast(ax));
+
+            const grad_packed = try b.graph.addNode(.{
+                .op = .{ .fused_layer_norm_backward = attrs },
+                .output_shape = Shape.init(dtype, &.{ rows + 2, dim }),
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+
+            const d_input_2d = try sliceRows(b, grad_packed, 0, rows, dim, dtype);
+            const d_input = if (rank == 2) d_input_2d else try b.reshape(d_input_2d, in_shape);
+            const d_gamma_row = try sliceRows(b, grad_packed, rows, rows + 1, dim, dtype);
+            const d_gamma = try b.reshape(d_gamma_row, g.node(ins[1]).output_shape);
+            const d_beta_row = try sliceRows(b, grad_packed, rows + 1, rows + 2, dim, dtype);
+            const d_beta = try b.reshape(d_beta_row, g.node(ins[2]).output_shape);
+            try accumulate(b, adjoints, ins[0], d_input);
+            try accumulate(b, adjoints, ins[1], d_gamma);
+            try accumulate(b, adjoints, ins[2], d_beta);
+        },
+
         // ── Fused ops should not appear after lowering ───────────────
         else => {
             // Fused ops should have been lowered. If we hit one, it had

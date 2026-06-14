@@ -197,6 +197,11 @@ pub const GlinerAutodiffCtx = struct {
         self.graph_batch = batch;
         self.graph_seq_len = seq_len;
 
+        // Keep LayerNorm fused so autodiff differentiates it with the custom
+        // `fused_layer_norm_backward` VJP (op-count win) instead of lowering to
+        // ~11 primitives + their backward. Flag-gated, default-off.
+        bld.fuse_layer_norm_backward = deberta_graph.fuseLayerNormBackwardEnabled();
+
         // Flatten harness input_ids [B, S] → [B*S] so the shape matches the
         // `deberta_graph` expectation (its embedding lookup emits one row
         // per flat token).

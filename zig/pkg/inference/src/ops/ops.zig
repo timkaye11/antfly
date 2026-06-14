@@ -1076,6 +1076,13 @@ pub const ComputeBackend = struct {
         /// the input is at last use.
         layerNormConsumeInput: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
 
+        /// Backward of `fused_layer_norm` over the last axis. Inputs are the
+        /// forward input, gamma, beta, and the upstream adjoint dy. Returns the
+        /// packed adjoint `[rows + 2, dim]`: rows 0..rows = d_input, row `rows`
+        /// = d_gamma, row `rows+1` = d_beta. Optional; backends without it fall
+        /// back to the lowered (decomposed) backward.
+        layerNormBackward: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT = null,
+
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
 
@@ -2221,6 +2228,11 @@ pub const ComputeBackend = struct {
 
     pub fn layerNormConsumeInput(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.layerNormConsumeInput) |f| return f(self.ptr, input, gamma, beta, dim, eps);
+        return null;
+    }
+
+    pub fn layerNormBackward(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) !?CT {
+        if (self.vtable.layerNormBackward) |f| return try f(self.ptr, input, gamma, beta, dy, dim, eps);
         return null;
     }
 

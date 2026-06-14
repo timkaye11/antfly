@@ -306,6 +306,11 @@ fn fusedDisentangledAttentionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_DEBERTA_FUSED_ATTENTION", false);
 }
 
+pub fn fuseLayerNormBackwardEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    return platform.env.getenvBoolDefault("TERMITE_FUSE_LAYER_NORM", false);
+}
+
 const RelScoreIndices = struct {
     /// [S*S] i64: c2p_flat[qi*S+ki] = qi*num_rel + (qi-ki+S-1)
     c2p: NodeId,

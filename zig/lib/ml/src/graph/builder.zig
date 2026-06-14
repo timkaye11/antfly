@@ -33,6 +33,12 @@ const DType = shape_mod.DType;
 /// autograd without hand-written VJPs for fused ops (GoMLX pattern).
 pub const Builder = struct {
     graph: *Graph,
+    /// When true, `layerNorm` emits the fused op with NO `vjp_alternate`, so
+    /// lowering keeps it fused and autodiff differentiates it via the custom
+    /// `fused_layer_norm_backward` VJP rule (op-count win for training). When
+    /// false (default), it attaches the decomposed primitive subgraph and
+    /// lowering replaces the fused op with it (current behavior).
+    fuse_layer_norm_backward: bool = false,
 
     pub fn init(graph: *Graph) Builder {
         return .{ .graph = graph };
@@ -735,22 +741,27 @@ pub const Builder = struct {
     /// Used by BERT, DeBERTa, LayoutLMv3, ModernBERT. Distinct from rmsNorm.
     pub fn layerNorm(self: *Builder, input: NodeId, gamma: NodeId, beta: NodeId, dim: u32, eps: f32) !NodeId {
         const dtype = self.graph.node(input).output_shape.dtype;
-        const last_axis: u8 = self.graph.node(input).output_shape.rank() - 1;
 
-        // Decomposed: (x - mean) / sqrt(var + eps) * gamma + beta
-        const in_shape = self.graph.node(input).output_shape;
-        const mean = try self.reduceMean(input, &.{last_axis});
-        const mean_bc = try self.broadcastReduced(mean, in_shape);
-        const centered = try self.sub(input, mean_bc);
-        const centered_sq = try self.mul(centered, centered);
-        const variance = try self.reduceMean(centered_sq, &.{last_axis});
-        const eps_node = try self.scalarConst(dtype, eps);
-        const var_plus_eps = try self.add(variance, eps_node);
-        const inv_std = try self.rsqrt(var_plus_eps);
-        const inv_std_bc = try self.broadcastReduced(inv_std, in_shape);
-        const normalized = try self.mul(centered, inv_std_bc);
-        const scaled = try self.mul(normalized, gamma);
-        const decomposed = try self.add(scaled, beta);
+        // When fusing the backward, skip the decomposed primitive subgraph
+        // entirely (it would be dead nodes) so lowering keeps the fused op and
+        // the custom `fused_layer_norm_backward` VJP differentiates it.
+        const decomposed: NodeId = if (self.fuse_layer_norm_backward) null_node else blk: {
+            const last_axis: u8 = self.graph.node(input).output_shape.rank() - 1;
+            // Decomposed: (x - mean) / sqrt(var + eps) * gamma + beta
+            const in_shape = self.graph.node(input).output_shape;
+            const mean = try self.reduceMean(input, &.{last_axis});
+            const mean_bc = try self.broadcastReduced(mean, in_shape);
+            const centered = try self.sub(input, mean_bc);
+            const centered_sq = try self.mul(centered, centered);
+            const variance = try self.reduceMean(centered_sq, &.{last_axis});
+            const eps_node = try self.scalarConst(dtype, eps);
+            const var_plus_eps = try self.add(variance, eps_node);
+            const inv_std = try self.rsqrt(var_plus_eps);
+            const inv_std_bc = try self.broadcastReduced(inv_std, in_shape);
+            const normalized = try self.mul(centered, inv_std_bc);
+            const scaled = try self.mul(normalized, gamma);
+            break :blk try self.add(scaled, beta);
+        };
 
         const fused = try self.graph.addNode(.{
             .op = .{ .fused_layer_norm = .{ .dim = dim, .eps = eps } },

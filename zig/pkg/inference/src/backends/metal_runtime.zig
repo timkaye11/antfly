@@ -3263,6 +3263,26 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
     return MetalTensor.owned(output, &shape);
 }
 
+pub fn decoderRuntimeApplyActivationDeviceInto(self: anytype, input: MetalTensor, kind: u32, rows: usize, dim: usize, output_override: MetalTensor) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (rows == 0 or dim == 0) return null;
+    if (!input.isDevice() or !output_override.isDevice()) return null;
+    if (input.elemCount() != rows * dim or output_override.elemCount() != rows * dim) return null;
+    const device_rc = termite_metal_decode_runtime_apply_activation_device(
+        runtime,
+        kind,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        dim,
+        output_override.deviceHandle(),
+        output_override.deviceByteOffset(),
+    );
+    if (device_rc != 0) return null;
+    return output_override;
+}
+
 pub fn decoderRuntimeApplyGeluBackward(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -3452,11 +3472,34 @@ pub fn decoderRuntimeFfnGeluBackwardOutputF32Device(
 }
 
 pub fn decoderRuntimeApplyPrimitiveUnary(self: anytype, input: MetalTensor, activation_kind: u32) !?MetalTensor {
+    return decoderRuntimeApplyPrimitiveUnaryImpl(self, input, activation_kind, null);
+}
+
+pub fn decoderRuntimeApplyPrimitiveUnaryInto(self: anytype, input: MetalTensor, activation_kind: u32, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeApplyPrimitiveUnaryImpl(self, input, activation_kind, output_override);
+}
+
+fn decoderRuntimeApplyPrimitiveUnaryImpl(self: anytype, input: MetalTensor, activation_kind: u32, output_override: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice()) return null;
     const dim = input.elemCount();
     if (dim == 0) return null;
+    if (output_override) |override| {
+        if (!override.isDevice() or override.elemCount() != dim) return null;
+        const rc = termite_metal_decode_runtime_apply_activation_device(
+            runtime,
+            activation_kind,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            1,
+            dim,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
     var output_device = try MetalTensor.deviceAllocate(runtime, dim * @sizeOf(f32), .private, input.shape());
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_apply_activation_device(
@@ -3497,12 +3540,35 @@ pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows:
 }
 
 pub fn decoderRuntimeReduceLastDimDevice(self: anytype, input: MetalTensor, rows: usize, dim: usize, kind: u32, output_shape: []const i32) !?MetalTensor {
+    return decoderRuntimeReduceLastDimDeviceImpl(self, input, rows, dim, kind, output_shape, null);
+}
+
+pub fn decoderRuntimeReduceLastDimDeviceInto(self: anytype, input: MetalTensor, rows: usize, dim: usize, kind: u32, output_shape: []const i32, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeReduceLastDimDeviceImpl(self, input, rows, dim, kind, output_shape, output_override);
+}
+
+fn decoderRuntimeReduceLastDimDeviceImpl(self: anytype, input: MetalTensor, rows: usize, dim: usize, kind: u32, output_shape: []const i32, output_override: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice()) return null;
     if (rows == 0 or dim == 0 or kind > 2) return null;
     if (rows > std.math.maxInt(usize) / dim) return null;
     if (input.elemCount() != rows * dim) return null;
+    if (output_override) |override| {
+        if (!override.isDevice() or override.elemCount() != rows) return null;
+        const rc = termite_metal_decode_runtime_reduce_last_dim_device(
+            runtime,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            rows,
+            dim,
+            kind,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
     var output_device = try MetalTensor.deviceAllocate(runtime, rows * @sizeOf(f32), .private, output_shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_reduce_last_dim_device(
@@ -3584,6 +3650,14 @@ pub fn decoderRuntimeReduceAxisF32Device(
 }
 
 pub fn decoderRuntimeBroadcastLastDimDevice(self: anytype, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output_shape: []const i32) !?MetalTensor {
+    return decoderRuntimeBroadcastLastDimDeviceImpl(self, input, rows, in_dim, out_dim, output_shape, null);
+}
+
+pub fn decoderRuntimeBroadcastLastDimDeviceInto(self: anytype, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output_shape: []const i32, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeBroadcastLastDimDeviceImpl(self, input, rows, in_dim, out_dim, output_shape, output_override);
+}
+
+fn decoderRuntimeBroadcastLastDimDeviceImpl(self: anytype, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output_shape: []const i32, output_override: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice()) return null;
@@ -3591,6 +3665,21 @@ pub fn decoderRuntimeBroadcastLastDimDevice(self: anytype, input: MetalTensor, r
     if (in_dim != 1 and in_dim != out_dim) return null;
     if (rows > std.math.maxInt(usize) / in_dim or rows > std.math.maxInt(usize) / out_dim) return null;
     if (input.elemCount() != rows * in_dim) return null;
+    if (output_override) |override| {
+        if (!override.isDevice() or override.elemCount() != rows * out_dim) return null;
+        const rc = termite_metal_decode_runtime_broadcast_last_dim_device(
+            runtime,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            rows,
+            in_dim,
+            out_dim,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
     var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, output_shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_broadcast_last_dim_device(
@@ -4032,6 +4121,31 @@ pub fn decoderRuntimeTransposeF32Device(
     perm_u8: []const u8,
     output_shape: []const i32,
 ) !?MetalTensor {
+    return decoderRuntimeTransposeF32DeviceImpl(self, input, input_shape, perm_u8, output_shape, null);
+}
+
+/// Transpose writing into `output_override` (a per-node pool buffer) when
+/// provided; otherwise allocates. Returns the output tensor (the override on
+/// success) or null to decline.
+pub fn decoderRuntimeTransposeF32DeviceInto(
+    self: anytype,
+    input: MetalTensor,
+    input_shape: []const i64,
+    perm_u8: []const u8,
+    output_shape: []const i32,
+    output_override: MetalTensor,
+) !?MetalTensor {
+    return decoderRuntimeTransposeF32DeviceImpl(self, input, input_shape, perm_u8, output_shape, output_override);
+}
+
+fn decoderRuntimeTransposeF32DeviceImpl(
+    self: anytype,
+    input: MetalTensor,
+    input_shape: []const i64,
+    perm_u8: []const u8,
+    output_shape: []const i32,
+    output_override: ?MetalTensor,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice()) return null;
@@ -4085,6 +4199,24 @@ pub fn decoderRuntimeTransposeF32Device(
         if (output_shape[idx] != @as(i32, @intCast(dims[p]))) return null;
     }
 
+    if (output_override) |override| {
+        if (!override.isDevice() or override.elemCount() != total) return null;
+        const rc = termite_metal_decode_runtime_transpose_f32_device(
+            runtime,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            &dims,
+            &in_strides,
+            &out_strides,
+            &perm,
+            rank,
+            total,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
     var output_device = try MetalTensor.deviceAllocate(runtime, total * @sizeOf(f32), .private, output_shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_transpose_f32_device(
@@ -4113,6 +4245,32 @@ pub fn decoderRuntimeDotGeneral2DF32Device(
     k: usize,
     rhs_contract_axis: u32,
 ) !?MetalTensor {
+    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, null);
+}
+
+pub fn decoderRuntimeDotGeneral2DF32DeviceInto(
+    self: anytype,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+    output_override: MetalTensor,
+) !?MetalTensor {
+    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, output_override);
+}
+
+fn decoderRuntimeDotGeneral2DF32DeviceImpl(
+    self: anytype,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+    output_override: ?MetalTensor,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!lhs.isDevice() or !rhs.isDevice()) return null;
@@ -4120,6 +4278,24 @@ pub fn decoderRuntimeDotGeneral2DF32Device(
     if (m > std.math.maxInt(usize) / k or m > std.math.maxInt(usize) / n or n > std.math.maxInt(usize) / k) return null;
     if (lhs.elemCount() != m * k or rhs.elemCount() != n * k) return null;
     const out_shape = [_]i32{ @intCast(m), @intCast(n) };
+    if (output_override) |override| {
+        if (!override.isDevice() or override.elemCount() != m * n) return null;
+        const rc = termite_metal_decode_runtime_dot_general_2d_f32_device(
+            runtime,
+            lhs.deviceHandle(),
+            lhs.deviceByteOffset(),
+            rhs.deviceHandle(),
+            rhs.deviceByteOffset(),
+            m,
+            n,
+            k,
+            rhs_contract_axis,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
     var output_device = try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_dot_general_2d_f32_device(
@@ -4857,6 +5033,38 @@ pub fn decoderRuntimeApplyMultiply(
     return MetalTensor.owned(output, &shape);
 }
 
+pub extern fn termite_metal_decode_runtime_force_planned_compute_barrier(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+pub fn decoderRuntimeForcePlannedComputeBarrier(self: anytype) void {
+    const runtime = self.raw_decode_runtime orelse return;
+    _ = termite_metal_decode_runtime_force_planned_compute_barrier(runtime);
+}
+
+pub fn decoderRuntimeApplyAddInto(
+    self: anytype,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    output: MetalTensor,
+    dim: usize,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (dim == 0) return false;
+    if (!lhs.isDevice() or !rhs.isDevice() or !output.isDevice()) return false;
+    if (lhs.elemCount() != rhs.elemCount() or lhs.elemCount() != output.elemCount() or lhs.elemCount() == 0) return false;
+    const device_rc = termite_metal_decode_runtime_apply_add_device(
+        runtime,
+        lhs.deviceHandle(),
+        lhs.deviceByteOffset(),
+        rhs.deviceHandle(),
+        rhs.deviceByteOffset(),
+        lhs.elemCount(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    return device_rc == 0;
+}
+
 pub fn decoderRuntimeApplyMultiplyInto(
     self: anytype,
     lhs: MetalTensor,
@@ -4912,6 +5120,16 @@ fn decoderRuntimeApplyFlatBinaryDevice(
     rhs: MetalTensor,
     comptime apply_device: fn (?*RawMetalDecodeRuntime, ?*anyopaque, usize, ?*anyopaque, usize, usize, c_int, c_int, ?*anyopaque, usize) callconv(.c) c_int,
 ) !?MetalTensor {
+    return decoderRuntimeApplyFlatBinaryDeviceImpl(self, lhs, rhs, apply_device, null);
+}
+
+fn decoderRuntimeApplyFlatBinaryDeviceImpl(
+    self: anytype,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    comptime apply_device: fn (?*RawMetalDecodeRuntime, ?*anyopaque, usize, ?*anyopaque, usize, usize, c_int, c_int, ?*anyopaque, usize) callconv(.c) c_int,
+    output_override: ?MetalTensor,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!lhs.isDevice() or !rhs.isDevice()) return null;
@@ -4923,6 +5141,23 @@ fn decoderRuntimeApplyFlatBinaryDevice(
     if (lhs_count != rhs_count and !lhs_scalar and !rhs_scalar) return null;
     const elem_count = if (lhs_scalar) rhs_count else lhs_count;
     const output_shape = if (lhs_scalar) rhs.shape() else lhs.shape();
+    if (output_override) |override| {
+        if (!override.isDevice() or override.elemCount() != elem_count) return null;
+        const rc = apply_device(
+            runtime,
+            lhs.deviceHandle(),
+            lhs.deviceByteOffset(),
+            rhs.deviceHandle(),
+            rhs.deviceByteOffset(),
+            elem_count,
+            if (lhs_scalar) 1 else 0,
+            if (rhs_scalar) 1 else 0,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
     var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, output_shape);
     errdefer output_device.deinit();
     const rc = apply_device(
@@ -4945,8 +5180,16 @@ pub fn decoderRuntimeApplySubtract(self: anytype, lhs: MetalTensor, rhs: MetalTe
     return decoderRuntimeApplyFlatBinaryDevice(self, lhs, rhs, termite_metal_decode_runtime_apply_subtract_device_broadcast);
 }
 
+pub fn decoderRuntimeApplySubtractInto(self: anytype, lhs: MetalTensor, rhs: MetalTensor, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeApplyFlatBinaryDeviceImpl(self, lhs, rhs, termite_metal_decode_runtime_apply_subtract_device_broadcast, output_override);
+}
+
 pub fn decoderRuntimeApplyDivide(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
     return decoderRuntimeApplyFlatBinaryDevice(self, lhs, rhs, termite_metal_decode_runtime_apply_divide_device_broadcast);
+}
+
+pub fn decoderRuntimeApplyDivideInto(self: anytype, lhs: MetalTensor, rhs: MetalTensor, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeApplyFlatBinaryDeviceImpl(self, lhs, rhs, termite_metal_decode_runtime_apply_divide_device_broadcast, output_override);
 }
 
 pub fn decoderRuntimeApplyDivideRhsRepeat(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
@@ -5147,6 +5390,41 @@ pub fn decoderRuntimeTrainingSumSquaresF32(
         output.deviceByteOffset(),
     );
     if (rc != 0) return error.MetalTrainingSumSquaresFailed;
+    return true;
+}
+
+pub fn decoderRuntimeLayerNormBackwardF32(
+    self: anytype,
+    input: MetalTensor,
+    gamma: MetalTensor,
+    dy: MetalTensor,
+    output: MetalTensor,
+    rows: usize,
+    hidden_size: usize,
+    eps: f32,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!input.isDevice() or !gamma.isDevice() or !dy.isDevice() or !output.isDevice()) return false;
+    if (rows == 0 or hidden_size == 0) return false;
+    if (input.elemCount() < rows * hidden_size or dy.elemCount() < rows * hidden_size) return false;
+    if (gamma.elemCount() < hidden_size) return false;
+    if (output.elemCount() < (rows + 2) * hidden_size) return false;
+    const rc = termite_metal_decode_runtime_layer_norm_backward_f32(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        gamma.deviceHandle(),
+        gamma.deviceByteOffset(),
+        dy.deviceHandle(),
+        dy.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+        rows,
+        hidden_size,
+        eps,
+    );
+    if (rc != 0) return error.MetalLayerNormBackwardFailed;
     return true;
 }
 
@@ -8842,6 +9120,20 @@ pub extern fn termite_metal_decode_runtime_training_sumsq_many_f32(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_layer_norm_backward_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    gamma_handle: ?*anyopaque,
+    gamma_offset: usize,
+    dy_handle: ?*anyopaque,
+    dy_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    eps: f32,
+) c_int;
 pub extern fn termite_metal_decode_runtime_apply_rms_norm_add_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
@@ -8921,6 +9213,25 @@ pub extern fn termite_metal_decode_runtime_apply_multiply_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_icb_smoke_test(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_icb_bench(runtime: ?*RawMetalDecodeRuntime) void;
+
+/// Phase 2 ROI gate: host-encode micro-benchmark (eager re-encode vs ICB replay).
+/// Prints per-op nanos + win ratio to stderr. No-op if no runtime.
+pub fn decoderRuntimeIcbBench(self: anytype) void {
+    const runtime = self.raw_decode_runtime orelse return;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return;
+    termite_metal_decode_runtime_icb_bench(runtime);
+}
+
+/// Phase 2 ICB de-risk: run the self-contained ICB lifecycle smoke (encode one
+/// multiply into an MTLIndirectCommandBuffer, replay it, verify the result).
+/// Returns the C status (0 = pass, negative = failure code), or null if no runtime.
+pub fn decoderRuntimeIcbSmokeTest(self: anytype) ?c_int {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    return termite_metal_decode_runtime_icb_smoke_test(runtime);
+}
 pub extern fn termite_metal_decode_runtime_apply_multiply_device_rhs_repeat(
     runtime: ?*RawMetalDecodeRuntime,
     lhs_handle: ?*anyopaque,

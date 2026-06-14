@@ -1868,6 +1868,10 @@ pub fn executeNode(
             return cb.layerNorm(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs.dim, attrs.eps);
         },
 
+        .fused_layer_norm_backward => |attrs| {
+            return (try cb.layerNormBackward(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.get(ins[3]), attrs.dim, attrs.eps)) orelse error.UnsupportedPrimitiveOp;
+        },
+
         .fused_rms_norm => |attrs| {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.rmsNormConsumeInput(V.get(ins[0]), V.get(ins[1]), attrs.dim, attrs.eps)) |consumed| return consumed;
@@ -3637,6 +3641,9 @@ const TestCompute = struct {
     fn stubDeberta(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
+    fn stubDebertaBackward(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: []const i64, _: CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
+        return error.UnsupportedPrimitiveOp;
+    }
     fn stubWindowedAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: CT, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
@@ -3799,6 +3806,7 @@ const TestCompute = struct {
         .crossAttention = &stubCrossAttn,
         .relativePositionBias = &stubRelPosBias,
         .disentangledRelativeAttention = &stubDeberta,
+        .disentangledRelativeAttentionBackward = &stubDebertaBackward,
         .windowedSelfAttention = &stubWindowedAttn,
         .channelSelfAttention = &stubChannelAttn,
         .tokenGridConv2d = &stubTokenConv,

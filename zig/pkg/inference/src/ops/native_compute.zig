@@ -4392,6 +4392,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .moeSelectRoutes = null,
     .layerNorm = &layerNormOp,
     .layerNormConsumeInput = &layerNormConsumeInputOp,
+    .layerNormBackward = &layerNormBackwardOp,
     .rmsNorm = &rmsNormOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
@@ -5563,6 +5564,102 @@ fn layerNormConsumeInputOp(_: *anyopaque, input: CT, gamma: CT, beta: CT, dim: u
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.layerNorm(buf.data, getData(gamma), getData(beta), dim, eps);
     return input;
+}
+
+pub const LayerNormBackwardGrads = struct {
+    dx: []f32,
+    dgamma: []f32,
+    dbeta: []f32,
+};
+
+/// Host reference for the backward of `fused_layer_norm` over the last axis.
+/// Recomputes mean/inv_std the SAME single-pass way the forward
+/// (`activations.layerNorm`) does, so gradients match bit-for-bit.
+///   y_i  = (x_i - μ)·inv_std·γ_i + β_i,   x̂_i = (x_i - μ)·inv_std
+///   g_i  = dy_i·γ_i
+///   dx_i    = inv_std·[ g_i − mean_j(g) − x̂_i·mean_j(g·x̂) ]
+///   dγ_i    = Σ_rows dy_i·x̂_i
+///   dβ_i    = Σ_rows dy_i
+pub fn debertaLayerNormBackwardHost(
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    gamma: []const f32,
+    dy: []const f32,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) !LayerNormBackwardGrads {
+    if (dim == 0) return error.InvalidTensorShape;
+    if (input.len < rows * dim or dy.len < rows * dim or gamma.len < dim) return error.InvalidTensorShape;
+    const dx = try allocator.alloc(f32, rows * dim);
+    errdefer allocator.free(dx);
+    const dgamma = try allocator.alloc(f32, dim);
+    errdefer allocator.free(dgamma);
+    const dbeta = try allocator.alloc(f32, dim);
+    errdefer allocator.free(dbeta);
+    @memset(dgamma, 0.0);
+    @memset(dbeta, 0.0);
+
+    const dim_f: f32 = @floatFromInt(dim);
+    const inv_dim: f32 = 1.0 / dim_f;
+
+    for (0..rows) |r| {
+        const x = input[r * dim .. (r + 1) * dim];
+        const gy = dy[r * dim .. (r + 1) * dim];
+
+        var sum: f32 = 0.0;
+        var sumsq: f32 = 0.0;
+        for (x) |xi| {
+            sum += xi;
+            sumsq += xi * xi;
+        }
+        const mean = sum * inv_dim;
+        const variance = @max(sumsq * inv_dim - mean * mean, 0.0);
+        const inv_std = 1.0 / @sqrt(variance + eps);
+
+        var mean_g: f32 = 0.0;
+        var mean_g_xhat: f32 = 0.0;
+        for (0..dim) |i| {
+            const xhat = (x[i] - mean) * inv_std;
+            const g = gy[i] * gamma[i];
+            mean_g += g;
+            mean_g_xhat += g * xhat;
+            dgamma[i] += gy[i] * xhat;
+            dbeta[i] += gy[i];
+        }
+        mean_g *= inv_dim;
+        mean_g_xhat *= inv_dim;
+
+        for (0..dim) |i| {
+            const xhat = (x[i] - mean) * inv_std;
+            const g = gy[i] * gamma[i];
+            dx[r * dim + i] = inv_std * (g - mean_g - xhat * mean_g_xhat);
+        }
+    }
+
+    return .{ .dx = dx, .dgamma = dgamma, .dbeta = dbeta };
+}
+
+/// `fused_layer_norm_backward` vtable impl. Inputs: input/gamma/beta/dy
+/// (beta unused for grads). Returns the packed adjoint
+/// `[rows + 2, dim]`: rows 0..rows = dx, row `rows` = dgamma, row `rows+1` = dbeta.
+fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    _ = beta;
+    const in_data = getData(input);
+    if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
+    const rows = in_data.len / dim;
+    const grads = try debertaLayerNormBackwardHost(self.allocator, in_data, getData(gamma), getData(dy), rows, dim, eps);
+    defer self.allocator.free(grads.dx);
+    defer self.allocator.free(grads.dgamma);
+    defer self.allocator.free(grads.dbeta);
+
+    const packed_grads = try self.allocator.alloc(f32, (rows + 2) * dim);
+    errdefer self.allocator.free(packed_grads);
+    @memcpy(packed_grads[0 .. rows * dim], grads.dx[0 .. rows * dim]);
+    @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
+    @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
+    return self.makeBuf(packed_grads, true);
 }
 
 fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -34602,6 +34699,75 @@ pub fn debertaDisentangledAttentionBackwardHost(
     }
 
     return .{ .dQ = dQ, .dK = dK, .dV = dV, .dQ_r = dQ_r, .dK_r = dK_r };
+}
+
+fn layerNormBackwardFiniteDiffCase(rows: usize, dim: usize, eps: f32, seed: u64) !void {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rnd = prng.random();
+
+    const x = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(x);
+    const gamma = try allocator.alloc(f32, dim);
+    defer allocator.free(gamma);
+    const beta = try allocator.alloc(f32, dim);
+    defer allocator.free(beta);
+    const dy = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(dy);
+    for (x) |*v| v.* = rnd.floatNorm(f32);
+    for (gamma) |*v| v.* = 1.0 + rnd.floatNorm(f32) * 0.3;
+    for (beta) |*v| v.* = rnd.floatNorm(f32) * 0.3;
+    for (dy) |*v| v.* = rnd.floatNorm(f32);
+
+    const grads = try debertaLayerNormBackwardHost(allocator, x, gamma, dy, rows, dim, eps);
+    defer allocator.free(grads.dx);
+    defer allocator.free(grads.dgamma);
+    defer allocator.free(grads.dbeta);
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, xx: []const f32, gg: []const f32, bb: []const f32, dd: []const f32, d: usize, e: f32) !f32 {
+            const tmp = try a.dupe(f32, xx);
+            defer a.free(tmp);
+            activations_mod.layerNorm(tmp, gg, bb, d, e);
+            var s: f32 = 0.0;
+            for (tmp, dd) |o, gv| s += o * gv;
+            return s;
+        }
+    }.f;
+
+    const h: f32 = 1e-3;
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = x, .grad = grads.dx, .name = "dx" },
+        .{ .buf = gamma, .grad = grads.dgamma, .name = "dgamma" },
+        .{ .buf = beta, .grad = grads.dbeta, .name = "dbeta" },
+    };
+    for (params) |p| {
+        for (p.buf, 0..) |*elem, idx| {
+            const orig = elem.*;
+            elem.* = orig + h;
+            const lp = try lossFn(allocator, x, gamma, beta, dy, dim, eps);
+            elem.* = orig - h;
+            const lm = try lossFn(allocator, x, gamma, beta, dy, dim, eps);
+            elem.* = orig;
+            const num_grad = (lp - lm) / (2.0 * h);
+            const ana_grad = p.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(num_grad), @abs(ana_grad)));
+            const rel = @abs(num_grad - ana_grad) / denom;
+            if (rel > 2e-2) {
+                std.debug.print("layer_norm backward mismatch {s}[{d}] num={d} ana={d} rel={d}\n", .{ p.name, idx, num_grad, ana_grad, rel });
+                return error.LayerNormBackwardFiniteDiffMismatch;
+            }
+        }
+    }
+}
+
+test "fused_layer_norm backward matches finite differences (single row)" {
+    try layerNormBackwardFiniteDiffCase(1, 8, 1e-5, 0xA11CE);
+}
+
+test "fused_layer_norm backward matches finite differences (multi-row)" {
+    try layerNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xBADF00D);
 }
 
 test "DeBERTa backward matches finite differences (all keys valid)" {

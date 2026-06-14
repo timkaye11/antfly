@@ -933,6 +933,256 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.cachedZeroBiasBuf(out_dim);
     }
 
+    // ── Phase-0 slot-bound output pool helpers ───────────────────────────
+    // Persistent device buffers keyed by buffer_plan AllocationId let the
+    // executor bind a node's output to a fixed address reused across steps
+    // (the prerequisite for ICB encode-once-replay). The pool owns the
+    // MTLBuffer; `ctFromPoolBufferView` hands out a non-owning `deviceBorrowed`
+    // view so freeing the per-step CT never releases the pooled buffer.
+
+    /// Allocate one persistent private device buffer of `byte_len` bytes as an
+    /// owned CT. The executor pool keeps it alive and frees it on rebuild/deinit.
+    pub fn poolAllocateOutputCt(cb: *const ops.ComputeBackend, byte_len: usize) !CT {
+        if (cb.kind() != .metal) return error.UnsupportedTensorType;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const elems: i32 = @intCast(byte_len / @sizeOf(f32));
+        const tensor = try MetalTensor.deviceAllocate(runtime, byte_len, .private, &.{elems});
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    /// Non-owning CT view over a pooled buffer CT, shaped `dims`. Freeing the
+    /// returned view decrements only the borrowed wrapper (release_on_drop=false),
+    /// leaving the pooled MTLBuffer alive for reuse.
+    pub fn ctFromPoolCtView(cb: *const ops.ComputeBackend, pool_ct: CT, dims: []const i32) !CT {
+        if (cb.kind() != .metal) return error.UnsupportedTensorType;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const buf = toBuf(pool_ct);
+        const mt = if (buf.metal_tensor) |*m| m else return error.MetalRuntimeUnavailable;
+        const handle = mt.deviceHandle() orelse return error.MetalRuntimeUnavailable;
+        const view = MetalTensor.deviceBorrowed(runtime, handle, 0, mt.deviceByteLen(), dims);
+        return self.ctFromOwnedMetalTensor(view);
+    }
+
+    /// Elementwise `a*b` written IN PLACE into `out_ct` (a pooled view).
+    /// `force_barrier`: insert a full buffer barrier first (for reused pooled
+    /// outputs). Returns `out_ct` on success, null to decline.
+    pub fn multiplyInto(cb: *const ops.ComputeBackend, a: CT, b: CT, out_ct: CT, force_barrier: bool) !?CT {
+        return elementwiseBinaryInto(cb, a, b, out_ct, .multiply, force_barrier);
+    }
+
+    /// Elementwise `a+b` (same-shape only) written IN PLACE into `out_ct`.
+    pub fn addInto(cb: *const ops.ComputeBackend, a: CT, b: CT, out_ct: CT, force_barrier: bool) !?CT {
+        return elementwiseBinaryInto(cb, a, b, out_ct, .add, force_barrier);
+    }
+
+    /// 2D matmul `lhs @ rhs` (m×k · k×n → m×n) written into the pooled `out_ct`.
+    /// Restricted to k>1 and n>1 (rank-1 cases route through their specialization).
+    pub fn dotGeneral2DInto(cb: *const ops.ComputeBackend, lhs: CT, rhs: CT, m: usize, n: usize, k: usize, rhs_contract_axis: u32, out_ct: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        if (k <= 1 or n <= 1 or m == 0) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
+        var lhs_mt = self.ownedDeviceMetalTensorFromCt(lhs) catch return null;
+        defer lhs_mt.deinit();
+        var rhs_mt = self.ownedDeviceMetalTensorFromCt(rhs) catch return null;
+        defer rhs_mt.deinit();
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!lhs_mt.isDevice() or !rhs_mt.isDevice() or !out_mt.isDevice()) return null;
+        if (lhs_mt.elemCount() != m * k or rhs_mt.elemCount() != n * k or out_mt.elemCount() != m * n) return null;
+        const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(scope);
+        const res = metal_runtime.decoderRuntimeDotGeneral2DF32DeviceInto(self.provider_impl, lhs_mt, rhs_mt, m, n, k, rhs_contract_axis, out_mt) catch return null;
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    /// Last-axis reduce (kind_id: sum=0,max=1,mean=2) of `input` into pooled
+    /// `out_ct`. Clean device-resident path only (declines lazy/quant/view,
+    /// non-last-axis, multi-axis) → caller falls back.
+    pub fn reduceLastDimInto(cb: *const ops.ComputeBackend, input: CT, axes: []const u8, in_shape: []const i64, kind_id: u32, out_ct: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        if (axes.len != 1 or in_shape.len == 0) return null;
+        if (axes[0] != @as(u8, @intCast(in_shape.len - 1))) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const input_buf = toBuf(input);
+        if (input_buf.lazy_multiply != null or input_buf.quantized_storage != null or hasHostView(input_buf)) return null;
+        const input_metal = input_buf.metal_tensor orelse return null;
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+        const dim_i64 = in_shape[in_shape.len - 1];
+        if (dim_i64 <= 0) return null;
+        const dim: usize = @intCast(dim_i64);
+        if (input_metal.elemCount() % dim != 0) return null;
+        const rows = input_metal.elemCount() / dim;
+        var input_mt = input_metal.retainedCopy() catch return null;
+        defer input_mt.deinit();
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!out_mt.isDevice() or out_mt.elemCount() != rows) return null;
+        const out_shape_i32 = [_]i32{@intCast(rows)};
+        const res = metal_runtime.decoderRuntimeReduceLastDimDeviceInto(self.provider_impl, input_mt, rows, dim, kind_id, &out_shape_i32, out_mt) catch return null;
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    /// Transpose `input` by `perm` written into the pooled `out_ct`.
+    pub fn transposeInto(cb: *const ops.ComputeBackend, input: CT, perm: []const u8, in_shape: []const i64, out_ct: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (in_shape.len != perm.len or in_shape.len == 0 or in_shape.len > 8) return null;
+        var in_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        defer in_mt.deinit();
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!in_mt.isDevice() or !out_mt.isDevice()) return null;
+        var out_shape_buf: [8]i32 = undefined;
+        for (perm, 0..) |p, i| {
+            if (p >= in_shape.len) return null;
+            out_shape_buf[i] = std.math.cast(i32, in_shape[p]) orelse return null;
+        }
+        const res = metal_runtime.decoderRuntimeTransposeF32DeviceInto(self.provider_impl, in_mt, in_shape, perm, out_shape_buf[0..perm.len], out_mt) catch return null;
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    /// Broadcast `input`'s last dim ([..,in_dim] -> [..,out_dim], in_dim==1 or ==out_dim)
+    /// written into the pooled `out_ct`. Identity-axis (non-transposing) broadcasts only.
+    pub fn broadcastLastDimInto(cb: *const ops.ComputeBackend, input: CT, in_shape: []const i64, out_shape: []const i64, out_ct: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        if (in_shape.len == 0 or in_shape.len != out_shape.len) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const input_buf = toBuf(input);
+        if (input_buf.lazy_multiply != null or input_buf.quantized_storage != null or hasHostView(input_buf)) return null;
+        const input_metal = input_buf.metal_tensor orelse return null;
+        if (!input_metal.isDevice() or input_metal.elemCount() == 0) return null;
+        var rows: usize = 1;
+        for (0..in_shape.len - 1) |axis| {
+            if (in_shape[axis] <= 0 or out_shape[axis] <= 0 or in_shape[axis] != out_shape[axis]) return null;
+            rows = std.math.mul(usize, rows, @intCast(in_shape[axis])) catch return null;
+        }
+        const in_dim_i64 = in_shape[in_shape.len - 1];
+        const out_dim_i64 = out_shape[out_shape.len - 1];
+        if (in_dim_i64 <= 0 or out_dim_i64 <= 0) return null;
+        const in_dim: usize = @intCast(in_dim_i64);
+        const out_dim: usize = @intCast(out_dim_i64);
+        if (in_dim != 1 and in_dim != out_dim) return null;
+        if (input_metal.elemCount() != rows * in_dim) return null;
+        var input_mt = input_metal.retainedCopy() catch return null;
+        defer input_mt.deinit();
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!out_mt.isDevice() or out_mt.elemCount() != rows * out_dim) return null;
+        const out_shape_i32 = try self.i32ShapeFromI64(out_shape);
+        defer self.allocator.free(out_shape_i32);
+        const res = metal_runtime.decoderRuntimeBroadcastLastDimDeviceInto(self.provider_impl, input_mt, rows, in_dim, out_dim, out_shape_i32, out_mt) catch return null;
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    /// Elementwise lhs-rhs (with scalar broadcast) written into the pooled `out_ct`.
+    pub fn subtractInto(cb: *const ops.ComputeBackend, lhs: CT, rhs: CT, out_ct: CT) !?CT {
+        return flatBinaryInto(cb, lhs, rhs, out_ct, .subtract);
+    }
+
+    /// Elementwise lhs/rhs (with scalar broadcast) written into the pooled `out_ct`.
+    pub fn divideInto(cb: *const ops.ComputeBackend, lhs: CT, rhs: CT, out_ct: CT) !?CT {
+        return flatBinaryInto(cb, lhs, rhs, out_ct, .divide);
+    }
+
+    fn flatBinaryInto(cb: *const ops.ComputeBackend, lhs: CT, rhs: CT, out_ct: CT, comptime kind: enum { subtract, divide }) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const lhs_buf = toBuf(lhs);
+        const rhs_buf = toBuf(rhs);
+        if (lhs_buf.quantized_storage != null or rhs_buf.quantized_storage != null) return null;
+        var lhs_mt = self.ownedDeviceMetalTensorFromCt(lhs) catch return null;
+        defer lhs_mt.deinit();
+        var rhs_mt = self.ownedDeviceMetalTensorFromCt(rhs) catch return null;
+        defer rhs_mt.deinit();
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!lhs_mt.isDevice() or !rhs_mt.isDevice() or !out_mt.isDevice()) return null;
+        const res = switch (kind) {
+            .subtract => metal_runtime.decoderRuntimeApplySubtractInto(self.provider_impl, lhs_mt, rhs_mt, out_mt) catch return null,
+            .divide => metal_runtime.decoderRuntimeApplyDivideInto(self.provider_impl, lhs_mt, rhs_mt, out_mt) catch return null,
+        };
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    /// Phase 2 ICB de-risk: run the self-contained ICB lifecycle smoke once when
+    /// `TERMITE_METAL_ICB_SMOKE` is set. Prints PASS/FAIL + the C status code.
+    pub fn runIcbSmokeIfRequested(cb: *const ops.ComputeBackend) void {
+        if (cb.kind() != .metal) return;
+        if (!getenvBool("TERMITE_METAL_ICB_SMOKE")) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (metal_runtime.decoderRuntimeIcbSmokeTest(self.provider_impl)) |rc| {
+            std.debug.print("metal_icb_smoke: result={d} ({s})\n", .{ rc, if (rc == 0) @as([]const u8, "PASS") else @as([]const u8, "FAIL") });
+            if (rc == 0) metal_runtime.decoderRuntimeIcbBench(self.provider_impl);
+        } else {
+            std.debug.print("metal_icb_smoke: no runtime\n", .{});
+        }
+    }
+
+    /// Apply fused activation `kind` ([rows,dim] device input) written into the pooled `out_ct`.
+    pub fn activationInto(cb: *const ops.ComputeBackend, input: CT, kind: u32, dim: usize, out_ct: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        if (dim == 0) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return null;
+        var in_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        defer in_mt.deinit();
+        if (!in_mt.isDevice() or in_mt.elemCount() == 0 or in_mt.elemCount() % dim != 0) return null;
+        const rows = in_mt.elemCount() / dim;
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!out_mt.isDevice() or out_mt.elemCount() != rows * dim) return null;
+        const res = metal_runtime.decoderRuntimeApplyActivationDeviceInto(self.provider_impl, in_mt, kind, rows, dim, out_mt) catch return null;
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    /// Apply primitive unary activation `activation_kind` to `input` written into the pooled `out_ct`.
+    pub fn unaryInto(cb: *const ops.ComputeBackend, input: CT, activation_kind: u32, out_ct: CT) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null) return null;
+        var in_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        defer in_mt.deinit();
+        if (!in_mt.isDevice() or in_mt.elemCount() == 0) return null;
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!out_mt.isDevice() or out_mt.elemCount() != in_mt.elemCount()) return null;
+        const res = metal_runtime.decoderRuntimeApplyPrimitiveUnaryInto(self.provider_impl, in_mt, activation_kind, out_mt) catch return null;
+        if (res != null) return out_ct;
+        return null;
+    }
+
+    fn elementwiseBinaryInto(cb: *const ops.ComputeBackend, a: CT, b: CT, out_ct: CT, comptime kind: enum { add, multiply }, force_barrier: bool) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var a_mt = self.ownedDeviceMetalTensorFromCt(a) catch return null;
+        defer a_mt.deinit();
+        var b_mt = self.ownedDeviceMetalTensorFromCt(b) catch return null;
+        defer b_mt.deinit();
+        var out_mt = self.ownedDeviceMetalTensorFromCt(out_ct) catch return null;
+        defer out_mt.deinit();
+        if (!a_mt.isDevice() or !b_mt.isDevice() or !out_mt.isDevice()) return null;
+        const n = a_mt.elemCount();
+        if (n == 0 or b_mt.elemCount() != n or out_mt.elemCount() != n) return null;
+        if (force_barrier) metal_runtime.decoderRuntimeForcePlannedComputeBarrier(self.provider_impl);
+        const ok = switch (kind) {
+            .multiply => metal_runtime.decoderRuntimeApplyMultiplyInto(self.provider_impl, a_mt, b_mt, out_mt, n) catch return null,
+            .add => metal_runtime.decoderRuntimeApplyAddInto(self.provider_impl, a_mt, b_mt, out_mt, n) catch return null,
+        };
+        if (ok) return out_ct;
+        return null;
+    }
+
     pub fn reserveHiddenStatePair(cb: *const ops.ComputeBackend, rows: usize, hidden_size: usize) !?ReservedHiddenStatePair {
         if (cb.kind() != .metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -8194,6 +8444,54 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const rows: i64 = @intCast(3 * batch * seq_len + 2 * (2 * seq_len - 1));
         const out_shape = [_]i64{ rows, H };
         return self.exportCtFromHostNative(&native_ctx, n_output, &out_shape);
+    }
+
+    fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (dim == 0) return error.InvalidTensorShape;
+        const in_count = bufElemCount(toBuf(input));
+        if (in_count % dim != 0) return error.InvalidTensorShape;
+        const rows = in_count / dim;
+
+        // Device path: the fused backward kernels. Falls through to the host
+        // reference if any operand can't be made device-resident.
+        if (rows != 0) device_path: {
+            var in_mt = self.ownedDeviceMetalTensorFromCt(input) catch break :device_path;
+            defer in_mt.deinit();
+            var gamma_mt = self.ownedDeviceMetalTensorFromCt(gamma) catch break :device_path;
+            defer gamma_mt.deinit();
+            var dy_mt = self.ownedDeviceMetalTensorFromCt(dy) catch break :device_path;
+            defer dy_mt.deinit();
+            if (!in_mt.isDevice() or !gamma_mt.isDevice() or !dy_mt.isDevice()) break :device_path;
+            if (in_mt.elemCount() != rows * dim or dy_mt.elemCount() != rows * dim or gamma_mt.elemCount() < dim) break :device_path;
+            const runtime = self.provider_impl.raw_decode_runtime orelse break :device_path;
+            const out_shape = [_]i32{ @intCast(rows + 2), @intCast(dim) };
+            var out_mt = MetalTensor.deviceAllocate(@ptrCast(runtime), (rows + 2) * dim * @sizeOf(f32), .private, &out_shape) catch break :device_path;
+            const ok = metal_runtime.decoderRuntimeLayerNormBackwardF32(self.provider_impl, in_mt, gamma_mt, dy_mt, out_mt, rows, dim, eps) catch {
+                out_mt.deinit();
+                break :device_path;
+            };
+            if (ok) return self.ctFromOwnedMetalTensor(out_mt);
+            out_mt.deinit();
+        }
+
+        // Correctness-first fallback: route through the validated native host
+        // backward. A fused device kernel can replace this later.
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const n_in = try self.importCtToHostNative(&native_ctx, input, toBuf(input).logical_shape);
+        defer native_ctx.cb.free(n_in);
+        const n_gamma = try self.importCtToHostNative(&native_ctx, gamma, toBuf(gamma).logical_shape);
+        defer native_ctx.cb.free(n_gamma);
+        const n_beta = try self.importCtToHostNative(&native_ctx, beta, toBuf(beta).logical_shape);
+        defer native_ctx.cb.free(n_beta);
+        const n_dy = try self.importCtToHostNative(&native_ctx, dy, toBuf(dy).logical_shape);
+        defer native_ctx.cb.free(n_dy);
+
+        const n_out = (try native_ctx.cb.layerNormBackward(n_in, n_gamma, n_beta, n_dy, dim, eps)) orelse return error.UnsupportedOperation;
+        defer native_ctx.cb.free(n_out);
+        const out_shape = [_]i64{ @intCast(rows + 2), @intCast(dim) };
+        return self.exportCtFromHostNative(&native_ctx, n_out, &out_shape);
     }
 
     fn disentangledRelativeAttentionOp(
@@ -21317,6 +21615,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concat = concatOp;
         vt.rmsNorm = rmsNormOp;
         vt.layerNorm = layerNormOp;
+        vt.layerNormBackward = layerNormBackwardOp;
         vt.addLayerNorm = addLayerNormOp;
         vt.linear = linearOp;
         vt.denseMlp2 = denseMlp2Op;

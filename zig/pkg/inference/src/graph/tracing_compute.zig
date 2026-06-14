@@ -211,6 +211,7 @@ pub const TracingCompute = struct {
         .crossAttention = &crossAttentionOp,
         .relativePositionBias = &relativePositionBiasOp,
         .disentangledRelativeAttention = &debertaOp,
+        .disentangledRelativeAttentionBackward = &debertaBackwardOp,
         .windowedSelfAttention = &windowedSelfAttentionOp,
         .channelSelfAttention = &channelSelfAttentionOp,
         .tokenGridConv2d = &tokenGridConv2dOp,
@@ -658,6 +659,12 @@ pub const TracingCompute = struct {
             .vjp_alternate = nodeIdFromCT(K_r),
         });
         return tc.makeHandle(id);
+    }
+
+    fn debertaBackwardOp(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: []const i64, _: CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
+        // Tracing captures forward inference graphs only; the disentangled
+        // attention backward never appears in a traced graph.
+        return error.UnsupportedOperation;
     }
 
     fn windowedSelfAttentionOp(

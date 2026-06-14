@@ -396,6 +396,7 @@ pub const OpCode = union(enum) {
     fused_linear_no_bias: LinearAttrs,
     fused_embedding_lookup: EmbeddingAttrs,
     fused_layer_norm: NormAttrs,
+    fused_layer_norm_backward: NormAttrs,
     fused_rms_norm: NormAttrs,
     fused_gelu: void,
     fused_gelu_backward: void,
