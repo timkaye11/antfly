@@ -1838,7 +1838,13 @@ fn appendUpstreamSchema(
             }
         },
         .entities => {
+            // Gold field values can repeat a field name (multiple mentions of one
+            // type); the schema prompt lists each field name ONCE.
+            var seen = std.ArrayListUnmanaged([]const u8).empty;
+            defer seen.deinit(allocator);
             for (task.fields) |field| {
+                if (sliceContainsString(seen.items, field.name)) continue;
+                try seen.append(allocator, field.name);
                 const marker_pos = pos.*;
                 try appendSchemaSpecial(tokenizer.ent_id, input_ids, attention_mask, pos, schema_special_positions, schema_special_count, max_schema_specials);
                 if (indexOfLabel(entity_types, field.name)) |label_idx| {
@@ -1850,7 +1856,12 @@ fn appendUpstreamSchema(
         },
         .json_structures, .relations => {
             const marker_id = if (task.kind == .json_structures) tokenizer.c_token_id else tokenizer.r_token_id;
+            // Aggregated multi-instance gold values repeat field names; emit each ONCE.
+            var seen = std.ArrayListUnmanaged([]const u8).empty;
+            defer seen.deinit(allocator);
             for (task.fields) |field| {
+                if (sliceContainsString(seen.items, field.name)) continue;
+                try seen.append(allocator, field.name);
                 const marker_pos = pos.*;
                 try appendSchemaSpecial(marker_id, input_ids, attention_mask, pos, schema_special_positions, schema_special_count, max_schema_specials);
                 const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ task.name, field.name });
@@ -2129,66 +2140,18 @@ fn appendUpstreamOutputTasks(
 
     if (output.get("json_structures")) |structures_value| {
         if (structures_value != .array) return error.InvalidGliner2Example;
-        for (structures_value.array.items) |structure_value| {
-            if (structure_value != .object) return error.InvalidGliner2Example;
-            var struct_iter = structure_value.object.iterator();
-            while (struct_iter.next()) |struct_entry| {
-                if (struct_entry.value_ptr.* != .object) continue;
-                var choice_targets = std.ArrayListUnmanaged(ChoiceFieldTarget).empty;
-                defer choice_targets.deinit(allocator);
-                try appendJsonChoicePrefixTokens(
-                    allocator,
-                    struct_entry.key_ptr.*,
-                    struct_entry.value_ptr.object,
-                    prefix_tokens,
-                    &choice_targets,
-                );
-                var fields = std.ArrayListUnmanaged(UpstreamField).empty;
-                errdefer fields.deinit(allocator);
-                var field_iter = struct_entry.value_ptr.object.iterator();
-                while (field_iter.next()) |field_entry| {
-                    try appendTaskFieldsFromValue(
-                        allocator,
-                        text,
-                        field_entry.key_ptr.*,
-                        field_entry.value_ptr.*,
-                        findChoiceFieldTarget(choice_targets.items, field_entry.key_ptr.*),
-                        &fields,
-                    );
-                }
-                try tasks.append(allocator, .{
-                    .kind = .json_structures,
-                    .name = struct_entry.key_ptr.*,
-                    .fields = try fields.toOwnedSlice(allocator),
-                    .count = 1,
-                });
-            }
-        }
+        // Upstream GLiNER2 emits ONE schema per distinct structure NAME, with the
+        // count = number of instances and the gold field values aggregated across
+        // instances (the schema prompt lists each field name once; see
+        // appendUpstreamSchema's dedup). Group instances by name in first-seen order.
+        try appendGroupedStructureTasks(allocator, text, structures_value, .json_structures, prefix_tokens, tasks);
     }
 
     if (entity_task) |task| try tasks.append(allocator, task);
 
     if (output.get("relations")) |relations_value| {
         if (relations_value != .array) return error.InvalidGliner2Example;
-        for (relations_value.array.items) |relation_value| {
-            if (relation_value != .object) return error.InvalidGliner2Example;
-            var relation_iter = relation_value.object.iterator();
-            while (relation_iter.next()) |relation_entry| {
-                if (relation_entry.value_ptr.* != .object) continue;
-                var fields = std.ArrayListUnmanaged(UpstreamField).empty;
-                errdefer fields.deinit(allocator);
-                var field_iter = relation_entry.value_ptr.object.iterator();
-                while (field_iter.next()) |field_entry| {
-                    try appendTaskFieldsFromValue(allocator, text, field_entry.key_ptr.*, field_entry.value_ptr.*, null, &fields);
-                }
-                try tasks.append(allocator, .{
-                    .kind = .relations,
-                    .name = relation_entry.key_ptr.*,
-                    .fields = try fields.toOwnedSlice(allocator),
-                    .count = 1,
-                });
-            }
-        }
+        try appendGroupedStructureTasks(allocator, text, relations_value, .relations, prefix_tokens, tasks);
     }
 
     if (output.get("classifications")) |classifications_value| {
@@ -2365,6 +2328,86 @@ fn findChoiceFieldTarget(targets: []const ChoiceFieldTarget, name: []const u8) ?
         if (std.mem.eql(u8, target.name, name)) return target;
     }
     return null;
+}
+
+/// Group `json_structures` / `relations` instances by their structure NAME into
+/// one UpstreamTask per name: count = number of instances, gold field values
+/// aggregated across all instances (the schema prompt dedups the field names).
+/// Mirrors upstream GLiNER2, which emits one schema per distinct structure name.
+fn sliceContainsString(items: []const []const u8, needle: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+fn appendGroupedStructureTasks(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    array_value: std.json.Value,
+    kind: UpstreamTaskKind,
+    prefix_tokens: *std.ArrayListUnmanaged([]const u8),
+    tasks: *std.ArrayListUnmanaged(UpstreamTask),
+) !void {
+    var group_names = std.ArrayListUnmanaged([]const u8).empty;
+    defer group_names.deinit(allocator);
+    var group_fields = std.ArrayListUnmanaged(std.ArrayListUnmanaged(UpstreamField)).empty;
+    defer {
+        for (group_fields.items) |*gf| gf.deinit(allocator);
+        group_fields.deinit(allocator);
+    }
+    var group_counts = std.ArrayListUnmanaged(usize).empty;
+    defer group_counts.deinit(allocator);
+
+    for (array_value.array.items) |instance_value| {
+        if (instance_value != .object) return error.InvalidGliner2Example;
+        var inst_iter = instance_value.object.iterator();
+        while (inst_iter.next()) |inst_entry| {
+            if (inst_entry.value_ptr.* != .object) continue;
+            const name = inst_entry.key_ptr.*;
+
+            var choice_targets = std.ArrayListUnmanaged(ChoiceFieldTarget).empty;
+            defer choice_targets.deinit(allocator);
+            if (kind == .json_structures) {
+                try appendJsonChoicePrefixTokens(allocator, name, inst_entry.value_ptr.object, prefix_tokens, &choice_targets);
+            }
+
+            var gi: usize = group_names.items.len;
+            for (group_names.items, 0..) |gn, idx| {
+                if (std.mem.eql(u8, gn, name)) {
+                    gi = idx;
+                    break;
+                }
+            }
+            if (gi == group_names.items.len) {
+                try group_names.append(allocator, name);
+                try group_fields.append(allocator, .empty);
+                try group_counts.append(allocator, 0);
+            }
+
+            var field_iter = inst_entry.value_ptr.object.iterator();
+            while (field_iter.next()) |field_entry| {
+                try appendTaskFieldsFromValue(
+                    allocator,
+                    text,
+                    field_entry.key_ptr.*,
+                    field_entry.value_ptr.*,
+                    if (kind == .json_structures) findChoiceFieldTarget(choice_targets.items, field_entry.key_ptr.*) else null,
+                    &group_fields.items[gi],
+                );
+            }
+            group_counts.items[gi] += 1;
+        }
+    }
+
+    for (group_names.items, 0..) |name, idx| {
+        try tasks.append(allocator, .{
+            .kind = kind,
+            .name = name,
+            .fields = try group_fields.items[idx].toOwnedSlice(allocator),
+            .count = group_counts.items[idx],
+        });
+    }
 }
 
 fn appendTaskFieldsFromValue(
