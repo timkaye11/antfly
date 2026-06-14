@@ -13899,7 +13899,7 @@ test "metal partition executor runtime add keeps resident input device backed" {
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state, null)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state, null, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 
@@ -13949,7 +13949,7 @@ test "metal partition executor runtime rms norm supports row-wise resident shape
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state, null)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state, null, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 

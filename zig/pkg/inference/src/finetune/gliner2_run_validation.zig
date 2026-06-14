@@ -41,6 +41,8 @@ pub const ValidationOptions = struct {
     max_device_trainable_transfer_count: ?u64 = null,
     max_device_resident_transfer_count: ?u64 = null,
     min_device_trainable_bytes: ?usize = null,
+    max_metal_runtime_total_bytes: ?u64 = null,
+    min_metal_runtime_reuse_hit_count: ?u64 = null,
 };
 
 pub const RunValidationSummary = struct {
@@ -88,6 +90,16 @@ pub const RunValidationSummary = struct {
     max_device_resident_transfer_count: u64,
     max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
+    max_metal_tensor_device_owned_live_bytes: u64,
+    max_metal_tensor_device_owned_peak_live_bytes: u64,
+    max_metal_runtime_total_bytes: u64,
+    max_metal_runtime_frame_retained_bytes: u64,
+    max_metal_runtime_reuse_pool_bytes: u64,
+    max_metal_runtime_reuse_pool_slots: u64,
+    max_metal_runtime_reuse_pool_peak_slots: u64,
+    total_metal_runtime_reuse_alloc_delta: u64,
+    total_metal_runtime_reuse_hit_delta: u64,
+    metal_runtime_reuse_hit_rate: f64,
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
     first_step_loss: ?f64 = null,
@@ -181,6 +193,13 @@ pub fn validateRun(
     if (options.min_device_trainable_bytes) |min_bytes| {
         if (metrics.max_device_trainable_bytes < min_bytes) return error.DeviceTrainableBytesBelowThreshold;
     }
+    if (options.max_metal_runtime_total_bytes) |max_bytes| {
+        if (max_bytes == 0) return error.InvalidPerformanceThreshold;
+        if (metrics.max_metal_runtime_total_bytes > max_bytes) return error.MetalRuntimeTotalBytesAboveThreshold;
+    }
+    if (options.min_metal_runtime_reuse_hit_count) |min_hits| {
+        if (metrics.total_metal_runtime_reuse_hit_delta < min_hits) return error.MetalRuntimeReuseHitCountBelowThreshold;
+    }
     if (options.require_loss_decrease and !metrics.loss_decreased) return error.LossDidNotDecrease;
 
     const adapter_file_count = try countAdapterParameterFiles(out_dir);
@@ -242,6 +261,16 @@ pub fn validateRun(
         .max_device_resident_transfer_count = metrics.max_device_resident_transfer_count,
         .max_device_trainable_bytes = metrics.max_device_trainable_bytes,
         .max_peak_resident_bytes = metrics.max_peak_resident_bytes,
+        .max_metal_tensor_device_owned_live_bytes = metrics.max_metal_tensor_device_owned_live_bytes,
+        .max_metal_tensor_device_owned_peak_live_bytes = metrics.max_metal_tensor_device_owned_peak_live_bytes,
+        .max_metal_runtime_total_bytes = metrics.max_metal_runtime_total_bytes,
+        .max_metal_runtime_frame_retained_bytes = metrics.max_metal_runtime_frame_retained_bytes,
+        .max_metal_runtime_reuse_pool_bytes = metrics.max_metal_runtime_reuse_pool_bytes,
+        .max_metal_runtime_reuse_pool_slots = metrics.max_metal_runtime_reuse_pool_slots,
+        .max_metal_runtime_reuse_pool_peak_slots = metrics.max_metal_runtime_reuse_pool_peak_slots,
+        .total_metal_runtime_reuse_alloc_delta = metrics.total_metal_runtime_reuse_alloc_delta,
+        .total_metal_runtime_reuse_hit_delta = metrics.total_metal_runtime_reuse_hit_delta,
+        .metal_runtime_reuse_hit_rate = metrics.metal_runtime_reuse_hit_rate,
         .total_graph_command_dispatches = metrics.total_graph_command_dispatches,
         .total_graph_planned_dispatches = metrics.total_graph_planned_dispatches,
         .first_step_loss = metrics.first_step_loss,
@@ -283,6 +312,15 @@ const MetricsInspection = struct {
     max_device_resident_transfer_count: u64 = 0,
     max_device_trainable_bytes: usize = 0,
     max_peak_resident_bytes: usize = 0,
+    max_metal_tensor_device_owned_live_bytes: u64 = 0,
+    max_metal_tensor_device_owned_peak_live_bytes: u64 = 0,
+    max_metal_runtime_total_bytes: u64 = 0,
+    max_metal_runtime_frame_retained_bytes: u64 = 0,
+    max_metal_runtime_reuse_pool_bytes: u64 = 0,
+    max_metal_runtime_reuse_pool_slots: u64 = 0,
+    max_metal_runtime_reuse_pool_peak_slots: u64 = 0,
+    total_metal_runtime_reuse_alloc_delta: u64 = 0,
+    total_metal_runtime_reuse_hit_delta: u64 = 0,
     total_graph_command_dispatches: u64 = 0,
     total_graph_planned_dispatches: u64 = 0,
     first_step_loss: ?f64 = null,
@@ -327,6 +365,12 @@ const MetricsInspection = struct {
         if (self.supervised_token_count == 0 or self.total_step_wall_ms <= 0) return 0;
         const seconds = self.total_step_wall_ms / 1000.0;
         return @as(f64, @floatFromInt(self.supervised_token_count)) / seconds;
+    }
+
+    fn metalRuntimeReuseHitRate(self: MetricsInspection) f64 {
+        if (self.total_metal_runtime_reuse_alloc_delta == 0) return 0;
+        return @as(f64, @floatFromInt(self.total_metal_runtime_reuse_hit_delta)) /
+            @as(f64, @floatFromInt(self.total_metal_runtime_reuse_alloc_delta));
     }
 };
 
@@ -462,6 +506,16 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     max_device_resident_transfer_count: u64,
     max_device_trainable_bytes: usize,
     max_peak_resident_bytes: usize,
+    max_metal_tensor_device_owned_live_bytes: u64,
+    max_metal_tensor_device_owned_peak_live_bytes: u64,
+    max_metal_runtime_total_bytes: u64,
+    max_metal_runtime_frame_retained_bytes: u64,
+    max_metal_runtime_reuse_pool_bytes: u64,
+    max_metal_runtime_reuse_pool_slots: u64,
+    max_metal_runtime_reuse_pool_peak_slots: u64,
+    total_metal_runtime_reuse_alloc_delta: u64,
+    total_metal_runtime_reuse_hit_delta: u64,
+    metal_runtime_reuse_hit_rate: f64,
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
     first_step_loss: ?f64,
@@ -517,6 +571,15 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
                 (jsonU64(obj.get("device_resident_transfer_count")) orelse 0);
             const device_resident_transfer_count = jsonU64(obj.get("device_resident_transfer_count")) orelse 0;
             const device_trainable_bytes = jsonUsize(obj.get("device_trainable_bytes")) orelse 0;
+            const metal_tensor_device_owned_live_bytes = jsonU64(obj.get("metal_tensor_device_owned_live_bytes")) orelse 0;
+            const metal_tensor_device_owned_peak_live_bytes = jsonU64(obj.get("metal_tensor_device_owned_peak_live_bytes")) orelse 0;
+            const metal_runtime_total_bytes = jsonU64(obj.get("metal_runtime_total_bytes")) orelse 0;
+            const metal_runtime_frame_retained_bytes = jsonU64(obj.get("metal_runtime_frame_retained_bytes")) orelse 0;
+            const metal_runtime_reuse_pool_bytes = jsonU64(obj.get("metal_runtime_reuse_pool_bytes")) orelse 0;
+            const metal_runtime_reuse_pool_slots = jsonU64(obj.get("metal_runtime_reuse_pool_slots")) orelse 0;
+            const metal_runtime_reuse_pool_peak_slots = jsonU64(obj.get("metal_runtime_reuse_pool_peak_slots")) orelse 0;
+            const metal_runtime_reuse_alloc_delta = jsonU64(obj.get("metal_runtime_reuse_alloc_delta")) orelse 0;
+            const metal_runtime_reuse_hit_delta = jsonU64(obj.get("metal_runtime_reuse_hit_delta")) orelse 0;
             const trainer_total_ms = jsonF64(obj.get("trainer_total_ms")) orelse return error.InvalidMetricsRecord;
             const peak_resident_bytes = jsonUsize(obj.get("peak_resident_bytes")) orelse return error.InvalidMetricsRecord;
             const supervised_tokens_per_second = jsonF64(obj.get("supervised_tokens_per_second")) orelse return error.InvalidMetricsRecord;
@@ -545,6 +608,15 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.max_device_trainable_transfer_count = @max(inspection.max_device_trainable_transfer_count, device_trainable_transfer_count);
             inspection.max_device_resident_transfer_count = @max(inspection.max_device_resident_transfer_count, device_resident_transfer_count);
             inspection.max_device_trainable_bytes = @max(inspection.max_device_trainable_bytes, device_trainable_bytes);
+            inspection.max_metal_tensor_device_owned_live_bytes = @max(inspection.max_metal_tensor_device_owned_live_bytes, metal_tensor_device_owned_live_bytes);
+            inspection.max_metal_tensor_device_owned_peak_live_bytes = @max(inspection.max_metal_tensor_device_owned_peak_live_bytes, metal_tensor_device_owned_peak_live_bytes);
+            inspection.max_metal_runtime_total_bytes = @max(inspection.max_metal_runtime_total_bytes, metal_runtime_total_bytes);
+            inspection.max_metal_runtime_frame_retained_bytes = @max(inspection.max_metal_runtime_frame_retained_bytes, metal_runtime_frame_retained_bytes);
+            inspection.max_metal_runtime_reuse_pool_bytes = @max(inspection.max_metal_runtime_reuse_pool_bytes, metal_runtime_reuse_pool_bytes);
+            inspection.max_metal_runtime_reuse_pool_slots = @max(inspection.max_metal_runtime_reuse_pool_slots, metal_runtime_reuse_pool_slots);
+            inspection.max_metal_runtime_reuse_pool_peak_slots = @max(inspection.max_metal_runtime_reuse_pool_peak_slots, metal_runtime_reuse_pool_peak_slots);
+            inspection.total_metal_runtime_reuse_alloc_delta += metal_runtime_reuse_alloc_delta;
+            inspection.total_metal_runtime_reuse_hit_delta += metal_runtime_reuse_hit_delta;
             inspection.total_graph_command_dispatches += jsonU64(obj.get("graph_executor_command_dispatches")) orelse 0;
             inspection.total_graph_planned_dispatches += jsonU64(obj.get("graph_executor_planned_dispatches")) orelse 0;
             if (optimizer_backend) |backend| {
@@ -584,6 +656,16 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .max_device_resident_transfer_count = inspection.max_device_resident_transfer_count,
         .max_device_trainable_bytes = inspection.max_device_trainable_bytes,
         .max_peak_resident_bytes = inspection.max_peak_resident_bytes,
+        .max_metal_tensor_device_owned_live_bytes = inspection.max_metal_tensor_device_owned_live_bytes,
+        .max_metal_tensor_device_owned_peak_live_bytes = inspection.max_metal_tensor_device_owned_peak_live_bytes,
+        .max_metal_runtime_total_bytes = inspection.max_metal_runtime_total_bytes,
+        .max_metal_runtime_frame_retained_bytes = inspection.max_metal_runtime_frame_retained_bytes,
+        .max_metal_runtime_reuse_pool_bytes = inspection.max_metal_runtime_reuse_pool_bytes,
+        .max_metal_runtime_reuse_pool_slots = inspection.max_metal_runtime_reuse_pool_slots,
+        .max_metal_runtime_reuse_pool_peak_slots = inspection.max_metal_runtime_reuse_pool_peak_slots,
+        .total_metal_runtime_reuse_alloc_delta = inspection.total_metal_runtime_reuse_alloc_delta,
+        .total_metal_runtime_reuse_hit_delta = inspection.total_metal_runtime_reuse_hit_delta,
+        .metal_runtime_reuse_hit_rate = inspection.metalRuntimeReuseHitRate(),
         .total_graph_command_dispatches = inspection.total_graph_command_dispatches,
         .total_graph_planned_dispatches = inspection.total_graph_planned_dispatches,
         .first_step_loss = inspection.first_step_loss,

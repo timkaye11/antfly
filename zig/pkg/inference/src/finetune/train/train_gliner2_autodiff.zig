@@ -837,11 +837,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 6d. Memory pre-flight. The disentangled-attention intermediates scale
     // batch*S^2 and have previously hard-OOMed the whole machine (not just
-    // this process) on 16GB hosts. Estimate the peak fp32 footprint and
-    // refuse configs that would exceed a safe fraction of physical RAM
-    // unless --allow-large-memory is passed.
+    // this process) on 16GB hosts. Legacy frame-retained execution must budget
+    // every layer's transient attention workspace. Metal's default in-frame
+    // private-buffer reuse budgets the live workspace instead, matching the
+    // allocator behavior this gate is meant to prove.
     // ------------------------------------------------------------------
     {
+        const reuse_preflight = selected_backend == .metal and metalBufferReuseEnabledForPreflight();
         const est = estimateTrainingPeakBytes(
             @intCast(deberta_config.vocab_size),
             @intCast(deberta_config.hidden_size),
@@ -850,16 +852,18 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             @intCast(deberta_config.num_attention_heads),
             opts.batch_size,
             effective_seq_len,
+            reuse_preflight,
         );
         if (physicalMemoryBytes()) |total| {
             const budget = total * 6 / 10;
-            print("  estimated peak memory: {d:.2} GiB (budget {d:.2} GiB of {d:.2} GiB physical)\n", .{
+            print("  estimated peak memory ({s}): {d:.2} GiB (budget {d:.2} GiB of {d:.2} GiB physical)\n", .{
+                if (reuse_preflight) "metal-reuse-live-set" else "frame-retained",
                 @as(f64, @floatFromInt(est)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(budget)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(total)) / (1024.0 * 1024.0 * 1024.0),
             });
             if (est > budget and !opts.allow_large_memory) {
-                print("error: estimated peak memory exceeds the safe budget; lower --batch-size or --seq-len (attention intermediates scale batch*seq^2), or pass --allow-large-memory to proceed anyway\n", .{});
+                print("error: estimated peak memory exceeds the safe budget; lower --batch-size or --seq-len (attention intermediates scale batch*seq^2), enable Metal buffer reuse, or pass --allow-large-memory to proceed anyway\n", .{});
                 return error.EstimatedMemoryExceedsBudget;
             }
             if (est > budget) {
@@ -1531,6 +1535,16 @@ fn writeStepMetric(
         .graph_executor_plan_cache_misses = timing.profile.graph_executor_plan_cache_misses,
         .metal_frame_wait_ms = nsToMillis(timing.profile.metal_frame_wait_ns),
         .metal_frame_gpu_ms = nsToMillis(timing.profile.metal_frame_gpu_ns),
+        .metal_tensor_device_owned_live_bytes = timing.profile.metal_tensor_device_owned_live_bytes,
+        .metal_tensor_device_owned_peak_live_bytes = timing.profile.metal_tensor_device_owned_peak_live_bytes,
+        .metal_runtime_total_bytes = timing.profile.metal_runtime_total_bytes,
+        .metal_runtime_frame_retained_bytes = timing.profile.metal_runtime_frame_retained_bytes,
+        .metal_runtime_reuse_pool_bytes = timing.profile.metal_runtime_reuse_pool_bytes,
+        .metal_runtime_reuse_pool_slots = timing.profile.metal_runtime_reuse_pool_slots,
+        .metal_runtime_reuse_pool_peak_slots = timing.profile.metal_runtime_reuse_pool_peak_slots,
+        .metal_runtime_reuse_alloc_delta = timing.profile.metal_runtime_reuse_alloc_delta,
+        .metal_runtime_reuse_hit_delta = timing.profile.metal_runtime_reuse_hit_delta,
+        .metal_runtime_reuse_hit_rate = ratio(timing.profile.metal_runtime_reuse_hit_delta, timing.profile.metal_runtime_reuse_alloc_delta),
         .metal_last_frame_compute_encoders = timing.profile.metal_last_frame_compute_encoders,
         .metal_last_frame_blit_encoders = timing.profile.metal_last_frame_blit_encoders,
         .metal_last_frame_planned_scopes = timing.profile.metal_last_frame_planned_scopes,
@@ -2345,6 +2359,11 @@ fn tokensPerSecond(tokens: u64, ns: u64) f64 {
     if (tokens == 0 or ns == 0) return 0.0;
     const seconds = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
     return @as(f64, @floatFromInt(tokens)) / seconds;
+}
+
+fn ratio(numerator: u64, denominator: u64) f64 {
+    if (denominator == 0) return 0.0;
+    return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
 }
 
 /// Fills input_ids, attention_mask, and one-hot targets for one batch
@@ -3377,6 +3396,7 @@ fn estimateTrainingPeakBytes(
     num_heads: u64,
     batch_size: u64,
     seq_len: u64,
+    metal_reuse_live_set: bool,
 ) u64 {
     const f32_size: u64 = 4;
     const head_dim = hidden_size / @max(num_heads, 1);
@@ -3385,7 +3405,18 @@ fn estimateTrainingPeakBytes(
     const weights = (vocab_size * hidden_size +
         num_layers * (4 * hidden_size * hidden_size + 2 * hidden_size * intermediate_size)) * f32_size;
     const attn_per_layer = (bh * ss * head_dim + ss * hidden_size) * f32_size;
+    if (metal_reuse_live_set) {
+        const hidden_workspace = batch_size * seq_len * (hidden_size + intermediate_size) * f32_size;
+        return weights + 3 * attn_per_layer + 4 * hidden_workspace;
+    }
     return weights + 2 * num_layers * attn_per_layer;
+}
+
+fn metalBufferReuseEnabledForPreflight() bool {
+    const raw = std.c.getenv("TERMITE_METAL_BUFFER_REUSE") orelse return true;
+    const value = std.mem.span(raw);
+    if (value.len == 0) return true;
+    return !(value[0] == '0' or value[0] == 'f' or value[0] == 'F');
 }
 
 fn printUsage() void {

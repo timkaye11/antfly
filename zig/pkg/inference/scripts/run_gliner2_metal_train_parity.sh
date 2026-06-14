@@ -442,6 +442,14 @@ run_production_gate() {
     zig build -Dmetal=true "-Doptimize=${zig_optimize}" gliner2-production-readiness --
     "${model_dir}" "${train_data}" "${eval_data}" "${out_dir}" "${entity_types}"
     --production-metal-gate
+    --batch-size "${batch_size}"
+    --max-examples "${max_examples}"
+    --seq-len "${seq_len}"
+    --learning-rate "${learning_rate}"
+    --lora-rank "${lora_rank}"
+    --lora-alpha "${lora_alpha}"
+    --lora-dropout "${lora_dropout}"
+    --max-span-width "${max_span_width}"
     --objective "${objective}"
   )
   if [[ "${lora_only_trainables}" -eq 1 ]]; then

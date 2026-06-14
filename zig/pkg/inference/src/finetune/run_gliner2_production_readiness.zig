@@ -83,6 +83,8 @@ const Options = struct {
     max_device_trainable_transfer_count: ?u64 = null,
     max_device_resident_transfer_count: ?u64 = null,
     min_device_trainable_bytes: ?usize = null,
+    max_metal_runtime_total_bytes: ?u64 = null,
+    min_metal_runtime_reuse_hit_count: ?u64 = null,
     require_loss_decrease: bool = true,
 
     eval_text: ?[]const u8 = null,
@@ -281,6 +283,8 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .max_device_trainable_transfer_count = opts.max_device_trainable_transfer_count orelse opts.max_device_resident_transfer_count,
         .max_device_resident_transfer_count = opts.max_device_resident_transfer_count,
         .min_device_trainable_bytes = min_device_trainable_bytes,
+        .max_metal_runtime_total_bytes = opts.max_metal_runtime_total_bytes,
+        .min_metal_runtime_reuse_hit_count = opts.min_metal_runtime_reuse_hit_count,
     });
     errdefer validation.freeRunValidationSummary(allocator, &run_summary);
 
@@ -533,13 +537,6 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\max_device_trainable_transfer_count: {?}
         \\max_device_resident_transfer_count: {?}
         \\min_device_trainable_bytes: {?}
-        \\semantic_golden_count: {}
-        \\quality_eval: {}
-        \\quality_max_examples: {?s}
-        \\quality_min_prediction_score: {?s}
-        \\quality_diagnostic_limit: {s}
-        \\min_entity_f1: {?s}
-        \\semantic_eval_required: {}
         \\
     , .{
         opts.model_dir,
@@ -568,6 +565,21 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.max_device_trainable_transfer_count,
         opts.max_device_resident_transfer_count,
         opts.min_device_trainable_bytes,
+    });
+    try writer.interface.print(
+        \\max_metal_runtime_total_bytes: {?}
+        \\min_metal_runtime_reuse_hit_count: {?}
+        \\semantic_golden_count: {}
+        \\quality_eval: {}
+        \\quality_max_examples: {?s}
+        \\quality_min_prediction_score: {?s}
+        \\quality_diagnostic_limit: {s}
+        \\min_entity_f1: {?s}
+        \\semantic_eval_required: {}
+        \\
+    , .{
+        opts.max_metal_runtime_total_bytes,
+        opts.min_metal_runtime_reuse_hit_count,
         opts.semantic_golden_count,
         opts.quality_eval,
         opts.quality_max_examples,
@@ -689,6 +701,10 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             if (opts.max_device_trainable_transfer_count == null) opts.max_device_trainable_transfer_count = opts.max_device_resident_transfer_count;
         } else if (std.mem.eql(u8, arg, "--min-device-trainable-bytes")) {
             opts.min_device_trainable_bytes = try parseUsizeArg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-runtime-total-bytes")) {
+            opts.max_metal_runtime_total_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-runtime-reuse-hit-count")) {
+            opts.min_metal_runtime_reuse_hit_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--allow-flat-loss")) {
             opts.require_loss_decrease = false;
         } else if (std.mem.eql(u8, arg, "--eval-text")) {
@@ -730,6 +746,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.semantic_require_entitylike_span = true;
         } else if (std.mem.eql(u8, arg, "--quality-eval")) {
             opts.quality_eval = true;
+        } else if (std.mem.eql(u8, arg, "--skip-quality-eval")) {
+            opts.quality_eval = false;
         } else if (std.mem.eql(u8, arg, "--quality-max-examples")) {
             opts.quality_max_examples = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--quality-min-prediction-score")) {
@@ -900,6 +918,7 @@ fn printUsage() void {
         \\  --semantic-best-label-per-span-start
         \\  --semantic-require-entitylike-span
         \\  --quality-eval
+        \\  --skip-quality-eval
         \\  --quality-max-examples N
         \\  --quality-min-prediction-score FLOAT
         \\  --quality-label-thresholds label=FLOAT[,label=FLOAT...]
@@ -959,6 +978,8 @@ fn printUsage() void {
         \\  --max-device-trainable-transfer-count N
         \\  --max-device-resident-transfer-count N
         \\  --min-device-trainable-bytes N
+        \\  --max-metal-runtime-total-bytes N
+        \\  --min-metal-runtime-reuse-hit-count N
         \\
     , .{});
 }

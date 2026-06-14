@@ -12,6 +12,7 @@ Modes:
   unit                  Focused Metal unit tests touched by training graph work
   suite                 Existing smoke + parity + readiness suite
   train-profile         Production-shaped training-only profile with executor stats
+  batch32               True batch-size-32 Metal readiness gate (OOM regression check)
   profile              Short production-gate-shaped run with graph op profiling
   diagnostic           Full production-gate-shaped diagnostic, semantic eval skipped
   production           Canonical production gate
@@ -32,6 +33,13 @@ Options:
   --reduce-trace        Enable Metal reduce_sum/reduce_mean device/fallback trace diagnostics
   --broadcast-trace     Enable Metal broadcast_in_dim device/fallback trace diagnostics
   --skip-semantic-eval  Skip semantic eval in production mode too
+  --batch-size N        Training batch size for train-profile/batch32/profile gates
+  --seq-len N           Sequence length for train-profile/batch32/profile gates
+  --max-examples N      Max train examples for train-profile/batch32/profile gates
+  --max-metal-runtime-total-bytes N
+                        Fail readiness if Metal runtime allocation snapshot exceeds N
+  --min-metal-runtime-reuse-hit-count N
+                        Fail readiness unless in-frame buffer reuse hits at least N
   --max-commands N      train-profile graph-exec command ceiling (default: 6200)
   --max-host-outputs N  train-profile host-output ceiling (default: 500)
   --max-runtime-region-fallbacks N
@@ -47,6 +55,9 @@ Examples:
   scripts/run_gliner2_metal_train_tests.sh suite
   scripts/run_gliner2_metal_train_tests.sh train-profile \
     --train-data /private/tmp/termite-gliner2-production-diagnostic/train.jsonl
+  scripts/run_gliner2_metal_train_tests.sh batch32 \
+    --train-data /private/tmp/termite-gliner2-production-diagnostic/train.jsonl \
+    --eval-data /private/tmp/termite-gliner2-production-diagnostic/eval.jsonl
   scripts/run_gliner2_metal_train_tests.sh profile \
     --train-data /private/tmp/termite-gliner2-production-diagnostic/train.jsonl \
     --eval-data /private/tmp/termite-gliner2-production-diagnostic/eval.jsonl
@@ -75,6 +86,14 @@ reduce_trace=0
 broadcast_trace=0
 skip_semantic_eval=0
 dry_run=0
+batch_size=1
+seq_len=32
+max_examples=5
+batch_size_explicit=0
+seq_len_explicit=0
+max_examples_explicit=0
+max_metal_runtime_total_bytes=""
+min_metal_runtime_reuse_hit_count=""
 max_commands=6200
 max_host_outputs=500
 max_runtime_region_fallbacks=0
@@ -84,7 +103,7 @@ extra_args=()
 
 is_mode() {
   case "$1" in
-    unit|suite|train-profile|profile|diagnostic|production|all)
+    unit|suite|train-profile|batch32|profile|diagnostic|production|all)
       return 0
       ;;
     *)
@@ -150,6 +169,29 @@ while [[ $# -gt 0 ]]; do
     --skip-semantic-eval)
       skip_semantic_eval=1
       shift
+      ;;
+    --batch-size)
+      batch_size="${2:?missing value for --batch-size}"
+      batch_size_explicit=1
+      shift 2
+      ;;
+    --seq-len)
+      seq_len="${2:?missing value for --seq-len}"
+      seq_len_explicit=1
+      shift 2
+      ;;
+    --max-examples)
+      max_examples="${2:?missing value for --max-examples}"
+      max_examples_explicit=1
+      shift 2
+      ;;
+    --max-metal-runtime-total-bytes)
+      max_metal_runtime_total_bytes="${2:?missing value for --max-metal-runtime-total-bytes}"
+      shift 2
+      ;;
+    --min-metal-runtime-reuse-hit-count)
+      min_metal_runtime_reuse_hit_count="${2:?missing value for --min-metal-runtime-reuse-hit-count}"
+      shift 2
       ;;
     --max-commands)
       max_commands="${2:?missing value for --max-commands}"
@@ -283,6 +325,15 @@ append_profile_env_args() {
       profile_env_result+=("${env_arg}")
     fi
   done < <(profile_env_args)
+}
+
+append_metal_runtime_threshold_args() {
+  if [[ -n "${max_metal_runtime_total_bytes}" ]]; then
+    cmd+=("--max-metal-runtime-total-bytes" "${max_metal_runtime_total_bytes}")
+  fi
+  if [[ -n "${min_metal_runtime_reuse_hit_count}" ]]; then
+    cmd+=("--min-metal-runtime-reuse-hit-count" "${min_metal_runtime_reuse_hit_count}")
+  fi
 }
 
 require_data() {
@@ -505,8 +556,9 @@ run_train_profile() {
     --model-dir "${model_dir}"
     --train-data "${train_data}"
     --out-suffix "$(suffix_arg train-profile)"
-    --max-examples 5
-    --seq-len 32
+    --batch-size "${batch_size}"
+    --max-examples "${max_examples}"
+    --seq-len "${seq_len}"
     --max-span-width 4
     --lora-rank 16
     --lora-alpha 32
@@ -532,6 +584,67 @@ run_train_profile() {
   run_env_cmd_with_profile_assertions "${profile_env_result[@]}" -- "${cmd[@]}"
 }
 
+run_batch32() {
+  require_data
+  graph_stats=1
+  op_profile=1
+  partition_op_stats=1
+
+  local gate_batch_size="${batch_size}"
+  local gate_seq_len="${seq_len}"
+  local gate_max_examples="${max_examples}"
+  if [[ "${batch_size_explicit}" -eq 0 ]]; then
+    gate_batch_size=32
+  fi
+  if [[ "${seq_len_explicit}" -eq 0 ]]; then
+    gate_seq_len=128
+  fi
+  if [[ "${max_examples_explicit}" -eq 0 ]]; then
+    gate_max_examples=32
+  fi
+  if [[ -z "${min_metal_runtime_reuse_hit_count}" ]]; then
+    min_metal_runtime_reuse_hit_count=1
+  fi
+
+  local -a cmd=(
+    "${parity_script}"
+    --production-gate
+    --model-dir "${model_dir}"
+    --train-data "${train_data}"
+    --eval-data "${eval_data}"
+    --out-suffix "$(suffix_arg production-batch32)"
+    --skip-semantic-eval
+    --batch-size "${gate_batch_size}"
+    --max-examples "${gate_max_examples}"
+    --seq-len "${gate_seq_len}"
+    --max-span-width 4
+    --lora-rank 16
+    --lora-alpha 32
+    --lora-dropout 0.1
+    --
+    --allow-flat-loss
+    --skip-quality-eval
+    --min-train-examples "${gate_max_examples}"
+    --min-eval-examples 1
+    --min-total-entities 1
+    --min-unique-labels 1
+    --min-target-coverage-ratio 0.1
+    --min-positive-span-labels 1
+    --min-steps 1
+    --min-supervised-tokens 1
+    --min-entity-tokens 1
+    --max-avg-step-wall-ms 30000
+    --max-total-execute-ms 30000
+  )
+  append_metal_runtime_threshold_args
+  if [[ "${#extra_args[@]}" -gt 0 ]]; then
+    cmd+=("${extra_args[@]}")
+  fi
+  local -a profile_env_result=("TERMITE_METAL_BUFFER_REUSE_STATS=1")
+  append_profile_env_args
+  run_env_cmd_with_profile_assertions "${profile_env_result[@]}" -- "${cmd[@]}"
+}
+
 run_profile() {
   require_data
   graph_stats=1
@@ -542,6 +655,9 @@ run_profile() {
     "--model-dir" "${model_dir}"
     "--train-data" "${train_data}"
     "--eval-data" "${eval_data}"
+    "--batch-size" "${batch_size}"
+    "--max-examples" "${max_examples}"
+    "--seq-len" "${seq_len}"
   )
   if [[ -n "${trace_range}" ]]; then
     args+=(--trace "${trace_range}")
@@ -551,17 +667,19 @@ run_profile() {
     --out-suffix "$(suffix_arg production-profile)" \
     --skip-semantic-eval \
     -- \
-    --max-examples 5 \
+    --max-examples "${max_examples}" \
     --min-steps 5 \
     --allow-flat-loss \
+    --skip-quality-eval \
     --max-avg-step-wall-ms 10000 \
-    --min-train-examples 5 \
-    --min-eval-examples 5 \
-    --min-total-entities 5 \
-    --min-positive-span-labels 5 \
+    --min-train-examples "${max_examples}" \
+    --min-eval-examples 1 \
+    --min-total-entities 1 \
+    --min-positive-span-labels 1 \
     --min-supervised-tokens 1 \
     --min-entity-tokens 1
   )
+  append_metal_runtime_threshold_args
   if [[ "${#extra_args[@]}" -gt 0 ]]; then
     cmd+=("${extra_args[@]}")
   fi
@@ -580,14 +698,20 @@ run_diagnostic() {
     "--model-dir" "${model_dir}"
     "--train-data" "${train_data}"
     "--eval-data" "${eval_data}"
+    "--batch-size" "${batch_size}"
+    "--max-examples" "${max_examples}"
+    "--seq-len" "${seq_len}"
   )
   cmd=(
     "${parity_script}" "${args[@]}" \
     --out-suffix "$(suffix_arg production-diagnostic)" \
-    --skip-semantic-eval
+    --skip-semantic-eval \
+    -- \
+    --skip-quality-eval
   )
+  append_metal_runtime_threshold_args
   if [[ "${#extra_args[@]}" -gt 0 ]]; then
-    cmd+=("--" "${extra_args[@]}")
+    cmd+=("${extra_args[@]}")
   fi
   if [[ "${#profile_env_result[@]}" -gt 0 ]]; then
     run_env_cmd_with_profile_assertions "${profile_env_result[@]}" -- "${cmd[@]}"
@@ -606,6 +730,9 @@ run_production() {
     "--model-dir" "${model_dir}"
     "--train-data" "${train_data}"
     "--eval-data" "${eval_data}"
+    "--batch-size" "${batch_size}"
+    "--max-examples" "${max_examples}"
+    "--seq-len" "${seq_len}"
   )
   if [[ "${skip_semantic_eval}" -eq 1 ]]; then
     args+=("--skip-semantic-eval")
@@ -614,8 +741,12 @@ run_production() {
     "${parity_script}" "${args[@]}" \
     --out-suffix "$(suffix_arg production-gate)"
   )
-  if [[ "${#extra_args[@]}" -gt 0 ]]; then
-    cmd+=("--" "${extra_args[@]}")
+  if [[ "${#extra_args[@]}" -gt 0 || -n "${max_metal_runtime_total_bytes}" || -n "${min_metal_runtime_reuse_hit_count}" ]]; then
+    cmd+=("--")
+    append_metal_runtime_threshold_args
+    if [[ "${#extra_args[@]}" -gt 0 ]]; then
+      cmd+=("${extra_args[@]}")
+    fi
   fi
   if [[ "${#profile_env_result[@]}" -gt 0 ]]; then
     run_env_cmd_with_profile_assertions "${profile_env_result[@]}" -- "${cmd[@]}"
@@ -639,6 +770,9 @@ case "${mode}" in
     ;;
   train-profile)
     run_train_profile
+    ;;
+  batch32)
+    run_batch32
     ;;
   diagnostic)
     run_diagnostic

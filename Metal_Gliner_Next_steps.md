@@ -1,5 +1,18 @@
 # Metal GLiNER2 Fine-tuning — Next Steps Plan (v2, merged)
 
+> **Production batch-32 correction 2026-06-14 — in progress.**
+> The current batch-32 OOM class is not a Python/Zig numerical mismatch; it is
+> the Metal training executor's single-frame lifetime model retaining thousands
+> of dead private intermediates until frame completion. The corrective path is
+> now explicit: in-frame private-buffer reuse is default-ON in the Metal runtime
+> (escape hatch: `TERMITE_METAL_BUFFER_REUSE=0`), per-step JSONL telemetry reports
+> Metal live/runtime/frame-retained/reuse counters, and the stable regression
+> entrypoint is `scripts/run_gliner2_metal_train_tests.sh batch32`. That gate
+> forwards true `--batch-size 32` into `gliner2-production-readiness`, defaults
+> to `seq_len=128`/32 train examples, enables reuse stats, and requires allocator
+> reuse hits so a future accidental disablement fails loudly. Frame chunking is
+> diagnostic/fallback work only until it shows measured peak-memory wins.
+
 > **✅ PRODUCTION PUSH 2026-06-11 — OOM FIXED + restructure shipped (default-on).**
 > The machine-OOM (Metal at realistic seq≥128 exhausting 16GB) was the
 > **`[bh,S,S,D]` disentangled-attention materialization**. Replaced C2P/P2C with
