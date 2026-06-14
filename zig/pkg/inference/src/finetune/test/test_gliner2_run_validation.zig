@@ -688,6 +688,7 @@ test "zeroPaddedSpanTargetRows masks padded total-loss rows and keeps gather ind
         real_batch,
         padded_batch,
         false,
+        1,
     );
 
     // Real rows keep their supervision values untouched.
@@ -750,6 +751,7 @@ test "zeroPaddedSpanTargetRows masks padded span-start rows and rejects bad shap
         real_batch,
         padded_batch,
         false,
+        1,
     );
 
     for (0..padded_batch * max_spans) |flat_span_idx| {
@@ -768,6 +770,7 @@ test "zeroPaddedSpanTargetRows masks padded span-start rows and rejects bad shap
         real_batch,
         padded_batch,
         false,
+        1,
     ));
     try std.testing.expectError(error.InvalidGlinerObjective, gliner2_autodiff.zeroPaddedSpanTargetRows(
         targets,
@@ -777,5 +780,6 @@ test "zeroPaddedSpanTargetRows masks padded span-start rows and rejects bad shap
         real_batch,
         padded_batch,
         false,
+        1,
     ));
 }

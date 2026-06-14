@@ -914,6 +914,14 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         print("  metal deberta encoder frame preplan: {s}\n", .{if (preplanned) "ready" else "not-ready"});
     }
 
+    const structure_max_instances: u32 = if (opts.objective == .gliner2_total_loss)
+        computeMaxStructureInstances(training_records)
+    else
+        1;
+    if (structure_max_instances > 1) {
+        print("  structure max instances (per-instance struct loss): {d}\n", .{structure_max_instances});
+    }
+
     var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
         .graph_config = graph_config,
         .num_classes = effective_num_classes,
@@ -922,6 +930,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .span_start_loss_reduction = opts.span_loss_reduction,
         .span_start_positive_weight = opts.span_positive_weight,
         .span_start_negative_weight = opts.span_negative_weight,
+        .structure_max_instances = structure_max_instances,
     });
 
     // ------------------------------------------------------------------
@@ -991,7 +1000,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     const use_label_positive_weights = opts.span_label_positive_weights != null;
     const span_entity_types: usize = if (effective_num_classes > 1) @as(usize, @intCast(effective_num_classes)) - 1 else 0;
     const span_target_width: usize = if (opts.objective == .gliner2_total_loss)
-        gliner2_autodiff.gliner2TotalLossTargetWidth(span_entity_types)
+        gliner2_autodiff.gliner2TotalLossTargetWidthEx(span_entity_types, structure_max_instances)
     else if (use_label_positive_weights)
         gliner2_autodiff.weightedSpanStartTargetWidth(span_entity_types)
     else
@@ -1146,7 +1155,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     }
 
                     const width = if (opts.objective == .gliner2_total_loss)
-                        gliner2_autodiff.gliner2TotalLossTargetWidth(encoded.num_entity_types)
+                        gliner2_autodiff.gliner2TotalLossTargetWidthEx(encoded.num_entity_types, structure_max_instances)
                     else if (use_label_positive_weights)
                         gliner2_autodiff.weightedSpanStartTargetWidth(encoded.num_entity_types)
                     else
@@ -1158,6 +1167,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                             &encoded,
                             batch_records,
                             entity_types,
+                            structure_max_instances,
                             targets_buf[0..target_len],
                         )
                     else
@@ -1187,13 +1197,15 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                         real_batch,
                         ab,
                         use_label_positive_weights,
+                        structure_max_instances,
                     );
                     target_stats = BatchTargetStats.fromSpanStart(span_stats, encoded.num_entity_types);
                     targets_shape = if (opts.objective == .gliner2_total_loss)
-                        gliner2_autodiff.gliner2TotalLossTargetsShape(
+                        gliner2_autodiff.gliner2TotalLossTargetsShapeEx(
                             actual_batch,
                             @intCast(encoded.max_spans),
                             @intCast(encoded.num_entity_types),
+                            structure_max_instances,
                         )
                     else if (use_label_positive_weights)
                         gliner2_autodiff.weightedSpanStartTargetsShape(
@@ -1255,35 +1267,42 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 printSpanComponentDebug(components);
             }
             if (opts.dump_span_parity and opts.objective == .gliner2_total_loss and total_steps == 0) {
-                const logits = try gliner2_autodiff.spanStartLogitsForBatch(
-                    allocator,
-                    &trainer,
-                    &gliner_ctx,
-                    input_ids[0 .. ab * sl],
-                    attention_mask[0 .. ab * sl],
-                    target_slice,
-                    targets_shape,
-                    actual_batch,
-                    @intCast(sl),
-                );
-                defer allocator.free(logits);
-                try printSpanParityDebug(logits, target_slice, targets_shape, entity_types.len, false, opts);
-                if (gliner2_autodiff.spanStartComponentDebugForBatch(
-                    allocator,
-                    &trainer,
-                    &gliner_ctx,
-                    input_ids[0 .. ab * sl],
-                    attention_mask[0 .. ab * sl],
-                    target_slice,
-                    targets_shape,
-                    actual_batch,
-                    @intCast(sl),
-                    entity_types.len,
-                )) |span_components| {
-                    printSpanComponentDebug(span_components);
-                } else |err| switch (err) {
-                    error.MissingPositiveSpanLabel => {},
-                    else => return err,
+                // The legacy span-parity dumps assume the single-instance
+                // structure logits shape `[span_rows, E]`. The per-instance
+                // structure loss emits `[span_rows, max_gold * E]`, so skip
+                // those dumps there and still emit the component-loss debug
+                // (which the parity harness reads).
+                if (gliner_ctx.config.structure_max_instances == 1) {
+                    const logits = try gliner2_autodiff.spanStartLogitsForBatch(
+                        allocator,
+                        &trainer,
+                        &gliner_ctx,
+                        input_ids[0 .. ab * sl],
+                        attention_mask[0 .. ab * sl],
+                        target_slice,
+                        targets_shape,
+                        actual_batch,
+                        @intCast(sl),
+                    );
+                    defer allocator.free(logits);
+                    try printSpanParityDebug(logits, target_slice, targets_shape, entity_types.len, false, opts);
+                    if (gliner2_autodiff.spanStartComponentDebugForBatch(
+                        allocator,
+                        &trainer,
+                        &gliner_ctx,
+                        input_ids[0 .. ab * sl],
+                        attention_mask[0 .. ab * sl],
+                        target_slice,
+                        targets_shape,
+                        actual_batch,
+                        @intCast(sl),
+                        entity_types.len,
+                    )) |span_components| {
+                        printSpanComponentDebug(span_components);
+                    } else |err| switch (err) {
+                        error.MissingPositiveSpanLabel => {},
+                        else => return err,
+                    }
                 }
                 const components = try gliner2_autodiff.gliner2TotalLossComponentDebugForBatch(
                     allocator,
@@ -1922,7 +1941,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
             }
 
             const width = if (opts.objective == .gliner2_total_loss)
-                gliner2_autodiff.gliner2TotalLossTargetWidth(encoded.num_entity_types)
+                gliner2_autodiff.gliner2TotalLossTargetWidthEx(encoded.num_entity_types, gliner_ctx.config.structure_max_instances)
             else if (use_label_positive_weights)
                 gliner2_autodiff.weightedSpanStartTargetWidth(encoded.num_entity_types)
             else
@@ -1934,6 +1953,7 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                     &encoded,
                     batch_records,
                     entity_types,
+                    gliner_ctx.config.structure_max_instances,
                     targets_buf[0..target_len],
                 )
             else
@@ -1953,12 +1973,14 @@ fn ensureTrainerGraphBuiltFromFirstBatch(
                 real_batch,
                 ab,
                 use_label_positive_weights,
+                gliner_ctx.config.structure_max_instances,
             );
             targets_shape = if (opts.objective == .gliner2_total_loss)
-                gliner2_autodiff.gliner2TotalLossTargetsShape(
+                gliner2_autodiff.gliner2TotalLossTargetsShapeEx(
                     actual_batch,
                     @intCast(encoded.max_spans),
                     @intCast(encoded.num_entity_types),
+                    gliner_ctx.config.structure_max_instances,
                 )
             else if (use_label_positive_weights)
                 gliner2_autodiff.weightedSpanStartTargetsShape(
@@ -3514,22 +3536,42 @@ fn shuffleExamplesAndRecords(prng: *std.Random, examples: []gliner2_data.Example
     }
 }
 
+/// Max structure `gold_count` (capped at upstream's 19) across all
+/// json_structures / relations tasks in the dataset. Drives
+/// `structure_max_instances`: `1` keeps the legacy single-instance structure
+/// loss; `>1` activates the per-instance count-conditioned einsum.
+fn computeMaxStructureInstances(records: []const gliner2_data.UpstreamRecord) u32 {
+    var max_instances: u32 = 1;
+    for (records) |record| {
+        for (record.tasks) |task| {
+            switch (task.kind) {
+                .json_structures, .relations => {
+                    const c: u32 = @intCast(@min(task.count, @as(usize, 19)));
+                    if (c > max_instances) max_instances = c;
+                },
+                else => {},
+            }
+        }
+    }
+    return max_instances;
+}
+
 fn fillGliner2TotalLossTargetsFromRecords(
     allocator: std.mem.Allocator,
     encoded: *const gliner2_data.EncodedBatch,
     records: []const gliner2_data.UpstreamRecord,
     entity_labels: []const []const u8,
+    max_instances: u32,
     out: []f32,
 ) !gliner2_autodiff.SpanStartTargetStats {
     if (records.len != encoded.batch_size) return error.InvalidGlinerBatchShape;
     if (entity_labels.len != encoded.num_entity_types) return error.EntityTypeCountMismatch;
     const E = encoded.num_entity_types;
-    const total_width = gliner2_autodiff.gliner2TotalLossTargetWidth(E);
+    const total_width = gliner2_autodiff.gliner2TotalLossTargetWidthEx(E, max_instances);
     const rows = encoded.batch_size * encoded.max_spans;
     if (out.len != rows * total_width) return error.InvalidGlinerSpanTargetShape;
     @memset(out, 0.0);
 
-    _ = allocator;
     var stats = gliner2_autodiff.SpanStartTargetStats{ .entity_type_count = E };
 
     const cls_labels_offset = gliner2_autodiff.gliner2TotalLossClassificationLabelsOffset(E);
@@ -3628,6 +3670,53 @@ fn fillGliner2TotalLossTargetsFromRecords(
                         row[count_mask_offset] = 1.0;
                     }
                 },
+            }
+        }
+    }
+
+    // Per-instance structure-loss trailing columns (only when activated):
+    // gold_count[E] (the schema's instance count for active fields, broadcast
+    // across the sample's spans) and instance_idx[E] (the document-order
+    // instance each located gold (span, field) belongs to).
+    if (max_instances > 1) {
+        const inst_offset = gliner2_autodiff.gliner2TotalLossInstanceIdxOffset(E);
+        const gc_offset = gliner2_autodiff.gliner2TotalLossGoldCountOffset(E);
+        const max_span_width = if (encoded.max_words_per_sample > 0)
+            encoded.max_spans / encoded.max_words_per_sample
+        else
+            0;
+        for (records, 0..) |record, sample_idx| {
+            for (0..encoded.max_spans) |span_idx| {
+                const flat = sample_idx * encoded.max_spans + span_idx;
+                const row = out[flat * total_width ..][0..total_width];
+                for (0..E) |label| {
+                    const kind = encoded.entity_type_kind[sample_idx * E + label];
+                    if (kind > 1) row[gc_offset + label] = @floatFromInt(kind - 1);
+                }
+            }
+
+            const char_to_word = try gliner2_data.buildCharToWordMap(allocator, record.text);
+            defer allocator.free(char_to_word);
+            const prefix_word_count = record.prefix_tokens.len;
+            for (record.tasks) |task| {
+                switch (task.kind) {
+                    .json_structures, .relations => {},
+                    else => continue,
+                }
+                for (task.fields) |field| {
+                    const span_idx = gliner2_data.locateUpstreamFieldSpanIdx(
+                        field,
+                        char_to_word,
+                        prefix_word_count,
+                        encoded.max_words_per_sample,
+                        max_span_width,
+                    ) orelse continue;
+                    const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ task.name, field.name });
+                    defer allocator.free(label);
+                    const label_idx = indexOfEntityLabel(entity_labels, label) orelse continue;
+                    const flat = sample_idx * encoded.max_spans + span_idx;
+                    out[flat * total_width + inst_offset + label_idx] = @floatFromInt(field.instance);
+                }
             }
         }
     }

@@ -41,6 +41,11 @@ pub const UpstreamField = struct {
     end: ?usize = null,
     target_word_start: ?usize = null,
     target_word_end: ?usize = null,
+    /// Document-order instance index this field value belongs to within its
+    /// grouped structure task (0-based). Used by the per-instance structure
+    /// loss to assign each gold span to the matching count-conditioned
+    /// projection. Single-instance tasks leave this at 0.
+    instance: usize = 0,
 };
 
 pub const UpstreamTask = struct {
@@ -2385,6 +2390,8 @@ fn appendGroupedStructureTasks(
                 try group_counts.append(allocator, 0);
             }
 
+            const instance_idx = group_counts.items[gi];
+            const fields_before = group_fields.items[gi].items.len;
             var field_iter = inst_entry.value_ptr.object.iterator();
             while (field_iter.next()) |field_entry| {
                 try appendTaskFieldsFromValue(
@@ -2396,6 +2403,7 @@ fn appendGroupedStructureTasks(
                     &group_fields.items[gi],
                 );
             }
+            for (group_fields.items[gi].items[fields_before..]) |*f| f.instance = instance_idx;
             group_counts.items[gi] += 1;
         }
     }
@@ -2673,27 +2681,7 @@ fn fillUpstreamSpanGrid(
         if (task.kind == .classifications) continue;
         const count_state: i32 = @intCast(@min(task.count, @as(usize, 19)) + 1);
         for (task.fields) |field| {
-            const start_word, const end_word = if (field.target_word_start != null and field.target_word_end != null)
-                .{ field.target_word_start.?, field.target_word_end.? }
-            else blk: {
-                const start = field.start orelse continue;
-                const end_exclusive = field.end orelse continue;
-                if (start >= char_to_word.len or end_exclusive == 0 or end_exclusive > char_to_word.len) continue;
-                const end = end_exclusive - 1;
-                if (end >= char_to_word.len) continue;
-                const start_word_raw = char_to_word[start];
-                const end_word_raw = char_to_word[end];
-                if (start_word_raw < 0 or end_word_raw < start_word_raw) continue;
-                break :blk .{
-                    prefix_word_count + @as(usize, @intCast(start_word_raw)),
-                    prefix_word_count + @as(usize, @intCast(end_word_raw)),
-                };
-            };
-            if (start_word >= max_words or end_word >= max_words) continue;
-            const width = end_word - start_word + 1;
-            if (width == 0 or width > max_span_width) continue;
-            const span_idx = start_word * max_span_width + (width - 1);
-            if (span_idx >= max_spans) continue;
+            const span_idx = locateUpstreamFieldSpanIdx(field, char_to_word, prefix_word_count, max_words, max_span_width) orelse continue;
             const label_idx = if (task.kind == .entities)
                 indexOfLabel(entity_types, field.name)
             else blk: {
@@ -2709,7 +2697,42 @@ fn fillUpstreamSpanGrid(
     }
 }
 
-fn buildCharToWordMap(allocator: std.mem.Allocator, text: []const u8) ![]i32 {
+/// Map an upstream field's located mention to its flat span-grid index within
+/// a sample (`start_word * max_span_width + (width - 1)`), or null if the field
+/// has no locatable / in-bounds span. Shared by `fillUpstreamSpanGrid` and the
+/// per-instance structure-loss target builder so both agree on the mapping.
+pub fn locateUpstreamFieldSpanIdx(
+    field: UpstreamField,
+    char_to_word: []const i32,
+    prefix_word_count: usize,
+    max_words: usize,
+    max_span_width: usize,
+) ?usize {
+    const start_word, const end_word = if (field.target_word_start != null and field.target_word_end != null)
+        .{ field.target_word_start.?, field.target_word_end.? }
+    else blk: {
+        const start = field.start orelse return null;
+        const end_exclusive = field.end orelse return null;
+        if (start >= char_to_word.len or end_exclusive == 0 or end_exclusive > char_to_word.len) return null;
+        const end = end_exclusive - 1;
+        if (end >= char_to_word.len) return null;
+        const start_word_raw = char_to_word[start];
+        const end_word_raw = char_to_word[end];
+        if (start_word_raw < 0 or end_word_raw < start_word_raw) return null;
+        break :blk .{
+            prefix_word_count + @as(usize, @intCast(start_word_raw)),
+            prefix_word_count + @as(usize, @intCast(end_word_raw)),
+        };
+    };
+    if (start_word >= max_words or end_word >= max_words) return null;
+    const width = end_word - start_word + 1;
+    if (width == 0 or width > max_span_width) return null;
+    const span_idx = start_word * max_span_width + (width - 1);
+    if (span_idx >= max_words * max_span_width) return null;
+    return span_idx;
+}
+
+pub fn buildCharToWordMap(allocator: std.mem.Allocator, text: []const u8) ![]i32 {
     const map = try allocator.alloc(i32, text.len);
     @memset(map, -1);
     var text_idx: usize = 0;

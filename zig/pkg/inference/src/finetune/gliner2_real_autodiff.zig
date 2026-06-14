@@ -128,6 +128,14 @@ pub const GlinerAutodiffConfig = struct {
     /// Default keeps the existing normalized local training behavior; `.sum`
     /// matches upstream GLiNER2 `compute_struct_loss` for parity runs.
     span_start_loss_reduction: SpanStartLossReduction = .mean,
+    /// Maximum number of structure instances (`gold_count`) across the dataset.
+    /// `1` (default) keeps the legacy single-instance structure-loss path
+    /// byte-identical. `>1` activates the per-instance count-conditioned
+    /// einsum that matches upstream `compute_struct_loss`'s
+    /// `(gold_count, num_fields, starts, widths)` scoring, where each instance
+    /// `i` uses the learned `count_embed.pos_embedding` row `i` (document
+    /// order). Set by the trainer from the dataset's max structure count.
+    structure_max_instances: u32 = 1,
 };
 
 /// Trainer-opaque context that owns the graph-construction state and (after
@@ -607,20 +615,145 @@ pub const GlinerAutodiffCtx = struct {
         const C: u32 = self.config.num_classes;
         if (C < 2) return error.InvalidGlinerClassCount;
         const E: u32 = C - 1;
+        const H: u32 = self.config.graph_config.hidden_size;
         const target_shape = bld.graph.node(targets).output_shape;
         if (target_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
-        const expected_width: i64 = @intCast(gliner2TotalLossTargetWidth(@intCast(E)));
+        const expected_width: i64 = @intCast(gliner2TotalLossTargetWidthEx(@intCast(E), self.config.structure_max_instances));
         if (target_shape.dim(1) != expected_width) return error.InvalidGlinerSpanTargetShape;
 
         const span_width: i64 = @intCast(spanStartTargetWidth(@intCast(E)));
         const structure_targets = try bld.sliceLastDim(targets, 0, span_width);
-        const structure_loss = try self.buildSpanStartLoss(bld, hidden, structure_targets);
+        const structure_loss = if (self.config.structure_max_instances > 1)
+            try self.buildGliner2PerInstanceStructureLoss(bld, hidden, targets, E, H)
+        else
+            try self.buildSpanStartLoss(bld, hidden, structure_targets);
         const classification_loss = try self.buildGliner2ClassificationLoss(bld, hidden, targets);
         const count_loss = try self.buildGliner2CountLoss(bld, hidden, targets);
         self.gliner2_structure_loss = structure_loss;
         self.gliner2_classification_loss = classification_loss;
         self.gliner2_count_loss = count_loss;
         return bld.add(try bld.add(structure_loss, classification_loss), count_loss);
+    }
+
+    /// Per-instance count-conditioned structure loss matching upstream
+    /// `compute_struct_loss`'s `(gold_count, num_fields, starts, widths)`
+    /// einsum. Active only when `config.structure_max_instances > 1`. Reads the
+    /// legacy structure columns plus the trailing `instance_idx[E]` /
+    /// `gold_count[E]` columns and scores each span against every
+    /// `(instance, field)` projection, with `labs[span, instance, field]` and a
+    /// mask gating `instance < gold_count`, active fields, and valid spans.
+    fn buildGliner2PerInstanceStructureLoss(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+        E: u32,
+        H: u32,
+    ) !NodeId {
+        const max_gold = self.config.structure_max_instances;
+        const graph_batch = self.graph_batch;
+        const target_shape = bld.graph.node(targets).output_shape;
+        const span_rows: u32 = @intCast(target_shape.dim(0));
+        if (graph_batch == 0 or span_rows == 0 or @mod(span_rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
+        const max_spans_per_sample = span_rows / graph_batch;
+        const compact_schema_rows = graph_batch * E;
+
+        const hidden_flat = try flattenHiddenForLoss(bld, hidden, H);
+
+        // Legacy total-loss structure layout (unweighted):
+        // labels[0:E], mask[E:2E], schema_idx[2E:3E], row_idx[3E:4E],
+        // count_idx[4E:5E], start[5E], end[5E+1].
+        const schema_idx_offset: u32 = 2 * E;
+        const start_idx_offset: u32 = 5 * E;
+        const inst_offset: u32 = @intCast(gliner2TotalLossInstanceIdxOffset(E));
+        const gc_offset: u32 = @intCast(gliner2TotalLossGoldCountOffset(E));
+
+        // Span representation (identical to buildSpanStartLoss).
+        const start_idx_2d = try bld.sliceLastDim(targets, @intCast(start_idx_offset), @intCast(start_idx_offset + 1));
+        const start_idx_i64 = try bld.convertDtype(try bld.reshape(start_idx_2d, Shape.init(.f32, &.{@intCast(span_rows)})), .i64);
+        const end_idx_2d = try bld.sliceLastDim(targets, @intCast(start_idx_offset + 1), @intCast(start_idx_offset + 2));
+        const end_idx_i64 = try bld.convertDtype(try bld.reshape(end_idx_2d, Shape.init(.f32, &.{@intCast(span_rows)})), .i64);
+        const start_hidden = try bld.gather(hidden_flat, start_idx_i64, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(H) }));
+        const end_hidden = try bld.gather(hidden_flat, end_idx_i64, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(H) }));
+        const projected_span = try buildParitySpanProjection(bld, start_hidden, end_hidden, span_rows, H);
+        self.span_debug_projected_span = projected_span;
+
+        // First-span-row indices: one row per sample, to gather the per-sample
+        // schema field embeddings + active mask (which are span-invariant).
+        const first_span_rows_buf = try bld.graph.allocator.alloc(f32, graph_batch);
+        defer bld.graph.allocator.free(first_span_rows_buf);
+        for (first_span_rows_buf, 0..) |*dst, sample_idx| {
+            dst.* = @floatFromInt(sample_idx * max_spans_per_sample);
+        }
+        const first_span_rows_i64 = try bld.convertDtype(
+            try bld.tensorConst(first_span_rows_buf, Shape.init(.f32, &.{@intCast(graph_batch)})),
+            .i64,
+        );
+
+        const schema_idx_2d = try bld.sliceLastDim(targets, @intCast(schema_idx_offset), @intCast(schema_idx_offset + E));
+        const compact_schema_idx_2d = try bld.gather(schema_idx_2d, first_span_rows_i64, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }));
+        const schema_idx_i64 = try bld.convertDtype(try bld.reshape(compact_schema_idx_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)})), .i64);
+        const schema_hidden = try bld.gather(hidden_flat, schema_idx_i64, Shape.init(.f32, &.{ @intCast(compact_schema_rows), @intCast(H) }));
+        self.span_debug_schema_hidden = schema_hidden;
+
+        const mask_2d = try bld.sliceLastDim(targets, @intCast(E), @intCast(2 * E)); // [span_rows, E]
+        const compact_active_2d = try bld.gather(mask_2d, first_span_rows_i64, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(E) }));
+        const compact_active = try bld.reshape(compact_active_2d, Shape.init(.f32, &.{@intCast(compact_schema_rows)}));
+
+        // struct_proj [graph_batch*max_gold*E, H] ordered [sample, instance, field].
+        const struct_proj = try buildParityCountEmbedSequence(bld, schema_hidden, compact_active, graph_batch, E, H, max_gold);
+        self.span_debug_schema_projection = struct_proj;
+
+        // scores[span, instance*E + field] = projected_span · struct_proj.
+        const span_3d = try bld.reshape(projected_span, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(max_spans_per_sample), @intCast(H) }));
+        const proj_3d = try bld.reshape(struct_proj, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(max_gold * E), @intCast(H) }));
+        const proj_3d_t = try bld.transpose(proj_3d, &.{ 0, 2, 1 }); // [graph_batch, H, max_gold*E]
+        const scores_3d = try bld.matmul3D(span_3d, proj_3d_t); // [graph_batch, max_spans, max_gold*E]
+        const scores_flat = try bld.reshape(scores_3d, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(max_gold * E) }));
+        self.span_logits = scores_flat;
+
+        // Per-instance labels and masks, flattened to [span_rows, max_gold*E]
+        // with the same [instance, field] inner ordering as struct_proj.
+        const labs_2d = try bld.sliceLastDim(targets, 0, @intCast(E));
+        const inst_2d = try bld.sliceLastDim(targets, @intCast(inst_offset), @intCast(inst_offset + E));
+        const gc_2d = try bld.sliceLastDim(targets, @intCast(gc_offset), @intCast(gc_offset + E));
+        const one = try bld.scalarConst(.f32, 1.0);
+
+        var labs_concat: NodeId = undefined;
+        var mask_concat: NodeId = undefined;
+        var m: u32 = 0;
+        while (m < max_gold) : (m += 1) {
+            const m_const = try bld.scalarConst(.f32, @floatFromInt(m));
+            // eq_m = relu(1 - |inst_idx - m|): 1 where instance == m, else 0.
+            const eq_m = try bld.relu(try bld.sub(one, try bld.absOp(try bld.sub(inst_2d, m_const))));
+            const labs_m = try bld.mul(labs_2d, eq_m);
+            // active_m = min(relu(gold_count - m), 1): 1 while m < gold_count.
+            const t = try bld.relu(try bld.sub(gc_2d, m_const));
+            const active_m = try bld.sub(one, try bld.relu(try bld.sub(one, t)));
+            const mask_m = try bld.mul(mask_2d, active_m);
+            const labs_m3 = try bld.reshape(labs_m, Shape.init(.f32, &.{ @intCast(span_rows), 1, @intCast(E) }));
+            const mask_m3 = try bld.reshape(mask_m, Shape.init(.f32, &.{ @intCast(span_rows), 1, @intCast(E) }));
+            if (m == 0) {
+                labs_concat = labs_m3;
+                mask_concat = mask_m3;
+            } else {
+                labs_concat = try bld.concat(labs_concat, labs_m3, 1);
+                mask_concat = try bld.concat(mask_concat, mask_m3, 1);
+            }
+        }
+        const labs_flat = try bld.reshape(labs_concat, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(max_gold * E) }));
+        const mask_flat = try bld.reshape(mask_concat, Shape.init(.f32, &.{ @intCast(span_rows), @intCast(max_gold * E) }));
+
+        return buildMaskedSpanStartBceLoss(
+            bld,
+            scores_flat,
+            labs_flat,
+            mask_flat,
+            null,
+            self.config.span_start_positive_weight,
+            self.config.span_start_negative_weight,
+            self.config.span_start_loss_reduction,
+        );
     }
 
     fn buildGliner2ClassificationLoss(
@@ -831,10 +964,32 @@ fn buildParityCountEmbed(
     hidden_size: u32,
     debug_nodes: ?*CountEmbedDebugNodes,
 ) !NodeId {
-    const count_dim: u32 = 128;
-    const count_ff: u32 = 256;
     const gru_state = try buildCountLstmV2UnrolledState(bld, hidden, count_state_indices, rows, hidden_size);
     const count_state = try bld.add(gru_state, hidden);
+    if (debug_nodes) |nodes| {
+        nodes.gru_state = gru_state;
+        nodes.count_state = count_state;
+    }
+    return buildCountEmbedProjectionHead(bld, count_state, active_schema_mask, rows, attention_seq_len, hidden_size, debug_nodes);
+}
+
+/// The shared `count_embed.transformer` projection head: in_projector →
+/// 2-layer DownscaledTransformer (attention over `attention_seq_len` fields) →
+/// concat(transformer_out, count_state) → out_projector. `count_state`
+/// (= GRU output + pc_emb) is `[rows, hidden_size]`; the result is the
+/// per-row projection `[rows, hidden_size]`. Used by both the legacy
+/// single-instance path and the per-instance sequence path.
+fn buildCountEmbedProjectionHead(
+    bld: *Builder,
+    count_state: NodeId,
+    active_schema_mask: ?NodeId,
+    rows: u32,
+    attention_seq_len: u32,
+    hidden_size: u32,
+    debug_nodes: ?*CountEmbedDebugNodes,
+) !NodeId {
+    const count_dim: u32 = 128;
+    const count_ff: u32 = 256;
     const in_project = try linearNamed(bld, count_state, "count_embed.transformer.in_projector.weight", "count_embed.transformer.in_projector.bias", rows, hidden_size, count_dim);
 
     const layer0_out = try buildCountTransformerLayer(bld, in_project, active_schema_mask, rows, attention_seq_len, count_dim, count_ff, 0);
@@ -844,8 +999,6 @@ fn buildParityCountEmbed(
     const out0 = try bld.relu(try linearNamed(bld, transformer_joined, "count_embed.transformer.out_projector.0.weight", "count_embed.transformer.out_projector.0.bias", rows, count_dim + hidden_size, hidden_size));
     const out2 = try bld.relu(try linearNamed(bld, out0, "count_embed.transformer.out_projector.2.weight", "count_embed.transformer.out_projector.2.bias", rows, hidden_size, hidden_size));
     if (debug_nodes) |nodes| {
-        nodes.gru_state = gru_state;
-        nodes.count_state = count_state;
         nodes.in_project = in_project;
         nodes.layer0 = layer0_out;
         nodes.layer1 = layer1_out;
@@ -853,6 +1006,88 @@ fn buildParityCountEmbed(
         nodes.out2 = out2;
     }
     return linearNamed(bld, out2, "count_embed.transformer.out_projector.4.weight", "count_embed.transformer.out_projector.4.bias", rows, hidden_size, hidden_size);
+}
+
+/// Per-instance count-conditioned schema projection matching upstream
+/// `CountLSTMv2.forward(schema_emb[1:], gold_count)` for `gold_count = max_gold`
+/// instances. Produces `[graph_batch * max_gold * E, H]` ordered
+/// `[sample, instance, field]`: each instance `i` uses GRU state after pos
+/// steps `0..i` (the learned `count_embed.pos_embedding` row sequence) with
+/// `h0 = schema_hidden` (the field embeddings = pc_emb), then `+ pc_emb` and
+/// the shared transformer head. `schema_hidden` is `[graph_batch * E, H]`.
+fn buildParityCountEmbedSequence(
+    bld: *Builder,
+    schema_hidden: NodeId,
+    active_schema_mask: ?NodeId,
+    graph_batch: u32,
+    field_count: u32,
+    hidden_size: u32,
+    max_gold: u32,
+) !NodeId {
+    const rows = graph_batch * field_count;
+    const out_rows = graph_batch * max_gold * field_count;
+
+    // GRU sequence: state_concat[step, sample, field] = output[step] = hidden
+    // after pos steps 0..step starting from pc_emb. Shape [max_gold*rows, H].
+    const seq = try buildCountGruSequenceStates(bld, schema_hidden, rows, hidden_size, max_gold);
+    const seq_4d = try bld.reshape(seq, Shape.init(.f32, &.{ @intCast(max_gold), @intCast(graph_batch), @intCast(field_count), @intCast(hidden_size) }));
+    // → [sample, instance, field, H]
+    const seq_t = try bld.transpose(seq_4d, &.{ 1, 0, 2, 3 });
+    const output_seq = try bld.reshape(seq_t, Shape.init(.f32, &.{ @intCast(out_rows), @intCast(hidden_size) }));
+
+    // pc_emb broadcast over the instance axis: [graph_batch, field, H] →
+    // [graph_batch, max_gold, field, H].
+    const pc_3d = try bld.reshape(schema_hidden, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(field_count), @intCast(hidden_size) }));
+    const pc_b = try broadcastInDim(
+        bld,
+        pc_3d,
+        Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(max_gold), @intCast(field_count), @intCast(hidden_size) }),
+        &.{ 0, 2, 3 },
+    );
+    const pc_flat = try bld.reshape(pc_b, Shape.init(.f32, &.{ @intCast(out_rows), @intCast(hidden_size) }));
+    const count_state = try bld.add(output_seq, pc_flat);
+
+    const mask_b: ?NodeId = if (active_schema_mask) |m| blk: {
+        const m_2d = try bld.reshape(m, Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(field_count) }));
+        const m_b = try broadcastInDim(
+            bld,
+            m_2d,
+            Shape.init(.f32, &.{ @intCast(graph_batch), @intCast(max_gold), @intCast(field_count) }),
+            &.{ 0, 2 },
+        );
+        break :blk try bld.reshape(m_b, Shape.init(.f32, &.{@intCast(out_rows)}));
+    } else null;
+
+    return buildCountEmbedProjectionHead(bld, count_state, mask_b, out_rows, field_count, hidden_size, null);
+}
+
+/// GRU sequence states for the per-instance count embed: returns the first
+/// `num_steps` hidden states concatenated along axis 0 as `[num_steps*rows, H]`
+/// with layout `[step, row]`. `step` = instance index, `row` = (sample, field).
+fn buildCountGruSequenceStates(
+    bld: *Builder,
+    hidden: NodeId,
+    rows: u32,
+    hidden_size: u32,
+    num_steps: u32,
+) !NodeId {
+    const pos_weight = try bld.parameter(
+        "count_embed.pos_embedding.weight",
+        Shape.init(.f32, &.{ 20, @intCast(hidden_size) }),
+    );
+    var state = hidden;
+    var state_concat: NodeId = undefined;
+    var step: u32 = 0;
+    while (step < num_steps) : (step += 1) {
+        const pos_rows = try buildCountPositionRows(bld, pos_weight, @intCast(step), hidden, rows, hidden_size);
+        state = try buildCountGruStep(bld, pos_rows, state, rows, hidden_size);
+        if (step == 0) {
+            state_concat = state;
+        } else {
+            state_concat = try bld.concat(state_concat, state, 0);
+        }
+    }
+    return state_concat;
 }
 
 fn buildCountTransformerLayer(
@@ -1567,7 +1802,7 @@ pub fn gliner2TotalLossComponentDebugForBatch(
     const target_width: usize = @intCast(targets_shape.dim(1));
     if (targets.len != rows * target_width) return error.InvalidGlinerSpanTargetShape;
     const E: usize = @intCast(ctx.config.num_classes - 1);
-    const expected_width = gliner2TotalLossTargetWidth(E);
+    const expected_width = gliner2TotalLossTargetWidthEx(E, ctx.config.structure_max_instances);
     if (target_width != expected_width) return error.InvalidGlinerSpanTargetShape;
 
     const structure_mask_mass = sumPackedTargetColumns(targets, rows, target_width, E, E);
@@ -2039,6 +2274,33 @@ pub fn gliner2TotalLossTargetWidth(num_entity_types: usize) usize {
     return gliner2TotalLossParentIndexOffset(num_entity_types) + 1;
 }
 
+/// Per-instance structure-loss trailing columns. When `max_instances > 1` the
+/// total-loss target is widened by `2 * E` columns appended after the legacy
+/// layout: `instance_idx[E]` (the document-order instance each gold
+/// (span, field) belongs to) and `gold_count[E]` (the schema's instance count
+/// for active fields). The legacy offsets are unchanged, so `max_instances == 1`
+/// runs keep the exact legacy width and path.
+pub fn gliner2TotalLossInstanceIdxOffset(num_entity_types: usize) usize {
+    return gliner2TotalLossTargetWidth(num_entity_types);
+}
+
+pub fn gliner2TotalLossGoldCountOffset(num_entity_types: usize) usize {
+    return gliner2TotalLossInstanceIdxOffset(num_entity_types) + num_entity_types;
+}
+
+pub fn gliner2TotalLossTargetWidthEx(num_entity_types: usize, max_instances: u32) usize {
+    const base = gliner2TotalLossTargetWidth(num_entity_types);
+    if (max_instances > 1) return base + 2 * num_entity_types;
+    return base;
+}
+
+pub fn gliner2TotalLossTargetsShapeEx(batch: u32, max_rows: u32, num_entity_types: u32, max_instances: u32) Shape {
+    return Shape.init(.f32, &.{
+        @intCast(batch * max_rows),
+        @intCast(gliner2TotalLossTargetWidthEx(@intCast(num_entity_types), max_instances)),
+    });
+}
+
 pub fn gliner2TotalLossTargetsShape(batch: u32, max_rows: u32, num_entity_types: u32) Shape {
     return Shape.init(.f32, &.{
         @intCast(batch * max_rows),
@@ -2068,12 +2330,13 @@ pub fn zeroPaddedSpanTargetRows(
     real_batch: usize,
     padded_batch: usize,
     has_label_positive_weights: bool,
+    structure_max_instances: u32,
 ) !void {
     if (objective == .token) return error.InvalidGlinerObjective;
     if (real_batch > padded_batch or real_batch == 0) return error.InvalidGlinerBatchShape;
     const E = num_entity_types;
     const width = if (objective == .gliner2_total_loss)
-        gliner2TotalLossTargetWidth(E)
+        gliner2TotalLossTargetWidthEx(E, structure_max_instances)
     else if (has_label_positive_weights)
         weightedSpanStartTargetWidth(E)
     else
