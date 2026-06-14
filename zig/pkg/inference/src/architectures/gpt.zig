@@ -913,19 +913,32 @@ fn forwardGreedyLastTokenTensorFromFinalHidden(
     defer cb.free(lm_w);
 
     if (canUseFastGreedyArgmaxForConfig(config)) {
-        if (try cb.linearNoBiasArgmaxLastRowTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_tensor| {
-            errdefer cb.free(token_tensor);
-            const ids = try cb.toFloat32(token_tensor, allocator);
-            defer allocator.free(ids);
-            if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
-            return .{
-                .token_id = @intFromFloat(ids[0]),
-                .token_tensor = token_tensor,
-            };
-        }
-
-        if (try cb.linearNoBiasArgmaxLastRow(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_id| {
-            return .{ .token_id = @intCast(token_id) };
+        const suppress_token_ids = config.suppressTokenIds();
+        if (suppress_token_ids.len == 0) {
+            if (try cb.linearNoBiasArgmaxLastRowTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token| {
+                errdefer cb.free(token);
+                const ids = try cb.toFloat32(token, allocator);
+                defer allocator.free(ids);
+                if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+                return .{
+                    .token_id = @intFromFloat(ids[0]),
+                    .token_tensor = token,
+                };
+            }
+            if (try cb.linearNoBiasArgmaxLastRow(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_id| {
+                return .{ .token_id = @intCast(token_id) };
+            }
+        } else {
+            if (try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size, suppress_token_ids)) |token| {
+                errdefer cb.free(token);
+                const ids = try cb.toFloat32(token, allocator);
+                defer allocator.free(ids);
+                if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+                return .{
+                    .token_id = @intFromFloat(ids[0]),
+                    .token_tensor = token,
+                };
+            }
         }
     }
 
@@ -934,7 +947,19 @@ fn forwardGreedyLastTokenTensorFromFinalHidden(
     try maybeDebugTensor(cb, allocator, "lm_head", logits);
 
     if (canUseFastGreedyArgmaxForConfig(config)) {
-        if (try cb.argmaxLastRow(logits, hidden_result.total_rows, config.vocab_size)) |token_id| {
+        const suppress_token_ids = config.suppressTokenIds();
+        if (suppress_token_ids.len > 0) {
+            if (try cb.argmaxLastRowSuppressTensor(logits, hidden_result.total_rows, config.vocab_size, suppress_token_ids)) |token_tensor| {
+                errdefer cb.free(token_tensor);
+                const ids = try cb.toFloat32(token_tensor, allocator);
+                defer allocator.free(ids);
+                if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+                return .{
+                    .token_id = @intFromFloat(ids[0]),
+                    .token_tensor = token_tensor,
+                };
+            }
+        } else if (try cb.argmaxLastRow(logits, hidden_result.total_rows, config.vocab_size)) |token_id| {
             return .{ .token_id = @intCast(token_id) };
         }
     }
@@ -942,9 +967,13 @@ fn forwardGreedyLastTokenTensorFromFinalHidden(
     const result = try cb.toFloat32(logits, allocator);
     defer allocator.free(result);
     applyFinalLogitSoftcap(config, result);
-    return .{
-        .token_id = activations.argmax(result[(hidden_result.total_rows - 1) * config.vocab_size ..][0..config.vocab_size]),
-    };
+    const last = result[(hidden_result.total_rows - 1) * config.vocab_size ..][0..config.vocab_size];
+    for (config.suppressTokenIds()) |token_id| {
+        if (token_id < 0) continue;
+        const idx: usize = @intCast(token_id);
+        if (idx < last.len) last[idx] = -std.math.inf(f32);
+    }
+    return .{ .token_id = activations.argmax(last) };
 }
 
 fn forwardLogitsTensorFromEmbeddings(
@@ -3889,12 +3918,19 @@ fn decoderBlock(
         debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
 
         if (config.family == .gemma) {
-            const attn_post = try applyGemmaPostAttentionNorm(cb, allocator, config, proj, layer, &name_buf);
-            defer if (attn_post != proj) cb.free(attn_post);
-            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-post", attn_post, hidden_size);
-            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_post", layer, attn_post, hidden_size);
+            const sa_out = blk_sa_out: {
+                if (allowGemmaRmsNormAddResidualFusion(trace_sink)) {
+                    if (try applyGemmaPostAttentionNormResidual(cb, allocator, config, proj, hidden, layer, &name_buf)) |fused| {
+                        break :blk_sa_out fused;
+                    }
+                }
 
-            const sa_out = try cb.add(attn_post, hidden);
+                const attn_post = try applyGemmaPostAttentionNorm(cb, allocator, config, proj, layer, &name_buf);
+                defer if (attn_post != proj) cb.free(attn_post);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-post", attn_post, hidden_size);
+                try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_post", layer, attn_post, hidden_size);
+                break :blk_sa_out try cb.add(attn_post, hidden);
+            };
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-residual", sa_out, hidden_size);
             try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_residual", layer, sa_out, hidden_size);
 
@@ -3978,6 +4014,11 @@ fn decoderBlock(
 
             var layer_result_output_scaled = false;
             const ffn_residual = if (ple_vectors == null) residual_blk: {
+                if (allowGemmaRmsNormAddResidualFusion(trace_sink) and (config.hasPle() or !branchGemma4LayerOutputScaleDebug())) {
+                    if (try applyGemmaFfnPostNormResidual(cb, allocator, config, ffn_out_raw, sa_out, layer, &name_buf)) |fused| {
+                        break :residual_blk fused;
+                    }
+                }
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
@@ -3987,6 +4028,11 @@ fn decoderBlock(
                 }
                 break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
             } else ple_residual_blk: {
+                if (allowGemmaRmsNormAddResidualFusion(trace_sink)) {
+                    if (try applyGemmaFfnPostNormResidual(cb, allocator, config, ffn_out_raw, sa_out, layer, &name_buf)) |fused| {
+                        break :ple_residual_blk fused;
+                    }
+                }
                 const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
                 defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
@@ -4607,6 +4653,20 @@ fn disableGemma4LayerOutputScaleDebug() bool {
 
 fn branchGemma4LayerOutputScaleDebug() bool {
     return getenvBool("ANTFLY_INFERENCE_GEMMA4_BRANCH_LAYER_OUTPUT_SCALE");
+}
+
+fn disableGemmaRmsNormAddResidualFusionDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_DISABLE_RMSNORM_ADD_FUSION") or
+        getenvBool("TERMITE_GEMMA4_DISABLE_RMSNORM_ADD_FUSION");
+}
+
+fn allowGemmaRmsNormAddResidualFusion(trace_sink: ?*ActivationTraceSink) bool {
+    if (disableGemmaRmsNormAddResidualFusionDebug()) return false;
+    if (trace_sink != null) return false;
+    if (debugTensorStatsEnabled()) return false;
+    if (debugTensorSampleIndex() != null) return false;
+    if (dumpGatedLayerTarget() != null) return false;
+    return true;
 }
 
 fn scaleGemma4TiedLogitsDebug() bool {
@@ -7279,6 +7339,20 @@ fn applyGemmaPostAttentionNorm(
     })) orelse hidden;
 }
 
+fn applyGemmaPostAttentionNormResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    residual: CT,
+    layer: usize,
+    buf: *[256]u8,
+) !?CT {
+    return try applyOptionalAdjustedRmsNormAddResidualByNames(cb, allocator, config, hidden, residual, config.hidden_size, &.{
+        std.fmt.bufPrint(buf, "model.layers.{d}.post_attention_layernorm.weight", .{layer}) catch return error.NameTooLong,
+    });
+}
+
 fn applyGemmaFfnPreNorm(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -7304,6 +7378,20 @@ fn applyGemmaFfnPostNorm(
     return (try applyOptionalAdjustedRmsNormByNames(cb, allocator, config, hidden, config.hidden_size, &.{
         std.fmt.bufPrint(buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong,
     })) orelse hidden;
+}
+
+fn applyGemmaFfnPostNormResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    residual: CT,
+    layer: usize,
+    buf: *[256]u8,
+) !?CT {
+    return try applyOptionalAdjustedRmsNormAddResidualByNames(cb, allocator, config, hidden, residual, config.hidden_size, &.{
+        std.fmt.bufPrint(buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong,
+    });
 }
 
 /// Gemma 4: post-norm for the shared expert FFN sublayer (post_ffw_norm_1).
@@ -7366,6 +7454,28 @@ fn applyOptionalAdjustedRmsNormByNames(
         const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
         defer if (w != base_w) cb.free(w);
         return try cb.rmsNorm(hidden, w, dim, config.norm_eps);
+    }
+    return null;
+}
+
+fn applyOptionalAdjustedRmsNormAddResidualByNames(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    residual: CT,
+    dim: usize,
+    names: []const []const u8,
+) !?CT {
+    for (names) |name| {
+        const base_w = getModelWeight(cb, config, name) catch |err| switch (err) {
+            error.MissingWeight, error.WeightNotFound => continue,
+            else => return err,
+        };
+        defer cb.free(base_w);
+        const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
+        defer if (w != base_w) cb.free(w);
+        return try cb.rmsNormAddTensor(hidden, w, residual, dim, config.norm_eps);
     }
     return null;
 }
@@ -8062,11 +8172,15 @@ pub fn applyPle(
     defer cb.free(gate_w);
     const gate_proj = try cb.linearNoBias(hidden, gate_w, total, hidden_size, ple_dim);
     defer cb.free(gate_proj);
-    const gate = try applyActivation(cb, config, gate_proj);
-    defer cb.free(gate);
 
     // 3. Element-wise multiply gate with PLE conditioning vector.
-    const gated = try cb.multiply(gate, ple_ct);
+    const gated = if (try cb.activationMultiply(gate_proj, ple_ct, decoderRuntimeActivationKind(config.activation))) |fused|
+        fused
+    else blk: {
+        const gate = try applyActivation(cb, config, gate_proj);
+        defer cb.free(gate);
+        break :blk try cb.multiply(gate, ple_ct);
+    };
     defer cb.free(gated);
 
     // 4. Project back to hidden_size.
@@ -8103,7 +8217,7 @@ pub fn applyPle(
 
     // 6. Residual add, optionally fused with the per-layer output scale.
     if (output_scale) |scale| {
-        if (try cb.addMultiplyScalarTensor(hidden, normed, scale)) |scaled| return scaled;
+        if (try cb.addMultiplyScalarTensor(normed, hidden, scale)) |scaled| return scaled;
         const branch_scaled = try cb.multiply(normed, scale);
         defer cb.free(branch_scaled);
         return try cb.add(hidden, branch_scaled);

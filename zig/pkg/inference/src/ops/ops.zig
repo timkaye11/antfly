@@ -908,9 +908,14 @@ pub const ComputeBackend = struct {
         /// device-resident scalar multiply used by per-layer output scales.
         addMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT = null,
 
-        /// Y = (rms_norm(input, weight, dim, eps) + residual) * scalar[0].
+        /// Y = rms_norm(input, weight, dim, eps) * scalar[0] + residual.
         /// Backends may fuse Gemma-style post-norm residual epilogues.
         rmsNormAddMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = rms_norm(input, weight, dim, eps) + residual.
+        /// Backends may fuse Gemma-style post-norm residual epilogues when no
+        /// layer-output scale is present.
+        rmsNormAddTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) anyerror!?CT = null,
 
         /// Y = rope(rms_norm_heads(input, weight, eps), ...), optionally scaled.
         /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
@@ -1336,6 +1341,11 @@ pub const ComputeBackend = struct {
         /// Backends may return null when they do not provide a specialized path.
         argmaxLastRow: ?*const fn (ctx: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!?u32 = null,
 
+        /// Return the argmax token id as a backend tensor while masking a small
+        /// list of suppressed token ids. Used by pure-greedy decode paths that
+        /// must avoid full-logit host transfers.
+        argmaxLastRowSuppressTensor: ?*const fn (ctx: *anyopaque, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) anyerror!?CT = null,
+
         /// Sample a token id from the last row of a [rows, dim] tensor.
         /// Backends may return null to fall back to host materialization.
         sampleLastRow: ?*const fn (ctx: *anyopaque, request: *const SampleLastRowRequest) anyerror!?u32 = null,
@@ -1349,6 +1359,11 @@ pub const ComputeBackend = struct {
         /// the token id as a backend tensor. Used by decode paths that want to
         /// feed the next token back into the backend without a host upload.
         linearNoBiasArgmaxLastRowTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
+
+        /// Compute argmax(input @ weight^T) for the last input row while
+        /// masking a small list of suppressed token ids, returning the token id
+        /// as a backend tensor.
+        linearNoBiasArgmaxLastRowSuppressTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32) anyerror!?CT = null,
 
         /// Gemma4 MTP masked embedding selection. Backends may keep centroid
         /// top-k and restricted-token argmax on device; callers fall back to
@@ -2569,6 +2584,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, weight, residual, scalar, dim, eps);
     }
 
+    pub fn rmsNormAddTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) !?CT {
+        const op = self.vtable.rmsNormAddTensor orelse return null;
+        return op(self.ptr, input, weight, residual, dim, eps);
+    }
+
     pub fn rmsNormHeadsRope(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) !?CT {
         const op = self.vtable.rmsNormHeadsRope orelse return null;
         return op(self.ptr, input, weight, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale);
@@ -2688,6 +2708,13 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn argmaxLastRowSuppressTensor(self: *const ComputeBackend, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) !?CT {
+        if (self.vtable.argmaxLastRowSuppressTensor) |argmax_last_row_suppress_tensor| {
+            return argmax_last_row_suppress_tensor(self.ptr, tensor, rows, dim, suppress_token_ids);
+        }
+        return null;
+    }
+
     pub fn sampleLastRow(self: *const ComputeBackend, request: *const SampleLastRowRequest) !?u32 {
         if (self.vtable.sampleLastRow) |sample_last_row| {
             return sample_last_row(self.ptr, request);
@@ -2705,6 +2732,13 @@ pub const ComputeBackend = struct {
     pub fn linearNoBiasArgmaxLastRowTensor(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !?CT {
         if (self.vtable.linearNoBiasArgmaxLastRowTensor) |op| {
             return op(self.ptr, input, weight, rows, in_dim, out_dim);
+        }
+        return null;
+    }
+
+    pub fn linearNoBiasArgmaxLastRowSuppressTensor(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32) !?CT {
+        if (self.vtable.linearNoBiasArgmaxLastRowSuppressTensor) |op| {
+            return op(self.ptr, input, weight, rows, in_dim, out_dim, suppress_token_ids);
         }
         return null;
     }

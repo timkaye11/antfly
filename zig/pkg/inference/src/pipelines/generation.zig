@@ -348,6 +348,10 @@ fn enableCudaPrefillFirstToken() bool {
     return getenvBool("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN");
 }
 
+fn enableCudaPrefillGreedyToken() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", true);
+}
+
 fn cudaPrefillFirstTokenCoalesceTokenLimit() usize {
     return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 8;
 }
@@ -439,6 +443,21 @@ fn hasSamplingPenalties(config: GenerationConfig) bool {
 
 fn shouldUsePrefillFirstTokenPath(backend_kind: ops.BackendKind, max_tokens: usize, use_speculative: bool, enabled: bool) bool {
     return enabled and backend_kind == .cuda and max_tokens == 1 and !use_speculative;
+}
+
+fn shouldUseCudaPrefillGreedyToken(
+    backend_kind: ops.BackendKind,
+    config: GenerationConfig,
+    allow_resident_greedy_token: bool,
+    has_suppress_token_ids: bool,
+    enabled: bool,
+) bool {
+    _ = has_suppress_token_ids;
+    return enabled and
+        allow_resident_greedy_token and
+        backend_kind == .cuda and
+        isPureGreedyConfig(config) and
+        config.grammar == null;
 }
 
 fn coalescedPrefillChunkSizeForFirstToken(
@@ -2101,13 +2120,22 @@ pub const NativeGenerationPipeline = struct {
     ) !PrefillOutput {
         const allocator = self.allocator;
         var prefill_last_logits: ?[]f32 = null;
+        var prefill_greedy_token: ?usize = null;
+        const use_cuda_prefill_greedy_token = shouldUseCudaPrefillGreedyToken(
+            self.cb.kind(),
+            config,
+            allow_resident_greedy_token,
+            self.gpt_config.suppressTokenIds().len > 0,
+            enableCudaPrefillGreedyToken(),
+        );
         debugGenerationStage(
-            "executePrefill enter seq_len={d} paged={} scheduler={} compiled_whole_model={}",
+            "executePrefill enter seq_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
                 seq_len,
                 decode_state.isPaged(),
                 self.scheduler != null,
                 self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null,
+                use_cuda_prefill_greedy_token,
             },
         );
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
@@ -2193,16 +2221,18 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, chunk_end, chunk.len, chunk_end == seq_len) catch |err| {
-                                if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                                    current_chunk_size = @max(chunk_size / 2, 1);
-                                    continue;
-                                }
-                                return err;
-                            };
-                            processed = chunk_end;
-                            scheduler.notePrefillProgress(lease, processed, seq_len);
-                            continue;
+                            if (!(chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
+                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, chunk_end, chunk.len, chunk_end == seq_len) catch |err| {
+                                    if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
+                                        current_chunk_size = @max(chunk_size / 2, 1);
+                                        continue;
+                                    }
+                                    return err;
+                                };
+                                processed = chunk_end;
+                                scheduler.notePrefillProgress(lease, processed, seq_len);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -2214,24 +2244,38 @@ pub const NativeGenerationPipeline = struct {
                 }
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
-                const logits = self.forwardAllLogits(chunk, 1, chunk_end, &decode_context) catch |err| {
-                    if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                        current_chunk_size = @max(chunk_size / 2, 1);
-                        continue;
-                    }
-                    return err;
-                };
-                defer allocator.free(logits);
-                debugGenerationStage(
-                    "executePrefill chunk complete processed={d} chunk_end={d} logits_len={d}",
-                    .{ processed, chunk_end, logits.len },
-                );
-                if (chunk_end == seq_len) {
-                    prefill_last_logits = try allocator.dupe(f32, logits[(chunk.len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
+                if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
+                    prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                        if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
+                            current_chunk_size = @max(chunk_size / 2, 1);
+                            continue;
+                        }
+                        return err;
+                    };
                     debugGenerationStage(
-                        "executePrefill captured last logits vocab_size={d}",
-                        .{self.gpt_config.vocab_size},
+                        "executePrefill captured greedy token={d}",
+                        .{prefill_greedy_token.?},
                     );
+                } else {
+                    const logits = self.forwardAllLogits(chunk, 1, chunk_end, &decode_context) catch |err| {
+                        if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
+                            current_chunk_size = @max(chunk_size / 2, 1);
+                            continue;
+                        }
+                        return err;
+                    };
+                    defer allocator.free(logits);
+                    debugGenerationStage(
+                        "executePrefill chunk complete processed={d} chunk_end={d} logits_len={d}",
+                        .{ processed, chunk_end, logits.len },
+                    );
+                    if (chunk_end == seq_len) {
+                        prefill_last_logits = try allocator.dupe(f32, logits[(chunk.len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
+                        debugGenerationStage(
+                            "executePrefill captured last logits vocab_size={d}",
+                            .{self.gpt_config.vocab_size},
+                        );
+                    }
                 }
                 processed = chunk_end;
                 if (self.scheduler) |scheduler| {
@@ -2268,10 +2312,10 @@ pub const NativeGenerationPipeline = struct {
         }
 
         debugGenerationStage(
-            "executePrefill exit cached_logits={}",
-            .{prefill_last_logits != null},
+            "executePrefill exit cached_logits={} greedy_token={}",
+            .{ prefill_last_logits != null, prefill_greedy_token != null },
         );
-        return .{ .last_logits = prefill_last_logits };
+        return .{ .last_logits = prefill_last_logits, .greedy_token = prefill_greedy_token };
     }
 
     fn executePreparedMultimodalPrefill(
@@ -5258,6 +5302,27 @@ test "cuda prefill first token path is narrowly gated" {
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.native, 1, false, true));
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.metal, 1, false, true));
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 1, false, false));
+}
+
+test "cuda prefill greedy token path is pure greedy only" {
+    const greedy: GenerationConfig = .{ .max_tokens = 32, .temperature = 0 };
+    try std.testing.expect(shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, false, true));
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.native, greedy, true, false, true));
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, greedy, false, false, true));
+    try std.testing.expect(shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, true, true));
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, false, false));
+
+    var sampled = greedy;
+    sampled.temperature = 0.7;
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, sampled, true, false, true));
+
+    var penalized = greedy;
+    penalized.repetition_penalty = 1.1;
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, penalized, true, false, true));
+
+    var grammar = greedy;
+    grammar.grammar = "json";
+    try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, grammar, true, false, true));
 }
 
 test "cuda prefill first token coalesces only short eligible prompts" {

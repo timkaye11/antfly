@@ -675,6 +675,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
     gpt_arch.resetDebugTimingStats();
 
+    const cuda_stats_before_generate = if (comptime build_options.enable_cuda)
+        session_factory.getCudaRuntimeStats(model.session)
+    else
+        null;
     var result = pipeline.generate(&messages, config) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
@@ -684,6 +688,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
+        session_factory.getCudaRuntimeStats(model.session)
+    else
+        null;
+    const cuda_generate_stats = if (comptime build_options.enable_cuda)
+        if (cuda_stats_after_generate) |after|
+            if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+        else
+            null
+    else
+        null;
     defer result.deinit();
 
     print("{s}\n", .{result.text});
@@ -1048,9 +1063,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             },
         );
         if (comptime build_options.enable_cuda) {
-            if (session_factory.getCudaRuntimeStats(model.session)) |cuda_stats| {
+            if (cuda_stats_after_generate) |cuda_stats| {
                 print(
-                    "cuda_runtime_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} eval_syncs={d} alloc_calls={d} free_calls={d} temp_hits={d} temp_misses={d} temp_releases={d} temp_evictions={d} temp_cached_mb={d}\n",
+                    "cuda_runtime_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} eval_syncs={d} alloc_calls={d} free_calls={d} temp_hits={d} temp_misses={d} temp_releases={d} temp_evictions={d} temp_cached_mb={d} deferred_free_queued={d} deferred_free_drains={d} deferred_free_forced_drains={d} deferred_free_pending_mb={d} deferred_free_reclaimed_mb={d}\n",
                     .{
                         cuda_stats.kernel_launches,
                         cuda_stats.stream_syncs,
@@ -1064,6 +1079,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.temp_buffer_releases,
                         cuda_stats.temp_buffer_evictions,
                         cuda_stats.temp_buffer_cached_bytes / (1024 * 1024),
+                        cuda_stats.deferred_free_queued,
+                        cuda_stats.deferred_free_drains,
+                        cuda_stats.deferred_free_forced_drains,
+                        cuda_stats.deferred_free_pending_bytes / (1024 * 1024),
+                        cuda_stats.deferred_free_reclaimed_bytes / (1024 * 1024),
                     },
                 );
                 print(
@@ -1073,6 +1093,80 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         perToken(cuda_stats.stream_syncs, result.tokens_used),
                     },
                 );
+                if (cuda_generate_stats) |generate_stats| {
+                    print(
+                        "cuda_generate_counts: launches={d} syncs={d} upload_syncs={d} download_syncs={d} eval_syncs={d} alloc_calls={d} free_calls={d} temp_hits={d} temp_misses={d} temp_releases={d} temp_evictions={d} h2d={d} d2h={d} to_f32_calls={d} to_f32_bytes={d} argmax={d} norm={d} elementwise={d} scalar={d} qkv={d} linear={d} attention={d} deferred_free_queued={d} deferred_free_drains={d} deferred_free_forced_drains={d}\n",
+                        .{
+                            generate_stats.kernel_launches,
+                            generate_stats.stream_syncs,
+                            generate_stats.upload_syncs,
+                            generate_stats.download_syncs,
+                            generate_stats.eval_syncs,
+                            generate_stats.device_alloc_calls,
+                            generate_stats.device_free_calls,
+                            generate_stats.temp_buffer_hits,
+                            generate_stats.temp_buffer_misses,
+                            generate_stats.temp_buffer_releases,
+                            generate_stats.temp_buffer_evictions,
+                            generate_stats.h2d_bytes,
+                            generate_stats.d2h_bytes,
+                            generate_stats.to_float32_calls,
+                            generate_stats.to_float32_bytes,
+                            generate_stats.launch_argmax,
+                            generate_stats.launch_norm,
+                            generate_stats.launch_elementwise,
+                            generate_stats.launch_scalar,
+                            generate_stats.launch_linear_qkv,
+                            generate_stats.launch_linear,
+                            generate_stats.launch_attention,
+                            generate_stats.deferred_free_queued,
+                            generate_stats.deferred_free_drains,
+                            generate_stats.deferred_free_forced_drains,
+                        },
+                    );
+                    print(
+                        "cuda_generate_norm_launch_breakdown: layer={d} add_layer={d} rms={d} rms_add={d} rms_add_mul_scalar={d} rms_bare={d} head_rope={d}\n",
+                        .{
+                            generate_stats.launch_norm_layer,
+                            generate_stats.launch_norm_add_layer,
+                            generate_stats.launch_norm_rms,
+                            generate_stats.launch_norm_rms_add,
+                            generate_stats.launch_norm_rms_add_mul_scalar,
+                            generate_stats.launch_norm_rms_bare,
+                            generate_stats.launch_norm_head_rope,
+                        },
+                    );
+                    print(
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_scalar={d}\n",
+                        .{
+                            generate_stats.launch_attention_gqa_decode,
+                            generate_stats.launch_attention_gqa_scalar,
+                        },
+                    );
+                    print(
+                        "cuda_generate_rates: launches_per_token={d:.3} syncs_per_token={d:.3}\n",
+                        .{
+                            perToken(generate_stats.kernel_launches, result.tokens_used),
+                            perToken(generate_stats.stream_syncs, result.tokens_used),
+                        },
+                    );
+                    print(
+                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                        .{
+                            generate_stats.lm_head_argmax_fused_q8,
+                            generate_stats.lm_head_argmax_fused_q4,
+                            generate_stats.lm_head_argmax_fallbacks,
+                        },
+                    );
+                    print(
+                        "cuda_generate_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d}\n",
+                        .{
+                            generate_stats.activation_multiply_fused,
+                            generate_stats.add_mul_scalar_fused,
+                            generate_stats.rms_norm_add_fused,
+                        },
+                    );
+                }
                 print(
                     "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
                     .{
@@ -1190,6 +1284,25 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_norm_launch_breakdown: layer={d} add_layer={d} rms={d} rms_add={d} rms_add_mul_scalar={d} rms_bare={d} head_rope={d}\n",
+                    .{
+                        cuda_stats.launch_norm_layer,
+                        cuda_stats.launch_norm_add_layer,
+                        cuda_stats.launch_norm_rms,
+                        cuda_stats.launch_norm_rms_add,
+                        cuda_stats.launch_norm_rms_add_mul_scalar,
+                        cuda_stats.launch_norm_rms_bare,
+                        cuda_stats.launch_norm_head_rope,
+                    },
+                );
+                print(
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_scalar={d}\n",
+                    .{
+                        cuda_stats.launch_attention_gqa_decode,
+                        cuda_stats.launch_attention_gqa_scalar,
+                    },
+                );
+                print(
                     "cuda_scalar_launch_breakdown: multiply_immediate={d} add_immediate={d} device_broadcast={d}\n",
                     .{
                         cuda_stats.launch_scalar_multiply_immediate,
@@ -1271,6 +1384,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.linear_pair_fused_q8,
                         cuda_stats.linear_pair_fused_q4,
                         cuda_stats.linear_pair_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    .{
+                        cuda_stats.lm_head_argmax_fused_q8,
+                        cuda_stats.lm_head_argmax_fused_q4,
+                        cuda_stats.lm_head_argmax_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d}\n",
+                    .{
+                        cuda_stats.activation_multiply_fused,
+                        cuda_stats.add_mul_scalar_fused,
+                        cuda_stats.rms_norm_add_fused,
                     },
                 );
                 print(
@@ -1358,7 +1487,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             durationMillis(created_backend_at, created_decode_state_at),
             durationMillis(created_decode_state_at, finished_generate_at),
             durationMillis(started_at, finished_generate_at),
-            session_factory.getCudaRuntimeStats(model.session),
+            cuda_stats_after_generate,
+            cuda_generate_stats,
         );
     }
 }
@@ -1391,6 +1521,18 @@ fn perToken(count: usize, tokens: usize) f64 {
     return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(tokens));
 }
 
+fn cudaStatsDelta(after: session_factory.CudaRuntimeStats, before: session_factory.CudaRuntimeStats) session_factory.CudaRuntimeStats {
+    if (comptime !build_options.enable_cuda) return;
+    var delta = after;
+    inline for (std.meta.fields(session_factory.CudaRuntimeStats)) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
+            else => {},
+        }
+    }
+    return delta;
+}
+
 fn appendFmt(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1417,6 +1559,7 @@ fn writeJsonTiming(
     generate_ms: u64,
     total_ms: u64,
     cuda_stats_opt: ?session_factory.CudaRuntimeStats,
+    cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
 ) !void {
     const inner_timing = result.timing_ms orelse generation.GenerationTimingMs{};
     const decode_ms = if (inner_timing.decode != 0) inner_timing.decode else generate_ms;
@@ -1443,6 +1586,11 @@ fn writeJsonTiming(
                 \\"temp_buffer_releases":{d},
                 \\"temp_buffer_evictions":{d},
                 \\"temp_buffer_cached_bytes":{d},
+                \\"deferred_free_queued":{d},
+                \\"deferred_free_drains":{d},
+                \\"deferred_free_forced_drains":{d},
+                \\"deferred_free_pending_bytes":{d},
+                \\"deferred_free_reclaimed_bytes":{d},
                 \\
             ,
                 .{
@@ -1461,6 +1609,11 @@ fn writeJsonTiming(
                     cuda_stats.temp_buffer_releases,
                     cuda_stats.temp_buffer_evictions,
                     cuda_stats.temp_buffer_cached_bytes,
+                    cuda_stats.deferred_free_queued,
+                    cuda_stats.deferred_free_drains,
+                    cuda_stats.deferred_free_forced_drains,
+                    cuda_stats.deferred_free_pending_bytes,
+                    cuda_stats.deferred_free_reclaimed_bytes,
                 },
             );
             try appendFmt(
@@ -1472,9 +1625,32 @@ fn writeJsonTiming(
                 \\"launch_norm":{d},
                 \\"launch_rope":{d},
                 \\"launch_attention":{d},
+                \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_embedding,
+                    cuda_stats.launch_linear,
+                    cuda_stats.launch_linear_qkv,
+                    cuda_stats.launch_norm,
+                    cuda_stats.launch_rope,
+                    cuda_stats.launch_attention,
+                    cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_scalar,
+                    cuda_stats.launch_elementwise,
+                    cuda_stats.launch_scalar,
+                    cuda_stats.launch_argmax,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"activation_multiply_fused":{d},
+                \\"add_mul_scalar_fused":{d},
                 \\"qkv_fused_q8":{d},
                 \\"qkv_fused_q4":{d},
                 \\"qkv_fused_q4_q4_f32":{d},
@@ -1484,6 +1660,9 @@ fn writeJsonTiming(
                 \\"linear_pair_fused_q8":{d},
                 \\"linear_pair_fused_q4":{d},
                 \\"linear_pair_fallbacks":{d},
+                \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
                 \\"bf16_cublaslt_linear_calls":{d},
@@ -1495,15 +1674,8 @@ fn writeJsonTiming(
                 \\
             ,
                 .{
-                    cuda_stats.launch_embedding,
-                    cuda_stats.launch_linear,
-                    cuda_stats.launch_linear_qkv,
-                    cuda_stats.launch_norm,
-                    cuda_stats.launch_rope,
-                    cuda_stats.launch_attention,
-                    cuda_stats.launch_elementwise,
-                    cuda_stats.launch_scalar,
-                    cuda_stats.launch_argmax,
+                    cuda_stats.activation_multiply_fused,
+                    cuda_stats.add_mul_scalar_fused,
                     cuda_stats.qkv_fused_q8,
                     cuda_stats.qkv_fused_q4,
                     cuda_stats.qkv_fused_q4_q4_f32,
@@ -1513,6 +1685,9 @@ fn writeJsonTiming(
                     cuda_stats.linear_pair_fused_q8,
                     cuda_stats.linear_pair_fused_q4,
                     cuda_stats.linear_pair_fallbacks,
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fallbacks,
                     cuda_stats.q4k_decode_fast_hits,
                     cuda_stats.q4k_decode_fast_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
@@ -1521,6 +1696,30 @@ fn writeJsonTiming(
                     cuda_stats.bf16_cublaslt_fallbacks,
                     cuda_stats.bf16_scalar_linear_calls,
                     cuda_stats.bf16_scalar_qkv_calls,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"launch_norm_layer":{d},
+                \\"launch_norm_add_layer":{d},
+                \\"launch_norm_rms":{d},
+                \\"launch_norm_rms_add":{d},
+                \\"launch_norm_rms_add_mul_scalar":{d},
+                \\"launch_norm_rms_bare":{d},
+                \\"launch_norm_head_rope":{d},
+                \\"rms_norm_add_fused":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.launch_norm_layer,
+                    cuda_stats.launch_norm_add_layer,
+                    cuda_stats.launch_norm_rms,
+                    cuda_stats.launch_norm_rms_add,
+                    cuda_stats.launch_norm_rms_add_mul_scalar,
+                    cuda_stats.launch_norm_rms_bare,
+                    cuda_stats.launch_norm_head_rope,
+                    cuda_stats.rms_norm_add_fused,
                 },
             );
             try appendFmt(
@@ -1600,6 +1799,119 @@ fn writeJsonTiming(
     } else try allocator.dupe(u8, "null");
     defer allocator.free(cuda_json);
 
+    const cuda_generate_json = if (comptime build_options.enable_cuda) blk: {
+        if (cuda_generate_stats_opt) |cuda_stats| {
+            var cuda_generate_out = std.ArrayListUnmanaged(u8).empty;
+            errdefer cuda_generate_out.deinit(allocator);
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\{{
+                \\"kernel_launches":{d},
+                \\"launches_per_token":{d:.6},
+                \\"stream_syncs":{d},
+                \\"syncs_per_token":{d:.6},
+                \\"upload_syncs":{d},
+                \\"download_syncs":{d},
+                \\"eval_syncs":{d},
+                \\"device_alloc_calls":{d},
+                \\"device_free_calls":{d},
+                \\"temp_buffer_hits":{d},
+                \\"temp_buffer_misses":{d},
+                \\"temp_buffer_releases":{d},
+                \\"temp_buffer_evictions":{d},
+                \\"h2d_bytes":{d},
+                \\"d2h_bytes":{d},
+                \\"to_float32_calls":{d},
+                \\"to_float32_bytes":{d},
+                \\"launch_linear":{d},
+                \\"launch_linear_qkv":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.kernel_launches,
+                    perToken(cuda_stats.kernel_launches, result.tokens_used),
+                    cuda_stats.stream_syncs,
+                    perToken(cuda_stats.stream_syncs, result.tokens_used),
+                    cuda_stats.upload_syncs,
+                    cuda_stats.download_syncs,
+                    cuda_stats.eval_syncs,
+                    cuda_stats.device_alloc_calls,
+                    cuda_stats.device_free_calls,
+                    cuda_stats.temp_buffer_hits,
+                    cuda_stats.temp_buffer_misses,
+                    cuda_stats.temp_buffer_releases,
+                    cuda_stats.temp_buffer_evictions,
+                    cuda_stats.h2d_bytes,
+                    cuda_stats.d2h_bytes,
+                    cuda_stats.to_float32_calls,
+                    cuda_stats.to_float32_bytes,
+                    cuda_stats.launch_linear,
+                    cuda_stats.launch_linear_qkv,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"launch_norm":{d},
+                \\"launch_norm_layer":{d},
+                \\"launch_norm_add_layer":{d},
+                \\"launch_norm_rms":{d},
+                \\"launch_norm_rms_add":{d},
+                \\"launch_norm_rms_add_mul_scalar":{d},
+                \\"launch_norm_rms_bare":{d},
+                \\"launch_norm_head_rope":{d},
+                \\"launch_attention":{d},
+                \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_scalar":{d},
+                \\"launch_elementwise":{d},
+                \\"launch_scalar":{d},
+                \\"launch_argmax":{d},
+                \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fallbacks":{d},
+                \\"activation_multiply_fused":{d},
+                \\"add_mul_scalar_fused":{d},
+                \\"rms_norm_add_fused":{d},
+                \\"deferred_free_queued":{d},
+                \\"deferred_free_drains":{d},
+                \\"deferred_free_forced_drains":{d},
+                \\"deferred_free_reclaimed_bytes":{d}
+                \\}}
+            ,
+                .{
+                    cuda_stats.launch_norm,
+                    cuda_stats.launch_norm_layer,
+                    cuda_stats.launch_norm_add_layer,
+                    cuda_stats.launch_norm_rms,
+                    cuda_stats.launch_norm_rms_add,
+                    cuda_stats.launch_norm_rms_add_mul_scalar,
+                    cuda_stats.launch_norm_rms_bare,
+                    cuda_stats.launch_norm_head_rope,
+                    cuda_stats.launch_attention,
+                    cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_scalar,
+                    cuda_stats.launch_elementwise,
+                    cuda_stats.launch_scalar,
+                    cuda_stats.launch_argmax,
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fallbacks,
+                    cuda_stats.activation_multiply_fused,
+                    cuda_stats.add_mul_scalar_fused,
+                    cuda_stats.rms_norm_add_fused,
+                    cuda_stats.deferred_free_queued,
+                    cuda_stats.deferred_free_drains,
+                    cuda_stats.deferred_free_forced_drains,
+                    cuda_stats.deferred_free_reclaimed_bytes,
+                },
+            );
+            break :blk try cuda_generate_out.toOwnedSlice(allocator);
+        }
+        break :blk try allocator.dupe(u8, "null");
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_generate_json);
+
     const json = try std.fmt.allocPrint(
         allocator,
         \\{{
@@ -1623,7 +1935,8 @@ fn writeJsonTiming(
         \\"decode_inner":{d},
         \\"total_inner":{d}
         \\}},
-        \\"cuda":{s}
+        \\"cuda":{s},
+        \\"cuda_generate":{s}
         \\}}
         \\
     ,
@@ -1647,6 +1960,7 @@ fn writeJsonTiming(
             inner_timing.decode,
             inner_timing.total,
             cuda_json,
+            cuda_generate_json,
         },
     );
     defer allocator.free(json);

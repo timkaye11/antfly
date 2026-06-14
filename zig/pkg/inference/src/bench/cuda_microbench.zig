@@ -27,6 +27,8 @@ const cuda_ptx_z = cuda_ptx ++ "\x00";
 
 const q4_k_values_per_block: usize = 256;
 const q4_k_block_bytes: usize = 144;
+const q8_0_values_per_block: usize = 32;
+const q8_0_block_bytes: usize = 34;
 
 const Shape = struct {
     label: []const u8,
@@ -44,22 +46,36 @@ const shapes = [_]Shape{
     .{ .label = "pooled projection", .rows = 1, .in_dim = 768, .out_dim = 768 },
 };
 
+const gemma4_shapes = [_]Shape{
+    .{ .label = "Gemma4 Q proj", .rows = 1, .in_dim = 3840, .out_dim = 4096 },
+    .{ .label = "Gemma4 KV proj", .rows = 1, .in_dim = 3840, .out_dim = 2048 },
+    .{ .label = "Gemma4 attn out", .rows = 1, .in_dim = 4096, .out_dim = 3840 },
+    .{ .label = "Gemma4 full attn out", .rows = 1, .in_dim = 8192, .out_dim = 3840 },
+    .{ .label = "Gemma4 FFN gate/up", .rows = 1, .in_dim = 3840, .out_dim = 15360 },
+    .{ .label = "Gemma4 FFN down", .rows = 1, .in_dim = 15360, .out_dim = 3840 },
+    .{ .label = "Gemma4 LM head", .rows = 1, .in_dim = 3840, .out_dim = 262144 },
+};
+
 const Config = struct {
     warmup_iters: usize = 5,
     measure_iters: usize = 50,
     model_path: ?[]const u8 = null,
     text: []const u8 = "a photo of a document with audio metadata",
     full_iters: usize = 1,
+    gemma4_shapes: bool = false,
 };
 
 const BenchModule = if (build_options.enable_cuda) struct {
     module: cuda_driver.CUmodule = null,
     linear_q4_k_f32: cuda_driver.CUfunction = null,
     linear_q4_k_bias_f32: cuda_driver.CUfunction = null,
+    linear_q8_0_f32: cuda_driver.CUfunction = null,
+    linear_q8_0_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_f32_tiled: cuda_driver.CUfunction = null,
     linear_q4_k_bias_f32_tiled: cuda_driver.CUfunction = null,
     linear_q4_k_bias_quick_gelu_f32_tiled: cuda_driver.CUfunction = null,
     linear_q4_k_f32_tile4: cuda_driver.CUfunction = null,
+    linear_q4_k_f32_tile8: cuda_driver.CUfunction = null,
     linear_q4_k_bias_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_bias_quick_gelu_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_triple_bias_f32: cuda_driver.CUfunction = null,
@@ -75,6 +91,10 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32, module, "termite_linear_q4_k_f32"));
         var linear_q4_k_bias_f32: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32, module, "termite_linear_q4_k_bias_f32"));
+        var linear_q8_0_f32: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q8_0_f32, module, "termite_linear_q8_0_f32"));
+        var linear_q8_0_f32_tile4: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q8_0_f32_tile4, module, "termite_linear_q8_0_f32_tile4"));
         var linear_q4_k_f32_tiled: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tiled, module, "termite_linear_q4_k_f32_tiled"));
         var linear_q4_k_bias_f32_tiled: cuda_driver.CUfunction = null;
@@ -83,6 +103,8 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_quick_gelu_f32_tiled, module, "termite_linear_q4_k_bias_quick_gelu_f32_tiled"));
         var linear_q4_k_f32_tile4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tile4, module, "termite_linear_q4_k_f32_tile4"));
+        var linear_q4_k_f32_tile8: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tile8, module, "termite_linear_q4_k_f32_tile8"));
         var linear_q4_k_bias_f32_tile4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32_tile4, module, "termite_linear_q4_k_bias_f32_tile4"));
         var linear_q4_k_bias_quick_gelu_f32_tile4: cuda_driver.CUfunction = null;
@@ -96,10 +118,13 @@ const BenchModule = if (build_options.enable_cuda) struct {
             .module = module,
             .linear_q4_k_f32 = linear_q4_k_f32,
             .linear_q4_k_bias_f32 = linear_q4_k_bias_f32,
+            .linear_q8_0_f32 = linear_q8_0_f32,
+            .linear_q8_0_f32_tile4 = linear_q8_0_f32_tile4,
             .linear_q4_k_f32_tiled = linear_q4_k_f32_tiled,
             .linear_q4_k_bias_f32_tiled = linear_q4_k_bias_f32_tiled,
             .linear_q4_k_bias_quick_gelu_f32_tiled = linear_q4_k_bias_quick_gelu_f32_tiled,
             .linear_q4_k_f32_tile4 = linear_q4_k_f32_tile4,
+            .linear_q4_k_f32_tile8 = linear_q4_k_f32_tile8,
             .linear_q4_k_bias_f32_tile4 = linear_q4_k_bias_f32_tile4,
             .linear_q4_k_bias_quick_gelu_f32_tile4 = linear_q4_k_bias_quick_gelu_f32_tile4,
             .linear_q4_k_triple_bias_f32 = linear_q4_k_triple_bias_f32,
@@ -114,10 +139,13 @@ const BenchModule = if (build_options.enable_cuda) struct {
             self.module = null;
             self.linear_q4_k_f32 = null;
             self.linear_q4_k_bias_f32 = null;
+            self.linear_q8_0_f32 = null;
+            self.linear_q8_0_f32_tile4 = null;
             self.linear_q4_k_f32_tiled = null;
             self.linear_q4_k_bias_f32_tiled = null;
             self.linear_q4_k_bias_quick_gelu_f32_tiled = null;
             self.linear_q4_k_f32_tile4 = null;
+            self.linear_q4_k_f32_tile8 = null;
             self.linear_q4_k_bias_f32_tile4 = null;
             self.linear_q4_k_bias_quick_gelu_f32_tile4 = null;
             self.linear_q4_k_triple_bias_f32 = null;
@@ -168,6 +196,8 @@ fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingFullIters;
             cfg.full_iters = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--gemma4-shapes")) {
+            cfg.gemma4_shapes = true;
         } else {
             print("unknown bench-cuda argument: {s}\n", .{arg});
             printUsage();
@@ -190,9 +220,11 @@ fn printUsage() void {
     print(
         \\usage: antfly inference bench-cuda [--warmup-iters N] [--measure-iters N]
         \\                         [--model <clipclap-model-dir>] [--text <prompt>] [--full-iters N]
+        \\                         [--gemma4-shapes]
         \\
-        \\Benchmarks CUDA Q4_K linear kernels on CLIP/CLAP-sized shapes. If --model is
-        \\provided, also runs full ClipCLAP text embedding through the CUDA backend.
+        \\Benchmarks CUDA Q4_K linear kernels on CLIP/CLAP-sized shapes.
+        \\With --gemma4-shapes, also benchmarks Gemma4 Q8_0/Q4_K decode-sized matmuls.
+        \\If --model is provided, also runs full ClipCLAP text embedding through the CUDA backend.
         \\
     , .{});
 }
@@ -260,6 +292,10 @@ fn runKernelBench(allocator: std.mem.Allocator, cfg: Config) !void {
     });
     try benchTripleShape(allocator, &ctx, &module, cfg, .{ .label = "CLIP text QKV", .rows = 77, .in_dim = 768, .out_dim = 768 });
     try benchTripleShape(allocator, &ctx, &module, cfg, .{ .label = "CLIP vision QKV", .rows = 257, .in_dim = 768, .out_dim = 768 });
+
+    if (cfg.gemma4_shapes) {
+        try runGemma4KernelBench(allocator, &ctx, &module, cfg);
+    }
 }
 
 fn benchShape(
@@ -402,6 +438,190 @@ fn benchTripleShape(
     });
 }
 
+const Gemma4Q8BenchResult = struct {
+    scalar_ns: u64,
+    tile4_ns: u64,
+    checksum: f32,
+};
+
+const Gemma4Q4BenchResult = struct {
+    scalar_ns: u64,
+    tile4_ns: u64,
+    tile8_ns: u64,
+    checksum: f32,
+};
+
+fn runGemma4KernelBench(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+) !void {
+    print("\nCUDA Gemma4 decode matvec microbench: synthetic rows=1 weights\n", .{});
+    print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>12} {s:>12}\n", .{
+        "shape",
+        "rows",
+        "in",
+        "out",
+        "q8 scalar",
+        "q8 tile4",
+        "q4 scalar",
+        "q4 tile4",
+        "q4 tile8",
+        "q8 check",
+        "q4 check",
+    });
+    print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>14} {s:>14} {s:>14} {s:>14} {s:>14} {s:>12} {s:>12}\n", .{
+        "-----",
+        "----",
+        "--",
+        "---",
+        "---------",
+        "--------",
+        "---------",
+        "--------",
+        "--------",
+        "--------",
+        "--------",
+    });
+
+    for (gemma4_shapes) |shape| {
+        const q8 = try benchGemma4Q8Shape(allocator, ctx, module, cfg, shape);
+        const q4 = try benchGemma4Q4Shape(allocator, ctx, module, cfg, shape);
+        print("{s:<24} {d:>8} {d:>8} {d:>8} {d:>14} {d:>14} {d:>14} {d:>14} {d:>14} {d:>12.4} {d:>12.4}\n", .{
+            shape.label,
+            shape.rows,
+            shape.in_dim,
+            shape.out_dim,
+            q8.scalar_ns,
+            q8.tile4_ns,
+            q4.scalar_ns,
+            q4.tile4_ns,
+            q4.tile8_ns,
+            q8.checksum,
+            q4.checksum,
+        });
+    }
+}
+
+fn benchGemma4Q8Shape(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    shape: Shape,
+) !Gemma4Q8BenchResult {
+    if (shape.in_dim % q8_0_values_per_block != 0) return error.InvalidArgument;
+
+    const input_count = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const output_count = try std.math.mul(usize, shape.rows, shape.out_dim);
+    const row_blocks = shape.in_dim / q8_0_values_per_block;
+    const weight_bytes = try std.math.mul(usize, try std.math.mul(usize, shape.out_dim, row_blocks), q8_0_block_bytes);
+
+    const input_host = try allocator.alloc(f32, input_count);
+    defer allocator.free(input_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillInput(input_host);
+    fillQ8Weights(weight_host);
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(ctx, input_count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var output = try cuda_buffer.DeviceBuffer.alloc(ctx, output_count * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try ctx.synchronize();
+
+    const scalar_ns = try timeCudaStep(ctx, cfg, launchQ8, .{ module, ctx, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+    const tile4_ns = try timeCudaStep(ctx, cfg, launchQ8Tile4, .{ module, ctx, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+
+    var sample: [1]f32 = undefined;
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(&sample));
+    try ctx.synchronize();
+    return .{
+        .scalar_ns = scalar_ns,
+        .tile4_ns = tile4_ns,
+        .checksum = sample[0],
+    };
+}
+
+fn benchGemma4Q4Shape(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    shape: Shape,
+) !Gemma4Q4BenchResult {
+    if (shape.in_dim % q4_k_values_per_block != 0) return error.InvalidArgument;
+
+    const input_count = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const output_count = try std.math.mul(usize, shape.rows, shape.out_dim);
+    const row_blocks = shape.in_dim / q4_k_values_per_block;
+    const weight_bytes = try std.math.mul(usize, try std.math.mul(usize, shape.out_dim, row_blocks), q4_k_block_bytes);
+
+    const input_host = try allocator.alloc(f32, input_count);
+    defer allocator.free(input_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillInput(input_host);
+    fillQ4KWeights(weight_host);
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(ctx, input_count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var output = try cuda_buffer.DeviceBuffer.alloc(ctx, output_count * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try ctx.synchronize();
+
+    const scalar_ns = try timeCudaStep(ctx, cfg, launchQ4K, .{ module, ctx, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+    const tile4_ns = try timeCudaStep(ctx, cfg, launchQ4KTiled, .{ module, ctx, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+    const tile8_ns = try timeCudaStep(ctx, cfg, launchQ4KTile8, .{ module, ctx, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+
+    var sample: [1]f32 = undefined;
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(&sample));
+    try ctx.synchronize();
+    return .{
+        .scalar_ns = scalar_ns,
+        .tile4_ns = tile4_ns,
+        .tile8_ns = tile8_ns,
+        .checksum = sample[0],
+    };
+}
+
+fn launchQ8(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ8Raw(ctx, module.linear_q8_0_f32, output, input, weight, rows, in_dim, out_dim);
+}
+
+fn launchQ8Tile4(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ8Tile4(ctx, module.linear_q8_0_f32_tile4, output, input, weight, rows, in_dim, out_dim);
+}
+
 fn launchQ4K(
     module: *BenchModule,
     ctx: *cuda_context.CudaContext,
@@ -440,6 +660,19 @@ fn launchQ4KTiled(
     out_dim: usize,
 ) !void {
     try launchLinearQ4KTile4(ctx, module.linear_q4_k_f32_tile4, output, input, weight, .{}, rows, in_dim, out_dim, false, false);
+}
+
+fn launchQ4KTile8(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ4KTile8(ctx, module.linear_q4_k_f32_tile8, output, input, weight, rows, in_dim, out_dim);
 }
 
 fn launchQ4KBiasTiled(
@@ -506,6 +739,90 @@ fn launchLinearQ4KTile4(
         params[4] = @ptrCast(&in_dim_u32);
         params[5] = @ptrCast(&out_dim_u32);
     }
+    try launch2d(ctx, function, (out_dim + 3) / 4, rows, 256, &params);
+}
+
+fn launchLinearQ4KTile8(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4KBuffers(output, input, weight, null, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, function, (out_dim + 7) / 8, rows, 256, &params);
+}
+
+fn launchLinearQ8Raw(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ8Buffers(output, input, weight, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch1d(ctx, function, try checkedMul(rows, out_dim), &params);
+}
+
+fn launchLinearQ8Tile4(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ8Buffers(output, input, weight, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
     try launch2d(ctx, function, (out_dim + 3) / 4, rows, 256, &params);
 }
 
@@ -729,6 +1046,21 @@ fn validateQ4KBuffers(
     if (bias) |bias_buf| try checkF32Bytes(bias_buf, out_dim);
 }
 
+fn validateQ8Buffers(
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
+    const row_blocks = in_dim / q8_0_values_per_block;
+    try checkF32Bytes(output, try checkedMul(rows, out_dim));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    try checkRawBytes(weight, try checkedMul(try checkedMul(out_dim, row_blocks), q8_0_block_bytes));
+}
+
 fn launch1d(
     ctx: *cuda_context.CudaContext,
     function: cuda_driver.CUfunction,
@@ -849,6 +1181,22 @@ fn fillQ4KWeights(bytes: []u8) void {
             value.* = (lane - 15.0) * 0.01;
         }
         quant_codec.quantizeQ4_KBlock(&block_input, bytes[offset..][0..q4_k_block_bytes]);
+    }
+}
+
+fn fillQ8Weights(bytes: []u8) void {
+    var block_input: [q8_0_values_per_block]f32 = undefined;
+    var offset: usize = 0;
+    var block_index: usize = 0;
+    while (offset < bytes.len) : ({
+        offset += q8_0_block_bytes;
+        block_index += 1;
+    }) {
+        for (&block_input, 0..) |*value, i| {
+            const lane: f32 = @floatFromInt((i + block_index * 7) % 37);
+            value.* = (lane - 18.0) * 0.008;
+        }
+        quant_codec.quantizeQ8_0Block(&block_input, bytes[offset..][0..q8_0_block_bytes]);
     }
 }
 
