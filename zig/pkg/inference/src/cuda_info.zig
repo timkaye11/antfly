@@ -198,6 +198,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: gemma4_primitives ok\n", .{});
+            cuda_compute.smokeDecoderRuntimeSlots(allocator) catch |err| {
+                print("smoke: decoder_runtime_slots failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: decoder_runtime_slots ok\n", .{});
             const cublaslt_ok = smokeCublasLtBf16(allocator) catch |err| {
                 print("smoke: cublaslt_bf16 failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -303,7 +308,7 @@ fn printUsage() void {
         \\usage: antfly inference cuda-info [--smoke] [--gemma4-parity <gguf>] [--gemma4-hf-parity <model-dir>]
         \\                                      [--gguf-meta <gguf>]
         \\
-        \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, Q4_0, Q4_K, RoPE, and GQA.
+        \\  --smoke   Run CUDA smoke checks for fill, graph capture, dense/quant kernels, Gemma4 primitives, decoder-runtime slots, and cuBLASLt.
         \\  --gguf-meta <gguf>
         \\            Dump raw GGUF header metadata and reconstructed GPT config.
         \\  --gemma4-parity <gguf>

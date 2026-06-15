@@ -1181,6 +1181,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.rms_norm_add_fused,
                         },
                     );
+                    print(
+                        "cuda_generate_decoder_runtime_counts: linear_prepares={d} linear_prepare_misses={d} rms_prepares={d} rms_prepare_misses={d} linear_apply_hits={d} linear_apply_misses={d} linear_pair_apply_hits={d} linear_qkv_apply_hits={d} rms_apply_hits={d} rms_apply_misses={d} pinned_eviction_skips={d}\n",
+                        .{
+                            generate_stats.decoder_runtime_linear_slot_prepares,
+                            generate_stats.decoder_runtime_linear_slot_prepare_misses,
+                            generate_stats.decoder_runtime_rms_norm_slot_prepares,
+                            generate_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                            generate_stats.decoder_runtime_linear_apply_hits,
+                            generate_stats.decoder_runtime_linear_apply_misses,
+                            generate_stats.decoder_runtime_linear_pair_apply_hits,
+                            generate_stats.decoder_runtime_linear_qkv_apply_hits,
+                            generate_stats.decoder_runtime_rms_norm_apply_hits,
+                            generate_stats.decoder_runtime_rms_norm_apply_misses,
+                            generate_stats.decoder_runtime_pinned_eviction_skips,
+                        },
+                    );
                 }
                 print(
                     "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
@@ -1415,6 +1431,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.activation_multiply_fused,
                         cuda_stats.add_mul_scalar_fused,
                         cuda_stats.rms_norm_add_fused,
+                    },
+                );
+                print(
+                    "cuda_decoder_runtime_counts: linear_prepares={d} linear_prepare_misses={d} rms_prepares={d} rms_prepare_misses={d} linear_apply_hits={d} linear_apply_misses={d} linear_pair_apply_hits={d} linear_qkv_apply_hits={d} rms_apply_hits={d} rms_apply_misses={d} pinned_eviction_skips={d}\n",
+                    .{
+                        cuda_stats.decoder_runtime_linear_slot_prepares,
+                        cuda_stats.decoder_runtime_linear_slot_prepare_misses,
+                        cuda_stats.decoder_runtime_rms_norm_slot_prepares,
+                        cuda_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                        cuda_stats.decoder_runtime_linear_apply_hits,
+                        cuda_stats.decoder_runtime_linear_apply_misses,
+                        cuda_stats.decoder_runtime_linear_pair_apply_hits,
+                        cuda_stats.decoder_runtime_linear_qkv_apply_hits,
+                        cuda_stats.decoder_runtime_rms_norm_apply_hits,
+                        cuda_stats.decoder_runtime_rms_norm_apply_misses,
+                        cuda_stats.decoder_runtime_pinned_eviction_skips,
                     },
                 );
                 print(
@@ -1736,6 +1768,36 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_out,
+                \\"decoder_runtime_linear_slot_prepares":{d},
+                \\"decoder_runtime_linear_slot_prepare_misses":{d},
+                \\"decoder_runtime_rms_norm_slot_prepares":{d},
+                \\"decoder_runtime_rms_norm_slot_prepare_misses":{d},
+                \\"decoder_runtime_linear_apply_hits":{d},
+                \\"decoder_runtime_linear_apply_misses":{d},
+                \\"decoder_runtime_linear_pair_apply_hits":{d},
+                \\"decoder_runtime_linear_qkv_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_misses":{d},
+                \\"decoder_runtime_pinned_eviction_skips":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.decoder_runtime_linear_slot_prepares,
+                    cuda_stats.decoder_runtime_linear_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepares,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_linear_apply_hits,
+                    cuda_stats.decoder_runtime_linear_apply_misses,
+                    cuda_stats.decoder_runtime_linear_pair_apply_hits,
+                    cuda_stats.decoder_runtime_linear_qkv_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_misses,
+                    cuda_stats.decoder_runtime_pinned_eviction_skips,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"launch_norm_layer":{d},
                 \\"launch_norm_add_layer":{d},
                 \\"launch_norm_rms":{d},
@@ -1903,6 +1965,36 @@ fn writeJsonTiming(
                     cuda_stats.cuda_graph_capture_capacity_skips,
                     cuda_stats.launch_linear,
                     cuda_stats.launch_linear_qkv,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"decoder_runtime_linear_slot_prepares":{d},
+                \\"decoder_runtime_linear_slot_prepare_misses":{d},
+                \\"decoder_runtime_rms_norm_slot_prepares":{d},
+                \\"decoder_runtime_rms_norm_slot_prepare_misses":{d},
+                \\"decoder_runtime_linear_apply_hits":{d},
+                \\"decoder_runtime_linear_apply_misses":{d},
+                \\"decoder_runtime_linear_pair_apply_hits":{d},
+                \\"decoder_runtime_linear_qkv_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_hits":{d},
+                \\"decoder_runtime_rms_norm_apply_misses":{d},
+                \\"decoder_runtime_pinned_eviction_skips":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.decoder_runtime_linear_slot_prepares,
+                    cuda_stats.decoder_runtime_linear_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepares,
+                    cuda_stats.decoder_runtime_rms_norm_slot_prepare_misses,
+                    cuda_stats.decoder_runtime_linear_apply_hits,
+                    cuda_stats.decoder_runtime_linear_apply_misses,
+                    cuda_stats.decoder_runtime_linear_pair_apply_hits,
+                    cuda_stats.decoder_runtime_linear_qkv_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_hits,
+                    cuda_stats.decoder_runtime_rms_norm_apply_misses,
+                    cuda_stats.decoder_runtime_pinned_eviction_skips,
                 },
             );
             try appendFmt(

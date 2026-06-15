@@ -32,6 +32,8 @@ const quant_matmul = @import("../../graph/quant_matmul.zig");
 const operator_plan = @import("../../graph/operator_plan.zig");
 const kv_storage_runtime = @import("../../runtime/kv/storage_runtime.zig");
 const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
+const gpt_arch = @import("../../architectures/gpt.zig");
+const gpt_model = @import("../../models/gpt.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
 
@@ -111,6 +113,36 @@ const TempPinnedSlot = struct {
     buffer: buffer_mod.DeviceBuffer = .{},
     requested_len: usize = 0,
     in_use: bool = false,
+};
+
+const CudaDecoderRuntimeLinearSlot = struct {
+    weight: CudaTensor,
+    bias: ?CudaTensor = null,
+    in_dim: usize = 0,
+    out_dim: usize = 0,
+};
+
+const CudaDecoderRuntimeRmsNormSlot = struct {
+    weight: CudaTensor,
+    hidden_size: usize = 0,
+};
+
+const CudaDecoderRuntimeFamilyState = struct {
+    prepared: bool = false,
+    reserve_kv_tokens: usize = 0,
+    configured_layer_count: usize = 0,
+    hidden_size: u32 = 0,
+    intermediate_size: u32 = 0,
+    num_hidden_layers: u32 = 0,
+    num_attention_heads: u32 = 0,
+    num_key_value_heads: u32 = 0,
+    num_global_key_value_heads: u32 = 0,
+    attention_head_dim: u32 = 0,
+    global_head_dim: u32 = 0,
+    vocab_size: u32 = 0,
+    sliding_window: u32 = 0,
+    sliding_window_pattern: u32 = 0,
+    ple_hidden_size: u32 = 0,
 };
 
 pub const RuntimeStats = struct {
@@ -241,6 +273,17 @@ pub const RuntimeStats = struct {
     q4k_decode_fast_fallbacks: usize = 0,
     head_norm_rope_fused_hits: usize = 0,
     head_norm_rope_fused_fallbacks: usize = 0,
+    decoder_runtime_linear_slot_prepares: usize = 0,
+    decoder_runtime_linear_slot_prepare_misses: usize = 0,
+    decoder_runtime_rms_norm_slot_prepares: usize = 0,
+    decoder_runtime_rms_norm_slot_prepare_misses: usize = 0,
+    decoder_runtime_linear_apply_hits: usize = 0,
+    decoder_runtime_linear_apply_misses: usize = 0,
+    decoder_runtime_linear_pair_apply_hits: usize = 0,
+    decoder_runtime_linear_qkv_apply_hits: usize = 0,
+    decoder_runtime_rms_norm_apply_hits: usize = 0,
+    decoder_runtime_rms_norm_apply_misses: usize = 0,
+    decoder_runtime_pinned_eviction_skips: usize = 0,
     mtp_masked_argmax_hits: usize = 0,
     mtp_masked_argmax_fallbacks: usize = 0,
     lazy_prefetch_enqueues: usize = 0,
@@ -362,6 +405,10 @@ pub const CudaCompute = struct {
     lazy_device_bytes: usize = 0,
     lazy_device_budget_bytes: usize = 0,
     lazy_access_epoch: u64 = 1,
+    decoder_runtime_linear_slots: std.AutoHashMapUnmanaged(usize, CudaDecoderRuntimeLinearSlot) = .empty,
+    decoder_runtime_rms_norm_slots: std.AutoHashMapUnmanaged(usize, CudaDecoderRuntimeRmsNormSlot) = .empty,
+    decoder_runtime_next_dynamic_slot: usize = 1,
+    decoder_runtime_family_state: CudaDecoderRuntimeFamilyState = .{},
     run_budget: ?*run_memory.RunBudget = null,
     dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
     dense_stream_epoch: u64 = 1,
@@ -378,6 +425,7 @@ pub const CudaCompute = struct {
     debug_cuda_graph_exec: driver_mod.CUgraphExec = null,
     debug_cuda_decode_scalars: buffer_mod.DeviceBuffer = .{},
     debug_cuda_graph_final_hidden_input_storage: buffer_mod.DeviceBuffer = .{},
+    debug_cuda_graph_final_hidden_output_storage: buffer_mod.DeviceBuffer = .{},
     debug_cuda_graph_final_hidden_input: buffer_mod.DeviceBuffer = .{},
     debug_cuda_graph_final_hidden_output: buffer_mod.DeviceBuffer = .{},
     debug_cuda_graph_final_hidden_shape: ?[]i64 = null,
@@ -424,6 +472,8 @@ pub const CudaCompute = struct {
         if (self.lazy_host_store) |store| {
             native_compute_mod.stopPrefetchWorker(store);
         }
+        self.decoder_runtime_linear_slots.deinit(self.allocator);
+        self.decoder_runtime_rms_norm_slots.deinit(self.allocator);
         var it = self.resident_weights.iterator();
         while (it.next()) |entry| {
             var tensor = entry.value_ptr.*;
@@ -446,6 +496,7 @@ pub const CudaCompute = struct {
             self.debug_cuda_graph_final_hidden_shape = null;
         }
         self.debug_cuda_graph_final_hidden_input_storage.free(&self.ctx);
+        self.debug_cuda_graph_final_hidden_output_storage.free(&self.ctx);
         self.debug_cuda_decode_scalars.free(&self.ctx);
         for (self.temp_pinned_slots.items) |*slot| slot.buffer.free(&self.ctx);
         self.temp_pinned_slots.deinit(self.allocator);
@@ -635,6 +686,121 @@ pub const CudaCompute = struct {
         });
     }
 };
+
+fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32) !void {
+    if (actual.len != expected.len) return error.CudaParityMismatch;
+    for (actual, expected) |got, want| {
+        if (@abs(got - want) > tolerance) return error.CudaParityMismatch;
+    }
+}
+
+pub fn smokeDecoderRuntimeSlots(allocator: std.mem.Allocator) !void {
+    var compute = try CudaCompute.init(allocator);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+
+    const linear_shape = [_]i64{ 2, 2 };
+    const linear_weight_data = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
+    var linear_weight = try tensor_mod.Tensor.initFloat32(allocator, "slot.linear.identity", &linear_shape, &linear_weight_data);
+    defer linear_weight.deinit();
+    try compute.insertWeightFromTensor(try allocator.dupe(u8, "slot.linear.identity"), &linear_weight);
+
+    const norm_shape = [_]i64{2};
+    const norm_weight_data = [_]f32{ 1.0, 1.0 };
+    var norm_weight = try tensor_mod.Tensor.initFloat32(allocator, "slot.norm.ones", &norm_shape, &norm_weight_data);
+    defer norm_weight.deinit();
+    try compute.insertWeightFromTensor(try allocator.dupe(u8, "slot.norm.ones"), &norm_weight);
+
+    const linear_weight_ct = try cb.getWeight("slot.linear.identity");
+    const norm_weight_ct = try cb.getWeight("slot.norm.ones");
+    const linear_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{
+        .weight = linear_weight_ct,
+        .bias = null,
+        .in_dim = 2,
+        .out_dim = 2,
+    })) orelse return error.CudaRuntimeSlotUnavailable;
+    const norm_slot = (try cb.decoderRuntimeEnsureRmsNormSlot(&.{
+        .weight = norm_weight_ct,
+        .hidden_size = 2,
+    })) orelse return error.CudaRuntimeSlotUnavailable;
+
+    const input_shape = [_]i32{ 1, 2 };
+    const input_data = [_]f32{ 3.0, 4.0 };
+    const input = try cb.fromFloat32Shape(&input_data, &input_shape);
+    defer cb.free(input);
+
+    const linear_out = (try cb.decoderRuntimeApplyLinear(&.{
+        .slot = linear_slot,
+        .input = input,
+        .in_dim = 2,
+        .out_dim = 2,
+    })) orelse return error.CudaRuntimeSlotUnavailable;
+    defer cb.free(linear_out);
+    const linear_actual = try cb.toFloat32(linear_out, allocator);
+    defer allocator.free(linear_actual);
+    try expectApproxSlice(linear_actual, &input_data, 0.0001);
+
+    const pair_out = (try cb.decoderRuntimeApplyLinearPair(&.{
+        .slot_a = linear_slot,
+        .slot_b = linear_slot,
+        .input = input,
+        .in_dim = 2,
+        .out_dim = 2,
+    })) orelse return error.CudaRuntimeSlotUnavailable;
+    defer cb.free(pair_out.first);
+    defer cb.free(pair_out.second);
+    const pair_first = try cb.toFloat32(pair_out.first, allocator);
+    defer allocator.free(pair_first);
+    const pair_second = try cb.toFloat32(pair_out.second, allocator);
+    defer allocator.free(pair_second);
+    try expectApproxSlice(pair_first, &input_data, 0.0001);
+    try expectApproxSlice(pair_second, &input_data, 0.0001);
+
+    const qkv_out = (try cb.decoderRuntimeApplyLinearQkv(&.{
+        .q_slot = linear_slot,
+        .k_slot = linear_slot,
+        .v_slot = linear_slot,
+        .input = input,
+        .in_dim = 2,
+        .q_out_dim = 2,
+        .kv_out_dim = 2,
+    })) orelse return error.CudaRuntimeSlotUnavailable;
+    defer cb.free(qkv_out.first);
+    defer cb.free(qkv_out.second);
+    defer cb.free(qkv_out.third);
+    const q_actual = try cb.toFloat32(qkv_out.first, allocator);
+    defer allocator.free(q_actual);
+    const k_actual = try cb.toFloat32(qkv_out.second, allocator);
+    defer allocator.free(k_actual);
+    const v_actual = try cb.toFloat32(qkv_out.third, allocator);
+    defer allocator.free(v_actual);
+    try expectApproxSlice(q_actual, &input_data, 0.0001);
+    try expectApproxSlice(k_actual, &input_data, 0.0001);
+    try expectApproxSlice(v_actual, &input_data, 0.0001);
+
+    const norm_input_data = [_]f32{ 1.0, 1.0 };
+    const norm_input = try cb.fromFloat32Shape(&norm_input_data, &input_shape);
+    defer cb.free(norm_input);
+    const norm_out = (try cb.decoderRuntimeApplyRmsNorm(&.{
+        .slot = norm_slot,
+        .input = norm_input,
+        .hidden_size = 2,
+        .eps = 0.000001,
+    })) orelse return error.CudaRuntimeSlotUnavailable;
+    defer cb.free(norm_out);
+    const norm_actual = try cb.toFloat32(norm_out, allocator);
+    defer allocator.free(norm_actual);
+    try expectApproxSlice(norm_actual, &norm_input_data, 0.0001);
+
+    const stats = compute.snapshotStats();
+    if (stats.decoder_runtime_linear_slot_prepares == 0 or
+        stats.decoder_runtime_rms_norm_slot_prepares == 0 or
+        stats.decoder_runtime_linear_apply_hits < 6 or
+        stats.decoder_runtime_rms_norm_apply_hits == 0)
+    {
+        return error.CudaRuntimeSlotUnavailable;
+    }
+}
 
 const CudaKvLayer = struct {
     k: buffer_mod.DeviceBuffer = .{},
@@ -1921,6 +2087,45 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     self.allocator.destroy(cuda_tensor);
 }
 
+fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
+    var borrowed = tensor.*;
+    borrowed.owns_buffer = false;
+    borrowed.owns_shape = false;
+    borrowed.owned_by_tensor = false;
+    return borrowed;
+}
+
+fn residentTensorForSlot(self: *CudaCompute, tensor: *const CudaTensor) ?*CudaTensor {
+    var it = self.resident_weights.iterator();
+    while (it.next()) |entry| {
+        const resident = entry.value_ptr;
+        if (resident.buffer.ptr == tensor.buffer.ptr and
+            resident.buffer.len == tensor.buffer.len and
+            resident.elem_count == tensor.elem_count)
+        {
+            return resident;
+        }
+    }
+    return null;
+}
+
+fn decoderRuntimeSlotPinsBuffer(self: *const CudaCompute, buffer: buffer_mod.DeviceBuffer) bool {
+    if (buffer.ptr == 0) return false;
+    var linear_it = self.decoder_runtime_linear_slots.iterator();
+    while (linear_it.next()) |entry| {
+        const slot = entry.value_ptr;
+        if (slot.weight.buffer.ptr == buffer.ptr) return true;
+        if (slot.bias) |bias| {
+            if (bias.buffer.ptr == buffer.ptr) return true;
+        }
+    }
+    var norm_it = self.decoder_runtime_rms_norm_slots.iterator();
+    while (norm_it.next()) |entry| {
+        if (entry.value_ptr.weight.buffer.ptr == buffer.ptr) return true;
+    }
+    return false;
+}
+
 fn cudaTensorDeviceBytes(tensor: *const CudaTensor) usize {
     if (tensor.quant_type) |quant_type| {
         const block_size = gguf_tensor_types.bytesPerBlock(quant_type) orelse return tensor.buffer.len;
@@ -1954,6 +2159,12 @@ fn evictLazyDeviceWeightsToBudget(self: *CudaCompute, protected_name: []const u8
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             if (std.mem.eql(u8, name, protected_name)) continue;
+            if (self.resident_weights.getPtr(name)) |tensor| {
+                if (decoderRuntimeSlotPinsBuffer(self, tensor.buffer)) {
+                    self.stats.decoder_runtime_pinned_eviction_skips += 1;
+                    continue;
+                }
+            }
             if (entry.value_ptr.* < oldest_epoch) {
                 oldest_epoch = entry.value_ptr.*;
                 oldest_name = name;
@@ -2345,12 +2556,36 @@ fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !?CT 
             self.stats.device_free_calls += 1;
             self.debug_cuda_graph_final_hidden_input_storage.free(&self.ctx);
         }
+        if (self.debug_cuda_graph_final_hidden_output_storage.ptr != 0) {
+            self.stats.device_free_calls += 1;
+            self.debug_cuda_graph_final_hidden_output_storage.free(&self.ctx);
+        }
         self.debug_cuda_graph_final_hidden_input_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
         self.noteDeviceBytes(byte_len);
         self.stats.device_alloc_calls += 1;
         std.log.info("cuda_graph_capture_probe: persistent_input_alloc ptr=0x{x} len={d}", .{
             self.debug_cuda_graph_final_hidden_input_storage.ptr,
             self.debug_cuda_graph_final_hidden_input_storage.len,
+        });
+        self.debug_cuda_graph_final_hidden_output_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
+        self.noteDeviceBytes(byte_len);
+        self.stats.device_alloc_calls += 1;
+        std.log.info("cuda_graph_capture_probe: persistent_output_alloc ptr=0x{x} len={d}", .{
+            self.debug_cuda_graph_final_hidden_output_storage.ptr,
+            self.debug_cuda_graph_final_hidden_output_storage.len,
+        });
+    } else if (self.debug_cuda_graph_final_hidden_output_storage.ptr == 0 or self.debug_cuda_graph_final_hidden_output_storage.len != byte_len) {
+        invalidateDebugFinalHiddenGraph(self);
+        if (self.debug_cuda_graph_final_hidden_output_storage.ptr != 0) {
+            self.stats.device_free_calls += 1;
+            self.debug_cuda_graph_final_hidden_output_storage.free(&self.ctx);
+        }
+        self.debug_cuda_graph_final_hidden_output_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
+        self.noteDeviceBytes(byte_len);
+        self.stats.device_alloc_calls += 1;
+        std.log.info("cuda_graph_capture_probe: persistent_output_alloc ptr=0x{x} len={d}", .{
+            self.debug_cuda_graph_final_hidden_output_storage.ptr,
+            self.debug_cuda_graph_final_hidden_output_storage.len,
         });
     }
 
@@ -2392,6 +2627,11 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
 
     const output_tensor = tensorFromCt(output);
     if (output_tensor.quant_type != null) return error.UnsupportedTensorType;
+    const byte_len = try checkedMul(output_tensor.elem_count, output_tensor.dtype.byteSize());
+    if (byte_len == 0) return error.InvalidTensorShape;
+    if (self.debug_cuda_graph_final_hidden_output_storage.ptr == 0 or self.debug_cuda_graph_final_hidden_output_storage.len < byte_len) return error.InvalidCudaState;
+    try copyFromDeviceTracked(self, self.debug_cuda_graph_final_hidden_output_storage, output_tensor.buffer, byte_len);
+
     const shape = try dupeShape(self.allocator, output_tensor.shape);
     errdefer self.allocator.free(shape);
 
@@ -2399,13 +2639,14 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
         self.allocator.free(old_shape);
     }
     self.debug_cuda_graph_final_hidden_shape = shape;
-    self.debug_cuda_graph_final_hidden_output = output_tensor.buffer;
+    self.debug_cuda_graph_final_hidden_output = self.debug_cuda_graph_final_hidden_output_storage;
     self.debug_cuda_graph_final_hidden_elem_count = output_tensor.elem_count;
     self.debug_cuda_graph_final_hidden_dtype = output_tensor.dtype;
     self.debug_cuda_graph_final_hidden_valid = true;
 
-    std.log.info("cuda_graph_capture_probe: persistent_boundary input=0x{x} output=0x{x} elem_count={d} dtype={s} kv_capacity={d} shape={any}", .{
+    std.log.info("cuda_graph_capture_probe: persistent_boundary input=0x{x} output=0x{x} temp_output=0x{x} elem_count={d} dtype={s} kv_capacity={d} shape={any}", .{
         self.debug_cuda_graph_final_hidden_input.ptr,
+        self.debug_cuda_graph_final_hidden_output.ptr,
         output_tensor.buffer.ptr,
         output_tensor.elem_count,
         @tagName(output_tensor.dtype),
@@ -2444,14 +2685,8 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
     const shape = try dupeShape(self.allocator, shape_src);
     errdefer self.allocator.free(shape);
 
-    var output = self.debug_cuda_graph_final_hidden_output;
-    if (!retainPinnedTempSlot(self, output)) {
-        std.log.warn("cuda_graph_capture_probe: persistent_replay_output_unavailable ptr=0x{x}", .{output.ptr});
-        return null;
-    }
-    errdefer {
-        _ = releasePinnedTempSlot(self, &output);
-    }
+    const output = self.debug_cuda_graph_final_hidden_output;
+    if (output.ptr == 0) return null;
 
     try self.ctx.launchGraph(exec);
     self.stats.cuda_graph_capture_replays += 1;
@@ -2463,13 +2698,15 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
         if (self.debug_cuda_graph_kv_replay_capacity_valid) self.debug_cuda_graph_kv_replay_capacity_tokens else 0,
     });
 
-    return createTensorWithDType(
-        self,
-        output,
-        shape,
-        self.debug_cuda_graph_final_hidden_elem_count,
-        self.debug_cuda_graph_final_hidden_dtype,
-    );
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = output,
+        .dtype = self.debug_cuda_graph_final_hidden_dtype,
+        .shape = shape,
+        .elem_count = self.debug_cuda_graph_final_hidden_elem_count,
+        .owns_buffer = false,
+    };
+    return tensor;
 }
 
 fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph) !void {
@@ -2950,6 +3187,12 @@ fn recordQuantMatmulPlan(self: *CudaCompute, weight_tensor: *const CudaTensor, o
 
 fn ensureCount(tensor: *const CudaTensor, expected: usize) !void {
     if (tensor.elem_count != expected) return error.InvalidShape;
+}
+
+fn ensureLogicalWeightCount(tensor: *const CudaTensor, expected: usize) !void {
+    if (tensor.quant_type == null) return ensureCount(tensor, expected);
+    const logical_count = try elementCountFromShape(tensor.shape);
+    if (logical_count != expected) return error.InvalidShape;
 }
 
 fn checkedMul(a: usize, b: usize) !usize {
@@ -5378,6 +5621,582 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn cudaDecoderRuntimeReserveKvTokens(config: gpt_model.Config, current_kv_tokens: usize) usize {
+    if (config.sliding_window > 0) return @intCast(config.sliding_window);
+    if (config.max_position_embeddings > 0) return @intCast(config.max_position_embeddings);
+    return if (current_kv_tokens > 0) current_kv_tokens else 1;
+}
+
+fn cudaDecoderRuntimeOverrideLevel() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DECODER_SLOT_OVERRIDE_LEVEL") orelse 2;
+}
+
+fn cudaGemmaPreparedLayers(configured_layers: usize) usize {
+    const configured = platform.env.getenvUsize("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GATED_LAYERS") orelse configured_layers;
+    return @min(configured_layers, configured);
+}
+
+fn cudaGemmaNormSlot(layer: usize, comptime kind: enum { attn_pre, attn_post, ffn_pre, ffn_post }) usize {
+    return switch (kind) {
+        .attn_pre => layer * 4,
+        .attn_post => layer * 4 + 1,
+        .ffn_pre => layer * 4 + 2,
+        .ffn_post => layer * 4 + 3,
+    };
+}
+
+fn cudaGemmaLinearSlot(layer: usize, comptime kind: enum { attn_q, attn_k, attn_v, attn_out_proj, mlp_gate, mlp_up, mlp_down }) usize {
+    return switch (kind) {
+        .attn_q => layer * 7,
+        .attn_k => layer * 7 + 1,
+        .attn_v => layer * 7 + 2,
+        .attn_out_proj => layer * 7 + 3,
+        .mlp_gate => layer * 7 + 4,
+        .mlp_up => layer * 7 + 5,
+        .mlp_down => layer * 7 + 6,
+    };
+}
+
+fn cudaFamilyStateMatches(self: *const CudaCompute, config: gpt_model.Config, configured_layer_count: usize) bool {
+    const state = self.decoder_runtime_family_state;
+    return state.prepared and
+        state.configured_layer_count == configured_layer_count and
+        state.hidden_size == config.hidden_size and
+        state.intermediate_size == config.intermediate_size and
+        state.num_hidden_layers == config.num_hidden_layers and
+        state.num_attention_heads == config.num_attention_heads and
+        state.num_key_value_heads == config.num_key_value_heads and
+        state.num_global_key_value_heads == config.num_global_key_value_heads and
+        state.attention_head_dim == config.attention_head_dim and
+        state.global_head_dim == config.global_head_dim and
+        state.vocab_size == config.vocab_size and
+        state.sliding_window == config.sliding_window and
+        state.sliding_window_pattern == config.sliding_window_pattern and
+        state.ple_hidden_size == config.ple_hidden_size;
+}
+
+fn cudaNoteFamilyPrepared(self: *CudaCompute, config: gpt_model.Config, reserve_kv_tokens: usize, configured_layer_count: usize) void {
+    self.decoder_runtime_family_state = .{
+        .prepared = true,
+        .reserve_kv_tokens = reserve_kv_tokens,
+        .configured_layer_count = configured_layer_count,
+        .hidden_size = config.hidden_size,
+        .intermediate_size = config.intermediate_size,
+        .num_hidden_layers = config.num_hidden_layers,
+        .num_attention_heads = config.num_attention_heads,
+        .num_key_value_heads = config.num_key_value_heads,
+        .num_global_key_value_heads = config.num_global_key_value_heads,
+        .attention_head_dim = config.attention_head_dim,
+        .global_head_dim = config.global_head_dim,
+        .vocab_size = config.vocab_size,
+        .sliding_window = config.sliding_window,
+        .sliding_window_pattern = config.sliding_window_pattern,
+        .ple_hidden_size = config.ple_hidden_size,
+    };
+}
+
+fn cudaPrepareRmsNormSlotByName(
+    self: *CudaCompute,
+    cb: *const ops.ComputeBackend,
+    config: gpt_model.Config,
+    slot: usize,
+    name: []const u8,
+    hidden_size: usize,
+) !bool {
+    const weight = try gpt_arch.getModelWeight(cb, config, name);
+    defer cb.free(weight);
+    return decoderRuntimePrepareRmsNormOp(self, &.{
+        .slot = slot,
+        .weight = weight,
+        .hidden_size = hidden_size,
+    });
+}
+
+fn cudaPrepareLinearNoBiasSlotFromWeight(
+    self: *CudaCompute,
+    slot: usize,
+    weight: CT,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    const resident = residentTensorForSlot(self, tensorFromCt(weight)) orelse {
+        self.stats.decoder_runtime_linear_slot_prepare_misses += 1;
+        return false;
+    };
+    try decoderRuntimePrepareLinearSlot(self, slot, resident, null, in_dim, out_dim);
+    return true;
+}
+
+fn cudaPrepareLinearNoBiasSlotByName(
+    self: *CudaCompute,
+    cb: *const ops.ComputeBackend,
+    config: gpt_model.Config,
+    slot: usize,
+    name: []const u8,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    const weight = try gpt_arch.getModelWeight(cb, config, name);
+    defer cb.free(weight);
+    return cudaPrepareLinearNoBiasSlotFromWeight(self, slot, weight, in_dim, out_dim);
+}
+
+fn cudaPrepareGemmaDecoderRuntimeFamily(
+    self: *CudaCompute,
+    allocator: std.mem.Allocator,
+    config: gpt_model.Config,
+    configured_layer_count: usize,
+) !bool {
+    _ = allocator;
+    if (config.family != .gemma or config.usesMoe()) return false;
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    if (layer_count == 0 or layer_count > 256) return false;
+
+    const cb = self.computeBackend();
+    const prepared_layer_count = cudaGemmaPreparedLayers(@min(configured_layer_count, layer_count));
+    const override_level = cudaDecoderRuntimeOverrideLevel();
+    if (override_level == 0) return false;
+
+    for (0..prepared_layer_count) |layer| {
+        var name_buf: [256]u8 = undefined;
+        const layer_head_dim: usize = @intCast(config.effectiveHeadDimForLayer(layer));
+        const layer_kv_heads: usize = @intCast(config.effectiveKVHeadsForLayer(layer));
+        const attention_input_size: usize = @as(usize, @intCast(config.num_attention_heads)) * layer_head_dim;
+        const kv_dim = layer_kv_heads * layer_head_dim;
+
+        const attn_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.input_layernorm.weight", .{layer});
+        if (!(try cudaPrepareRmsNormSlotByName(self, &cb, config, cudaGemmaNormSlot(layer, .attn_pre), attn_norm_name, config.hidden_size))) return false;
+
+        if (override_level >= 2) {
+            const q_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
+            if (!(try cudaPrepareLinearNoBiasSlotByName(self, &cb, config, cudaGemmaLinearSlot(layer, .attn_q), q_name, config.hidden_size, attention_input_size))) return false;
+
+            const k_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+            const k_weight = try gpt_arch.getModelWeight(&cb, config, k_name);
+            defer cb.free(k_weight);
+            if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .attn_k), k_weight, config.hidden_size, kv_dim))) return false;
+
+            const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+            const v_weight = gpt_arch.getModelWeight(&cb, config, v_name) catch |err| switch (err) {
+                error.MissingWeight, error.WeightNotFound => if (config.layerOmitsVProj(layer)) k_weight else return err,
+                else => return err,
+            };
+            const owns_v_weight = v_weight != k_weight;
+            defer if (owns_v_weight) cb.free(v_weight);
+            if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .attn_v), v_weight, config.hidden_size, kv_dim))) return false;
+
+            const attn_out_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
+            if (!(try cudaPrepareLinearNoBiasSlotByName(self, &cb, config, cudaGemmaLinearSlot(layer, .attn_out_proj), attn_out_name, attention_input_size, config.hidden_size))) return false;
+        }
+
+        if (override_level >= 3) {
+            const attn_post_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{layer});
+            if (!(try cudaPrepareRmsNormSlotByName(self, &cb, config, cudaGemmaNormSlot(layer, .attn_post), attn_post_norm_name, config.hidden_size))) return false;
+
+            const ffn_pre_norm_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong;
+            const ffn_pre_norm = gpt_arch.getModelWeight(&cb, config, ffn_pre_norm_name) catch |err| switch (err) {
+                error.MissingWeight, error.WeightNotFound => null,
+                else => return err,
+            };
+            if (ffn_pre_norm) |weight| {
+                defer cb.free(weight);
+                if (!(try decoderRuntimePrepareRmsNormOp(self, &.{
+                    .slot = cudaGemmaNormSlot(layer, .ffn_pre),
+                    .weight = weight,
+                    .hidden_size = config.hidden_size,
+                }))) return false;
+            }
+
+            const ffn_post_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+            if (!(try cudaPrepareRmsNormSlotByName(self, &cb, config, cudaGemmaNormSlot(layer, .ffn_post), ffn_post_norm_name, config.hidden_size))) return false;
+        }
+
+        if (override_level >= 4) {
+            const gate_w = try gpt_arch.getFFNWeight(&cb, config, layer, "gate", &name_buf);
+            defer cb.free(gate_w);
+            if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .mlp_gate), gate_w, config.hidden_size, config.intermediateSize(layer)))) return false;
+
+            const up_w = try gpt_arch.getFFNWeight(&cb, config, layer, "up", &name_buf);
+            defer cb.free(up_w);
+            if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .mlp_up), up_w, config.hidden_size, config.intermediateSize(layer)))) return false;
+
+            const down_w = try gpt_arch.getFFNWeight(&cb, config, layer, "down", &name_buf);
+            defer cb.free(down_w);
+            if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .mlp_down), down_w, config.intermediateSize(layer), config.hidden_size))) return false;
+        }
+    }
+
+    return true;
+}
+
+fn decoderRuntimePrepareGreedyOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeGreedyRequest) anyerror!bool {
+    _ = ctx;
+    if (request.hidden_size == 0 or request.num_layers == 0 or request.num_heads == 0 or
+        request.num_kv_heads == 0 or request.head_dim == 0 or request.vocab_size == 0 or
+        request.kv_tokens == 0)
+    {
+        return false;
+    }
+    return true;
+}
+
+fn decoderRuntimePrepareOrReuseFamilyOp(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    config: gpt_model.Config,
+    current_kv_tokens: usize,
+    configured_layer_count: usize,
+) anyerror!ops.DecoderRuntimePrepareReuseResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const reserve_kv_tokens = cudaDecoderRuntimeReserveKvTokens(config, current_kv_tokens);
+    if (cudaFamilyStateMatches(self, config, configured_layer_count)) {
+        if (reserve_kv_tokens <= self.decoder_runtime_family_state.reserve_kv_tokens) {
+            return .{
+                .prepared = true,
+                .reserve_kv_tokens = reserve_kv_tokens,
+                .fast_hit = true,
+            };
+        }
+        const prepared = try decoderRuntimePrepareGreedyOp(ctx, &.{
+            .hidden_size = config.hidden_size,
+            .intermediate_size = config.intermediate_size,
+            .num_layers = config.num_hidden_layers,
+            .num_heads = config.num_attention_heads,
+            .num_kv_heads = config.effectiveKVHeads(),
+            .head_dim = config.headDim(),
+            .vocab_size = config.vocab_size,
+            .kv_tokens = reserve_kv_tokens,
+        });
+        if (prepared) self.decoder_runtime_family_state.reserve_kv_tokens = reserve_kv_tokens;
+        return .{
+            .prepared = prepared,
+            .reserve_kv_tokens = reserve_kv_tokens,
+            .used_greedy = prepared,
+        };
+    }
+
+    if (!(try decoderRuntimePrepareGreedyOp(ctx, &.{
+        .hidden_size = config.hidden_size,
+        .intermediate_size = config.intermediate_size,
+        .num_layers = config.num_hidden_layers,
+        .num_heads = config.num_attention_heads,
+        .num_kv_heads = config.effectiveKVHeads(),
+        .head_dim = config.headDim(),
+        .vocab_size = config.vocab_size,
+        .kv_tokens = reserve_kv_tokens,
+    }))) {
+        return .{ .reserve_kv_tokens = reserve_kv_tokens };
+    }
+
+    const prepared = try cudaPrepareGemmaDecoderRuntimeFamily(self, allocator, config, configured_layer_count);
+    if (prepared) cudaNoteFamilyPrepared(self, config, reserve_kv_tokens, configured_layer_count);
+    return .{
+        .prepared = prepared,
+        .reserve_kv_tokens = reserve_kv_tokens,
+    };
+}
+
+fn decoderRuntimeReadyOp(ctx: *anyopaque) bool {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.decoder_runtime_family_state.prepared or
+        self.decoder_runtime_linear_slots.count() != 0 or
+        self.decoder_runtime_rms_norm_slots.count() != 0;
+}
+
+fn decoderRuntimePrepareRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareRmsNormRequest) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight_tensor = tensorFromCt(request.weight);
+    const resident = residentTensorForSlot(self, weight_tensor) orelse {
+        self.stats.decoder_runtime_rms_norm_slot_prepare_misses += 1;
+        return false;
+    };
+    try ensureF32(resident);
+    try ensureCount(resident, request.hidden_size);
+    try self.decoder_runtime_rms_norm_slots.put(self.allocator, request.slot, .{
+        .weight = borrowedSlotTensor(resident),
+        .hidden_size = request.hidden_size,
+    });
+    self.stats.decoder_runtime_rms_norm_slot_prepares += 1;
+    return true;
+}
+
+fn decoderRuntimeEnsureRmsNormSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureRmsNormSlotRequest) anyerror!?usize {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight_tensor = tensorFromCt(request.weight);
+    const resident = residentTensorForSlot(self, weight_tensor) orelse {
+        self.stats.decoder_runtime_rms_norm_slot_prepare_misses += 1;
+        return null;
+    };
+    try ensureF32(resident);
+    try ensureCount(resident, request.hidden_size);
+    var it = self.decoder_runtime_rms_norm_slots.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr;
+        if (slot.weight.buffer.ptr == resident.buffer.ptr and slot.hidden_size == request.hidden_size) {
+            return entry.key_ptr.*;
+        }
+    }
+    const slot_id = self.decoder_runtime_next_dynamic_slot;
+    self.decoder_runtime_next_dynamic_slot += 1;
+    try self.decoder_runtime_rms_norm_slots.put(self.allocator, slot_id, .{
+        .weight = borrowedSlotTensor(resident),
+        .hidden_size = request.hidden_size,
+    });
+    self.stats.decoder_runtime_rms_norm_slot_prepares += 1;
+    return slot_id;
+}
+
+fn decoderRuntimeApplyRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const slot = self.decoder_runtime_rms_norm_slots.getPtr(request.slot) orelse {
+        self.stats.decoder_runtime_rms_norm_apply_misses += 1;
+        return null;
+    };
+    if (slot.hidden_size != request.hidden_size) return error.UnexpectedOutputShape;
+    self.stats.decoder_runtime_rms_norm_apply_hits += 1;
+    return try rmsNorm(ctx, request.input, &slot.weight, request.hidden_size, request.eps);
+}
+
+fn sameOptionalSlotBias(slot_bias: ?CudaTensor, request_bias: ?*CudaTensor) bool {
+    if (slot_bias) |bias| {
+        const requested = request_bias orelse return false;
+        return bias.buffer.ptr == requested.buffer.ptr and bias.buffer.len == requested.buffer.len and bias.elem_count == requested.elem_count;
+    }
+    return request_bias == null;
+}
+
+fn decoderRuntimePrepareLinearSlot(
+    self: *CudaCompute,
+    slot_id: usize,
+    weight: *CudaTensor,
+    bias: ?*CudaTensor,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try ensureF32Bf16OrQuantized(weight);
+    try ensureLogicalWeightCount(weight, try checkedMul(out_dim, in_dim));
+    if (bias) |bias_tensor| {
+        try ensureF32(bias_tensor);
+        try ensureCount(bias_tensor, out_dim);
+    }
+    try self.decoder_runtime_linear_slots.put(self.allocator, slot_id, .{
+        .weight = borrowedSlotTensor(weight),
+        .bias = if (bias) |bias_tensor| borrowedSlotTensor(bias_tensor) else null,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    });
+    self.stats.decoder_runtime_linear_slot_prepares += 1;
+}
+
+fn decoderRuntimePrepareLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareLinearRequest) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight = residentTensorForSlot(self, tensorFromCt(request.weight)) orelse {
+        self.stats.decoder_runtime_linear_slot_prepare_misses += 1;
+        return false;
+    };
+    const bias = residentTensorForSlot(self, tensorFromCt(request.bias)) orelse {
+        self.stats.decoder_runtime_linear_slot_prepare_misses += 1;
+        return false;
+    };
+    try decoderRuntimePrepareLinearSlot(self, request.slot, weight, bias, request.in_dim, request.out_dim);
+    return true;
+}
+
+fn decoderRuntimeEnsureLinearSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureLinearSlotRequest) anyerror!?usize {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight = residentTensorForSlot(self, tensorFromCt(request.weight)) orelse {
+        self.stats.decoder_runtime_linear_slot_prepare_misses += 1;
+        return null;
+    };
+    const bias = if (request.bias) |bias_ct| blk: {
+        break :blk residentTensorForSlot(self, tensorFromCt(bias_ct)) orelse {
+            self.stats.decoder_runtime_linear_slot_prepare_misses += 1;
+            return null;
+        };
+    } else null;
+
+    var it = self.decoder_runtime_linear_slots.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr;
+        if (slot.weight.buffer.ptr == weight.buffer.ptr and
+            slot.in_dim == request.in_dim and
+            slot.out_dim == request.out_dim and
+            sameOptionalSlotBias(slot.bias, bias))
+        {
+            return entry.key_ptr.*;
+        }
+    }
+
+    const slot_id = self.decoder_runtime_next_dynamic_slot;
+    self.decoder_runtime_next_dynamic_slot += 1;
+    try decoderRuntimePrepareLinearSlot(self, slot_id, weight, bias, request.in_dim, request.out_dim);
+    return slot_id;
+}
+
+fn decoderRuntimeApplyLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const slot = self.decoder_runtime_linear_slots.getPtr(request.slot) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    if (slot.in_dim != request.in_dim or slot.out_dim != request.out_dim) return error.UnexpectedOutputShape;
+    self.stats.decoder_runtime_linear_apply_hits += 1;
+    if (slot.bias) |*bias| {
+        return try linear(ctx, request.input, &slot.weight, bias, 1, request.in_dim, request.out_dim);
+    }
+    return try linearNoBias(ctx, request.input, &slot.weight, 1, request.in_dim, request.out_dim);
+}
+
+fn decoderRuntimeApplyLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const slot = self.decoder_runtime_linear_slots.getPtr(request.slot) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    if (slot.in_dim != request.in_dim or slot.out_dim != request.out_dim) return error.UnexpectedOutputShape;
+    self.stats.decoder_runtime_linear_apply_hits += 1;
+    if (slot.bias == null) {
+        const token = (try linearNoBiasArgmaxLastRow(ctx, request.input, &slot.weight, 1, request.in_dim, request.out_dim)) orelse return null;
+        return @intCast(token);
+    }
+    const logits = try linear(ctx, request.input, &slot.weight, &slot.bias.?, 1, request.in_dim, request.out_dim);
+    defer freeTensor(ctx, logits);
+    const token = (try argmaxLastRow(ctx, logits, 1, request.out_dim)) orelse return null;
+    return @intCast(token);
+}
+
+fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearPairRequest) anyerror!?ops.LinearNoBiasPairResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const slot_a = self.decoder_runtime_linear_slots.getPtr(request.slot_a) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    const slot_b = self.decoder_runtime_linear_slots.getPtr(request.slot_b) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    if (slot_a.in_dim != request.in_dim or slot_b.in_dim != request.in_dim or
+        slot_a.out_dim != request.out_dim or slot_b.out_dim != request.out_dim)
+    {
+        return error.UnexpectedOutputShape;
+    }
+    if (slot_a.bias != null or slot_b.bias != null) return null;
+    self.stats.decoder_runtime_linear_apply_hits += 2;
+    self.stats.decoder_runtime_linear_pair_apply_hits += 1;
+    return try linearNoBiasPair(ctx, request.input, &slot_a.weight, &slot_b.weight, 1, request.in_dim, request.out_dim);
+}
+
+fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const q_slot = self.decoder_runtime_linear_slots.getPtr(request.q_slot) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    const k_slot = self.decoder_runtime_linear_slots.getPtr(request.k_slot) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    const v_slot = self.decoder_runtime_linear_slots.getPtr(request.v_slot) orelse {
+        self.stats.decoder_runtime_linear_apply_misses += 1;
+        return null;
+    };
+    if (q_slot.in_dim != request.in_dim or k_slot.in_dim != request.in_dim or v_slot.in_dim != request.in_dim or
+        q_slot.out_dim != request.q_out_dim or k_slot.out_dim != request.kv_out_dim or v_slot.out_dim != request.kv_out_dim)
+    {
+        return error.UnexpectedOutputShape;
+    }
+    if (q_slot.bias != null or k_slot.bias != null or v_slot.bias != null) return null;
+    self.stats.decoder_runtime_linear_apply_hits += 3;
+    self.stats.decoder_runtime_linear_qkv_apply_hits += 1;
+    if (try linearNoBiasQkv(ctx, request.input, &q_slot.weight, &k_slot.weight, &v_slot.weight, 1, request.in_dim, request.q_out_dim, request.kv_out_dim)) |fused| {
+        return fused;
+    }
+    const q = try linearNoBias(ctx, request.input, &q_slot.weight, 1, request.in_dim, request.q_out_dim);
+    errdefer freeTensor(ctx, q);
+    const k = try linearNoBias(ctx, request.input, &k_slot.weight, 1, request.in_dim, request.kv_out_dim);
+    errdefer freeTensor(ctx, k);
+    const v = try linearNoBias(ctx, request.input, &v_slot.weight, 1, request.in_dim, request.kv_out_dim);
+    return .{ .first = q, .second = k, .third = v };
+}
+
+fn decoderRuntimeApplyBlockRmsNorm(
+    ctx: *anyopaque,
+    input: CT,
+    slot_id: ?usize,
+    hidden_size: usize,
+    eps: f32,
+) anyerror!?CT {
+    const slot = slot_id orelse return input;
+    return decoderRuntimeApplyRmsNormOp(ctx, &.{
+        .slot = slot,
+        .input = input,
+        .hidden_size = hidden_size,
+        .eps = eps,
+    });
+}
+
+fn runAttentionResidualOp(ctx: *anyopaque, request: *const ops.RunAttentionResidualRequest) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (request.attention_sink.hasMetadata()) return null;
+    const attention_input_size = request.num_heads * request.head_dim;
+    var current = try gqaPagedAttention(
+        ctx,
+        request.q,
+        request.k,
+        request.v,
+        null,
+        request.attention,
+        1,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+    );
+    errdefer freeTensor(ctx, current);
+
+    if (try decoderRuntimeApplyBlockRmsNorm(ctx, current, request.pre_linear_rms_norm_slot, attention_input_size, request.eps)) |normed| {
+        if (normed != current) {
+            freeTensor(ctx, current);
+            current = normed;
+        }
+    } else return null;
+
+    const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
+        .slot = request.linear_slot,
+        .input = current,
+        .in_dim = attention_input_size,
+        .out_dim = request.hidden_size,
+    })) orelse {
+        freeTensor(ctx, current);
+        return null;
+    };
+    freeTensor(ctx, current);
+    current = projected;
+
+    if (request.post_linear_rms_norm_slot) |slot_id| {
+        if (self.decoder_runtime_rms_norm_slots.getPtr(slot_id)) |slot| {
+            if (try rmsNormAddTensor(ctx, current, &slot.weight, request.residual, request.hidden_size, request.eps)) |fused| {
+                freeTensor(ctx, current);
+                return fused;
+            }
+        }
+        const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = slot_id,
+            .input = current,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+        })) orelse {
+            freeTensor(ctx, current);
+            return null;
+        };
+        freeTensor(ctx, current);
+        current = normed;
+    }
+
+    const result = try add(ctx, current, request.residual);
+    freeTensor(ctx, current);
+    return result;
+}
+
 fn gqaCausalAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!CT {
     if (num_heads == num_kv_heads) {
         const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -5437,6 +6256,18 @@ const vtable = ops.ComputeBackend.VTable{
     .linearNoBiasQkv = &linearNoBiasQkv,
     .linearPair = &linearPair,
     .linearTriple = &linearTriple,
+    .decoderRuntimePrepareGreedy = &decoderRuntimePrepareGreedyOp,
+    .decoderRuntimePrepareOrReuseFamily = &decoderRuntimePrepareOrReuseFamilyOp,
+    .decoderRuntimeReady = &decoderRuntimeReadyOp,
+    .decoderRuntimePrepareRmsNorm = &decoderRuntimePrepareRmsNormOp,
+    .decoderRuntimeEnsureRmsNormSlot = &decoderRuntimeEnsureRmsNormSlotOp,
+    .decoderRuntimeApplyRmsNorm = &decoderRuntimeApplyRmsNormOp,
+    .decoderRuntimePrepareLinear = &decoderRuntimePrepareLinearOp,
+    .decoderRuntimeEnsureLinearSlot = &decoderRuntimeEnsureLinearSlotOp,
+    .decoderRuntimeApplyLinear = &decoderRuntimeApplyLinearOp,
+    .decoderRuntimeApplyLinearArgmax = &decoderRuntimeApplyLinearArgmaxOp,
+    .decoderRuntimeApplyLinearPair = &decoderRuntimeApplyLinearPairOp,
+    .decoderRuntimeApplyLinearQkv = &decoderRuntimeApplyLinearQkvOp,
     .multiplyScalar = &multiplyScalar,
     .addScalar = &addScalar,
     .siluMultiply = &siluMultiply,
@@ -5478,6 +6309,7 @@ const vtable = ops.ComputeBackend.VTable{
     .rope = &rope,
     .ropeScaled = &ropeScaled,
     .ropePerItem = &ropePerItem,
+    .runAttentionResidual = &runAttentionResidualOp,
     .gqaCausalAttention = &gqaCausalAttention,
     .gqaPagedAttention = &gqaPagedAttention,
     .fromFloat32 = &fromFloat32Op,

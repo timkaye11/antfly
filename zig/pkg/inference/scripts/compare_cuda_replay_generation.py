@@ -186,7 +186,40 @@ def decode_rate(result: dict[str, object]) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
-def validate_pair(model: str, prompt: str, persistent: dict[str, object], recapture: dict[str, object]) -> list[str]:
+def validate_transfer_and_memory(
+    *,
+    label: str,
+    result: dict[str, object],
+    token_count: int,
+    max_extra_scalar_downloads: int,
+    max_temp_evictions: int,
+) -> list[str]:
+    errors: list[str] = []
+    max_scalar_d2h = 4 * (token_count + max_extra_scalar_downloads)
+    d2h_bytes = cuda_counter(result, "d2h_bytes")
+    temp_evictions = cuda_counter(result, "temp_buffer_evictions")
+    lm_head_fallbacks = cuda_counter(result, "lm_head_argmax_fallbacks")
+    if d2h_bytes > max_scalar_d2h:
+        errors.append(
+            f"{label} d2h_bytes={d2h_bytes} exceeds scalar-only budget {max_scalar_d2h}"
+        )
+    if temp_evictions > max_temp_evictions:
+        errors.append(
+            f"{label} temp_buffer_evictions={temp_evictions} exceeds budget {max_temp_evictions}"
+        )
+    if lm_head_fallbacks != 0:
+        errors.append(f"{label} lm_head_argmax_fallbacks={lm_head_fallbacks}")
+    return errors
+
+
+def validate_pair(
+    model: str,
+    prompt: str,
+    persistent: dict[str, object],
+    recapture: dict[str, object],
+    max_extra_scalar_downloads: int,
+    max_temp_evictions: int,
+) -> list[str]:
     errors: list[str] = []
     if persistent["exit_code"] != 0:
         errors.append(f"persistent run failed exit={persistent['exit_code']}")
@@ -217,6 +250,26 @@ def validate_pair(model: str, prompt: str, persistent: dict[str, object], recapt
 
     if cuda_counter(persistent, "kernel_launches") > cuda_counter(recapture, "kernel_launches"):
         errors.append("persistent run used more kernel launches than recapture control")
+
+    token_count = len(persistent["token_ids"]) if persistent["token_ids"] else len(recapture["token_ids"])
+    errors.extend(
+        validate_transfer_and_memory(
+            label="persistent",
+            result=persistent,
+            token_count=token_count,
+            max_extra_scalar_downloads=max_extra_scalar_downloads,
+            max_temp_evictions=max_temp_evictions,
+        )
+    )
+    errors.extend(
+        validate_transfer_and_memory(
+            label="recapture",
+            result=recapture,
+            token_count=token_count,
+            max_extra_scalar_downloads=max_extra_scalar_downloads,
+            max_temp_evictions=max_temp_evictions,
+        )
+    )
 
     if "q4" in model.lower() and cuda_counter(persistent, "q4k_decode_fast_fallbacks") != 0:
         errors.append("persistent Q4 run reported q4k_decode_fast_fallbacks != 0")
@@ -253,6 +306,18 @@ def main() -> int:
     parser.add_argument("--backend-budget-mb", type=int, default=19000)
     parser.add_argument("--kv-budget-mb", type=int, default=512)
     parser.add_argument("--scratch-budget-mb", type=int, default=1024)
+    parser.add_argument(
+        "--max-extra-scalar-downloads",
+        type=int,
+        default=2,
+        help="Allow this many extra 4-byte token-id downloads beyond emitted tokens.",
+    )
+    parser.add_argument(
+        "--max-temp-evictions",
+        type=int,
+        default=0,
+        help="Maximum allowed CUDA temp-buffer evictions per generate run.",
+    )
     parser.add_argument("--raw-prompt", action="store_true")
     parser.add_argument("--no-chat-template", action="store_true")
     args = parser.parse_args()
@@ -313,7 +378,14 @@ def main() -> int:
             )
             write_run_artifacts(base.with_name(base.name + "-persistent.json"), persistent)
             write_run_artifacts(base.with_name(base.name + "-recapture.json"), recapture)
-            pair_failures = validate_pair(model, prompt, persistent, recapture)
+            pair_failures = validate_pair(
+                model,
+                prompt,
+                persistent,
+                recapture,
+                args.max_extra_scalar_downloads,
+                args.max_temp_evictions,
+            )
             failures.extend(pair_failures)
 
             row = {
@@ -328,6 +400,10 @@ def main() -> int:
                     "replays": cuda_counter(persistent, "graph_capture_replays"),
                     "persistent_replays": cuda_counter(persistent, "graph_capture_persistent_replays"),
                     "capacity_skips": cuda_counter(persistent, "graph_capture_capacity_skips"),
+                    "d2h_bytes": cuda_counter(persistent, "d2h_bytes"),
+                    "temp_buffer_evictions": cuda_counter(persistent, "temp_buffer_evictions"),
+                    "temp_buffer_cached_bytes": cuda_counter(persistent, "temp_buffer_cached_bytes"),
+                    "lm_head_argmax_fallbacks": cuda_counter(persistent, "lm_head_argmax_fallbacks"),
                 },
                 "recapture": {
                     "decode_tok_per_s": decode_rate(recapture),
@@ -337,6 +413,10 @@ def main() -> int:
                     "update_successes": cuda_counter(recapture, "graph_capture_update_successes"),
                     "persistent_replays": cuda_counter(recapture, "graph_capture_persistent_replays"),
                     "capacity_skips": cuda_counter(recapture, "graph_capture_capacity_skips"),
+                    "d2h_bytes": cuda_counter(recapture, "d2h_bytes"),
+                    "temp_buffer_evictions": cuda_counter(recapture, "temp_buffer_evictions"),
+                    "temp_buffer_cached_bytes": cuda_counter(recapture, "temp_buffer_cached_bytes"),
+                    "lm_head_argmax_fallbacks": cuda_counter(recapture, "lm_head_argmax_fallbacks"),
                 },
             }
             summary.append(row)
@@ -347,6 +427,8 @@ def main() -> int:
                 f"tokens={row['tokens']}",
                 f"persistent_replays={row['persistent']['persistent_replays']}",
                 f"launches={row['persistent']['kernel_launches']}/{row['recapture']['kernel_launches']}",
+                f"d2h={row['persistent']['d2h_bytes']}/{row['recapture']['d2h_bytes']}",
+                f"temp_evictions={row['persistent']['temp_buffer_evictions']}/{row['recapture']['temp_buffer_evictions']}",
             )
 
     summary_path = args.out_dir / "summary.json"

@@ -218,6 +218,31 @@ Implemented from Phase 5E follow-up:
   - timing JSON/print output now reports `lm_head_argmax_fused_q8`,
     `lm_head_argmax_fused_q4`, and `lm_head_argmax_fallbacks`
 
+Implemented from pure-greedy resident prefill follow-up:
+
+- Removed the remaining large host-logit download from scheduler-owned,
+  non-final prefill chunks in pure-greedy CUDA generation:
+  - the scheduler now detects steps where every claimed item is prefill work
+    with `wants_last_logits=false`
+  - those steps call a new `gpt.forwardHiddenOnly` wrapper that runs embeddings
+    plus transformer/KV writes on device, frees the final hidden tensor, and
+    skips LM-head projection plus `toFloat32`
+  - final prefill chunks that need logits, decode batches, grammar/sampling
+    paths, and mixed decode/prefill batches keep the existing logits path
+- Validation on the 35-token counting prompt confirms the pure-greedy model
+  math is resident CUDA for both prefill and decode:
+  - before: the first 32-token prefill chunk downloaded
+    `32 * 262144 * sizeof(f32) = 33554432` bytes of discarded logits
+  - Q4_K after fix: `d2h=32`, `to_f32_calls=8`, `to_f32_bytes=32`,
+    `download_gt256k=0`, `cuda_download_top_sizes: 8x4`,
+    `lm_head_argmax_fused_q4=8`, `lm_head_argmax_fallbacks=0`
+  - Q8_0 after fix: `d2h=40`, `to_f32_calls=10`, `to_f32_bytes=40`,
+    `download_gt256k=0`, `cuda_download_top_sizes: 10x4`,
+    `lm_head_argmax_fused_q8=10`, `lm_head_argmax_fallbacks=0`
+- Remaining CPU/GPU boundary in this pure-greedy path is intentional and tiny:
+  the CPU scheduler/tokenizer/output loop still runs on host, and the selected
+  token id is copied back as one 4-byte scalar per argmax call.
+
 Implemented from Phase 5G/H epilogue probe:
 
 - PLE gating now uses the existing backend `activationMultiply` hook, with the
@@ -980,8 +1005,34 @@ Validation:
     - harness runs persistent replay and recapture/update for each model/prompt
       pair, compares generated token ids, and validates graph counters
     - harness result: all four Q8_0/Q4_K prompt comparisons passed
+  - replay harness now also enforces memory/transfer gates:
+    - persistent and recapture runs must stay within scalar-only D2H budget
+    - temp-buffer evictions must stay within the configured budget, default `0`
+    - LM-head argmax fallback count must remain `0`
+    - summary JSON now records `d2h_bytes`, `temp_buffer_evictions`,
+      `temp_buffer_cached_bytes`, and `lm_head_argmax_fallbacks`
+    - latest one-prompt Q8_0/Q4_K run with these gates passed:
+      `python3 zig/pkg/inference/scripts/compare_cuda_replay_generation.py --model .models/google/gemma-4-12B-it-q8_0 --model .models/google/gemma-4-12B-it-q4_k --out-dir /tmp/gemma-cuda-replay-harness-memory --max-prompts 1 --max-tokens 12`
+    - Q8_0: `persistent_replays=8`, launches `2925/8757`,
+      D2H `48/48`, temp evictions `0/0`
+    - Q4_K: `persistent_replays=8`, launches `2925/8757`,
+      D2H `48/48`, temp evictions `0/0`
   - this is still env-gated diagnostic work, not a default path, until broader
     quality gates and capacity/long-context behavior pass
+  - latest counting-prompt validation after the graph-owned output fix now
+    passes persistent replay on the prompt that exposed the output-lifetime
+    bug:
+    - prompt: `Count upward starting at 1. Output only numbers separated by spaces: 1 2 3 4`
+    - output stayed valid and transfer profile stayed resident:
+      `d2h=32`, `to_f32_bytes=32`, `download_gt256k=0`
+    - Q4_K graph counters: `begins=1`, `replays=6`,
+      `persistent_replays=5`, `capacity_skips=0`, `launches=3004`
+    - Q8_0 graph counters: `begins=1`, `replays=8`,
+      `persistent_replays=7`, `capacity_skips=0`, `launches=3014`
+    - captured final-hidden output is now copied into a graph-owned output
+      buffer (`15360` bytes for Gemma4 12B hidden size) instead of retaining a
+      temp-slot pointer, so replay no longer depends on temp-slot availability
+    - both formats kept zero temp evictions and scalar-only token downloads
 
 Still pending from the original Phase 0/1 acceptance:
 
@@ -1033,6 +1084,10 @@ Conclusion:
 - Device greedy argmax is active for Gemma pure-greedy decode, including the
   prefill first token and Gemma4 suppress-token masking. Sustained Q8_0/Q4_K
   runs now show only 4-byte token-id downloads.
+- Pure-greedy scheduler prefill is now resident as well: non-final prefill
+  chunks that only need KV side effects run embeddings plus transformer layers
+  on CUDA and skip discarded host logits. The 35-token counting prompt now
+  shows `download_gt256k=0` for both Q8_0 and Q4_K.
 - Quantized LM-head greedy argmax is now fused for Q8_0 and Q4_K, including
   Gemma4 suppress-token masking. The implementation avoids materializing the
   full device logits tensor, but it still uses a safe two-stage reduction, so
@@ -1081,6 +1136,13 @@ Conclusion:
   `runGatedDecoderBlock` support comparable to Metal/MLX, or direct graph-level
   Gemma4 post-norm/residual fusion. More LM-head or PLE cleanup will not move
   the current Q8_0/Q4_K ant benchmark.
+- The first safe CUDA decoder-runtime slot layer is now implemented. Prepared
+  slots are resident-only, pin their backing CUDA buffers against lazy
+  device-weight eviction, and expose linear/RMSNorm apply counters in text and
+  JSON timing. CUDA `runAttentionResidual` is wired conservatively on top of
+  those slots; `runGatedDecoderBlock` remains the next structural fusion step
+  once a real caller path prepares all required Gemma slots and counters show
+  the slot path active on Q8_0/Q4_K generation.
 - CUDA graph capture is now mechanically available and the steady-state
   Q8_0/Q4_K decode allocator path is miss-free after warmup. The skipped trace
   probes show identical Q8_0 and Q4_K requested-size/buffer-size sequences, but
@@ -1128,6 +1190,9 @@ Conclusion:
 - Persistent final-hidden replay now works for the short and sustained
   Q8_0/Q4_K ant controls:
   - graph-owned final-hidden input buffer avoids embedding input pointer drift
+  - graph-owned final-hidden output buffer avoids captured output temp-slot
+    lifetime/availability failures; the extra persistent allocation is one
+    hidden row (`15360` bytes for Gemma4 12B)
   - dynamic KV suffix writes avoid replaying stale captured destination offsets
   - both resident quantized formats return the healthy token streams
   - 8-token launch count drops from the recapture/update probe's `5581`
@@ -1151,6 +1216,13 @@ Conclusion:
     `scripts/compare_cuda_replay_generation.py`; the latest harness run passed
     all four Q8_0/Q4_K comparisons and wrote
     `/tmp/gemma-cuda-replay-harness/summary.json`
+  - the counting prompt that previously hit
+    `persistent_replay_output_unavailable` now uses persistent replay on both
+    formats:
+    - Q4_K: `begins=1`, `persistent_replays=5`, `launches=3004`,
+      `d2h=32`, `temp_evictions=0`
+    - Q8_0: `begins=1`, `persistent_replays=7`, `launches=3014`,
+      `d2h=40`, `temp_evictions=0`
   - throughput improves less than launch count because the captured graph still
     runs the same GPU kernels, and embedding, LM-head argmax, token download,
     scalar uploads, and graph launch remain outside/around the final-hidden
@@ -1619,6 +1691,16 @@ Phase 5J - Re-evaluate CUDA graph capture:
     `ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1`.
   - Graph-owned final-hidden input copying is implemented for persistent
     replay.
+  - Graph-owned final-hidden output copying is implemented for persistent
+    replay:
+    - capture copies the final hidden row into a dedicated persistent device
+      output buffer before graph end
+    - replay returns a non-owning tensor view over that graph-owned output
+      buffer
+    - this removes the `persistent_replay_output_unavailable` temp-slot failure
+      mode without materializing host logits
+    - memory cost is one additional `hidden_size * sizeof(f32)` device buffer
+      per captured final-hidden graph (`15360` bytes for Gemma4 12B)
   - Dynamic KV suffix write scalarization is implemented for captured decode:
     `termite_kv_write_suffix_decode_scalars_f32`.
   - Persistent replay KV-capacity guarding is implemented:
@@ -1636,6 +1718,21 @@ Phase 5J - Re-evaluate CUDA graph capture:
       `launches=2970`, `decode_tok_per_s=6.577`
     - Q4_K: `begins=1`, `replays=19`, `persistent_replays=18`,
       `launches=2975`, `decode_tok_per_s=5.334`
+  - Post-output-buffer counting-prompt controls pass:
+    - Q4_K: `begins=1`, `replays=6`, `persistent_replays=5`,
+      `capacity_skips=0`, `launches=3004`, `d2h=32`,
+      `temp_evictions=0`, `decode_tok_per_s=5.283`
+    - Q8_0: `begins=1`, `replays=8`, `persistent_replays=7`,
+      `capacity_skips=0`, `launches=3014`, `d2h=40`,
+      `temp_evictions=0`, `decode_tok_per_s=7.315`
+  - Replay-vs-recapture harness now includes memory/transfer gates:
+    - scalar-only D2H budget defaults to emitted token downloads plus two
+      extra 4-byte token-id reads
+    - temp-buffer eviction budget defaults to `0`
+    - LM-head argmax fallbacks must stay at `0`
+    - one-prompt Q8_0/Q4_K harness run passed with token-id parity,
+      `persistent_replays=8`, launches `2925/8757`, D2H `48/48`, and
+      temp evictions `0/0` for both formats
   - Post-capacity-guard Q8_0/Q4_K 8-token controls still pass:
     - Q8_0: `begins=1`, `replays=5`, `persistent_replays=4`,
       `capacity_skips=0`, `launches=2905`, `decode_tok_per_s=7.619`
@@ -1691,6 +1788,72 @@ Acceptance:
 - Kernel launches per token drop materially.
 - Greedy token ids remain unchanged for numerics-neutral fusions.
 - Phase 1 smoke eval still passes.
+
+## Phase 5K - CUDA Decoder-Runtime Slots For Block Fusion
+
+Status:
+
+- CUDA currently has the local tensor-level pieces:
+  - quantized QKV and gate/up pair projection hooks
+  - activation-product fusion
+  - RMSNorm+residual fusion
+  - device-KV GQA decode
+- CUDA now has the first safe slot-backed decoder-runtime layer:
+  - resident-only prepared linear and RMSNorm slot maps
+  - `decoderRuntimePrepareLinear` / `decoderRuntimeEnsureLinearSlot`
+  - `decoderRuntimePrepareRmsNorm` / `decoderRuntimeEnsureRmsNormSlot`
+  - `decoderRuntimeApplyLinear`, `decoderRuntimeApplyLinearArgmax`,
+    `decoderRuntimeApplyLinearPair`, `decoderRuntimeApplyLinearQkv`
+  - `decoderRuntimeApplyRmsNorm`
+  - slot-backed resident buffers are pinned against lazy device-weight
+    eviction; dense-stream-backed weights are deliberately refused until that
+    cache has equivalent pin/invalidation semantics
+- CUDA timing output and JSON now expose decoder-runtime counters:
+  - linear/RMS slot prepares and prepare misses
+  - linear/RMS apply hits and misses
+  - slot-backed pair/QKV apply hits
+  - pinned lazy-eviction skips
+- CUDA `runAttentionResidual` is wired conservatively on top of those slot
+  APIs:
+  - unsupported attention-sink metadata returns `null`
+  - attention core uses the existing device-KV GQA path
+  - post-linear RMSNorm+residual uses the existing fused CUDA kernel when the
+    slot is available
+- `runGatedDecoderBlock` remains pending. It should only be wired after the
+  caller path prepares all required Gemma slots and the attention-residual path
+  shows nonzero success counters on real Q8_0/Q4_K generation.
+
+Validation:
+
+- CUDA ReleaseFast build passed after the slot implementation.
+- `cuda-info --smoke` now includes and passes
+  `smoke: decoder_runtime_slots ok`; the smoke prepares resident linear/RMSNorm
+  slots and validates linear, pair, QKV, and RMSNorm apply outputs.
+- Q8_0 and Q4_K short resident greedy smokes still return coherent tokens with
+  scalar-only downloads and no temp evictions:
+  - Q8_0: `d2h=32`, `temp_evictions=0`, `lm_head_argmax_fused_q8=8`,
+    `decode_tok_per_s=7.641`
+  - Q4_K: `d2h=32`, `temp_evictions=0`, `lm_head_argmax_fused_q4=8`,
+    `decode_tok_per_s=6.163`
+- The memory-gated replay harness still passes after the slot implementation:
+  - Q8_0: `persistent_replays=8`, launches `2925/8757`, D2H `48/48`,
+    temp evictions `0/0`
+  - Q4_K: `persistent_replays=8`, launches `2925/8757`, D2H `48/48`,
+    temp evictions `0/0`
+- Normal eager Gemma generation reports zero decoder-runtime slot counters,
+  which is expected: the eager path does not prepare slot ids yet. The counters
+  are now available to prove activation once the graph/override caller path is
+  enabled.
+
+Acceptance:
+
+- Slot API smoke passes under `cuda-info --smoke`.
+- Q8_0 and Q4_K greedy token ids remain healthy.
+- No increase in D2H beyond scalar token downloads.
+- `temp_buffer_evictions` remains at `0` in the memory-gated replay harness.
+- Before enabling any default block fast path, real generation should show
+  nonzero decoder-runtime slot apply counters and nonzero
+  `runAttentionResidual` / `runGatedDecoderBlock` success counters.
 
 ## Phase 6 - Later High-Complexity Work
 

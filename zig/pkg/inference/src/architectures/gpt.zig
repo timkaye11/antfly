@@ -294,6 +294,116 @@ pub const Layer0DecoderOverrides = struct {
     mlp_down_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
 };
 
+fn cudaPreparedDecoderSlotsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREPARED_DECODER_SLOTS", true);
+}
+
+fn cudaDecoderSlotOverrideLevel() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DECODER_SLOT_OVERRIDE_LEVEL") orelse 2;
+}
+
+fn cudaGemmaPreparedLayers(configured_layers: usize) usize {
+    const configured = platform.env.getenvUsize("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GATED_LAYERS") orelse configured_layers;
+    return @min(configured_layers, configured);
+}
+
+fn cudaGemmaNormSlot(layer: usize, comptime kind: enum { attn_pre, attn_post, ffn_pre, ffn_post }) usize {
+    return switch (kind) {
+        .attn_pre => layer * 4,
+        .attn_post => layer * 4 + 1,
+        .ffn_pre => layer * 4 + 2,
+        .ffn_post => layer * 4 + 3,
+    };
+}
+
+fn cudaGemmaLinearSlot(layer: usize, comptime kind: enum { attn_q, attn_k, attn_v, attn_out_proj, mlp_gate, mlp_up, mlp_down }) usize {
+    return switch (kind) {
+        .attn_q => layer * 7,
+        .attn_k => layer * 7 + 1,
+        .attn_v => layer * 7 + 2,
+        .attn_out_proj => layer * 7 + 3,
+        .mlp_gate => layer * 7 + 4,
+        .mlp_up => layer * 7 + 5,
+        .mlp_down => layer * 7 + 6,
+    };
+}
+
+fn layer0DecoderOverridesEmpty(overrides: Layer0DecoderOverrides) bool {
+    if (overrides.attn_norm != null or overrides.fused_qkv != null or
+        overrides.q != null or overrides.k != null or overrides.v != null)
+    {
+        return false;
+    }
+    for (0..decoder_override_layer_capacity) |layer| {
+        if (overrides.attn_norm_slots[layer] != null or
+            overrides.attn_q_slots[layer] != null or
+            overrides.attn_k_slots[layer] != null or
+            overrides.attn_v_slots[layer] != null or
+            overrides.fused_qkv_linear_slots[layer] != null or
+            overrides.attn_out_proj_linear_slots[layer] != null or
+            overrides.attn_sub_norm_slots[layer] != null or
+            overrides.ffn_norm_slots[layer] != null or
+            overrides.mlp_fc1_slots[layer] != null or
+            overrides.mlp_fc2_slots[layer] != null or
+            overrides.mlp_gate_slots[layer] != null or
+            overrides.mlp_up_slots[layer] != null or
+            overrides.mlp_sub_norm_slots[layer] != null or
+            overrides.mlp_down_slots[layer] != null)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn buildCudaGemmaDecoderOverrides(config: Config, configured_layer_count: usize) Layer0DecoderOverrides {
+    const prepared_layer_count = cudaGemmaPreparedLayers(@min(configured_layer_count, @as(usize, @intCast(config.num_hidden_layers))));
+    const override_level = cudaDecoderSlotOverrideLevel();
+    var overrides = Layer0DecoderOverrides{};
+    for (0..prepared_layer_count) |layer| {
+        if (override_level >= 1) {
+            overrides.attn_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_pre);
+        }
+        if (override_level >= 2) {
+            overrides.attn_q_slots[layer] = cudaGemmaLinearSlot(layer, .attn_q);
+            overrides.attn_k_slots[layer] = cudaGemmaLinearSlot(layer, .attn_k);
+            overrides.attn_v_slots[layer] = cudaGemmaLinearSlot(layer, .attn_v);
+            overrides.attn_out_proj_linear_slots[layer] = cudaGemmaLinearSlot(layer, .attn_out_proj);
+        }
+        if (override_level >= 4) {
+            overrides.mlp_gate_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_gate);
+            overrides.mlp_up_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_up);
+            overrides.mlp_down_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_down);
+        }
+    }
+    return overrides;
+}
+
+fn maybePrepareCudaGemmaDecoderOverrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    overrides: Layer0DecoderOverrides,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    trace_sink: ?*ActivationTraceSink,
+) !Layer0DecoderOverrides {
+    if (cb.kind() != .cuda or config.family != .gemma or config.usesMoe()) return overrides;
+    if (!cudaPreparedDecoderSlotsEnabled() or trace_sink != null) return overrides;
+    if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
+
+    const configured_layer_count: usize = @intCast(config.num_hidden_layers);
+    const current_kv_tokens = if (decode_context) |ctx| ctx.kv_sequence_len else seq_len;
+    const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+        allocator,
+        config,
+        current_kv_tokens,
+        configured_layer_count,
+    );
+    if (!prepare.prepared) return overrides;
+    return buildCudaGemmaDecoderOverrides(config, configured_layer_count);
+}
+
 pub const GreedyDeviceTokenResult = struct {
     token_id: usize,
     token_tensor: ?CT = null,
@@ -1373,6 +1483,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     const total = batch * query_seq_len;
     var hidden = hidden_input;
     var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
 
     if (config.family == .deepseek_v4 and config.deepseek_v4_hc_mult > 0) {
         return forwardDeepSeekV4FinalHiddenWithStreams(
@@ -1387,12 +1498,20 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         );
     }
 
-    var layer0_attn_norm_pending = overrides.attn_norm;
-    var layer0_fused_qkv_pending = overrides.fused_qkv;
-    var layer0_q_pending = overrides.q;
-    var layer0_k_pending = overrides.k;
-    var layer0_v_pending = overrides.v;
-    errdefer if (owns_hidden) cb.free(hidden);
+    const effective_overrides = try maybePrepareCudaGemmaDecoderOverrides(
+        cb,
+        allocator,
+        config,
+        overrides,
+        seq_len,
+        decode_context,
+        trace_sink,
+    );
+    var layer0_attn_norm_pending = effective_overrides.attn_norm;
+    var layer0_fused_qkv_pending = effective_overrides.fused_qkv;
+    var layer0_q_pending = effective_overrides.q;
+    var layer0_k_pending = effective_overrides.k;
+    var layer0_v_pending = effective_overrides.v;
     errdefer if (layer0_attn_norm_pending) |override| cb.free(override);
     errdefer if (layer0_fused_qkv_pending) |override| cb.free(override);
     errdefer if (layer0_q_pending) |override| cb.free(override);
@@ -1435,7 +1554,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             layer,
             decode_context,
             ple_vectors,
-            overrides,
+            effective_overrides,
             layer0_attn_norm_pending,
             layer0_fused_qkv_pending,
             layer0_q_pending,
@@ -3625,6 +3744,21 @@ fn decoderBlock(
         break :blk .{ .q = layer0_q_override.?, .k = layer0_k_override.?, .v = layer0_v_override.? };
     } else blk: {
         const q_projection_dim: usize = if (config.family == .qwen3_5 and config.qwen35_attn_output_gate) q_dim * 2 else q_dim;
+        if (config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and
+            q_projection_dim == q_dim and attn_q_slot != null and attn_k_slot != null and attn_v_slot != null)
+        {
+            if (try cb.decoderRuntimeApplyLinearQkv(&.{
+                .q_slot = attn_q_slot.?,
+                .k_slot = attn_k_slot.?,
+                .v_slot = attn_v_slot.?,
+                .input = normed,
+                .in_dim = hidden_size,
+                .q_out_dim = q_dim,
+                .kv_out_dim = kv_dim,
+            })) |qkv| {
+                break :blk .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
+            }
+        }
         if (cb.kind() == .cuda and config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
             const q_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer}) catch return error.NameTooLong;
             const q_w = try getModelWeight(cb, config, q_name);
@@ -3685,6 +3819,16 @@ fn decoderBlock(
             })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
         } else if (config.family == .gemma and !config.layerOmitsVProj(layer)) blk_kv: {
+            if (attn_k_slot != null and attn_v_slot != null) {
+                const kv = (try cb.decoderRuntimeApplyLinearPair(&.{
+                    .slot_a = attn_k_slot.?,
+                    .slot_b = attn_v_slot.?,
+                    .input = normed,
+                    .in_dim = hidden_size,
+                    .out_dim = num_kv_heads * head_dim,
+                })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+                break :blk_kv .{ kv.first, false, kv.second };
+            }
             const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
         } else if (config.family == .bitnet) blk_kv: {
@@ -3928,7 +4072,7 @@ fn decoderBlock(
     }
 
     const attn_res = blk: {
-        if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_5) {
+        if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_5 and config.family != .gemma) {
             const fused_attn_started_at = monotonicNowNs();
             if (try applyAttentionResidual(
                 cb,
@@ -4674,7 +4818,8 @@ fn forceLayerCloneDebug() bool {
 }
 
 fn disablePreparedDecoderSlotsDebug() bool {
-    return getenvBool("TERMITE_METAL_DISABLE_PREPARED_DECODER_SLOTS");
+    return getenvBool("TERMITE_METAL_DISABLE_PREPARED_DECODER_SLOTS") or
+        getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_PREPARED_DECODER_SLOTS");
 }
 
 fn allowDenseBlockFastPath(decode_context: ?*const DecodeContext) bool {
