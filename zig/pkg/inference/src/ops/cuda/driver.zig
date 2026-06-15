@@ -21,8 +21,34 @@ pub const CUcontext = ?*anyopaque;
 pub const CUstream = ?*anyopaque;
 pub const CUmodule = ?*anyopaque;
 pub const CUfunction = ?*anyopaque;
+pub const CUgraph = ?*anyopaque;
+pub const CUgraphExec = ?*anyopaque;
+pub const CUgraphNode = ?*anyopaque;
 pub const CUjit_option = c_uint;
+pub const CUstreamCaptureMode = c_uint;
+pub const CUgraphExecUpdateResult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
+
+pub const CU_STREAM_CAPTURE_MODE_GLOBAL: CUstreamCaptureMode = 0;
+pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode = 1;
+pub const CU_STREAM_CAPTURE_MODE_RELAXED: CUstreamCaptureMode = 2;
+
+pub const CU_GRAPH_EXEC_UPDATE_SUCCESS: CUgraphExecUpdateResult = 0;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR: CUgraphExecUpdateResult = 1;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_TOPOLOGY_CHANGED: CUgraphExecUpdateResult = 2;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_NODE_TYPE_CHANGED: CUgraphExecUpdateResult = 3;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_FUNCTION_CHANGED: CUgraphExecUpdateResult = 4;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED: CUgraphExecUpdateResult = 5;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED: CUgraphExecUpdateResult = 6;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_UNSUPPORTED_FUNCTION_CHANGE: CUgraphExecUpdateResult = 7;
+pub const CU_GRAPH_EXEC_UPDATE_ERROR_ATTRIBUTES_CHANGED: CUgraphExecUpdateResult = 8;
+
+pub const CUgraphExecUpdateFn = *const fn (
+    hGraphExec: CUgraphExec,
+    hGraph: CUgraph,
+    hErrorNode_out: ?*CUgraphNode,
+    updateResult_out: *CUgraphExecUpdateResult,
+) callconv(.c) CUresult;
 
 pub const CU_JIT_INFO_LOG_BUFFER: CUjit_option = 3;
 pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: CUjit_option = 4;
@@ -53,6 +79,8 @@ pub const CudaDriver = struct {
         cuDevicePrimaryCtxRelease: *const fn (dev: CUdevice) callconv(.c) CUresult,
         cuCtxSetCurrent: *const fn (ctx: CUcontext) callconv(.c) CUresult,
         cuStreamCreate: *const fn (phStream: *CUstream, flags: c_uint) callconv(.c) CUresult,
+        cuStreamBeginCapture: *const fn (hStream: CUstream, mode: CUstreamCaptureMode) callconv(.c) CUresult,
+        cuStreamEndCapture: *const fn (hStream: CUstream, phGraph: *CUgraph) callconv(.c) CUresult,
         cuStreamSynchronize: *const fn (hStream: CUstream) callconv(.c) CUresult,
         cuStreamDestroy: *const fn (hStream: CUstream) callconv(.c) CUresult,
         cuMemAlloc: *const fn (dptr: *CUdeviceptr, bytesize: usize) callconv(.c) CUresult,
@@ -76,6 +104,11 @@ pub const CudaDriver = struct {
             kernelParams: ?[*]?*anyopaque,
             extra: ?[*]?*anyopaque,
         ) callconv(.c) CUresult,
+        cuGraphInstantiate: *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, phErrorNode: ?*CUgraphNode, logBuffer: ?[*]u8, bufferSize: usize) callconv(.c) CUresult,
+        cuGraphExecUpdate: ?CUgraphExecUpdateFn,
+        cuGraphLaunch: *const fn (hGraphExec: CUgraphExec, hStream: CUstream) callconv(.c) CUresult,
+        cuGraphExecDestroy: *const fn (hGraphExec: CUgraphExec) callconv(.c) CUresult,
+        cuGraphDestroy: *const fn (hGraph: CUgraph) callconv(.c) CUresult,
         cuGetErrorName: *const fn (error_: CUresult, pStr: *?[*:0]const u8) callconv(.c) CUresult,
         cuGetErrorString: *const fn (error_: CUresult, pStr: *?[*:0]const u8) callconv(.c) CUresult,
     };
@@ -96,6 +129,8 @@ pub const CudaDriver = struct {
                 .cuDevicePrimaryCtxRelease = lookup(&lib, @TypeOf(@as(Table, undefined).cuDevicePrimaryCtxRelease), "cuDevicePrimaryCtxRelease") catch return error.CudaSymbolMissing,
                 .cuCtxSetCurrent = lookup(&lib, @TypeOf(@as(Table, undefined).cuCtxSetCurrent), "cuCtxSetCurrent") catch return error.CudaSymbolMissing,
                 .cuStreamCreate = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamCreate), "cuStreamCreate") catch return error.CudaSymbolMissing,
+                .cuStreamBeginCapture = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamBeginCapture), "cuStreamBeginCapture_v2") catch return error.CudaSymbolMissing,
+                .cuStreamEndCapture = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamEndCapture), "cuStreamEndCapture") catch return error.CudaSymbolMissing,
                 .cuStreamSynchronize = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamSynchronize), "cuStreamSynchronize") catch return error.CudaSymbolMissing,
                 .cuStreamDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamDestroy), "cuStreamDestroy") catch return error.CudaSymbolMissing,
                 .cuMemAlloc = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemAlloc), "cuMemAlloc_v2") catch return error.CudaSymbolMissing,
@@ -107,6 +142,11 @@ pub const CudaDriver = struct {
                 .cuModuleUnload = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleUnload), "cuModuleUnload") catch return error.CudaSymbolMissing,
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
+                .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiate_v2") catch return error.CudaSymbolMissing,
+                .cuGraphExecUpdate = lib.lookup(CUgraphExecUpdateFn, "cuGraphExecUpdate"),
+                .cuGraphLaunch = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphLaunch), "cuGraphLaunch") catch return error.CudaSymbolMissing,
+                .cuGraphExecDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphExecDestroy), "cuGraphExecDestroy") catch return error.CudaSymbolMissing,
+                .cuGraphDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphDestroy), "cuGraphDestroy") catch return error.CudaSymbolMissing,
                 .cuGetErrorName = lookup(&lib, @TypeOf(@as(Table, undefined).cuGetErrorName), "cuGetErrorName") catch return error.CudaSymbolMissing,
                 .cuGetErrorString = lookup(&lib, @TypeOf(@as(Table, undefined).cuGetErrorString), "cuGetErrorString") catch return error.CudaSymbolMissing,
             },

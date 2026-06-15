@@ -4004,13 +4004,27 @@ pub const NativeGenerationPipeline = struct {
     /// buffer and the maximum query sequence length used to size each row.
     /// Caller owns the logits buffer.
     const StepForwardResult = struct {
-        logits: []f32,
+        logits: ?[]f32,
         max_query_seq_len: usize,
     };
 
+    fn scheduledStepNeedsLogits(claimed: []const runtime.scheduler.native_generate.StepItem) bool {
+        for (claimed) |item| {
+            switch (item.phase) {
+                .decode => return true,
+                .prefill => {
+                    const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    if (work.wants_last_logits) return true;
+                },
+                .waiting => return true,
+            }
+        }
+        return false;
+    }
+
     /// Run a step's forward pass: allocate scratch, populate per-item context,
     /// reserve prefill state, build the mixed-batch decode context, and invoke
-    /// the model. On any error before `forwardAllLogits` returns successfully,
+    /// the model. On any error before the forward pass returns successfully,
     /// any prefill reservations made so far are rolled back. Once the forward
     /// completes, the prefill state is committed and rollback is suppressed.
     fn forwardScheduledStep(
@@ -4078,6 +4092,11 @@ pub const NativeGenerationPipeline = struct {
         var owned_ctx = try buildOwnedMixedBatchDecodeContext(self.allocator, items);
         defer owned_ctx.deinit();
 
+        if (!scheduledStepNeedsLogits(claimed)) {
+            try gpt_arch.forwardHiddenOnly(&self.cb, self.allocator, self.gpt_config, input_ids, claimed.len, max_query_seq_len, &owned_ctx.context);
+            return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
+        }
+
         const logits = try self.forwardAllLogits(input_ids, claimed.len, max_query_seq_len, &owned_ctx.context);
         // Past this point the forward has committed: the prefill state is
         // valid and rollback would corrupt it. Returning normally cancels the
@@ -4100,7 +4119,7 @@ pub const NativeGenerationPipeline = struct {
             scheduler.completeStep(lease, claimed);
             return;
         };
-        defer self.allocator.free(result.logits);
+        defer if (result.logits) |logits| self.allocator.free(logits);
 
         dispatchStepLogits(self.gpt_config.vocab_size, claimed, result.logits, result.max_query_seq_len);
         scheduler.completeStep(lease, claimed);
@@ -4185,13 +4204,31 @@ pub const NativeGenerationPipeline = struct {
     fn dispatchStepLogits(
         vocab_size: usize,
         claimed: []const runtime.scheduler.native_generate.StepItem,
-        logits: []const f32,
+        logits: ?[]const f32,
         max_query_seq_len: usize,
     ) void {
+        const logits_buf = logits orelse {
+            for (claimed) |item| {
+                switch (item.phase) {
+                    .decode => {
+                        const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                        work.failure = error.InvalidBatchDecodeState;
+                        work.ready = true;
+                    },
+                    .prefill => {
+                        const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                        if (work.wants_last_logits) work.failure = error.InvalidBatchDecodeState;
+                        work.ready = true;
+                    },
+                    .waiting => {},
+                }
+            }
+            return;
+        };
         for (claimed, 0..) |item, idx| {
             const row_index = idx * max_query_seq_len + (item.query_sequence_len - 1);
             const start = row_index * vocab_size;
-            const slice = logits[start..][0..vocab_size];
+            const slice = logits_buf[start..][0..vocab_size];
             switch (item.phase) {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));

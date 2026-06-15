@@ -1,6 +1,6 @@
 # Gemma4 CUDA Performance Plan
 
-Last updated: 2026-06-14
+Last updated: 2026-06-15
 
 ## Current State
 
@@ -61,7 +61,21 @@ RMSNorm, RMSNorm+residual fusion, and 512-wide GQA decode work is about:
 Very short two-token latency smokes can report about 8.6-10 tok/s, but the
 20-token runs are the better steady-state planning baseline.
 
-## Implementation Status - 2026-06-13
+Current CUDA graph-capture status:
+
+- Final-hidden stream capture, graph-exec update, and experimental persistent
+  final-hidden replay work on Q8_0 and Q4_K.
+- Dynamic RoPE/GQA decode scalars are now available through an opt-in
+  device-resident scalar buffer:
+  `ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1`.
+- The scalar-buffer kernels and dynamic KV suffix write kernel validate with
+  stable pointer traces and valid tokens on both Q8_0 and Q4_K.
+- Persistent final-hidden replay reduces sustained launches from about
+  `825 launches/token` to about `142-149 launches/token`, but it is still an
+  env-gated diagnostic path until broader quality and long-context behavior
+  pass.
+
+## Implementation Status - 2026-06-15
 
 Implemented from Phase 0:
 
@@ -124,7 +138,7 @@ Implemented from Phase 3/4 first pass:
 - Gemma-family final-logit softcap now permits the pure-greedy device argmax
   fast path while keeping non-Gemma capped logits conservative.
 - Q4_K row-1 decode fast path now defaults on. The fallback counter now reports
-  unexpected tile8 kernel fallback, not "fast path disabled by env".
+  unexpected kernel fallback, not "fast path disabled by env".
 - Added a Q8_0 row-1 tiled matvec kernel:
   - CUDA source: `termite_linear_q8_0_f32_tile4`
   - Zig launcher: `launchLinearQ8_0Tile4F32`
@@ -291,12 +305,91 @@ Implemented from the bench-cuda Gemma4 shape pass:
   - FFN down: `15360 -> 3840`
   - tied LM head: `3840 -> 262144`
 - The table reports Q8_0 scalar vs tile4 and Q4_K scalar vs tile4 vs tile8.
+- Q4_K row-1 resident decode now prefers tile4 by default. Tile8 remains
+  available for comparison with `ANTFLY_CUDA_ENABLE_Q4K_DECODE_TILE8=1`.
+
+Implemented from the CUDA graph-capture foundation pass:
+
+- Added CUDA driver graph types and symbols:
+  - `CUgraph`
+  - `CUgraphExec`
+  - `CUgraphNode`
+  - `cuStreamBeginCapture_v2`
+  - `cuStreamEndCapture`
+  - `cuGraphInstantiate_v2`
+  - `cuGraphExecUpdate`
+  - `cuGraphLaunch`
+  - `cuGraphExecDestroy`
+  - `cuGraphDestroy`
+- Added `CudaContext` wrappers for stream capture, graph instantiation,
+  graph-exec update, graph launch, and graph destruction.
+- Added `cuda-info --smoke` coverage that captures a `fill_f32` kernel,
+  instantiates the graph, replays it, and verifies the replayed output.
+- This does not capture Gemma4 decode yet; it proves the driver/runtime
+  primitive needed for the next launch-reduction pass.
+
+Implemented from the CUDA temp-buffer capture-readiness pass:
+
+- Added env-gated temp-buffer allocation tracing in
+  `ops/cuda/cuda_compute.zig`.
+- `ANTFLY_INFERENCE_CUDA_TEMP_TRACE=1` logs temp allocator hits/misses with:
+  - absolute allocation sequence
+  - optional skipped sequence offset
+  - requested bytes
+  - returned cached buffer bytes
+  - CUDA device pointer
+  - current temp-cache count
+- `ANTFLY_INFERENCE_CUDA_TEMP_TRACE_SKIP=<N>` skips warmup/model-load events
+  so probes can focus on the steady-state decode region.
+- `ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT=<N>` caps emitted events.
+- `ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1` switches temp-buffer reuse to an
+  experimental exact-size, ordered cache mode:
+  - no oversized buffer reuse
+  - `orderedRemove` instead of `swapRemove`
+  - disabled by default
+  - intended as a graph-capture probe and a stepping stone toward graph-owned
+    decode scratch slots
+- `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=<N>` enables an experimental pinned
+  temp-slot arena:
+  - slots activate after `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP=<N>`
+  - each allocation uses `(seq - slot_skip) % slot_period` as its pinned slot
+  - slots seed from exact-size temp-cache buffers when possible, otherwise they
+    allocate once
+  - release marks the pinned slot reusable instead of returning it to the
+    normal temp cache
+  - disabled by default
+- `ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1` enables an experimental
+  final-hidden decode capture probe:
+  - currently wraps `forwardFinalHiddenTensorFromEmbeddings` on the CUDA
+    token-tensor greedy path
+  - leaves LM-head argmax and token download outside the captured window
+  - requires pinned temp slots unless
+    `ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED=1` is explicitly set
+  - skips capture until `ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ=<N>` or,
+    by default, `TEMP_SLOT_SKIP + TEMP_SLOT_PERIOD`
+  - by default, captures, instantiates, replays, and destroys immediately
+  - `ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1` caches one `CUgraphExec` and
+    updates it from each fresh token capture before replay
+  - this still recaptures every token; it avoids repeated graph instantiation
+    but does not yet remove per-kernel host launch calls during capture
+- `ANTFLY_INFERENCE_CUDA_CAPTURE_PARAM_TRACE=1` logs selected typed launch
+  parameters during the captured final-hidden window:
+  - currently covers RoPE, fused RMSNorm+heads+RoPE, and GQA attention
+  - `ANTFLY_INFERENCE_CUDA_CAPTURE_PARAM_TRACE_LIMIT=<N>` bounds emitted trace
+    rows per captured token
+  - intended to classify which values block persistent replay without per-token
+    recapture
+- The trace is disabled by default and does not change allocator behavior.
 
 Validation:
 
 - ReleaseFast CUDA build passed:
   - `../../../.tools/zig-x86_64-linux-0.16.0/zig build -Dcuda=true -Doptimize=ReleaseFast --global-cache-dir /tmp/zig-global-cache`
 - `git diff --check` passed for the touched files.
+- `cuda-info --smoke` passed after the graph API addition:
+  - `smoke: graph_capture ok`
+- `cuda-info --smoke` passed after the temp-buffer trace addition:
+  - `smoke: graph_capture ok`
 - Post-Phase-2 Q8_0 CUDA generate smoke passed:
   - output tokens: `14054 236751`
   - output text: `Ants`
@@ -597,6 +690,298 @@ Validation:
   - Q4_K tile4 beats scalar and tile8 on all measured Gemma4 shapes.
   - Q4_K LM head: `53.94ms` scalar, `13.79ms` tile4, `14.46ms` tile8.
   - Q4_K FFN down: `5.27ms` scalar, `0.613ms` tile4, `0.674ms` tile8.
+- Post-tile4-default Q4_K two-token smoke passed:
+  - output tokens: `14054 236751`
+  - output text: `Ants`
+  - `decode_tok_per_s=10.870`
+  - `q4k_decode_fast_counts: decode_hits=112 decode_fallbacks=0`
+- Post-tile4-default Q4_K sustained smoke, `--max-tokens 32`, stopped
+  naturally after 21 tokens:
+  - output remains coherent
+  - token ids unchanged from the previous coherent Q4_K ant output
+  - `decode_tok_per_s=5.311`
+  - inner prefill: `2879ms`
+  - inner decode: `3954ms`
+  - `q4k_decode_fast_counts: decode_hits=2352 decode_fallbacks=0`
+- Temp-buffer capture-readiness Q8_0 skipped trace passed:
+  - command shape:
+    `ANTFLY_INFERENCE_CUDA_TEMP_TRACE=1 ANTFLY_INFERENCE_CUDA_TEMP_TRACE_SKIP=2500 ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT=1000 ... --max-tokens 8 --temperature 0`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+  - `decode_tok_per_s=7.656`
+  - `cuda_generate_counts: launches=5576 syncs=8 alloc_calls=19 temp_hits=7077 temp_misses=19 temp_evictions=0`
+  - skipped trace window: 1000 temp allocation events, all `alloc_hit`,
+    zero `alloc_miss`
+  - steady-state trace used 16 unique cached CUDA pointers
+  - `cuda_generate_attention_launch_breakdown: gqa_decode=384 gqa_scalar=0`
+- Temp-buffer capture-readiness Q4_K skipped trace passed:
+  - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+  - `decode_tok_per_s=6.154`
+  - `cuda_generate_counts: launches=5576 syncs=8 alloc_calls=19 temp_hits=7077 temp_misses=19 temp_evictions=0`
+  - skipped trace window: 1000 temp allocation events, all `alloc_hit`,
+    zero `alloc_miss`
+  - steady-state trace used 16 unique cached CUDA pointers
+  - Q4_K fast path remained active:
+    `q4k_decode_fast_counts: decode_hits=784 decode_fallbacks=0`
+  - Q8_0 and Q4_K skipped trace requested-size/buffer-size sequences were
+    byte-for-byte identical.
+- Stable temp-reuse Q8_0 skipped trace passed:
+  - env:
+    `ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+  - `decode_tok_per_s=7.648`
+  - `cuda_generate_counts: launches=5576 syncs=8 alloc_calls=53 temp_hits=7043 temp_misses=53 temp_evictions=0`
+  - skipped trace window: 2000 temp allocation events, all `alloc_hit`,
+    zero `alloc_miss`
+  - every traced allocation was exact-size: `requested == buffer_len`
+  - unique cached CUDA pointers in the skipped window: `27`
+  - requested-size/buffer-size sequence period: `863` events
+  - pointer sequence still had no simple period up to `1200` events
+- Stable temp-reuse Q4_K skipped trace passed:
+  - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+  - `decode_tok_per_s=6.074`
+  - `cuda_generate_counts: launches=5576 syncs=8 alloc_calls=53 temp_hits=7043 temp_misses=53 temp_evictions=0`
+  - skipped trace window: 2000 temp allocation events, all `alloc_hit`,
+    zero `alloc_miss`
+  - every traced allocation was exact-size: `requested == buffer_len`
+  - unique cached CUDA pointers in the skipped window: `27`
+  - requested-size/buffer-size sequence period: `863` events
+  - pointer sequence still had no simple period up to `1200` events
+  - stable Q8_0 and Q4_K skipped trace shape sequences were byte-for-byte
+    identical
+  - Q4_K fast path remained active:
+    `q4k_decode_fast_counts: decode_hits=784 decode_fallbacks=0`
+- Pinned temp-slot Q8_0 skipped trace passed:
+  - env:
+    `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=863`
+    `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP=2500`
+    `ANTFLY_INFERENCE_CUDA_TEMP_TRACE_SKIP=3500`
+    `ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT=1726`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+  - `decode_tok_per_s=7.663`
+  - `cuda_generate_counts: launches=5576 syncs=8 alloc_calls=882 temp_hits=6214 temp_misses=882 temp_evictions=0`
+  - traced window: 1726 temp allocation events, all `alloc_slot_hit`
+  - no traced slot miss, shape fallback, busy fallback, or normal temp fallback
+  - requested-size/buffer-size sequence period: `863` events
+  - CUDA pointer sequence period: `863` events
+  - unique traced CUDA pointers: `863`
+- Pinned temp-slot Q4_K skipped trace passed:
+  - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+  - `decode_tok_per_s=6.130`
+  - `cuda_generate_counts: launches=5576 syncs=8 alloc_calls=882 temp_hits=6214 temp_misses=882 temp_evictions=0`
+  - traced window: 1726 temp allocation events, all `alloc_slot_hit`
+  - no traced slot miss, shape fallback, busy fallback, or normal temp fallback
+  - requested-size/buffer-size sequence period: `863` events
+  - CUDA pointer sequence period: `863` events
+  - stable Q8_0 and Q4_K pinned-slot shape sequences were byte-for-byte
+    identical
+  - Q4_K fast path remained active:
+    `q4k_decode_fast_counts: decode_hits=784 decode_fallbacks=0`
+- Warmed final-hidden capture Q8_0 probe passed:
+  - env:
+    `ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1`
+    `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=863`
+    `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP=2500`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+  - output text: `Ants are highly social insects that live`
+  - capture count: `5` begin/replay pairs
+  - first capture began at `alloc_seq=3449`, after `min_alloc_seq=3363`
+  - `decode_tok_per_s=7.583`
+  - `cuda_generate_counts: launches=5581 syncs=8 alloc_calls=882 temp_hits=6214 temp_misses=882 temp_evictions=0`
+  - `cuda_generate_attention_launch_breakdown: gqa_decode=384 gqa_scalar=0`
+  - `cuda_launch_breakdown` shows `unattributed=5`, matching the five graph
+    launches
+- Warmed final-hidden capture Q4_K probe passed:
+  - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+  - output text: `Ants are highly social insects that work`
+  - capture count: `5` begin/replay pairs
+  - first capture began at `alloc_seq=3449`, after `min_alloc_seq=3363`
+  - `decode_tok_per_s=6.038`
+  - `cuda_generate_counts: launches=5581 syncs=8 alloc_calls=882 temp_hits=6214 temp_misses=882 temp_evictions=0`
+  - Q4_K fast path remained active:
+    `q4k_decode_fast_counts: decode_hits=784 decode_fallbacks=0`
+- Warmed final-hidden graph-exec update Q8_0 probe passed:
+  - env adds `ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+  - output text: `Ants are highly social insects that live`
+  - `cuda_generate_graph_capture_counts: begins=5 replays=5 discards=0 instantiates=1 update_successes=4 update_failures=0 update_unavailable=0`
+  - `decode_tok_per_s=7.634`
+- Warmed final-hidden graph-exec update Q4_K probe passed:
+  - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+  - output text: `Ants are highly social insects that work`
+  - `cuda_generate_graph_capture_counts: begins=5 replays=5 discards=0 instantiates=1 update_successes=4 update_failures=0 update_unavailable=0`
+  - `decode_tok_per_s=6.074`
+- Warmed final-hidden parameter trace Q8_0 probe passed:
+  - env adds `ANTFLY_INFERENCE_CUDA_CAPTURE_PARAM_TRACE=1`
+  - first traced fused RMSNorm+heads+RoPE call keeps stable pointers/shapes but
+    `position_offset` advances `21, 22, 23, 24, 25` across captures
+  - first traced GQA call keeps stable pointers/shapes but
+    `query_position_offset` advances `21, 22, 23, 24, 25`
+  - the same GQA call has `kv_seq_len` and `total_sequence_len` advancing
+    `22, 23, 24, 25, 26`
+  - stable in the traced calls: `q_seq_len=1`, `seq_len=1`,
+    `kv_position_offset=0`, `mask_len=0`, `bias_mode=0`, and all checked
+    temp-slot pointers
+  - output text remained valid:
+    `Ants are highly social insects that live`
+- Warmed final-hidden parameter trace Q4_K probe passed:
+  - same dynamic scalar pattern as Q8_0:
+    `position_offset/query_position_offset` `21->25` and
+    `kv_seq_len/total_sequence_len` `22->26`
+  - output text remained valid:
+    `Ants are highly social insects that work`
+- Warmed final-hidden device-scalar graph-update Q8_0 probe passed:
+  - env adds `ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1`
+  - revalidated after scoping scalar-buffer kernel routing to active graph
+    capture windows
+  - added CUDA kernels:
+    `termite_rms_norm_heads_rope_decode_scalars_f32` and
+    `termite_gqa_attention_decode_scalars_f32`
+  - the graph-capture prep hook uploads four `u32` decode scalars to one stable
+    device buffer before capture:
+    `position_offset`, `query_position_offset`, `kv_seq_len`, and
+    `total_sequence_len`
+  - parameter trace shows the scalar-buffer pointer stays stable:
+    example `ptr=0x7f49271fc400`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+  - output text: `Ants are highly social insects that live`
+  - `cuda_generate_graph_capture_counts: begins=5 replays=5 discards=0 instantiates=1 update_successes=4 update_failures=0 update_unavailable=0 scalar_updates=7`
+  - latest revalidation: `decode_tok_per_s=7.428`
+- Warmed final-hidden device-scalar graph-update Q4_K probe passed:
+  - parameter trace shows the scalar-buffer pointer stays stable:
+    example `ptr=0x7f9f5fffee00`
+  - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+  - output text: `Ants are highly social insects that work`
+  - `cuda_generate_graph_capture_counts: begins=5 replays=5 discards=0 instantiates=1 update_successes=4 update_failures=0 update_unavailable=0 scalar_updates=7`
+  - `q4k_decode_fast_counts: decode_hits=784 decode_fallbacks=0`
+  - `decode_tok_per_s=6.020`
+- Final-hidden tensor-boundary trace Q8_0 probe passed:
+  - env adds `ANTFLY_INFERENCE_CUDA_CAPTURE_TENSOR_TRACE=1`
+  - added a backend debug hook that logs CUDA tensor wrapper pointer, device
+    buffer pointer, dtype, element count, shape, and ownership flags
+  - traced labels:
+    `gpt.capture_input`, `gpt.positioned_input`, `gpt.decoder_input`,
+    `gpt.pre_final_norm`, and `gpt.final_hidden`
+  - in the recapture/update probe, host-side tensor wrappers changed across
+    tokens, but device buffer pointers stayed stable:
+    `gpt.capture_input=0x7fb451d27c00`,
+    `gpt.pre_final_norm=0x7fb4499ea400`,
+    `gpt.final_hidden=0x7fb449fd7000`
+  - this proves CUDA graph replay cares about stable device buffers, not stable
+    Zig tensor wrapper addresses
+- Experimental persistent final-hidden replay Q8_0/Q4_K probes passed for the
+  short 8-token ant control:
+  - env adds `ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1`
+  - added backend hooks to prepare a graph-owned final-hidden input buffer,
+    register the captured final-hidden output boundary, and replay the cached
+    graph exec without recapturing
+  - fixed an initial bug where input registration happened after
+    `forwardFinalHidden...` had consumed/freed the input tensor wrapper
+  - added a dedicated f32 graph input buffer and D2D copy from the eager
+    embedding result before capture/replay
+  - added dynamic KV suffix write kernel:
+    `termite_kv_write_suffix_decode_scalars_f32`
+  - captured KV writes now read `kv_seq_len` from the same decode scalar buffer
+    as RoPE/GQA, so replay advances the device KV destination slot instead of
+    overwriting the originally captured token slot
+  - added a persistent replay KV-capacity guard:
+    - captured decode records the minimum device-KV layer capacity available
+      during graph capture
+    - each persistent replay compares the current scalar-buffer `kv_seq_len`
+      against that captured capacity
+    - replay is skipped with a warning instead of reusing the graph beyond its
+      captured KV allocation capacity
+    - timing output and JSON now report
+      `graph_capture_capacity_skips`
+    - `ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=<N>` can clamp captured
+      capacity for short diagnostic probes
+  - Q8_0 traced validation:
+    - output tokens: `14054 236751 659 6112 2777 30348 600 3892`
+    - output text: `Ants are highly social insects that live`
+    - `cuda_generate_graph_capture_counts: begins=1 replays=5 discards=0 instantiates=1 update_successes=0 update_failures=0 update_unavailable=0 scalar_updates=7 persistent_replays=4`
+    - `cuda_generate_counts: launches=2905`
+    - `decode_tok_per_s=7.597`
+  - Q4_K validation:
+    - output tokens: `14054 236751 659 6112 2777 30348 600 981`
+    - output text: `Ants are highly social insects that work`
+    - `cuda_generate_graph_capture_counts: begins=1 replays=5 discards=0 instantiates=1 update_successes=0 update_failures=0 update_unavailable=0 scalar_updates=7 persistent_replays=4`
+    - `cuda_generate_counts: launches=2905`
+    - `q4k_decode_fast_counts: decode_hits=336 decode_fallbacks=0`
+    - `decode_tok_per_s=6.065`
+  - longer Q8_0 control, `--max-tokens 32`, stopped naturally after 20 tokens:
+    - output text:
+      `Ants are highly social insects that live in complex colonies and work together to build intricate underground structures.`
+    - `cuda_generate_graph_capture_counts: begins=1 replays=18 discards=0 instantiates=1 update_successes=0 update_failures=0 update_unavailable=0 scalar_updates=20 persistent_replays=17`
+    - `cuda_generate_counts: launches=2970`
+    - `cuda_generate_rates: launches_per_token=148.500 syncs_per_token=1.050`
+    - `decode_tok_per_s=6.577`
+  - longer Q4_K control, `--max-tokens 32`, stopped naturally after 21 tokens:
+    - output text:
+      `Ants are highly social insects that work together in complex colonies to gather food and build intricate underground structures.`
+    - `cuda_generate_graph_capture_counts: begins=1 replays=19 discards=0 instantiates=1 update_successes=0 update_failures=0 update_unavailable=0 scalar_updates=21 persistent_replays=18`
+    - `cuda_generate_counts: launches=2975`
+    - `cuda_generate_rates: launches_per_token=141.667 syncs_per_token=1.048`
+    - `q4k_decode_fast_counts: decode_hits=336 decode_fallbacks=0`
+    - `decode_tok_per_s=5.334`
+  - post-capacity-guard Q8_0 8-token validation:
+    - output text: `Ants are highly social insects that live`
+    - boundary log: `kv_capacity=550`
+    - replay logs advanced through `kv_seq_len=23..26` inside capacity
+    - `cuda_generate_graph_capture_counts: begins=1 replays=5 discards=0 instantiates=1 update_successes=0 update_failures=0 update_unavailable=0 scalar_updates=7 persistent_replays=4 capacity_skips=0`
+    - `cuda_generate_counts: launches=2905`
+    - latest revalidation: `decode_tok_per_s=7.619`
+  - post-capacity-guard Q4_K 8-token validation:
+    - output text: `Ants are highly social insects that work`
+    - boundary log: `kv_capacity=550`
+    - replay logs advanced through `kv_seq_len=23..26` inside capacity
+    - `cuda_generate_graph_capture_counts: begins=1 replays=5 discards=0 instantiates=1 update_successes=0 update_failures=0 update_unavailable=0 scalar_updates=7 persistent_replays=4 capacity_skips=0`
+    - `cuda_generate_counts: launches=2905`
+    - `q4k_decode_fast_counts: decode_hits=336 decode_fallbacks=0`
+    - latest revalidation: `decode_tok_per_s=6.065`
+  - forced-capacity Q8_0 fallback probe passed:
+    - env adds `ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=22`
+    - output text stayed valid:
+      `Ants are highly social insects that live`
+    - captured boundary reported `kv_capacity=22`
+    - replay attempts at `kv_seq_len=23..26` skipped with
+      `persistent_replay_kv_capacity_exceeded`
+    - graph-update recapture handled the fallback path:
+      `begins=5`, `replays=5`, `update_successes=4`,
+      `persistent_replays=0`, `capacity_skips=4`
+    - `decode_tok_per_s=7.583`
+  - second-prompt persistent replay sanity passed on Q8_0 and Q4_K:
+    - prompt: `Name two uses for a compass.`
+    - both formats produced the same token ids and text prefix:
+      `Two common uses for a compass are:\n\n1.  `
+    - Q8_0: `persistent_replays=8`, `capacity_skips=0`,
+      `decode_tok_per_s=7.246`
+    - Q4_K: `persistent_replays=8`, `capacity_skips=0`,
+      `q4k_decode_fast_fallbacks=0`, `decode_tok_per_s=5.720`
+  - replay-vs-recapture controls passed for the compass prompt:
+    - Q8_0 persistent and recapture/update token ids match exactly
+    - Q4_K persistent and recapture/update token ids match exactly
+    - persistent path: `begins=1`, `persistent_replays=8`,
+      `launches=2925`
+    - recapture/update control: `begins=9`, `update_successes=8`,
+      `persistent_replays=0`, `launches=8757`
+  - replay-vs-recapture controls also passed for:
+    `Rewrite this in uppercase: cuda kernels are fast`
+    - Q8_0 and Q4_K persistent/recapture token ids match exactly:
+      `225266 751 24951 40693 24212 89813`
+    - generated text: `CUDA KERNELS ARE FAST`
+    - persistent path: `begins=1`, `persistent_replays=3`,
+      `launches=2900`, `capacity_skips=0`
+    - recapture/update control: `begins=4`, `update_successes=3`,
+      `persistent_replays=0`, `launches=5087`, `capacity_skips=0`
+  - added reusable generated-output replay harness:
+    - script: `zig/pkg/inference/scripts/compare_cuda_replay_generation.py`
+    - prompt fixture: `zig/pkg/inference/testdata/gemma4_replay_prompts.txt`
+    - command used:
+      `python3 zig/pkg/inference/scripts/compare_cuda_replay_generation.py --model .models/google/gemma-4-12B-it-q8_0 --model .models/google/gemma-4-12B-it-q4_k --out-dir /tmp/gemma-cuda-replay-harness --max-tokens 12`
+    - harness runs persistent replay and recapture/update for each model/prompt
+      pair, compares generated token ids, and validates graph counters
+    - harness result: all four Q8_0/Q4_K prompt comparisons passed
+  - this is still env-gated diagnostic work, not a default path, until broader
+    quality gates and capacity/long-context behavior pass
 
 Still pending from the original Phase 0/1 acceptance:
 
@@ -635,6 +1020,9 @@ Conclusion:
   back to tile8. Q8_0 tile4 is the right default for most Gemma4 decode matvecs,
   but a materialized LM-head matvec is not faster than scalar in this synthetic
   microbench; generation uses the fused LM-head argmax path instead.
+- Runtime Q4_K row-1 decode now follows the microbench result and prefers
+  tile4 by default. The sustained Q4_K ant smoke improved from `5.138` to
+  `5.311 tok/s` with identical token ids and zero decode fallback.
 - Q8_0 launch count dropped from about `959` launches/token to `825`
   launches/token, but throughput only moved from `4.745` to `4.766 tok/s`.
   Q4_K launch count dropped from about `873` launches/token to `823`
@@ -693,6 +1081,82 @@ Conclusion:
   `runGatedDecoderBlock` support comparable to Metal/MLX, or direct graph-level
   Gemma4 post-norm/residual fusion. More LM-head or PLE cleanup will not move
   the current Q8_0/Q4_K ant benchmark.
+- CUDA graph capture is now mechanically available and the steady-state
+  Q8_0/Q4_K decode allocator path is miss-free after warmup. The skipped trace
+  probes show identical Q8_0 and Q4_K requested-size/buffer-size sequences, but
+  the best-fit temp cache rotates among 16 cached device pointers and does not
+  expose a simple fixed pointer period. The next graph-capture step should not
+  capture over arbitrary best-fit cache hits; it should introduce graph-owned
+  pinned decode scratch slots or a deterministic decode arena first.
+- Experimental stable temp reuse gets the decode trace closer to a graph-slot
+  model: exact-size reuse only, identical Q8_0/Q4_K 863-event shape period, and
+  zero steady-state allocation misses. It still rotates among 27 CUDA pointers,
+  so it is a probe/slot-signature mechanism, not a complete graph-capture
+  solution.
+- The pinned temp-slot arena proves replay-stable pointer ownership for the
+  traced decode window: both Q8_0 and Q4_K show 1726 consecutive
+  `alloc_slot_hit` events with shape and pointer period `863`. The tradeoff is
+  warmup allocation: the slot arena owns one CUDA buffer per allocation slot in
+  the period, adding about `27 MB` of cached temp storage and `882`
+  generation-scoped slot allocations in the 8-token probe. This is acceptable
+  for graph-capture probing, not yet a production default.
+- Warmed final-hidden stream capture now works for both Q8_0 and Q4_K on the
+  token-tensor greedy path. The capture probe begins only after pinned-slot
+  warmup and replays immediately. This proves the main final-hidden decoder
+  stack is stream-capture-compatible under the pinned arena. Graph-exec update
+  also works: after one instantiate, CUDA accepts four successive
+  `cuGraphExecUpdate` calls for both Q8_0 and Q4_K. Throughput stays flat
+  because the probe still recaptures every token, so the host still issues all
+  per-kernel launch calls during capture; it only avoids repeated graph
+  instantiation. LM-head argmax plus token download also remain outside the
+  captured window.
+- Final-hidden capture parameter tracing identifies the persistent-replay
+  blockers precisely: temp-slot pointers and tensor shapes are stable under the
+  pinned arena, but RoPE position and GQA attention length/position scalars are
+  per-token values. A persistent replay path must update or externalize:
+  `position_offset`, `query_position_offset`, `kv_seq_len`, and
+  `total_sequence_len`.
+- The first persistent-replay blocker above is now addressed in an opt-in probe:
+  RoPE and GQA can read their changing decode scalars from a stable
+  device-resident buffer. Q8_0 and Q4_K graph-update probes still return valid
+  tokens, and graph exec update still succeeds. This deliberately does not
+  improve throughput yet because every token is still recaptured; it prepares
+  the graph for replay with only one tiny H2D scalar update per token.
+- Tensor-boundary tracing shows the final-hidden graph boundary can be stable
+  at the CUDA device-buffer level under pinned slots. The host-side Zig tensor
+  wrappers are not stable and should not be used as replay identity.
+- Persistent final-hidden replay now works for the short and sustained
+  Q8_0/Q4_K ant controls:
+  - graph-owned final-hidden input buffer avoids embedding input pointer drift
+  - dynamic KV suffix writes avoid replaying stale captured destination offsets
+  - both resident quantized formats return the healthy token streams
+  - 8-token launch count drops from the recapture/update probe's `5581`
+    launches to `2905`
+  - sustained Q8_0 uses one capture plus 17 persistent replays and reports
+    `2970` launches, `148.500 launches/token`, `decode_tok_per_s=6.577`
+  - sustained Q4_K uses one capture plus 18 persistent replays and reports
+    `2975` launches, `141.667 launches/token`, `decode_tok_per_s=5.334`
+  - persistent replay now records the captured device-KV capacity and refuses
+    replay if a later decode step's `kv_seq_len` exceeds that capacity
+  - post-guard Q8_0/Q4_K 8-token validations record `kv_capacity=550`, replay
+    through `kv_seq_len=26`, and keep the same healthy token streams
+  - forced-capacity Q8_0 validation with captured `kv_capacity=22` proves the
+    over-capacity path skips persistent replay, recaptures via graph update,
+    and keeps valid output
+  - second-prompt Q8_0/Q4_K validations on the compass prompt both produce the
+    same token ids, use eight persistent replays, and record zero capacity skips
+  - replay-vs-recapture generated-output controls now cover both Q8_0 and Q4_K
+    on the compass and uppercase prompts with exact token-id matches
+  - those controls are now reproducible through
+    `scripts/compare_cuda_replay_generation.py`; the latest harness run passed
+    all four Q8_0/Q4_K comparisons and wrote
+    `/tmp/gemma-cuda-replay-harness/summary.json`
+  - throughput improves less than launch count because the captured graph still
+    runs the same GPU kernels, and embedding, LM-head argmax, token download,
+    scalar uploads, and graph launch remain outside/around the final-hidden
+    replay
+  - keep `ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1` diagnostic-only
+    until broader quality gates pass
 - BF16 CUDA uses cuBLASLt successfully, but streamed dense/FFN weight reads and
   uploads dominate the 123s one-token control.
 
@@ -891,8 +1355,9 @@ Acceptance:
 
 Status:
 
-- Q4_K row-1 tile8 fast decode now defaults on and validates with zero
-  unexpected fallback on the sustained smoke.
+- Q4_K row-1 fast decode now defaults to tile4 and validates with zero
+  unexpected fallback on the sustained smoke. Tile8 is opt-in via
+  `ANTFLY_CUDA_ENABLE_Q4K_DECODE_TILE8=1`.
 - Q8_0 row-1 tile4 matvec is implemented and enabled with scalar fallback.
 - Q8_0/Q4_K correctness smokes pass after the changes.
 - `bench-cuda --gemma4-shapes` coverage for Q8_0/Q4_K Gemma4 row-1 decode
@@ -1110,8 +1575,114 @@ Phase 5I - Active GQA attention coverage:
 
 Phase 5J - Re-evaluate CUDA graph capture:
 
-- Only after the above fusions reduce dynamic allocation and stabilize buffer
-  addresses, prototype graph capture for steady-state single-token decode.
+- Status:
+  - CUDA driver/context graph APIs are implemented and smoke-tested.
+  - Basic stream capture/replay works on the L4.
+  - Temp-buffer capture-readiness probes are implemented and env-gated.
+  - Experimental stable temp reuse is implemented behind
+    `ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1`.
+  - Experimental pinned temp-slot arena is implemented behind
+    `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=<N>`.
+  - Skipped Q8_0/Q4_K decode traces show zero temp allocation misses in the
+    steady-state window.
+  - Q8_0 and Q4_K skipped trace shape sequences match exactly, so one
+    graph-scratch strategy should cover both quantized formats.
+  - Current best-fit temp cache reuses a 16-pointer pool with no simple fixed
+    pointer period across the sampled window.
+  - Stable temp reuse makes every sampled allocation exact-size and reveals an
+    863-event allocation-shape period, but still rotates through a 27-pointer
+    pool with no simple pointer period.
+  - Pinned temp slots with period `863` produce replay-stable pointer sequence
+    period `863` for both Q8_0 and Q4_K.
+  - Warmed final-hidden decode capture/replay succeeds on Q8_0 and Q4_K.
+  - Warmed final-hidden graph-exec update succeeds on Q8_0 and Q4_K:
+    one instantiate, four successful updates, zero update failures in the
+    8-token ant probe.
+  - Graph-exec update does not materially improve throughput because it still
+    requires a fresh token capture, and capture still issues each kernel launch
+    call from the host.
+  - Parameter tracing shows the specific per-token scalars that change while
+    pointers and shapes stay stable under pinned slots:
+    `position_offset`, `query_position_offset`, `kv_seq_len`, and
+    `total_sequence_len`.
+  - Device-resident decode scalar buffers are implemented behind
+    `ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1`.
+  - The capture path now has scalar-buffer variants for fused head-norm/RoPE
+    and decode GQA attention, and they are only selected while graph capture is
+    active.
+  - Q8_0 and Q4_K scalar-buffer graph-update probes return valid tokens and
+    keep graph update success at four updates after one instantiate in the
+    8-token ant probe.
+  - Tensor-boundary tracing is implemented behind
+    `ANTFLY_INFERENCE_CUDA_CAPTURE_TENSOR_TRACE=1`.
+  - Experimental persistent final-hidden replay is implemented behind
+    `ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1`.
+  - Graph-owned final-hidden input copying is implemented for persistent
+    replay.
+  - Dynamic KV suffix write scalarization is implemented for captured decode:
+    `termite_kv_write_suffix_decode_scalars_f32`.
+  - Persistent replay KV-capacity guarding is implemented:
+    - capture records the minimum device-KV layer capacity
+    - replay checks current `kv_seq_len` against that capacity
+    - over-capacity replay falls back instead of launching a stale captured
+      graph
+    - `graph_capture_capacity_skips` is reported in text and JSON timing
+    - `ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=<N>` provides a short
+      diagnostic clamp for fallback validation
+  - Q8_0 and Q4_K persistent replay now pass the 8-token ant control:
+    `begins=1`, `replays=5`, `persistent_replays=4`, `launches=2905`.
+  - Q8_0 and Q4_K persistent replay also pass the sustained ant control:
+    - Q8_0: `begins=1`, `replays=18`, `persistent_replays=17`,
+      `launches=2970`, `decode_tok_per_s=6.577`
+    - Q4_K: `begins=1`, `replays=19`, `persistent_replays=18`,
+      `launches=2975`, `decode_tok_per_s=5.334`
+  - Post-capacity-guard Q8_0/Q4_K 8-token controls still pass:
+    - Q8_0: `begins=1`, `replays=5`, `persistent_replays=4`,
+      `capacity_skips=0`, `launches=2905`, `decode_tok_per_s=7.619`
+    - Q4_K: `begins=1`, `replays=5`, `persistent_replays=4`,
+      `capacity_skips=0`, `launches=2905`, `decode_tok_per_s=6.065`,
+      `q4k_decode_fast_fallbacks=0`
+    - both record boundary `kv_capacity=550` and replayed
+      `kv_seq_len=23..26`
+  - Forced-capacity Q8_0 fallback probe passes with
+    `ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=22`:
+    `capacity_skips=4`, `persistent_replays=0`, `update_successes=4`, valid
+    output, and no stale-KV replay beyond the forced capacity.
+  - Second-prompt Q8_0/Q4_K compass controls pass:
+    `persistent_replays=8`, `capacity_skips=0`, matching token ids between
+    formats.
+  - Replay-vs-recapture generated-output controls pass for Q8_0 and Q4_K on
+    compass and uppercase prompts:
+    - compass: persistent `begins=1`, `persistent_replays=8`,
+      `launches=2925`; recapture/update `begins=9`, `update_successes=8`,
+      `launches=8757`
+    - uppercase: persistent `begins=1`, `persistent_replays=3`,
+      `launches=2900`; recapture/update `begins=4`, `update_successes=3`,
+      `launches=5087`
+    - all runs have `capacity_skips=0`; Q4_K runs have zero fast-decode
+      fallbacks
+  - Reusable generated-output harness is implemented and validated:
+    `zig/pkg/inference/scripts/compare_cuda_replay_generation.py`
+    - default prompts live in
+      `zig/pkg/inference/testdata/gemma4_replay_prompts.txt`
+    - latest Q8_0/Q4_K run passed all four comparisons
+  - Full reusable Gemma4 decode graph execution is not implemented yet.
+- Next implementation step:
+  - expand the reusable generated-output harness to more prompts once disk/time
+    budget allows, and keep it as the replay acceptance gate
+  - add a real long-context probe that crosses natural captured KV capacity,
+    complementing the synthetic forced-capacity check
+  - keep graph scratch/output buffers reserved from the eager temp allocator
+    if longer probes reveal temp-slot aliasing beyond the graph input/output
+    boundary
+  - then prove graph replay can be reused on successive decode steps with
+    stable token ids and without stale KV/temp-buffer data
+  - extend the capture boundary to include LM-head argmax only after the final
+    token tensor can stay device-resident without host sync inside the graph
+  - capture only when generation mode is pure greedy, batch size is 1, shapes
+    are stable, and no host sync/download is required inside the captured window
+  - keep the temp-trace probe as the acceptance diagnostic for pointer drift
+  - keep an env kill-switch and fall back to eager CUDA on any capture failure
 - This is likely necessary for the final jump toward 20+ tok/s if launch
   overhead remains dominant after kernel fusion.
 
@@ -1128,7 +1699,7 @@ Only start if Phases 1-5 do not reach target speed.
 Options:
 
 - CUDA graph capture of steady-state decode:
-  - add graph APIs to `driver.zig`
+  - graph APIs are now present in `driver.zig` / `context.zig`
   - use a dedicated decode arena with stable buffer addresses
   - keep env kill-switch
 - Int8 activation path:

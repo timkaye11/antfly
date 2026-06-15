@@ -17,6 +17,7 @@ const ops = @import("../ops.zig");
 const tensor_mod = @import("../../backends/tensor.zig");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
+const driver_mod = @import("driver.zig");
 const kernels_mod = @import("kernels.zig");
 const cublaslt_mod = @import("cublaslt.zig");
 const scratch_mod = @import("scratch.zig");
@@ -106,6 +107,12 @@ const DenseHostPrefetchEntry = struct {
 
 const DenseHostPrefetchQueue = prefetch_mod.Queue(*DenseHostPrefetchEntry);
 
+const TempPinnedSlot = struct {
+    buffer: buffer_mod.DeviceBuffer = .{},
+    requested_len: usize = 0,
+    in_use: bool = false,
+};
+
 pub const RuntimeStats = struct {
     pub const top_transfer_size_count = 8;
 
@@ -129,6 +136,16 @@ pub const RuntimeStats = struct {
     deferred_free_reclaimed_bytes: usize = 0,
     kernel_launches: usize = 0,
     stream_syncs: usize = 0,
+    cuda_graph_capture_begins: usize = 0,
+    cuda_graph_capture_replays: usize = 0,
+    cuda_graph_capture_discards: usize = 0,
+    cuda_graph_capture_instantiates: usize = 0,
+    cuda_graph_capture_update_successes: usize = 0,
+    cuda_graph_capture_update_failures: usize = 0,
+    cuda_graph_capture_update_unavailable: usize = 0,
+    cuda_graph_capture_scalar_updates: usize = 0,
+    cuda_graph_capture_persistent_replays: usize = 0,
+    cuda_graph_capture_capacity_skips: usize = 0,
     upload_syncs: usize = 0,
     download_syncs: usize = 0,
     eval_syncs: usize = 0,
@@ -353,8 +370,24 @@ pub const CudaCompute = struct {
     dense_host_prefetch_initialized: bool = false,
     dense_host_prefetch_epoch: u64 = 1,
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
+    temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
+    temp_trace_seq: usize = 0,
+    debug_cuda_graph_capture_active: bool = false,
+    debug_cuda_graph_exec: driver_mod.CUgraphExec = null,
+    debug_cuda_decode_scalars: buffer_mod.DeviceBuffer = .{},
+    debug_cuda_graph_final_hidden_input_storage: buffer_mod.DeviceBuffer = .{},
+    debug_cuda_graph_final_hidden_input: buffer_mod.DeviceBuffer = .{},
+    debug_cuda_graph_final_hidden_output: buffer_mod.DeviceBuffer = .{},
+    debug_cuda_graph_final_hidden_shape: ?[]i64 = null,
+    debug_cuda_graph_final_hidden_elem_count: usize = 0,
+    debug_cuda_graph_final_hidden_dtype: tensor_mod.DType = .f32,
+    debug_cuda_graph_final_hidden_input_valid: bool = false,
+    debug_cuda_graph_final_hidden_valid: bool = false,
+    debug_cuda_graph_decode_kv_seq_len: usize = 0,
+    debug_cuda_graph_kv_replay_capacity_tokens: usize = 0,
+    debug_cuda_graph_kv_replay_capacity_valid: bool = false,
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt: ?cublaslt_mod.CublasLt = null,
@@ -404,6 +437,18 @@ pub const CudaCompute = struct {
         while (lazy_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.lazy_device_epochs.deinit(self.allocator);
         deinitDenseStreamCache(self);
+        if (self.debug_cuda_graph_exec) |exec| {
+            self.ctx.destroyGraphExec(exec);
+            self.debug_cuda_graph_exec = null;
+        }
+        if (self.debug_cuda_graph_final_hidden_shape) |shape| {
+            self.allocator.free(shape);
+            self.debug_cuda_graph_final_hidden_shape = null;
+        }
+        self.debug_cuda_graph_final_hidden_input_storage.free(&self.ctx);
+        self.debug_cuda_decode_scalars.free(&self.ctx);
+        for (self.temp_pinned_slots.items) |*slot| slot.buffer.free(&self.ctx);
+        self.temp_pinned_slots.deinit(self.allocator);
         for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
         self.temp_buffers.deinit(self.allocator);
         if (self.deferred_device_frees.items.len != 0) {
@@ -449,6 +494,9 @@ pub const CudaCompute = struct {
         stats.stream_syncs = self.ctx.stats.stream_syncs;
         for (self.temp_buffers.items) |buffer| {
             stats.temp_buffer_cached_bytes += buffer.len;
+        }
+        for (self.temp_pinned_slots.items) |slot| {
+            stats.temp_buffer_cached_bytes += slot.buffer.len;
         }
         stats.deferred_free_pending_bytes = self.deferred_device_free_bytes;
         return stats;
@@ -642,8 +690,12 @@ const CudaKvDeviceStorage = struct {
         layer.row_width = row_width;
         layer.position_offset = write.position_offset;
 
-        if (layer.capacity_tokens < write.total_token_count) {
-            const new_capacity = @max(write.total_token_count, @max(@as(usize, 16), layer.capacity_tokens * 2));
+        const required_capacity = if (cudaDebugGraphPersistentReplayEnabled())
+            try std.math.add(usize, write.total_token_count, 256)
+        else
+            write.total_token_count;
+        if (layer.capacity_tokens < required_capacity) {
+            const new_capacity = @max(required_capacity, @max(@as(usize, 16), layer.capacity_tokens * 2));
             const bytes = try checkedMul(try checkedMul(new_capacity, row_width), @sizeOf(f32));
             var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, bytes);
             errdefer new_k.free(&self.compute.ctx);
@@ -660,6 +712,16 @@ const CudaKvDeviceStorage = struct {
             layer.k = new_k;
             layer.v = new_v;
             layer.capacity_tokens = new_capacity;
+        }
+        if (cudaDebugGraphPersistentReplayEnabled() and self.compute.debug_cuda_graph_capture_active) {
+            const replay_capacity = if (cudaDebugGraphForcedKvReplayCapacityTokens()) |forced|
+                @min(layer.capacity_tokens, forced)
+            else
+                layer.capacity_tokens;
+            if (!self.compute.debug_cuda_graph_kv_replay_capacity_valid or replay_capacity < self.compute.debug_cuda_graph_kv_replay_capacity_tokens) {
+                self.compute.debug_cuda_graph_kv_replay_capacity_tokens = replay_capacity;
+                self.compute.debug_cuda_graph_kv_replay_capacity_valid = true;
+            }
         }
         return layer;
     }
@@ -681,6 +743,23 @@ const CudaKvDeviceStorage = struct {
         const dst_offset = try checkedMul(try checkedMul(token_start, row_width), @sizeOf(f32));
         const k_src = buffer_mod.DeviceBuffer{ .ptr = @as(@TypeOf(layer.k.ptr), @intCast(@intFromPtr(k_ref.handle) + k_ref.byte_offset)), .len = suffix_bytes };
         const v_src = buffer_mod.DeviceBuffer{ .ptr = @as(@TypeOf(layer.v.ptr), @intCast(@intFromPtr(v_ref.handle) + v_ref.byte_offset)), .len = suffix_bytes };
+        if (cudaDebugDecodeScalarsReady(self.compute) and write.suffix_token_count == 1) {
+            try self.compute.kernels.launchKvWriteSuffixDecodeScalarsF32(
+                &self.compute.ctx,
+                layer.k,
+                layer.v,
+                k_src,
+                v_src,
+                self.compute.debug_cuda_decode_scalars,
+                write.suffix_token_count,
+                row_width,
+                write.total_token_count,
+            );
+            layer.token_count = write.total_token_count;
+            layer.position_offset = write.position_offset;
+            self.compute.stats.device_kv_writes += 1;
+            return;
+        }
         const k_dst = buffer_mod.DeviceBuffer{ .ptr = layer.k.ptr + dst_offset, .len = layer.k.len - dst_offset };
         const v_dst = buffer_mod.DeviceBuffer{ .ptr = layer.v.ptr + dst_offset, .len = layer.v.len - dst_offset };
         try k_dst.copyFromDevice(&self.compute.ctx, k_src, suffix_bytes);
@@ -1444,6 +1523,203 @@ fn cudaDeferredFreeBudgetBytes() usize {
     return mb * 1024 * 1024;
 }
 
+fn cudaTempTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_TRACE", false);
+}
+
+fn cudaTempTraceLimit() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT") orelse 4096;
+}
+
+fn cudaTempTraceSkip() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_TRACE_SKIP") orelse 0;
+}
+
+fn cudaTempStableReuseEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE", false);
+}
+
+const max_temp_pinned_slots = 16_384;
+
+fn cudaTempSlotPeriod() usize {
+    const period = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD") orelse 0;
+    if (period > max_temp_pinned_slots) return 0;
+    return period;
+}
+
+fn cudaTempSlotSkip() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP") orelse cudaTempTraceSkip();
+}
+
+fn cudaDebugGraphCaptureMinAllocSeq() usize {
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ")) |seq| return seq;
+    const period = cudaTempSlotPeriod();
+    if (period != 0) return cudaTempSlotSkip() + period;
+    return 0;
+}
+
+fn cudaDebugGraphCaptureUpdateExecEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC", false);
+}
+
+fn cudaDebugGraphPersistentReplayEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY", false);
+}
+
+fn cudaDebugGraphForcedKvReplayCapacityTokens() ?usize {
+    const forced = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse return null;
+    return if (forced == 0) null else forced;
+}
+
+fn cudaDebugGraphCaptureDeviceScalarsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS", false);
+}
+
+fn cudaDebugGraphCaptureTensorTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_TENSOR_TRACE", false);
+}
+
+fn cudaDebugGraphCaptureTensorTraceLimit() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_TENSOR_TRACE_LIMIT") orelse 64;
+}
+
+fn cudaDebugDecodeScalarsReady(self: *const CudaCompute) bool {
+    return cudaDebugGraphCaptureDeviceScalarsEnabled() and self.debug_cuda_graph_capture_active and self.debug_cuda_decode_scalars.ptr != 0;
+}
+
+fn cudaGraphExecUpdateResultName(result: driver_mod.CUgraphExecUpdateResult) []const u8 {
+    return switch (result) {
+        driver_mod.CU_GRAPH_EXEC_UPDATE_SUCCESS => "success",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR => "error",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_TOPOLOGY_CHANGED => "topology_changed",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_NODE_TYPE_CHANGED => "node_type_changed",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_FUNCTION_CHANGED => "function_changed",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED => "parameters_changed",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED => "not_supported",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_UNSUPPORTED_FUNCTION_CHANGE => "unsupported_function_change",
+        driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR_ATTRIBUTES_CHANGED => "attributes_changed",
+        else => "unknown",
+    };
+}
+
+fn traceCudaTempAlloc(
+    self: *CudaCompute,
+    seq: usize,
+    comptime event: []const u8,
+    requested_len: usize,
+    buffer: buffer_mod.DeviceBuffer,
+) void {
+    if (!cudaTempTraceEnabled()) return;
+    const skip = cudaTempTraceSkip();
+    if (seq < skip) return;
+    const trace_seq = seq - skip;
+    const limit = cudaTempTraceLimit();
+    if (trace_seq >= limit) return;
+    if (trace_seq == 0) {
+        std.log.info(
+            "cuda_temp_trace: begin skip={d} limit={d} temp_cache_budget_mb={d} stable_reuse={} slot_period={d} slot_skip={d}",
+            .{
+                skip,
+                limit,
+                cudaTempCacheBudgetBytes() / (1024 * 1024),
+                cudaTempStableReuseEnabled(),
+                cudaTempSlotPeriod(),
+                cudaTempSlotSkip(),
+            },
+        );
+    }
+    std.log.info(
+        "cuda_temp_trace: seq={d} trace_seq={d} event={s} requested={d} buffer_len={d} ptr=0x{x} cache_count={d}",
+        .{ seq, trace_seq, event, requested_len, buffer.len, buffer.ptr, self.temp_buffers.items.len },
+    );
+    if (trace_seq + 1 == limit) {
+        std.log.info("cuda_temp_trace: limit_reached limit={d}", .{limit});
+    }
+}
+
+fn ensureTempPinnedSlots(self: *CudaCompute, period: usize) !void {
+    if (self.temp_pinned_slots.items.len >= period) return;
+    try self.temp_pinned_slots.ensureTotalCapacity(self.allocator, period);
+    while (self.temp_pinned_slots.items.len < period) {
+        self.temp_pinned_slots.appendAssumeCapacity(.{});
+    }
+}
+
+fn findExactTempBufferIndex(self: *const CudaCompute, len: usize) ?usize {
+    for (self.temp_buffers.items, 0..) |buffer, i| {
+        if (buffer.len == len) return i;
+    }
+    return null;
+}
+
+fn allocPinnedTempSlot(
+    self: *CudaCompute,
+    seq: usize,
+    len: usize,
+) !?buffer_mod.DeviceBuffer {
+    const period = cudaTempSlotPeriod();
+    if (period == 0) return null;
+    const skip = cudaTempSlotSkip();
+    if (seq < skip) return null;
+
+    try ensureTempPinnedSlots(self, period);
+    const slot_index = (seq - skip) % period;
+    const slot = &self.temp_pinned_slots.items[slot_index];
+    if (slot.in_use) {
+        traceCudaTempAlloc(self, seq, "alloc_slot_busy_fallback", len, .{});
+        return null;
+    }
+    if (slot.requested_len != 0 and slot.requested_len != len) {
+        traceCudaTempAlloc(self, seq, "alloc_slot_shape_fallback", len, .{});
+        return null;
+    }
+    if (slot.buffer.ptr == 0) {
+        slot.requested_len = len;
+        if (findExactTempBufferIndex(self, len)) |i| {
+            slot.buffer = self.temp_buffers.orderedRemove(i);
+            self.stats.temp_buffer_hits += 1;
+            slot.in_use = true;
+            traceCudaTempAlloc(self, seq, "alloc_slot_seed", len, slot.buffer);
+            return slot.buffer;
+        }
+        self.stats.temp_buffer_misses += 1;
+        slot.buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
+        self.noteDeviceBytes(len);
+        self.stats.device_alloc_calls += 1;
+        slot.in_use = true;
+        traceCudaTempAlloc(self, seq, "alloc_slot_miss", len, slot.buffer);
+        return slot.buffer;
+    }
+    slot.in_use = true;
+    self.stats.temp_buffer_hits += 1;
+    traceCudaTempAlloc(self, seq, "alloc_slot_hit", len, slot.buffer);
+    return slot.buffer;
+}
+
+fn releasePinnedTempSlot(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) bool {
+    if (buffer.ptr == 0 or self.temp_pinned_slots.items.len == 0) return false;
+    for (self.temp_pinned_slots.items) |*slot| {
+        if (slot.buffer.ptr == buffer.ptr) {
+            slot.in_use = false;
+            buffer.* = .{};
+            return true;
+        }
+    }
+    return false;
+}
+
+fn retainPinnedTempSlot(self: *CudaCompute, buffer: buffer_mod.DeviceBuffer) bool {
+    if (buffer.ptr == 0 or self.temp_pinned_slots.items.len == 0) return false;
+    for (self.temp_pinned_slots.items) |*slot| {
+        if (slot.buffer.ptr == buffer.ptr) {
+            if (slot.in_use) return false;
+            slot.in_use = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 fn drainDeferredDeviceFreesAfterSync(self: *CudaCompute) void {
     if (self.deferred_device_frees.items.len == 0) return;
     var reclaimed: usize = 0;
@@ -1555,17 +1831,30 @@ fn touchBytesForPageCache(bytes: []const u8) void {
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
+    const seq = self.temp_trace_seq;
+    self.temp_trace_seq = seq + 1;
+    if (try allocPinnedTempSlot(self, seq, len)) |buffer| return buffer;
+    const stable_reuse = cudaTempStableReuseEnabled();
     var best_index: ?usize = null;
     var best_len: usize = std.math.maxInt(usize);
     for (self.temp_buffers.items, 0..) |buffer, i| {
-        if (buffer.len >= len and buffer.len < best_len) {
+        if (stable_reuse) {
+            if (buffer.len == len) {
+                best_index = i;
+                break;
+            }
+        } else if (buffer.len >= len and buffer.len < best_len) {
             best_index = i;
             best_len = buffer.len;
         }
     }
     if (best_index) |i| {
-        const buffer = self.temp_buffers.swapRemove(i);
+        const buffer = if (stable_reuse)
+            self.temp_buffers.orderedRemove(i)
+        else
+            self.temp_buffers.swapRemove(i);
         self.stats.temp_buffer_hits += 1;
+        traceCudaTempAlloc(self, seq, "alloc_hit", len, buffer);
         return buffer;
     }
     self.stats.temp_buffer_misses += 1;
@@ -1575,17 +1864,20 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
             const retry = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
             self.noteDeviceBytes(len);
             self.stats.device_alloc_calls += 1;
+            traceCudaTempAlloc(self, seq, "alloc_miss_retry", len, retry);
             return retry;
         }
         return err;
     };
     self.noteDeviceBytes(len);
     self.stats.device_alloc_calls += 1;
+    traceCudaTempAlloc(self, seq, "alloc_miss", len, buffer);
     return buffer;
 }
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
+    if (releasePinnedTempSlot(self, buffer)) return;
     const cache_budget = cudaTempCacheBudgetBytes();
     var cached_bytes: usize = 0;
     for (self.temp_buffers.items) |cached| cached_bytes += cached.len;
@@ -1935,6 +2227,311 @@ fn debugProfileCheckpoint(ctx: *anyopaque, label: []const u8, layer: usize) void
             stats.device_free_calls,
         },
     );
+}
+
+fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    if (cudaTempSlotPeriod() == 0 and !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED", false)) return false;
+    const min_alloc_seq = cudaDebugGraphCaptureMinAllocSeq();
+    if (self.temp_trace_seq < min_alloc_seq) return false;
+    try self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    self.debug_cuda_graph_capture_active = true;
+    if (cudaDebugGraphPersistentReplayEnabled()) {
+        self.debug_cuda_graph_kv_replay_capacity_tokens = 0;
+        self.debug_cuda_graph_kv_replay_capacity_valid = false;
+    }
+    self.stats.cuda_graph_capture_begins += 1;
+    std.log.info("cuda_graph_capture_probe: begin label={s} alloc_seq={d} min_alloc_seq={d}", .{
+        label,
+        self.temp_trace_seq,
+        min_alloc_seq,
+    });
+    return true;
+}
+
+fn debugCudaGraphPrepareDecodeScalars(
+    ctx: *anyopaque,
+    position_offset: usize,
+    query_position_offset: usize,
+    kv_seq_len: usize,
+    total_sequence_len: usize,
+) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphCaptureDeviceScalarsEnabled()) return false;
+    if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    self.debug_cuda_graph_decode_kv_seq_len = kv_seq_len;
+    if (self.debug_cuda_decode_scalars.ptr == 0) {
+        self.debug_cuda_decode_scalars = try buffer_mod.DeviceBuffer.alloc(&self.ctx, 4 * @sizeOf(u32));
+    }
+    var scalars = [_]u32{
+        std.math.cast(u32, position_offset) orelse return error.InvalidCudaState,
+        std.math.cast(u32, query_position_offset) orelse return error.InvalidCudaState,
+        std.math.cast(u32, kv_seq_len) orelse return error.InvalidCudaState,
+        std.math.cast(u32, total_sequence_len) orelse return error.InvalidCudaState,
+    };
+    try copyFromHostTracked(self, self.debug_cuda_decode_scalars, std.mem.sliceAsBytes(&scalars));
+    self.stats.cuda_graph_capture_scalar_updates += 1;
+    std.log.info("cuda_graph_capture_probe: decode_scalars position_offset={d} query_position_offset={d} kv_seq_len={d} total_sequence_len={d} ptr=0x{x}", .{
+        scalars[0],
+        scalars[1],
+        scalars[2],
+        scalars[3],
+        self.debug_cuda_decode_scalars.ptr,
+    });
+    return true;
+}
+
+fn debugCudaTraceTensor(ctx: *anyopaque, label: []const u8, tensor: CT) !void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.ctx.debug_graph_capture_active) return;
+    if (!cudaDebugGraphCaptureTensorTraceEnabled()) return;
+    const limit = cudaDebugGraphCaptureTensorTraceLimit();
+    if (self.ctx.debug_graph_capture_tensor_trace_count >= limit) return;
+    const index = self.ctx.debug_graph_capture_tensor_trace_count;
+    self.ctx.debug_graph_capture_tensor_trace_count += 1;
+
+    const cuda_tensor = tensorFromCt(tensor);
+    std.log.info("cuda_capture_tensor_trace: capture={d} index={d} label={s} tensor=0x{x} buffer=0x{x} buffer_len={d} logical_bytes={d} dtype={s} elem_count={d} shape={any} owns_buffer={d} owns_shape={d} owned_by_tensor={d}", .{
+        self.ctx.debug_graph_capture_id,
+        index,
+        label,
+        @intFromPtr(cuda_tensor),
+        cuda_tensor.buffer.ptr,
+        cuda_tensor.buffer.len,
+        cudaTensorDeviceBytes(cuda_tensor),
+        @tagName(cuda_tensor.dtype),
+        cuda_tensor.elem_count,
+        cuda_tensor.shape,
+        @intFromBool(cuda_tensor.owns_buffer),
+        @intFromBool(cuda_tensor.owns_shape),
+        @intFromBool(cuda_tensor.owned_by_tensor),
+    });
+}
+
+fn invalidateDebugFinalHiddenGraph(self: *CudaCompute) void {
+    if (self.debug_cuda_graph_exec) |exec| {
+        self.ctx.destroyGraphExec(exec);
+        self.debug_cuda_graph_exec = null;
+    }
+    if (self.debug_cuda_graph_final_hidden_shape) |shape| {
+        self.allocator.free(shape);
+        self.debug_cuda_graph_final_hidden_shape = null;
+    }
+    self.debug_cuda_graph_final_hidden_input = .{};
+    self.debug_cuda_graph_final_hidden_output = .{};
+    self.debug_cuda_graph_final_hidden_elem_count = 0;
+    self.debug_cuda_graph_final_hidden_dtype = .f32;
+    self.debug_cuda_graph_final_hidden_input_valid = false;
+    self.debug_cuda_graph_final_hidden_valid = false;
+    self.debug_cuda_graph_kv_replay_capacity_tokens = 0;
+    self.debug_cuda_graph_kv_replay_capacity_valid = false;
+}
+
+fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) return null;
+    if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+
+    const input_tensor = tensorFromCt(input);
+    if (input_tensor.dtype != .f32 or input_tensor.quant_type != null) return null;
+    const byte_len = try checkedMul(input_tensor.elem_count, @sizeOf(f32));
+    if (byte_len == 0) return null;
+    if (input_tensor.buffer.len < byte_len) return error.InvalidCudaState;
+
+    if (self.debug_cuda_graph_final_hidden_input_storage.ptr == 0 or self.debug_cuda_graph_final_hidden_input_storage.len != byte_len) {
+        invalidateDebugFinalHiddenGraph(self);
+        if (self.debug_cuda_graph_final_hidden_input_storage.ptr != 0) {
+            self.stats.device_free_calls += 1;
+            self.debug_cuda_graph_final_hidden_input_storage.free(&self.ctx);
+        }
+        self.debug_cuda_graph_final_hidden_input_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
+        self.noteDeviceBytes(byte_len);
+        self.stats.device_alloc_calls += 1;
+        std.log.info("cuda_graph_capture_probe: persistent_input_alloc ptr=0x{x} len={d}", .{
+            self.debug_cuda_graph_final_hidden_input_storage.ptr,
+            self.debug_cuda_graph_final_hidden_input_storage.len,
+        });
+    }
+
+    try copyFromDeviceTracked(self, self.debug_cuda_graph_final_hidden_input_storage, input_tensor.buffer, byte_len);
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = self.debug_cuda_graph_final_hidden_input_storage,
+        .dtype = .f32,
+        .shape = shape,
+        .elem_count = input_tensor.elem_count,
+        .owns_buffer = false,
+    };
+    return tensor;
+}
+
+fn debugCudaGraphRegisterFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) return;
+    if (!self.debug_cuda_graph_capture_active) return;
+
+    const input_tensor = tensorFromCt(input);
+    self.debug_cuda_graph_final_hidden_input = input_tensor.buffer;
+    self.debug_cuda_graph_final_hidden_input_valid = true;
+    std.log.info("cuda_graph_capture_probe: persistent_input input=0x{x} len={d}", .{
+        input_tensor.buffer.ptr,
+        input_tensor.buffer.len,
+    });
+}
+
+fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, output: CT) !void {
+    _ = input;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) return;
+    if (!self.debug_cuda_graph_capture_active) return;
+    if (!self.debug_cuda_graph_final_hidden_input_valid) return;
+
+    const output_tensor = tensorFromCt(output);
+    if (output_tensor.quant_type != null) return error.UnsupportedTensorType;
+    const shape = try dupeShape(self.allocator, output_tensor.shape);
+    errdefer self.allocator.free(shape);
+
+    if (self.debug_cuda_graph_final_hidden_shape) |old_shape| {
+        self.allocator.free(old_shape);
+    }
+    self.debug_cuda_graph_final_hidden_shape = shape;
+    self.debug_cuda_graph_final_hidden_output = output_tensor.buffer;
+    self.debug_cuda_graph_final_hidden_elem_count = output_tensor.elem_count;
+    self.debug_cuda_graph_final_hidden_dtype = output_tensor.dtype;
+    self.debug_cuda_graph_final_hidden_valid = true;
+
+    std.log.info("cuda_graph_capture_probe: persistent_boundary input=0x{x} output=0x{x} elem_count={d} dtype={s} kv_capacity={d} shape={any}", .{
+        self.debug_cuda_graph_final_hidden_input.ptr,
+        output_tensor.buffer.ptr,
+        output_tensor.elem_count,
+        @tagName(output_tensor.dtype),
+        if (self.debug_cuda_graph_kv_replay_capacity_valid) self.debug_cuda_graph_kv_replay_capacity_tokens else 0,
+        output_tensor.shape,
+    });
+}
+
+fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) return null;
+    if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    const exec = self.debug_cuda_graph_exec orelse return null;
+    if (!self.debug_cuda_graph_final_hidden_valid) return null;
+    const shape_src = self.debug_cuda_graph_final_hidden_shape orelse return null;
+    if (self.debug_cuda_graph_kv_replay_capacity_valid and self.debug_cuda_graph_decode_kv_seq_len > self.debug_cuda_graph_kv_replay_capacity_tokens) {
+        self.stats.cuda_graph_capture_capacity_skips += 1;
+        std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded kv_seq_len={d} capacity={d}", .{
+            self.debug_cuda_graph_decode_kv_seq_len,
+            self.debug_cuda_graph_kv_replay_capacity_tokens,
+        });
+        return null;
+    }
+
+    const input_tensor = tensorFromCt(input);
+    if (input_tensor.buffer.ptr != self.debug_cuda_graph_final_hidden_input.ptr or input_tensor.buffer.len != self.debug_cuda_graph_final_hidden_input.len) {
+        std.log.warn("cuda_graph_capture_probe: persistent_replay_input_mismatch expected=0x{x}/{d} actual=0x{x}/{d}", .{
+            self.debug_cuda_graph_final_hidden_input.ptr,
+            self.debug_cuda_graph_final_hidden_input.len,
+            input_tensor.buffer.ptr,
+            input_tensor.buffer.len,
+        });
+        return null;
+    }
+
+    const shape = try dupeShape(self.allocator, shape_src);
+    errdefer self.allocator.free(shape);
+
+    var output = self.debug_cuda_graph_final_hidden_output;
+    if (!retainPinnedTempSlot(self, output)) {
+        std.log.warn("cuda_graph_capture_probe: persistent_replay_output_unavailable ptr=0x{x}", .{output.ptr});
+        return null;
+    }
+    errdefer {
+        _ = releasePinnedTempSlot(self, &output);
+    }
+
+    try self.ctx.launchGraph(exec);
+    self.stats.cuda_graph_capture_replays += 1;
+    self.stats.cuda_graph_capture_persistent_replays += 1;
+    std.log.info("cuda_graph_capture_probe: persistent_replayed input=0x{x} output=0x{x} kv_seq_len={d} kv_capacity={d}", .{
+        input_tensor.buffer.ptr,
+        output.ptr,
+        self.debug_cuda_graph_decode_kv_seq_len,
+        if (self.debug_cuda_graph_kv_replay_capacity_valid) self.debug_cuda_graph_kv_replay_capacity_tokens else 0,
+    });
+
+    return createTensorWithDType(
+        self,
+        output,
+        shape,
+        self.debug_cuda_graph_final_hidden_elem_count,
+        self.debug_cuda_graph_final_hidden_dtype,
+    );
+}
+
+fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph) !void {
+    const exec = try self.ctx.instantiateGraph(graph);
+    defer self.ctx.destroyGraphExec(exec);
+    self.stats.cuda_graph_capture_instantiates += 1;
+    try self.ctx.launchGraph(exec);
+    self.stats.cuda_graph_capture_replays += 1;
+    std.log.info("cuda_graph_capture_probe: replayed", .{});
+}
+
+fn replayCapturedDebugGraphWithUpdate(self: *CudaCompute, graph: driver_mod.CUgraph) !void {
+    if (self.debug_cuda_graph_exec) |exec| {
+        const outcome = self.ctx.updateGraphExec(exec, graph) catch |err| {
+            if (err == error.CudaSymbolMissing) {
+                self.stats.cuda_graph_capture_update_unavailable += 1;
+                std.log.warn("cuda_graph_capture_probe: update_unavailable fallback=instantiate", .{});
+                return replayCapturedDebugGraphOneShot(self, graph);
+            }
+            return err;
+        };
+        if (outcome.success()) {
+            self.stats.cuda_graph_capture_update_successes += 1;
+            try self.ctx.launchGraph(exec);
+            self.stats.cuda_graph_capture_replays += 1;
+            std.log.info("cuda_graph_capture_probe: updated_replayed", .{});
+            return;
+        }
+
+        self.stats.cuda_graph_capture_update_failures += 1;
+        std.log.warn("cuda_graph_capture_probe: update_failed cuda={s} update_result={s} fallback=reinstantiate", .{
+            self.ctx.driver.errorName(outcome.cuda_result),
+            cudaGraphExecUpdateResultName(outcome.update_result),
+        });
+        self.ctx.destroyGraphExec(exec);
+        self.debug_cuda_graph_exec = null;
+    }
+
+    const exec = try self.ctx.instantiateGraph(graph);
+    self.debug_cuda_graph_exec = exec;
+    self.stats.cuda_graph_capture_instantiates += 1;
+    try self.ctx.launchGraph(exec);
+    self.stats.cuda_graph_capture_replays += 1;
+    std.log.info("cuda_graph_capture_probe: instantiated_cached_replayed", .{});
+}
+
+fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.debug_cuda_graph_capture_active) return;
+    self.debug_cuda_graph_capture_active = false;
+    const graph = try self.ctx.endStreamCapture();
+    defer self.ctx.destroyGraph(graph);
+    if (replay) {
+        if (cudaDebugGraphCaptureUpdateExecEnabled()) {
+            try replayCapturedDebugGraphWithUpdate(self, graph);
+        } else {
+            try replayCapturedDebugGraphOneShot(self, graph);
+        }
+    } else {
+        self.stats.cuda_graph_capture_discards += 1;
+        std.log.info("cuda_graph_capture_probe: discarded", .{});
+    }
 }
 
 fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
@@ -4191,27 +4788,57 @@ fn gqaDenseAttention(
     var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
 
-    const attention_launch = self.kernels.launchGqaAttentionF32(
-        &self.ctx,
-        device,
-        q_tensor.buffer,
-        k_tensor.buffer,
-        v_tensor.buffer,
-        mask_device,
-        bias_buffer,
-        batch,
-        q_seq_len,
-        kv_seq_len,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        query_position_offset,
-        kv_position_offset,
-        sliding_window,
-        mask_sequence_len,
-        mask_len,
-        bias_mode,
-    ) catch |err| {
+    const attention_launch = launch: {
+        if (cudaDebugDecodeScalarsReady(self)) {
+            const scalar_launch = self.kernels.launchGqaAttentionDecodeScalarsF32(
+                &self.ctx,
+                device,
+                q_tensor.buffer,
+                k_tensor.buffer,
+                v_tensor.buffer,
+                mask_device,
+                bias_buffer,
+                self.debug_cuda_decode_scalars,
+                batch,
+                q_seq_len,
+                kv_seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                query_position_offset,
+                kv_position_offset,
+                sliding_window,
+                mask_sequence_len,
+                mask_len,
+                bias_mode,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable => null,
+                else => return err,
+            };
+            if (scalar_launch) |kind| break :launch kind;
+        }
+        break :launch self.kernels.launchGqaAttentionF32(
+            &self.ctx,
+            device,
+            q_tensor.buffer,
+            k_tensor.buffer,
+            v_tensor.buffer,
+            mask_device,
+            bias_buffer,
+            batch,
+            q_seq_len,
+            kv_seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            query_position_offset,
+            kv_position_offset,
+            sliding_window,
+            mask_sequence_len,
+            mask_len,
+            bias_mode,
+        );
+    } catch |err| {
         if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
             return gqaDenseAttentionHostFallback(
                 self,
@@ -4676,7 +5303,11 @@ fn rmsNormHeadsRope(ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_d
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    self.kernels.launchRmsNormHeadsRopeF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale) catch |err| switch (err) {
+    const launch_result = if (cudaDebugDecodeScalarsReady(self))
+        self.kernels.launchRmsNormHeadsRopeDecodeScalarsF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, self.debug_cuda_decode_scalars, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale)
+    else
+        self.kernels.launchRmsNormHeadsRopeF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale);
+    launch_result catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             self.stats.head_norm_rope_fused_fallbacks += 1;
             return null;
@@ -4775,6 +5406,14 @@ const vtable = ops.ComputeBackend.VTable{
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .debugProfileCheckpoint = &debugProfileCheckpoint,
+    .debugCudaGraphCaptureBegin = &debugCudaGraphCaptureBegin,
+    .debugCudaGraphPrepareDecodeScalars = &debugCudaGraphPrepareDecodeScalars,
+    .debugCudaTraceTensor = &debugCudaTraceTensor,
+    .debugCudaGraphRegisterFinalHiddenReplayBoundary = &debugCudaGraphRegisterFinalHiddenReplayBoundary,
+    .debugCudaGraphRegisterFinalHiddenReplayInput = &debugCudaGraphRegisterFinalHiddenReplayInput,
+    .debugCudaGraphPrepareFinalHiddenReplayInput = &debugCudaGraphPrepareFinalHiddenReplayInput,
+    .debugCudaGraphReplayFinalHidden = &debugCudaGraphReplayFinalHidden,
+    .debugCudaGraphCaptureEnd = &debugCudaGraphCaptureEnd,
     .embeddingLookup = &embeddingLookup,
     .embeddingLookupTensor = &embeddingLookupTensor,
     .takeRows = &takeRows,

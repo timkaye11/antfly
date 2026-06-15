@@ -18,6 +18,10 @@ const driver_mod = @import("driver.zig");
 const CudaDriver = driver_mod.CudaDriver;
 const CUcontext = driver_mod.CUcontext;
 const CUdevice = driver_mod.CUdevice;
+const CUgraph = driver_mod.CUgraph;
+const CUgraphExec = driver_mod.CUgraphExec;
+const CUgraphExecUpdateResult = driver_mod.CUgraphExecUpdateResult;
+const CUgraphNode = driver_mod.CUgraphNode;
 const CUstream = driver_mod.CUstream;
 
 pub const DeviceInfo = struct {
@@ -39,6 +43,17 @@ pub const RuntimeStats = struct {
     stream_syncs: usize = 0,
 };
 
+pub const GraphExecUpdateOutcome = struct {
+    cuda_result: driver_mod.CUresult,
+    update_result: CUgraphExecUpdateResult = driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR,
+    error_node: CUgraphNode = null,
+
+    pub fn success(self: GraphExecUpdateOutcome) bool {
+        return self.cuda_result == driver_mod.CUDA_SUCCESS and
+            self.update_result == driver_mod.CU_GRAPH_EXEC_UPDATE_SUCCESS;
+    }
+};
+
 pub const CudaContext = struct {
     driver: CudaDriver,
     device: CUdevice,
@@ -46,6 +61,10 @@ pub const CudaContext = struct {
     stream: CUstream,
     info: DeviceInfo,
     stats: RuntimeStats = .{},
+    debug_graph_capture_active: bool = false,
+    debug_graph_capture_id: usize = 0,
+    debug_graph_capture_param_trace_count: usize = 0,
+    debug_graph_capture_tensor_trace_count: usize = 0,
 
     pub fn initDefault() driver_mod.Error!CudaContext {
         var driver = try CudaDriver.open();
@@ -112,6 +131,61 @@ pub const CudaContext = struct {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuStreamSynchronize(self.stream));
         self.stats.stream_syncs += 1;
+    }
+
+    pub fn beginStreamCapture(self: *CudaContext, mode: driver_mod.CUstreamCaptureMode) driver_mod.Error!void {
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuStreamBeginCapture(self.stream, mode));
+        self.debug_graph_capture_active = true;
+        self.debug_graph_capture_id += 1;
+        self.debug_graph_capture_param_trace_count = 0;
+        self.debug_graph_capture_tensor_trace_count = 0;
+    }
+
+    pub fn endStreamCapture(self: *CudaContext) driver_mod.Error!CUgraph {
+        try self.makeCurrent();
+        var graph: CUgraph = null;
+        self.driver.check(self.driver.fns.cuStreamEndCapture(self.stream, &graph)) catch |err| {
+            self.debug_graph_capture_active = false;
+            return err;
+        };
+        self.debug_graph_capture_active = false;
+        if (graph == null) return error.InvalidCudaState;
+        return graph;
+    }
+
+    pub fn instantiateGraph(self: *CudaContext, graph: CUgraph) driver_mod.Error!CUgraphExec {
+        try self.makeCurrent();
+        var exec: CUgraphExec = null;
+        try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, null, null, 0));
+        if (exec == null) return error.InvalidCudaState;
+        return exec;
+    }
+
+    pub fn updateGraphExec(self: *CudaContext, exec: CUgraphExec, graph: CUgraph) driver_mod.Error!GraphExecUpdateOutcome {
+        const update_fn = self.driver.fns.cuGraphExecUpdate orelse return error.CudaSymbolMissing;
+        try self.makeCurrent();
+        var outcome = GraphExecUpdateOutcome{ .cuda_result = driver_mod.CUDA_SUCCESS };
+        outcome.cuda_result = update_fn(exec, graph, &outcome.error_node, &outcome.update_result);
+        return outcome;
+    }
+
+    pub fn launchGraph(self: *CudaContext, exec: CUgraphExec) driver_mod.Error!void {
+        try self.makeCurrent();
+        try self.driver.check(self.driver.fns.cuGraphLaunch(exec, self.stream));
+        self.noteKernelLaunch();
+    }
+
+    pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {
+        if (exec == null) return;
+        self.makeCurrent() catch {};
+        _ = self.driver.fns.cuGraphExecDestroy(exec);
+    }
+
+    pub fn destroyGraph(self: *CudaContext, graph: CUgraph) void {
+        if (graph == null) return;
+        self.makeCurrent() catch {};
+        _ = self.driver.fns.cuGraphDestroy(graph);
     }
 
     pub fn noteKernelLaunch(self: *CudaContext) void {

@@ -16,9 +16,20 @@ const std = @import("std");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
+const platform = @import("antfly_platform");
 
 const fill_ptx = @embedFile("artifacts/inference_cuda_kernels.ptx");
 const fill_ptx_z = fill_ptx ++ "\x00";
+
+fn captureParamTraceIndex(ctx: *context_mod.CudaContext) ?usize {
+    if (!ctx.debug_graph_capture_active) return null;
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PARAM_TRACE", false)) return null;
+    const limit = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_PARAM_TRACE_LIMIT") orelse 256;
+    if (ctx.debug_graph_capture_param_trace_count >= limit) return null;
+    const index = ctx.debug_graph_capture_param_trace_count;
+    ctx.debug_graph_capture_param_trace_count += 1;
+    return index;
+}
 
 pub const GqaAttentionLaunchKind = enum {
     none,
@@ -74,8 +85,11 @@ pub const KernelModule = struct {
     rope_scaled_f32: driver_mod.CUfunction = null,
     rope_per_item_f32: driver_mod.CUfunction = null,
     rms_norm_heads_rope_f32: driver_mod.CUfunction = null,
+    rms_norm_heads_rope_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_scalars_f32: driver_mod.CUfunction = null,
+    kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
     split_last_dim3_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32: driver_mod.CUfunction = null,
@@ -195,8 +209,11 @@ pub const KernelModule = struct {
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
         const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
         const rms_norm_heads_rope_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_f32");
+        const rms_norm_heads_rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_decode_scalars_f32");
         const gqa_attention_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_f32");
         const gqa_attention_decode_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_f32");
+        const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
+        const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
         var split_last_dim3_f32: driver_mod.CUfunction = null;
@@ -312,8 +329,11 @@ pub const KernelModule = struct {
             .rope_scaled_f32 = rope_scaled_f32,
             .rope_per_item_f32 = rope_per_item_f32,
             .rms_norm_heads_rope_f32 = rms_norm_heads_rope_f32,
+            .rms_norm_heads_rope_decode_scalars_f32 = rms_norm_heads_rope_decode_scalars_f32,
             .gqa_attention_f32 = gqa_attention_f32,
             .gqa_attention_decode_f32 = gqa_attention_decode_f32,
+            .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
+            .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
             .deberta_attention_f32 = deberta_attention_f32,
             .split_last_dim3_f32 = split_last_dim3_f32,
             .linear_q8_0_f32 = linear_q8_0_f32,
@@ -399,8 +419,11 @@ pub const KernelModule = struct {
             self.rope_scaled_f32 = null;
             self.rope_per_item_f32 = null;
             self.rms_norm_heads_rope_f32 = null;
+            self.rms_norm_heads_rope_decode_scalars_f32 = null;
             self.gqa_attention_f32 = null;
             self.gqa_attention_decode_f32 = null;
+            self.gqa_attention_decode_scalars_f32 = null;
+            self.kv_write_suffix_decode_scalars_f32 = null;
             self.deberta_attention_f32 = null;
             self.split_last_dim3_f32 = null;
             self.linear_q8_0_f32 = null;
@@ -2108,6 +2131,23 @@ pub const KernelModule = struct {
             @ptrCast(&chunks_per_position_u32),
             @ptrCast(&consecutive_pairs_u32),
         };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope dst=0x{x} input=0x{x} total_chunks={d} head_dim={d} rope_dim={d} theta={d:.6} freq_scale={d:.6} position_offset={d} seq_len={d} chunks_per_position={d} consecutive_pairs={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                input_ptr,
+                total_chunks_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                theta_f32,
+                freq_scale_f32,
+                position_offset_u32,
+                seq_len_u32,
+                chunks_per_position_u32,
+                consecutive_pairs_u32,
+            });
+        }
         try launch1d(function, ctx, count, &params);
     }
 
@@ -2273,6 +2313,102 @@ pub const KernelModule = struct {
             @ptrCast(&consecutive_pairs_u32),
             @ptrCast(&output_scale_value),
         };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rms_norm_heads_rope dst=0x{x} input=0x{x} weight=0x{x} total_chunks={d} head_dim={d} rope_dim={d} eps={d:.8} theta={d:.6} freq_scale={d:.6} position_offset={d} seq_len={d} chunks_per_position={d} consecutive_pairs={d} output_scale={d:.6}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                input_ptr,
+                weight_ptr,
+                total_chunks_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                eps_value,
+                theta_value,
+                freq_scale_value,
+                position_offset_u32,
+                seq_len_u32,
+                chunks_per_position_u32,
+                consecutive_pairs_u32,
+                output_scale_value,
+            });
+        }
+        try launchBlocks(function, ctx, total_chunks, f32_tiled_threads, &params);
+    }
+
+    pub fn launchRmsNormHeadsRopeDecodeScalarsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        rows: usize,
+        total_dim: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        eps: f32,
+        theta: f32,
+        freq_scale: f32,
+        position_offset: usize,
+        seq_len: usize,
+        consecutive_pairs: bool,
+        output_scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.rms_norm_heads_rope_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or total_dim == 0 or head_dim == 0 or total_dim % head_dim != 0 or rope_dim == 0 or rope_dim > head_dim or rope_dim % 2 != 0 or seq_len == 0) return error.InvalidCudaState;
+        try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        const total = try checkedTensorElements(rows, total_dim);
+        const total_chunks = total / head_dim;
+        const chunks_per_position = total_dim / head_dim;
+        try checkBytes(dst, total);
+        try checkBytes(input, total);
+        try checkBytes(weight, head_dim);
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var head_dim_u32 = try toU32(head_dim);
+        var rope_dim_u32 = try toU32(rope_dim);
+        var eps_value = eps;
+        var theta_value = theta;
+        var freq_scale_value = freq_scale;
+        var position_offset_u32 = try toU32(position_offset);
+        var seq_len_u32 = try toU32(seq_len);
+        var chunks_per_position_u32 = try toU32(chunks_per_position);
+        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
+        var output_scale_value = output_scale;
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&rope_dim_u32),
+            @ptrCast(&eps_value),
+            @ptrCast(&theta_value),
+            @ptrCast(&freq_scale_value),
+            @ptrCast(&position_offset_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&chunks_per_position_u32),
+            @ptrCast(&consecutive_pairs_u32),
+            @ptrCast(&output_scale_value),
+            @ptrCast(&decode_scalars_ptr),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rms_norm_heads_rope_decode_scalars dst=0x{x} input=0x{x} weight=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                input_ptr,
+                weight_ptr,
+                decode_scalars_ptr,
+                position_offset_u32,
+                seq_len_u32,
+            });
+        }
         try launchBlocks(function, ctx, total_chunks, f32_tiled_threads, &params);
     }
 
@@ -2349,6 +2485,30 @@ pub const KernelModule = struct {
             @ptrCast(&mask_len_u32),
             @ptrCast(&bias_mode_u32),
         };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention dst=0x{x} q=0x{x} k=0x{x} v=0x{x} mask=0x{x} bias=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} query_position_offset={d} kv_position_offset={d} sliding_window={d} total_sequence_len={d} mask_len={d} bias_mode={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                mask_ptr,
+                bias_ptr,
+                batch_u32,
+                q_seq_len_u32,
+                kv_seq_len_u32,
+                num_heads_u32,
+                num_kv_heads_u32,
+                head_dim_u32,
+                query_position_offset_u32,
+                kv_position_offset_u32,
+                sliding_window_u32,
+                total_sequence_len_u32,
+                mask_len_u32,
+                bias_mode_u32,
+            });
+        }
         if (self.gqa_attention_decode_f32) |decode_function| {
             if (head_dim <= 512) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
@@ -2374,6 +2534,173 @@ pub const KernelModule = struct {
 
         try launch1d(scalar_function, ctx, q_count, &params);
         return .scalar;
+    }
+
+    pub fn launchGqaAttentionDecodeScalarsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        attn_or_mask: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        batch: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        mask_len: usize,
+        bias_mode: u32,
+    ) driver_mod.Error!GqaAttentionLaunchKind {
+        const function = self.gqa_attention_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
+        if (head_dim > 512) return error.CudaKernelUnavailable;
+        const q_hidden = try checkedTensorElements(num_heads, head_dim);
+        const kv_hidden = try checkedTensorElements(num_kv_heads, head_dim);
+        const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
+        const kv_count = try checkedTensorElements(try checkedTensorElements(batch, kv_seq_len), kv_hidden);
+        try checkBytes(dst, q_count);
+        try checkBytes(q, q_count);
+        try checkBytes(k, kv_count);
+        try checkBytes(v, kv_count);
+        try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
+        if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
+        if (q_count == 0) return .none;
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = attn_or_mask.ptr;
+        var bias_ptr = bias.ptr;
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var batch_u32 = try toU32(batch);
+        var q_seq_len_u32 = try toU32(q_seq_len);
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var total_sequence_len_u32 = try toU32(total_sequence_len);
+        var mask_len_u32 = try toU32(mask_len);
+        var bias_mode_u32 = bias_mode;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&q_seq_len_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&total_sequence_len_u32),
+            @ptrCast(&mask_len_u32),
+            @ptrCast(&bias_mode_u32),
+            @ptrCast(&decode_scalars_ptr),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_scalars dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} fallback_query_position_offset={d} fallback_kv_seq_len={d} fallback_total_sequence_len={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                decode_scalars_ptr,
+                query_position_offset_u32,
+                kv_seq_len_u32,
+                total_sequence_len_u32,
+            });
+        }
+        const block: c_uint = if (head_dim <= 256) 256 else 512;
+        const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+            function,
+            grid,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            ctx.stream,
+            &params,
+            null,
+        ));
+        ctx.noteKernelLaunch();
+        return .decode;
+    }
+
+    pub fn launchKvWriteSuffixDecodeScalarsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        k_dst: buffer_mod.DeviceBuffer,
+        v_dst: buffer_mod.DeviceBuffer,
+        k_src: buffer_mod.DeviceBuffer,
+        v_src: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        suffix_token_count: usize,
+        row_width: usize,
+        fallback_total_token_count: usize,
+    ) driver_mod.Error!void {
+        const function = self.kv_write_suffix_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        const total = try checkedTensorElements(suffix_token_count, row_width);
+        try checkBytes(k_src, total);
+        try checkBytes(v_src, total);
+        try checkBytes(k_dst, try checkedTensorElements(fallback_total_token_count, row_width));
+        try checkBytes(v_dst, try checkedTensorElements(fallback_total_token_count, row_width));
+
+        var k_dst_ptr = k_dst.ptr;
+        var v_dst_ptr = v_dst.ptr;
+        var k_src_ptr = k_src.ptr;
+        var v_src_ptr = v_src.ptr;
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var suffix_token_count_u32 = try toU32(suffix_token_count);
+        var row_width_u32 = try toU32(row_width);
+        var fallback_total_token_count_u32 = try toU32(fallback_total_token_count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&k_dst_ptr),
+            @ptrCast(&v_dst_ptr),
+            @ptrCast(&k_src_ptr),
+            @ptrCast(&v_src_ptr),
+            @ptrCast(&decode_scalars_ptr),
+            @ptrCast(&suffix_token_count_u32),
+            @ptrCast(&row_width_u32),
+            @ptrCast(&fallback_total_token_count_u32),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=kv_write_suffix_decode_scalars k_dst=0x{x} v_dst=0x{x} k_src=0x{x} v_src=0x{x} scalars=0x{x} suffix={d} row_width={d} fallback_total_token_count={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                k_dst_ptr,
+                v_dst_ptr,
+                k_src_ptr,
+                v_src_ptr,
+                decode_scalars_ptr,
+                suffix_token_count_u32,
+                row_width_u32,
+                fallback_total_token_count_u32,
+            });
+        }
+        try launch1d(function, ctx, total, &params);
     }
 
     pub fn launchDebertaAttentionF32(
@@ -3767,6 +4094,37 @@ pub fn smokeFill(allocator: std.mem.Allocator) !void {
     try ctx.synchronize();
     for (out) |v| {
         if (@abs(v - 3.5) > 0.00001) return error.CudaSmokeMismatch;
+    }
+}
+
+pub fn smokeGraphCapture(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    const count: usize = 16;
+    var buf = try buffer_mod.DeviceBuffer.alloc(&ctx, count * @sizeOf(f32));
+    defer buf.free(&ctx);
+    try module.launchFillF32(&ctx, buf, count, 0.0);
+    try ctx.synchronize();
+
+    try ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    try module.launchFillF32(&ctx, buf, count, 4.25);
+    const graph = try ctx.endStreamCapture();
+    defer ctx.destroyGraph(graph);
+    const exec = try ctx.instantiateGraph(graph);
+    defer ctx.destroyGraphExec(exec);
+
+    try ctx.launchGraph(exec);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, count);
+    defer allocator.free(out);
+    try buf.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    for (out) |v| {
+        if (@abs(v - 4.25) > 0.00001) return error.CudaSmokeMismatch;
     }
 }
 

@@ -168,6 +168,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: fill_f32 ok\n", .{});
+            cuda_kernels.smokeGraphCapture(allocator) catch |err| {
+                print("smoke: graph_capture failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: graph_capture ok\n", .{});
             cuda_kernels.smokeDenseF32(allocator) catch |err| {
                 print("smoke: dense_f32 failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);

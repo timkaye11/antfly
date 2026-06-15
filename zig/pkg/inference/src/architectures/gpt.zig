@@ -417,6 +417,43 @@ pub fn forward(
     return forwardFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
 }
 
+/// Run embeddings and transformer layers for KV/cache side effects without
+/// projecting logits or materializing anything on the host.
+pub fn forwardHiddenOnly(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !void {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+
+    const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    var deepseek_v4_decode_context_storage: DecodeContext = undefined;
+    const effective_decode_context = deepSeekV4DecodeContextWithInputIds(
+        config,
+        input_ids,
+        total,
+        seq_len,
+        query_seq_len,
+        decode_context,
+        &deepseek_v4_decode_context_storage,
+    );
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
+    cb.free(hidden_result.hidden);
+}
+
 pub fn forwardGreedyLastToken(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -829,8 +866,59 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !GreedyDeviceTokenResult {
-    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var prepared_final_hidden_input = false;
+    if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(hidden_input)) |prepared| {
+            final_hidden_input = prepared;
+            prepared_final_hidden_input = true;
+            cb.free(hidden_input);
+        }
+        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+
+        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len);
+        if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |hidden| {
+            if (prepared_final_hidden_input) {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+            }
+            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, .{
+                .hidden = hidden,
+                .total_rows = batch * query_seq_len,
+            });
+        }
+        capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
+        if (capture_final_hidden) try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors);
+    prepared_final_hidden_input = false;
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
     return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
+}
+
+fn cudaCaptureFinalHiddenProbeEnabled(
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) bool {
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false)) return false;
+    if (cb.kind() != .cuda) return false;
+    if (batch != 1) return false;
+    return actualQuerySeqLen(seq_len, decode_context) == 1;
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -1115,6 +1203,7 @@ fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
         hidden = with_pos;
     }
 
+    try cb.debugCudaTraceTensor("gpt.positioned_input", hidden);
     owns_hidden = false;
     return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
         cb,
@@ -1317,6 +1406,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         hidden = carrier.active();
         owns_hidden = false;
     }
+    try cb.debugCudaTraceTensor("gpt.decoder_input", hidden);
     if (!isDecodeStep(decode_context)) {
         try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "input", hidden, hidden_size);
     }
@@ -1414,6 +1504,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (!isDecodeStep(decode_context)) {
         try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "pre_final_norm", hidden, hidden_size);
     }
+    try cb.debugCudaTraceTensor("gpt.pre_final_norm", hidden);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "pre_final_norm", null, hidden, hidden_size);
 
     // 4. Final layer norm
@@ -1437,6 +1528,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (!isDecodeStep(decode_context)) {
         try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "final_norm", hidden, hidden_size);
     }
+    try cb.debugCudaTraceTensor("gpt.final_hidden", hidden);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "final_norm", null, hidden, hidden_size);
 
     return .{

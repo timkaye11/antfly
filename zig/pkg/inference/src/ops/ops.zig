@@ -796,6 +796,46 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, target);
     }
 
+    pub fn debugCudaGraphCaptureBegin(self: *const ComputeBackend, label: []const u8) !bool {
+        const op = self.vtable.debugCudaGraphCaptureBegin orelse return false;
+        return op(self.ptr, label);
+    }
+
+    pub fn debugCudaGraphPrepareDecodeScalars(self: *const ComputeBackend, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize) !bool {
+        const op = self.vtable.debugCudaGraphPrepareDecodeScalars orelse return false;
+        return op(self.ptr, position_offset, query_position_offset, kv_seq_len, total_sequence_len);
+    }
+
+    pub fn debugCudaTraceTensor(self: *const ComputeBackend, label: []const u8, tensor: CT) !void {
+        const op = self.vtable.debugCudaTraceTensor orelse return;
+        return op(self.ptr, label, tensor);
+    }
+
+    pub fn debugCudaGraphRegisterFinalHiddenReplayBoundary(self: *const ComputeBackend, input: CT, output: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayBoundary orelse return;
+        return op(self.ptr, input, output);
+    }
+
+    pub fn debugCudaGraphRegisterFinalHiddenReplayInput(self: *const ComputeBackend, input: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayInput orelse return;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphReplayFinalHidden(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphReplayFinalHidden orelse return null;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphCaptureEnd(self: *const ComputeBackend, replay: bool) !void {
+        const op = self.vtable.debugCudaGraphCaptureEnd orelse return;
+        return op(self.ptr, replay);
+    }
+
     pub const VTable = struct {
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
         deinitBackend: *const fn (ctx: *anyopaque) void,
@@ -824,6 +864,15 @@ pub const ComputeBackend = struct {
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
+
+        debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
+        debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize) anyerror!bool = null,
+        debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
 
         /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
