@@ -491,13 +491,19 @@ pub const KernelModule = struct {
             self.attention_f32_block != null;
     }
 
-    pub fn hasGliner2Primitives(self: *const KernelModule) bool {
+    pub fn hasDebertaRerankerPrimitives(self: *const KernelModule) bool {
         return self.hasClipClapPrimitives() and
+            self.take_rows_f32 != null and
+            self.deberta_attention_f32 != null and
+            self.split_last_dim3_f32 != null;
+    }
+
+    pub fn hasGliner2Primitives(self: *const KernelModule) bool {
+        return self.hasDebertaRerankerPrimitives() and
             self.take_rows_f32 != null and
             self.gliner_word_embeddings_f32 != null and
             self.repeat_first_row_f32 != null and
             self.gliner_gru_combine_f32 != null and
-            self.deberta_attention_f32 != null and
             self.split_last_dim3_f32 != null;
     }
 

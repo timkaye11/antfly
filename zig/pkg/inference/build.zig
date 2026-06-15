@@ -565,6 +565,33 @@ pub fn build(b: *std.Build) void {
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
+    const reranker_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-reranker-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/reranker_e2e.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    reranker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    reranker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    reranker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
+    configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
+    if (b.args) |args| {
+        run_reranker_e2e_bench.addArgs(args);
+    }
+    const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
+    reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
+
     const audio_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-audio-bench",
         .root_module = b.createModule(.{

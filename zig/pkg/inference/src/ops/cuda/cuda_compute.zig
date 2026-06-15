@@ -52,6 +52,7 @@ pub const CudaTensor = struct {
 
 pub const CapabilityProfile = enum {
     clipclap,
+    deberta_reranker,
     gliner2,
     gemma4,
 };
@@ -528,6 +529,7 @@ pub const CudaCompute = struct {
     pub fn supportsProfile(self: *const CudaCompute, profile: CapabilityProfile) bool {
         return switch (profile) {
             .clipclap => self.kernels.hasClipClapPrimitives(),
+            .deberta_reranker => self.kernels.hasDebertaRerankerPrimitives(),
             .gliner2 => self.kernels.hasGliner2Primitives(),
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and

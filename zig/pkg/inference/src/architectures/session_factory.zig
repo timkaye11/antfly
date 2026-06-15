@@ -70,6 +70,7 @@ const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cud
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
+    deberta_reranker,
     gliner2,
     gemma4,
 };
@@ -647,7 +648,7 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
         };
     }
     return switch (model_type) {
-        .classifier => .classifier,
+        .classifier, .reranker => .classifier,
         .recognizer => .recognizer,
         else => .generic,
     };
@@ -1359,7 +1360,8 @@ fn cudaRequiresGemma4DecoderPrimitives(arch_config: ArchConfig) bool {
 fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
     return switch (arch_config) {
         .clip, .clap => .clipclap,
-        .deberta, .gliner => .gliner2,
+        .deberta => .deberta_reranker,
+        .gliner => .gliner2,
         .gpt => |cfg| if (cfg.family == .gemma) .gemma4 else null,
         else => null,
     };
@@ -1373,6 +1375,7 @@ test "cuda support gate admits Gemma-family GPT only after decoder primitives ex
     try std.testing.expect(!cudaRequiresGemma4DecoderPrimitives(.{ .gliner = .{} }));
     if (comptime build_options.enable_cuda) {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
     }
@@ -4138,8 +4141,10 @@ test "makeBertConfig carries num_labels from manifest" {
 
 test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.classifier, null));
+    try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.reranker, null));
     try std.testing.expectEqual(@as(SessionTask, .recognizer), sessionTaskForModelType(.recognizer, null));
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.embedder, null));
+    try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
 test "detectArchitecture recognizes generic deberta classifier configs" {
@@ -5193,11 +5198,12 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
             const attention_mask = inputs[1].asInt64();
-            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
-            defer allocator.free(hidden);
 
             if (self.task == .classifier) {
-                const logits = try runDebertaSequenceClassifier(&cb, allocator, cfg, hidden, batch, seq_len);
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+                defer cb.free(hidden_ct);
+
+                const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
                 defer allocator.free(logits);
 
                 const logits_shape = [_]i64{ @intCast(batch), @intCast(cfg.num_labels) };
@@ -5208,6 +5214,10 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 result[0] = output_tensor;
                 return result;
             }
+
+            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            defer allocator.free(hidden);
+
             if (self.task == .recognizer) {
                 const logits = try runTokenClassifier(&cb, allocator, hidden, batch, seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
@@ -5784,6 +5794,96 @@ fn runDebertaSequenceClassifier(
     defer allocator.free(pooled);
 
     return runLinearHead(allocator, cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
+}
+
+fn runDebertaSequenceClassifierCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+) ![]f32 {
+    const H: usize = @intCast(cfg.hidden_size);
+    const cls_embeddings = try extractClsEmbeddingsCt(cb, allocator, hidden, batch, seq_len, H);
+    defer cb.free(cls_embeddings);
+
+    const pooled = try maybeApplyPoolerCt(cb, allocator, cls_embeddings, batch, H, "pooler.dense.weight", "pooler.dense.bias");
+    defer cb.free(pooled);
+
+    const logits = try runLinearHeadCt(cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
+    defer cb.free(logits);
+    return try cb.toFloat32(logits, allocator);
+}
+
+fn extractClsEmbeddingsCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) !ops.CT {
+    const row_ids = try allocator.alloc(u32, batch);
+    defer allocator.free(row_ids);
+    for (0..batch) |b| row_ids[b] = @intCast(b * seq_len);
+
+    if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |cls| {
+        return cls;
+    }
+
+    const hidden_f32 = try cb.toFloat32(hidden, allocator);
+    defer allocator.free(hidden_f32);
+    const cls_f32 = try extractClsEmbeddings(allocator, hidden_f32, batch, seq_len, hidden_size);
+    defer allocator.free(cls_f32);
+    const shape = [_]i32{ @intCast(batch), @intCast(hidden_size) };
+    return try cb.fromFloat32Shape(cls_f32, &shape);
+}
+
+fn maybeApplyPoolerCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cls_embeddings: ops.CT,
+    batch: usize,
+    hidden_size: usize,
+    weight_name: []const u8,
+    bias_name: []const u8,
+) !ops.CT {
+    const pool_w = cb.getWeight(weight_name) catch |err| switch (err) {
+        error.WeightNotFound => {
+            const shape = [_]i32{ @intCast(batch), @intCast(hidden_size) };
+            if (try cb.cloneTensorShape(cls_embeddings, &shape)) |clone| return clone;
+            const cls_f32 = try cb.toFloat32(cls_embeddings, allocator);
+            defer allocator.free(cls_f32);
+            return try cb.fromFloat32Shape(cls_f32, &shape);
+        },
+        else => return err,
+    };
+    defer cb.free(pool_w);
+    const pool_b = try cb.getWeight(bias_name);
+    defer cb.free(pool_b);
+
+    const pooled_ct = try cb.linear(cls_embeddings, pool_w, pool_b, batch, hidden_size, hidden_size);
+    defer cb.free(pooled_ct);
+
+    return try cb.tanh_act(pooled_ct);
+}
+
+fn runLinearHeadCt(
+    cb: *const ops.ComputeBackend,
+    input: ops.CT,
+    batch: usize,
+    input_dim: usize,
+    output_dim_u32: u32,
+    weight_name: []const u8,
+    bias_name: []const u8,
+) !ops.CT {
+    const output_dim: usize = @intCast(output_dim_u32);
+    const weight = try cb.getWeight(weight_name);
+    defer cb.free(weight);
+    const bias = try cb.getWeight(bias_name);
+    defer cb.free(bias);
+    return try cb.linear(input, weight, bias, batch, input_dim, output_dim);
 }
 
 fn runTokenClassifier(

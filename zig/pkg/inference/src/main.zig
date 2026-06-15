@@ -99,6 +99,8 @@ pub fn runFromArgs(
         try inference.native_embed.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "classify")) {
         try inference.native_classify.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "rerank")) {
+        try inference.native_rerank.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
         try inference.native_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
@@ -294,6 +296,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  run       Start the inference server
         \\  embed     Run native text/image/audio embedding from the command line
         \\  classify  Run native text classification from the command line
+        \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors

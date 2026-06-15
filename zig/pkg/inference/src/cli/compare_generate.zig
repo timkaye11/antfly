@@ -2679,6 +2679,7 @@ fn compareRuntimeTopLogits(phase: []const u8, native: []const TopLogit, cuda: []
 }
 
 fn printRuntimeParityCudaStats(session: backends.Session) void {
+    if (comptime !build_options.enable_cuda) return;
     if (session_factory.getCudaRuntimeStats(session)) |stats| {
         print(
             "runtime_parity_cuda_stats: launches={d} syncs={d} upload_syncs={d} download_syncs={d} linear={d} attention={d} h2d={d} d2h={d} device_kv_attempts={d} device_kv_successes={d} host_attention_fallbacks={d}\n",

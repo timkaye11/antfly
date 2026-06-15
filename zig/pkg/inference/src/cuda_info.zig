@@ -159,6 +159,7 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         };
         defer compute.deinit();
         print("capability_clipclap: {}\n", .{compute.supportsProfile(.clipclap)});
+        print("capability_deberta_reranker: {}\n", .{compute.supportsProfile(.deberta_reranker)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
         print("capability_gemma4: {}\n", .{compute.supportsProfile(.gemma4)});
 
