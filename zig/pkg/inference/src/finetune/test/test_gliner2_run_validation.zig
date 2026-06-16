@@ -416,7 +416,7 @@ test "GLiNER2 autodiff run validator enforces Metal graph residency counters" {
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = metrics_path,
         .data =
-        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_runtime_region_dispatches":2,"graph_executor_runtime_region_fallbacks":0,"graph_executor_runtime_region_elided_nodes":5,"metal_deberta_ffn_forward_regions":1,"metal_deberta_attention_flash_calls":1,"metal_deberta_attention_gemm_fallbacks":0,"metal_deberta_ffn_fused_calls":1,"metal_deberta_ffn_fused_fallbacks":0}
+        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_host_outputs":4,"graph_executor_runtime_region_dispatches":2,"graph_executor_runtime_region_fallbacks":0,"graph_executor_runtime_region_elided_nodes":5,"graph_executor_runtime_frame_metadata_ready":1,"graph_executor_runtime_frame_ineligible_missing_model_metadata":1,"metal_deberta_ffn_forward_regions":1,"metal_deberta_encoder_lora_layer_regions":1,"metal_deberta_encoder_lora_residual_layernorm_regions":1,"metal_deberta_encoder_lora_layer_scaffold_regions":0,"metal_deberta_encoder_lora_layer_fallbacks":0,"metal_deberta_encoder_layer_successes":1,"metal_deberta_attention_flash_calls":1,"metal_deberta_attention_gemm_fallbacks":0,"metal_deberta_ffn_fused_calls":1,"metal_deberta_ffn_fused_fallbacks":0}
         \\{"event":"epoch","avg_loss":1.0}
         \\
         ,
@@ -431,17 +431,32 @@ test "GLiNER2 autodiff run validator enforces Metal graph residency counters" {
     try std.testing.expectError(error.MetalDebertaFfnForwardRegionCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
         .min_metal_deberta_ffn_forward_region_count = 2,
     }));
+    try std.testing.expectError(error.MetalDebertaEncoderLoraLayerRegionCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_encoder_lora_layer_region_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLoraResidualLayerNormRegionCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_encoder_lora_residual_layernorm_region_count = 2,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLayerSuccessCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
+        .min_metal_deberta_encoder_layer_success_count = 2,
+    }));
     try std.testing.expectError(error.MetalDebertaAttentionFlashCallCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
         .min_metal_deberta_attention_flash_call_count = 2,
     }));
     try std.testing.expectError(error.MetalDebertaFfnFusedCallCountBelowThreshold, validation.validateRun(allocator, out_dir, .{
         .min_metal_deberta_ffn_fused_call_count = 2,
     }));
+    try std.testing.expectError(error.GraphHostOutputCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_graph_host_output_count = 3,
+    }));
+    try std.testing.expectError(error.RuntimeFrameIneligibleMissingModelMetadataAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_runtime_frame_ineligible_missing_model_metadata = 0,
+    }));
 
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = metrics_path,
         .data =
-        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_runtime_region_dispatches":2,"graph_executor_runtime_region_fallbacks":1,"graph_executor_runtime_region_elided_nodes":5,"metal_deberta_attention_flash_calls":1,"metal_deberta_attention_gemm_fallbacks":1,"metal_deberta_ffn_fused_calls":1,"metal_deberta_ffn_fused_fallbacks":1}
+        \\{"event":"step","loss":1.0,"supervised_token_count":4,"entity_token_count":1,"ignored_token_count":0,"target_build_ms":1.0,"train_step_ms":9.0,"step_wall_ms":10.0,"graph_build_ms":1.0,"runtime_input_ms":1.0,"autodiff_ms":2.0,"execute_ms":3.0,"extract_ms":1.0,"optimizer_update_ms":1.0,"trainer_total_ms":8.0,"peak_resident_bytes":1024,"supervised_tokens_per_second":400.0,"graph_executor_runtime_region_dispatches":2,"graph_executor_runtime_region_fallbacks":1,"graph_executor_runtime_region_elided_nodes":5,"metal_deberta_encoder_lora_layer_fallbacks":1,"metal_deberta_attention_flash_calls":1,"metal_deberta_attention_gemm_fallbacks":1,"metal_deberta_ffn_fused_calls":1,"metal_deberta_ffn_fused_fallbacks":1}
         \\{"event":"epoch","avg_loss":1.0}
         \\
         ,
@@ -452,6 +467,9 @@ test "GLiNER2 autodiff run validator enforces Metal graph residency counters" {
     }));
     try std.testing.expectError(error.MetalDebertaAttentionGemmFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
         .max_metal_deberta_attention_gemm_fallback_count = 0,
+    }));
+    try std.testing.expectError(error.MetalDebertaEncoderLoraLayerFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
+        .max_metal_deberta_encoder_lora_layer_fallback_count = 0,
     }));
     try std.testing.expectError(error.MetalDebertaFfnFusedFallbackCountAboveThreshold, validation.validateRun(allocator, out_dir, .{
         .max_metal_deberta_ffn_fused_fallback_count = 0,

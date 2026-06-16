@@ -59,6 +59,8 @@ Options:
                         Fail readiness unless in-frame buffer reuse hits at least N
   --max-graph-command-dispatch-count N
                         Fail readiness if graph command dispatches exceed N
+  --max-graph-host-output-count N
+                        Fail readiness if graph host outputs exceed N
   --max-metal-frame-gpu-ms N
                         Fail readiness if any Metal frame GPU duration exceeds N ms
   --max-metal-last-frame-compute-encoder-count N
@@ -77,14 +79,22 @@ Options:
                         Fail readiness unless runtime regions elide at least N graph nodes
   --min-metal-deberta-ffn-forward-region-count N
                         Fail readiness unless graph-level DeBERTa FFN forward regions run at least N times
+  --min-metal-deberta-encoder-lora-layer-region-count N
+                        Fail readiness unless LoRA-aware DeBERTa encoder-layer regions run at least N times
+  --max-metal-deberta-encoder-lora-layer-fallback-count N
+                        Fail readiness if LoRA-aware DeBERTa encoder-layer fallbacks exceed N
   --min-metal-deberta-attention-flash-call-count N
                         Fail readiness unless fused DeBERTa attention runs at least N times
   --max-metal-deberta-attention-gemm-fallback-count N
                         Fail readiness if fused DeBERTa attention GEMM fallbacks exceed N
+  --min-metal-deberta-encoder-layer-success-count N
+                        Fail readiness unless DeBERTa encoder-layer runtime calls succeed at least N times
   --min-metal-deberta-ffn-fused-call-count N
                         Fail readiness unless fused DeBERTa FFN runs at least N times
   --max-metal-deberta-ffn-fused-fallback-count N
                         Fail readiness if fused DeBERTa FFN fallbacks exceed N
+  --max-runtime-frame-ineligible-missing-model-metadata N
+                        Fail readiness if runtime-frame candidates are blocked by missing model metadata more than N times
   --max-commands N      train-profile graph-exec command ceiling (default: 6200)
   --max-host-outputs N  train-profile host-output ceiling (default: 500)
   --max-runtime-region-fallbacks N
@@ -145,6 +155,7 @@ max_runtime_region_fallbacks=0
 min_graph_regions=1
 min_runtime_plan_dispatches=1
 max_graph_command_dispatch_count=""
+max_graph_host_output_count=""
 max_metal_frame_gpu_ms=""
 max_metal_last_frame_compute_encoder_count=""
 max_metal_tensor_device_owned_peak_live_bytes=""
@@ -161,10 +172,15 @@ min_graph_runtime_region_dispatch_count=""
 max_graph_runtime_region_fallback_count=""
 min_graph_runtime_region_elided_node_count=""
 min_metal_deberta_ffn_forward_region_count=""
+min_metal_deberta_encoder_lora_layer_region_count=""
+min_metal_deberta_encoder_lora_residual_layernorm_region_count=""
+max_metal_deberta_encoder_lora_layer_fallback_count=""
 min_metal_deberta_attention_flash_call_count=""
 max_metal_deberta_attention_gemm_fallback_count=""
+min_metal_deberta_encoder_layer_success_count=""
 min_metal_deberta_ffn_fused_call_count=""
 max_metal_deberta_ffn_fused_fallback_count=""
+max_runtime_frame_ineligible_missing_model_metadata=""
 require_slot_bound_outputs=0
 require_eager_arena_outputs=0
 require_chunk_local_outputs=0
@@ -294,6 +310,10 @@ while [[ $# -gt 0 ]]; do
       max_graph_command_dispatch_count="${2:?missing value for --max-graph-command-dispatch-count}"
       shift 2
       ;;
+    --max-graph-host-output-count)
+      max_graph_host_output_count="${2:?missing value for --max-graph-host-output-count}"
+      shift 2
+      ;;
     --max-metal-frame-gpu-ms)
       max_metal_frame_gpu_ms="${2:?missing value for --max-metal-frame-gpu-ms}"
       shift 2
@@ -330,6 +350,18 @@ while [[ $# -gt 0 ]]; do
       min_metal_deberta_ffn_forward_region_count="${2:?missing value for --min-metal-deberta-ffn-forward-region-count}"
       shift 2
       ;;
+    --min-metal-deberta-encoder-lora-layer-region-count)
+      min_metal_deberta_encoder_lora_layer_region_count="${2:?missing value for --min-metal-deberta-encoder-lora-layer-region-count}"
+      shift 2
+      ;;
+    --min-metal-deberta-encoder-lora-residual-layernorm-region-count)
+      min_metal_deberta_encoder_lora_residual_layernorm_region_count="${2:?missing value for --min-metal-deberta-encoder-lora-residual-layernorm-region-count}"
+      shift 2
+      ;;
+    --max-metal-deberta-encoder-lora-layer-fallback-count)
+      max_metal_deberta_encoder_lora_layer_fallback_count="${2:?missing value for --max-metal-deberta-encoder-lora-layer-fallback-count}"
+      shift 2
+      ;;
     --min-metal-deberta-attention-flash-call-count)
       min_metal_deberta_attention_flash_call_count="${2:?missing value for --min-metal-deberta-attention-flash-call-count}"
       shift 2
@@ -338,12 +370,20 @@ while [[ $# -gt 0 ]]; do
       max_metal_deberta_attention_gemm_fallback_count="${2:?missing value for --max-metal-deberta-attention-gemm-fallback-count}"
       shift 2
       ;;
+    --min-metal-deberta-encoder-layer-success-count)
+      min_metal_deberta_encoder_layer_success_count="${2:?missing value for --min-metal-deberta-encoder-layer-success-count}"
+      shift 2
+      ;;
     --min-metal-deberta-ffn-fused-call-count)
       min_metal_deberta_ffn_fused_call_count="${2:?missing value for --min-metal-deberta-ffn-fused-call-count}"
       shift 2
       ;;
     --max-metal-deberta-ffn-fused-fallback-count)
       max_metal_deberta_ffn_fused_fallback_count="${2:?missing value for --max-metal-deberta-ffn-fused-fallback-count}"
+      shift 2
+      ;;
+    --max-runtime-frame-ineligible-missing-model-metadata)
+      max_runtime_frame_ineligible_missing_model_metadata="${2:?missing value for --max-runtime-frame-ineligible-missing-model-metadata}"
       shift 2
       ;;
     --max-commands)
@@ -526,6 +566,9 @@ append_metal_runtime_threshold_args() {
   if [[ -n "${max_graph_command_dispatch_count}" ]]; then
     cmd+=("--max-graph-command-dispatch-count" "${max_graph_command_dispatch_count}")
   fi
+  if [[ -n "${max_graph_host_output_count}" ]]; then
+    cmd+=("--max-graph-host-output-count" "${max_graph_host_output_count}")
+  fi
   if [[ -n "${max_metal_frame_gpu_ms}" ]]; then
     cmd+=("--max-metal-frame-gpu-ms" "${max_metal_frame_gpu_ms}")
   fi
@@ -553,17 +596,32 @@ append_metal_runtime_threshold_args() {
   if [[ -n "${min_metal_deberta_ffn_forward_region_count}" ]]; then
     cmd+=("--min-metal-deberta-ffn-forward-region-count" "${min_metal_deberta_ffn_forward_region_count}")
   fi
+  if [[ -n "${min_metal_deberta_encoder_lora_layer_region_count}" ]]; then
+    cmd+=("--min-metal-deberta-encoder-lora-layer-region-count" "${min_metal_deberta_encoder_lora_layer_region_count}")
+  fi
+  if [[ -n "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}" ]]; then
+    cmd+=("--min-metal-deberta-encoder-lora-residual-layernorm-region-count" "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}")
+  fi
+  if [[ -n "${max_metal_deberta_encoder_lora_layer_fallback_count}" ]]; then
+    cmd+=("--max-metal-deberta-encoder-lora-layer-fallback-count" "${max_metal_deberta_encoder_lora_layer_fallback_count}")
+  fi
   if [[ -n "${min_metal_deberta_attention_flash_call_count}" ]]; then
     cmd+=("--min-metal-deberta-attention-flash-call-count" "${min_metal_deberta_attention_flash_call_count}")
   fi
   if [[ -n "${max_metal_deberta_attention_gemm_fallback_count}" ]]; then
     cmd+=("--max-metal-deberta-attention-gemm-fallback-count" "${max_metal_deberta_attention_gemm_fallback_count}")
   fi
+  if [[ -n "${min_metal_deberta_encoder_layer_success_count}" ]]; then
+    cmd+=("--min-metal-deberta-encoder-layer-success-count" "${min_metal_deberta_encoder_layer_success_count}")
+  fi
   if [[ -n "${min_metal_deberta_ffn_fused_call_count}" ]]; then
     cmd+=("--min-metal-deberta-ffn-fused-call-count" "${min_metal_deberta_ffn_fused_call_count}")
   fi
   if [[ -n "${max_metal_deberta_ffn_fused_fallback_count}" ]]; then
     cmd+=("--max-metal-deberta-ffn-fused-fallback-count" "${max_metal_deberta_ffn_fused_fallback_count}")
+  fi
+  if [[ -n "${max_runtime_frame_ineligible_missing_model_metadata}" ]]; then
+    cmd+=("--max-runtime-frame-ineligible-missing-model-metadata" "${max_runtime_frame_ineligible_missing_model_metadata}")
   fi
 }
 
@@ -620,7 +678,7 @@ json_log_value() {
 
 assert_production_summary_log() {
   local log_file="$1"
-  local status manifest_backend optimizer_backend optimizer_mismatch trainable_transfers resident_transfers adapter_tensors task_head_tensors steps supervised_tokens execute_ms graph_commands graph_planned owned_peak_bytes metal_gpu_ms metal_compute_encoders chunk_boundaries chunk_promoted chunk_swept runtime_regions runtime_region_fallbacks runtime_region_elided_nodes deberta_ffn_forward_regions deberta_flash_calls deberta_gemm_fallbacks deberta_ffn_fused_calls deberta_ffn_fused_fallbacks
+  local status manifest_backend optimizer_backend optimizer_mismatch trainable_transfers resident_transfers adapter_tensors task_head_tensors steps supervised_tokens execute_ms graph_commands graph_planned owned_peak_bytes metal_gpu_ms metal_compute_encoders chunk_boundaries chunk_promoted chunk_swept runtime_regions runtime_region_fallbacks runtime_region_elided_nodes deberta_ffn_forward_regions deberta_lora_layer_regions deberta_lora_layer_fallbacks deberta_flash_calls deberta_gemm_fallbacks deberta_ffn_fused_calls deberta_ffn_fused_fallbacks
 
   status="$(json_log_value "${log_file}" "status")" || return 1
   [[ "${status}" == "passed" ]] || return 1
@@ -647,6 +705,10 @@ assert_production_summary_log() {
   runtime_region_fallbacks="$(json_log_value "${log_file}" "total_graph_runtime_region_fallbacks")" || return 1
   runtime_region_elided_nodes="$(json_log_value "${log_file}" "total_graph_runtime_region_elided_nodes")" || return 1
   deberta_ffn_forward_regions="$(json_log_value "${log_file}" "total_metal_deberta_ffn_forward_regions")" || return 1
+  deberta_lora_layer_regions="$(json_log_value "${log_file}" "total_metal_deberta_encoder_lora_layer_regions")" || return 1
+  deberta_lora_residual_layernorm_regions="$(json_log_value "${log_file}" "total_metal_deberta_encoder_lora_residual_layernorm_regions")" || return 1
+  deberta_lora_layer_scaffold_regions="$(json_log_value "${log_file}" "total_metal_deberta_encoder_lora_layer_scaffold_regions")" || return 1
+  deberta_lora_layer_fallbacks="$(json_log_value "${log_file}" "total_metal_deberta_encoder_lora_layer_fallbacks")" || return 1
   deberta_flash_calls="$(json_log_value "${log_file}" "total_metal_deberta_attention_flash_calls")" || return 1
   deberta_gemm_fallbacks="$(json_log_value "${log_file}" "total_metal_deberta_attention_gemm_fallbacks")" || return 1
   deberta_ffn_fused_calls="$(json_log_value "${log_file}" "total_metal_deberta_ffn_fused_calls")" || return 1
@@ -674,8 +736,8 @@ assert_production_summary_log() {
     return 1
   fi
 
-  printf 'production_profile_summary_assertions: status=%s manifest_backend=%s optimizer_backend=%s max_device_trainable_transfer_count=%s max_device_resident_transfer_count=%s peft_adapter_tensor_count=%s task_head_tensor_count=%s step_record_count=%s supervised_token_count=%s total_execute_ms=%s total_graph_command_dispatches=%s total_graph_planned_dispatches=%s max_metal_tensor_device_owned_peak_live_bytes=%s max_metal_frame_gpu_ms=%s max_metal_last_frame_compute_encoders=%s total_metal_frame_chunk_boundaries=%s total_metal_frame_chunk_promoted_values=%s total_metal_frame_chunk_swept_values=%s total_graph_runtime_region_dispatches=%s total_graph_runtime_region_fallbacks=%s total_graph_runtime_region_elided_nodes=%s total_metal_deberta_ffn_forward_regions=%s total_metal_deberta_attention_flash_calls=%s total_metal_deberta_attention_gemm_fallbacks=%s total_metal_deberta_ffn_fused_calls=%s total_metal_deberta_ffn_fused_fallbacks=%s\n' \
-    "${status}" "${manifest_backend}" "${optimizer_backend}" "${trainable_transfers}" "${resident_transfers}" "${adapter_tensors}" "${task_head_tensors}" "${steps}" "${supervised_tokens}" "${execute_ms}" "${graph_commands}" "${graph_planned}" "${owned_peak_bytes}" "${metal_gpu_ms}" "${metal_compute_encoders}" "${chunk_boundaries}" "${chunk_promoted}" "${chunk_swept}" "${runtime_regions}" "${runtime_region_fallbacks}" "${runtime_region_elided_nodes}" "${deberta_ffn_forward_regions}" "${deberta_flash_calls}" "${deberta_gemm_fallbacks}" "${deberta_ffn_fused_calls}" "${deberta_ffn_fused_fallbacks}"
+  printf 'production_profile_summary_assertions: status=%s manifest_backend=%s optimizer_backend=%s max_device_trainable_transfer_count=%s max_device_resident_transfer_count=%s peft_adapter_tensor_count=%s task_head_tensor_count=%s step_record_count=%s supervised_token_count=%s total_execute_ms=%s total_graph_command_dispatches=%s total_graph_planned_dispatches=%s max_metal_tensor_device_owned_peak_live_bytes=%s max_metal_frame_gpu_ms=%s max_metal_last_frame_compute_encoders=%s total_metal_frame_chunk_boundaries=%s total_metal_frame_chunk_promoted_values=%s total_metal_frame_chunk_swept_values=%s total_graph_runtime_region_dispatches=%s total_graph_runtime_region_fallbacks=%s total_graph_runtime_region_elided_nodes=%s total_metal_deberta_ffn_forward_regions=%s total_metal_deberta_encoder_lora_layer_regions=%s total_metal_deberta_encoder_lora_residual_layernorm_regions=%s total_metal_deberta_encoder_lora_layer_scaffold_regions=%s total_metal_deberta_encoder_lora_layer_fallbacks=%s total_metal_deberta_attention_flash_calls=%s total_metal_deberta_attention_gemm_fallbacks=%s total_metal_deberta_ffn_fused_calls=%s total_metal_deberta_ffn_fused_fallbacks=%s\n' \
+    "${status}" "${manifest_backend}" "${optimizer_backend}" "${trainable_transfers}" "${resident_transfers}" "${adapter_tensors}" "${task_head_tensors}" "${steps}" "${supervised_tokens}" "${execute_ms}" "${graph_commands}" "${graph_planned}" "${owned_peak_bytes}" "${metal_gpu_ms}" "${metal_compute_encoders}" "${chunk_boundaries}" "${chunk_promoted}" "${chunk_swept}" "${runtime_regions}" "${runtime_region_fallbacks}" "${runtime_region_elided_nodes}" "${deberta_ffn_forward_regions}" "${deberta_lora_layer_regions}" "${deberta_lora_residual_layernorm_regions}" "${deberta_lora_layer_scaffold_regions}" "${deberta_lora_layer_fallbacks}" "${deberta_flash_calls}" "${deberta_gemm_fallbacks}" "${deberta_ffn_fused_calls}" "${deberta_ffn_fused_fallbacks}"
 }
 
 assert_graph_exec_profile_log() {
@@ -1009,6 +1071,12 @@ run_batch32() {
   if [[ -z "${max_graph_runtime_region_fallback_count}" ]]; then
     max_graph_runtime_region_fallback_count=0
   fi
+  if [[ -z "${max_graph_host_output_count}" ]]; then
+    # Current safe batch32 graph path still materializes host outputs; keep the
+    # ceiling explicit so the production target can be tightened as residency
+    # work lands.
+    max_graph_host_output_count=1000
+  fi
   if [[ -z "${min_graph_runtime_region_elided_node_count}" ]]; then
     min_graph_runtime_region_elided_node_count=1
   fi
@@ -1017,11 +1085,28 @@ run_batch32() {
     # but it currently raises batch32 checkpointed residency enough to re-OOM.
     min_metal_deberta_ffn_forward_region_count=0
   fi
+  if [[ -z "${min_metal_deberta_encoder_lora_layer_region_count}" ]]; then
+    min_metal_deberta_encoder_lora_layer_region_count=0
+  fi
+  if [[ -z "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}" ]]; then
+    min_metal_deberta_encoder_lora_residual_layernorm_region_count=0
+  fi
+  if [[ -z "${max_metal_deberta_encoder_lora_layer_fallback_count}" ]]; then
+    max_metal_deberta_encoder_lora_layer_fallback_count=0
+  fi
   if [[ -z "${min_metal_deberta_attention_flash_call_count}" ]]; then
     min_metal_deberta_attention_flash_call_count=1
   fi
   if [[ -z "${max_metal_deberta_attention_gemm_fallback_count}" ]]; then
     max_metal_deberta_attention_gemm_fallback_count=0
+  fi
+  if [[ -z "${min_metal_deberta_encoder_layer_success_count}" ]]; then
+    # The full DeBERTa encoder-layer runtime path is the next speed milestone;
+    # keep the gate at zero until the opt-in region lands and parity passes.
+    min_metal_deberta_encoder_layer_success_count=0
+  fi
+  if [[ -z "${max_runtime_frame_ineligible_missing_model_metadata}" ]]; then
+    max_runtime_frame_ineligible_missing_model_metadata=1
   fi
 
   local -a cmd=(
@@ -1206,6 +1291,7 @@ run_production() {
     -n "${min_metal_chunk_local_output_consumed_hints}" ||
     -n "${min_metal_runtime_reuse_hit_count}" ||
     -n "${max_graph_command_dispatch_count}" ||
+    -n "${max_graph_host_output_count}" ||
     -n "${max_metal_frame_gpu_ms}" ||
     -n "${max_metal_last_frame_compute_encoder_count}" ||
     -n "${min_metal_frame_chunk_boundary_count}" ||
@@ -1215,10 +1301,15 @@ run_production() {
     -n "${max_graph_runtime_region_fallback_count}" ||
     -n "${min_graph_runtime_region_elided_node_count}" ||
     -n "${min_metal_deberta_ffn_forward_region_count}" ||
+    -n "${min_metal_deberta_encoder_lora_layer_region_count}" ||
+    -n "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}" ||
+    -n "${max_metal_deberta_encoder_lora_layer_fallback_count}" ||
     -n "${min_metal_deberta_attention_flash_call_count}" ||
     -n "${max_metal_deberta_attention_gemm_fallback_count}" ||
+    -n "${min_metal_deberta_encoder_layer_success_count}" ||
     -n "${min_metal_deberta_ffn_fused_call_count}" ||
-    -n "${max_metal_deberta_ffn_fused_fallback_count}" ]]; then
+    -n "${max_metal_deberta_ffn_fused_fallback_count}" ||
+    -n "${max_runtime_frame_ineligible_missing_model_metadata}" ]]; then
     cmd+=("--")
     append_metal_runtime_threshold_args
     if [[ "${#extra_args[@]}" -gt 0 ]]; then

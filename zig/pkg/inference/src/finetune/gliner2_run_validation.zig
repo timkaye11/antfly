@@ -51,6 +51,7 @@ pub const ValidationOptions = struct {
     min_metal_chunk_local_output_consumed_hints: ?u64 = null,
     min_metal_runtime_reuse_hit_count: ?u64 = null,
     max_graph_command_dispatch_count: ?u64 = null,
+    max_graph_host_output_count: ?u64 = null,
     max_metal_frame_gpu_ms: ?f64 = null,
     max_metal_last_frame_compute_encoder_count: ?u64 = null,
     min_metal_frame_chunk_boundary_count: ?u64 = null,
@@ -60,10 +61,15 @@ pub const ValidationOptions = struct {
     max_graph_runtime_region_fallback_count: ?u64 = null,
     min_graph_runtime_region_elided_node_count: ?u64 = null,
     min_metal_deberta_ffn_forward_region_count: ?u64 = null,
+    min_metal_deberta_encoder_lora_layer_region_count: ?u64 = null,
+    min_metal_deberta_encoder_lora_residual_layernorm_region_count: ?u64 = null,
+    max_metal_deberta_encoder_lora_layer_fallback_count: ?u64 = null,
     min_metal_deberta_attention_flash_call_count: ?u64 = null,
     max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
+    min_metal_deberta_encoder_layer_success_count: ?u64 = null,
     min_metal_deberta_ffn_fused_call_count: ?u64 = null,
     max_metal_deberta_ffn_fused_fallback_count: ?u64 = null,
+    max_runtime_frame_ineligible_missing_model_metadata: ?u64 = null,
 };
 
 pub const RunValidationSummary = struct {
@@ -144,6 +150,7 @@ pub const RunValidationSummary = struct {
     total_metal_chunk_local_output_reset_live_carry_values: u64,
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
+    total_graph_host_outputs: u64,
     max_metal_frame_gpu_ms: f64,
     max_metal_last_frame_compute_encoders: u64,
     total_metal_frame_chunk_boundaries: u64,
@@ -156,7 +163,22 @@ pub const RunValidationSummary = struct {
     total_graph_runtime_region_elided_nodes: u64,
     total_graph_runtime_region_plan_compiles: u64,
     total_graph_runtime_region_plan_reuses: u64,
+    total_graph_runtime_frame_metadata_ready: u64,
+    total_graph_runtime_frame_ineligible_no_regions: u64,
+    total_graph_runtime_frame_ineligible_missing_qkv: u64,
+    total_graph_runtime_frame_ineligible_missing_attention: u64,
+    total_graph_runtime_frame_ineligible_missing_ffn: u64,
+    total_graph_runtime_frame_ineligible_missing_ple: u64,
+    total_graph_runtime_frame_ineligible_single_row: u64,
+    total_graph_runtime_frame_ineligible_non_layer_order: u64,
+    total_graph_runtime_frame_ineligible_shape_mismatch: u64,
+    total_graph_runtime_frame_ineligible_missing_model_metadata: u64,
     total_metal_deberta_ffn_forward_regions: u64,
+    total_metal_deberta_encoder_lora_layer_regions: u64,
+    total_metal_deberta_encoder_lora_residual_layernorm_regions: u64,
+    total_metal_deberta_encoder_lora_layer_scaffold_regions: u64,
+    total_metal_deberta_encoder_lora_layer_fallbacks: u64,
+    total_metal_deberta_encoder_layer_successes: u64,
     total_metal_deberta_attention_flash_calls: u64,
     total_metal_deberta_attention_gemm_calls: u64,
     total_metal_deberta_attention_gemm_fallbacks: u64,
@@ -288,6 +310,9 @@ pub fn validateRun(
         if (max_dispatches == 0) return error.InvalidPerformanceThreshold;
         if (metrics.total_graph_command_dispatches > max_dispatches) return error.GraphCommandDispatchCountAboveThreshold;
     }
+    if (options.max_graph_host_output_count) |max_outputs| {
+        if (metrics.total_graph_host_outputs > max_outputs) return error.GraphHostOutputCountAboveThreshold;
+    }
     if (options.max_metal_frame_gpu_ms) |max_ms| {
         if (!std.math.isFinite(max_ms) or max_ms <= 0) return error.InvalidPerformanceThreshold;
         if (metrics.max_metal_frame_gpu_ms > max_ms) return error.MetalFrameGpuMsAboveThreshold;
@@ -317,17 +342,32 @@ pub fn validateRun(
     if (options.min_metal_deberta_ffn_forward_region_count) |min_regions| {
         if (metrics.total_metal_deberta_ffn_forward_regions < min_regions) return error.MetalDebertaFfnForwardRegionCountBelowThreshold;
     }
+    if (options.min_metal_deberta_encoder_lora_layer_region_count) |min_regions| {
+        if (metrics.total_metal_deberta_encoder_lora_layer_regions < min_regions) return error.MetalDebertaEncoderLoraLayerRegionCountBelowThreshold;
+    }
+    if (options.min_metal_deberta_encoder_lora_residual_layernorm_region_count) |min_regions| {
+        if (metrics.total_metal_deberta_encoder_lora_residual_layernorm_regions < min_regions) return error.MetalDebertaEncoderLoraResidualLayerNormRegionCountBelowThreshold;
+    }
+    if (options.max_metal_deberta_encoder_lora_layer_fallback_count) |max_fallbacks| {
+        if (metrics.total_metal_deberta_encoder_lora_layer_fallbacks > max_fallbacks) return error.MetalDebertaEncoderLoraLayerFallbackCountAboveThreshold;
+    }
     if (options.min_metal_deberta_attention_flash_call_count) |min_calls| {
         if (metrics.total_metal_deberta_attention_flash_calls < min_calls) return error.MetalDebertaAttentionFlashCallCountBelowThreshold;
     }
     if (options.max_metal_deberta_attention_gemm_fallback_count) |max_fallbacks| {
         if (metrics.total_metal_deberta_attention_gemm_fallbacks > max_fallbacks) return error.MetalDebertaAttentionGemmFallbackCountAboveThreshold;
     }
+    if (options.min_metal_deberta_encoder_layer_success_count) |min_successes| {
+        if (metrics.total_metal_deberta_encoder_layer_successes < min_successes) return error.MetalDebertaEncoderLayerSuccessCountBelowThreshold;
+    }
     if (options.min_metal_deberta_ffn_fused_call_count) |min_calls| {
         if (metrics.total_metal_deberta_ffn_fused_calls < min_calls) return error.MetalDebertaFfnFusedCallCountBelowThreshold;
     }
     if (options.max_metal_deberta_ffn_fused_fallback_count) |max_fallbacks| {
         if (metrics.total_metal_deberta_ffn_fused_fallbacks > max_fallbacks) return error.MetalDebertaFfnFusedFallbackCountAboveThreshold;
+    }
+    if (options.max_runtime_frame_ineligible_missing_model_metadata) |max_count| {
+        if (metrics.total_graph_runtime_frame_ineligible_missing_model_metadata > max_count) return error.RuntimeFrameIneligibleMissingModelMetadataAboveThreshold;
     }
     if (options.require_loss_decrease and !metrics.loss_decreased) return error.LossDidNotDecrease;
 
@@ -423,6 +463,7 @@ pub fn validateRun(
         .total_metal_chunk_local_output_reset_live_carry_values = metrics.total_metal_chunk_local_output_reset_live_carry_values,
         .total_graph_command_dispatches = metrics.total_graph_command_dispatches,
         .total_graph_planned_dispatches = metrics.total_graph_planned_dispatches,
+        .total_graph_host_outputs = metrics.total_graph_host_outputs,
         .max_metal_frame_gpu_ms = metrics.max_metal_frame_gpu_ms,
         .max_metal_last_frame_compute_encoders = metrics.max_metal_last_frame_compute_encoders,
         .total_metal_frame_chunk_boundaries = metrics.total_metal_frame_chunk_boundaries,
@@ -435,7 +476,22 @@ pub fn validateRun(
         .total_graph_runtime_region_elided_nodes = metrics.total_graph_runtime_region_elided_nodes,
         .total_graph_runtime_region_plan_compiles = metrics.total_graph_runtime_region_plan_compiles,
         .total_graph_runtime_region_plan_reuses = metrics.total_graph_runtime_region_plan_reuses,
+        .total_graph_runtime_frame_metadata_ready = metrics.total_graph_runtime_frame_metadata_ready,
+        .total_graph_runtime_frame_ineligible_no_regions = metrics.total_graph_runtime_frame_ineligible_no_regions,
+        .total_graph_runtime_frame_ineligible_missing_qkv = metrics.total_graph_runtime_frame_ineligible_missing_qkv,
+        .total_graph_runtime_frame_ineligible_missing_attention = metrics.total_graph_runtime_frame_ineligible_missing_attention,
+        .total_graph_runtime_frame_ineligible_missing_ffn = metrics.total_graph_runtime_frame_ineligible_missing_ffn,
+        .total_graph_runtime_frame_ineligible_missing_ple = metrics.total_graph_runtime_frame_ineligible_missing_ple,
+        .total_graph_runtime_frame_ineligible_single_row = metrics.total_graph_runtime_frame_ineligible_single_row,
+        .total_graph_runtime_frame_ineligible_non_layer_order = metrics.total_graph_runtime_frame_ineligible_non_layer_order,
+        .total_graph_runtime_frame_ineligible_shape_mismatch = metrics.total_graph_runtime_frame_ineligible_shape_mismatch,
+        .total_graph_runtime_frame_ineligible_missing_model_metadata = metrics.total_graph_runtime_frame_ineligible_missing_model_metadata,
         .total_metal_deberta_ffn_forward_regions = metrics.total_metal_deberta_ffn_forward_regions,
+        .total_metal_deberta_encoder_lora_layer_regions = metrics.total_metal_deberta_encoder_lora_layer_regions,
+        .total_metal_deberta_encoder_lora_residual_layernorm_regions = metrics.total_metal_deberta_encoder_lora_residual_layernorm_regions,
+        .total_metal_deberta_encoder_lora_layer_scaffold_regions = metrics.total_metal_deberta_encoder_lora_layer_scaffold_regions,
+        .total_metal_deberta_encoder_lora_layer_fallbacks = metrics.total_metal_deberta_encoder_lora_layer_fallbacks,
+        .total_metal_deberta_encoder_layer_successes = metrics.total_metal_deberta_encoder_layer_successes,
         .total_metal_deberta_attention_flash_calls = metrics.total_metal_deberta_attention_flash_calls,
         .total_metal_deberta_attention_gemm_calls = metrics.total_metal_deberta_attention_gemm_calls,
         .total_metal_deberta_attention_gemm_fallbacks = metrics.total_metal_deberta_attention_gemm_fallbacks,
@@ -514,6 +570,7 @@ const MetricsInspection = struct {
     total_metal_chunk_local_output_reset_live_carry_values: u64 = 0,
     total_graph_command_dispatches: u64 = 0,
     total_graph_planned_dispatches: u64 = 0,
+    total_graph_host_outputs: u64 = 0,
     max_metal_frame_gpu_ms: f64 = 0,
     max_metal_last_frame_compute_encoders: u64 = 0,
     total_metal_frame_chunk_boundaries: u64 = 0,
@@ -526,7 +583,22 @@ const MetricsInspection = struct {
     total_graph_runtime_region_elided_nodes: u64 = 0,
     total_graph_runtime_region_plan_compiles: u64 = 0,
     total_graph_runtime_region_plan_reuses: u64 = 0,
+    total_graph_runtime_frame_metadata_ready: u64 = 0,
+    total_graph_runtime_frame_ineligible_no_regions: u64 = 0,
+    total_graph_runtime_frame_ineligible_missing_qkv: u64 = 0,
+    total_graph_runtime_frame_ineligible_missing_attention: u64 = 0,
+    total_graph_runtime_frame_ineligible_missing_ffn: u64 = 0,
+    total_graph_runtime_frame_ineligible_missing_ple: u64 = 0,
+    total_graph_runtime_frame_ineligible_single_row: u64 = 0,
+    total_graph_runtime_frame_ineligible_non_layer_order: u64 = 0,
+    total_graph_runtime_frame_ineligible_shape_mismatch: u64 = 0,
+    total_graph_runtime_frame_ineligible_missing_model_metadata: u64 = 0,
     total_metal_deberta_ffn_forward_regions: u64 = 0,
+    total_metal_deberta_encoder_lora_layer_regions: u64 = 0,
+    total_metal_deberta_encoder_lora_residual_layernorm_regions: u64 = 0,
+    total_metal_deberta_encoder_lora_layer_scaffold_regions: u64 = 0,
+    total_metal_deberta_encoder_lora_layer_fallbacks: u64 = 0,
+    total_metal_deberta_encoder_layer_successes: u64 = 0,
     total_metal_deberta_attention_flash_calls: u64 = 0,
     total_metal_deberta_attention_gemm_calls: u64 = 0,
     total_metal_deberta_attention_gemm_fallbacks: u64 = 0,
@@ -750,6 +822,7 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     total_metal_chunk_local_output_reset_live_carry_values: u64,
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
+    total_graph_host_outputs: u64,
     max_metal_frame_gpu_ms: f64,
     max_metal_last_frame_compute_encoders: u64,
     total_metal_frame_chunk_boundaries: u64,
@@ -762,7 +835,22 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     total_graph_runtime_region_elided_nodes: u64,
     total_graph_runtime_region_plan_compiles: u64,
     total_graph_runtime_region_plan_reuses: u64,
+    total_graph_runtime_frame_metadata_ready: u64,
+    total_graph_runtime_frame_ineligible_no_regions: u64,
+    total_graph_runtime_frame_ineligible_missing_qkv: u64,
+    total_graph_runtime_frame_ineligible_missing_attention: u64,
+    total_graph_runtime_frame_ineligible_missing_ffn: u64,
+    total_graph_runtime_frame_ineligible_missing_ple: u64,
+    total_graph_runtime_frame_ineligible_single_row: u64,
+    total_graph_runtime_frame_ineligible_non_layer_order: u64,
+    total_graph_runtime_frame_ineligible_shape_mismatch: u64,
+    total_graph_runtime_frame_ineligible_missing_model_metadata: u64,
     total_metal_deberta_ffn_forward_regions: u64,
+    total_metal_deberta_encoder_lora_layer_regions: u64,
+    total_metal_deberta_encoder_lora_residual_layernorm_regions: u64,
+    total_metal_deberta_encoder_lora_layer_scaffold_regions: u64,
+    total_metal_deberta_encoder_lora_layer_fallbacks: u64,
+    total_metal_deberta_encoder_layer_successes: u64,
     total_metal_deberta_attention_flash_calls: u64,
     total_metal_deberta_attention_gemm_calls: u64,
     total_metal_deberta_attention_gemm_fallbacks: u64,
@@ -913,6 +1001,7 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.total_metal_chunk_local_output_reset_live_carry_values += metal_chunk_local_output_reset_live_carry_values;
             inspection.total_graph_command_dispatches += jsonU64(obj.get("graph_executor_command_dispatches")) orelse 0;
             inspection.total_graph_planned_dispatches += jsonU64(obj.get("graph_executor_planned_dispatches")) orelse 0;
+            inspection.total_graph_host_outputs += jsonU64(obj.get("graph_executor_host_outputs")) orelse 0;
             inspection.total_metal_frame_chunk_boundaries += jsonU64(obj.get("graph_executor_metal_frame_chunk_boundaries")) orelse 0;
             inspection.total_metal_frame_chunk_promoted_values += jsonU64(obj.get("graph_executor_metal_frame_chunk_promoted_values")) orelse 0;
             inspection.total_metal_frame_chunk_swept_values += jsonU64(obj.get("graph_executor_metal_frame_chunk_swept_values")) orelse 0;
@@ -930,7 +1019,22 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.total_graph_runtime_region_elided_nodes += jsonU64(obj.get("graph_executor_runtime_region_elided_nodes")) orelse 0;
             inspection.total_graph_runtime_region_plan_compiles += jsonU64(obj.get("graph_executor_runtime_region_plan_compiles")) orelse 0;
             inspection.total_graph_runtime_region_plan_reuses += jsonU64(obj.get("graph_executor_runtime_region_plan_reuses")) orelse 0;
+            inspection.total_graph_runtime_frame_metadata_ready += jsonU64(obj.get("graph_executor_runtime_frame_metadata_ready")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_no_regions += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_no_regions")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_missing_qkv += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_missing_qkv")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_missing_attention += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_missing_attention")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_missing_ffn += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_missing_ffn")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_missing_ple += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_missing_ple")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_single_row += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_single_row")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_non_layer_order += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_non_layer_order")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_shape_mismatch += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_shape_mismatch")) orelse 0;
+            inspection.total_graph_runtime_frame_ineligible_missing_model_metadata += jsonU64(obj.get("graph_executor_runtime_frame_ineligible_missing_model_metadata")) orelse 0;
             inspection.total_metal_deberta_ffn_forward_regions += jsonU64(obj.get("metal_deberta_ffn_forward_regions")) orelse 0;
+            inspection.total_metal_deberta_encoder_lora_layer_regions += jsonU64(obj.get("metal_deberta_encoder_lora_layer_regions")) orelse 0;
+            inspection.total_metal_deberta_encoder_lora_residual_layernorm_regions += jsonU64(obj.get("metal_deberta_encoder_lora_residual_layernorm_regions")) orelse 0;
+            inspection.total_metal_deberta_encoder_lora_layer_scaffold_regions += jsonU64(obj.get("metal_deberta_encoder_lora_layer_scaffold_regions")) orelse 0;
+            inspection.total_metal_deberta_encoder_lora_layer_fallbacks += jsonU64(obj.get("metal_deberta_encoder_lora_layer_fallbacks")) orelse 0;
+            inspection.total_metal_deberta_encoder_layer_successes += jsonU64(obj.get("metal_deberta_encoder_layer_successes")) orelse 0;
             inspection.total_metal_deberta_attention_flash_calls += jsonU64(obj.get("metal_deberta_attention_flash_calls")) orelse 0;
             inspection.total_metal_deberta_attention_gemm_calls += jsonU64(obj.get("metal_deberta_attention_gemm_calls")) orelse 0;
             inspection.total_metal_deberta_attention_gemm_fallbacks += jsonU64(obj.get("metal_deberta_attention_gemm_fallbacks")) orelse 0;
@@ -1008,6 +1112,7 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .total_metal_chunk_local_output_reset_live_carry_values = inspection.total_metal_chunk_local_output_reset_live_carry_values,
         .total_graph_command_dispatches = inspection.total_graph_command_dispatches,
         .total_graph_planned_dispatches = inspection.total_graph_planned_dispatches,
+        .total_graph_host_outputs = inspection.total_graph_host_outputs,
         .max_metal_frame_gpu_ms = inspection.max_metal_frame_gpu_ms,
         .max_metal_last_frame_compute_encoders = inspection.max_metal_last_frame_compute_encoders,
         .total_metal_frame_chunk_boundaries = inspection.total_metal_frame_chunk_boundaries,
@@ -1020,7 +1125,22 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .total_graph_runtime_region_elided_nodes = inspection.total_graph_runtime_region_elided_nodes,
         .total_graph_runtime_region_plan_compiles = inspection.total_graph_runtime_region_plan_compiles,
         .total_graph_runtime_region_plan_reuses = inspection.total_graph_runtime_region_plan_reuses,
+        .total_graph_runtime_frame_metadata_ready = inspection.total_graph_runtime_frame_metadata_ready,
+        .total_graph_runtime_frame_ineligible_no_regions = inspection.total_graph_runtime_frame_ineligible_no_regions,
+        .total_graph_runtime_frame_ineligible_missing_qkv = inspection.total_graph_runtime_frame_ineligible_missing_qkv,
+        .total_graph_runtime_frame_ineligible_missing_attention = inspection.total_graph_runtime_frame_ineligible_missing_attention,
+        .total_graph_runtime_frame_ineligible_missing_ffn = inspection.total_graph_runtime_frame_ineligible_missing_ffn,
+        .total_graph_runtime_frame_ineligible_missing_ple = inspection.total_graph_runtime_frame_ineligible_missing_ple,
+        .total_graph_runtime_frame_ineligible_single_row = inspection.total_graph_runtime_frame_ineligible_single_row,
+        .total_graph_runtime_frame_ineligible_non_layer_order = inspection.total_graph_runtime_frame_ineligible_non_layer_order,
+        .total_graph_runtime_frame_ineligible_shape_mismatch = inspection.total_graph_runtime_frame_ineligible_shape_mismatch,
+        .total_graph_runtime_frame_ineligible_missing_model_metadata = inspection.total_graph_runtime_frame_ineligible_missing_model_metadata,
         .total_metal_deberta_ffn_forward_regions = inspection.total_metal_deberta_ffn_forward_regions,
+        .total_metal_deberta_encoder_lora_layer_regions = inspection.total_metal_deberta_encoder_lora_layer_regions,
+        .total_metal_deberta_encoder_lora_residual_layernorm_regions = inspection.total_metal_deberta_encoder_lora_residual_layernorm_regions,
+        .total_metal_deberta_encoder_lora_layer_scaffold_regions = inspection.total_metal_deberta_encoder_lora_layer_scaffold_regions,
+        .total_metal_deberta_encoder_lora_layer_fallbacks = inspection.total_metal_deberta_encoder_lora_layer_fallbacks,
+        .total_metal_deberta_encoder_layer_successes = inspection.total_metal_deberta_encoder_layer_successes,
         .total_metal_deberta_attention_flash_calls = inspection.total_metal_deberta_attention_flash_calls,
         .total_metal_deberta_attention_gemm_calls = inspection.total_metal_deberta_attention_gemm_calls,
         .total_metal_deberta_attention_gemm_fallbacks = inspection.total_metal_deberta_attention_gemm_fallbacks,

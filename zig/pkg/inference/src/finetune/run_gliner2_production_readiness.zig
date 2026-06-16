@@ -98,6 +98,7 @@ const Options = struct {
     min_metal_chunk_local_output_consumed_hints: ?u64 = null,
     min_metal_runtime_reuse_hit_count: ?u64 = null,
     max_graph_command_dispatch_count: ?u64 = null,
+    max_graph_host_output_count: ?u64 = null,
     max_metal_frame_gpu_ms: ?f64 = null,
     max_metal_last_frame_compute_encoder_count: ?u64 = null,
     min_metal_frame_chunk_boundary_count: ?u64 = null,
@@ -107,10 +108,15 @@ const Options = struct {
     max_graph_runtime_region_fallback_count: ?u64 = null,
     min_graph_runtime_region_elided_node_count: ?u64 = null,
     min_metal_deberta_ffn_forward_region_count: ?u64 = null,
+    min_metal_deberta_encoder_lora_layer_region_count: ?u64 = null,
+    min_metal_deberta_encoder_lora_residual_layernorm_region_count: ?u64 = null,
+    max_metal_deberta_encoder_lora_layer_fallback_count: ?u64 = null,
     min_metal_deberta_attention_flash_call_count: ?u64 = null,
     max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
+    min_metal_deberta_encoder_layer_success_count: ?u64 = null,
     min_metal_deberta_ffn_fused_call_count: ?u64 = null,
     max_metal_deberta_ffn_fused_fallback_count: ?u64 = null,
+    max_runtime_frame_ineligible_missing_model_metadata: ?u64 = null,
     require_loss_decrease: bool = true,
 
     eval_text: ?[]const u8 = null,
@@ -332,6 +338,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .min_metal_chunk_local_output_consumed_hints = opts.min_metal_chunk_local_output_consumed_hints,
         .min_metal_runtime_reuse_hit_count = opts.min_metal_runtime_reuse_hit_count,
         .max_graph_command_dispatch_count = opts.max_graph_command_dispatch_count,
+        .max_graph_host_output_count = opts.max_graph_host_output_count,
         .max_metal_frame_gpu_ms = opts.max_metal_frame_gpu_ms,
         .max_metal_last_frame_compute_encoder_count = opts.max_metal_last_frame_compute_encoder_count,
         .min_metal_frame_chunk_boundary_count = opts.min_metal_frame_chunk_boundary_count,
@@ -341,10 +348,15 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .max_graph_runtime_region_fallback_count = opts.max_graph_runtime_region_fallback_count,
         .min_graph_runtime_region_elided_node_count = opts.min_graph_runtime_region_elided_node_count,
         .min_metal_deberta_ffn_forward_region_count = opts.min_metal_deberta_ffn_forward_region_count,
+        .min_metal_deberta_encoder_lora_layer_region_count = opts.min_metal_deberta_encoder_lora_layer_region_count,
+        .min_metal_deberta_encoder_lora_residual_layernorm_region_count = opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        .max_metal_deberta_encoder_lora_layer_fallback_count = opts.max_metal_deberta_encoder_lora_layer_fallback_count,
         .min_metal_deberta_attention_flash_call_count = opts.min_metal_deberta_attention_flash_call_count,
         .max_metal_deberta_attention_gemm_fallback_count = opts.max_metal_deberta_attention_gemm_fallback_count,
+        .min_metal_deberta_encoder_layer_success_count = opts.min_metal_deberta_encoder_layer_success_count,
         .min_metal_deberta_ffn_fused_call_count = opts.min_metal_deberta_ffn_fused_call_count,
         .max_metal_deberta_ffn_fused_fallback_count = opts.max_metal_deberta_ffn_fused_fallback_count,
+        .max_runtime_frame_ineligible_missing_model_metadata = opts.max_runtime_frame_ineligible_missing_model_metadata,
     });
     errdefer validation.freeRunValidationSummary(allocator, &run_summary);
 
@@ -648,6 +660,20 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\min_metal_runtime_reuse_hit_count: {?}
         \\max_graph_command_dispatch_count: {?}
         \\max_metal_frame_gpu_ms: {?}
+    , .{
+        opts.max_metal_tensor_device_owned_peak_live_bytes,
+        opts.max_metal_runtime_total_bytes,
+        opts.max_metal_eager_arena_peak_bytes,
+        opts.max_metal_eager_arena_spill_bytes,
+        opts.max_metal_chunk_local_output_peak_bytes,
+        opts.max_metal_chunk_local_output_spill_bytes,
+        opts.max_metal_chunk_local_output_unconsumed_hints,
+        opts.min_metal_chunk_local_output_consumed_hints,
+        opts.min_metal_runtime_reuse_hit_count,
+        opts.max_graph_command_dispatch_count,
+        opts.max_metal_frame_gpu_ms,
+    });
+    try writer.interface.print(
         \\max_metal_last_frame_compute_encoder_count: {?}
         \\min_metal_frame_chunk_boundary_count: {?}
         \\min_metal_frame_chunk_promoted_value_count: {?}
@@ -656,6 +682,9 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\max_graph_runtime_region_fallback_count: {?}
         \\min_graph_runtime_region_elided_node_count: {?}
         \\min_metal_deberta_ffn_forward_region_count: {?}
+        \\min_metal_deberta_encoder_lora_layer_region_count: {?}
+        \\min_metal_deberta_encoder_lora_residual_layernorm_region_count: {?}
+        \\max_metal_deberta_encoder_lora_layer_fallback_count: {?}
         \\min_metal_deberta_attention_flash_call_count: {?}
         \\max_metal_deberta_attention_gemm_fallback_count: {?}
         \\min_metal_deberta_ffn_fused_call_count: {?}
@@ -669,17 +698,6 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\semantic_eval_required: {}
         \\
     , .{
-        opts.max_metal_tensor_device_owned_peak_live_bytes,
-        opts.max_metal_runtime_total_bytes,
-        opts.max_metal_eager_arena_peak_bytes,
-        opts.max_metal_eager_arena_spill_bytes,
-        opts.max_metal_chunk_local_output_peak_bytes,
-        opts.max_metal_chunk_local_output_spill_bytes,
-        opts.max_metal_chunk_local_output_unconsumed_hints,
-        opts.min_metal_chunk_local_output_consumed_hints,
-        opts.min_metal_runtime_reuse_hit_count,
-        opts.max_graph_command_dispatch_count,
-        opts.max_metal_frame_gpu_ms,
         opts.max_metal_last_frame_compute_encoder_count,
         opts.min_metal_frame_chunk_boundary_count,
         opts.min_metal_frame_chunk_promoted_value_count,
@@ -688,6 +706,9 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.max_graph_runtime_region_fallback_count,
         opts.min_graph_runtime_region_elided_node_count,
         opts.min_metal_deberta_ffn_forward_region_count,
+        opts.min_metal_deberta_encoder_lora_layer_region_count,
+        opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        opts.max_metal_deberta_encoder_lora_layer_fallback_count,
         opts.min_metal_deberta_attention_flash_call_count,
         opts.max_metal_deberta_attention_gemm_fallback_count,
         opts.min_metal_deberta_ffn_fused_call_count,
@@ -843,6 +864,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.min_metal_runtime_reuse_hit_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-graph-command-dispatch-count")) {
             opts.max_graph_command_dispatch_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-graph-host-output-count")) {
+            opts.max_graph_host_output_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-metal-frame-gpu-ms")) {
             opts.max_metal_frame_gpu_ms = try parseF64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-metal-last-frame-compute-encoder-count")) {
@@ -861,14 +884,24 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.min_graph_runtime_region_elided_node_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-metal-deberta-ffn-forward-region-count")) {
             opts.min_metal_deberta_ffn_forward_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-lora-layer-region-count")) {
+            opts.min_metal_deberta_encoder_lora_layer_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-lora-residual-layernorm-region-count")) {
+            opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-fallback-count")) {
+            opts.max_metal_deberta_encoder_lora_layer_fallback_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-metal-deberta-attention-flash-call-count")) {
             opts.min_metal_deberta_attention_flash_call_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-metal-deberta-attention-gemm-fallback-count")) {
             opts.max_metal_deberta_attention_gemm_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-layer-success-count")) {
+            opts.min_metal_deberta_encoder_layer_success_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-metal-deberta-ffn-fused-call-count")) {
             opts.min_metal_deberta_ffn_fused_call_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-metal-deberta-ffn-fused-fallback-count")) {
             opts.max_metal_deberta_ffn_fused_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-runtime-frame-ineligible-missing-model-metadata")) {
+            opts.max_runtime_frame_ineligible_missing_model_metadata = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--allow-flat-loss")) {
             opts.require_loss_decrease = false;
         } else if (std.mem.eql(u8, arg, "--eval-text")) {
@@ -1167,6 +1200,7 @@ fn printUsage() void {
         \\  --min-metal-chunk-local-output-consumed-hints N
         \\  --min-metal-runtime-reuse-hit-count N
         \\  --max-graph-command-dispatch-count N
+        \\  --max-graph-host-output-count N
         \\  --max-metal-frame-gpu-ms FLOAT
         \\  --max-metal-last-frame-compute-encoder-count N
         \\  --min-metal-frame-chunk-boundary-count N
@@ -1176,10 +1210,15 @@ fn printUsage() void {
         \\  --max-graph-runtime-region-fallback-count N
         \\  --min-graph-runtime-region-elided-node-count N
         \\  --min-metal-deberta-ffn-forward-region-count N
+        \\  --min-metal-deberta-encoder-lora-layer-region-count N
+        \\  --min-metal-deberta-encoder-lora-residual-layernorm-region-count N
+        \\  --max-metal-deberta-encoder-lora-layer-fallback-count N
         \\  --min-metal-deberta-attention-flash-call-count N
         \\  --max-metal-deberta-attention-gemm-fallback-count N
+        \\  --min-metal-deberta-encoder-layer-success-count N
         \\  --min-metal-deberta-ffn-fused-call-count N
         \\  --max-metal-deberta-ffn-fused-fallback-count N
+        \\  --max-runtime-frame-ineligible-missing-model-metadata N
         \\
     , .{});
 }

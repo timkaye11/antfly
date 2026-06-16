@@ -204,6 +204,7 @@ const RuntimeRegionKind = enum(u8) {
     lora_linear_qkv,
     deberta_attention,
     deberta_ffn_forward,
+    deberta_encoder_lora_layer,
     lora_backward,
     ffn_gelu_backward,
     q_linear,
@@ -226,6 +227,7 @@ const RuntimeRegion = union(RuntimeRegionKind) {
     lora_linear_qkv: LoraLinearQkvPattern,
     deberta_attention: DebertaAttentionPattern,
     deberta_ffn_forward: DebertaFfnForwardPattern,
+    deberta_encoder_lora_layer: DebertaEncoderLoraLayerPattern,
     lora_backward: LoraBackwardPattern,
     ffn_gelu_backward: FfnGeluBackwardPattern,
     q_linear: QLinearPattern,
@@ -297,6 +299,7 @@ const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     lora_linear_qkv: void,
     deberta_attention: void,
     deberta_ffn_forward: PreparedDebertaFfnForwardRegion,
+    deberta_encoder_lora_layer: PreparedDebertaFfnForwardRegion,
     lora_backward: void,
     ffn_gelu_backward: void,
     q_linear: PreparedLinearRegion,
@@ -3524,6 +3527,11 @@ fn traceDebertaFfnForwardMatchingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_FFN_FORWARD_MATCH", false);
 }
 
+fn traceDebertaEncoderLoraLayerMatchingEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_ENCODER_LORA_LAYER_MATCH", false) or
+        traceDebertaFfnForwardMatchingEnabled();
+}
+
 fn debertaAttentionRuntimeRegionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_ENABLE_DEBERTA_ATTENTION_RUNTIME_REGION", false);
 }
@@ -3604,6 +3612,10 @@ fn attentionOutputResidualGraphFusionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_ATTENTION_OUTPUT_RESIDUAL_GRAPH_FUSION", true);
 }
 
+fn debertaEncoderLoraLayerRuntimeRegionEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_DEBERTA_ENCODER_LAYER_LORA_REGION", false);
+}
+
 fn buildRuntimeRegionPlan(
     allocator: std.mem.Allocator,
     graph: *const Graph,
@@ -3636,6 +3648,14 @@ fn buildRuntimeRegionPlan(
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
 
+        if (debertaEncoderLoraLayerRuntimeRegionEnabled()) {
+            if (matchDebertaEncoderLoraLayerPattern(graph, node_ids, node_pos, reachable, skipped, regions)) |pattern| {
+                regions[node_pos] = .{ .deberta_encoder_lora_layer = pattern };
+                markDebertaEncoderLoraLayerSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
         if (debertaFfnForwardRuntimeRegionEnabled()) {
             if (matchDebertaFfnForwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
                 regions[node_pos] = .{ .deberta_ffn_forward = pattern };
@@ -4059,7 +4079,7 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .lora_backward, .ffn_gelu_backward => continue,
+            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .deberta_encoder_lora_layer, .lora_backward, .ffn_gelu_backward => continue,
             .deberta_attention => {
                 if (phase != .attention or pending_qkv == null) {
                     traceRuntimeFrameMetadataDeclined("attention_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
@@ -4182,7 +4202,7 @@ fn analyzeRuntimeFrameEligibility(plan: RuntimeRegionPlan) RuntimeFrameEligibili
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .lora_backward, .ffn_gelu_backward => continue,
+            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .deberta_encoder_lora_layer, .lora_backward, .ffn_gelu_backward => continue,
             .deberta_attention => {
                 if (phase != .attention) return .{ .layers = layers, .reason = .non_layer_order };
                 phase = .ffn;
@@ -4682,6 +4702,7 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .lora_linear_qkv => 0,
         .deberta_attention => 0,
         .deberta_ffn_forward => 2,
+        .deberta_encoder_lora_layer => 2,
         .lora_backward => 0,
         .ffn_gelu_backward => 0,
         .q_linear => 1,
@@ -5061,6 +5082,23 @@ fn prepareDebertaFfnForwardRegion(
     return .{ .first_slot = first_slot, .second_slot = second_slot };
 }
 
+fn prepareDebertaEncoderLoraLayerRegion(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    pattern: DebertaEncoderLoraLayerPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedDebertaFfnForwardRegion {
+    const ffn = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern.ffn, stats)) orelse return null;
+    if (pattern.layer_norm_id != null_node) {
+        _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.layer_norm_weight_id)) orelse return null;
+        _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.layer_norm_bias_id)) orelse return null;
+    }
+    return ffn;
+}
+
 fn prepareRuntimeRegion(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -5097,6 +5135,9 @@ fn prepareRuntimeRegion(
         .deberta_attention => .{ .deberta_attention = {} },
         .deberta_ffn_forward => |pattern| .{
             .deberta_ffn_forward = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
+        },
+        .deberta_encoder_lora_layer => |pattern| .{
+            .deberta_encoder_lora_layer = (try prepareDebertaEncoderLoraLayerRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
         },
         .lora_backward => .{ .lora_backward = {} },
         .ffn_gelu_backward => .{ .ffn_gelu_backward = {} },
@@ -5254,6 +5295,20 @@ fn tryExecutePlannedRuntimeRegion(
             pattern,
             switch (prepared) {
                 .deberta_ffn_forward => |slots| slots,
+                else => return false,
+            },
+            skipped_nodes,
+        ),
+        .deberta_encoder_lora_layer => |pattern| executeDebertaEncoderLoraLayerPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .deberta_encoder_lora_layer => |slots| slots,
                 else => return false,
             },
             skipped_nodes,
@@ -6785,6 +6840,26 @@ const DebertaFfnForwardPattern = struct {
     intermediate_size: usize,
 };
 
+const DebertaEncoderLoraLayerPattern = struct {
+    ffn: DebertaFfnForwardPattern,
+    residual_add_id: NodeId,
+    layer_norm_id: NodeId,
+    layer_norm_weight_id: NodeId,
+    layer_norm_bias_id: NodeId,
+    layer_index: usize,
+    norm_eps: f32,
+};
+
+const LayerNormForwardPattern = struct {
+    output_id: NodeId,
+    weight_id: NodeId,
+    bias_id: NodeId,
+    dim: usize,
+    eps: f32,
+    internal_node_ids: [16]NodeId = [_]NodeId{null_node} ** 16,
+    internal_node_count: usize = 0,
+};
+
 const LoraBackwardPattern = struct {
     d_after_a_id: NodeId,
     grad_a_dot_id: NodeId,
@@ -7178,6 +7253,105 @@ fn executeDebertaFfnForwardPattern(
         std.debug.print(
             "metal_graph_fusion_trace: deberta_ffn_forward_region executed first_dot={d} first_add={d} gelu={d} output_dot={d} output_add={d} rows={d} hidden={d} intermediate={d}\n",
             .{ pattern.first_dot_id, pattern.first_add_id, pattern.gelu_id, pattern.output_dot_id, pattern.output_add_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size },
+        );
+    }
+    return true;
+}
+
+fn executeDebertaEncoderLoraLayerPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: DebertaEncoderLoraLayerPattern,
+    prepared: PreparedDebertaFfnForwardRegion,
+    skipped_nodes: []bool,
+) !bool {
+    if (!try executeDebertaFfnForwardPattern(
+        graph,
+        cb,
+        values,
+        value_device,
+        device_id,
+        null,
+        pattern.ffn,
+        prepared,
+        skipped_nodes,
+    )) {
+        if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+        return false;
+    }
+
+    if (pattern.layer_norm_id == null_node) {
+        markDebertaEncoderLoraLayerSkipped(skipped_nodes, pattern);
+        if (stats) |s| {
+            recordMetalGraphRegion(s, .ffn, 1);
+            s.metal_deberta_encoder_lora_layer_regions += 1;
+            s.metal_deberta_encoder_lora_layer_scaffold_regions += 1;
+            s.fused_graph_pattern_dispatches += 1;
+        }
+        return true;
+    }
+
+    const ffn_output = valueFor(values, pattern.ffn.output_add_id) orelse {
+        if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+        return false;
+    };
+    const residual_input = valueFor(values, pattern.ffn.input_id) orelse {
+        if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+        return false;
+    };
+    const ln_weight = valueFor(values, pattern.layer_norm_weight_id) orelse {
+        if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+        return false;
+    };
+    const ln_bias = valueFor(values, pattern.layer_norm_bias_id) orelse {
+        if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+        return false;
+    };
+
+    const residual = cb.add(ffn_output, residual_input) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
+            if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+            return false;
+        },
+        else => return err,
+    };
+    values[@intCast(pattern.residual_add_id)] = residual;
+    value_device[@intCast(pattern.residual_add_id)] = device_id;
+
+    const normed = cb.layerNorm(
+        residual,
+        ln_weight,
+        ln_bias,
+        pattern.ffn.hidden_size,
+        pattern.norm_eps,
+    ) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
+            if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+            return false;
+        },
+        else => return err,
+    };
+
+    values[@intCast(pattern.layer_norm_id)] = normed;
+    value_device[@intCast(pattern.layer_norm_id)] = device_id;
+    markDebertaEncoderLoraLayerSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 2);
+        s.metal_deberta_encoder_lora_layer_regions += 1;
+        s.metal_deberta_encoder_lora_residual_layernorm_regions += 1;
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 2;
+        recordGemmaRuntimeResidency(s, graph, pattern.layer_norm_id, isMetalResidentOrQuantizedDescriptor(cb, normed));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: deberta_encoder_lora_layer_region executed layer={d} ffn_output={d} residual={d} layer_norm={d} hidden={d}\n",
+            .{ pattern.layer_index, pattern.ffn.output_add_id, pattern.residual_add_id, pattern.layer_norm_id, pattern.ffn.hidden_size },
         );
     }
     return true;
@@ -7833,6 +8007,523 @@ fn resolvedRuntimeDot2DRhs(
     return .{ .rhs = source, .rhs_contract_axis = source_contract_axis };
 }
 
+fn matchDebertaEncoderLoraLayerPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    regions: []const RuntimeRegion,
+) ?DebertaEncoderLoraLayerPattern {
+    _ = regions;
+    const ffn = matchDebertaFfnForwardPattern(graph, node_ids, node_pos, reachable, skipped_nodes) orelse return null;
+    if (ffn.first_lora == null or ffn.second_lora == null) return traceDebertaEncoderLoraLayerMatchDecline("missing_ffn_lora", ffn.first_dot_id, null);
+    const layer_index = layerIndexForWeight(graph, ffn.first_weight_id) orelse return traceDebertaEncoderLoraLayerMatchDecline("ffn_layer", ffn.first_dot_id, null);
+
+    const residual_add_id = singleAddConsumerForInput(graph, ffn.output_add_id, reachable, skipped_nodes) orelse return traceDebertaEncoderLoraLayerMatchDecline("missing_residual", ffn.output_add_id, null);
+    const residual_node = graph.node(residual_add_id);
+    if (residual_node.num_inputs < 2) return traceDebertaEncoderLoraLayerMatchDecline("residual_inputs", residual_add_id, null);
+    const residual_other = if (residual_node.inputs[0] == ffn.output_add_id)
+        residual_node.inputs[1]
+    else if (residual_node.inputs[1] == ffn.output_add_id)
+        residual_node.inputs[0]
+    else
+        return traceDebertaEncoderLoraLayerMatchDecline("residual_output_input", residual_add_id, null);
+    if (residual_other != ffn.input_id) return traceDebertaEncoderLoraLayerMatchDecline("residual_skip_input", residual_add_id, residual_other);
+
+    const layer_norm = matchLayerNormFromInput(graph, residual_add_id, reachable, skipped_nodes) orelse {
+        traceLayerNormConsumerChain(graph, residual_add_id, reachable, skipped_nodes);
+        return .{
+            .ffn = ffn,
+            .residual_add_id = null_node,
+            .layer_norm_id = null_node,
+            .layer_norm_weight_id = null_node,
+            .layer_norm_bias_id = null_node,
+            .layer_index = layer_index,
+            .norm_eps = 0,
+        };
+    };
+    if (layer_norm.dim != ffn.hidden_size) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_dim", layer_norm.output_id, null);
+    if (layerIndexForWeight(graph, layer_norm.weight_id) != layer_index) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_layer", layer_norm.output_id, layer_norm.weight_id);
+    if (!isDebertaOutputLayerNormName(graph.parameterName(graph.node(layer_norm.weight_id)))) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_weight_name", layer_norm.output_id, layer_norm.weight_id);
+    if (!isDebertaOutputLayerNormName(graph.parameterName(graph.node(layer_norm.bias_id)))) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_bias_name", layer_norm.output_id, layer_norm.bias_id);
+
+    return .{
+        .ffn = ffn,
+        .residual_add_id = residual_add_id,
+        .layer_norm_id = layer_norm.output_id,
+        .layer_norm_weight_id = layer_norm.weight_id,
+        .layer_norm_bias_id = layer_norm.bias_id,
+        .layer_index = layer_index,
+        .norm_eps = layer_norm.eps,
+    };
+}
+
+fn matchLayerNormFromInput(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LayerNormForwardPattern {
+    var found: ?LayerNormForwardPattern = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        const attrs = switch (node.op) {
+            .fused_layer_norm => |a| a,
+            else => continue,
+        };
+        if (node.num_inputs < 3 or node.inputs[0] != producer_id) continue;
+        const weight_id = node.inputs[1];
+        const bias_id = node.inputs[2];
+        if (weight_id == null_node or bias_id == null_node) continue;
+        if (std.meta.activeTag(graph.node(weight_id).op) != .parameter or
+            std.meta.activeTag(graph.node(bias_id).op) != .parameter) continue;
+        const weight_shape = graph.node(weight_id).output_shape;
+        const bias_shape = graph.node(bias_id).output_shape;
+        if (weight_shape.rank() != 1 or bias_shape.rank() != 1) continue;
+        if (shapeDimUsize(weight_shape, 0) != attrs.dim or shapeDimUsize(bias_shape, 0) != attrs.dim) continue;
+        if (found != null) return null;
+        found = .{
+            .output_id = node_id,
+            .weight_id = weight_id,
+            .bias_id = bias_id,
+            .dim = attrs.dim,
+            .eps = attrs.eps,
+        };
+    }
+    return found orelse matchDecomposedLayerNormFromInput(graph, producer_id, reachable, skipped_nodes);
+}
+
+fn matchDecomposedLayerNormFromInput(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LayerNormForwardPattern {
+    const input_shape = graph.node(producer_id).output_shape;
+    if (input_shape.rank() != 2) return traceDecomposedLayerNormDecline("input_rank", producer_id, null);
+    const hidden_size = shapeDimUsize(input_shape, 1) orelse return traceDecomposedLayerNormDecline("hidden_dim", producer_id, null);
+
+    const mean_id = singleUnaryConsumerByTag(graph, producer_id, reachable, skipped_nodes, .reduce_mean) orelse return traceDecomposedLayerNormDecline("mean", producer_id, null);
+    const mean_broadcast_id = singleUnaryConsumerByTag(graph, mean_id, reachable, skipped_nodes, .broadcast_in_dim) orelse return traceDecomposedLayerNormDecline("mean_broadcast", producer_id, mean_id);
+    if (!shapesEqual(graph.node(mean_broadcast_id).output_shape, input_shape)) return traceDecomposedLayerNormDecline("mean_broadcast_shape", producer_id, mean_broadcast_id);
+
+    const centered_id = binaryConsumerForPair(graph, producer_id, mean_broadcast_id, reachable, skipped_nodes, .sub) orelse return traceDecomposedLayerNormDecline("centered", producer_id, mean_broadcast_id);
+    const square_id = binaryConsumerForPair(graph, centered_id, centered_id, reachable, skipped_nodes, .mul) orelse return traceDecomposedLayerNormDecline("square", producer_id, centered_id);
+    const variance_id = singleUnaryConsumerByTag(graph, square_id, reachable, skipped_nodes, .reduce_mean) orelse return traceDecomposedLayerNormDecline("variance", producer_id, square_id);
+    const variance_eps_id = addConsumerWithScalar(graph, variance_id, reachable, skipped_nodes) orelse return traceDecomposedLayerNormDecline("variance_eps", producer_id, variance_id);
+    const eps = scalarOtherInputF32(graph, variance_eps_id, variance_id) orelse return traceDecomposedLayerNormDecline("eps", producer_id, variance_eps_id);
+    const norm_scale = matchLayerNormScale(graph, variance_eps_id, input_shape, reachable, skipped_nodes) orelse {
+        traceDecomposedLayerNormConsumers(graph, variance_eps_id, reachable, skipped_nodes);
+        return traceDecomposedLayerNormDecline("norm_scale", producer_id, variance_eps_id);
+    };
+    const normalized = normalizedLayerNormOutputCandidate(graph, centered_id, norm_scale.broadcast_id, norm_scale.normalize_op, reachable, skipped_nodes) orelse return traceDecomposedLayerNormDecline("normalized_output", producer_id, norm_scale.broadcast_id);
+    const normalized_id = normalized.normalized_id;
+    const scaled = normalized.scaled;
+    const output = normalized.output;
+
+    const weight_shape = graph.node(scaled.param_id).output_shape;
+    const bias_shape = graph.node(output.param_id).output_shape;
+    if (weight_shape.rank() != 1 or bias_shape.rank() != 1) return traceDecomposedLayerNormDecline("param_rank", producer_id, output.consumer_id);
+    if (shapeDimUsize(weight_shape, 0) != hidden_size or shapeDimUsize(bias_shape, 0) != hidden_size) return traceDecomposedLayerNormDecline("param_dim", producer_id, output.consumer_id);
+
+    var internal_nodes = [_]NodeId{null_node} ** 16;
+    const internal_count: usize = 9;
+    internal_nodes[0] = mean_id;
+    internal_nodes[1] = mean_broadcast_id;
+    internal_nodes[2] = centered_id;
+    internal_nodes[3] = square_id;
+    internal_nodes[4] = variance_id;
+    internal_nodes[5] = variance_eps_id;
+    internal_nodes[6] = norm_scale.scale_id;
+    internal_nodes[7] = norm_scale.broadcast_id;
+    internal_nodes[8] = normalized_id;
+
+    return .{
+        .output_id = output.consumer_id,
+        .weight_id = scaled.param_id,
+        .bias_id = output.param_id,
+        .dim = hidden_size,
+        .eps = eps,
+        .internal_node_ids = internal_nodes,
+        .internal_node_count = internal_count,
+    };
+}
+
+fn traceDecomposedLayerNormDecline(reason: []const u8, producer_id: NodeId, detail_id: ?NodeId) ?LayerNormForwardPattern {
+    if (!traceDebertaEncoderLoraLayerMatchingEnabled()) return null;
+    std.debug.print(
+        "deberta_encoder_lora_layer_match: decomposed_layer_norm declined reason={s} producer={d} detail={d}\n",
+        .{ reason, producer_id, detail_id orelse null_node },
+    );
+    return null;
+}
+
+fn traceDecomposedLayerNormConsumers(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) void {
+    if (!traceDebertaEncoderLoraLayerMatchingEnabled()) return;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        const node = graph.node(node_id);
+        var consumes = false;
+        for (node.getInputs()) |input_id| {
+            if (input_id == producer_id) {
+                consumes = true;
+                break;
+            }
+        }
+        if (!consumes) continue;
+        std.debug.print(
+            "deberta_encoder_lora_layer_match: decomposed_consumer producer={d} node={d} op={s} reachable={} skipped={} inputs={d} rank={d} dim0={d} dim1={d}\n",
+            .{
+                producer_id,
+                node_id,
+                @tagName(std.meta.activeTag(node.op)),
+                isReachableUnskippedNode(reachable, skipped_nodes, node_id),
+                node_id < skipped_nodes.len and skipped_nodes[@intCast(node_id)],
+                node.num_inputs,
+                node.output_shape.rank(),
+                shapeDimForNodeOr(graph, node_id, 0, -1),
+                shapeDimForNodeOr(graph, node_id, 1, -1),
+            },
+        );
+    }
+}
+
+const OpTag = std.meta.Tag(@TypeOf(@as(*const Graph, undefined).node(0).op));
+
+const BinaryParamConsumer = struct {
+    consumer_id: NodeId,
+    param_id: NodeId,
+};
+
+const NormalizedLayerNormCandidate = struct {
+    normalized_id: NodeId,
+    scaled: BinaryParamConsumer,
+    output: BinaryParamConsumer,
+};
+
+const LayerNormScalePattern = struct {
+    scale_id: NodeId,
+    broadcast_id: NodeId,
+    normalize_op: OpTag,
+};
+
+fn matchLayerNormScale(
+    graph: *const Graph,
+    variance_eps_id: NodeId,
+    input_shape: ml.graph.Shape,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LayerNormScalePattern {
+    if (firstUnaryConsumerByTag(graph, variance_eps_id, reachable, skipped_nodes, .rsqrt)) |rsqrt_id| {
+        const broadcast_id = singleUnaryConsumerByTag(graph, rsqrt_id, reachable, skipped_nodes, .broadcast_in_dim) orelse return null;
+        if (!shapesEqual(graph.node(broadcast_id).output_shape, input_shape)) return null;
+        return .{
+            .scale_id = rsqrt_id,
+            .broadcast_id = broadcast_id,
+            .normalize_op = .mul,
+        };
+    }
+    if (firstUnaryConsumerByTag(graph, variance_eps_id, reachable, skipped_nodes, .sqrt)) |sqrt_id| {
+        const broadcast_id = singleUnaryConsumerByTag(graph, sqrt_id, reachable, skipped_nodes, .broadcast_in_dim) orelse return null;
+        if (!shapesEqual(graph.node(broadcast_id).output_shape, input_shape)) return null;
+        return .{
+            .scale_id = sqrt_id,
+            .broadcast_id = broadcast_id,
+            .normalize_op = .div,
+        };
+    }
+    return null;
+}
+
+fn firstUnaryConsumerByTag(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    tag: OpTag,
+) ?NodeId {
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        if (std.meta.activeTag(node.op) != tag) continue;
+        if (node.num_inputs < 1 or node.inputs[0] != producer_id) continue;
+        return node_id;
+    }
+    return null;
+}
+
+fn normalizedLayerNormOutputCandidate(
+    graph: *const Graph,
+    centered_id: NodeId,
+    scale_broadcast_id: NodeId,
+    normalize_op: OpTag,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?NormalizedLayerNormCandidate {
+    var found: ?NormalizedLayerNormCandidate = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        if (std.meta.activeTag(node.op) != normalize_op or node.num_inputs < 2) continue;
+        const exact = node.inputs[0] == centered_id and node.inputs[1] == scale_broadcast_id;
+        const commuted = normalize_op != .div and node.inputs[0] == scale_broadcast_id and node.inputs[1] == centered_id;
+        if (!exact and !commuted) continue;
+        const scaled = binaryConsumerWithDebertaLayerNormParam(graph, node_id, reachable, skipped_nodes, .mul, "output.LayerNorm", ".weight") orelse continue;
+        const output = binaryConsumerWithDebertaLayerNormParam(graph, scaled.consumer_id, reachable, skipped_nodes, .add, "output.LayerNorm", ".bias") orelse continue;
+        if (found != null) return null;
+        found = .{
+            .normalized_id = node_id,
+            .scaled = scaled,
+            .output = output,
+        };
+    }
+    return found;
+}
+
+fn singleUnaryConsumerByTag(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    tag: OpTag,
+) ?NodeId {
+    var found: ?NodeId = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        if (std.meta.activeTag(node.op) != tag) continue;
+        if (node.num_inputs < 1 or node.inputs[0] != producer_id) continue;
+        if (found != null) return null;
+        found = node_id;
+    }
+    return found;
+}
+
+fn binaryConsumerForPair(
+    graph: *const Graph,
+    lhs_id: NodeId,
+    rhs_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    tag: OpTag,
+) ?NodeId {
+    var found: ?NodeId = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        if (std.meta.activeTag(node.op) != tag or node.num_inputs < 2) continue;
+        const exact = node.inputs[0] == lhs_id and node.inputs[1] == rhs_id;
+        const commuted = tag != .sub and node.inputs[0] == rhs_id and node.inputs[1] == lhs_id;
+        if (!exact and !commuted) continue;
+        if (found != null) return null;
+        found = node_id;
+    }
+    return found;
+}
+
+fn addConsumerWithScalar(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?NodeId {
+    var found: ?NodeId = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        if (std.meta.activeTag(node.op) != .add or node.num_inputs < 2) continue;
+        if (node.inputs[0] == producer_id) {
+            if (scalarConstantF32(graph, node.inputs[1]) == null) continue;
+        } else if (node.inputs[1] == producer_id) {
+            if (scalarConstantF32(graph, node.inputs[0]) == null) continue;
+        } else continue;
+        if (found != null) return null;
+        found = node_id;
+    }
+    return found;
+}
+
+fn scalarOtherInputF32(graph: *const Graph, binary_id: NodeId, producer_id: NodeId) ?f32 {
+    if (binary_id == null_node or binary_id >= graph.nodeCount()) return null;
+    const node = graph.node(binary_id);
+    if (node.num_inputs < 2) return null;
+    if (node.inputs[0] == producer_id) return scalarConstantF32(graph, node.inputs[1]);
+    if (node.inputs[1] == producer_id) return scalarConstantF32(graph, node.inputs[0]);
+    return null;
+}
+
+fn binaryConsumerWithDebertaLayerNormParam(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    tag: OpTag,
+    name_substring: []const u8,
+    suffix: []const u8,
+) ?BinaryParamConsumer {
+    var found: ?BinaryParamConsumer = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        if (std.meta.activeTag(node.op) != tag or node.num_inputs < 2) continue;
+        const param_id = if (node.inputs[0] == producer_id)
+            node.inputs[1]
+        else if (node.inputs[1] == producer_id)
+            node.inputs[0]
+        else
+            continue;
+        const source_param_id = debertaLayerNormParamSource(graph, param_id, name_substring, suffix) orelse continue;
+        if (found != null) return null;
+        found = .{ .consumer_id = node_id, .param_id = source_param_id };
+    }
+    return found;
+}
+
+fn debertaLayerNormParamSource(graph: *const Graph, node_id: NodeId, substring: []const u8, suffix: []const u8) ?NodeId {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    if (parameterNameContainsSuffix(graph, node_id, substring, suffix)) return node_id;
+    switch (node.op) {
+        .broadcast_in_dim, .reshape => {
+            if (node.num_inputs < 1) return null;
+            const source_id = node.inputs[0];
+            if (parameterNameContainsSuffix(graph, source_id, substring, suffix)) return source_id;
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn parameterNameContainsSuffix(graph: *const Graph, node_id: NodeId, substring: []const u8, suffix: []const u8) bool {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) != .parameter) return false;
+    const name = graph.parameterName(node);
+    return std.mem.indexOf(u8, name, substring) != null and std.mem.endsWith(u8, name, suffix);
+}
+
+fn traceLayerNormConsumerChain(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) void {
+    if (!traceDebertaEncoderLoraLayerMatchingEnabled()) return;
+    std.debug.print(
+        "deberta_encoder_lora_layer_match: layer_norm_consumer_scan producer={d} producer_op={s} producer_rank={d}\n",
+        .{ producer_id, @tagName(std.meta.activeTag(graph.node(producer_id).op)), graph.node(producer_id).output_shape.rank() },
+    );
+
+    var direct_count: usize = 0;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        const node = graph.node(node_id);
+        var consumes = false;
+        for (node.getInputs()) |input_id| {
+            if (input_id == producer_id) {
+                consumes = true;
+                break;
+            }
+        }
+        if (!consumes) continue;
+        direct_count += 1;
+        std.debug.print(
+            "deberta_encoder_lora_layer_match: layer_norm_consumer depth=1 node={d} op={s} reachable={} skipped={} inputs={d} rank={d} dim0={d} dim1={d}\n",
+            .{
+                node_id,
+                @tagName(std.meta.activeTag(node.op)),
+                isReachableUnskippedNode(reachable, skipped_nodes, node_id),
+                node_id < skipped_nodes.len and skipped_nodes[@intCast(node_id)],
+                node.num_inputs,
+                node.output_shape.rank(),
+                shapeDimForNodeOr(graph, node_id, 0, -1),
+                shapeDimForNodeOr(graph, node_id, 1, -1),
+            },
+        );
+        traceLayerNormConsumerSecondHop(graph, node_id, reachable, skipped_nodes);
+    }
+    std.debug.print(
+        "deberta_encoder_lora_layer_match: layer_norm_consumer_scan producer={d} direct_consumers={d}\n",
+        .{ producer_id, direct_count },
+    );
+}
+
+fn traceLayerNormConsumerSecondHop(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) void {
+    var emitted: usize = 0;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (emitted >= 8) return;
+        const node = graph.node(node_id);
+        var consumes = false;
+        for (node.getInputs()) |input_id| {
+            if (input_id == producer_id) {
+                consumes = true;
+                break;
+            }
+        }
+        if (!consumes) continue;
+        emitted += 1;
+        std.debug.print(
+            "deberta_encoder_lora_layer_match: layer_norm_consumer depth=2 parent={d} node={d} op={s} reachable={} skipped={} inputs={d} rank={d} dim0={d} dim1={d}\n",
+            .{
+                producer_id,
+                node_id,
+                @tagName(std.meta.activeTag(node.op)),
+                isReachableUnskippedNode(reachable, skipped_nodes, node_id),
+                node_id < skipped_nodes.len and skipped_nodes[@intCast(node_id)],
+                node.num_inputs,
+                node.output_shape.rank(),
+                shapeDimForNodeOr(graph, node_id, 0, -1),
+                shapeDimForNodeOr(graph, node_id, 1, -1),
+            },
+        );
+    }
+}
+
+fn previousDebertaAttentionRegion(regions: []const RuntimeRegion, node_pos: usize) ?DebertaAttentionPattern {
+    var pos = node_pos;
+    while (pos > 0) {
+        pos -= 1;
+        switch (regions[pos]) {
+            .deberta_attention => |pattern| return pattern,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn isDebertaOutputLayerNormName(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "output.LayerNorm") != null;
+}
+
+fn traceDebertaEncoderLoraLayerMatchDecline(reason: []const u8, node_id: NodeId, detail_id: ?NodeId) ?DebertaEncoderLoraLayerPattern {
+    if (!traceDebertaEncoderLoraLayerMatchingEnabled()) return null;
+    std.debug.print(
+        "deberta_encoder_lora_layer_match: declined reason={s} node={d} detail={d}\n",
+        .{ reason, node_id, detail_id orelse null_node },
+    );
+    return null;
+}
+
 fn matchDebertaFfnForwardPattern(
     graph: *const Graph,
     node_ids: []const NodeId,
@@ -8199,6 +8890,12 @@ fn markDebertaFfnForwardSkipped(skipped: []bool, pattern: DebertaFfnForwardPatte
     markSkipped(skipped, pattern.output_add_id);
     if (pattern.first_lora) |lora| markLoraLinearSkipped(skipped, lora);
     if (pattern.second_lora) |lora| markLoraLinearSkipped(skipped, lora);
+}
+
+fn markDebertaEncoderLoraLayerSkipped(skipped: []bool, pattern: DebertaEncoderLoraLayerPattern) void {
+    markDebertaFfnForwardSkipped(skipped, pattern.ffn);
+    if (pattern.residual_add_id != null_node) markSkipped(skipped, pattern.residual_add_id);
+    if (pattern.layer_norm_id != null_node) markSkipped(skipped, pattern.layer_norm_id);
 }
 
 fn matchFfnGeluBackwardPattern(
