@@ -32,6 +32,8 @@ const OutputFormat = enum {
     csv,
 };
 
+const sweep_doc_counts = [_]usize{ 1, 2, 4, 8, 16, 32 };
+
 const Options = struct {
     model_dir: []const u8 = "",
     query: []const u8 = "what is CUDA",
@@ -39,6 +41,7 @@ const Options = struct {
     backend: native_backend_choice.Choice = .native,
     warmup_iters: usize = 1,
     measure_iters: usize = 5,
+    batch_sweep: bool = false,
     format: OutputFormat = .text,
     owns_model_dir: bool = false,
     owns_query: bool = false,
@@ -82,56 +85,126 @@ pub fn main(init: std.process.Init) !void {
     const model = try model_manager.loadFromDir(opts.model_dir);
     var pipeline = model.rerankingPipeline(allocator);
 
+    if (opts.format == .csv) printCsvHeader();
+
+    if (opts.batch_sweep) {
+        for (sweep_doc_counts) |doc_count| {
+            const docs = try docsForCount(allocator, opts.docs.items, doc_count);
+            const result = try runTimed(&pipeline, allocator, opts, docs);
+            printResult(opts, doc_count, result);
+            allocator.free(docs);
+        }
+    } else {
+        const result = try runTimed(&pipeline, allocator, opts, opts.docs.items);
+        printResult(opts, opts.docs.items.len, result);
+    }
+}
+
+const BenchResult = struct {
+    avg_ms: f64,
+    min_ms: f64,
+    p95_ms: f64,
+    docs_per_s: f64,
+    checksum: f64,
+};
+
+fn runTimed(
+    pipeline: anytype,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    docs: []const []const u8,
+) !BenchResult {
     var checksum: f64 = 0;
     for (0..opts.warmup_iters) |_| {
-        const scores = try pipeline.rerank(opts.query, opts.docs.items);
-        checksum += scores[0];
+        const scores = try pipeline.rerank(opts.query, docs);
+        for (scores) |score| checksum += score;
         allocator.free(scores);
     }
 
     var total_ns: u64 = 0;
     var min_ns: u64 = std.math.maxInt(u64);
-    for (0..opts.measure_iters) |_| {
+    const samples_ns = try allocator.alloc(u64, opts.measure_iters);
+    defer allocator.free(samples_ns);
+    for (0..opts.measure_iters) |idx| {
         const start = nowNs();
-        const scores = try pipeline.rerank(opts.query, opts.docs.items);
+        const scores = try pipeline.rerank(opts.query, docs);
         const elapsed = nowNs() - start;
         total_ns += elapsed;
         min_ns = @min(min_ns, elapsed);
+        samples_ns[idx] = elapsed;
         for (scores) |score| checksum += score;
         allocator.free(scores);
     }
 
-    const measured = @max(opts.measure_iters, 1);
-    const avg_ms = nsToMs(total_ns / measured);
-    const min_ms = nsToMs(min_ns);
-    const docs_per_s = (@as(f64, @floatFromInt(opts.docs.items.len)) * 1000.0) / avg_ms;
+    std.mem.sort(u64, samples_ns, {}, struct {
+        fn lessThan(_: void, a: u64, b: u64) bool {
+            return a < b;
+        }
+    }.lessThan);
 
+    const avg_ms = nsToMs(total_ns / opts.measure_iters);
+    const min_ms = nsToMs(min_ns);
+    const p95_ms = nsToMs(samples_ns[(samples_ns.len - 1) * 95 / 100]);
+    const docs_per_s = if (avg_ms == 0)
+        0
+    else
+        (@as(f64, @floatFromInt(docs.len)) * 1000.0) / avg_ms;
+
+    return .{
+        .avg_ms = avg_ms,
+        .min_ms = min_ms,
+        .p95_ms = p95_ms,
+        .docs_per_s = docs_per_s,
+        .checksum = checksum,
+    };
+}
+
+fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
     switch (opts.format) {
         .text => {
             print("reranker_e2e backend={s} model={s} docs={d} warmup={d} measure={d}\n", .{
                 @tagName(opts.backend),
                 opts.model_dir,
-                opts.docs.items.len,
+                doc_count,
                 opts.warmup_iters,
                 opts.measure_iters,
             });
-            print("avg_ms={d:.3} min_ms={d:.3} docs_per_s={d:.3} checksum={d:.6}\n", .{ avg_ms, min_ms, docs_per_s, checksum });
+            print("avg_ms={d:.3} min_ms={d:.3} p95_ms={d:.3} docs_per_s={d:.3} checksum={d:.6}\n", .{
+                result.avg_ms,
+                result.min_ms,
+                result.p95_ms,
+                result.docs_per_s,
+                result.checksum,
+            });
         },
         .csv => {
-            print("backend,model,docs,warmup_iters,measure_iters,avg_ms,min_ms,docs_per_s,checksum\n", .{});
-            print("{s},{s},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d:.6}\n", .{
+            print("{s},{s},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.6}\n", .{
                 @tagName(opts.backend),
                 opts.model_dir,
-                opts.docs.items.len,
+                doc_count,
                 opts.warmup_iters,
                 opts.measure_iters,
-                avg_ms,
-                min_ms,
-                docs_per_s,
-                checksum,
+                result.avg_ms,
+                result.min_ms,
+                result.p95_ms,
+                result.docs_per_s,
+                result.checksum,
             });
         },
     }
+}
+
+fn printCsvHeader() void {
+    print("backend,model,docs,warmup_iters,measure_iters,avg_ms,min_ms,p95_ms,docs_per_s,checksum\n", .{});
+}
+
+fn docsForCount(allocator: std.mem.Allocator, source: []const []const u8, count: usize) ![]const []const u8 {
+    if (source.len == 0) return error.InvalidArguments;
+    const docs = try allocator.alloc([]const u8, count);
+    for (docs, 0..) |*doc, idx| {
+        doc.* = source[idx % source.len];
+    }
+    return docs;
 }
 
 fn nowNs() u64 {
@@ -178,6 +251,8 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             opts.warmup_iters = try std.fmt.parseInt(usize, args_iter.next() orelse return error.MissingWarmupItersValue, 10);
         } else if (std.mem.eql(u8, arg, "--measure-iters")) {
             opts.measure_iters = try std.fmt.parseInt(usize, args_iter.next() orelse return error.MissingMeasureItersValue, 10);
+        } else if (std.mem.eql(u8, arg, "--batch-sweep")) {
+            opts.batch_sweep = true;
         } else if (std.mem.eql(u8, arg, "--format")) {
             opts.format = parseFormat(args_iter.next() orelse return error.MissingFormatValue) orelse return error.InvalidFormat;
         } else {
@@ -197,7 +272,7 @@ fn parseFormat(value: []const u8) ?OutputFormat {
 
 fn printUsage() void {
     print(
-        \\usage: zig build bench-reranker-e2e -- --model-dir <dir> [--backend auto|native|cuda|metal|mlx|onnx] [--query TEXT] [--doc TEXT]... [--warmup-iters N] [--measure-iters N] [--format text|csv]
+        \\usage: zig build bench-reranker-e2e -- --model-dir <dir> [--backend auto|native|cuda|metal|mlx|onnx] [--query TEXT] [--doc TEXT]... [--warmup-iters N] [--measure-iters N] [--batch-sweep] [--format text|csv]
         \\
     , .{});
 }
