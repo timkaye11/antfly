@@ -794,7 +794,7 @@ fn encoderLayer(
     const ffn_i_w = try layerParam2D(bld, layer, "intermediate.dense", ".weight", I, H);
     const ffn_i_b = try layerParam1D(bld, layer, "intermediate.dense", ".bias", I);
     const ffn_inter = try bld.linear(attn_normed, ffn_i_w, ffn_i_b, total, H, I);
-    const ffn_gelu = try exactGelu(bld, ffn_inter);
+    const ffn_gelu = try bld.geluExact(ffn_inter);
 
     const ffn_o_w = try layerParam2D(bld, layer, "output.dense", ".weight", H, I);
     const ffn_o_b = try layerParam1D(bld, layer, "output.dense", ".bias", H);
@@ -804,17 +804,6 @@ fn encoderLayer(
     const ffn_ln_w = try layerParam1D(bld, layer, "output.LayerNorm", ".weight", H);
     const ffn_ln_b = try layerParam1D(bld, layer, "output.LayerNorm", ".bias", H);
     return bld.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, config.layer_norm_eps);
-}
-
-fn exactGelu(bld: *Builder, input: NodeId) !NodeId {
-    const half = try bld.scalarConst(.f32, 0.5);
-    const inv_sqrt2 = try bld.scalarConst(.f32, 0.7071067811865476);
-
-    const half_x = try bld.mul(input, half);
-    const scaled = try bld.mul(input, inv_sqrt2);
-    const erf_v = try bld.erfOp(scaled);
-    const erf_term = try bld.mul(half_x, erf_v);
-    return bld.add(half_x, erf_term);
 }
 
 // ──────── Parameter naming helpers ────────

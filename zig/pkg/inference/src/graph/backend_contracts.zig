@@ -417,12 +417,13 @@ pub const DecoderRuntimeApplyLinearQkvRequest = struct {
 };
 
 pub const DecoderRuntimeActivationKind = enum(u8) {
-    gelu,
-    gelu_new,
-    silu,
-    relu,
-    quick_gelu,
-    relu_squared,
+    gelu = 0,
+    gelu_new = 1,
+    silu = 2,
+    relu = 3,
+    quick_gelu = 4,
+    relu_squared = 5,
+    gelu_exact = 17,
 };
 
 pub const PlannedLayerContract = struct {

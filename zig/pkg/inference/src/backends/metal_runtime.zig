@@ -571,6 +571,10 @@ fn applyActivationHost(values: []f32, kind: ops.DecoderRuntimeActivationKind) vo
             const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
             v.* = 0.5 * x * (1.0 + std.math.tanh(inner));
         },
+        .gelu_exact => for (values) |*v| {
+            const x = v.*;
+            v.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+        },
         .silu => activations.silu(values),
         .relu => activations.relu(values),
         .quick_gelu => activations.quickGelu(values),
@@ -579,6 +583,14 @@ fn applyActivationHost(values: []f32, kind: ops.DecoderRuntimeActivationKind) vo
             for (values) |*v| v.* *= v.*;
         },
     }
+}
+
+fn erfApproxF32(x: f32) f32 {
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return sign * (1.0 - poly * @exp(-(ax * ax)));
 }
 
 fn sampleLogits(logits: []const f32, request: anytype) usize {
@@ -20030,7 +20042,7 @@ test "metal native activation device rows match host" {
     const rows: usize = 7;
     const dim: usize = 37;
     const shape = [_]i32{ @intCast(rows), @intCast(dim) };
-    const kinds = [_]ops.DecoderRuntimeActivationKind{ .gelu, .gelu_new, .silu, .relu, .quick_gelu, .relu_squared };
+    const kinds = [_]ops.DecoderRuntimeActivationKind{ .gelu, .gelu_new, .silu, .relu, .quick_gelu, .relu_squared, .gelu_exact };
 
     var input_data: [rows * dim]f32 = undefined;
     for (&input_data, 0..) |*value, i| {
@@ -20295,7 +20307,7 @@ test "metal native activation host ABI copies fallback output buffer" {
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
     const dim: usize = 37;
-    const kinds = [_]ops.DecoderRuntimeActivationKind{ .gelu, .gelu_new, .silu, .relu, .quick_gelu, .relu_squared };
+    const kinds = [_]ops.DecoderRuntimeActivationKind{ .gelu, .gelu_new, .silu, .relu, .quick_gelu, .relu_squared, .gelu_exact };
 
     var input_data: [dim]f32 = undefined;
     for (&input_data, 0..) |*value, i| {
@@ -20345,7 +20357,7 @@ test "metal native activation multiply device rows match host" {
     const rows: usize = 9;
     const dim: usize = 64;
     const shape = [_]i32{ @intCast(rows), @intCast(dim) };
-    const kinds = [_]ops.DecoderRuntimeActivationKind{ .gelu, .gelu_new, .silu, .relu, .quick_gelu, .relu_squared };
+    const kinds = [_]ops.DecoderRuntimeActivationKind{ .gelu, .gelu_new, .silu, .relu, .quick_gelu, .relu_squared, .gelu_exact };
 
     var gate_data: [rows * dim]f32 = undefined;
     var up_data: [rows * dim]f32 = undefined;

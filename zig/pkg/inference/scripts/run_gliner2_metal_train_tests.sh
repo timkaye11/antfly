@@ -12,7 +12,7 @@ Modes:
   unit                  Focused Metal unit tests touched by training graph work
   suite                 Existing smoke + parity + readiness suite
   train-profile         Production-shaped training-only profile with executor stats
-  batch32               True batch-size-32 Metal readiness gate (OOM regression check)
+  batch32               Effective batch-size-32 Metal readiness gate with activation checkpointing
   profile              Short production-gate-shaped run with graph op profiling
   diagnostic           Full production-gate-shaped diagnostic, semantic eval skipped
   production           Canonical production gate
@@ -38,8 +38,53 @@ Options:
   --max-examples N      Max train examples for train-profile/batch32/profile gates
   --max-metal-runtime-total-bytes N
                         Fail readiness if Metal runtime allocation snapshot exceeds N
+  --max-metal-tensor-device-owned-peak-live-bytes N
+                        Fail readiness if owned Metal device tensor peak exceeds N
+  --max-metal-eager-arena-peak-bytes N
+                        Fail readiness if Metal eager arena peak exceeds N
+  --max-metal-eager-arena-spill-bytes N
+                        Fail readiness if Metal eager arena spills exceed N
+  --max-metal-chunk-local-output-peak-bytes N
+                        Fail readiness if chunk-local output pool peak exceeds N
+  --max-metal-chunk-local-output-spill-bytes N
+                        Fail readiness if chunk-local output spills exceed N
+  --max-metal-chunk-local-output-unconsumed-hints N
+                        Fail readiness if output hints are allocated but unused
+  --min-metal-chunk-local-output-consumed-hints N
+                        Fail readiness unless chunk-local output hints are consumed
+  TERMITE_METAL_CHUNK_LOCAL_OUTPUTS=1
+                        Enable chunk-local command-output backing storage; batch32
+                        asserts allocations, resets, and freed bytes when set
   --min-metal-runtime-reuse-hit-count N
                         Fail readiness unless in-frame buffer reuse hits at least N
+  --max-graph-command-dispatch-count N
+                        Fail readiness if graph command dispatches exceed N
+  --max-metal-frame-gpu-ms N
+                        Fail readiness if any Metal frame GPU duration exceeds N ms
+  --max-metal-last-frame-compute-encoder-count N
+                        Fail readiness if the last Metal frame compute-encoder count exceeds N
+  --min-metal-frame-chunk-boundary-count N
+                        Fail readiness unless Metal frame chunk boundaries execute at least N times
+  --min-metal-frame-chunk-promoted-value-count N
+                        Fail readiness unless chunk boundaries promote at least N live values
+  --min-metal-frame-chunk-swept-value-count N
+                        Fail readiness unless chunk boundaries sweep at least N expired values
+  --min-graph-runtime-region-dispatch-count N
+                        Fail readiness unless graph runtime regions execute at least N times
+  --max-graph-runtime-region-fallback-count N
+                        Fail readiness if graph runtime-region fallbacks exceed N
+  --min-graph-runtime-region-elided-node-count N
+                        Fail readiness unless runtime regions elide at least N graph nodes
+  --min-metal-deberta-ffn-forward-region-count N
+                        Fail readiness unless graph-level DeBERTa FFN forward regions run at least N times
+  --min-metal-deberta-attention-flash-call-count N
+                        Fail readiness unless fused DeBERTa attention runs at least N times
+  --max-metal-deberta-attention-gemm-fallback-count N
+                        Fail readiness if fused DeBERTa attention GEMM fallbacks exceed N
+  --min-metal-deberta-ffn-fused-call-count N
+                        Fail readiness unless fused DeBERTa FFN runs at least N times
+  --max-metal-deberta-ffn-fused-fallback-count N
+                        Fail readiness if fused DeBERTa FFN fallbacks exceed N
   --max-commands N      train-profile graph-exec command ceiling (default: 6200)
   --max-host-outputs N  train-profile host-output ceiling (default: 500)
   --max-runtime-region-fallbacks N
@@ -99,6 +144,30 @@ max_host_outputs=500
 max_runtime_region_fallbacks=0
 min_graph_regions=1
 min_runtime_plan_dispatches=1
+max_graph_command_dispatch_count=""
+max_metal_frame_gpu_ms=""
+max_metal_last_frame_compute_encoder_count=""
+max_metal_tensor_device_owned_peak_live_bytes=""
+max_metal_eager_arena_peak_bytes=""
+max_metal_eager_arena_spill_bytes=""
+max_metal_chunk_local_output_peak_bytes=""
+max_metal_chunk_local_output_spill_bytes=""
+max_metal_chunk_local_output_unconsumed_hints=""
+min_metal_chunk_local_output_consumed_hints=""
+min_metal_frame_chunk_boundary_count=""
+min_metal_frame_chunk_promoted_value_count=""
+min_metal_frame_chunk_swept_value_count=""
+min_graph_runtime_region_dispatch_count=""
+max_graph_runtime_region_fallback_count=""
+min_graph_runtime_region_elided_node_count=""
+min_metal_deberta_ffn_forward_region_count=""
+min_metal_deberta_attention_flash_call_count=""
+max_metal_deberta_attention_gemm_fallback_count=""
+min_metal_deberta_ffn_fused_call_count=""
+max_metal_deberta_ffn_fused_fallback_count=""
+require_slot_bound_outputs=0
+require_eager_arena_outputs=0
+require_chunk_local_outputs=0
 extra_args=()
 
 is_mode() {
@@ -189,8 +258,92 @@ while [[ $# -gt 0 ]]; do
       max_metal_runtime_total_bytes="${2:?missing value for --max-metal-runtime-total-bytes}"
       shift 2
       ;;
+    --max-metal-tensor-device-owned-peak-live-bytes)
+      max_metal_tensor_device_owned_peak_live_bytes="${2:?missing value for --max-metal-tensor-device-owned-peak-live-bytes}"
+      shift 2
+      ;;
+    --max-metal-eager-arena-peak-bytes)
+      max_metal_eager_arena_peak_bytes="${2:?missing value for --max-metal-eager-arena-peak-bytes}"
+      shift 2
+      ;;
+    --max-metal-eager-arena-spill-bytes)
+      max_metal_eager_arena_spill_bytes="${2:?missing value for --max-metal-eager-arena-spill-bytes}"
+      shift 2
+      ;;
+    --max-metal-chunk-local-output-peak-bytes)
+      max_metal_chunk_local_output_peak_bytes="${2:?missing value for --max-metal-chunk-local-output-peak-bytes}"
+      shift 2
+      ;;
+    --max-metal-chunk-local-output-spill-bytes)
+      max_metal_chunk_local_output_spill_bytes="${2:?missing value for --max-metal-chunk-local-output-spill-bytes}"
+      shift 2
+      ;;
+    --max-metal-chunk-local-output-unconsumed-hints)
+      max_metal_chunk_local_output_unconsumed_hints="${2:?missing value for --max-metal-chunk-local-output-unconsumed-hints}"
+      shift 2
+      ;;
+    --min-metal-chunk-local-output-consumed-hints)
+      min_metal_chunk_local_output_consumed_hints="${2:?missing value for --min-metal-chunk-local-output-consumed-hints}"
+      shift 2
+      ;;
     --min-metal-runtime-reuse-hit-count)
       min_metal_runtime_reuse_hit_count="${2:?missing value for --min-metal-runtime-reuse-hit-count}"
+      shift 2
+      ;;
+    --max-graph-command-dispatch-count)
+      max_graph_command_dispatch_count="${2:?missing value for --max-graph-command-dispatch-count}"
+      shift 2
+      ;;
+    --max-metal-frame-gpu-ms)
+      max_metal_frame_gpu_ms="${2:?missing value for --max-metal-frame-gpu-ms}"
+      shift 2
+      ;;
+    --max-metal-last-frame-compute-encoder-count)
+      max_metal_last_frame_compute_encoder_count="${2:?missing value for --max-metal-last-frame-compute-encoder-count}"
+      shift 2
+      ;;
+    --min-metal-frame-chunk-boundary-count)
+      min_metal_frame_chunk_boundary_count="${2:?missing value for --min-metal-frame-chunk-boundary-count}"
+      shift 2
+      ;;
+    --min-metal-frame-chunk-promoted-value-count)
+      min_metal_frame_chunk_promoted_value_count="${2:?missing value for --min-metal-frame-chunk-promoted-value-count}"
+      shift 2
+      ;;
+    --min-metal-frame-chunk-swept-value-count)
+      min_metal_frame_chunk_swept_value_count="${2:?missing value for --min-metal-frame-chunk-swept-value-count}"
+      shift 2
+      ;;
+    --min-graph-runtime-region-dispatch-count)
+      min_graph_runtime_region_dispatch_count="${2:?missing value for --min-graph-runtime-region-dispatch-count}"
+      shift 2
+      ;;
+    --max-graph-runtime-region-fallback-count)
+      max_graph_runtime_region_fallback_count="${2:?missing value for --max-graph-runtime-region-fallback-count}"
+      shift 2
+      ;;
+    --min-graph-runtime-region-elided-node-count)
+      min_graph_runtime_region_elided_node_count="${2:?missing value for --min-graph-runtime-region-elided-node-count}"
+      shift 2
+      ;;
+    --min-metal-deberta-ffn-forward-region-count)
+      min_metal_deberta_ffn_forward_region_count="${2:?missing value for --min-metal-deberta-ffn-forward-region-count}"
+      shift 2
+      ;;
+    --min-metal-deberta-attention-flash-call-count)
+      min_metal_deberta_attention_flash_call_count="${2:?missing value for --min-metal-deberta-attention-flash-call-count}"
+      shift 2
+      ;;
+    --max-metal-deberta-attention-gemm-fallback-count)
+      max_metal_deberta_attention_gemm_fallback_count="${2:?missing value for --max-metal-deberta-attention-gemm-fallback-count}"
+      shift 2
+      ;;
+    --min-metal-deberta-ffn-fused-call-count)
+      min_metal_deberta_ffn_fused_call_count="${2:?missing value for --min-metal-deberta-ffn-fused-call-count}"
+      shift 2
+      ;;
+    --max-metal-deberta-ffn-fused-fallback-count)
+      max_metal_deberta_ffn_fused_fallback_count="${2:?missing value for --max-metal-deberta-ffn-fused-fallback-count}"
       shift 2
       ;;
     --max-commands)
@@ -313,6 +466,21 @@ profile_env_args() {
   if [[ "${broadcast_trace}" -eq 1 ]]; then
     local_env+=("TERMITE_METAL_TRACE_BROADCAST_PRIM=1")
   fi
+  if [[ -n "${TERMITE_METAL_TRACE_OWNED_ALLOC_LIMIT:-}" ]]; then
+    local_env+=("TERMITE_METAL_TRACE_OWNED_ALLOC_LIMIT=${TERMITE_METAL_TRACE_OWNED_ALLOC_LIMIT}")
+  fi
+  if [[ -n "${TERMITE_METAL_TRACE_OWNED_ALLOC_MIN_BYTES:-}" ]]; then
+    local_env+=("TERMITE_METAL_TRACE_OWNED_ALLOC_MIN_BYTES=${TERMITE_METAL_TRACE_OWNED_ALLOC_MIN_BYTES}")
+  fi
+  if [[ -n "${TERMITE_METAL_OWNED_PEAK_SNAPSHOT_TOP:-}" ]]; then
+    local_env+=("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_TOP=${TERMITE_METAL_OWNED_PEAK_SNAPSHOT_TOP}")
+  fi
+  if [[ -n "${TERMITE_METAL_OWNED_PEAK_SNAPSHOT_LIMIT:-}" ]]; then
+    local_env+=("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_LIMIT=${TERMITE_METAL_OWNED_PEAK_SNAPSHOT_LIMIT}")
+  fi
+  if [[ -n "${TERMITE_METAL_OWNED_PEAK_SNAPSHOT_MIN_BYTES:-}" ]]; then
+    local_env+=("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_MIN_BYTES=${TERMITE_METAL_OWNED_PEAK_SNAPSHOT_MIN_BYTES}")
+  fi
   if [[ "${#local_env[@]}" -gt 0 ]]; then
     printf '%s\n' "${local_env[@]}"
   fi
@@ -331,8 +499,71 @@ append_metal_runtime_threshold_args() {
   if [[ -n "${max_metal_runtime_total_bytes}" ]]; then
     cmd+=("--max-metal-runtime-total-bytes" "${max_metal_runtime_total_bytes}")
   fi
+  if [[ -n "${max_metal_tensor_device_owned_peak_live_bytes}" ]]; then
+    cmd+=("--max-metal-tensor-device-owned-peak-live-bytes" "${max_metal_tensor_device_owned_peak_live_bytes}")
+  fi
+  if [[ -n "${max_metal_eager_arena_peak_bytes}" ]]; then
+    cmd+=("--max-metal-eager-arena-peak-bytes" "${max_metal_eager_arena_peak_bytes}")
+  fi
+  if [[ -n "${max_metal_eager_arena_spill_bytes}" ]]; then
+    cmd+=("--max-metal-eager-arena-spill-bytes" "${max_metal_eager_arena_spill_bytes}")
+  fi
+  if [[ -n "${max_metal_chunk_local_output_peak_bytes}" ]]; then
+    cmd+=("--max-metal-chunk-local-output-peak-bytes" "${max_metal_chunk_local_output_peak_bytes}")
+  fi
+  if [[ -n "${max_metal_chunk_local_output_spill_bytes}" ]]; then
+    cmd+=("--max-metal-chunk-local-output-spill-bytes" "${max_metal_chunk_local_output_spill_bytes}")
+  fi
+  if [[ -n "${max_metal_chunk_local_output_unconsumed_hints}" ]]; then
+    cmd+=("--max-metal-chunk-local-output-unconsumed-hints" "${max_metal_chunk_local_output_unconsumed_hints}")
+  fi
+  if [[ -n "${min_metal_chunk_local_output_consumed_hints}" ]]; then
+    cmd+=("--min-metal-chunk-local-output-consumed-hints" "${min_metal_chunk_local_output_consumed_hints}")
+  fi
   if [[ -n "${min_metal_runtime_reuse_hit_count}" ]]; then
     cmd+=("--min-metal-runtime-reuse-hit-count" "${min_metal_runtime_reuse_hit_count}")
+  fi
+  if [[ -n "${max_graph_command_dispatch_count}" ]]; then
+    cmd+=("--max-graph-command-dispatch-count" "${max_graph_command_dispatch_count}")
+  fi
+  if [[ -n "${max_metal_frame_gpu_ms}" ]]; then
+    cmd+=("--max-metal-frame-gpu-ms" "${max_metal_frame_gpu_ms}")
+  fi
+  if [[ -n "${max_metal_last_frame_compute_encoder_count}" ]]; then
+    cmd+=("--max-metal-last-frame-compute-encoder-count" "${max_metal_last_frame_compute_encoder_count}")
+  fi
+  if [[ -n "${min_metal_frame_chunk_boundary_count}" ]]; then
+    cmd+=("--min-metal-frame-chunk-boundary-count" "${min_metal_frame_chunk_boundary_count}")
+  fi
+  if [[ -n "${min_metal_frame_chunk_promoted_value_count}" ]]; then
+    cmd+=("--min-metal-frame-chunk-promoted-value-count" "${min_metal_frame_chunk_promoted_value_count}")
+  fi
+  if [[ -n "${min_metal_frame_chunk_swept_value_count}" ]]; then
+    cmd+=("--min-metal-frame-chunk-swept-value-count" "${min_metal_frame_chunk_swept_value_count}")
+  fi
+  if [[ -n "${min_graph_runtime_region_dispatch_count}" ]]; then
+    cmd+=("--min-graph-runtime-region-dispatch-count" "${min_graph_runtime_region_dispatch_count}")
+  fi
+  if [[ -n "${max_graph_runtime_region_fallback_count}" ]]; then
+    cmd+=("--max-graph-runtime-region-fallback-count" "${max_graph_runtime_region_fallback_count}")
+  fi
+  if [[ -n "${min_graph_runtime_region_elided_node_count}" ]]; then
+    cmd+=("--min-graph-runtime-region-elided-node-count" "${min_graph_runtime_region_elided_node_count}")
+  fi
+  if [[ -n "${min_metal_deberta_ffn_forward_region_count}" ]]; then
+    cmd+=("--min-metal-deberta-ffn-forward-region-count" "${min_metal_deberta_ffn_forward_region_count}")
+  fi
+  if [[ -n "${min_metal_deberta_attention_flash_call_count}" ]]; then
+    cmd+=("--min-metal-deberta-attention-flash-call-count" "${min_metal_deberta_attention_flash_call_count}")
+  fi
+  if [[ -n "${max_metal_deberta_attention_gemm_fallback_count}" ]]; then
+    cmd+=("--max-metal-deberta-attention-gemm-fallback-count" "${max_metal_deberta_attention_gemm_fallback_count}")
+  fi
+  if [[ -n "${min_metal_deberta_ffn_fused_call_count}" ]]; then
+    cmd+=("--min-metal-deberta-ffn-fused-call-count" "${min_metal_deberta_ffn_fused_call_count}")
+  fi
+  if [[ -n "${max_metal_deberta_ffn_fused_fallback_count}" ]]; then
+    cmd+=("--max-metal-deberta-ffn-fused-fallback-count" "${max_metal_deberta_ffn_fused_fallback_count}")
   fi
 }
 
@@ -389,7 +620,7 @@ json_log_value() {
 
 assert_production_summary_log() {
   local log_file="$1"
-  local status manifest_backend optimizer_backend optimizer_mismatch trainable_transfers resident_transfers adapter_tensors task_head_tensors steps supervised_tokens execute_ms graph_commands graph_planned
+  local status manifest_backend optimizer_backend optimizer_mismatch trainable_transfers resident_transfers adapter_tensors task_head_tensors steps supervised_tokens execute_ms graph_commands graph_planned owned_peak_bytes metal_gpu_ms metal_compute_encoders chunk_boundaries chunk_promoted chunk_swept runtime_regions runtime_region_fallbacks runtime_region_elided_nodes deberta_ffn_forward_regions deberta_flash_calls deberta_gemm_fallbacks deberta_ffn_fused_calls deberta_ffn_fused_fallbacks
 
   status="$(json_log_value "${log_file}" "status")" || return 1
   [[ "${status}" == "passed" ]] || return 1
@@ -406,6 +637,20 @@ assert_production_summary_log() {
   execute_ms="$(json_log_value "${log_file}" "total_execute_ms")" || return 1
   graph_commands="$(json_log_value "${log_file}" "total_graph_command_dispatches")" || return 1
   graph_planned="$(json_log_value "${log_file}" "total_graph_planned_dispatches")" || return 1
+  owned_peak_bytes="$(json_log_value "${log_file}" "max_metal_tensor_device_owned_peak_live_bytes")" || return 1
+  metal_gpu_ms="$(json_log_value "${log_file}" "max_metal_frame_gpu_ms")" || return 1
+  metal_compute_encoders="$(json_log_value "${log_file}" "max_metal_last_frame_compute_encoders")" || return 1
+  chunk_boundaries="$(json_log_value "${log_file}" "total_metal_frame_chunk_boundaries")" || return 1
+  chunk_promoted="$(json_log_value "${log_file}" "total_metal_frame_chunk_promoted_values")" || return 1
+  chunk_swept="$(json_log_value "${log_file}" "total_metal_frame_chunk_swept_values")" || return 1
+  runtime_regions="$(json_log_value "${log_file}" "total_graph_runtime_region_dispatches")" || return 1
+  runtime_region_fallbacks="$(json_log_value "${log_file}" "total_graph_runtime_region_fallbacks")" || return 1
+  runtime_region_elided_nodes="$(json_log_value "${log_file}" "total_graph_runtime_region_elided_nodes")" || return 1
+  deberta_ffn_forward_regions="$(json_log_value "${log_file}" "total_metal_deberta_ffn_forward_regions")" || return 1
+  deberta_flash_calls="$(json_log_value "${log_file}" "total_metal_deberta_attention_flash_calls")" || return 1
+  deberta_gemm_fallbacks="$(json_log_value "${log_file}" "total_metal_deberta_attention_gemm_fallbacks")" || return 1
+  deberta_ffn_fused_calls="$(json_log_value "${log_file}" "total_metal_deberta_ffn_fused_calls")" || return 1
+  deberta_ffn_fused_fallbacks="$(json_log_value "${log_file}" "total_metal_deberta_ffn_fused_fallbacks")" || return 1
 
   if [[ "${manifest_backend}" != "Metal" ||
     "${optimizer_backend}" != "metal" ||
@@ -429,8 +674,8 @@ assert_production_summary_log() {
     return 1
   fi
 
-  printf 'production_profile_summary_assertions: status=%s manifest_backend=%s optimizer_backend=%s max_device_trainable_transfer_count=%s max_device_resident_transfer_count=%s peft_adapter_tensor_count=%s task_head_tensor_count=%s step_record_count=%s supervised_token_count=%s total_execute_ms=%s total_graph_command_dispatches=%s total_graph_planned_dispatches=%s\n' \
-    "${status}" "${manifest_backend}" "${optimizer_backend}" "${trainable_transfers}" "${resident_transfers}" "${adapter_tensors}" "${task_head_tensors}" "${steps}" "${supervised_tokens}" "${execute_ms}" "${graph_commands}" "${graph_planned}"
+  printf 'production_profile_summary_assertions: status=%s manifest_backend=%s optimizer_backend=%s max_device_trainable_transfer_count=%s max_device_resident_transfer_count=%s peft_adapter_tensor_count=%s task_head_tensor_count=%s step_record_count=%s supervised_token_count=%s total_execute_ms=%s total_graph_command_dispatches=%s total_graph_planned_dispatches=%s max_metal_tensor_device_owned_peak_live_bytes=%s max_metal_frame_gpu_ms=%s max_metal_last_frame_compute_encoders=%s total_metal_frame_chunk_boundaries=%s total_metal_frame_chunk_promoted_values=%s total_metal_frame_chunk_swept_values=%s total_graph_runtime_region_dispatches=%s total_graph_runtime_region_fallbacks=%s total_graph_runtime_region_elided_nodes=%s total_metal_deberta_ffn_forward_regions=%s total_metal_deberta_attention_flash_calls=%s total_metal_deberta_attention_gemm_fallbacks=%s total_metal_deberta_ffn_fused_calls=%s total_metal_deberta_ffn_fused_fallbacks=%s\n' \
+    "${status}" "${manifest_backend}" "${optimizer_backend}" "${trainable_transfers}" "${resident_transfers}" "${adapter_tensors}" "${task_head_tensors}" "${steps}" "${supervised_tokens}" "${execute_ms}" "${graph_commands}" "${graph_planned}" "${owned_peak_bytes}" "${metal_gpu_ms}" "${metal_compute_encoders}" "${chunk_boundaries}" "${chunk_promoted}" "${chunk_swept}" "${runtime_regions}" "${runtime_region_fallbacks}" "${runtime_region_elided_nodes}" "${deberta_ffn_forward_regions}" "${deberta_flash_calls}" "${deberta_gemm_fallbacks}" "${deberta_ffn_fused_calls}" "${deberta_ffn_fused_fallbacks}"
 }
 
 assert_graph_exec_profile_log() {
@@ -483,6 +728,120 @@ assert_graph_exec_profile_log() {
     "${commands}" "${host_outputs}" "${graph_regions}" "${runtime_plan_dispatches}" "${runtime_region_fallbacks}"
 }
 
+assert_slot_bound_output_log() {
+  local log_file="$1"
+  local line="" consumed="" pool_allocs="" pool_reuses="" pool_peak_bytes="" pool_budget_declines=""
+  while IFS= read -r candidate; do
+    [[ "${candidate}" == *metal_slot_bound_outputs:* ]] || continue
+    line="metal_slot_bound_outputs:${candidate#*metal_slot_bound_outputs:}"
+  done < "${log_file}"
+
+  if [[ -z "${line}" ]]; then
+    echo "error: batch32 did not emit metal_slot_bound_outputs diagnostics" >&2
+    return 1
+  fi
+
+  consumed="$(stat_value "${line}" consumed)" || return 1
+  pool_allocs="$(stat_value "${line}" pool_allocs)" || return 1
+  pool_reuses="$(stat_value "${line}" pool_reuses)" || return 1
+  pool_budget_declines="$(stat_value "${line}" pool_budget_declines)" || pool_budget_declines=0
+  pool_peak_bytes="$(stat_value "${line}" pool_peak_bytes)" || return 1
+  if (( consumed <= 0 || pool_allocs <= 0 || pool_reuses <= 0 )); then
+    echo "error: slot-bound output pool did not prove active allocation reuse" >&2
+    echo "       ${line}" >&2
+    return 1
+  fi
+  if [[ -n "${TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES:-}" && "${TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES}" != "0" ]]; then
+    if (( pool_peak_bytes > TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES )); then
+      echo "error: slot-bound output pool exceeded configured byte budget" >&2
+      echo "       budget=${TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES} ${line}" >&2
+      return 1
+    fi
+  fi
+
+  printf 'slot_bound_output_assertions: consumed=%s pool_allocs=%s pool_reuses=%s pool_budget_declines=%s pool_peak_bytes=%s\n' \
+    "${consumed}" "${pool_allocs}" "${pool_reuses}" "${pool_budget_declines}" "${pool_peak_bytes}"
+}
+
+assert_eager_arena_log() {
+  local log_file="$1"
+  local line="" peak_bytes="" allocations="" reuse_hits="" spill_bytes="" hazard_declines="" alias_conflicts="" alias_reclaims="" alias_reclaim_bytes=""
+  while IFS= read -r candidate; do
+    [[ "${candidate}" == *metal_eager_arena:* ]] || continue
+    line="metal_eager_arena:${candidate#*metal_eager_arena:}"
+  done < "${log_file}"
+
+  if [[ -z "${line}" ]]; then
+    echo "error: batch32 did not emit metal_eager_arena diagnostics" >&2
+    return 1
+  fi
+
+  peak_bytes="$(stat_value "${line}" peak_bytes)" || return 1
+  allocations="$(stat_value "${line}" allocations)" || return 1
+  reuse_hits="$(stat_value "${line}" reuse_hits)" || reuse_hits=0
+  spill_bytes="$(stat_value "${line}" spill_bytes)" || spill_bytes=0
+  hazard_declines="$(stat_value "${line}" hazard_declines)" || hazard_declines=0
+  alias_conflicts="$(stat_value "${line}" alias_conflicts)" || alias_conflicts=0
+  alias_reclaims="$(stat_value "${line}" alias_reclaims)" || alias_reclaims=0
+  alias_reclaim_bytes="$(stat_value "${line}" alias_reclaim_bytes)" || alias_reclaim_bytes=0
+  if (( peak_bytes <= 0 || allocations <= 0 )); then
+    echo "error: Metal eager arena did not prove active allocation" >&2
+    echo "       ${line}" >&2
+    return 1
+  fi
+  if [[ -n "${TERMITE_METAL_EAGER_ARENA_MAX_BYTES:-}" && "${TERMITE_METAL_EAGER_ARENA_MAX_BYTES}" != "0" ]]; then
+    if (( peak_bytes > TERMITE_METAL_EAGER_ARENA_MAX_BYTES )); then
+      echo "error: Metal eager arena exceeded configured byte budget" >&2
+      echo "       budget=${TERMITE_METAL_EAGER_ARENA_MAX_BYTES} ${line}" >&2
+      return 1
+    fi
+  fi
+
+  printf 'eager_arena_assertions: peak_bytes=%s allocations=%s reuse_hits=%s spill_bytes=%s hazard_declines=%s alias_conflicts=%s alias_reclaims=%s alias_reclaim_bytes=%s\n' \
+    "${peak_bytes}" "${allocations}" "${reuse_hits}" "${spill_bytes}" "${hazard_declines}" "${alias_conflicts}" "${alias_reclaims}" "${alias_reclaim_bytes}"
+}
+
+assert_chunk_local_output_log() {
+  local log_file="$1"
+  local line="" peak_bytes="" allocations="" reuse_hits="" consumed_hints="" unconsumed_hints="" spill_bytes="" alias_conflicts="" resets="" reset_freed_bytes="" discard_freed_bytes="" reset_live_carry_values=""
+  while IFS= read -r candidate; do
+    [[ "${candidate}" == *metal_chunk_local_outputs:* ]] || continue
+    line="metal_chunk_local_outputs:${candidate#*metal_chunk_local_outputs:}"
+  done < "${log_file}"
+
+  if [[ -z "${line}" ]]; then
+    echo "error: batch32 did not emit metal_chunk_local_outputs diagnostics" >&2
+    return 1
+  fi
+
+  peak_bytes="$(stat_value "${line}" peak_bytes)" || return 1
+  allocations="$(stat_value "${line}" allocations)" || return 1
+  reuse_hits="$(stat_value "${line}" reuse_hits)" || reuse_hits=0
+  consumed_hints="$(stat_value "${line}" consumed_hints)" || consumed_hints=0
+  unconsumed_hints="$(stat_value "${line}" unconsumed_hints)" || unconsumed_hints=0
+  spill_bytes="$(stat_value "${line}" spill_bytes)" || spill_bytes=0
+  alias_conflicts="$(stat_value "${line}" alias_conflicts)" || alias_conflicts=0
+  resets="$(stat_value "${line}" resets)" || return 1
+  reset_freed_bytes="$(stat_value "${line}" reset_freed_bytes)" || return 1
+  discard_freed_bytes="$(stat_value "${line}" discard_freed_bytes)" || discard_freed_bytes=0
+  reset_live_carry_values="$(stat_value "${line}" reset_live_carry_values)" || reset_live_carry_values=0
+  if (( peak_bytes <= 0 || allocations <= 0 || resets <= 0 || reset_freed_bytes <= 0 )); then
+    echo "error: chunk-local outputs did not prove active mid-step release" >&2
+    echo "       ${line}" >&2
+    return 1
+  fi
+  if [[ -n "${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES:-}" && "${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES}" != "0" ]]; then
+    if (( peak_bytes > TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES )); then
+      echo "error: chunk-local output pool exceeded configured byte budget" >&2
+      echo "       budget=${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES} ${line}" >&2
+      return 1
+    fi
+  fi
+
+  printf 'chunk_local_output_assertions: peak_bytes=%s allocations=%s reuse_hits=%s consumed_hints=%s unconsumed_hints=%s spill_bytes=%s alias_conflicts=%s resets=%s reset_freed_bytes=%s discard_freed_bytes=%s reset_live_carry_values=%s\n' \
+    "${peak_bytes}" "${allocations}" "${reuse_hits}" "${consumed_hints}" "${unconsumed_hints}" "${spill_bytes}" "${alias_conflicts}" "${resets}" "${reset_freed_bytes}" "${discard_freed_bytes}" "${reset_live_carry_values}"
+}
+
 run_env_cmd_with_profile_assertions() {
   local -a local_env=()
   while [[ $# -gt 0 ]]; do
@@ -525,6 +884,15 @@ run_env_cmd_with_profile_assertions() {
     fi
   fi
   assert_graph_exec_profile_log "${log_file}"
+  if [[ "${require_slot_bound_outputs}" -eq 1 ]]; then
+    assert_slot_bound_output_log "${log_file}"
+  fi
+  if [[ "${require_eager_arena_outputs}" -eq 1 ]]; then
+    assert_eager_arena_log "${log_file}"
+  fi
+  if [[ "${require_chunk_local_outputs}" -eq 1 ]]; then
+    assert_chunk_local_output_log "${log_file}"
+  fi
 }
 
 run_unit() {
@@ -562,7 +930,7 @@ run_train_profile() {
     --max-span-width 4
     --lora-rank 16
     --lora-alpha 32
-    --lora-dropout 0.1
+    --lora-dropout 0
   )
   if [[ -n "${trace_range}" ]]; then
     cmd+=(--trace "${trace_range}")
@@ -589,6 +957,24 @@ run_batch32() {
   graph_stats=1
   op_profile=1
   partition_op_stats=1
+  require_slot_bound_outputs=0
+  require_eager_arena_outputs=0
+  require_chunk_local_outputs=0
+  if [[ "${TERMITE_METAL_SLOT_BOUND_OUTPUTS:-0}" == "1" ]]; then
+    require_slot_bound_outputs=1
+  fi
+  if [[ "${TERMITE_METAL_EAGER_ARENA:-0}" == "1" ]]; then
+    require_eager_arena_outputs=1
+  fi
+  if [[ "${TERMITE_METAL_CHUNK_LOCAL_OUTPUTS:-0}" == "1" ]]; then
+    require_chunk_local_outputs=1
+    if [[ -z "${min_metal_chunk_local_output_consumed_hints}" ]]; then
+      min_metal_chunk_local_output_consumed_hints=1
+    fi
+    if [[ -z "${max_metal_chunk_local_output_unconsumed_hints}" ]]; then
+      max_metal_chunk_local_output_unconsumed_hints=0
+    fi
+  fi
 
   local gate_batch_size="${batch_size}"
   local gate_seq_len="${seq_len}"
@@ -605,6 +991,38 @@ run_batch32() {
   if [[ -z "${min_metal_runtime_reuse_hit_count}" ]]; then
     min_metal_runtime_reuse_hit_count=1
   fi
+  if [[ -z "${max_metal_runtime_total_bytes}" ]]; then
+    max_metal_runtime_total_bytes=536870912
+  fi
+  if [[ -z "${max_metal_tensor_device_owned_peak_live_bytes}" ]]; then
+    max_metal_tensor_device_owned_peak_live_bytes=4294967296
+  fi
+  if [[ -z "${min_graph_runtime_region_dispatch_count}" ]]; then
+    min_graph_runtime_region_dispatch_count=1
+  fi
+  if [[ -z "${min_metal_frame_chunk_boundary_count}" ]]; then
+    min_metal_frame_chunk_boundary_count=1
+  fi
+  if [[ -z "${min_metal_frame_chunk_swept_value_count}" ]]; then
+    min_metal_frame_chunk_swept_value_count=1
+  fi
+  if [[ -z "${max_graph_runtime_region_fallback_count}" ]]; then
+    max_graph_runtime_region_fallback_count=0
+  fi
+  if [[ -z "${min_graph_runtime_region_elided_node_count}" ]]; then
+    min_graph_runtime_region_elided_node_count=1
+  fi
+  if [[ -z "${min_metal_deberta_ffn_forward_region_count}" ]]; then
+    # The FFN-forward runtime region is available as an opt-in perf experiment,
+    # but it currently raises batch32 checkpointed residency enough to re-OOM.
+    min_metal_deberta_ffn_forward_region_count=0
+  fi
+  if [[ -z "${min_metal_deberta_attention_flash_call_count}" ]]; then
+    min_metal_deberta_attention_flash_call_count=1
+  fi
+  if [[ -z "${max_metal_deberta_attention_gemm_fallback_count}" ]]; then
+    max_metal_deberta_attention_gemm_fallback_count=0
+  fi
 
   local -a cmd=(
     "${parity_script}"
@@ -620,7 +1038,10 @@ run_batch32() {
     --max-span-width 4
     --lora-rank 16
     --lora-alpha 32
-    --lora-dropout 0.1
+    --lora-dropout 0
+    --activation-checkpointing
+    --activation-checkpoint-interval 1
+    --activation-checkpoint-strategy parameters-only
     --
     --allow-flat-loss
     --skip-quality-eval
@@ -633,14 +1054,47 @@ run_batch32() {
     --min-steps 1
     --min-supervised-tokens 1
     --min-entity-tokens 1
-    --max-avg-step-wall-ms 30000
-    --max-total-execute-ms 30000
+    --max-avg-step-wall-ms 120000
+    --max-total-execute-ms 120000
   )
   append_metal_runtime_threshold_args
   if [[ "${#extra_args[@]}" -gt 0 ]]; then
     cmd+=("${extra_args[@]}")
   fi
   local -a profile_env_result=("TERMITE_METAL_BUFFER_REUSE_STATS=1")
+  if [[ -z "${TERMITE_METAL_FRAME_CHUNK_OPS:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_FRAME_CHUNK_OPS=128")
+  fi
+  if [[ -n "${TERMITE_METAL_SLOT_BOUND_OUTPUTS:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_SLOT_BOUND_OUTPUTS=${TERMITE_METAL_SLOT_BOUND_OUTPUTS}")
+  fi
+  if [[ -n "${TERMITE_METAL_SLOT_BOUND_MIN_BYTES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_SLOT_BOUND_MIN_BYTES=${TERMITE_METAL_SLOT_BOUND_MIN_BYTES}")
+  fi
+  if [[ -n "${TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES=${TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES}")
+  fi
+  if [[ -n "${TERMITE_METAL_EAGER_ARENA:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_EAGER_ARENA=${TERMITE_METAL_EAGER_ARENA}")
+  fi
+  if [[ -n "${TERMITE_METAL_EAGER_ARENA_MIN_BYTES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_EAGER_ARENA_MIN_BYTES=${TERMITE_METAL_EAGER_ARENA_MIN_BYTES}")
+  fi
+  if [[ -n "${TERMITE_METAL_EAGER_ARENA_MAX_BYTES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_EAGER_ARENA_MAX_BYTES=${TERMITE_METAL_EAGER_ARENA_MAX_BYTES}")
+  fi
+  if [[ -n "${TERMITE_METAL_EAGER_ARENA_RECLAIM_ALIASES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_EAGER_ARENA_RECLAIM_ALIASES=${TERMITE_METAL_EAGER_ARENA_RECLAIM_ALIASES}")
+  fi
+  if [[ -n "${TERMITE_METAL_CHUNK_LOCAL_OUTPUTS:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_CHUNK_LOCAL_OUTPUTS=${TERMITE_METAL_CHUNK_LOCAL_OUTPUTS}")
+  fi
+  if [[ -n "${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MIN_BYTES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MIN_BYTES=${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MIN_BYTES}")
+  fi
+  if [[ -n "${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES:-}" ]]; then
+    profile_env_result+=("TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES=${TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES}")
+  fi
   append_profile_env_args
   run_env_cmd_with_profile_assertions "${profile_env_result[@]}" -- "${cmd[@]}"
 }
@@ -741,7 +1195,30 @@ run_production() {
     "${parity_script}" "${args[@]}" \
     --out-suffix "$(suffix_arg production-gate)"
   )
-  if [[ "${#extra_args[@]}" -gt 0 || -n "${max_metal_runtime_total_bytes}" || -n "${min_metal_runtime_reuse_hit_count}" ]]; then
+  if [[ "${#extra_args[@]}" -gt 0 ||
+    -n "${max_metal_runtime_total_bytes}" ||
+    -n "${max_metal_tensor_device_owned_peak_live_bytes}" ||
+    -n "${max_metal_eager_arena_peak_bytes}" ||
+    -n "${max_metal_eager_arena_spill_bytes}" ||
+    -n "${max_metal_chunk_local_output_peak_bytes}" ||
+    -n "${max_metal_chunk_local_output_spill_bytes}" ||
+    -n "${max_metal_chunk_local_output_unconsumed_hints}" ||
+    -n "${min_metal_chunk_local_output_consumed_hints}" ||
+    -n "${min_metal_runtime_reuse_hit_count}" ||
+    -n "${max_graph_command_dispatch_count}" ||
+    -n "${max_metal_frame_gpu_ms}" ||
+    -n "${max_metal_last_frame_compute_encoder_count}" ||
+    -n "${min_metal_frame_chunk_boundary_count}" ||
+    -n "${min_metal_frame_chunk_promoted_value_count}" ||
+    -n "${min_metal_frame_chunk_swept_value_count}" ||
+    -n "${min_graph_runtime_region_dispatch_count}" ||
+    -n "${max_graph_runtime_region_fallback_count}" ||
+    -n "${min_graph_runtime_region_elided_node_count}" ||
+    -n "${min_metal_deberta_ffn_forward_region_count}" ||
+    -n "${min_metal_deberta_attention_flash_call_count}" ||
+    -n "${max_metal_deberta_attention_gemm_fallback_count}" ||
+    -n "${min_metal_deberta_ffn_fused_call_count}" ||
+    -n "${max_metal_deberta_ffn_fused_fallback_count}" ]]; then
     cmd+=("--")
     append_metal_runtime_threshold_args
     if [[ "${#extra_args[@]}" -gt 0 ]]; then

@@ -55,6 +55,16 @@ pub const MemoryStats = struct {
     device_owned_bytes_released: u64 = 0,
     device_owned_live_bytes: u64 = 0,
     device_owned_peak_live_bytes: u64 = 0,
+    device_owned_live_lt_256kb_bytes: u64 = 0,
+    device_owned_peak_lt_256kb_bytes: u64 = 0,
+    device_owned_live_256kb_1mb_bytes: u64 = 0,
+    device_owned_peak_256kb_1mb_bytes: u64 = 0,
+    device_owned_live_1mb_4mb_bytes: u64 = 0,
+    device_owned_peak_1mb_4mb_bytes: u64 = 0,
+    device_owned_live_4mb_16mb_bytes: u64 = 0,
+    device_owned_peak_4mb_16mb_bytes: u64 = 0,
+    device_owned_live_ge_16mb_bytes: u64 = 0,
+    device_owned_peak_ge_16mb_bytes: u64 = 0,
     device_borrowed_tensors_created: u64 = 0,
     retained_device_views_created: u64 = 0,
     host_mirror_allocations: u64 = 0,
@@ -69,6 +79,32 @@ pub const MemoryStats = struct {
 
 var memory_stats = MemoryStats{};
 var to_host_trace_count: usize = 0;
+var owned_alloc_trace_count: usize = 0;
+const owned_peak_snapshot_capacity: usize = 16384;
+const owned_peak_snapshot_label_len: usize = 96;
+
+const OwnedAllocationRecord = struct {
+    handle: ?*anyopaque = null,
+    bytes: usize = 0,
+    dims: [max_dims]i32 = [_]i32{0} ** max_dims,
+    rank: u8 = 0,
+    seq: u64 = 0,
+    label: [owned_peak_snapshot_label_len]u8 = [_]u8{0} ** owned_peak_snapshot_label_len,
+    label_len: u8 = 0,
+    active: bool = false,
+
+    fn labelSlice(self: *const OwnedAllocationRecord) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
+
+var owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
+var owned_allocation_next_slot: usize = 0;
+var owned_allocation_sequence: u64 = 0;
+var owned_allocation_live_record_count: usize = 0;
+var owned_allocation_lost_record_count: u64 = 0;
+var owned_peak_snapshot_print_count: usize = 0;
+var owned_alloc_context: []const u8 = "";
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
@@ -87,17 +123,210 @@ fn traceToHostStackLimit() usize {
     return getenvUsize("TERMITE_METAL_TRACE_TO_HOST_STACK_LIMIT") orelse 0;
 }
 
-fn noteDeviceOwnedCreate(byte_len: usize) void {
+fn traceOwnedAllocLimit() usize {
+    return getenvUsize("TERMITE_METAL_TRACE_OWNED_ALLOC_LIMIT") orelse 0;
+}
+
+fn traceOwnedAllocMinBytes() usize {
+    return getenvUsize("TERMITE_METAL_TRACE_OWNED_ALLOC_MIN_BYTES") orelse 0;
+}
+
+fn ownedPeakSnapshotTop() usize {
+    const requested = getenvUsize("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_TOP") orelse 0;
+    return @min(requested, 32);
+}
+
+fn ownedPeakSnapshotLimit() usize {
+    return getenvUsize("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_LIMIT") orelse 8;
+}
+
+fn ownedPeakSnapshotMinBytes() u64 {
+    return getenvUsize("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_MIN_BYTES") orelse 0;
+}
+
+pub fn setOwnedAllocationContext(label: []const u8) void {
+    owned_alloc_context = label;
+}
+
+pub fn clearOwnedAllocationContext() void {
+    owned_alloc_context = "";
+}
+
+fn copyLabel(dst: *[owned_peak_snapshot_label_len]u8, src: []const u8) u8 {
+    const n = @min(src.len, dst.len);
+    if (n > 0) @memcpy(dst[0..n], src[0..n]);
+    if (n < dst.len) @memset(dst[n..], 0);
+    return @intCast(n);
+}
+
+fn noteOwnedAllocationRecord(handle: *anyopaque, byte_len: usize, dims: []const i32) void {
+    var slot_index: ?usize = null;
+    for (owned_allocation_records, 0..) |record, idx| {
+        if (!record.active) {
+            slot_index = idx;
+            break;
+        }
+    }
+    if (slot_index == null and owned_allocation_records.len > 0) {
+        for (0..owned_allocation_records.len) |_| {
+            const idx = owned_allocation_next_slot;
+            owned_allocation_next_slot = (owned_allocation_next_slot + 1) % owned_allocation_records.len;
+            if (!owned_allocation_records[idx].active) {
+                slot_index = idx;
+                break;
+            }
+        }
+    }
+    const idx = slot_index orelse {
+        owned_allocation_lost_record_count += 1;
+        return;
+    };
+    var dims_buf = [_]i32{0} ** max_dims;
+    const rank = @min(dims.len, max_dims);
+    for (dims[0..rank], 0..) |dim, axis| dims_buf[axis] = dim;
+    owned_allocation_sequence += 1;
+    var label_buf = [_]u8{0} ** owned_peak_snapshot_label_len;
+    const label_len = copyLabel(&label_buf, owned_alloc_context);
+    owned_allocation_records[idx] = .{
+        .handle = handle,
+        .bytes = byte_len,
+        .dims = dims_buf,
+        .rank = @intCast(rank),
+        .seq = owned_allocation_sequence,
+        .label = label_buf,
+        .label_len = label_len,
+        .active = true,
+    };
+    owned_allocation_live_record_count += 1;
+}
+
+fn forgetOwnedAllocationRecord(handle: *anyopaque) void {
+    for (&owned_allocation_records) |*record| {
+        if (!record.active or record.handle != handle) continue;
+        record.active = false;
+        record.handle = null;
+        owned_allocation_live_record_count -|= 1;
+        return;
+    }
+}
+
+fn maybeRecordTop(top: []OwnedAllocationRecord, used: *usize, record: OwnedAllocationRecord) void {
+    const cap = top.len;
+    if (cap == 0) return;
+    var pos: usize = 0;
+    while (pos < used.* and top[pos].bytes >= record.bytes) : (pos += 1) {}
+    if (pos >= cap) return;
+    if (used.* < cap) used.* += 1;
+    var idx = used.* - 1;
+    while (idx > pos) : (idx -= 1) top[idx] = top[idx - 1];
+    top[pos] = record;
+}
+
+fn printOwnedPeakSnapshot() void {
+    const top_n = ownedPeakSnapshotTop();
+    if (top_n == 0) return;
+    if (memory_stats.device_owned_peak_live_bytes < ownedPeakSnapshotMinBytes()) return;
+    if (owned_peak_snapshot_print_count >= ownedPeakSnapshotLimit()) return;
+    owned_peak_snapshot_print_count += 1;
+
+    var top = [_]OwnedAllocationRecord{.{}} ** 32;
+    var used: usize = 0;
+    var live_bytes: u64 = 0;
+    for (owned_allocation_records) |record| {
+        if (!record.active) continue;
+        live_bytes += @intCast(record.bytes);
+        maybeRecordTop(top[0..top_n], &used, record);
+    }
+
+    std.debug.print(
+        "metal_owned_peak_snapshot: peak={d} live={d} live_records={d} tracked_live_records={d} lost_records={d} top={d}\n",
+        .{
+            memory_stats.device_owned_peak_live_bytes,
+            live_bytes,
+            owned_allocation_live_record_count,
+            used,
+            owned_allocation_lost_record_count,
+            top_n,
+        },
+    );
+    for (top[0..used], 0..) |record, i| {
+        std.debug.print(
+            "metal_owned_peak_snapshot_entry: index={d} bytes={d} seq={d} label=\"{s}\" dims=[",
+            .{ i + 1, record.bytes, record.seq, record.labelSlice() },
+        );
+        for (record.dims[0..record.rank], 0..) |dim, axis| {
+            if (axis != 0) std.debug.print(",", .{});
+            std.debug.print("{d}", .{dim});
+        }
+        std.debug.print("]\n", .{});
+    }
+}
+
+fn updateOwnedCreateBucket(byte_len: usize) void {
+    const bytes: u64 = @intCast(byte_len);
+    if (byte_len < 256 * 1024) {
+        memory_stats.device_owned_live_lt_256kb_bytes += bytes;
+        memory_stats.device_owned_peak_lt_256kb_bytes = @max(memory_stats.device_owned_peak_lt_256kb_bytes, memory_stats.device_owned_live_lt_256kb_bytes);
+    } else if (byte_len < 1024 * 1024) {
+        memory_stats.device_owned_live_256kb_1mb_bytes += bytes;
+        memory_stats.device_owned_peak_256kb_1mb_bytes = @max(memory_stats.device_owned_peak_256kb_1mb_bytes, memory_stats.device_owned_live_256kb_1mb_bytes);
+    } else if (byte_len < 4 * 1024 * 1024) {
+        memory_stats.device_owned_live_1mb_4mb_bytes += bytes;
+        memory_stats.device_owned_peak_1mb_4mb_bytes = @max(memory_stats.device_owned_peak_1mb_4mb_bytes, memory_stats.device_owned_live_1mb_4mb_bytes);
+    } else if (byte_len < 16 * 1024 * 1024) {
+        memory_stats.device_owned_live_4mb_16mb_bytes += bytes;
+        memory_stats.device_owned_peak_4mb_16mb_bytes = @max(memory_stats.device_owned_peak_4mb_16mb_bytes, memory_stats.device_owned_live_4mb_16mb_bytes);
+    } else {
+        memory_stats.device_owned_live_ge_16mb_bytes += bytes;
+        memory_stats.device_owned_peak_ge_16mb_bytes = @max(memory_stats.device_owned_peak_ge_16mb_bytes, memory_stats.device_owned_live_ge_16mb_bytes);
+    }
+}
+
+fn updateOwnedReleaseBucket(byte_len: usize) void {
+    const bytes: u64 = @intCast(byte_len);
+    if (byte_len < 256 * 1024) {
+        memory_stats.device_owned_live_lt_256kb_bytes -|= bytes;
+    } else if (byte_len < 1024 * 1024) {
+        memory_stats.device_owned_live_256kb_1mb_bytes -|= bytes;
+    } else if (byte_len < 4 * 1024 * 1024) {
+        memory_stats.device_owned_live_1mb_4mb_bytes -|= bytes;
+    } else if (byte_len < 16 * 1024 * 1024) {
+        memory_stats.device_owned_live_4mb_16mb_bytes -|= bytes;
+    } else {
+        memory_stats.device_owned_live_ge_16mb_bytes -|= bytes;
+    }
+}
+
+fn noteDeviceOwnedCreate(handle: *anyopaque, byte_len: usize, dims: []const i32) void {
     memory_stats.device_owned_buffers_created += 1;
     memory_stats.device_owned_bytes_created += @intCast(byte_len);
     memory_stats.device_owned_live_bytes += @intCast(byte_len);
+    updateOwnedCreateBucket(byte_len);
+    noteOwnedAllocationRecord(handle, byte_len, dims);
+    const previous_peak = memory_stats.device_owned_peak_live_bytes;
     memory_stats.device_owned_peak_live_bytes = @max(memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_live_bytes);
+    const limit = traceOwnedAllocLimit();
+    if (limit > 0 and owned_alloc_trace_count < limit and byte_len >= traceOwnedAllocMinBytes()) {
+        owned_alloc_trace_count += 1;
+        std.debug.print(
+            "metal_owned_alloc_trace: bytes={d} live={d} peak={d} new_peak={} dims=[",
+            .{ byte_len, memory_stats.device_owned_live_bytes, memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_peak_live_bytes > previous_peak },
+        );
+        for (dims, 0..) |dim, i| {
+            if (i != 0) std.debug.print(",", .{});
+            std.debug.print("{d}", .{dim});
+        }
+        std.debug.print("]\n", .{});
+    }
+    if (memory_stats.device_owned_peak_live_bytes > previous_peak) printOwnedPeakSnapshot();
 }
 
-fn noteDeviceOwnedRelease(byte_len: usize) void {
+fn noteDeviceOwnedRelease(handle: *anyopaque, byte_len: usize) void {
     memory_stats.device_owned_buffers_released += 1;
     memory_stats.device_owned_bytes_released += @intCast(byte_len);
     memory_stats.device_owned_live_bytes -|= @intCast(byte_len);
+    updateOwnedReleaseBucket(byte_len);
+    forgetOwnedAllocationRecord(handle);
 }
 
 fn noteHostMirrorAlloc(byte_len: usize) void {
@@ -118,6 +347,14 @@ pub fn memoryStatsSnapshot() MemoryStats {
 
 pub fn resetMemoryStats() void {
     memory_stats = .{};
+    owned_alloc_trace_count = 0;
+    owned_peak_snapshot_print_count = 0;
+    owned_allocation_next_slot = 0;
+    owned_allocation_sequence = 0;
+    owned_allocation_live_record_count = 0;
+    owned_allocation_lost_record_count = 0;
+    owned_alloc_context = "";
+    owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
 }
 
 pub const DeviceStorage = struct {
@@ -240,7 +477,7 @@ pub const MetalTensor = struct {
                 .byte_len = byte_len,
             },
         };
-        noteDeviceOwnedCreate(byte_len);
+        noteDeviceOwnedCreate(handle, byte_len, dims);
         for (dims, 0..) |axis_dim, i| t.shape_buf[i] = axis_dim;
         return t;
     }
@@ -298,7 +535,7 @@ pub const MetalTensor = struct {
         if (ref.ref_count == 0 and ref.release_on_drop and !ref.released) {
             termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle);
             ref.released = true;
-            noteDeviceOwnedRelease(ref.byte_len);
+            noteDeviceOwnedRelease(ref.handle, ref.byte_len);
         }
         if (ref.ref_count == 0) {
             std.heap.c_allocator.destroy(ref);
@@ -444,6 +681,12 @@ pub const MetalTensor = struct {
 
     pub fn isDevice(self: *const MetalTensor) bool {
         return self.device != null;
+    }
+
+    pub fn isOwnedDeviceBuffer(self: *const MetalTensor) bool {
+        const d = self.device orelse return false;
+        if (d.ref.released or d.ref.ref_count == 0) return false;
+        return d.ref.release_on_drop;
     }
 
     pub fn deviceHandle(self: *const MetalTensor) ?*anyopaque {

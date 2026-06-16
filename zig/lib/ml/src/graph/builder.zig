@@ -511,6 +511,28 @@ pub const Builder = struct {
         return fused;
     }
 
+    /// Fused exact GELU activation: 0.5 * x * (1 + erf(x / sqrt(2))).
+    pub fn geluExact(self: *Builder, input: NodeId) !NodeId {
+        const dtype = self.graph.node(input).output_shape.dtype;
+        const half = try self.scalarConst(dtype, 0.5);
+        const inv_sqrt2 = try self.scalarConst(dtype, 0.7071067811865476);
+
+        const half_x = try self.mul(input, half);
+        const scaled = try self.mul(input, inv_sqrt2);
+        const erf_v = try self.erfOp(scaled);
+        const erf_term = try self.mul(half_x, erf_v);
+        const decomposed = try self.add(half_x, erf_term);
+
+        const fused = try self.graph.addNode(.{
+            .op = .{ .fused_gelu_exact = {} },
+            .output_shape = self.graph.node(input).output_shape,
+            .inputs = .{ input, null_node, null_node, null_node },
+            .num_inputs = 1,
+            .vjp_alternate = decomposed,
+        });
+        return fused;
+    }
+
     /// Fused SiLU/Swish activation: x * sigmoid(x).
     pub fn silu(self: *Builder, input: NodeId) !NodeId {
         // Decomposed: x / (1 + exp(-x))
@@ -1051,6 +1073,28 @@ test "Builder.gelu emits fused + decomposed" {
 
     try std.testing.expect(result_node.op.isFused());
     try std.testing.expect(result_node.vjp_alternate != null_node);
+}
+
+test "Builder.geluExact emits exact fused + erf decomposed alternate" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("input", Shape.init(.f32, &.{ 4, 8 }));
+    const result = try b.geluExact(x);
+    const result_node = g.node(result);
+
+    try std.testing.expectEqual(OpCode.fused_gelu_exact, std.meta.activeTag(result_node.op));
+    try std.testing.expect(result_node.vjp_alternate != null_node);
+    var saw_erf = false;
+    for (0..g.nodeCount()) |node_index| {
+        if (std.meta.activeTag(g.node(@intCast(node_index)).op) == .erf) {
+            saw_erf = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_erf);
 }
 
 test "Builder.softmax emits fused + decomposed" {

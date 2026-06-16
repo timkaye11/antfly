@@ -882,6 +882,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const metal_tensor = if (buf.metal_tensor) |*mt| mt else return null;
         if (!metal_tensor.isDevice()) return null;
         if (metal_tensor.deviceByteLen() == 0) return null;
+        if (metal_tensor.isOwnedDeviceBuffer()) return null;
         var copied = try metal_tensor.copiedView(0, metal_tensor.deviceByteLen(), metal_tensor.shape());
         const owned_ct = self.ctFromOwnedMetalTensor(copied) catch |err| {
             copied.deinit();
@@ -961,7 +962,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const buf = toBuf(pool_ct);
         const mt = if (buf.metal_tensor) |*m| m else return error.MetalRuntimeUnavailable;
         const handle = mt.deviceHandle() orelse return error.MetalRuntimeUnavailable;
-        const view = MetalTensor.deviceBorrowed(runtime, handle, 0, mt.deviceByteLen(), dims);
+        var elem_count: usize = 1;
+        for (dims) |dim| {
+            if (dim <= 0) return error.InvalidTensorShape;
+            elem_count = std.math.mul(usize, elem_count, @intCast(dim)) catch return error.OutOfMemory;
+        }
+        const view_byte_len = std.math.mul(usize, elem_count, @sizeOf(f32)) catch return error.OutOfMemory;
+        if (view_byte_len > mt.deviceByteLen()) return error.InvalidTensorShape;
+        const view = MetalTensor.deviceBorrowed(runtime, handle, 0, view_byte_len, dims);
         return self.ctFromOwnedMetalTensor(view);
     }
 
@@ -10313,7 +10321,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn denseFfnLayerNormOp(ctx: *anyopaque, request: *const ops.DenseFfnLayerNormRequest) anyerror!?CT {
         if (!enableDebertaFfnFusion()) return null;
         if (!enableGlinerDebertaDirectFfn()) return null;
-        if (request.activation != .gelu and request.activation != .gelu_new) return null;
+        if (request.activation != .gelu and request.activation != .gelu_new and request.activation != .gelu_exact) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.rows == 0 or request.hidden_size == 0 or request.intermediate_size == 0) return null;
         const input_buf = toBuf(request.input);
@@ -20458,6 +20466,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_tensor_device_owned_buffers_released = tensor_stats.device_owned_buffers_released;
         stats.metal_tensor_device_owned_live_bytes = tensor_stats.device_owned_live_bytes;
         stats.metal_tensor_device_owned_peak_live_bytes = tensor_stats.device_owned_peak_live_bytes;
+        stats.metal_tensor_device_owned_peak_lt_256kb_bytes = tensor_stats.device_owned_peak_lt_256kb_bytes;
+        stats.metal_tensor_device_owned_peak_256kb_1mb_bytes = tensor_stats.device_owned_peak_256kb_1mb_bytes;
+        stats.metal_tensor_device_owned_peak_1mb_4mb_bytes = tensor_stats.device_owned_peak_1mb_4mb_bytes;
+        stats.metal_tensor_device_owned_peak_4mb_16mb_bytes = tensor_stats.device_owned_peak_4mb_16mb_bytes;
+        stats.metal_tensor_device_owned_peak_ge_16mb_bytes = tensor_stats.device_owned_peak_ge_16mb_bytes;
         stats.metal_tensor_host_mirror_allocations = tensor_stats.host_mirror_allocations;
         stats.metal_tensor_host_mirror_frees = tensor_stats.host_mirror_frees;
         stats.metal_tensor_host_mirror_live_bytes = tensor_stats.host_mirror_live_bytes;

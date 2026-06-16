@@ -1028,6 +1028,7 @@ fn cloneOutputIfAliasedInputWouldBeFreedFast(
 pub fn canKeepAliasedOutput(op: anytype) bool {
     return switch (op) {
         .fused_gelu,
+        .fused_gelu_exact,
         .fused_relu,
         .fused_silu,
         .fused_quick_gelu,
@@ -1463,6 +1464,44 @@ fn executeGeluBackwardFallback(
     return cb.fromFloat32Shape(output, shape_buf[0..rank]);
 }
 
+fn executeExactGeluFallback(
+    allocator: std.mem.Allocator,
+    output_shape: Shape,
+    cb: *const ComputeBackend,
+    input: CT,
+) !CT {
+    const input_data = try cb.toFloat32(input, allocator);
+    defer allocator.free(input_data);
+
+    const output = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(output);
+    for (input_data, output) |x, *dst| {
+        if (!std.math.isFinite(x)) {
+            dst.* = 0.0;
+            continue;
+        }
+        dst.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    }
+
+    var shape_buf: [8]i32 = undefined;
+    const rank = output_shape.rank();
+    if (rank > shape_buf.len) return error.UnsupportedShape;
+    for (0..rank) |axis| {
+        const dim = output_shape.dim(@intCast(axis));
+        if (dim <= 0) return error.UnsupportedShape;
+        shape_buf[axis] = @intCast(dim);
+    }
+    return cb.fromFloat32Shape(output, shape_buf[0..rank]);
+}
+
+fn erfApproxF32(x: f32) f32 {
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return sign * (1.0 - poly * @exp(-(ax * ax)));
+}
+
 fn graphTraceShapesEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_TRACE_SHAPES", false);
 }
@@ -1884,6 +1923,10 @@ pub fn executeNode(
                 if (try cb.unaryConsume(.gelu, V.get(ins[0]))) |consumed| return consumed;
             }
             return cb.gelu(V.get(ins[0]));
+        },
+
+        .fused_gelu_exact => {
+            return executeExactGeluFallback(graph.allocator, n.output_shape, cb, V.get(ins[0]));
         },
 
         .fused_gelu_backward => {

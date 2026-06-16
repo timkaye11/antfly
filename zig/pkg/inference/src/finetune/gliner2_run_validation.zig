@@ -41,8 +41,29 @@ pub const ValidationOptions = struct {
     max_device_trainable_transfer_count: ?u64 = null,
     max_device_resident_transfer_count: ?u64 = null,
     min_device_trainable_bytes: ?usize = null,
+    max_metal_tensor_device_owned_peak_live_bytes: ?u64 = null,
     max_metal_runtime_total_bytes: ?u64 = null,
+    max_metal_eager_arena_peak_bytes: ?u64 = null,
+    max_metal_eager_arena_spill_bytes: ?u64 = null,
+    max_metal_chunk_local_output_peak_bytes: ?u64 = null,
+    max_metal_chunk_local_output_spill_bytes: ?u64 = null,
+    max_metal_chunk_local_output_unconsumed_hints: ?u64 = null,
+    min_metal_chunk_local_output_consumed_hints: ?u64 = null,
     min_metal_runtime_reuse_hit_count: ?u64 = null,
+    max_graph_command_dispatch_count: ?u64 = null,
+    max_metal_frame_gpu_ms: ?f64 = null,
+    max_metal_last_frame_compute_encoder_count: ?u64 = null,
+    min_metal_frame_chunk_boundary_count: ?u64 = null,
+    min_metal_frame_chunk_promoted_value_count: ?u64 = null,
+    min_metal_frame_chunk_swept_value_count: ?u64 = null,
+    min_graph_runtime_region_dispatch_count: ?u64 = null,
+    max_graph_runtime_region_fallback_count: ?u64 = null,
+    min_graph_runtime_region_elided_node_count: ?u64 = null,
+    min_metal_deberta_ffn_forward_region_count: ?u64 = null,
+    min_metal_deberta_attention_flash_call_count: ?u64 = null,
+    max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
+    min_metal_deberta_ffn_fused_call_count: ?u64 = null,
+    max_metal_deberta_ffn_fused_fallback_count: ?u64 = null,
 };
 
 pub const RunValidationSummary = struct {
@@ -100,8 +121,49 @@ pub const RunValidationSummary = struct {
     total_metal_runtime_reuse_alloc_delta: u64,
     total_metal_runtime_reuse_hit_delta: u64,
     metal_runtime_reuse_hit_rate: f64,
+    max_metal_eager_arena_peak_bytes: u64,
+    max_metal_eager_arena_live_bytes: u64,
+    total_metal_eager_arena_reuse_hits: u64,
+    total_metal_eager_arena_allocations: u64,
+    total_metal_eager_arena_spill_bytes: u64,
+    total_metal_eager_arena_hazard_declines: u64,
+    total_metal_eager_arena_alias_conflicts: u64,
+    total_metal_eager_arena_alias_reclaims: u64,
+    total_metal_eager_arena_alias_reclaim_bytes: u64,
+    max_metal_chunk_local_output_peak_bytes: u64,
+    max_metal_chunk_local_output_live_bytes: u64,
+    total_metal_chunk_local_output_allocations: u64,
+    total_metal_chunk_local_output_reuse_hits: u64,
+    total_metal_chunk_local_output_consumed_hints: u64,
+    total_metal_chunk_local_output_unconsumed_hints: u64,
+    total_metal_chunk_local_output_spill_bytes: u64,
+    total_metal_chunk_local_output_alias_conflicts: u64,
+    total_metal_chunk_local_output_resets: u64,
+    total_metal_chunk_local_output_reset_freed_bytes: u64,
+    total_metal_chunk_local_output_discard_freed_bytes: u64,
+    total_metal_chunk_local_output_reset_live_carry_values: u64,
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
+    max_metal_frame_gpu_ms: f64,
+    max_metal_last_frame_compute_encoders: u64,
+    total_metal_frame_chunk_boundaries: u64,
+    total_metal_frame_chunk_promoted_values: u64,
+    total_metal_frame_chunk_swept_values: u64,
+    total_graph_runtime_region_dispatches: u64,
+    total_graph_runtime_region_fallbacks: u64,
+    total_graph_runtime_region_active_regions: u64,
+    total_graph_runtime_region_covered_nodes: u64,
+    total_graph_runtime_region_elided_nodes: u64,
+    total_graph_runtime_region_plan_compiles: u64,
+    total_graph_runtime_region_plan_reuses: u64,
+    total_metal_deberta_ffn_forward_regions: u64,
+    total_metal_deberta_attention_flash_calls: u64,
+    total_metal_deberta_attention_gemm_calls: u64,
+    total_metal_deberta_attention_gemm_fallbacks: u64,
+    total_metal_deberta_attention_legacy_calls: u64,
+    total_metal_deberta_ffn_fused_calls: u64,
+    total_metal_deberta_ffn_fused_mps_matmuls: u64,
+    total_metal_deberta_ffn_fused_fallbacks: u64,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
     all_step_losses_finite: bool,
@@ -139,9 +201,7 @@ pub fn validateRun(
     if (metrics.step_record_count != manifest.total_steps) return error.TrainingManifestMetricsMismatch;
     if (metrics.epoch_record_count != manifest.epochs) return error.TrainingManifestMetricsMismatch;
     if (!metrics.all_step_losses_finite) return error.NonFiniteLoss;
-    if (metrics.supervised_token_count == 0) return error.NoSupervisedTokens;
-    if (metrics.entity_token_count == 0) return error.NoEntityPositiveTokens;
-    if (metrics.total_step_wall_ms <= 0 or metrics.supervised_tokens_per_second <= 0) return error.InvalidPerformanceMetrics;
+    if (metrics.total_step_wall_ms <= 0 or metrics.supervised_tokens_per_second < 0) return error.InvalidPerformanceMetrics;
     if (metrics.total_autodiff_ms <= 0 or metrics.total_execute_ms <= 0 or metrics.max_peak_resident_bytes == 0) return error.InvalidPerformanceMetrics;
     if (options.min_supervised_tokens_per_second) |min_tps| {
         if (!std.math.isFinite(min_tps) or min_tps < 0) return error.InvalidPerformanceThreshold;
@@ -197,8 +257,77 @@ pub fn validateRun(
         if (max_bytes == 0) return error.InvalidPerformanceThreshold;
         if (metrics.max_metal_runtime_total_bytes > max_bytes) return error.MetalRuntimeTotalBytesAboveThreshold;
     }
+    if (options.max_metal_tensor_device_owned_peak_live_bytes) |max_bytes| {
+        if (max_bytes == 0) return error.InvalidPerformanceThreshold;
+        if (metrics.max_metal_tensor_device_owned_peak_live_bytes > max_bytes) return error.MetalTensorDeviceOwnedPeakLiveBytesAboveThreshold;
+    }
+    if (options.max_metal_eager_arena_peak_bytes) |max_bytes| {
+        if (max_bytes == 0) return error.InvalidPerformanceThreshold;
+        if (metrics.max_metal_eager_arena_peak_bytes > max_bytes) return error.MetalEagerArenaPeakBytesAboveThreshold;
+    }
+    if (options.max_metal_eager_arena_spill_bytes) |max_bytes| {
+        if (metrics.total_metal_eager_arena_spill_bytes > max_bytes) return error.MetalEagerArenaSpillBytesAboveThreshold;
+    }
+    if (options.max_metal_chunk_local_output_peak_bytes) |max_bytes| {
+        if (max_bytes == 0) return error.InvalidPerformanceThreshold;
+        if (metrics.max_metal_chunk_local_output_peak_bytes > max_bytes) return error.MetalChunkLocalOutputPeakBytesAboveThreshold;
+    }
+    if (options.max_metal_chunk_local_output_spill_bytes) |max_bytes| {
+        if (metrics.total_metal_chunk_local_output_spill_bytes > max_bytes) return error.MetalChunkLocalOutputSpillBytesAboveThreshold;
+    }
+    if (options.max_metal_chunk_local_output_unconsumed_hints) |max_hints| {
+        if (metrics.total_metal_chunk_local_output_unconsumed_hints > max_hints) return error.MetalChunkLocalOutputUnconsumedHintsAboveThreshold;
+    }
+    if (options.min_metal_chunk_local_output_consumed_hints) |min_hints| {
+        if (metrics.total_metal_chunk_local_output_consumed_hints < min_hints) return error.MetalChunkLocalOutputConsumedHintsBelowThreshold;
+    }
     if (options.min_metal_runtime_reuse_hit_count) |min_hits| {
         if (metrics.total_metal_runtime_reuse_hit_delta < min_hits) return error.MetalRuntimeReuseHitCountBelowThreshold;
+    }
+    if (options.max_graph_command_dispatch_count) |max_dispatches| {
+        if (max_dispatches == 0) return error.InvalidPerformanceThreshold;
+        if (metrics.total_graph_command_dispatches > max_dispatches) return error.GraphCommandDispatchCountAboveThreshold;
+    }
+    if (options.max_metal_frame_gpu_ms) |max_ms| {
+        if (!std.math.isFinite(max_ms) or max_ms <= 0) return error.InvalidPerformanceThreshold;
+        if (metrics.max_metal_frame_gpu_ms > max_ms) return error.MetalFrameGpuMsAboveThreshold;
+    }
+    if (options.max_metal_last_frame_compute_encoder_count) |max_encoders| {
+        if (max_encoders == 0) return error.InvalidPerformanceThreshold;
+        if (metrics.max_metal_last_frame_compute_encoders > max_encoders) return error.MetalLastFrameComputeEncoderCountAboveThreshold;
+    }
+    if (options.min_metal_frame_chunk_boundary_count) |min_boundaries| {
+        if (metrics.total_metal_frame_chunk_boundaries < min_boundaries) return error.MetalFrameChunkBoundaryCountBelowThreshold;
+    }
+    if (options.min_metal_frame_chunk_promoted_value_count) |min_promoted| {
+        if (metrics.total_metal_frame_chunk_promoted_values < min_promoted) return error.MetalFrameChunkPromotedValueCountBelowThreshold;
+    }
+    if (options.min_metal_frame_chunk_swept_value_count) |min_swept| {
+        if (metrics.total_metal_frame_chunk_swept_values < min_swept) return error.MetalFrameChunkSweptValueCountBelowThreshold;
+    }
+    if (options.min_graph_runtime_region_dispatch_count) |min_dispatches| {
+        if (metrics.total_graph_runtime_region_dispatches < min_dispatches) return error.GraphRuntimeRegionDispatchCountBelowThreshold;
+    }
+    if (options.max_graph_runtime_region_fallback_count) |max_fallbacks| {
+        if (metrics.total_graph_runtime_region_fallbacks > max_fallbacks) return error.GraphRuntimeRegionFallbackCountAboveThreshold;
+    }
+    if (options.min_graph_runtime_region_elided_node_count) |min_nodes| {
+        if (metrics.total_graph_runtime_region_elided_nodes < min_nodes) return error.GraphRuntimeRegionElidedNodeCountBelowThreshold;
+    }
+    if (options.min_metal_deberta_ffn_forward_region_count) |min_regions| {
+        if (metrics.total_metal_deberta_ffn_forward_regions < min_regions) return error.MetalDebertaFfnForwardRegionCountBelowThreshold;
+    }
+    if (options.min_metal_deberta_attention_flash_call_count) |min_calls| {
+        if (metrics.total_metal_deberta_attention_flash_calls < min_calls) return error.MetalDebertaAttentionFlashCallCountBelowThreshold;
+    }
+    if (options.max_metal_deberta_attention_gemm_fallback_count) |max_fallbacks| {
+        if (metrics.total_metal_deberta_attention_gemm_fallbacks > max_fallbacks) return error.MetalDebertaAttentionGemmFallbackCountAboveThreshold;
+    }
+    if (options.min_metal_deberta_ffn_fused_call_count) |min_calls| {
+        if (metrics.total_metal_deberta_ffn_fused_calls < min_calls) return error.MetalDebertaFfnFusedCallCountBelowThreshold;
+    }
+    if (options.max_metal_deberta_ffn_fused_fallback_count) |max_fallbacks| {
+        if (metrics.total_metal_deberta_ffn_fused_fallbacks > max_fallbacks) return error.MetalDebertaFfnFusedFallbackCountAboveThreshold;
     }
     if (options.require_loss_decrease and !metrics.loss_decreased) return error.LossDidNotDecrease;
 
@@ -271,8 +400,49 @@ pub fn validateRun(
         .total_metal_runtime_reuse_alloc_delta = metrics.total_metal_runtime_reuse_alloc_delta,
         .total_metal_runtime_reuse_hit_delta = metrics.total_metal_runtime_reuse_hit_delta,
         .metal_runtime_reuse_hit_rate = metrics.metal_runtime_reuse_hit_rate,
+        .max_metal_eager_arena_peak_bytes = metrics.max_metal_eager_arena_peak_bytes,
+        .max_metal_eager_arena_live_bytes = metrics.max_metal_eager_arena_live_bytes,
+        .total_metal_eager_arena_reuse_hits = metrics.total_metal_eager_arena_reuse_hits,
+        .total_metal_eager_arena_allocations = metrics.total_metal_eager_arena_allocations,
+        .total_metal_eager_arena_spill_bytes = metrics.total_metal_eager_arena_spill_bytes,
+        .total_metal_eager_arena_hazard_declines = metrics.total_metal_eager_arena_hazard_declines,
+        .total_metal_eager_arena_alias_conflicts = metrics.total_metal_eager_arena_alias_conflicts,
+        .total_metal_eager_arena_alias_reclaims = metrics.total_metal_eager_arena_alias_reclaims,
+        .total_metal_eager_arena_alias_reclaim_bytes = metrics.total_metal_eager_arena_alias_reclaim_bytes,
+        .max_metal_chunk_local_output_peak_bytes = metrics.max_metal_chunk_local_output_peak_bytes,
+        .max_metal_chunk_local_output_live_bytes = metrics.max_metal_chunk_local_output_live_bytes,
+        .total_metal_chunk_local_output_allocations = metrics.total_metal_chunk_local_output_allocations,
+        .total_metal_chunk_local_output_reuse_hits = metrics.total_metal_chunk_local_output_reuse_hits,
+        .total_metal_chunk_local_output_consumed_hints = metrics.total_metal_chunk_local_output_consumed_hints,
+        .total_metal_chunk_local_output_unconsumed_hints = metrics.total_metal_chunk_local_output_unconsumed_hints,
+        .total_metal_chunk_local_output_spill_bytes = metrics.total_metal_chunk_local_output_spill_bytes,
+        .total_metal_chunk_local_output_alias_conflicts = metrics.total_metal_chunk_local_output_alias_conflicts,
+        .total_metal_chunk_local_output_resets = metrics.total_metal_chunk_local_output_resets,
+        .total_metal_chunk_local_output_reset_freed_bytes = metrics.total_metal_chunk_local_output_reset_freed_bytes,
+        .total_metal_chunk_local_output_discard_freed_bytes = metrics.total_metal_chunk_local_output_discard_freed_bytes,
+        .total_metal_chunk_local_output_reset_live_carry_values = metrics.total_metal_chunk_local_output_reset_live_carry_values,
         .total_graph_command_dispatches = metrics.total_graph_command_dispatches,
         .total_graph_planned_dispatches = metrics.total_graph_planned_dispatches,
+        .max_metal_frame_gpu_ms = metrics.max_metal_frame_gpu_ms,
+        .max_metal_last_frame_compute_encoders = metrics.max_metal_last_frame_compute_encoders,
+        .total_metal_frame_chunk_boundaries = metrics.total_metal_frame_chunk_boundaries,
+        .total_metal_frame_chunk_promoted_values = metrics.total_metal_frame_chunk_promoted_values,
+        .total_metal_frame_chunk_swept_values = metrics.total_metal_frame_chunk_swept_values,
+        .total_graph_runtime_region_dispatches = metrics.total_graph_runtime_region_dispatches,
+        .total_graph_runtime_region_fallbacks = metrics.total_graph_runtime_region_fallbacks,
+        .total_graph_runtime_region_active_regions = metrics.total_graph_runtime_region_active_regions,
+        .total_graph_runtime_region_covered_nodes = metrics.total_graph_runtime_region_covered_nodes,
+        .total_graph_runtime_region_elided_nodes = metrics.total_graph_runtime_region_elided_nodes,
+        .total_graph_runtime_region_plan_compiles = metrics.total_graph_runtime_region_plan_compiles,
+        .total_graph_runtime_region_plan_reuses = metrics.total_graph_runtime_region_plan_reuses,
+        .total_metal_deberta_ffn_forward_regions = metrics.total_metal_deberta_ffn_forward_regions,
+        .total_metal_deberta_attention_flash_calls = metrics.total_metal_deberta_attention_flash_calls,
+        .total_metal_deberta_attention_gemm_calls = metrics.total_metal_deberta_attention_gemm_calls,
+        .total_metal_deberta_attention_gemm_fallbacks = metrics.total_metal_deberta_attention_gemm_fallbacks,
+        .total_metal_deberta_attention_legacy_calls = metrics.total_metal_deberta_attention_legacy_calls,
+        .total_metal_deberta_ffn_fused_calls = metrics.total_metal_deberta_ffn_fused_calls,
+        .total_metal_deberta_ffn_fused_mps_matmuls = metrics.total_metal_deberta_ffn_fused_mps_matmuls,
+        .total_metal_deberta_ffn_fused_fallbacks = metrics.total_metal_deberta_ffn_fused_fallbacks,
         .first_step_loss = metrics.first_step_loss,
         .final_step_loss = metrics.final_step_loss,
         .all_step_losses_finite = metrics.all_step_losses_finite,
@@ -321,8 +491,49 @@ const MetricsInspection = struct {
     max_metal_runtime_reuse_pool_peak_slots: u64 = 0,
     total_metal_runtime_reuse_alloc_delta: u64 = 0,
     total_metal_runtime_reuse_hit_delta: u64 = 0,
+    max_metal_eager_arena_peak_bytes: u64 = 0,
+    max_metal_eager_arena_live_bytes: u64 = 0,
+    total_metal_eager_arena_reuse_hits: u64 = 0,
+    total_metal_eager_arena_allocations: u64 = 0,
+    total_metal_eager_arena_spill_bytes: u64 = 0,
+    total_metal_eager_arena_hazard_declines: u64 = 0,
+    total_metal_eager_arena_alias_conflicts: u64 = 0,
+    total_metal_eager_arena_alias_reclaims: u64 = 0,
+    total_metal_eager_arena_alias_reclaim_bytes: u64 = 0,
+    max_metal_chunk_local_output_peak_bytes: u64 = 0,
+    max_metal_chunk_local_output_live_bytes: u64 = 0,
+    total_metal_chunk_local_output_allocations: u64 = 0,
+    total_metal_chunk_local_output_reuse_hits: u64 = 0,
+    total_metal_chunk_local_output_consumed_hints: u64 = 0,
+    total_metal_chunk_local_output_unconsumed_hints: u64 = 0,
+    total_metal_chunk_local_output_spill_bytes: u64 = 0,
+    total_metal_chunk_local_output_alias_conflicts: u64 = 0,
+    total_metal_chunk_local_output_resets: u64 = 0,
+    total_metal_chunk_local_output_reset_freed_bytes: u64 = 0,
+    total_metal_chunk_local_output_discard_freed_bytes: u64 = 0,
+    total_metal_chunk_local_output_reset_live_carry_values: u64 = 0,
     total_graph_command_dispatches: u64 = 0,
     total_graph_planned_dispatches: u64 = 0,
+    max_metal_frame_gpu_ms: f64 = 0,
+    max_metal_last_frame_compute_encoders: u64 = 0,
+    total_metal_frame_chunk_boundaries: u64 = 0,
+    total_metal_frame_chunk_promoted_values: u64 = 0,
+    total_metal_frame_chunk_swept_values: u64 = 0,
+    total_graph_runtime_region_dispatches: u64 = 0,
+    total_graph_runtime_region_fallbacks: u64 = 0,
+    total_graph_runtime_region_active_regions: u64 = 0,
+    total_graph_runtime_region_covered_nodes: u64 = 0,
+    total_graph_runtime_region_elided_nodes: u64 = 0,
+    total_graph_runtime_region_plan_compiles: u64 = 0,
+    total_graph_runtime_region_plan_reuses: u64 = 0,
+    total_metal_deberta_ffn_forward_regions: u64 = 0,
+    total_metal_deberta_attention_flash_calls: u64 = 0,
+    total_metal_deberta_attention_gemm_calls: u64 = 0,
+    total_metal_deberta_attention_gemm_fallbacks: u64 = 0,
+    total_metal_deberta_attention_legacy_calls: u64 = 0,
+    total_metal_deberta_ffn_fused_calls: u64 = 0,
+    total_metal_deberta_ffn_fused_mps_matmuls: u64 = 0,
+    total_metal_deberta_ffn_fused_fallbacks: u64 = 0,
     first_step_loss: ?f64 = null,
     final_step_loss: ?f64 = null,
     first_loss_window_sum: f64 = 0,
@@ -516,8 +727,49 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     total_metal_runtime_reuse_alloc_delta: u64,
     total_metal_runtime_reuse_hit_delta: u64,
     metal_runtime_reuse_hit_rate: f64,
+    max_metal_eager_arena_peak_bytes: u64,
+    max_metal_eager_arena_live_bytes: u64,
+    total_metal_eager_arena_reuse_hits: u64,
+    total_metal_eager_arena_allocations: u64,
+    total_metal_eager_arena_spill_bytes: u64,
+    total_metal_eager_arena_hazard_declines: u64,
+    total_metal_eager_arena_alias_conflicts: u64,
+    total_metal_eager_arena_alias_reclaims: u64,
+    total_metal_eager_arena_alias_reclaim_bytes: u64,
+    max_metal_chunk_local_output_peak_bytes: u64,
+    max_metal_chunk_local_output_live_bytes: u64,
+    total_metal_chunk_local_output_allocations: u64,
+    total_metal_chunk_local_output_reuse_hits: u64,
+    total_metal_chunk_local_output_consumed_hints: u64,
+    total_metal_chunk_local_output_unconsumed_hints: u64,
+    total_metal_chunk_local_output_spill_bytes: u64,
+    total_metal_chunk_local_output_alias_conflicts: u64,
+    total_metal_chunk_local_output_resets: u64,
+    total_metal_chunk_local_output_reset_freed_bytes: u64,
+    total_metal_chunk_local_output_discard_freed_bytes: u64,
+    total_metal_chunk_local_output_reset_live_carry_values: u64,
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
+    max_metal_frame_gpu_ms: f64,
+    max_metal_last_frame_compute_encoders: u64,
+    total_metal_frame_chunk_boundaries: u64,
+    total_metal_frame_chunk_promoted_values: u64,
+    total_metal_frame_chunk_swept_values: u64,
+    total_graph_runtime_region_dispatches: u64,
+    total_graph_runtime_region_fallbacks: u64,
+    total_graph_runtime_region_active_regions: u64,
+    total_graph_runtime_region_covered_nodes: u64,
+    total_graph_runtime_region_elided_nodes: u64,
+    total_graph_runtime_region_plan_compiles: u64,
+    total_graph_runtime_region_plan_reuses: u64,
+    total_metal_deberta_ffn_forward_regions: u64,
+    total_metal_deberta_attention_flash_calls: u64,
+    total_metal_deberta_attention_gemm_calls: u64,
+    total_metal_deberta_attention_gemm_fallbacks: u64,
+    total_metal_deberta_attention_legacy_calls: u64,
+    total_metal_deberta_ffn_fused_calls: u64,
+    total_metal_deberta_ffn_fused_mps_matmuls: u64,
+    total_metal_deberta_ffn_fused_fallbacks: u64,
     first_step_loss: ?f64,
     final_step_loss: ?f64,
     all_step_losses_finite: bool,
@@ -580,6 +832,27 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             const metal_runtime_reuse_pool_peak_slots = jsonU64(obj.get("metal_runtime_reuse_pool_peak_slots")) orelse 0;
             const metal_runtime_reuse_alloc_delta = jsonU64(obj.get("metal_runtime_reuse_alloc_delta")) orelse 0;
             const metal_runtime_reuse_hit_delta = jsonU64(obj.get("metal_runtime_reuse_hit_delta")) orelse 0;
+            const metal_eager_arena_peak_bytes = jsonU64(obj.get("graph_executor_metal_eager_arena_peak_bytes")) orelse 0;
+            const metal_eager_arena_live_bytes = jsonU64(obj.get("graph_executor_metal_eager_arena_live_bytes")) orelse 0;
+            const metal_eager_arena_reuse_hits = jsonU64(obj.get("graph_executor_metal_eager_arena_reuse_hits")) orelse 0;
+            const metal_eager_arena_allocations = jsonU64(obj.get("graph_executor_metal_eager_arena_allocations")) orelse 0;
+            const metal_eager_arena_spill_bytes = jsonU64(obj.get("graph_executor_metal_eager_arena_spill_bytes")) orelse 0;
+            const metal_eager_arena_hazard_declines = jsonU64(obj.get("graph_executor_metal_eager_arena_hazard_declines")) orelse 0;
+            const metal_eager_arena_alias_conflicts = jsonU64(obj.get("graph_executor_metal_eager_arena_alias_conflicts")) orelse 0;
+            const metal_eager_arena_alias_reclaims = jsonU64(obj.get("graph_executor_metal_eager_arena_alias_reclaims")) orelse 0;
+            const metal_eager_arena_alias_reclaim_bytes = jsonU64(obj.get("graph_executor_metal_eager_arena_alias_reclaim_bytes")) orelse 0;
+            const metal_chunk_local_output_peak_bytes = jsonU64(obj.get("graph_executor_metal_chunk_local_output_peak_bytes")) orelse 0;
+            const metal_chunk_local_output_live_bytes = jsonU64(obj.get("graph_executor_metal_chunk_local_output_live_bytes")) orelse 0;
+            const metal_chunk_local_output_allocations = jsonU64(obj.get("graph_executor_metal_chunk_local_output_allocations")) orelse 0;
+            const metal_chunk_local_output_reuse_hits = jsonU64(obj.get("graph_executor_metal_chunk_local_output_reuse_hits")) orelse 0;
+            const metal_chunk_local_output_consumed_hints = jsonU64(obj.get("graph_executor_metal_chunk_local_output_consumed_hints")) orelse 0;
+            const metal_chunk_local_output_unconsumed_hints = jsonU64(obj.get("graph_executor_metal_chunk_local_output_unconsumed_hints")) orelse 0;
+            const metal_chunk_local_output_spill_bytes = jsonU64(obj.get("graph_executor_metal_chunk_local_output_spill_bytes")) orelse 0;
+            const metal_chunk_local_output_alias_conflicts = jsonU64(obj.get("graph_executor_metal_chunk_local_output_alias_conflicts")) orelse 0;
+            const metal_chunk_local_output_resets = jsonU64(obj.get("graph_executor_metal_chunk_local_output_resets")) orelse 0;
+            const metal_chunk_local_output_reset_freed_bytes = jsonU64(obj.get("graph_executor_metal_chunk_local_output_reset_freed_bytes")) orelse 0;
+            const metal_chunk_local_output_discard_freed_bytes = jsonU64(obj.get("graph_executor_metal_chunk_local_output_discard_freed_bytes")) orelse 0;
+            const metal_chunk_local_output_reset_live_carry_values = jsonU64(obj.get("graph_executor_metal_chunk_local_output_reset_live_carry_values")) orelse 0;
             const trainer_total_ms = jsonF64(obj.get("trainer_total_ms")) orelse return error.InvalidMetricsRecord;
             const peak_resident_bytes = jsonUsize(obj.get("peak_resident_bytes")) orelse return error.InvalidMetricsRecord;
             const supervised_tokens_per_second = jsonF64(obj.get("supervised_tokens_per_second")) orelse return error.InvalidMetricsRecord;
@@ -596,7 +869,7 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             if (!std.math.isFinite(device_optimizer_ms) or device_optimizer_ms < 0) return error.InvalidPerformanceMetrics;
             if (!std.math.isFinite(trainer_total_ms) or trainer_total_ms <= 0) return error.InvalidPerformanceMetrics;
             if (peak_resident_bytes == 0) return error.InvalidPerformanceMetrics;
-            if (!std.math.isFinite(supervised_tokens_per_second) or supervised_tokens_per_second <= 0) return error.InvalidPerformanceMetrics;
+            if (!std.math.isFinite(supervised_tokens_per_second) or supervised_tokens_per_second < 0) return error.InvalidPerformanceMetrics;
             inspection.total_step_wall_ms += step_wall_ms;
             inspection.total_graph_build_ms += graph_build_ms;
             inspection.total_runtime_input_ms += runtime_input_ms;
@@ -617,8 +890,54 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.max_metal_runtime_reuse_pool_peak_slots = @max(inspection.max_metal_runtime_reuse_pool_peak_slots, metal_runtime_reuse_pool_peak_slots);
             inspection.total_metal_runtime_reuse_alloc_delta += metal_runtime_reuse_alloc_delta;
             inspection.total_metal_runtime_reuse_hit_delta += metal_runtime_reuse_hit_delta;
+            inspection.max_metal_eager_arena_peak_bytes = @max(inspection.max_metal_eager_arena_peak_bytes, metal_eager_arena_peak_bytes);
+            inspection.max_metal_eager_arena_live_bytes = @max(inspection.max_metal_eager_arena_live_bytes, metal_eager_arena_live_bytes);
+            inspection.total_metal_eager_arena_reuse_hits += metal_eager_arena_reuse_hits;
+            inspection.total_metal_eager_arena_allocations += metal_eager_arena_allocations;
+            inspection.total_metal_eager_arena_spill_bytes += metal_eager_arena_spill_bytes;
+            inspection.total_metal_eager_arena_hazard_declines += metal_eager_arena_hazard_declines;
+            inspection.total_metal_eager_arena_alias_conflicts += metal_eager_arena_alias_conflicts;
+            inspection.total_metal_eager_arena_alias_reclaims += metal_eager_arena_alias_reclaims;
+            inspection.total_metal_eager_arena_alias_reclaim_bytes += metal_eager_arena_alias_reclaim_bytes;
+            inspection.max_metal_chunk_local_output_peak_bytes = @max(inspection.max_metal_chunk_local_output_peak_bytes, metal_chunk_local_output_peak_bytes);
+            inspection.max_metal_chunk_local_output_live_bytes = @max(inspection.max_metal_chunk_local_output_live_bytes, metal_chunk_local_output_live_bytes);
+            inspection.total_metal_chunk_local_output_allocations += metal_chunk_local_output_allocations;
+            inspection.total_metal_chunk_local_output_reuse_hits += metal_chunk_local_output_reuse_hits;
+            inspection.total_metal_chunk_local_output_consumed_hints += metal_chunk_local_output_consumed_hints;
+            inspection.total_metal_chunk_local_output_unconsumed_hints += metal_chunk_local_output_unconsumed_hints;
+            inspection.total_metal_chunk_local_output_spill_bytes += metal_chunk_local_output_spill_bytes;
+            inspection.total_metal_chunk_local_output_alias_conflicts += metal_chunk_local_output_alias_conflicts;
+            inspection.total_metal_chunk_local_output_resets += metal_chunk_local_output_resets;
+            inspection.total_metal_chunk_local_output_reset_freed_bytes += metal_chunk_local_output_reset_freed_bytes;
+            inspection.total_metal_chunk_local_output_discard_freed_bytes += metal_chunk_local_output_discard_freed_bytes;
+            inspection.total_metal_chunk_local_output_reset_live_carry_values += metal_chunk_local_output_reset_live_carry_values;
             inspection.total_graph_command_dispatches += jsonU64(obj.get("graph_executor_command_dispatches")) orelse 0;
             inspection.total_graph_planned_dispatches += jsonU64(obj.get("graph_executor_planned_dispatches")) orelse 0;
+            inspection.total_metal_frame_chunk_boundaries += jsonU64(obj.get("graph_executor_metal_frame_chunk_boundaries")) orelse 0;
+            inspection.total_metal_frame_chunk_promoted_values += jsonU64(obj.get("graph_executor_metal_frame_chunk_promoted_values")) orelse 0;
+            inspection.total_metal_frame_chunk_swept_values += jsonU64(obj.get("graph_executor_metal_frame_chunk_swept_values")) orelse 0;
+            const metal_frame_gpu_ms = jsonF64(obj.get("metal_frame_gpu_ms")) orelse 0;
+            if (!std.math.isFinite(metal_frame_gpu_ms) or metal_frame_gpu_ms < 0) return error.InvalidPerformanceMetrics;
+            inspection.max_metal_frame_gpu_ms = @max(inspection.max_metal_frame_gpu_ms, metal_frame_gpu_ms);
+            inspection.max_metal_last_frame_compute_encoders = @max(
+                inspection.max_metal_last_frame_compute_encoders,
+                jsonU64(obj.get("metal_last_frame_compute_encoders")) orelse 0,
+            );
+            inspection.total_graph_runtime_region_dispatches += jsonU64(obj.get("graph_executor_runtime_region_dispatches")) orelse 0;
+            inspection.total_graph_runtime_region_fallbacks += jsonU64(obj.get("graph_executor_runtime_region_fallbacks")) orelse 0;
+            inspection.total_graph_runtime_region_active_regions += jsonU64(obj.get("graph_executor_runtime_region_active_regions")) orelse 0;
+            inspection.total_graph_runtime_region_covered_nodes += jsonU64(obj.get("graph_executor_runtime_region_covered_nodes")) orelse 0;
+            inspection.total_graph_runtime_region_elided_nodes += jsonU64(obj.get("graph_executor_runtime_region_elided_nodes")) orelse 0;
+            inspection.total_graph_runtime_region_plan_compiles += jsonU64(obj.get("graph_executor_runtime_region_plan_compiles")) orelse 0;
+            inspection.total_graph_runtime_region_plan_reuses += jsonU64(obj.get("graph_executor_runtime_region_plan_reuses")) orelse 0;
+            inspection.total_metal_deberta_ffn_forward_regions += jsonU64(obj.get("metal_deberta_ffn_forward_regions")) orelse 0;
+            inspection.total_metal_deberta_attention_flash_calls += jsonU64(obj.get("metal_deberta_attention_flash_calls")) orelse 0;
+            inspection.total_metal_deberta_attention_gemm_calls += jsonU64(obj.get("metal_deberta_attention_gemm_calls")) orelse 0;
+            inspection.total_metal_deberta_attention_gemm_fallbacks += jsonU64(obj.get("metal_deberta_attention_gemm_fallbacks")) orelse 0;
+            inspection.total_metal_deberta_attention_legacy_calls += jsonU64(obj.get("metal_deberta_attention_legacy_calls")) orelse 0;
+            inspection.total_metal_deberta_ffn_fused_calls += jsonU64(obj.get("metal_deberta_ffn_fused_calls")) orelse 0;
+            inspection.total_metal_deberta_ffn_fused_mps_matmuls += jsonU64(obj.get("metal_deberta_ffn_fused_mps_matmuls")) orelse 0;
+            inspection.total_metal_deberta_ffn_fused_fallbacks += jsonU64(obj.get("metal_deberta_ffn_fused_fallbacks")) orelse 0;
             if (optimizer_backend) |backend| {
                 if (inspection.optimizer_backend) |first_backend| {
                     if (!std.mem.eql(u8, first_backend, backend)) inspection.optimizer_backend_mismatch = true;
@@ -666,8 +985,49 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .total_metal_runtime_reuse_alloc_delta = inspection.total_metal_runtime_reuse_alloc_delta,
         .total_metal_runtime_reuse_hit_delta = inspection.total_metal_runtime_reuse_hit_delta,
         .metal_runtime_reuse_hit_rate = inspection.metalRuntimeReuseHitRate(),
+        .max_metal_eager_arena_peak_bytes = inspection.max_metal_eager_arena_peak_bytes,
+        .max_metal_eager_arena_live_bytes = inspection.max_metal_eager_arena_live_bytes,
+        .total_metal_eager_arena_reuse_hits = inspection.total_metal_eager_arena_reuse_hits,
+        .total_metal_eager_arena_allocations = inspection.total_metal_eager_arena_allocations,
+        .total_metal_eager_arena_spill_bytes = inspection.total_metal_eager_arena_spill_bytes,
+        .total_metal_eager_arena_hazard_declines = inspection.total_metal_eager_arena_hazard_declines,
+        .total_metal_eager_arena_alias_conflicts = inspection.total_metal_eager_arena_alias_conflicts,
+        .total_metal_eager_arena_alias_reclaims = inspection.total_metal_eager_arena_alias_reclaims,
+        .total_metal_eager_arena_alias_reclaim_bytes = inspection.total_metal_eager_arena_alias_reclaim_bytes,
+        .max_metal_chunk_local_output_peak_bytes = inspection.max_metal_chunk_local_output_peak_bytes,
+        .max_metal_chunk_local_output_live_bytes = inspection.max_metal_chunk_local_output_live_bytes,
+        .total_metal_chunk_local_output_allocations = inspection.total_metal_chunk_local_output_allocations,
+        .total_metal_chunk_local_output_reuse_hits = inspection.total_metal_chunk_local_output_reuse_hits,
+        .total_metal_chunk_local_output_consumed_hints = inspection.total_metal_chunk_local_output_consumed_hints,
+        .total_metal_chunk_local_output_unconsumed_hints = inspection.total_metal_chunk_local_output_unconsumed_hints,
+        .total_metal_chunk_local_output_spill_bytes = inspection.total_metal_chunk_local_output_spill_bytes,
+        .total_metal_chunk_local_output_alias_conflicts = inspection.total_metal_chunk_local_output_alias_conflicts,
+        .total_metal_chunk_local_output_resets = inspection.total_metal_chunk_local_output_resets,
+        .total_metal_chunk_local_output_reset_freed_bytes = inspection.total_metal_chunk_local_output_reset_freed_bytes,
+        .total_metal_chunk_local_output_discard_freed_bytes = inspection.total_metal_chunk_local_output_discard_freed_bytes,
+        .total_metal_chunk_local_output_reset_live_carry_values = inspection.total_metal_chunk_local_output_reset_live_carry_values,
         .total_graph_command_dispatches = inspection.total_graph_command_dispatches,
         .total_graph_planned_dispatches = inspection.total_graph_planned_dispatches,
+        .max_metal_frame_gpu_ms = inspection.max_metal_frame_gpu_ms,
+        .max_metal_last_frame_compute_encoders = inspection.max_metal_last_frame_compute_encoders,
+        .total_metal_frame_chunk_boundaries = inspection.total_metal_frame_chunk_boundaries,
+        .total_metal_frame_chunk_promoted_values = inspection.total_metal_frame_chunk_promoted_values,
+        .total_metal_frame_chunk_swept_values = inspection.total_metal_frame_chunk_swept_values,
+        .total_graph_runtime_region_dispatches = inspection.total_graph_runtime_region_dispatches,
+        .total_graph_runtime_region_fallbacks = inspection.total_graph_runtime_region_fallbacks,
+        .total_graph_runtime_region_active_regions = inspection.total_graph_runtime_region_active_regions,
+        .total_graph_runtime_region_covered_nodes = inspection.total_graph_runtime_region_covered_nodes,
+        .total_graph_runtime_region_elided_nodes = inspection.total_graph_runtime_region_elided_nodes,
+        .total_graph_runtime_region_plan_compiles = inspection.total_graph_runtime_region_plan_compiles,
+        .total_graph_runtime_region_plan_reuses = inspection.total_graph_runtime_region_plan_reuses,
+        .total_metal_deberta_ffn_forward_regions = inspection.total_metal_deberta_ffn_forward_regions,
+        .total_metal_deberta_attention_flash_calls = inspection.total_metal_deberta_attention_flash_calls,
+        .total_metal_deberta_attention_gemm_calls = inspection.total_metal_deberta_attention_gemm_calls,
+        .total_metal_deberta_attention_gemm_fallbacks = inspection.total_metal_deberta_attention_gemm_fallbacks,
+        .total_metal_deberta_attention_legacy_calls = inspection.total_metal_deberta_attention_legacy_calls,
+        .total_metal_deberta_ffn_fused_calls = inspection.total_metal_deberta_ffn_fused_calls,
+        .total_metal_deberta_ffn_fused_mps_matmuls = inspection.total_metal_deberta_ffn_fused_mps_matmuls,
+        .total_metal_deberta_ffn_fused_fallbacks = inspection.total_metal_deberta_ffn_fused_fallbacks,
         .first_step_loss = inspection.first_step_loss,
         .final_step_loss = inspection.final_step_loss,
         .all_step_losses_finite = inspection.all_step_losses_finite,

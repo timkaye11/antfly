@@ -27,6 +27,10 @@ const operator_plan_mod = @import("operator_plan.zig");
 const device_mesh_mod = @import("device_mesh.zig");
 const gpu_hosted_store_mod = @import("../ops/gpu_hosted_store.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
+const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/metal_tensor.zig") else struct {
+    pub fn setOwnedAllocationContext(_: []const u8) void {}
+    pub fn clearOwnedAllocationContext() void {}
+};
 const weight_source_mod = @import("../models/weight_source.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const transpose_utils = @import("transpose_utils.zig");
@@ -199,6 +203,7 @@ const RuntimeRegionKind = enum(u8) {
     lora_linear,
     lora_linear_qkv,
     deberta_attention,
+    deberta_ffn_forward,
     lora_backward,
     ffn_gelu_backward,
     q_linear,
@@ -220,6 +225,7 @@ const RuntimeRegion = union(RuntimeRegionKind) {
     lora_linear: LoraLinearPattern,
     lora_linear_qkv: LoraLinearQkvPattern,
     deberta_attention: DebertaAttentionPattern,
+    deberta_ffn_forward: DebertaFfnForwardPattern,
     lora_backward: LoraBackwardPattern,
     ffn_gelu_backward: FfnGeluBackwardPattern,
     q_linear: QLinearPattern,
@@ -276,6 +282,11 @@ const PreparedPleResidualRegion = struct {
     post_norm_slot: usize,
 };
 
+const PreparedDebertaFfnForwardRegion = struct {
+    first_slot: usize,
+    second_slot: usize,
+};
+
 const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     none: void,
     raw_linear_dot: PreparedLinearRegion,
@@ -285,6 +296,7 @@ const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     lora_linear: void,
     lora_linear_qkv: void,
     deberta_attention: void,
+    deberta_ffn_forward: PreparedDebertaFfnForwardRegion,
     lora_backward: void,
     ffn_gelu_backward: void,
     q_linear: PreparedLinearRegion,
@@ -593,21 +605,19 @@ pub const MetalPartitionGraphPlan = struct {
     }
 };
 
-/// Phase-0 slot-bound output pool: one persistent device buffer per
-/// `buffer_plan` tensor `AllocationId`, reused across steps (same address every
-/// step). Lives on the persistent (owned) executor. Rebuilt when the
-/// allocation fingerprint changes (shape/batch change).
-/// Per-NODE persistent output buffers (NOT reused across nodes). Each bound
-/// node gets its own device buffer with a stable address across steps. This
-/// deliberately forgoes the buffer_plan's lifetime-reuse (which introduced a
-/// data-dependent corruption when pooled add outputs shared a reused buffer) —
-/// trading memory for correctness, and giving exactly the stable-address model
-/// ICB needs. Buffers are allocated lazily (only for nodes that actually bind)
-/// and sized to the node's output_shape; reallocated if the byte size changes.
+/// Slot-bound output pool: one persistent device buffer per reusable
+/// `buffer_plan` tensor `AllocationId`, reused across non-overlapping nodes and
+/// across steps. The pool owns the buffer CTs; output hints are borrowed views
+/// over those buffers and are safe to free at node last-use.
 const OutputBufferPool = struct {
-    buffers: []?CT = &.{}, // indexed by NodeId
+    buffers: []?CT = &.{}, // indexed by buffer_plan AllocationId
     byte_sizes: []u64 = &.{},
     built: bool = false,
+    allocations_created: u64 = 0,
+    allocation_reuses: u64 = 0,
+    budget_declines: u64 = 0,
+    bytes_live: u64 = 0,
+    peak_bytes_live: u64 = 0,
 
     fn deinit(self: *OutputBufferPool, allocator: std.mem.Allocator, cb: *const ComputeBackend) void {
         for (self.buffers) |b| {
@@ -618,22 +628,515 @@ const OutputBufferPool = struct {
         self.buffers = &.{};
         self.byte_sizes = &.{};
         self.built = false;
+        self.allocations_created = 0;
+        self.allocation_reuses = 0;
+        self.budget_declines = 0;
+        self.bytes_live = 0;
+        self.peak_bytes_live = 0;
     }
 
-    /// Lazily allocate (or resize) node `node_id`'s buffer to `byte_len`,
+    /// Lazily allocate (or resize) allocation `allocation_id`'s buffer to `byte_len`,
     /// returning the owning pool CT (the pool keeps ownership).
-    fn ensureBuffer(self: *OutputBufferPool, cb: *const ComputeBackend, node_id: NodeId, byte_len: u64) ?CT {
-        const idx: usize = @intCast(node_id);
+    fn ensureBuffer(self: *OutputBufferPool, cb: *const ComputeBackend, allocation_id: buffer_plan_mod.AllocationId, byte_len: u64) ?CT {
+        const idx: usize = @intCast(allocation_id);
         if (idx >= self.buffers.len) return null;
         if (self.buffers[idx]) |existing| {
-            if (self.byte_sizes[idx] == byte_len) return existing;
+            if (self.byte_sizes[idx] == byte_len) {
+                self.allocation_reuses += 1;
+                return existing;
+            }
+            if (poolWouldExceedBudget(self.bytes_live, self.byte_sizes[idx], byte_len)) {
+                self.budget_declines += 1;
+                return null;
+            }
+            self.bytes_live -|= self.byte_sizes[idx];
             cb.free(existing);
             self.buffers[idx] = null;
+            self.byte_sizes[idx] = 0;
+        } else {
+            if (poolWouldExceedBudget(self.bytes_live, 0, byte_len)) {
+                self.budget_declines += 1;
+                return null;
+            }
         }
         const ct = metal_compute_mod.MetalCompute.poolAllocateOutputCt(cb, @intCast(byte_len)) catch return null;
         self.buffers[idx] = ct;
         self.byte_sizes[idx] = byte_len;
+        self.allocations_created += 1;
+        self.bytes_live += byte_len;
+        self.peak_bytes_live = @max(self.peak_bytes_live, self.bytes_live);
         return ct;
+    }
+
+    fn allocationCount(self: *const OutputBufferPool) usize {
+        var count: usize = 0;
+        for (self.buffers) |maybe| {
+            if (maybe != null) count += 1;
+        }
+        return count;
+    }
+};
+
+fn poolWouldExceedBudget(bytes_live: u64, old_size: u64, new_size: u64) bool {
+    const max_bytes = slotBoundOutputPoolMaxBytes();
+    if (max_bytes == 0) return false;
+    if (new_size > max_bytes) return true;
+    const next_live = (bytes_live -| old_size) +| new_size;
+    return next_live > max_bytes;
+}
+
+/// Per-execution Metal eager arena. Unlike the persistent slot-bound pool, this
+/// arena is torn down at partition end and is intended to approximate PyTorch's
+/// step-local working set: local reusable outputs borrow storage from physical
+/// buffer-plan allocation ids, while escaping values keep ordinary ownership.
+const MetalEagerArena = struct {
+    buffers: []?CT = &.{}, // indexed by buffer_plan AllocationId
+    byte_sizes: []u64 = &.{},
+    built: bool = false,
+    allocations: u64 = 0,
+    reuse_hits: u64 = 0,
+    spill_bytes: u64 = 0,
+    hazard_declines: u64 = 0,
+    alias_conflicts: u64 = 0,
+    alias_reclaims: u64 = 0,
+    alias_reclaim_bytes: u64 = 0,
+    live_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+
+    fn init(self: *MetalEagerArena, allocator: std.mem.Allocator, allocation_count: usize) !void {
+        if (self.built and self.buffers.len == allocation_count) return;
+        const buffers = try allocator.alloc(?CT, allocation_count);
+        errdefer allocator.free(buffers);
+        @memset(buffers, null);
+        const byte_sizes = try allocator.alloc(u64, allocation_count);
+        errdefer allocator.free(byte_sizes);
+        @memset(byte_sizes, 0);
+        self.* = .{ .buffers = buffers, .byte_sizes = byte_sizes, .built = true };
+    }
+
+    fn deinit(self: *MetalEagerArena, allocator: std.mem.Allocator, cb: *const ComputeBackend) void {
+        for (self.buffers) |maybe| {
+            if (maybe) |ct| cb.free(ct);
+        }
+        allocator.free(self.buffers);
+        allocator.free(self.byte_sizes);
+        self.* = .{};
+    }
+
+    fn ensureBuffer(self: *MetalEagerArena, cb: *const ComputeBackend, allocation_id: buffer_plan_mod.AllocationId, byte_len: u64) ?CT {
+        const idx: usize = @intCast(allocation_id);
+        if (idx >= self.buffers.len) return null;
+        if (self.buffers[idx]) |existing| {
+            if (self.byte_sizes[idx] == byte_len) {
+                self.reuse_hits += 1;
+                return existing;
+            }
+            if (arenaWouldExceedBudget(self.live_bytes, self.byte_sizes[idx], byte_len)) {
+                self.spill_bytes += byte_len;
+                return null;
+            }
+            self.live_bytes -|= self.byte_sizes[idx];
+            cb.free(existing);
+            self.buffers[idx] = null;
+            self.byte_sizes[idx] = 0;
+        } else if (arenaWouldExceedBudget(self.live_bytes, 0, byte_len)) {
+            self.spill_bytes += byte_len;
+            return null;
+        }
+
+        const ct = metal_compute_mod.MetalCompute.poolAllocateOutputCt(cb, @intCast(byte_len)) catch {
+            self.spill_bytes += byte_len;
+            return null;
+        };
+        self.buffers[idx] = ct;
+        self.byte_sizes[idx] = byte_len;
+        self.allocations += 1;
+        self.live_bytes += byte_len;
+        self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+        return ct;
+    }
+
+    fn outputHintForNode(
+        self: *MetalEagerArena,
+        cb: *const ComputeBackend,
+        graph: *const Graph,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        values: []const ?CT,
+        node_id: NodeId,
+    ) ?CT {
+        if (!self.built) return null;
+        const node = graph.node(node_id);
+        if (!opSupportsOutputHint(node.op)) return null;
+        const slot = buffer_plan.slotForNode(node_id) orelse return null;
+        if (!slot.reusable or slot.roles.graph_output or slot.roles.partition_output or slot.roles.transfer_source) return null;
+        if (slot.kind != .allocation) return null;
+        if (slot.backend != .metal or slot.storage != .metal_buffer) return null;
+        if (slot.allocation == buffer_plan_mod.invalid_allocation) return null;
+        const allocation = buffer_plan.allocationForSlot(slot.id) orelse return null;
+        if (!allocation.reusable or allocation.kind != .tensor) return null;
+        if (allocation.backend != .metal or allocation.storage != .metal_buffer) return null;
+        const byte_len = outputByteLen(node.output_shape) orelse return null;
+        if (byte_len < metalEagerArenaMinBytes()) return null;
+        if (allocation.byte_size < byte_len) {
+            self.hazard_declines += 1;
+            self.spill_bytes += byte_len;
+            return null;
+        }
+        if (allocationHasMaterializedValue(buffer_plan, values, slot.allocation, node_id)) {
+            self.alias_conflicts += 1;
+            self.spill_bytes += byte_len;
+            return null;
+        }
+        const arena_ct = self.ensureBuffer(cb, slot.allocation, byte_len) orelse return null;
+        return viewCtForShape(cb, arena_ct, node.output_shape) catch {
+            self.spill_bytes += byte_len;
+            return null;
+        };
+    }
+
+    fn reclaimDeadAliasesForNode(
+        self: *MetalEagerArena,
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        cb: *const ComputeBackend,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        values: []?CT,
+        value_device: []DeviceId,
+        node_ids: []const NodeId,
+        node_pos: usize,
+        node_id: NodeId,
+        device_id: DeviceId,
+        last_use: []const u32,
+        runtime_region_plan: ?RuntimeRegionPlan,
+        rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+        donated: std.AutoHashMapUnmanaged(NodeId, void),
+        exec_ctx: PartitionExecutor.ExecutionContext,
+    ) !usize {
+        if (!self.built) return 0;
+        const slot = buffer_plan.slotForNode(node_id) orelse return 0;
+        if (slot.kind != .allocation or slot.allocation == buffer_plan_mod.invalid_allocation) return 0;
+
+        var released = std.AutoHashMapUnmanaged(usize, void).empty;
+        defer released.deinit(allocator);
+
+        var reclaimed: usize = 0;
+        const current_index: usize = @intCast(node_id);
+        for (values, 0..) |maybe_ct, raw_index| {
+            const ct = maybe_ct orelse continue;
+            if (raw_index == current_index) continue;
+            const other_node: NodeId = @intCast(raw_index);
+            const other_slot = buffer_plan.slotForNode(other_node) orelse continue;
+            if (other_slot.allocation != slot.allocation) continue;
+            if (arenaAliasStillLive(
+                graph,
+                buffer_plan,
+                node_ids,
+                node_pos,
+                other_node,
+                node_id,
+                last_use,
+                runtime_region_plan,
+                rt_map,
+                donated,
+                exec_ctx,
+            )) continue;
+
+            values[raw_index] = null;
+            self.alias_reclaims += 1;
+            if (outputByteLen(graph.node(other_node).output_shape)) |bytes| {
+                self.alias_reclaim_bytes += bytes;
+            }
+            traceMetalValueLifetime("eager_arena_alias_reclaim_clear", node_id, other_node);
+
+            const ct_key = @intFromPtr(ct);
+            if (released.contains(ct_key)) continue;
+            if (ctStillReferenced(values, ct)) continue;
+            try released.put(allocator, ct_key, {});
+            if (exec_ctx.mesh) |mesh| {
+                const value_dev = if (raw_index < value_device.len) value_device[raw_index] else device_id;
+                if (mesh.device(value_dev)) |entry| {
+                    entry.backend.free(ct);
+                } else {
+                    cb.free(ct);
+                }
+            } else {
+                cb.free(ct);
+            }
+            traceMetalValueLifetime("eager_arena_alias_reclaim_release", node_id, other_node);
+            reclaimed += 1;
+        }
+        return reclaimed;
+    }
+
+    fn recordStats(self: *const MetalEagerArena, stats: ?*PartitionExecutor.ExecutionStats) void {
+        if (stats) |s| {
+            s.metal_eager_arena_peak_bytes = @max(s.metal_eager_arena_peak_bytes, self.peak_bytes);
+            s.metal_eager_arena_live_bytes = @max(s.metal_eager_arena_live_bytes, self.live_bytes);
+            s.metal_eager_arena_reuse_hits += self.reuse_hits;
+            s.metal_eager_arena_allocations += self.allocations;
+            s.metal_eager_arena_spill_bytes += self.spill_bytes;
+            s.metal_eager_arena_hazard_declines += self.hazard_declines;
+            s.metal_eager_arena_alias_conflicts += self.alias_conflicts;
+            s.metal_eager_arena_alias_reclaims += self.alias_reclaims;
+            s.metal_eager_arena_alias_reclaim_bytes += self.alias_reclaim_bytes;
+        }
+    }
+};
+
+fn arenaWouldExceedBudget(bytes_live: u64, old_size: u64, new_size: u64) bool {
+    const max_bytes = metalEagerArenaMaxBytes();
+    if (max_bytes == 0) return false;
+    if (new_size > max_bytes) return true;
+    const next_live = (bytes_live -| old_size) +| new_size;
+    return next_live > max_bytes;
+}
+
+fn outputByteLen(shape: Shape) ?u64 {
+    const rank = shape.rank();
+    if (rank == 0 or rank > ml.graph.shape.max_rank) return null;
+    const numel = shape.numElements() orelse return null;
+    if (numel == 0) return null;
+    return @as(u64, @intCast(numel)) * @sizeOf(f32);
+}
+
+fn viewCtForShape(cb: *const ComputeBackend, storage_ct: CT, shape: Shape) !CT {
+    const rank = shape.rank();
+    if (rank == 0 or rank > ml.graph.shape.max_rank) return error.UnsupportedShape;
+    var dims_buf: [ml.graph.shape.max_rank]i32 = undefined;
+    for (0..rank) |ax| {
+        const d = shape.dim(@intCast(ax));
+        if (d <= 0) return error.UnsupportedShape;
+        dims_buf[ax] = @intCast(d);
+    }
+    return metal_compute_mod.MetalCompute.ctFromPoolCtView(cb, storage_ct, dims_buf[0..rank]);
+}
+
+const OutputHintSource = enum {
+    chunk_local,
+    eager_arena,
+    slot_bound_pool,
+};
+
+/// Chunk-local output pool: command-output backing storage that is eligible to
+/// die at the next frame chunk boundary. This is intentionally shorter-lived
+/// than MetalEagerArena: borrowed views may be consumed by normal command ops,
+/// but backing buffers are released after submit/wait once no live value still
+/// references the corresponding buffer-plan allocation.
+const ChunkLocalOutputPool = struct {
+    buffers: []?CT = &.{}, // indexed by buffer_plan AllocationId
+    byte_sizes: []u64 = &.{},
+    borrowed_nodes: []bool = &.{},
+    built: bool = false,
+    allocations: u64 = 0,
+    reuse_hits: u64 = 0,
+    consumed_hints: u64 = 0,
+    unconsumed_hints: u64 = 0,
+    spill_bytes: u64 = 0,
+    alias_conflicts: u64 = 0,
+    reset_count: u64 = 0,
+    reset_freed_bytes: u64 = 0,
+    discard_freed_bytes: u64 = 0,
+    reset_live_carry_values: u64 = 0,
+    live_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+
+    fn init(self: *ChunkLocalOutputPool, allocator: std.mem.Allocator, allocation_count: usize, value_count: usize) !void {
+        if (self.built and self.buffers.len == allocation_count and self.borrowed_nodes.len == value_count) return;
+        const buffers = try allocator.alloc(?CT, allocation_count);
+        errdefer allocator.free(buffers);
+        @memset(buffers, null);
+        const byte_sizes = try allocator.alloc(u64, allocation_count);
+        errdefer allocator.free(byte_sizes);
+        @memset(byte_sizes, 0);
+        const borrowed_nodes = try allocator.alloc(bool, value_count);
+        errdefer allocator.free(borrowed_nodes);
+        @memset(borrowed_nodes, false);
+        self.* = .{
+            .buffers = buffers,
+            .byte_sizes = byte_sizes,
+            .borrowed_nodes = borrowed_nodes,
+            .built = true,
+        };
+    }
+
+    fn deinit(self: *ChunkLocalOutputPool, allocator: std.mem.Allocator, cb: *const ComputeBackend) void {
+        for (self.buffers) |maybe| {
+            if (maybe) |ct| cb.free(ct);
+        }
+        allocator.free(self.buffers);
+        allocator.free(self.byte_sizes);
+        allocator.free(self.borrowed_nodes);
+        self.* = .{};
+    }
+
+    fn ensureBuffer(self: *ChunkLocalOutputPool, cb: *const ComputeBackend, allocation_id: buffer_plan_mod.AllocationId, byte_len: u64) ?CT {
+        const idx: usize = @intCast(allocation_id);
+        if (idx >= self.buffers.len) return null;
+        if (self.buffers[idx]) |existing| {
+            if (self.byte_sizes[idx] == byte_len) {
+                self.reuse_hits += 1;
+                return existing;
+            }
+            if (chunkLocalOutputsWouldExceedBudget(self.live_bytes, self.byte_sizes[idx], byte_len)) {
+                self.spill_bytes += byte_len;
+                return null;
+            }
+            self.live_bytes -|= self.byte_sizes[idx];
+            cb.free(existing);
+            self.buffers[idx] = null;
+            self.byte_sizes[idx] = 0;
+        } else if (chunkLocalOutputsWouldExceedBudget(self.live_bytes, 0, byte_len)) {
+            self.spill_bytes += byte_len;
+            return null;
+        }
+
+        const ct = metal_compute_mod.MetalCompute.poolAllocateOutputCt(cb, @intCast(byte_len)) catch {
+            self.spill_bytes += byte_len;
+            return null;
+        };
+        self.buffers[idx] = ct;
+        self.byte_sizes[idx] = byte_len;
+        self.allocations += 1;
+        self.live_bytes += byte_len;
+        self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+        return ct;
+    }
+
+    fn outputHintForNode(
+        self: *ChunkLocalOutputPool,
+        cb: *const ComputeBackend,
+        graph: *const Graph,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        values: []const ?CT,
+        node_ids: []const NodeId,
+        node_pos: usize,
+        chunk_boundary_pos: usize,
+        node_id: NodeId,
+    ) ?CT {
+        if (!self.built) return null;
+        if (node_pos > chunk_boundary_pos or chunk_boundary_pos >= node_ids.len) return null;
+        const node = graph.node(node_id);
+        if (!opSupportsOutputHint(node.op)) return null;
+        if (!nodeCanConsumeOutputHint(graph, cb, values, node_id)) return null;
+        const slot = buffer_plan.slotForNode(node_id) orelse return null;
+        if (!slot.reusable or slot.roles.graph_output or slot.roles.partition_output or slot.roles.transfer_source) return null;
+        if (slot.kind != .allocation) return null;
+        if (slot.backend != .metal or slot.storage != .metal_buffer) return null;
+        if (slot.allocation == buffer_plan_mod.invalid_allocation) return null;
+        const boundary_node_id = node_ids[chunk_boundary_pos];
+        if (slot.last_use > @as(u32, @intCast(boundary_node_id))) return null;
+        if (valueReferencedAfterBoundary(graph, node_ids, chunk_boundary_pos, node_id)) return null;
+        const allocation = buffer_plan.allocationForSlot(slot.id) orelse return null;
+        if (!allocation.reusable or allocation.kind != .tensor) return null;
+        if (allocation.backend != .metal or allocation.storage != .metal_buffer) return null;
+        const byte_len = outputByteLen(node.output_shape) orelse return null;
+        if (byte_len < metalChunkLocalOutputsMinBytes()) return null;
+        if (allocation.byte_size < byte_len) {
+            self.spill_bytes += byte_len;
+            return null;
+        }
+        if (allocationHasMaterializedValue(buffer_plan, values, slot.allocation, node_id)) {
+            self.alias_conflicts += 1;
+            self.spill_bytes += byte_len;
+            return null;
+        }
+        const pool_ct = self.ensureBuffer(cb, slot.allocation, byte_len) orelse return null;
+        const view = viewCtForShape(cb, pool_ct, node.output_shape) catch {
+            self.spill_bytes += byte_len;
+            return null;
+        };
+        const node_index: usize = @intCast(node_id);
+        if (node_index < self.borrowed_nodes.len) self.borrowed_nodes[node_index] = true;
+        return view;
+    }
+
+    fn recordConsumedHint(self: *ChunkLocalOutputPool) void {
+        self.consumed_hints += 1;
+    }
+
+    fn discardUnconsumedHintForNode(
+        self: *ChunkLocalOutputPool,
+        cb: *const ComputeBackend,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        node_id: NodeId,
+    ) void {
+        self.unconsumed_hints += 1;
+        const node_index: usize = @intCast(node_id);
+        if (node_index < self.borrowed_nodes.len) self.borrowed_nodes[node_index] = false;
+        const slot = buffer_plan.slotForNode(node_id) orelse return;
+        if (slot.allocation == buffer_plan_mod.invalid_allocation) return;
+        const idx: usize = @intCast(slot.allocation);
+        if (idx >= self.buffers.len) return;
+        const ct = self.buffers[idx] orelse return;
+        const bytes = self.byte_sizes[idx];
+        cb.free(ct);
+        self.buffers[idx] = null;
+        self.byte_sizes[idx] = 0;
+        self.live_bytes -|= bytes;
+        self.discard_freed_bytes += bytes;
+    }
+
+    fn resetAfterChunk(
+        self: *ChunkLocalOutputPool,
+        allocator: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
+        values: []const ?CT,
+    ) !void {
+        if (!self.built) return;
+        self.reset_count += 1;
+        const live_allocations = try allocator.alloc(bool, self.buffers.len);
+        defer allocator.free(live_allocations);
+        @memset(live_allocations, false);
+
+        var live_carry: u64 = 0;
+        for (self.borrowed_nodes, 0..) |*borrowed, raw_id| {
+            if (!borrowed.*) continue;
+            if (raw_id >= values.len or values[raw_id] == null) {
+                borrowed.* = false;
+                continue;
+            }
+            const slot = buffer_plan.slotForNode(@intCast(raw_id)) orelse {
+                borrowed.* = false;
+                continue;
+            };
+            if (slot.allocation == buffer_plan_mod.invalid_allocation) {
+                borrowed.* = false;
+                continue;
+            }
+            const alloc_index: usize = @intCast(slot.allocation);
+            if (alloc_index < live_allocations.len) live_allocations[alloc_index] = true;
+            live_carry += 1;
+        }
+        self.reset_live_carry_values += live_carry;
+
+        for (self.buffers, 0..) |maybe, idx| {
+            const ct = maybe orelse continue;
+            if (idx < live_allocations.len and live_allocations[idx]) continue;
+            const bytes = self.byte_sizes[idx];
+            cb.free(ct);
+            self.buffers[idx] = null;
+            self.byte_sizes[idx] = 0;
+            self.live_bytes -|= bytes;
+            self.reset_freed_bytes += bytes;
+        }
+    }
+
+    fn recordStats(self: *const ChunkLocalOutputPool, stats: ?*PartitionExecutor.ExecutionStats) void {
+        if (stats) |s| {
+            s.metal_chunk_local_output_peak_bytes = @max(s.metal_chunk_local_output_peak_bytes, self.peak_bytes);
+            s.metal_chunk_local_output_live_bytes = @max(s.metal_chunk_local_output_live_bytes, self.live_bytes);
+            s.metal_chunk_local_output_allocations += self.allocations;
+            s.metal_chunk_local_output_reuse_hits += self.reuse_hits;
+            s.metal_chunk_local_output_consumed_hints += self.consumed_hints;
+            s.metal_chunk_local_output_unconsumed_hints += self.unconsumed_hints;
+            s.metal_chunk_local_output_spill_bytes += self.spill_bytes;
+            s.metal_chunk_local_output_alias_conflicts += self.alias_conflicts;
+            s.metal_chunk_local_output_resets += self.reset_count;
+            s.metal_chunk_local_output_reset_freed_bytes += self.reset_freed_bytes;
+            s.metal_chunk_local_output_discard_freed_bytes += self.discard_freed_bytes;
+            s.metal_chunk_local_output_reset_live_carry_values += self.reset_live_carry_values;
+        }
     }
 };
 
@@ -714,53 +1217,50 @@ pub const MetalPartitionExecutor = struct {
     fn ensureOutputPool(
         self: *MetalPartitionExecutor,
         cb: *const ComputeBackend,
-        graph: *const Graph,
+        buffer_plan: *const buffer_plan_mod.BufferPlan,
     ) !void {
-        const node_count = graph.nodeCount();
-        if (self.output_pool.built and self.output_pool.buffers.len == node_count) return;
+        const allocation_count = buffer_plan.allocations.len;
+        if (self.output_pool.built and self.output_pool.buffers.len == allocation_count) return;
         self.output_pool.deinit(self.allocator, cb);
-        const buffers = try self.allocator.alloc(?CT, node_count);
+        const buffers = try self.allocator.alloc(?CT, allocation_count);
         errdefer self.allocator.free(buffers);
         @memset(buffers, null);
-        const byte_sizes = try self.allocator.alloc(u64, node_count);
+        const byte_sizes = try self.allocator.alloc(u64, allocation_count);
         errdefer self.allocator.free(byte_sizes);
         @memset(byte_sizes, 0);
         self.output_pool = .{ .buffers = buffers, .byte_sizes = byte_sizes, .built = true };
     }
 
-    /// Borrowed PER-NODE pool view for `node_id`'s output, or null if not
-    /// eligible (flag off, op unsupported, graph output, unsized). With
-    /// per-node buffers there is NO reuse and NO aliasing-with-inputs (each
-    /// node owns a distinct buffer), so the reuse/alias guards are gone.
+    /// Borrowed pool view for `node_id`'s planned allocation, or null if not
+    /// eligible. Reuse is allowed only when no currently-materialized graph
+    /// value still uses the same allocation id.
     /// Caller owns the returned CT and frees it if the op doesn't consume it.
     fn outputHintForNode(
         self: *MetalPartitionExecutor,
         cb: *const ComputeBackend,
         graph: *const Graph,
         buffer_plan: *const buffer_plan_mod.BufferPlan,
+        values: []const ?CT,
         node_id: NodeId,
     ) ?CT {
         if (!self.output_pool.built) return null;
         const node = graph.node(node_id);
         if (!opSupportsOutputHint(node.op)) return null;
-        // Keep the owned-copy path for graph outputs (host readback after frame).
-        if (buffer_plan.slotForNode(node_id)) |slot| {
-            if (slot.roles.graph_output) return null;
-        }
+        const slot = buffer_plan.slotForNode(node_id) orelse return null;
+        if (!slot.reusable or slot.roles.graph_output) return null;
+        if (slot.kind != .allocation) return null;
+        if (slot.backend != .metal or slot.storage != .metal_buffer) return null;
+        if (slot.allocation == buffer_plan_mod.invalid_allocation) return null;
+        const allocation = buffer_plan.allocationForSlot(slot.id) orelse return null;
+        if (!allocation.reusable or allocation.kind != .tensor) return null;
+        if (allocation.backend != .metal or allocation.storage != .metal_buffer) return null;
         const out_shape = node.output_shape;
-        const rank = out_shape.rank();
-        if (rank == 0 or rank > ml.graph.shape.max_rank) return null;
-        const numel = out_shape.numElements() orelse return null;
-        if (numel == 0) return null;
-        const byte_len: u64 = @as(u64, @intCast(numel)) * @sizeOf(f32);
-        const pool_ct = self.output_pool.ensureBuffer(cb, node_id, byte_len) orelse return null;
-        var dims_buf: [ml.graph.shape.max_rank]i32 = undefined;
-        for (0..rank) |ax| {
-            const d = out_shape.dim(@intCast(ax));
-            if (d <= 0) return null;
-            dims_buf[ax] = @intCast(d);
-        }
-        return metal_compute_mod.MetalCompute.ctFromPoolCtView(cb, pool_ct, dims_buf[0..rank]) catch null;
+        const byte_len = outputByteLen(out_shape) orelse return null;
+        if (byte_len < slotBoundOutputMinBytes()) return null;
+        if (allocation.byte_size < byte_len) return null;
+        if (allocationHasMaterializedValue(buffer_plan, values, slot.allocation, node_id)) return null;
+        const pool_ct = self.output_pool.ensureBuffer(cb, slot.allocation, byte_len) orelse return null;
+        return viewCtForShape(cb, pool_ct, out_shape) catch null;
     }
 
     fn partitionBufferView(
@@ -882,24 +1382,41 @@ pub const MetalPartitionExecutor = struct {
             );
         }
 
+        const chunk_ops = frameChunkOps();
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
-        defer metal_graph_plan.deinit(allocator);
-        if (trace_nodes) printMetalGraphPlanTrace(partition_index, metal_graph_plan);
-        if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_begin partition={d} slots={d}\n", .{ partition_index, metal_graph_plan.slots.len });
-        _ = try cb.reserveGraphPlanSlots(metal_graph_plan.slots);
-        if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_end partition={d}\n", .{partition_index});
-        if (trace_nodes) std.debug.print("graph_executor_node_trace: graph_plan_reserved partition={d}\n", .{partition_index});
-        if (collect_loop_profile) loop_profile.graph_plan_ns += metalPartitionElapsedNs(graph_plan_start_ns, metalPartitionNowNs());
-        if (exec_ctx.stats) |stats| {
-            stats.graph_plan_slots_reserved += metal_graph_plan.slots.len;
-            for (metal_graph_plan.slots) |slot| stats.graph_plan_bytes_reserved += slot.bytes;
+        if (reservePartitionGraphPlanForExecution(chunk_ops)) {
+            var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
+            defer metal_graph_plan.deinit(allocator);
+            if (trace_nodes) printMetalGraphPlanTrace(partition_index, metal_graph_plan);
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_begin partition={d} slots={d}\n", .{ partition_index, metal_graph_plan.slots.len });
+            _ = try cb.reserveGraphPlanSlots(metal_graph_plan.slots);
+            if (trace_progress) std.debug.print("metal_partition_progress: phase=reserve_graph_slots_end partition={d}\n", .{partition_index});
+            if (trace_nodes) std.debug.print("graph_executor_node_trace: graph_plan_reserved partition={d}\n", .{partition_index});
+            if (exec_ctx.stats) |stats| {
+                stats.graph_plan_slots_reserved += metal_graph_plan.slots.len;
+                for (metal_graph_plan.slots) |slot| stats.graph_plan_bytes_reserved += slot.bytes;
+            }
+        } else if (trace_nodes) {
+            std.debug.print("graph_executor_node_trace: graph_plan_reserved partition={d} skipped=frame_chunking\n", .{partition_index});
         }
+        if (collect_loop_profile) loop_profile.graph_plan_ns += metalPartitionElapsedNs(graph_plan_start_ns, metalPartitionNowNs());
 
         // Phase-0 slot-bound output pool (persistent executor only). Binds
         // node outputs to fixed device buffers reused across steps.
         const slot_bound_outputs = self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
-        if (slot_bound_outputs) self.ensureOutputPool(cb, graph) catch {};
+        if (slot_bound_outputs) self.ensureOutputPool(cb, buffer_plan) catch {};
+        const eager_arena_outputs = self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
+        var eager_arena = MetalEagerArena{};
+        defer eager_arena.deinit(allocator, cb);
+        if (eager_arena_outputs) {
+            eager_arena.init(allocator, buffer_plan.allocations.len) catch {};
+        }
+        const chunk_local_outputs = self.owned and cb.kind() == .metal and chunk_ops > 0 and metalChunkLocalOutputsEnabled();
+        var chunk_local_pool = ChunkLocalOutputPool{};
+        defer chunk_local_pool.deinit(allocator, cb);
+        if (chunk_local_outputs) {
+            chunk_local_pool.init(allocator, buffer_plan.allocations.len, values.len) catch {};
+        }
 
         const options = exec_ctx.options orelse interpreter.ExecuteOptions{
             .attention = if (exec_ctx.attention) |attention| attention.* else null,
@@ -993,7 +1510,6 @@ pub const MetalPartitionExecutor = struct {
 
         // Coarse frame chunking: split the single frame every `chunk_ops`
         // executed nodes so dead/pooled device buffers release mid-step.
-        const chunk_ops = frameChunkOps();
         var chunk_executed: usize = 0;
 
         var exec_state = interpreter.ExecState{
@@ -1098,6 +1614,16 @@ pub const MetalPartitionExecutor = struct {
             }
         }
 
+        try prepareRuntimeRegionPlan(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            runtime_region_plan,
+            exec_ctx.stats,
+        );
+
         var node_pos: usize = 0;
         while (node_pos < node_ids.len) : (node_pos += 1) {
             const node_id = node_ids[node_pos];
@@ -1105,20 +1631,34 @@ pub const MetalPartitionExecutor = struct {
             const i: usize = @intCast(node_id);
             if (i >= reachable.len or !reachable[i]) continue;
             if (i < skipped_nodes.len and skipped_nodes[i]) {
-                if (i >= elision_protected_nodes.len or !elision_protected_nodes[i]) continue;
+                traceMetalValueLifetime("top_skip_continue", node_id, node_id);
+                if (traceRuntimeRegionsEnabled()) {
+                    const skipped_region = runtime_region_plan.regionAt(node_pos, node_id, node_ids);
+                    if (std.meta.activeTag(skipped_region) != .none) {
+                        std.debug.print(
+                            "runtime_region_plan_skip: partition={d} pos={d} node={} kind={s}\n",
+                            .{ partition_index, node_pos, node_id, @tagName(skipped_region) },
+                        );
+                    }
+                }
+                const protected_output = i < elision_protected_nodes.len and elision_protected_nodes[i];
+                const future_consumer = valueReferencedAfterBoundary(graph, node_ids, node_pos, node_id);
+                if (!protected_output and !future_consumer) continue;
+                if (future_consumer and values[i] != null) continue;
                 // A fused pattern / runtime region elided this node as
-                // fused-interior state, but it is a GRAPH OUTPUT (or part of
-                // the tiny scalar tail feeding one): its slot must hold the
-                // node's value after the partition completes. Clear the skip
-                // and execute the node normally below; producers the fusion
-                // also elided are materialized on demand below and by the
-                // interpreter-fallback safety net. Any value a fused
-                // executor left behind cannot be trusted (it may be a
-                // plan-slot view no kernel writes), so drop it first —
-                // freeing only when this CT handle is not caller-owned and
-                // not aliased by another node's slot.
+                // fused-interior state, but its slot must escape the elided
+                // region (graph output/scalar tail, or a later unskipped
+                // consumer). Clear the skip and execute the node normally
+                // below; producers the fusion also elided are materialized
+                // on demand below and by the interpreter-fallback safety
+                // net. Any value a fused executor left behind cannot be
+                // trusted (it may be a plan-slot view no kernel writes), so
+                // drop it first — freeing only when this CT handle is not
+                // caller-owned and not aliased by another node's slot.
                 skipped_nodes[i] = false;
-                if (exec_ctx.stats) |stats| stats.graph_output_elision_overrides += 1;
+                if (protected_output) {
+                    if (exec_ctx.stats) |stats| stats.graph_output_elision_overrides += 1;
+                }
                 const override_op = graph.node(node_id).op;
                 const caller_or_weight_owned = rt_map.contains(node_id) or
                     override_op == .parameter or
@@ -1273,10 +1813,49 @@ pub const MetalPartitionExecutor = struct {
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=fused_pattern_miss partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     if (trace_node_progress) std.debug.print("metal_partition_progress: phase=metal_command_begin partition={d} pos={d} node={}\n", .{ partition_index, node_pos, node_id });
                     const command_path_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-                    const output_hint: ?CT = if (slot_bound_outputs)
-                        self.outputHintForNode(cb, graph, buffer_plan, node_id)
-                    else
-                        null;
+                    var output_hint_source: ?OutputHintSource = null;
+                    const output_hint: ?CT = blk: {
+                        if (chunk_local_outputs) {
+                            if (currentFrameChunkBoundaryPos(node_ids.len, node_pos, chunk_ops, chunk_executed)) |chunk_boundary_pos| {
+                                if (chunk_local_pool.outputHintForNode(cb, graph, buffer_plan, values, node_ids, node_pos, chunk_boundary_pos, node_id)) |hint| {
+                                    output_hint_source = .chunk_local;
+                                    break :blk hint;
+                                }
+                            }
+                        }
+                        if (eager_arena_outputs) {
+                            if (metalEagerArenaReclaimAliasesEnabled()) {
+                                _ = try eager_arena.reclaimDeadAliasesForNode(
+                                    allocator,
+                                    graph,
+                                    cb,
+                                    buffer_plan,
+                                    values,
+                                    value_device,
+                                    node_ids,
+                                    node_pos,
+                                    node_id,
+                                    device_id,
+                                    last_use,
+                                    runtime_region_plan,
+                                    rt_map,
+                                    donated,
+                                    effective_exec_ctx,
+                                );
+                            }
+                            if (eager_arena.outputHintForNode(cb, graph, buffer_plan, values, node_id)) |hint| {
+                                output_hint_source = .eager_arena;
+                                break :blk hint;
+                            }
+                        }
+                        if (slot_bound_outputs) {
+                            if (self.outputHintForNode(cb, graph, buffer_plan, values, node_id)) |hint| {
+                                output_hint_source = .slot_bound_pool;
+                                break :blk hint;
+                            }
+                        }
+                        break :blk null;
+                    };
                     const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
                         try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache)
                     else
@@ -1284,11 +1863,33 @@ pub const MetalPartitionExecutor = struct {
                     // Free an unconsumed pooled-output view (op didn't take the hint).
                     if (output_hint) |hint| {
                         const consumed = if (command_output_opt) |co| co == hint else false;
-                        if (consumed) {
-                            slot_bound_consumed_total += 1;
-                        } else {
-                            slot_bound_fallback_total += 1;
-                            cb.free(hint);
+                        switch (output_hint_source orelse .slot_bound_pool) {
+                            .chunk_local => {
+                                if (consumed) {
+                                    chunk_local_pool.recordConsumedHint();
+                                } else {
+                                    if (traceChunkLocalOutputHintsEnabled()) {
+                                        const hinted_node = graph.node(node_id);
+                                        std.debug.print(
+                                            "metal_chunk_local_output_hint: unconsumed node={d} op={s} source=chunk_local\n",
+                                            .{ node_id, @tagName(hinted_node.op) },
+                                        );
+                                    }
+                                    cb.free(hint);
+                                    chunk_local_pool.discardUnconsumedHintForNode(cb, buffer_plan, node_id);
+                                }
+                            },
+                            .slot_bound_pool => {
+                                if (consumed) {
+                                    slot_bound_consumed_total += 1;
+                                } else {
+                                    slot_bound_fallback_total += 1;
+                                    cb.free(hint);
+                                }
+                            },
+                            .eager_arena => {
+                                if (!consumed) cb.free(hint);
+                            },
                         }
                     }
                     if (command_output_opt) |command_output| {
@@ -1362,18 +1963,22 @@ pub const MetalPartitionExecutor = struct {
                     if (collect_op_stats) op_execution_stats.recordFallback(op_name, elapsed_ns);
                 }
                 if (collect_residency_stats) {
-                    const output_resident = isMetalResidentOrQuantizedDescriptor(cb, values[i].?);
-                    if (output_resident) {
-                        stats.device_resident_outputs += 1;
-                    } else {
-                        stats.host_materialized_outputs += 1;
-                        if (collect_op_stats) {
-                            op_execution_stats.recordHostOutput(op_name, elapsed_ns);
-                            op_execution_stats.recordHostOutputReason(hostOutputReasonName(execution_kind), elapsed_ns);
+                    if (values[i]) |node_value| {
+                        const output_resident = isMetalResidentOrQuantizedDescriptor(cb, node_value);
+                        if (output_resident) {
+                            stats.device_resident_outputs += 1;
+                        } else {
+                            stats.host_materialized_outputs += 1;
+                            if (collect_op_stats) {
+                                op_execution_stats.recordHostOutput(op_name, elapsed_ns);
+                                op_execution_stats.recordHostOutputReason(hostOutputReasonName(execution_kind), elapsed_ns);
+                            }
+                            if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, hostOutputReasonName(execution_kind));
                         }
-                        if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, hostOutputReasonName(execution_kind));
+                        recordGemmaRuntimeResidency(stats, graph, node_id, output_resident);
+                    } else {
+                        stats.device_resident_outputs += 1;
                     }
-                    recordGemmaRuntimeResidency(stats, graph, node_id, output_resident);
                 } else if (execution_kind != null) {
                     stats.device_resident_outputs += 1;
                 } else {
@@ -1382,8 +1987,11 @@ pub const MetalPartitionExecutor = struct {
             }
             if (collect_loop_profile) loop_profile.stats_ns += metalPartitionElapsedNs(stats_start_ns, metalPartitionNowNs());
             value_device[i] = device_id;
+            if (values[i] != null) traceMetalValueLifetime("value_set", node_id, node_id);
             const traced_command = if (execution_kind) |kind| kind == .command else false;
-            if (trace_nodes) printMetalNodeTraceEnd(graph, cb, node_id, values[i].?, traced_command);
+            if (trace_nodes) {
+                if (values[i]) |node_value| printMetalNodeTraceEnd(graph, cb, node_id, node_value, traced_command);
+            }
 
             const alias_clone_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
@@ -1399,7 +2007,7 @@ pub const MetalPartitionExecutor = struct {
             if (collect_loop_profile) loop_profile.alias_clone_ns += metalPartitionElapsedNs(alias_clone_start_ns, metalPartitionNowNs());
 
             const free_expired_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-            try freeExpiredInputs(
+            const expired_free_stats = try freeExpiredInputs(
                 allocator,
                 graph,
                 cb,
@@ -1416,24 +2024,117 @@ pub const MetalPartitionExecutor = struct {
             if (collect_loop_profile) loop_profile.free_expired_ns += metalPartitionElapsedNs(free_expired_start_ns, metalPartitionNowNs());
 
             if (i < skipped_nodes.len and skipped_nodes[i]) {
+                traceMetalValueLifetime("skip_node_clear", node_id, node_id);
                 values[i] = null;
             }
             if (trace_node_progress) {
                 printMetalProgressNode("node_end", graph, partition_index, node_pos, node_ids.len, node_id);
             }
 
+            var forced_liveness_boundary = false;
+            const expired_boundary_threshold = metalFrameChunkExpiredBytesThreshold();
+            if (expired_boundary_threshold > 0 and frame_active and node_pos + 1 < node_ids.len and expired_free_stats.bytes >= expired_boundary_threshold) {
+                forced_liveness_boundary = true;
+                chunk_executed = 0;
+                const swept = try sweepExpiredValuesThroughNode(
+                    allocator,
+                    graph,
+                    cb,
+                    values,
+                    value_device,
+                    node_ids,
+                    node_pos,
+                    node_id,
+                    device_id,
+                    last_use,
+                    runtime_region_plan,
+                    rt_map,
+                    donated,
+                    effective_exec_ctx,
+                );
+                metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                frame_active = false;
+                const promoted = try promoteLiveValuesAcrossFrameBoundary(
+                    allocator,
+                    graph,
+                    cb,
+                    values,
+                    value_device,
+                    node_ids,
+                    node_pos,
+                    device_id,
+                    rt_map,
+                    donated,
+                    effective_exec_ctx,
+                );
+                if (exec_ctx.stats) |stats| {
+                    stats.metal_frame_chunk_boundaries += 1;
+                    stats.metal_frame_chunk_promoted_values += promoted;
+                    stats.metal_frame_chunk_swept_values += swept + expired_free_stats.count;
+                }
+                if (chunk_local_outputs) {
+                    try chunk_local_pool.resetAfterChunk(allocator, cb, buffer_plan, values);
+                }
+                frame_active = try cb.decoderRuntimeBeginFrame();
+                planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
+                    try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
+                else
+                    metal_compute_mod.MetalCompute.PlannedGraphScope{};
+            }
+
             // Coarse frame chunking boundary: after every `chunk_ops` executed
-            // nodes, submit+wait the current frame (releasing its dead/pooled
-            // device buffers) and reopen a fresh frame + scope. Cross-chunk
-            // live values survive via their owned device CTs (last_use later,
-            // so freeExpiredInputs left them in `values`). Skip the very last
-            // node — the post-loop block submits that final chunk.
-            if (chunk_ops > 0 and frame_active and node_pos + 1 < node_ids.len) {
+            // nodes, sweep values whose last use is behind the boundary,
+            // submit+wait the current frame, then copy still-live values into
+            // owned storage before reopening a fresh frame + scope. Promoting
+            // after submit avoids duplicating the cross-boundary live set
+            // inside the same command-buffer window.
+            if (!forced_liveness_boundary and chunk_ops > 0 and frame_active and node_pos + 1 < node_ids.len) {
                 chunk_executed += 1;
                 if (chunk_executed >= chunk_ops) {
                     chunk_executed = 0;
+                    const swept = try sweepExpiredValuesThroughNode(
+                        allocator,
+                        graph,
+                        cb,
+                        values,
+                        value_device,
+                        node_ids,
+                        node_pos,
+                        node_id,
+                        device_id,
+                        last_use,
+                        runtime_region_plan,
+                        rt_map,
+                        donated,
+                        effective_exec_ctx,
+                    );
                     metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
+                    planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
                     try cb.decoderRuntimeSubmitAndWaitFrame();
+                    frame_active = false;
+                    const promoted = try promoteLiveValuesAcrossFrameBoundary(
+                        allocator,
+                        graph,
+                        cb,
+                        values,
+                        value_device,
+                        node_ids,
+                        node_pos,
+                        device_id,
+                        rt_map,
+                        donated,
+                        effective_exec_ctx,
+                    );
+                    if (exec_ctx.stats) |stats| {
+                        stats.metal_frame_chunk_boundaries += 1;
+                        stats.metal_frame_chunk_promoted_values += promoted;
+                        stats.metal_frame_chunk_swept_values += swept;
+                    }
+                    if (chunk_local_outputs) {
+                        try chunk_local_pool.resetAfterChunk(allocator, cb, buffer_plan, values);
+                    }
                     frame_active = try cb.decoderRuntimeBeginFrame();
                     planned_scope = if (frame_active and !metalPartitionPlannedScopeDisabled())
                         try metal_compute_mod.MetalCompute.beginPlannedGraphScope(cb, .ffn)
@@ -1445,6 +2146,7 @@ pub const MetalPartitionExecutor = struct {
 
         if (frame_active) {
             try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
+            planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
             // Drain BEFORE copying graph outputs to owned storage. The
             // previous order encoded the owned-copy blits into the
             // partition's frame ahead of the submit, but runtime region
@@ -1466,6 +2168,7 @@ pub const MetalPartitionExecutor = struct {
             if (trace_progress) std.debug.print("metal_partition_progress: phase=submit_frame_end partition={d}\n", .{partition_index});
         } else {
             try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
+            planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
         }
 
         if (exec_ctx.materialize_boundary_outputs) {
@@ -1518,8 +2221,56 @@ pub const MetalPartitionExecutor = struct {
             printOpExecutionStats("metal_partition_host_output_reasons", &op_execution_stats.host_output_reason_counts, op_execution_stats.host_output_reason_used);
         }
         if (collect_loop_profile) loop_profile.print("metal_partition_loop_profile");
-        if (slot_bound_outputs and collect_loop_profile) {
-            std.debug.print("metal_slot_bound_outputs: consumed={d} fallback={d} pool_allocs={d}\n", .{ slot_bound_consumed_total, slot_bound_fallback_total, self.output_pool.buffers.len });
+        if (slot_bound_outputs) {
+            std.debug.print(
+                "metal_slot_bound_outputs: consumed={d} fallback={d} pool_allocs={d} pool_reuses={d} pool_budget_declines={d} pool_live_bytes={d} pool_peak_bytes={d}\n",
+                .{
+                    slot_bound_consumed_total,
+                    slot_bound_fallback_total,
+                    self.output_pool.allocationCount(),
+                    self.output_pool.allocation_reuses,
+                    self.output_pool.budget_declines,
+                    self.output_pool.bytes_live,
+                    self.output_pool.peak_bytes_live,
+                },
+            );
+        }
+        if (eager_arena_outputs) {
+            eager_arena.recordStats(exec_ctx.stats);
+            std.debug.print(
+                "metal_eager_arena: peak_bytes={d} live_bytes={d} allocations={d} reuse_hits={d} spill_bytes={d} hazard_declines={d} alias_conflicts={d} alias_reclaims={d} alias_reclaim_bytes={d}\n",
+                .{
+                    eager_arena.peak_bytes,
+                    eager_arena.live_bytes,
+                    eager_arena.allocations,
+                    eager_arena.reuse_hits,
+                    eager_arena.spill_bytes,
+                    eager_arena.hazard_declines,
+                    eager_arena.alias_conflicts,
+                    eager_arena.alias_reclaims,
+                    eager_arena.alias_reclaim_bytes,
+                },
+            );
+        }
+        if (chunk_local_outputs) {
+            chunk_local_pool.recordStats(exec_ctx.stats);
+            std.debug.print(
+                "metal_chunk_local_outputs: peak_bytes={d} live_bytes={d} allocations={d} reuse_hits={d} consumed_hints={d} unconsumed_hints={d} spill_bytes={d} alias_conflicts={d} resets={d} reset_freed_bytes={d} discard_freed_bytes={d} reset_live_carry_values={d}\n",
+                .{
+                    chunk_local_pool.peak_bytes,
+                    chunk_local_pool.live_bytes,
+                    chunk_local_pool.allocations,
+                    chunk_local_pool.reuse_hits,
+                    chunk_local_pool.consumed_hints,
+                    chunk_local_pool.unconsumed_hints,
+                    chunk_local_pool.spill_bytes,
+                    chunk_local_pool.alias_conflicts,
+                    chunk_local_pool.reset_count,
+                    chunk_local_pool.reset_freed_bytes,
+                    chunk_local_pool.discard_freed_bytes,
+                    chunk_local_pool.reset_live_carry_values,
+                },
+            );
         }
         if (trace_progress) std.debug.print("metal_partition_progress: phase=executor_end partition={d}\n", .{partition_index});
     }
@@ -2374,19 +3125,248 @@ fn slotBoundOutputsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_SLOT_BOUND_OUTPUTS", false);
 }
 
+fn slotBoundOutputMinBytes() u64 {
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_SLOT_BOUND_MIN_BYTES") orelse (4 * 1024 * 1024));
+}
+
+fn slotBoundOutputPoolMaxBytes() u64 {
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES") orelse (1024 * 1024 * 1024));
+}
+
+fn metalEagerArenaEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_EAGER_ARENA", false);
+}
+
+fn metalEagerArenaMinBytes() u64 {
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_EAGER_ARENA_MIN_BYTES") orelse (1024 * 1024));
+}
+
+fn metalEagerArenaMaxBytes() u64 {
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_EAGER_ARENA_MAX_BYTES") orelse (4 * 1024 * 1024 * 1024));
+}
+
+fn metalEagerArenaReclaimAliasesEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_EAGER_ARENA_RECLAIM_ALIASES", false);
+}
+
+fn metalChunkLocalOutputsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_CHUNK_LOCAL_OUTPUTS", false);
+}
+
+fn metalChunkLocalOutputsMinBytes() u64 {
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MIN_BYTES") orelse (1024 * 1024));
+}
+
+fn metalChunkLocalOutputsMaxBytes() u64 {
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES") orelse (4 * 1024 * 1024 * 1024));
+}
+
+fn metalFrameChunkExpiredBytesThreshold() u64 {
+    if (!platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_EXPERIMENTAL_LIVENESS_BOUNDARIES", false)) return 0;
+    return @intCast(platform.env.getenvUsize("TERMITE_METAL_FRAME_CHUNK_ON_EXPIRED_BYTES") orelse 0);
+}
+
+fn chunkLocalOutputsWouldExceedBudget(bytes_live: u64, old_size: u64, new_size: u64) bool {
+    const max_bytes = metalChunkLocalOutputsMaxBytes();
+    if (max_bytes == 0) return false;
+    if (new_size > max_bytes) return true;
+    const next_live = (bytes_live -| old_size) +| new_size;
+    return next_live > max_bytes;
+}
+
+fn currentFrameChunkBoundaryPos(node_count: usize, node_pos: usize, chunk_ops: usize, chunk_executed: usize) ?usize {
+    if (chunk_ops == 0 or node_pos >= node_count) return null;
+    const remaining_in_chunk = chunk_ops - @min(chunk_ops, chunk_executed);
+    if (remaining_in_chunk == 0) return node_pos;
+    const boundary = node_pos + remaining_in_chunk - 1;
+    return @min(boundary, node_count - 1);
+}
+
+fn allocationHasMaterializedValue(
+    buffer_plan: *const buffer_plan_mod.BufferPlan,
+    values: []const ?CT,
+    allocation_id: buffer_plan_mod.AllocationId,
+    node_id: NodeId,
+) bool {
+    const node_index: usize = @intCast(node_id);
+    for (values, 0..) |maybe_value, raw_index| {
+        if (raw_index == node_index or maybe_value == null) continue;
+        const other_node: NodeId = @intCast(raw_index);
+        const other_slot = buffer_plan.slotForNode(other_node) orelse continue;
+        if (other_slot.allocation == allocation_id) return true;
+    }
+    return false;
+}
+
+fn arenaAliasStillLive(
+    graph: *const Graph,
+    buffer_plan: *const buffer_plan_mod.BufferPlan,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    alias_node: NodeId,
+    current_node: NodeId,
+    last_use: []const u32,
+    runtime_region_plan: ?RuntimeRegionPlan,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    donated: std.AutoHashMapUnmanaged(NodeId, void),
+    exec_ctx: PartitionExecutor.ExecutionContext,
+) bool {
+    const alias_index: usize = @intCast(alias_node);
+    if (alias_index >= last_use.len) return true;
+    if (last_use[alias_index] == std.math.maxInt(u32)) return true;
+    const slot = buffer_plan.slotForNode(alias_node) orelse return true;
+    if (slot.last_use >= @as(u32, @intCast(node_pos))) return true;
+    if (last_use[alias_index] >= @as(u32, @intCast(current_node))) return true;
+    if (valueReferencedAtOrAfterPosition(graph, node_ids, node_pos, alias_node)) return true;
+    if (slot.roles.graph_output or slot.roles.partition_output or slot.roles.transfer_source) return true;
+    if (runtime_region_plan) |plan| {
+        if (plan.needsAttentionInputAfterNode(alias_node, current_node)) return true;
+    }
+    if (rt_map.contains(alias_node) and
+        !donated.contains(alias_node) and
+        !ownedRuntimeTransferContains(exec_ctx, alias_node))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn ctStillReferenced(values: []const ?CT, ct: CT) bool {
+    for (values) |maybe_ct| {
+        if (maybe_ct == ct) return true;
+    }
+    return false;
+}
+
 // Phase-0 coverage counters (process-wide; executor runs single-threaded).
 var slot_bound_consumed_total: usize = 0;
 var slot_bound_fallback_total: usize = 0;
 
 /// Ops whose device path can write into a caller-provided output buffer
-/// (Phase-0 slice coverage). Elementwise multiply is the first; more ops gain
-/// `*Into` variants in later slices.
+/// through a `*Into` runtime command. The allocation-backed pool only enables
+/// these when the buffer plan proves the output allocation is reusable and no
+/// current value still materializes that allocation.
 fn opSupportsOutputHint(op: anytype) bool {
     return switch (op) {
-        // Per-node buffers (no reuse) make these safe.
-        .mul, .fused_elem_multiply, .add, .fused_elem_add, .transpose, .dot_general, .reduce_sum, .reduce_max, .reduce_mean, .broadcast_in_dim, .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs, .sub, .div, .fused_gelu, .fused_relu, .fused_silu, .fused_quick_gelu => true,
+        .mul, .fused_elem_multiply, .add, .fused_elem_add, .transpose, .dot_general, .reduce_sum, .reduce_max, .reduce_mean, .broadcast_in_dim, .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs, .sub, .div, .fused_gelu, .fused_gelu_exact, .fused_relu, .fused_silu, .fused_quick_gelu => true,
         else => false,
     };
+}
+
+fn nodeCanConsumeOutputHint(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []const ?CT,
+    node_id: NodeId,
+) bool {
+    const node = graph.node(node_id);
+    const inputs = node.getInputs();
+    return switch (node.op) {
+        .neg,
+        .sqrt,
+        .rsqrt,
+        .exp,
+        .log,
+        .sin,
+        .cos,
+        .tanh,
+        .erf,
+        .abs,
+        .fused_gelu,
+        .fused_gelu_exact,
+        .fused_relu,
+        .fused_silu,
+        .fused_quick_gelu,
+        => inputs.len >= 1 and inputIsMetalResident(values, cb, inputs[0]),
+        .transpose => blk: {
+            if (inputs.len < 1 or !inputIsMetalResident(values, cb, inputs[0])) break :blk false;
+            const attrs = switch (node.op) {
+                .transpose => |attrs| attrs,
+                else => unreachable,
+            };
+            break :blk transposeIsSimpleEnoughForHint(attrs, graph.node(inputs[0]).output_shape);
+        },
+        .mul, .fused_elem_multiply, .sub, .div => blk: {
+            if (inputs.len < 2) break :blk false;
+            if (!inputIsMetalResident(values, cb, inputs[0]) or !inputIsMetalResident(values, cb, inputs[1])) break :blk false;
+            break :blk sameElementCount(graph.node(inputs[0]).output_shape, graph.node(inputs[1]).output_shape);
+        },
+        .add, .fused_elem_add => blk: {
+            if (inputs.len < 2) break :blk false;
+            if (!inputIsMetalResident(values, cb, inputs[0]) or !inputIsMetalResident(values, cb, inputs[1])) break :blk false;
+            if (!sameElementCount(graph.node(inputs[0]).output_shape, graph.node(inputs[1]).output_shape)) break :blk false;
+            // Deferred mul+add fusions return before the addInto path and do not
+            // consume a supplied hint, so skip likely fused add nodes here.
+            if (isMulLikeOp(graph.node(inputs[0]).op) or isMulLikeOp(graph.node(inputs[1]).op)) break :blk false;
+            break :blk true;
+        },
+        .broadcast_in_dim => |attrs| blk: {
+            if (inputs.len < 1 or !inputIsMetalResident(values, cb, inputs[0])) break :blk false;
+            const in_shape = graph.node(inputs[0]).output_shape;
+            const in_rank = in_shape.rank();
+            const target_rank = attrs.target_shape.rank();
+            if (in_rank != target_rank or attrs.num_axes != in_rank) break :blk false;
+            for (attrs.broadcast_axes[0..attrs.num_axes], 0..) |axis, i| {
+                if (axis != i) break :blk false;
+            }
+            break :blk true;
+        },
+        .reduce_sum, .reduce_max, .reduce_mean => |attrs| blk: {
+            if (inputs.len < 1 or !inputIsMetalResident(values, cb, inputs[0])) break :blk false;
+            const rank = graph.node(inputs[0]).output_shape.rank();
+            if (rank == 0 or attrs.num_axes == 0) break :blk false;
+            const last_axis: u8 = @intCast(rank - 1);
+            break :blk attrs.num_axes == 1 and attrs.axes[0] == last_axis;
+        },
+        // dotGeneral2DInto has backend-only declines for quantized/lazy/view
+        // buffers. Until the graph executor can query those cheaply, avoid
+        // allocating chunk-local hints that may be ignored.
+        .dot_general => false,
+        else => false,
+    };
+}
+
+fn inputIsMetalResident(values: []const ?CT, cb: *const ComputeBackend, node_id: NodeId) bool {
+    const input = valueForConst(values, node_id) orelse return false;
+    return isMetalDeviceResident(cb, input);
+}
+
+fn valueForConst(values: []const ?CT, node_id: NodeId) ?CT {
+    if (node_id == null_node) return null;
+    const index: usize = @intCast(node_id);
+    if (index >= values.len) return null;
+    return values[index];
+}
+
+fn sameElementCount(a: Shape, b: Shape) bool {
+    const a_count = tensorElementCount(a) orelse return false;
+    const b_count = tensorElementCount(b) orelse return false;
+    return a_count == b_count;
+}
+
+fn isMulLikeOp(op: anytype) bool {
+    return switch (op) {
+        .mul, .fused_elem_multiply => true,
+        else => false,
+    };
+}
+
+fn transposeIsSimpleEnoughForHint(attrs: anytype, input_shape: Shape) bool {
+    var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
+    const rank = input_shape.rank();
+    if (rank == 0 or rank > ml.graph.shape.max_rank) return false;
+    const perm = transpose_utils.effectivePerm(attrs, rank, &perm_buf);
+    if (perm.len != rank) return false;
+    var seen: [ml.graph.shape.max_rank]bool = [_]bool{false} ** ml.graph.shape.max_rank;
+    for (perm) |axis| {
+        if (axis >= rank or seen[axis]) return false;
+        seen[axis] = true;
+    }
+    return true;
+}
+
+fn traceChunkLocalOutputHintsEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_CHUNK_LOCAL_OUTPUT_HINTS", false);
 }
 
 fn metalGraphProgressInterval() usize {
@@ -2417,6 +3397,12 @@ fn metalPartitionFrameDisabled() bool {
 /// boundary). 0 = disabled (single-frame, current behavior).
 fn frameChunkOps() usize {
     return platform.env.getenvUsize("TERMITE_METAL_FRAME_CHUNK_OPS") orelse 0;
+}
+
+fn reservePartitionGraphPlanForExecution(chunk_ops: usize) bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false)) return false;
+    if (chunk_ops == 0) return true;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_RESERVE_PARTITION_GRAPH_PLAN_WITH_CHUNKS", false);
 }
 
 /// TERMITE_DISABLE_GRAPH_OUTPUT_OWNED_COPY=1 skips the partition-end
@@ -2467,6 +3453,19 @@ fn fusedPatternProbingDisabled(exec_ctx: PartitionExecutor.ExecutionContext) boo
 fn traceMetalGraphProgressNode(node_pos: usize, interval: usize, start: usize, end: usize) bool {
     if (start != std.math.maxInt(usize) and node_pos >= start and node_pos <= end) return true;
     return interval != 0 and (node_pos == 0 or node_pos % interval == 0);
+}
+
+fn traceMetalValueLifetimeNode() ?NodeId {
+    const raw = platform.env.getenvUsize("TERMITE_METAL_TRACE_VALUE_LIFETIME_NODE") orelse return null;
+    return @intCast(raw);
+}
+
+fn traceMetalValueLifetime(event: []const u8, node_id: NodeId, detail_id: NodeId) void {
+    if (traceMetalValueLifetimeNode()) |target| {
+        if (node_id == target or detail_id == target) {
+            std.debug.print("metal_value_lifetime: event={s} node={d} detail={d}\n", .{ event, node_id, detail_id });
+        }
+    }
 }
 
 fn printMetalProgressNode(
@@ -2521,8 +3520,17 @@ fn traceDebertaAttentionMatchingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_ATTENTION_MATCH", false);
 }
 
+fn traceDebertaFfnForwardMatchingEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_FFN_FORWARD_MATCH", false);
+}
+
 fn debertaAttentionRuntimeRegionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_ENABLE_DEBERTA_ATTENTION_RUNTIME_REGION", false);
+}
+
+fn debertaFfnForwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_DEBERTA_FFN_FORWARD_RUNTIME_REGION", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_DEBERTA_FFN_FORWARD_RUNTIME_REGION", false);
 }
 
 /// When set, promote a gather's input operand to device residency before the
@@ -2628,6 +3636,14 @@ fn buildRuntimeRegionPlan(
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
 
+        if (debertaFfnForwardRuntimeRegionEnabled()) {
+            if (matchDebertaFfnForwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .deberta_ffn_forward = pattern };
+                markDebertaFfnForwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
         if (!raw_linear_regions_suppressed and rawLinearBiasPairRuntimeRegionEnabled()) {
             if (matchRawLinearBiasPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
                 regions[node_pos] = .{ .raw_linear_bias_pair = pattern };
@@ -3043,7 +4059,7 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .lora_backward, .ffn_gelu_backward => continue,
+            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .lora_backward, .ffn_gelu_backward => continue,
             .deberta_attention => {
                 if (phase != .attention or pending_qkv == null) {
                     traceRuntimeFrameMetadataDeclined("attention_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
@@ -3166,7 +4182,7 @@ fn analyzeRuntimeFrameEligibility(plan: RuntimeRegionPlan) RuntimeFrameEligibili
 
     for (plan.regions_by_pos) |region| {
         switch (region) {
-            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .lora_backward, .ffn_gelu_backward => continue,
+            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .lora_backward, .ffn_gelu_backward => continue,
             .deberta_attention => {
                 if (phase != .attention) return .{ .layers = layers, .reason = .non_layer_order };
                 phase = .ffn;
@@ -3665,6 +4681,7 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .lora_linear => 0,
         .lora_linear_qkv => 0,
         .deberta_attention => 0,
+        .deberta_ffn_forward => 2,
         .lora_backward => 0,
         .ffn_gelu_backward => 0,
         .q_linear => 1,
@@ -3677,6 +4694,31 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .gated_ffn_residual => |slots| 3 + @as(u64, if (slots.post_down_rms_norm_slot != null) 1 else 0),
         .ple_residual => 3,
     };
+}
+
+fn prepareRuntimeRegionPlan(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    plan: RuntimeRegionPlan,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !void {
+    for (plan.regions_by_pos, 0..) |region, node_pos| {
+        if (std.meta.activeTag(region) == .none) continue;
+        if (node_pos >= plan.prepared_by_pos.len) continue;
+        _ = try prepareRuntimeRegion(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            region,
+            &plan.prepared_by_pos[node_pos],
+            stats,
+        );
+    }
 }
 
 fn ensurePreparedLinearSlot(
@@ -3985,10 +5027,46 @@ fn preparePleResidualRegion(
     };
 }
 
+fn prepareDebertaFfnForwardRegion(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    pattern: DebertaFfnForwardPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedDebertaFfnForwardRegion {
+    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_bias_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_bias_id)) orelse return null;
+    const first_slot = (try ensurePreparedLinearSlotWithOptionalBias(
+        cb,
+        values,
+        pattern.first_weight_id,
+        pattern.first_bias_id,
+        pattern.hidden_size,
+        pattern.intermediate_size,
+        stats,
+    )) orelse return null;
+    const second_slot = (try ensurePreparedLinearSlotWithOptionalBias(
+        cb,
+        values,
+        pattern.second_weight_id,
+        pattern.second_bias_id,
+        pattern.intermediate_size,
+        pattern.hidden_size,
+        stats,
+    )) orelse return null;
+    return .{ .first_slot = first_slot, .second_slot = second_slot };
+}
+
 fn prepareRuntimeRegion(
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
     region: RuntimeRegion,
     prepared_region: ?*PreparedRuntimeRegion,
     stats: ?*PartitionExecutor.ExecutionStats,
@@ -4017,6 +5095,9 @@ fn prepareRuntimeRegion(
         .lora_linear => .{ .lora_linear = {} },
         .lora_linear_qkv => .{ .lora_linear_qkv = {} },
         .deberta_attention => .{ .deberta_attention = {} },
+        .deberta_ffn_forward => |pattern| .{
+            .deberta_ffn_forward = (try prepareDebertaFfnForwardRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
+        },
         .lora_backward => .{ .lora_backward = {} },
         .ffn_gelu_backward => .{ .ffn_gelu_backward = {} },
         .q_linear => |pattern| .{
@@ -4070,7 +5151,7 @@ fn tryExecutePlannedRuntimeRegion(
     _ = node_ids;
     _ = node_pos;
     _ = reachable;
-    const prepared = (try prepareRuntimeRegion(graph, cb, values, region, prepared_region, exec_ctx.stats)) orelse {
+    const prepared = (try prepareRuntimeRegion(graph, cb, values, value_device, device_id, region, prepared_region, exec_ctx.stats)) orelse {
         if (std.meta.activeTag(region) != .none) {
             if (exec_ctx.stats) |stats| stats.runtime_region_fallbacks += 1;
         }
@@ -4161,6 +5242,20 @@ fn tryExecutePlannedRuntimeRegion(
             device_id,
             exec_ctx.stats,
             pattern,
+            skipped_nodes,
+        ),
+        .deberta_ffn_forward => |pattern| executeDebertaFfnForwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .deberta_ffn_forward => |slots| slots,
+                else => return false,
+            },
             skipped_nodes,
         ),
         .lora_backward => |pattern| executeLoraBackwardPattern(
@@ -5528,6 +6623,7 @@ fn isSupportedGatedFfnActivation(node: *const ml.graph.Node) bool {
 fn activationKindForGraphNode(node: *const ml.graph.Node) ?ops_mod.DecoderRuntimeActivationKind {
     return switch (node.op) {
         .fused_gelu => .gelu,
+        .fused_gelu_exact => .gelu_exact,
         .fused_silu => .silu,
         .fused_relu => .relu,
         .fused_quick_gelu => .quick_gelu,
@@ -5669,6 +6765,26 @@ const DebertaAttentionShape = struct {
     head_dim: usize,
 };
 
+const DebertaFfnForwardPattern = struct {
+    first_dot_id: NodeId,
+    first_base_add_id: NodeId,
+    first_add_id: NodeId,
+    gelu_id: NodeId,
+    output_dot_id: NodeId,
+    output_base_add_id: NodeId,
+    output_add_id: NodeId,
+    input_id: NodeId,
+    first_weight_id: NodeId,
+    first_bias_id: NodeId,
+    second_weight_id: NodeId,
+    second_bias_id: NodeId,
+    first_lora: ?LoraLinearPattern = null,
+    second_lora: ?LoraLinearPattern = null,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+};
+
 const LoraBackwardPattern = struct {
     d_after_a_id: NodeId,
     grad_a_dot_id: NodeId,
@@ -5774,6 +6890,7 @@ fn executeLoraLinearPattern(
 
             if (stats) |s| {
                 recordMetalGraphRegion(s, .ffn, 4);
+                s.metal_lora_linear_regions += 1;
                 s.fused_graph_pattern_dispatches += 1;
                 s.fused_graph_nodes_elided += 3 + @as(u64, if (pattern.dropout_mul_id != null) 1 else 0);
                 recordGemmaRuntimeResidency(s, graph, pattern.add_id, isMetalResidentOrQuantizedDescriptor(cb, fused.output));
@@ -5840,6 +6957,7 @@ fn executeLoraLinearPattern(
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 4);
+        s.metal_lora_linear_regions += 1;
         s.fused_graph_pattern_dispatches += 1;
         s.fused_graph_nodes_elided += 3 + @as(u64, if (pattern.dropout_mul_id != null) 1 else 0);
         recordGemmaRuntimeResidency(s, graph, pattern.add_id, isMetalResidentOrQuantizedDescriptor(cb, output));
@@ -5868,6 +6986,7 @@ fn executeLoraLinearQkvPattern(
     if (!try executeLoraLinearPattern(graph, cb, values, value_device, device_id, stats, pattern.v)) return false;
     markLoraLinearQkvSkipped(skipped_nodes, pattern);
     if (stats) |s| {
+        s.metal_lora_qkv_regions += 1;
         s.gemma_qkv_hits += 3;
     }
     if (traceMetalGraphFusionsEnabled()) {
@@ -5981,6 +7100,192 @@ fn traceDebertaAttentionExecutionDecline(reason: []const u8, pattern: DebertaAtt
     );
 }
 
+fn executeDebertaFfnForwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: DebertaFfnForwardPattern,
+    prepared: PreparedDebertaFfnForwardRegion,
+    skipped_nodes: []bool,
+) !bool {
+    const first = (try executeDebertaFfnForwardLinear(
+        graph,
+        cb,
+        values,
+        value_device,
+        device_id,
+        pattern.input_id,
+        pattern.first_weight_id,
+        pattern.first_bias_id,
+        pattern.first_base_add_id,
+        pattern.first_add_id,
+        pattern.first_lora,
+        prepared.first_slot,
+        pattern.rows,
+        pattern.hidden_size,
+        pattern.intermediate_size,
+    )) orelse {
+        traceDebertaFfnForwardExecutionDecline("first_linear", pattern);
+        return false;
+    };
+
+    const gelu = (try cb.decoderRuntimeApplyActivation(&.{
+        .input = first,
+        .kind = .gelu_exact,
+        .dim = pattern.intermediate_size,
+    })) orelse {
+        traceDebertaFfnForwardExecutionDecline("gelu_exact", pattern);
+        return false;
+    };
+    errdefer cb.free(gelu);
+
+    values[@intCast(pattern.gelu_id)] = gelu;
+    value_device[@intCast(pattern.gelu_id)] = device_id;
+
+    const output = (try executeDebertaFfnForwardLinear(
+        graph,
+        cb,
+        values,
+        value_device,
+        device_id,
+        pattern.gelu_id,
+        pattern.second_weight_id,
+        pattern.second_bias_id,
+        pattern.output_base_add_id,
+        pattern.output_add_id,
+        pattern.second_lora,
+        prepared.second_slot,
+        pattern.rows,
+        pattern.intermediate_size,
+        pattern.hidden_size,
+    )) orelse {
+        traceDebertaFfnForwardExecutionDecline("second_linear", pattern);
+        return false;
+    };
+    markDebertaFfnForwardSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 3);
+        s.metal_deberta_ffn_forward_regions += 1;
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += debertaFfnForwardElidedNodeCount(pattern);
+        recordGemmaRuntimeResidency(s, graph, pattern.output_add_id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: deberta_ffn_forward_region executed first_dot={d} first_add={d} gelu={d} output_dot={d} output_add={d} rows={d} hidden={d} intermediate={d}\n",
+            .{ pattern.first_dot_id, pattern.first_add_id, pattern.gelu_id, pattern.output_dot_id, pattern.output_add_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size },
+        );
+    }
+    return true;
+}
+
+fn executeDebertaFfnForwardLinear(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    input_id: NodeId,
+    weight_id: NodeId,
+    bias_id: NodeId,
+    base_add_id: NodeId,
+    output_id: NodeId,
+    lora: ?LoraLinearPattern,
+    prepared_slot: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !?CT {
+    const input_raw = valueFor(values, input_id) orelse {
+        traceDebertaFfnForwardLinearDecline("missing_input", input_id, weight_id, bias_id, base_add_id, rows, in_dim, out_dim, null);
+        return null;
+    };
+    const input = blk: {
+        if (try makeMetalDeviceResident(cb, input_raw)) |device_input| {
+            values[@intCast(input_id)] = device_input;
+            value_device[@intCast(input_id)] = device_id;
+            break :blk device_input;
+        }
+        break :blk input_raw;
+    };
+    const base = (try cb.decoderRuntimeApplyLinear(&.{
+        .slot = prepared_slot,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse {
+        traceDebertaFfnForwardLinearDecline("linear_runtime_miss", input_id, weight_id, bias_id, base_add_id, rows, in_dim, out_dim, null);
+        return null;
+    };
+    errdefer cb.free(base);
+    values[@intCast(base_add_id)] = base;
+    value_device[@intCast(base_add_id)] = device_id;
+
+    if (lora) |lora_pattern| {
+        if (!try executeLoraLinearPattern(graph, cb, values, value_device, device_id, null, lora_pattern)) return null;
+        return valueFor(values, output_id);
+    }
+
+    return base;
+}
+
+fn valueForOrMaterializeParameter(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    node_id: NodeId,
+) !?CT {
+    if (valueFor(values, node_id)) |value| return value;
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const index: usize = @intCast(node_id);
+    if (index >= values.len or index >= value_device.len) return null;
+    const node = graph.node(node_id);
+    if (node.op != .parameter) return null;
+    const materialized = try cb.getWeight(graph.parameterName(node));
+    values[index] = materialized;
+    value_device[index] = device_id;
+    return materialized;
+}
+
+fn traceDebertaFfnForwardLinearDecline(
+    reason: []const u8,
+    input_id: NodeId,
+    weight_id: NodeId,
+    bias_id: NodeId,
+    base_add_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    err_name: ?[]const u8,
+) void {
+    if (!traceMetalGraphFusionsEnabled()) return;
+    std.debug.print(
+        "metal_graph_fusion_trace: deberta_ffn_forward_linear declined reason={s} err={?s} input={d} weight={d} bias={d} base_add={d} rows={d} in={d} out={d}\n",
+        .{ reason, err_name, input_id, weight_id, bias_id, base_add_id, rows, in_dim, out_dim },
+    );
+}
+
+fn debertaFfnForwardElidedNodeCount(pattern: DebertaFfnForwardPattern) u64 {
+    var count: u64 = 5;
+    if (pattern.first_lora != null) count += 4;
+    if (pattern.second_lora != null) count += 4;
+    return count;
+}
+
+fn traceDebertaFfnForwardExecutionDecline(reason: []const u8, pattern: DebertaFfnForwardPattern) void {
+    if (!traceMetalGraphFusionsEnabled()) return;
+    std.debug.print(
+        "metal_graph_fusion_trace: deberta_ffn_forward_region declined reason={s} first_dot={d} first_add={d} gelu={d} output_dot={d} output_add={d}\n",
+        .{ reason, pattern.first_dot_id, pattern.first_add_id, pattern.gelu_id, pattern.output_dot_id, pattern.output_add_id },
+    );
+}
+
 // Per-step cache for the disentangled-attention padding mask. The mask is
 // derived from `attn_bias < -1e8` (padding only) and is IDENTICAL across every
 // attention layer and the fwd/bwd of a step — a standard transformer property.
@@ -6075,6 +7380,7 @@ fn executeLoraBackwardPattern(
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 5);
+        s.metal_lora_backward_regions += 1;
         s.fused_graph_pattern_dispatches += 1;
         s.fused_graph_nodes_elided += 4;
         recordGemmaRuntimeResidency(s, graph, pattern.grad_a_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_a));
@@ -6177,6 +7483,7 @@ fn executeFfnGeluBackwardPattern(
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 5);
+        s.metal_ffn_gelu_backward_regions += 1;
         s.fused_graph_pattern_dispatches += 1;
         s.fused_graph_nodes_elided += 4;
         recordGemmaRuntimeResidency(s, graph, pattern.output_dot_id, isMetalResidentOrQuantizedDescriptor(cb, output));
@@ -6294,6 +7601,7 @@ fn executeFfnGeluBackwardOutputPattern(
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 5);
+        s.metal_ffn_gelu_backward_regions += 1;
         s.fused_graph_pattern_dispatches += 1;
         s.fused_graph_nodes_elided += 4;
         recordGemmaRuntimeResidency(s, graph, pattern.output_dot_id, isMetalResidentOrQuantizedDescriptor(cb, result.output));
@@ -6423,6 +7731,7 @@ fn executeFfnGeluBackwardChainPattern(
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 5);
+        s.metal_ffn_gelu_backward_regions += 1;
         s.fused_graph_pattern_dispatches += 1;
         s.fused_graph_nodes_elided += 4;
         recordGemmaRuntimeResidency(s, graph, pattern.output_dot_id, isMetalResidentOrQuantizedDescriptor(cb, chain.output));
@@ -6522,6 +7831,374 @@ fn resolvedRuntimeDot2DRhs(
         else => return null,
     };
     return .{ .rhs = source, .rhs_contract_axis = source_contract_axis };
+}
+
+fn matchDebertaFfnForwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?DebertaFfnForwardPattern {
+    const first = matchDebertaFfnLinearFromBaseDot(graph, node_ids, node_pos, reachable, skipped_nodes) orelse return null;
+    if (first.rows == 0 or first.in_dim == 0 or first.out_dim == 0) return traceDebertaFfnForwardMatchDecline("zero_shape", node_ids[node_pos], null, null, null);
+    if (first.in_dim >= first.out_dim) return null;
+    traceDebertaFfnForwardMatchCandidate("first_linear", first);
+
+    const gelu_id = singleExactGeluConsumerForInput(graph, first.output_id, reachable, skipped_nodes) orelse {
+        traceDebertaFfnForwardConsumers(graph, reachable, skipped_nodes, first.output_id, "missing_gelu");
+        return traceDebertaFfnForwardMatchDecline("missing_gelu", first.dot_id, first.output_id, null, null);
+    };
+    const gelu = graph.node(gelu_id);
+    if (!gelu.output_shape.eq(graph.node(first.output_id).output_shape)) return traceDebertaFfnForwardMatchDecline("gelu_shape", first.dot_id, first.output_id, gelu_id, null);
+
+    const output_dot_id = findDebertaFfnBaseDotConsumer(graph, gelu_id, first.rows, first.in_dim, reachable, skipped_nodes) orelse return traceDebertaFfnForwardMatchDecline("missing_output_dot", first.dot_id, first.output_id, gelu_id, null);
+    const output_pos = findNodePos(node_ids, output_dot_id) orelse return traceDebertaFfnForwardMatchDecline("missing_output_pos", first.dot_id, first.output_id, gelu_id, output_dot_id);
+    const second = matchDebertaFfnLinearFromBaseDot(graph, node_ids, output_pos, reachable, skipped_nodes) orelse return traceDebertaFfnForwardMatchDecline("bad_second_linear", first.dot_id, first.output_id, gelu_id, output_dot_id);
+    if (second.input_id != gelu_id) return traceDebertaFfnForwardMatchDecline("second_input", first.dot_id, first.output_id, gelu_id, second.input_id);
+    if (second.rows != first.rows or second.in_dim != first.out_dim or second.out_dim != first.in_dim) return traceDebertaFfnForwardMatchDecline("second_shape", first.dot_id, first.output_id, gelu_id, second.dot_id);
+    traceDebertaFfnForwardMatchCandidate("matched", second);
+
+    return .{
+        .first_dot_id = first.dot_id,
+        .first_base_add_id = first.base_add_id,
+        .first_add_id = first.output_id,
+        .gelu_id = gelu_id,
+        .output_dot_id = second.dot_id,
+        .output_base_add_id = second.base_add_id,
+        .output_add_id = second.output_id,
+        .input_id = first.input_id,
+        .first_weight_id = first.weight_id,
+        .first_bias_id = first.bias_id,
+        .second_weight_id = second.weight_id,
+        .second_bias_id = second.bias_id,
+        .first_lora = first.lora,
+        .second_lora = second.lora,
+        .rows = first.rows,
+        .hidden_size = first.in_dim,
+        .intermediate_size = first.out_dim,
+    };
+}
+
+fn traceDebertaFfnForwardMatchDecline(reason: []const u8, dot_id: NodeId, output_id: ?NodeId, gelu_id: ?NodeId, detail_id: ?NodeId) ?DebertaFfnForwardPattern {
+    if (traceDebertaFfnForwardMatchingEnabled()) {
+        std.debug.print(
+            "deberta_ffn_forward_match: declined reason={s} dot={d} output={?d} gelu={?d} detail={?d}\n",
+            .{ reason, dot_id, output_id, gelu_id, detail_id },
+        );
+    }
+    return null;
+}
+
+fn traceDebertaFfnForwardMatchCandidate(label: []const u8, pattern: DebertaFfnLinearMatch) void {
+    if (!traceDebertaFfnForwardMatchingEnabled()) return;
+    std.debug.print(
+        "deberta_ffn_forward_match: {s} dot={d} base_add={d} output={d} input={d} weight={d} rows={d} in={d} out={d} lora={}\n",
+        .{ label, pattern.dot_id, pattern.base_add_id, pattern.output_id, pattern.input_id, pattern.weight_id, pattern.rows, pattern.in_dim, pattern.out_dim, pattern.lora != null },
+    );
+}
+
+fn traceDebertaFfnForwardConsumers(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    producer_id: NodeId,
+    reason: []const u8,
+) void {
+    if (!traceDebertaFfnForwardMatchingEnabled()) return;
+    var printed: usize = 0;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        var consumes = false;
+        for (node.getInputs()) |input_id| {
+            if (input_id == producer_id) {
+                consumes = true;
+                break;
+            }
+        }
+        if (!consumes) continue;
+        if (printed == 0) {
+            std.debug.print("deberta_ffn_forward_match: consumers reason={s} producer={d}", .{ reason, producer_id });
+        }
+        std.debug.print(" {d}:{s}", .{ node_id, @tagName(node.op) });
+        printed += 1;
+        if (printed >= 8) break;
+    }
+    if (printed == 0) {
+        std.debug.print("deberta_ffn_forward_match: consumers reason={s} producer={d} none", .{ reason, producer_id });
+    }
+    std.debug.print("\n", .{});
+}
+
+const DebertaFfnLinearMatch = struct {
+    dot_id: NodeId,
+    base_add_id: NodeId,
+    output_id: NodeId,
+    input_id: NodeId,
+    weight_id: NodeId,
+    bias_id: NodeId,
+    lora: ?LoraLinearPattern = null,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+fn matchDebertaFfnLinearFromBaseDot(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?DebertaFfnLinearMatch {
+    const dot_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, dot_id)) return null;
+    const dot = graph.node(dot_id);
+    const attrs = switch (dot.op) {
+        .dot_general => |dot_attrs| dot_attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(attrs) or dot.num_inputs < 2) return null;
+    const output_shape = dot.output_shape;
+    if (output_shape.rank() != 2) return null;
+    const rows = shapeDimUsize(output_shape, 0) orelse return null;
+    const out_dim = shapeDimUsize(output_shape, 1) orelse return null;
+    const input_id = dot.inputs[0];
+    const transpose_id = dot.inputs[1];
+    if (input_id == null_node or transpose_id == null_node) return null;
+    const input_shape = graph.node(input_id).output_shape;
+    if (input_shape.rank() != 2) return null;
+    if ((shapeDimUsize(input_shape, 0) orelse return null) != rows) return null;
+    const in_dim = shapeDimUsize(input_shape, 1) orelse return null;
+    if (rows == 0 or in_dim == 0 or out_dim == 0) return null;
+    if (!linearDotConsumesTranspose(graph, dot_id, transpose_id)) return null;
+    const weight_id = sourceFromSimpleTranspose(graph, transpose_id) orelse return null;
+    const weight_shape = graph.node(weight_id).output_shape;
+    if ((shapeDimUsize(weight_shape, 0) orelse return null) != out_dim) return null;
+    if ((shapeDimUsize(weight_shape, 1) orelse return null) != in_dim) return null;
+
+    const trace_ffn_like = out_dim > in_dim and !isLoRAAdapterParameterName(graph.parameterName(graph.node(weight_id)));
+    const base_add_id = singleAddConsumerForInput(graph, dot_id, reachable, skipped_nodes) orelse {
+        if (trace_ffn_like and traceDebertaFfnForwardMatchingEnabled()) {
+            std.debug.print("deberta_ffn_forward_match: linear_declined reason=missing_base_add dot={d} input={d} weight={d} rows={d} in={d} out={d}\n", .{ dot_id, input_id, weight_id, rows, in_dim, out_dim });
+        }
+        return null;
+    };
+    if (!hasOnlyExpectedUses(graph, reachable, skipped_nodes, dot_id, &.{base_add_id})) {
+        if (trace_ffn_like and traceDebertaFfnForwardMatchingEnabled()) {
+            std.debug.print("deberta_ffn_forward_match: linear_declined reason=escaped_base_dot dot={d} base_add={d} input={d} weight={d} rows={d} in={d} out={d}\n", .{ dot_id, base_add_id, input_id, weight_id, rows, in_dim, out_dim });
+        }
+        return null;
+    }
+    const bias_id = linearBiasForAdd(graph, base_add_id, dot_id, out_dim) orelse {
+        if (trace_ffn_like and traceDebertaFfnForwardMatchingEnabled()) {
+            std.debug.print("deberta_ffn_forward_match: linear_declined reason=missing_bias dot={d} base_add={d} input={d} weight={d} rows={d} in={d} out={d}\n", .{ dot_id, base_add_id, input_id, weight_id, rows, in_dim, out_dim });
+        }
+        return null;
+    };
+    if (!graph.node(base_add_id).output_shape.eq(output_shape)) {
+        if (trace_ffn_like and traceDebertaFfnForwardMatchingEnabled()) {
+            std.debug.print("deberta_ffn_forward_match: linear_declined reason=base_add_shape dot={d} base_add={d} input={d} weight={d} rows={d} in={d} out={d}\n", .{ dot_id, base_add_id, input_id, weight_id, rows, in_dim, out_dim });
+        }
+        return null;
+    }
+
+    const lora = findCompatibleLoraLinearConsumer(
+        graph,
+        node_ids,
+        reachable,
+        skipped_nodes,
+        base_add_id,
+        input_id,
+        rows,
+        in_dim,
+        out_dim,
+    );
+    const final_output_id = if (lora) |lora_pattern| lora_pattern.add_id else base_add_id;
+
+    if (lora == null and trace_ffn_like and traceDebertaFfnForwardMatchingEnabled()) {
+        traceDebertaFfnForwardConsumers(graph, reachable, skipped_nodes, base_add_id, "no_lora_consumer");
+    }
+
+    return .{
+        .dot_id = dot_id,
+        .base_add_id = base_add_id,
+        .output_id = final_output_id,
+        .input_id = input_id,
+        .weight_id = weight_id,
+        .bias_id = bias_id,
+        .lora = lora,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    };
+}
+
+fn findCompatibleLoraLinearConsumer(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    base_add_id: NodeId,
+    input_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) ?LoraLinearPattern {
+    var found: ?LoraLinearPattern = null;
+    var found_pos: usize = std.math.maxInt(usize);
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        switch (node.op) {
+            .add, .fused_elem_add => {},
+            else => continue,
+        }
+        const inputs = node.getInputs();
+        if (inputs.len < 2) continue;
+        const other_input_id: NodeId = if (inputs[0] == base_add_id)
+            inputs[1]
+        else if (inputs[1] == base_add_id)
+            inputs[0]
+        else
+            continue;
+        const candidate_pos = findNodePos(node_ids, node_id) orelse {
+            if (traceDebertaFfnForwardMatchingEnabled()) {
+                std.debug.print("deberta_ffn_forward_match: lora_candidate_declined reason=missing_pos add={d} base_add={d}\n", .{ node_id, base_add_id });
+            }
+            continue;
+        };
+        const candidate_lora = matchLoraLinearPattern(graph, node_ids, candidate_pos, reachable, skipped_nodes) orelse {
+            if (traceDebertaFfnForwardMatchingEnabled()) {
+                std.debug.print("deberta_ffn_forward_match: lora_candidate_declined reason=pattern add={d} base_add={d} other={d}\n", .{ node_id, base_add_id, other_input_id });
+            }
+            continue;
+        };
+        if (candidate_lora.base_linear_id != base_add_id or
+            candidate_lora.input_id != input_id or
+            candidate_lora.rows != rows or
+            candidate_lora.in_dim != in_dim or
+            candidate_lora.out_dim != out_dim)
+        {
+            if (traceDebertaFfnForwardMatchingEnabled()) {
+                std.debug.print(
+                    "deberta_ffn_forward_match: lora_candidate_declined reason=shape_or_input add={d} base_add={d} got_base={d} got_input={d} want_input={d} got_rows={d} got_in={d} got_out={d} want_rows={d} want_in={d} want_out={d}\n",
+                    .{
+                        node_id,
+                        base_add_id,
+                        candidate_lora.base_linear_id,
+                        candidate_lora.input_id,
+                        input_id,
+                        candidate_lora.rows,
+                        candidate_lora.in_dim,
+                        candidate_lora.out_dim,
+                        rows,
+                        in_dim,
+                        out_dim,
+                    },
+                );
+            }
+            continue;
+        }
+        if (found != null and traceDebertaFfnForwardMatchingEnabled()) {
+            std.debug.print(
+                "deberta_ffn_forward_match: lora_candidate_ambiguous base_add={d} keep_add={d} keep_pos={d} candidate_add={d} candidate_pos={d}\n",
+                .{ base_add_id, found.?.add_id, found_pos, candidate_lora.add_id, candidate_pos },
+            );
+        }
+        if (candidate_pos < found_pos) {
+            found_pos = candidate_pos;
+            found = candidate_lora;
+        }
+    }
+    return found;
+}
+
+fn findDebertaFfnBaseDotConsumer(
+    graph: *const Graph,
+    producer_id: NodeId,
+    rows: usize,
+    out_dim: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?NodeId {
+    var found: ?NodeId = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        const attrs = switch (node.op) {
+            .dot_general => |dot_attrs| dot_attrs,
+            else => continue,
+        };
+        if (!isLinearDotAttrs(attrs) or node.num_inputs < 2 or node.inputs[0] != producer_id) continue;
+        const shape = node.output_shape;
+        if (shape.rank() != 2) continue;
+        if (shapeDimUsize(shape, 0) != rows or shapeDimUsize(shape, 1) != out_dim) continue;
+        const weight_id = sourceParameterFromSimpleTranspose(graph, node.inputs[1]) orelse continue;
+        if (isLoRAAdapterParameterName(graph.parameterName(graph.node(weight_id)))) continue;
+        if (found != null) return null;
+        found = node_id;
+    }
+    return found;
+}
+
+fn singleExactGeluConsumerForInput(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?NodeId {
+    var found: ?NodeId = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        switch (node.op) {
+            .fused_gelu_exact => {},
+            else => continue,
+        }
+        if (node.num_inputs < 1 or node.inputs[0] != producer_id) continue;
+        if (found != null) return null;
+        found = node_id;
+    }
+    return found;
+}
+
+fn linearBiasForAdd(graph: *const Graph, add_id: NodeId, producer_id: NodeId, expected_dim: usize) ?NodeId {
+    if (add_id == null_node or add_id >= graph.nodeCount()) return null;
+    const add_node = graph.node(add_id);
+    switch (add_node.op) {
+        .add, .fused_elem_add => {},
+        else => return null,
+    }
+    if (add_node.num_inputs < 2) return null;
+    const bias_id = if (add_node.inputs[0] == producer_id)
+        add_node.inputs[1]
+    else if (add_node.inputs[1] == producer_id)
+        add_node.inputs[0]
+    else
+        return null;
+    if (bias_id == null_node or bias_id >= graph.nodeCount()) return null;
+    const bias = graph.node(bias_id);
+    if (std.meta.activeTag(bias.op) != .parameter) return null;
+    if (bias.output_shape.rank() != 1) return null;
+    if ((shapeDimUsize(bias.output_shape, 0) orelse return null) != expected_dim) return null;
+    return bias_id;
+}
+
+fn markDebertaFfnForwardSkipped(skipped: []bool, pattern: DebertaFfnForwardPattern) void {
+    markSkipped(skipped, pattern.first_dot_id);
+    markSkipped(skipped, pattern.first_base_add_id);
+    markSkipped(skipped, pattern.first_add_id);
+    markSkipped(skipped, pattern.gelu_id);
+    markSkipped(skipped, pattern.output_dot_id);
+    markSkipped(skipped, pattern.output_base_add_id);
+    markSkipped(skipped, pattern.output_add_id);
+    if (pattern.first_lora) |lora| markLoraLinearSkipped(skipped, lora);
+    if (pattern.second_lora) |lora| markLoraLinearSkipped(skipped, lora);
 }
 
 fn matchFfnGeluBackwardPattern(
@@ -8252,7 +9929,7 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
         .kv_out_dim = pattern.qkv.kv_out_dim,
     })) orelse return traceQkvRegionDeclined("rms_grouped_backend_returned_null", pattern.qkv.linear_id);
 
-    try freeExpiredInputs(
+    _ = try freeExpiredInputs(
         allocator,
         graph,
         cb,
@@ -8266,7 +9943,7 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
         donated,
         exec_ctx,
     );
-    try freeExpiredInputs(
+    _ = try freeExpiredInputs(
         allocator,
         graph,
         cb,
@@ -8465,7 +10142,7 @@ fn executeGroupedLinearQkvSlicePattern(
         }
     }
 
-    try freeExpiredInputs(
+    _ = try freeExpiredInputs(
         allocator,
         graph,
         cb,
@@ -8735,7 +10412,7 @@ fn executeLinearNoBiasQkvPattern(
         rt_map,
         donated,
     );
-    try freeExpiredInputs(
+    _ = try freeExpiredInputs(
         allocator,
         graph,
         cb,
@@ -8749,7 +10426,7 @@ fn executeLinearNoBiasQkvPattern(
         donated,
         exec_ctx,
     );
-    try freeExpiredInputs(
+    _ = try freeExpiredInputs(
         allocator,
         graph,
         cb,
@@ -8983,7 +10660,7 @@ fn tryExecuteLinearNoBiasPairPattern(
         rt_map,
         donated,
     );
-    try freeExpiredInputs(
+    _ = try freeExpiredInputs(
         allocator,
         graph,
         cb,
@@ -9372,6 +11049,10 @@ fn tryExecuteMetalCommand(
 ) !?CT {
     const n = graph.node(node_id);
     const inputs = n.getInputs();
+    if (comptime build_options.enable_metal) {
+        metal_tensor_mod.setOwnedAllocationContext(@tagName(n.op));
+        defer metal_tensor_mod.clearOwnedAllocationContext();
+    }
     return switch (n.op) {
         .constant => |attrs| try executeRuntimeConstant(graph, cb, n.output_shape, attrs),
         // Fused disentangled attention forward/backward: run in-frame (instead of
@@ -9500,6 +11181,7 @@ fn tryExecuteMetalCommand(
         .gather => |attrs| try executeRuntimeGather(graph, cb, values, inputs, attrs),
         .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, inputs, attrs),
         .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape, output_hint),
+        .fused_gelu_exact => try executeRuntimeActivation(cb, values, inputs, .gelu_exact, n.output_shape, output_hint),
         .fused_gelu_backward => try executeRuntimeGeluBackward(cb, values, inputs, n.output_shape),
         .fused_relu => try executeRuntimeActivation(cb, values, inputs, .relu, n.output_shape, output_hint),
         .fused_silu => try executeRuntimeActivation(cb, values, inputs, .silu, n.output_shape, output_hint),
@@ -10654,7 +12336,7 @@ fn executeRuntimeActivation(
     output_hint: ?CT,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
-    const dim = tensorElementCount(output_shape) orelse return null;
+    const dim = activationLastDim(output_shape) orelse return null;
     // Slot-bound output: write the activation directly into the pooled buffer.
     // gelu/relu/silu/quick_gelu are elementwise, so the rows/dim split is
     // immaterial — pass the full element count (rows=1) like the eager path.
@@ -10670,6 +12352,11 @@ fn executeRuntimeActivation(
     })) |result| return result;
     return switch (kind) {
         .gelu => cb.gelu(input),
+        .gelu_exact => cb.decoderRuntimeApplyActivation(&.{
+            .input = input,
+            .kind = .gelu_exact,
+            .dim = dim,
+        }),
         .relu => cb.relu(input),
         .silu => cb.silu(input),
         .quick_gelu => cb.quickGelu(input),
@@ -10678,6 +12365,14 @@ fn executeRuntimeActivation(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn activationLastDim(shape: ml.graph.Shape) ?usize {
+    const rank = shape.rank();
+    if (rank == 0) return tensorElementCount(shape);
+    const dim = shape.dim(@intCast(rank - 1));
+    if (dim <= 0) return null;
+    return @intCast(dim);
 }
 
 fn executeRuntimeGeluBackward(
@@ -11503,6 +13198,11 @@ fn materializePartitionConstants(
     }
 }
 
+const ExpiredFreeStats = struct {
+    count: usize = 0,
+    bytes: u64 = 0,
+};
+
 fn freeExpiredInputs(
     allocator: std.mem.Allocator,
     graph: *const Graph,
@@ -11516,11 +13216,12 @@ fn freeExpiredInputs(
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
     exec_ctx: PartitionExecutor.ExecutionContext,
-) !void {
+) !ExpiredFreeStats {
     const n = graph.node(node_id);
     const node_index: usize = @intCast(node_id);
     var released = std.AutoHashMapUnmanaged(usize, void).empty;
     defer released.deinit(allocator);
+    var stats = ExpiredFreeStats{};
     for (n.getInputs()) |input_id| {
         if (input_id == null_node or input_id >= values.len) continue;
         const input_index: usize = @intCast(input_id);
@@ -11532,6 +13233,7 @@ fn freeExpiredInputs(
             !donated.contains(input_id) and
             !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
         const ct = values[input_index] orelse continue;
+        const input_bytes = outputByteLen(graph.node(input_id).output_shape) orelse 0;
         if (values[node_index]) |out_ct| {
             if (ct == out_ct and interpreter.canKeepAliasedOutput(n.op)) {
                 values[input_index] = null;
@@ -11540,6 +13242,7 @@ fn freeExpiredInputs(
         }
         const ct_key = @intFromPtr(ct);
         if (released.contains(ct_key)) {
+            traceMetalValueLifetime("free_expired_alias_clear", node_id, input_id);
             values[input_index] = null;
             continue;
         }
@@ -11556,8 +13259,186 @@ fn freeExpiredInputs(
         } else {
             cb.free(ct);
         }
+        traceMetalValueLifetime("free_expired_release", node_id, input_id);
         values[input_index] = null;
+        stats.count += 1;
+        stats.bytes += input_bytes;
     }
+    return stats;
+}
+
+fn sweepExpiredValuesThroughNode(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    boundary_pos: usize,
+    boundary_node_id: NodeId,
+    device_id: DeviceId,
+    last_use: []const u32,
+    runtime_region_plan: ?RuntimeRegionPlan,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    donated: std.AutoHashMapUnmanaged(NodeId, void),
+    exec_ctx: PartitionExecutor.ExecutionContext,
+) !usize {
+    var released = std.AutoHashMapUnmanaged(usize, void).empty;
+    defer released.deinit(allocator);
+
+    var freed_count: usize = 0;
+    for (values, 0..) |maybe_ct, raw_id| {
+        const ct = maybe_ct orelse continue;
+        if (raw_id >= last_use.len) continue;
+        const node_id: NodeId = @intCast(raw_id);
+        const use_id = last_use[raw_id];
+        if (use_id == std.math.maxInt(u32)) continue;
+        if (valueReferencedAfterBoundary(graph, node_ids, boundary_pos, node_id)) continue;
+        if (runtime_region_plan) |plan| {
+            if (plan.needsAttentionInputAfterNode(node_id, boundary_node_id)) continue;
+        }
+        if (rt_map.contains(node_id) and
+            !donated.contains(node_id) and
+            !ownedRuntimeTransferContains(exec_ctx, node_id)) continue;
+
+        var has_live_alias = false;
+        for (values, 0..) |other_maybe, other_raw_id| {
+            if (other_raw_id == raw_id) continue;
+            const other_ct = other_maybe orelse continue;
+            if (other_ct != ct) continue;
+            if (other_raw_id >= last_use.len) {
+                has_live_alias = true;
+                break;
+            }
+            const other_id: NodeId = @intCast(other_raw_id);
+            const other_use = last_use[other_raw_id];
+            if (other_use == std.math.maxInt(u32) or valueReferencedAfterBoundary(graph, node_ids, boundary_pos, other_id)) {
+                has_live_alias = true;
+                break;
+            }
+            if (rt_map.contains(other_id) and
+                !donated.contains(other_id) and
+                !ownedRuntimeTransferContains(exec_ctx, other_id))
+            {
+                has_live_alias = true;
+                break;
+            }
+        }
+
+        values[raw_id] = null;
+        traceMetalValueLifetime("sweep_clear", boundary_node_id, node_id);
+        if (has_live_alias) continue;
+        const ct_key = @intFromPtr(ct);
+        if (released.contains(ct_key)) continue;
+        try released.put(allocator, ct_key, {});
+        if (exec_ctx.mesh) |mesh| {
+            const value_dev = if (raw_id < value_device.len) value_device[raw_id] else device_id;
+            if (mesh.device(value_dev)) |entry| {
+                entry.backend.free(ct);
+            } else {
+                cb.free(ct);
+            }
+        } else {
+            cb.free(ct);
+        }
+        traceMetalValueLifetime("sweep_release", boundary_node_id, node_id);
+        freed_count += 1;
+    }
+
+    return freed_count;
+}
+
+fn promoteLiveValuesAcrossFrameBoundary(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    boundary_pos: usize,
+    device_id: DeviceId,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    donated: std.AutoHashMapUnmanaged(NodeId, void),
+    exec_ctx: PartitionExecutor.ExecutionContext,
+) !usize {
+    var old_values = std.ArrayListUnmanaged(CT).empty;
+    defer old_values.deinit(allocator);
+
+    var promoted_count: usize = 0;
+    for (values, 0..) |maybe_ct, raw_id| {
+        const ct = maybe_ct orelse continue;
+        const node_id: NodeId = @intCast(raw_id);
+        if (!valueReferencedAfterBoundary(graph, node_ids, boundary_pos, node_id)) continue;
+        if (rt_map.contains(node_id) and
+            !donated.contains(node_id) and
+            !ownedRuntimeTransferContains(exec_ctx, node_id)) continue;
+
+        const owned = (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
+        errdefer cb.free(owned);
+        try old_values.append(allocator, ct);
+        values[raw_id] = owned;
+        if (raw_id < value_device.len) value_device[raw_id] = device_id;
+        traceMetalValueLifetime("promote_live", @intCast(node_ids[boundary_pos]), node_id);
+        promoted_count += 1;
+    }
+
+    var released = std.AutoHashMapUnmanaged(usize, void).empty;
+    defer released.deinit(allocator);
+    for (old_values.items) |old_ct| {
+        const key = @intFromPtr(old_ct);
+        if (released.contains(key)) continue;
+        var still_referenced = false;
+        for (values) |maybe_ct| {
+            if (maybe_ct == old_ct) {
+                still_referenced = true;
+                break;
+            }
+        }
+        if (still_referenced) continue;
+        try released.put(allocator, key, {});
+        cb.free(old_ct);
+        traceMetalValueLifetime("promote_old_release", @intCast(node_ids[boundary_pos]), null_node);
+    }
+
+    return promoted_count;
+}
+
+fn valueReferencedAfterBoundary(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    boundary_pos: usize,
+    value_id: NodeId,
+) bool {
+    for (graph.outputs.items) |output_id| {
+        if (output_id == value_id) return true;
+    }
+    if (boundary_pos + 1 >= node_ids.len) return false;
+    for (node_ids[boundary_pos + 1 ..]) |future_id| {
+        const future = graph.node(future_id);
+        for (future.getInputs()) |input_id| {
+            if (input_id == value_id) return true;
+        }
+    }
+    return false;
+}
+
+fn valueReferencedAtOrAfterPosition(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    value_id: NodeId,
+) bool {
+    for (graph.outputs.items) |output_id| {
+        if (output_id == value_id) return true;
+    }
+    if (start_pos >= node_ids.len) return false;
+    for (node_ids[start_pos..]) |future_id| {
+        const future = graph.node(future_id);
+        for (future.getInputs()) |input_id| {
+            if (input_id == value_id) return true;
+        }
+    }
+    return false;
 }
 
 fn evalPartitionBoundaryOutputs(
@@ -11756,6 +13637,14 @@ fn initEmptyMetalWeightStore(allocator: std.mem.Allocator) gpu_hosted_store_mod.
 fn deinitEmptyMetalWeightStore(weight_store: *gpu_hosted_store_mod.WeightStore, allocator: std.mem.Allocator) void {
     metal_compute_mod.deinitPrefetchQueue(weight_store);
     weight_store.lazy_weights.deinit(allocator);
+}
+
+test "metal partition executor computes frame chunk boundary positions" {
+    try std.testing.expectEqual(@as(?usize, 3), currentFrameChunkBoundaryPos(10, 0, 4, 0));
+    try std.testing.expectEqual(@as(?usize, 3), currentFrameChunkBoundaryPos(10, 2, 4, 2));
+    try std.testing.expectEqual(@as(?usize, 7), currentFrameChunkBoundaryPos(10, 4, 4, 0));
+    try std.testing.expectEqual(@as(?usize, 9), currentFrameChunkBoundaryPos(10, 8, 4, 0));
+    try std.testing.expectEqual(@as(?usize, null), currentFrameChunkBoundaryPos(10, 0, 0, 0));
 }
 
 test "metal partition executor consumes buffer plan and evaluates partition" {
@@ -12478,6 +14367,126 @@ test "metal partition executor recognizes attention output residual graph patter
         },
         else => return error.ExpectedPlannedAttentionOutputResidualRegion,
     }
+}
+
+test "metal partition executor recognizes deberta ffn forward graph region with escaped activations" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const x = try b.parameter("hidden", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w1 = try b.parameter("encoder.layer.0.intermediate.dense.weight", ml.graph.Shape.init(.f32, &.{ intermediate, hidden }));
+    const b1 = try b.parameter("encoder.layer.0.intermediate.dense.bias", ml.graph.Shape.init(.f32, &.{intermediate}));
+    const w2 = try b.parameter("encoder.layer.0.output.dense.weight", ml.graph.Shape.init(.f32, &.{ hidden, intermediate }));
+    const b2 = try b.parameter("encoder.layer.0.output.dense.bias", ml.graph.Shape.init(.f32, &.{hidden}));
+
+    const w1_t = try b.transpose(w1, &.{ 1, 0 });
+    const first_dot = try b.matmul(x, w1_t);
+    const ffn_inter = try b.add(first_dot, b1);
+    const ffn_gelu = try b.geluExact(ffn_inter);
+    const w2_t = try b.transpose(w2, &.{ 1, 0 });
+    const output_dot = try b.matmul(ffn_gelu, w2_t);
+    const out = try b.add(output_dot, b2);
+    const escaped_inter = try b.add(ffn_inter, ffn_inter);
+    const escaped_gelu = try b.add(ffn_gelu, ffn_gelu);
+    try g.markOutput(out);
+    try g.markOutput(escaped_inter);
+    try g.markOutput(escaped_gelu);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+
+    const pattern = matchDebertaFfnForwardPattern(&g, node_ids, @intCast(first_dot), reachable, skipped) orelse return error.ExpectedDebertaFfnForwardPattern;
+    try std.testing.expectEqual(first_dot, pattern.first_dot_id);
+    try std.testing.expectEqual(ffn_inter, pattern.first_add_id);
+    try std.testing.expectEqual(ffn_gelu, pattern.gelu_id);
+    try std.testing.expectEqual(output_dot, pattern.output_dot_id);
+    try std.testing.expectEqual(out, pattern.output_add_id);
+    try std.testing.expectEqual(w1, pattern.first_weight_id);
+    try std.testing.expectEqual(b1, pattern.first_bias_id);
+    try std.testing.expectEqual(w2, pattern.second_weight_id);
+    try std.testing.expectEqual(b2, pattern.second_bias_id);
+    try std.testing.expectEqual(@as(usize, rows), pattern.rows);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.hidden_size);
+    try std.testing.expectEqual(@as(usize, intermediate), pattern.intermediate_size);
+}
+
+test "metal partition executor recognizes lora-wrapped deberta ffn forward graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const rank: usize = 2;
+    const x = try b.parameter("hidden", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w1 = try b.parameter("encoder.layer.0.intermediate.dense.weight", ml.graph.Shape.init(.f32, &.{ intermediate, hidden }));
+    const b1 = try b.parameter("encoder.layer.0.intermediate.dense.bias", ml.graph.Shape.init(.f32, &.{intermediate}));
+    const w1_lora_a = try b.parameter("encoder.layer.0.intermediate.dense.lora_A.weight", ml.graph.Shape.init(.f32, &.{ rank, hidden }));
+    const w1_lora_b = try b.parameter("encoder.layer.0.intermediate.dense.lora_B.weight", ml.graph.Shape.init(.f32, &.{ intermediate, rank }));
+    const w2 = try b.parameter("encoder.layer.0.output.dense.weight", ml.graph.Shape.init(.f32, &.{ hidden, intermediate }));
+    const b2 = try b.parameter("encoder.layer.0.output.dense.bias", ml.graph.Shape.init(.f32, &.{hidden}));
+    const w2_lora_a = try b.parameter("encoder.layer.0.output.dense.lora_A.weight", ml.graph.Shape.init(.f32, &.{ rank, intermediate }));
+    const w2_lora_b = try b.parameter("encoder.layer.0.output.dense.lora_B.weight", ml.graph.Shape.init(.f32, &.{ hidden, rank }));
+    const scale = try b.scalarConst(.f32, 2.0);
+
+    const w1_t = try b.transpose(w1, &.{ 1, 0 });
+    const first_dot = try b.matmul(x, w1_t);
+    const first_base = try b.add(first_dot, b1);
+    const w1_lora_a_t = try b.transpose(w1_lora_a, &.{ 1, 0 });
+    const first_after_a = try b.matmul(x, w1_lora_a_t);
+    const w1_lora_b_t = try b.transpose(w1_lora_b, &.{ 1, 0 });
+    const first_after_b = try b.matmul(first_after_a, w1_lora_b_t);
+    const first_scaled = try b.mul(first_after_b, scale);
+    const first_add = try b.add(first_base, first_scaled);
+    const duplicate_first_add = try b.add(first_base, first_scaled);
+    const ffn_gelu = try b.geluExact(first_add);
+
+    const w2_t = try b.transpose(w2, &.{ 1, 0 });
+    const output_dot = try b.matmul(ffn_gelu, w2_t);
+    const output_base = try b.add(output_dot, b2);
+    const w2_lora_a_t = try b.transpose(w2_lora_a, &.{ 1, 0 });
+    const second_after_a = try b.matmul(ffn_gelu, w2_lora_a_t);
+    const w2_lora_b_t = try b.transpose(w2_lora_b, &.{ 1, 0 });
+    const second_after_b = try b.matmul(second_after_a, w2_lora_b_t);
+    const second_scaled = try b.mul(second_after_b, scale);
+    const out = try b.add(output_base, second_scaled);
+    try g.markOutput(out);
+    try g.markOutput(duplicate_first_add);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+
+    const pattern = matchDebertaFfnForwardPattern(&g, node_ids, @intCast(first_dot), reachable, skipped) orelse return error.ExpectedDebertaFfnForwardPattern;
+    try std.testing.expectEqual(first_dot, pattern.first_dot_id);
+    try std.testing.expectEqual(first_base, pattern.first_base_add_id);
+    try std.testing.expectEqual(first_add, pattern.first_add_id);
+    try std.testing.expectEqual(ffn_gelu, pattern.gelu_id);
+    try std.testing.expectEqual(output_dot, pattern.output_dot_id);
+    try std.testing.expectEqual(output_base, pattern.output_base_add_id);
+    try std.testing.expectEqual(out, pattern.output_add_id);
+    try std.testing.expect(pattern.first_lora != null);
+    try std.testing.expect(pattern.second_lora != null);
 }
 
 test "metal partition executor recognizes gemma qkv sibling linear graph region" {

@@ -247,6 +247,25 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], grad);
         },
 
+        .fused_gelu_exact => {
+            // d/dx exact_gelu(x) =
+            //   0.5 * (1 + erf(x / sqrt(2))) + x * exp(-0.5 * x^2) / sqrt(2*pi)
+            const half = try b.scalarConst(n.output_shape.dtype, 0.5);
+            const one = try b.scalarConst(n.output_shape.dtype, 1.0);
+            const inv_sqrt2 = try b.scalarConst(n.output_shape.dtype, 0.7071067811865476);
+            const inv_sqrt2pi = try b.scalarConst(n.output_shape.dtype, 0.3989422804014327);
+            const neg_half = try b.scalarConst(n.output_shape.dtype, -0.5);
+
+            const scaled = try b.mul(ins[0], inv_sqrt2);
+            const erf_v = try b.erfOp(scaled);
+            const cdf = try b.mul(try b.add(one, erf_v), half);
+            const x_sq = try b.mul(ins[0], ins[0]);
+            const exp_arg = try b.mul(x_sq, neg_half);
+            const pdf = try b.mul(try b.expOp(exp_arg), inv_sqrt2pi);
+            const grad_factor = try b.add(cdf, try b.mul(ins[0], pdf));
+            try accumulate(b, adjoints, ins[0], try b.mul(adj, grad_factor));
+        },
+
         .fused_softmax => {
             // For y = softmax(x), dL/dx = y * (dL/dy - sum(dL/dy * y)).
             // Keeping this fused avoids routing attention gradients through
@@ -991,6 +1010,34 @@ test "gradient of fused gelu emits fused backward op" {
     const grad = result.param_grads[0];
     try std.testing.expect(grad != null_node);
     try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .fused_gelu_backward), std.meta.activeTag(result.graph.node(grad).op));
+}
+
+test "gradient of fused exact gelu keeps exact forward fused" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 3 }));
+    const activated = try bld.geluExact(x);
+    const loss = try bld.reduceSum(activated, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    var saw_exact_forward = false;
+    var saw_erf_derivative = false;
+    for (0..result.graph.nodeCount()) |node_index| {
+        switch (result.graph.node(@intCast(node_index)).op) {
+            .fused_gelu_exact => saw_exact_forward = true,
+            .erf => saw_erf_derivative = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_exact_forward);
+    try std.testing.expect(saw_erf_derivative);
+    try std.testing.expect(result.param_grads[0] != null_node);
 }
 
 test "gradient of 2d slice pads adjoint to input shape" {

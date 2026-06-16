@@ -4438,6 +4438,10 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
                 const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
                 v.* = 0.5 * x * (1.0 + std.math.tanh(inner));
             },
+            .gelu_exact => for (values) |*v| {
+                const x = v.*;
+                v.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+            },
             .silu => activations.silu(values),
             .relu => activations.relu(values),
             .quick_gelu => activations.quickGelu(values),
@@ -4446,6 +4450,14 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
                 for (values) |*v| v.* *= v.*;
             },
         }
+    }
+
+    fn erfApproxF32(x: f32) f32 {
+        const sign: f32 = if (x < 0) -1.0 else 1.0;
+        const ax = @abs(x);
+        const t = 1.0 / (1.0 + 0.3275911 * ax);
+        const poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+        return sign * (1.0 - poly * @exp(-(ax * ax)));
     }
 
     fn sliceRows(self: *MetalProvider, arr: c.mlx_array, start_row: usize, row_count: usize) !c.mlx_array {

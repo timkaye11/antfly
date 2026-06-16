@@ -349,6 +349,7 @@ fn executeNativePlannedNode(
             );
         },
         .fused_gelu => try cb.gelu(valueAt(values, inputs[0])),
+        .fused_gelu_exact => try executeExactGeluHost(allocator, cb, valueAt(values, inputs[0]), n.output_shape),
         .fused_relu => try cb.relu(valueAt(values, inputs[0])),
         .fused_quick_gelu => try cb.quickGelu(valueAt(values, inputs[0])),
         .fused_softmax => |attrs| try cb.primSoftmax(valueAt(values, inputs[0]), attrs.dim),
@@ -641,6 +642,34 @@ fn valueAt(values: []?CT, node_id: NodeId) CT {
 fn optionalValueAt(values: []?CT, node_id: NodeId) ?CT {
     if (node_id == null_node) return null;
     return values[@intCast(node_id)];
+}
+
+fn executeExactGeluHost(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    input: CT,
+    output_shape: ml.graph.Shape,
+) !CT {
+    const data = try cb.toFloat32(input, allocator);
+    defer allocator.free(data);
+    for (data) |*v| {
+        const x = v.*;
+        v.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    }
+
+    var dims_buf: [8]i32 = undefined;
+    const rank = output_shape.rank();
+    if (rank > dims_buf.len) return error.UnsupportedShape;
+    for (0..rank) |axis| dims_buf[axis] = @intCast(output_shape.dim(@intCast(axis)));
+    return cb.fromFloat32Shape(data, dims_buf[0..rank]);
+}
+
+fn erfApproxF32(x: f32) f32 {
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return sign * (1.0 - poly * @exp(-(ax * ax)));
 }
 
 fn executeNativeScatterAdd(

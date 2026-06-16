@@ -136,6 +136,17 @@ pub const GlinerAutodiffConfig = struct {
     /// `i` uses the learned `count_embed.pos_embedding` row `i` (document
     /// order). Set by the trainer from the dataset's max structure count.
     structure_max_instances: u32 = 1,
+    /// Maximum upstream schema/task rows per sample. GLiNER2 total-loss packs
+    /// classification/count supervision into the task-row prefix of each
+    /// sample's span block; compacting those heads to this prefix avoids
+    /// materialising masked-out logits for every span row.
+    max_schema_tasks: u32 = 1,
+    /// For GLiNER2 total-loss structure loss, process whole-sample span blocks
+    /// in groups of at most this many samples. `0` keeps the legacy full-batch
+    /// structure projection. A value such as `8` preserves LoRA attachment and
+    /// loss semantics while reducing the peak span-head tensor shapes for
+    /// large batches.
+    structure_span_chunk_samples: u32 = 0,
 };
 
 /// Trainer-opaque context that owns the graph-construction state and (after
@@ -396,6 +407,16 @@ pub const GlinerAutodiffCtx = struct {
         hidden: NodeId,
         targets: NodeId,
     ) !NodeId {
+        return self.buildSpanStartLossForBatch(bld, hidden, targets, self.graph_batch);
+    }
+
+    fn buildSpanStartLossForBatch(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+        graph_batch: u32,
+    ) !NodeId {
         const C: u32 = self.config.num_classes;
         if (C < 2) return error.InvalidGlinerClassCount;
         const E: u32 = C - 1;
@@ -475,7 +496,6 @@ pub const GlinerAutodiffCtx = struct {
         self.span_debug_end_hidden = end_hidden_for_parity;
         self.span_debug_projected_span = projected_span;
         const entity_logits = if (is_schema_conditioned) blk: {
-            const graph_batch = self.graph_batch;
             if (graph_batch == 0 or span_rows == 0 or @mod(span_rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
             const max_spans_per_sample = span_rows / graph_batch;
             const compact_schema_rows = graph_batch * E;
@@ -606,6 +626,48 @@ pub const GlinerAutodiffCtx = struct {
         };
     }
 
+    fn buildSpanStartLossChunkedBySample(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+        chunk_samples: u32,
+    ) !NodeId {
+        if (chunk_samples == 0) return self.buildSpanStartLoss(bld, hidden, targets);
+        if (self.config.span_start_loss_reduction != .sum) return self.buildSpanStartLoss(bld, hidden, targets);
+
+        const target_shape = bld.graph.node(targets).output_shape;
+        if (target_shape.rank() != 2) return error.InvalidGlinerSpanTargetShape;
+        const span_rows: u32 = @intCast(target_shape.dim(0));
+        const target_width: u32 = @intCast(target_shape.dim(1));
+        const graph_batch = self.graph_batch;
+        if (graph_batch == 0 or span_rows == 0 or @mod(span_rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
+        if (graph_batch <= chunk_samples) return self.buildSpanStartLoss(bld, hidden, targets);
+
+        const max_spans_per_sample = span_rows / graph_batch;
+        var total_loss: ?NodeId = null;
+        var sample_start: u32 = 0;
+        while (sample_start < graph_batch) {
+            const sample_count = @min(chunk_samples, graph_batch - sample_start);
+            const chunk_rows = sample_count * max_spans_per_sample;
+            const row_indices = try buildSpanSampleChunkRowIndices(bld, sample_start, sample_count, max_spans_per_sample);
+            const chunk_targets = try bld.gather(
+                targets,
+                row_indices,
+                Shape.init(.f32, &.{ @intCast(chunk_rows), @intCast(target_width) }),
+            );
+            const chunk_loss = try self.buildSpanStartLossForBatch(
+                bld,
+                hidden,
+                chunk_targets,
+                sample_count,
+            );
+            total_loss = if (total_loss) |acc| try bld.add(acc, chunk_loss) else chunk_loss;
+            sample_start += sample_count;
+        }
+        return total_loss orelse error.InvalidGlinerSpanTargetShape;
+    }
+
     fn buildGliner2TotalLoss(
         self: *GlinerAutodiffCtx,
         bld: *Builder,
@@ -626,7 +688,12 @@ pub const GlinerAutodiffCtx = struct {
         const structure_loss = if (self.config.structure_max_instances > 1)
             try self.buildGliner2PerInstanceStructureLoss(bld, hidden, targets, E, H)
         else
-            try self.buildSpanStartLoss(bld, hidden, structure_targets);
+            try self.buildSpanStartLossChunkedBySample(
+                bld,
+                hidden,
+                structure_targets,
+                self.config.structure_span_chunk_samples,
+            );
         const classification_loss = try self.buildGliner2ClassificationLoss(bld, hidden, targets);
         const count_loss = try self.buildGliner2CountLoss(bld, hidden, targets);
         self.gliner2_structure_loss = structure_loss;
@@ -650,8 +717,60 @@ pub const GlinerAutodiffCtx = struct {
         E: u32,
         H: u32,
     ) !NodeId {
-        const max_gold = self.config.structure_max_instances;
+        const target_shape = bld.graph.node(targets).output_shape;
+        const span_rows: u32 = @intCast(target_shape.dim(0));
+        const target_width: u32 = @intCast(target_shape.dim(1));
         const graph_batch = self.graph_batch;
+        if (graph_batch == 0 or span_rows == 0 or @mod(span_rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
+        const max_spans_per_sample = span_rows / graph_batch;
+
+        const chunk_samples = self.config.structure_span_chunk_samples;
+        if (chunk_samples > 0 and graph_batch > chunk_samples and self.config.span_start_loss_reduction == .sum) {
+            var total_loss: ?NodeId = null;
+            var sample_start: u32 = 0;
+            while (sample_start < graph_batch) {
+                const sample_count = @min(chunk_samples, graph_batch - sample_start);
+                const chunk_rows = sample_count * max_spans_per_sample;
+                const row_indices = try buildSpanSampleChunkRowIndices(bld, sample_start, sample_count, max_spans_per_sample);
+                const chunk_targets = try bld.gather(
+                    targets,
+                    row_indices,
+                    Shape.init(.f32, &.{ @intCast(chunk_rows), @intCast(target_width) }),
+                );
+                const chunk_loss = try self.buildGliner2PerInstanceStructureLossForTargets(
+                    bld,
+                    hidden,
+                    chunk_targets,
+                    E,
+                    H,
+                    sample_count,
+                );
+                total_loss = if (total_loss) |acc| try bld.add(acc, chunk_loss) else chunk_loss;
+                sample_start += sample_count;
+            }
+            return total_loss orelse error.InvalidGlinerSpanTargetShape;
+        }
+
+        return self.buildGliner2PerInstanceStructureLossForTargets(
+            bld,
+            hidden,
+            targets,
+            E,
+            H,
+            graph_batch,
+        );
+    }
+
+    fn buildGliner2PerInstanceStructureLossForTargets(
+        self: *GlinerAutodiffCtx,
+        bld: *Builder,
+        hidden: NodeId,
+        targets: NodeId,
+        E: u32,
+        H: u32,
+        graph_batch: u32,
+    ) !NodeId {
+        const max_gold = self.config.structure_max_instances;
         const target_shape = bld.graph.node(targets).output_shape;
         const span_rows: u32 = @intCast(target_shape.dim(0));
         if (graph_batch == 0 or span_rows == 0 or @mod(span_rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
@@ -767,26 +886,47 @@ pub const GlinerAutodiffCtx = struct {
         const H: u32 = self.config.graph_config.hidden_size;
         const target_shape = bld.graph.node(targets).output_shape;
         const rows: u32 = @intCast(target_shape.dim(0));
+        const graph_batch = self.graph_batch;
+        if (graph_batch == 0 or rows == 0 or @mod(rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
+        const max_spans_per_sample = rows / graph_batch;
+        const schema_tasks = @min(max_spans_per_sample, @max(@as(u32, 1), self.config.max_schema_tasks));
+        const compact_rows = graph_batch * schema_tasks;
+        const task_row_indices = try buildSchemaTaskRowIndices(bld, graph_batch, max_spans_per_sample, schema_tasks);
         const labels_offset: i64 = @intCast(gliner2TotalLossClassificationLabelsOffset(@intCast(E)));
         const mask_offset: i64 = @intCast(gliner2TotalLossClassificationMaskOffset(@intCast(E)));
         const schema_idx_offset: i64 = @intCast(2 * E);
 
         const hidden_flat = try flattenHiddenForLoss(bld, hidden, H);
-        const schema_idx_2d = try bld.sliceLastDim(targets, schema_idx_offset, schema_idx_offset + @as(i64, @intCast(E)));
-        const schema_idx_f32 = try bld.reshape(schema_idx_2d, Shape.init(.f32, &.{@intCast(rows * E)}));
+        const schema_idx_all = try bld.sliceLastDim(targets, schema_idx_offset, schema_idx_offset + @as(i64, @intCast(E)));
+        const schema_idx_2d = try bld.gather(
+            schema_idx_all,
+            task_row_indices,
+            Shape.init(.f32, &.{ @intCast(compact_rows), @intCast(E) }),
+        );
+        const schema_idx_f32 = try bld.reshape(schema_idx_2d, Shape.init(.f32, &.{@intCast(compact_rows * E)}));
         const schema_idx_i64 = try bld.convertDtype(schema_idx_f32, .i64);
         const schema_hidden = try bld.gather(
             hidden_flat,
             schema_idx_i64,
-            Shape.init(.f32, &.{ @intCast(rows * E), @intCast(H) }),
+            Shape.init(.f32, &.{ @intCast(compact_rows * E), @intCast(H) }),
         );
-        const classifier_0 = try linearNamed(bld, schema_hidden, "classifier.0.weight", "classifier.0.bias", rows * E, H, H * 2);
+        const classifier_0 = try linearNamed(bld, schema_hidden, "classifier.0.weight", "classifier.0.bias", compact_rows * E, H, H * 2);
         const classifier_act = try bld.relu(classifier_0);
-        const classifier_logits_flat = try linearNamed(bld, classifier_act, "classifier.2.weight", "classifier.2.bias", rows * E, H * 2, 1);
-        const classifier_logits = try bld.reshape(classifier_logits_flat, Shape.init(.f32, &.{ @intCast(rows), @intCast(E) }));
+        const classifier_logits_flat = try linearNamed(bld, classifier_act, "classifier.2.weight", "classifier.2.bias", compact_rows * E, H * 2, 1);
+        const classifier_logits = try bld.reshape(classifier_logits_flat, Shape.init(.f32, &.{ @intCast(compact_rows), @intCast(E) }));
         self.gliner2_classification_logits = classifier_logits;
-        const labels = try bld.sliceLastDim(targets, labels_offset, labels_offset + @as(i64, @intCast(E)));
-        const mask = try bld.sliceLastDim(targets, mask_offset, mask_offset + @as(i64, @intCast(E)));
+        const labels_all = try bld.sliceLastDim(targets, labels_offset, labels_offset + @as(i64, @intCast(E)));
+        const labels = try bld.gather(
+            labels_all,
+            task_row_indices,
+            Shape.init(.f32, &.{ @intCast(compact_rows), @intCast(E) }),
+        );
+        const mask_all = try bld.sliceLastDim(targets, mask_offset, mask_offset + @as(i64, @intCast(E)));
+        const mask = try bld.gather(
+            mask_all,
+            task_row_indices,
+            Shape.init(.f32, &.{ @intCast(compact_rows), @intCast(E) }),
+        );
         return buildMaskedSpanStartBceLoss(
             bld,
             classifier_logits,
@@ -810,31 +950,94 @@ pub const GlinerAutodiffCtx = struct {
         const H: u32 = self.config.graph_config.hidden_size;
         const target_shape = bld.graph.node(targets).output_shape;
         const rows: u32 = @intCast(target_shape.dim(0));
+        const graph_batch = self.graph_batch;
+        if (graph_batch == 0 or rows == 0 or @mod(rows, graph_batch) != 0) return error.InvalidGlinerSpanTargetShape;
+        const max_spans_per_sample = rows / graph_batch;
+        const schema_tasks = @min(max_spans_per_sample, @max(@as(u32, 1), self.config.max_schema_tasks));
+        const compact_rows = graph_batch * schema_tasks;
+        const task_row_indices = try buildSchemaTaskRowIndices(bld, graph_batch, max_spans_per_sample, schema_tasks);
         const count_labels_offset: i64 = @intCast(gliner2TotalLossCountLabelsOffset(@intCast(E)));
         const count_mask_offset: i64 = @intCast(gliner2TotalLossCountMaskOffset(@intCast(E)));
         const parent_idx_offset: i64 = @intCast(gliner2TotalLossParentIndexOffset(@intCast(E)));
 
         const hidden_flat = try flattenHiddenForLoss(bld, hidden, H);
-        const parent_idx_2d = try bld.sliceLastDim(targets, parent_idx_offset, parent_idx_offset + 1);
-        const parent_idx_f32 = try bld.reshape(parent_idx_2d, Shape.init(.f32, &.{@intCast(rows)}));
+        const parent_idx_all = try bld.sliceLastDim(targets, parent_idx_offset, parent_idx_offset + 1);
+        const parent_idx_2d = try bld.gather(
+            parent_idx_all,
+            task_row_indices,
+            Shape.init(.f32, &.{ @intCast(compact_rows), 1 }),
+        );
+        const parent_idx_f32 = try bld.reshape(parent_idx_2d, Shape.init(.f32, &.{@intCast(compact_rows)}));
         const parent_idx_i64 = try bld.convertDtype(parent_idx_f32, .i64);
         const parent_hidden = try bld.gather(
             hidden_flat,
             parent_idx_i64,
-            Shape.init(.f32, &.{ @intCast(rows), @intCast(H) }),
+            Shape.init(.f32, &.{ @intCast(compact_rows), @intCast(H) }),
         );
-        const count_pred_0 = try linearNamed(bld, parent_hidden, "count_pred.0.weight", "count_pred.0.bias", rows, H, H * 2);
+        const count_pred_0 = try linearNamed(bld, parent_hidden, "count_pred.0.weight", "count_pred.0.bias", compact_rows, H, H * 2);
         const count_pred_act = try bld.relu(count_pred_0);
-        const count_logits = try linearNamed(bld, count_pred_act, "count_pred.2.weight", "count_pred.2.bias", rows, H * 2, 20);
+        const count_logits = try linearNamed(bld, count_pred_act, "count_pred.2.weight", "count_pred.2.bias", compact_rows, H * 2, 20);
         const log_probs = try bld.logSoftmax(count_logits);
-        const count_labels = try bld.sliceLastDim(targets, count_labels_offset, count_labels_offset + 20);
-        const count_mask = try bld.sliceLastDim(targets, count_mask_offset, count_mask_offset + 1);
+        const count_labels_all = try bld.sliceLastDim(targets, count_labels_offset, count_labels_offset + 20);
+        const count_labels = try bld.gather(
+            count_labels_all,
+            task_row_indices,
+            Shape.init(.f32, &.{ @intCast(compact_rows), 20 }),
+        );
+        const count_mask_all = try bld.sliceLastDim(targets, count_mask_offset, count_mask_offset + 1);
+        const count_mask = try bld.gather(
+            count_mask_all,
+            task_row_indices,
+            Shape.init(.f32, &.{ @intCast(compact_rows), 1 }),
+        );
         const weighted = try bld.mul(count_labels, log_probs);
         const per_row = try bld.reduceSum(weighted, &.{1});
         const masked = try bld.mul(per_row, count_mask);
         return bld.neg(try bld.reduceSum(masked, &.{ 0, 1 }));
     }
 };
+
+fn buildSchemaTaskRowIndices(
+    bld: *Builder,
+    graph_batch: u32,
+    max_spans_per_sample: u32,
+    schema_tasks: u32,
+) !NodeId {
+    if (graph_batch == 0 or max_spans_per_sample == 0 or schema_tasks == 0) return error.InvalidGlinerSpanTargetShape;
+    if (schema_tasks > max_spans_per_sample) return error.InvalidGlinerSpanTargetShape;
+    const rows: usize = @as(usize, graph_batch) * @as(usize, schema_tasks);
+    const row_indices = try bld.graph.allocator.alloc(f32, rows);
+    defer bld.graph.allocator.free(row_indices);
+    for (0..graph_batch) |sample_idx| {
+        for (0..schema_tasks) |task_idx| {
+            row_indices[@as(usize, sample_idx) * @as(usize, schema_tasks) + task_idx] =
+                @floatFromInt(sample_idx * max_spans_per_sample + task_idx);
+        }
+    }
+    const rows_f32 = try bld.tensorConst(row_indices, Shape.init(.f32, &.{@intCast(rows)}));
+    return bld.convertDtype(rows_f32, .i64);
+}
+
+fn buildSpanSampleChunkRowIndices(
+    bld: *Builder,
+    sample_start: u32,
+    sample_count: u32,
+    max_spans_per_sample: u32,
+) !NodeId {
+    if (sample_count == 0 or max_spans_per_sample == 0) return error.InvalidGlinerSpanTargetShape;
+    const rows: usize = @as(usize, sample_count) * @as(usize, max_spans_per_sample);
+    const row_indices = try bld.graph.allocator.alloc(f32, rows);
+    defer bld.graph.allocator.free(row_indices);
+    for (0..sample_count) |local_sample_idx| {
+        const global_sample_idx = sample_start + @as(u32, @intCast(local_sample_idx));
+        for (0..max_spans_per_sample) |span_idx| {
+            row_indices[local_sample_idx * @as(usize, max_spans_per_sample) + span_idx] =
+                @floatFromInt(global_sample_idx * max_spans_per_sample + @as(u32, @intCast(span_idx)));
+        }
+    }
+    const rows_f32 = try bld.tensorConst(row_indices, Shape.init(.f32, &.{@intCast(rows)}));
+    return bld.convertDtype(rows_f32, .i64);
+}
 
 fn buildParitySpanProjection(
     bld: *Builder,

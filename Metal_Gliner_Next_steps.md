@@ -1,17 +1,207 @@
 # Metal GLiNER2 Fine-tuning — Next Steps Plan (v2, merged)
 
-> **Production batch-32 correction 2026-06-14 — in progress.**
+> **Production batch-32 correction 2026-06-15 — in progress; graph-plan explosion fixed, slot-bound pooling regressed.**
 > The current batch-32 OOM class is not a Python/Zig numerical mismatch; it is
 > the Metal training executor's single-frame lifetime model retaining thousands
-> of dead private intermediates until frame completion. The corrective path is
-> now explicit: in-frame private-buffer reuse is default-ON in the Metal runtime
-> (escape hatch: `TERMITE_METAL_BUFFER_REUSE=0`), per-step JSONL telemetry reports
-> Metal live/runtime/frame-retained/reuse counters, and the stable regression
-> entrypoint is `scripts/run_gliner2_metal_train_tests.sh batch32`. That gate
-> forwards true `--batch-size 32` into `gliner2-production-readiness`, defaults
-> to `seq_len=128`/32 train examples, enables reuse stats, and requires allocator
-> reuse hits so a future accidental disablement fails loudly. Frame chunking is
-> diagnostic/fallback work only until it shows measured peak-memory wins.
+> of dead private intermediates until frame completion. The supported batch-32
+> corrective path is activation checkpointing plus Metal frame chunking with
+> safe mid-step release: before each chunk submit/wait, expired values are
+> swept, skipped/fused nodes whose slots escape to later consumers are
+> materialized instead of left null, and cross-boundary live values are promoted
+> after the frame drain rather than before it. `train-gliner2-autodiff` and
+> `gliner2-production-readiness` expose `--activation-checkpointing` and
+> `--activation-checkpoint-interval`; the stable regression entrypoint
+> `scripts/run_gliner2_metal_train_tests.sh batch32` sets
+> `TERMITE_METAL_FRAME_CHUNK_OPS=128` by default and is the current
+> OOM/residency gate.
+> The gate forwards true `--batch-size 32` into `gliner2-production-readiness`,
+> defaults to `seq_len=128`/32 train examples with deterministic LoRA dropout
+> (`0`), enables reuse stats, and requires allocator reuse hits so a future
+> accidental disablement fails loudly; default runtime-memory ceiling is now
+> 512 MiB, specifically to catch a regression back to the old multi-GiB
+> graph-plan reservation.
+> The gate also fails if the resident GLiNER2 Metal path silently regresses:
+> it requires graph runtime-region dispatches, runtime-region elision, fused
+> DeBERTa attention flash calls, zero runtime-region fallbacks, and zero
+> DeBERTa attention GEMM fallbacks. It also requires chunk boundaries and
+> swept values; promoted values may legitimately be zero when the surviving
+> values already have storage the clone helper does not need to replace.
+> Activation-checkpoint boundary selection was also corrected: the graph pass
+> no longer treats every linear-like op as a saved checkpoint. That old
+> heuristic preserved the large DeBERTa FFN up-projection activations
+> (`[4096,3072]`, about 50 MiB each at b32/s128), which is the opposite of
+> PyTorch-style layer checkpointing. The `every_n_layers` policy now treats
+> shrinking FFN down-projections as layer boundaries and includes a regression
+> test that the FFN up activation and GELU are not checkpointed.
+> The checkpointed FFN-forward matcher now recovers the 12 encoder FFN-forward
+> regions on a tiny b1/s32 profile, but enabling that opt-in region on b32/s128
+> reintroduced an OS-kill during the step. Therefore
+> `TERMITE_METAL_ENABLE_DEBERTA_FFN_FORWARD_RUNTIME_REGION=1` remains a
+> performance experiment, not a production default, and the batch32 OOM gate
+> intentionally does not require `metal_deberta_ffn_forward_regions`.
+> Current non-regressed baseline validation, without slot-bound output pooling:
+> `/private/tmp/gliner2_realistic.jsonl` with
+> `TERMITE_METAL_FRAME_CHUNK_OPS=512`, checkpointed b32/s128, completed one
+> Metal training step with finite loss, 6,710 reuse allocations, 5,661 reuse
+> hits (84.4%), 13 frame chunk boundaries, 101 swept values, zero promoted
+> values, 28 runtime-region dispatches, 1,050 elided graph nodes, 24 fused
+> DeBERTa attention flash calls, zero runtime-region/attention fallbacks,
+> `max_metal_runtime_total_bytes=90,722,304`, and no OOM. The previous
+> 12.55 GB runtime reading was not live training state; it was almost entirely
+> a broad partition graph-plan pool (`metal_runtime_graph_plan_bytes` about
+> 12.46 GB). Under frame chunking, the executor now skips that broad
+> partition-level graph-plan reservation by default while leaving runtime
+> kernels free to reserve their own specific scratch slots. This is the
+> correction that stopped the memory explosion.
+> This is closer to PyTorch-style lifetime behavior, but still not fully
+> PyTorch-like: peak owned device bytes improved from about 7.06 GB to
+> `6,531,897,540` bytes, versus a ~2.33 GB resident/live estimate. Bucket
+> metrics show the remaining owned peak is dominated by large activations:
+> `>=16MiB` peaked at `4,372,561,920` bytes and `4-16MiB` at
+> `1,920,466,944` bytes. Direct allocation tracing identifies repeated
+> DeBERTa FFN intermediate tensors (`[4096,3072]`, about 50 MiB each) as the
+> main remaining source. A more aggressive checkpoint graph reorder that tried
+> to move recompute chains closer to gradient consumers reduced command count
+> early in the run but was not safe: batch32 was OS-killed, so it was backed
+> out. The next corrective path is implemented behind
+> `TERMITE_METAL_SLOT_BOUND_OUTPUTS=1`: large eligible Metal command outputs
+> borrow buffers from the existing `BufferPlan` physical allocation ids instead
+> of allocating one owned private tensor per graph node. The first unbounded
+> version regressed batch32: it completed the training step, but the pool alone
+> reached `9,550,430,208` bytes and the owned-device peak reached
+> `14,204,787,172` bytes, so the pool is now bounded by
+> `TERMITE_METAL_SLOT_BOUND_POOL_MAX_BYTES` (default 1 GiB) and allocates only
+> the current output view byte length, not the full buffer-plan allocation size.
+> It still declines graph outputs, constants/runtime inputs, non-reusable slots,
+> non-Metal slots, and any allocation id that is still materialized in
+> `values[]`. Because the most recent local attempt still produced an immediate
+> memory spike, `batch32` no longer enables this path by default; the pool is an
+> explicit diagnostic experiment only (`TERMITE_METAL_SLOT_BOUND_OUTPUTS=1`),
+> and the script asserts `metal_slot_bound_outputs` only for that opt-in mode.
+> Until the gate is rerun successfully, the last confirmed non-regressed memory
+> number remains the `6,531,897,540` byte owned peak above.
+> The new production-candidate memory path is now implemented behind
+> `TERMITE_METAL_EAGER_ARENA=1`. Unlike the persistent slot-bound output pool,
+> the eager arena is partition-local and is torn down at partition end. It only
+> binds eligible large command outputs to reusable Metal buffer-plan allocation
+> ids, declines graph/partition outputs and transfer sources, and refuses an
+> allocation id that is still materialized in `values[]`. Defaults are
+> intentionally conservative: `TERMITE_METAL_EAGER_ARENA_MIN_BYTES=1048576`
+> and `TERMITE_METAL_EAGER_ARENA_MAX_BYTES=4294967296`. Step JSONL metrics now
+> include `graph_executor_metal_eager_arena_peak_bytes`,
+> `graph_executor_metal_eager_arena_live_bytes`,
+> `graph_executor_metal_eager_arena_reuse_hits`,
+> `graph_executor_metal_eager_arena_allocations`,
+> `graph_executor_metal_eager_arena_spill_bytes`,
+> `graph_executor_metal_eager_arena_hazard_declines`, and
+> `graph_executor_metal_eager_arena_alias_conflicts`. The production readiness
+> gate exposes `--max-metal-eager-arena-peak-bytes` and
+> `--max-metal-eager-arena-spill-bytes`; the intended batch32 acceptance run
+> should enable the arena and require peak under the current 4 GiB working-set
+> target with zero spill before calling the memory work production-ready.
+> Current evidence: the arena is useful telemetry and a bounded experiment, but
+> it is not production-ready. A b8/s64 checkpointed gate completed with owned
+> peak `2,081,165,508` bytes, runtime total `90,722,304` bytes, arena peak
+> `975,175,680` bytes, spill `364,904,448` bytes, and 183 alias conflicts. A
+> full b32/s128 checkpointed gate completed without OOM, but failed the 4 GiB
+> owned-device cap: owned peak was `10,476,640,452` bytes, arena peak was
+> `4,294,705,152` bytes, arena spill was `12,107,907,072` bytes, and alias
+> conflicts were 279. That is worse than the last non-arena owned peak
+> (`6,531,897,540` bytes), so the arena must remain opt-in until it can reuse
+> storage without adding a second large resident pool.
+> Same-allocation alias reclaim is implemented only as a diagnostic experiment
+> behind `TERMITE_METAL_EAGER_ARENA_RECLAIM_ALIASES=1`. It is not a production
+> default: the first b1/s32 smoke with reclaim enabled cleared a deferred
+> producer still needed by node 2868 and forced graph-executor fallback
+> (`missing_partition_input`). Keep reclaim off until the liveness predicate is
+> proven against skipped/deferred producers.
+> The current long-term correction is chunk-local command-output ownership,
+> implemented behind `TERMITE_METAL_CHUNK_LOCAL_OUTPUTS=1`. This path reuses
+> existing `BufferPlan` physical allocation ids without retaining a separate
+> partition-long arena: only command outputs whose planned lifetime ends inside
+> the current `TERMITE_METAL_FRAME_CHUNK_OPS` window can borrow chunk-local
+> backing storage, and the pool releases dead backing buffers immediately after
+> the chunk submit/wait. If a borrowed value unexpectedly survives a boundary,
+> the reset code carries that allocation forward instead of freeing a live
+> backing buffer. Step JSONL and graph executor stats include
+> `graph_executor_metal_chunk_local_output_peak_bytes`,
+> `graph_executor_metal_chunk_local_output_live_bytes`,
+> `graph_executor_metal_chunk_local_output_allocations`,
+> `graph_executor_metal_chunk_local_output_reuse_hits`,
+> `graph_executor_metal_chunk_local_output_spill_bytes`,
+> `graph_executor_metal_chunk_local_output_alias_conflicts`,
+> `graph_executor_metal_chunk_local_output_resets`,
+> `graph_executor_metal_chunk_local_output_reset_freed_bytes`, and
+> `graph_executor_metal_chunk_local_output_reset_live_carry_values`.
+> `scripts/run_gliner2_metal_train_tests.sh batch32` forwards
+> `TERMITE_METAL_CHUNK_LOCAL_OUTPUTS`,
+> `TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MIN_BYTES`, and
+> `TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES`; when enabled, the harness
+> asserts that the pool allocated, reset, and freed bytes mid-step. This is the
+> next b32/s128 gate to run before calling the memory work production-ready.
+> Current evidence after the first chunk-local workload pass: chunk-local
+> ownership is safe enough to finish b32/s128, but it is not the memory fix yet.
+> With `TERMITE_METAL_FRAME_CHUNK_OPS=512`, chunk-local outputs completed one
+> b32/s128 step but increased owned peak to `9,249,806,532` bytes while the
+> chunk-local pool itself peaked at `3,019,898,880` bytes. Immediate discard of
+> ignored output hints reduced the chunk-local pool peak to `2,322,333,696`
+> bytes and owned peak to `7,425,284,292` bytes; still worse than the
+> non-arena baseline. This shows chunk-local output binding remains additive
+> unless the hinted ops truly replace their normal command-output allocations.
+> Finer chunking without chunk-local outputs is the current safer knob:
+> `TERMITE_METAL_FRAME_CHUNK_OPS=128`, `64`, and `32` all completed b32/s128
+> and reduced owned peak to `5,846,620,648` bytes, with runtime reuse-pool peak
+> slots dropping from 213 at chunk 512 to 78/43/34. The owned peak plateaus
+> there despite more chunk boundaries, so the remaining gap to the 4 GiB target
+> is not frame-retained scratch; it is still live owned activation storage,
+> most likely the large FFN/head tensors identified by allocation tracing.
+> The batch-32 gate is an OOM/residency regression smoke, not the final
+> performance SLA; the measured step was still slow (~18.5s wall / ~17.2s Metal
+> GPU frame). A smaller b1/s32
+> op-run profile showed the dominant performance blocker is shape-invariant
+> command fanout, not batch-size memory pressure: 4,492 graph command dispatches,
+> 1,198 Metal compute encoders, 204 runtime-region dispatches, and zero
+> runtime-region fallbacks. A fusion trace showed those runtime regions are
+> LoRA-only (`lora_linear`, `lora_linear_qkv`, `lora_backward`); the old
+> aggregate `ffn_regions` number was therefore not proof of DeBERTa FFN fusion.
+> The executor stats now report separate LoRA/FFN-backward region counters, and
+> the validation surface has explicit optional perf/fusion ceilings
+> (`--max-graph-command-dispatch-count`, `--max-metal-frame-gpu-ms`,
+> `--max-metal-last-frame-compute-encoder-count`,
+> `--min-metal-deberta-ffn-forward-region-count`,
+> `--min-metal-deberta-ffn-fused-call-count`, and
+> `--max-metal-deberta-ffn-fused-fallback-count`) so OOM readiness and
+> production-performance readiness cannot be conflated. The immediate
+> implementation prerequisite for DeBERTa FFN fusion is also in place:
+> `DecoderRuntimeActivationKind.gelu_exact = 17` plus matching Metal/host
+> activation support, because upstream GLiNER2/DeBERTa uses exact erf GELU and
+> the existing dense FFN primitive's `.gelu`/`.gelu_new` are tanh-approx GELU.
+> The first parity-safe FFN increment is also landed: the ML graph now has
+> `fused_gelu_exact`, DeBERTa FFN construction emits it directly with an exact
+> erf decomposed VJP alternate, autodiff preserves the fused forward while using
+> the exact derivative, and Metal routes it through the runtime activation
+> kernel. A tiny b1/s32 train profile verified no `fused_gelu_exact` fallback or
+> host-output and reduced graph dispatches/host outputs from 4,492/366 to
+> 4,468/354. That is useful hygiene, not the production-performance fix: true
+> DeBERTa FFN fused calls still read zero. The first parity-safe graph-level
+> FFN-forward region is now implemented and gated separately: it recognizes the
+> lowered DeBERTa `linear -> exact GELU -> linear` chain, elides the internal
+> dot/add/GELU nodes, and publishes `ffn_inter`, `ffn_gelu`, and `ffn_output` so
+> backward remains valid. Metrics now expose
+> `metal_deberta_ffn_forward_regions`, and the production gate can require it
+> via `--min-metal-deberta-ffn-forward-region-count`. Under activation
+> checkpointing, a duplicate LoRA consumer from recompute/backward used to make
+> the matcher reject the forward FFN add as ambiguous; the matcher now chooses
+> the earliest compatible LoRA consumer and recovers 12 FFN-forward regions on
+> b1/s32 (`commands=5403`, `fused_nodes_elided=277`, `runtime_region_fallbacks=0`;
+> prior checkpointed baseline was `commands=5535`, `fused_nodes_elided=157`,
+> `metal_deberta_ffn_forward_regions=0`). This is a corrective course change,
+> not the final performance claim: the batch-32 gate remains an
+> OOM/residency smoke until true backend FFN/layer fusion is implemented,
+> measured on production-shape runs, and hard-gated with the true DeBERTa FFN
+> counters. Do not re-enable raw linear runtime regions in training without a
+> fresh parity proof; that path is intentionally suppressed because it
+> previously diverged on GLiNER2 LoRA training graphs.
 
 > **✅ PRODUCTION PUSH 2026-06-11 — OOM FIXED + restructure shipped (default-on).**
 > The machine-OOM (Metal at realistic seq≥128 exhausting 16GB) was the

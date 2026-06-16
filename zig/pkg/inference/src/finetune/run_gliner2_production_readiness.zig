@@ -52,6 +52,7 @@ const Options = struct {
     objective: []const u8 = "span-start",
     max_span_width: []const u8 = "4",
     span_loss: []const u8 = "bce",
+    span_loss_reduction: []const u8 = "mean",
     span_positive_weight: []const u8 = "32",
     span_label_positive_weights: ?[]const u8 = null,
     span_negative_weight: []const u8 = "1",
@@ -61,6 +62,10 @@ const Options = struct {
     seed: []const u8 = "42",
     backend: []const u8 = "auto",
     compiled_required: bool = false,
+    activation_checkpointing: bool = false,
+    activation_checkpoint_interval: []const u8 = "1",
+    activation_checkpoint_strategy: []const u8 = "every-n-layers",
+    structure_span_chunk_samples: []const u8 = "0",
     production_metal_gate: bool = false,
     production_mlx_gate: bool = false,
     num_classes_override: ?[]const u8 = null,
@@ -83,8 +88,29 @@ const Options = struct {
     max_device_trainable_transfer_count: ?u64 = null,
     max_device_resident_transfer_count: ?u64 = null,
     min_device_trainable_bytes: ?usize = null,
+    max_metal_tensor_device_owned_peak_live_bytes: ?u64 = null,
     max_metal_runtime_total_bytes: ?u64 = null,
+    max_metal_eager_arena_peak_bytes: ?u64 = null,
+    max_metal_eager_arena_spill_bytes: ?u64 = null,
+    max_metal_chunk_local_output_peak_bytes: ?u64 = null,
+    max_metal_chunk_local_output_spill_bytes: ?u64 = null,
+    max_metal_chunk_local_output_unconsumed_hints: ?u64 = null,
+    min_metal_chunk_local_output_consumed_hints: ?u64 = null,
     min_metal_runtime_reuse_hit_count: ?u64 = null,
+    max_graph_command_dispatch_count: ?u64 = null,
+    max_metal_frame_gpu_ms: ?f64 = null,
+    max_metal_last_frame_compute_encoder_count: ?u64 = null,
+    min_metal_frame_chunk_boundary_count: ?u64 = null,
+    min_metal_frame_chunk_promoted_value_count: ?u64 = null,
+    min_metal_frame_chunk_swept_value_count: ?u64 = null,
+    min_graph_runtime_region_dispatch_count: ?u64 = null,
+    max_graph_runtime_region_fallback_count: ?u64 = null,
+    min_graph_runtime_region_elided_node_count: ?u64 = null,
+    min_metal_deberta_ffn_forward_region_count: ?u64 = null,
+    min_metal_deberta_attention_flash_call_count: ?u64 = null,
+    max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
+    min_metal_deberta_ffn_fused_call_count: ?u64 = null,
+    max_metal_deberta_ffn_fused_fallback_count: ?u64 = null,
     require_loss_decrease: bool = true,
 
     eval_text: ?[]const u8 = null,
@@ -236,6 +262,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         "--objective",                 opts.objective,
         "--max-span-width",            opts.max_span_width,
         "--span-loss",                 opts.span_loss,
+        "--span-loss-reduction",       opts.span_loss_reduction,
         "--span-positive-weight",      opts.span_positive_weight,
         "--span-hard-negative-weight", opts.span_hard_negative_weight,
         "--max-grad-norm",             opts.max_grad_norm,
@@ -250,6 +277,18 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
     try train_args_list.appendSlice(allocator, &.{ "--span-negative-weight", opts.span_negative_weight });
     if (opts.lora_only_trainables) try train_args_list.append(allocator, "--lora-only-trainables");
     if (opts.compiled_required) try train_args_list.append(allocator, "--compiled-required");
+    if (opts.activation_checkpointing) {
+        try train_args_list.appendSlice(allocator, &.{
+            "--activation-checkpointing",
+            "--activation-checkpoint-interval",
+            opts.activation_checkpoint_interval,
+            "--activation-checkpoint-strategy",
+            opts.activation_checkpoint_strategy,
+        });
+    }
+    if (!std.mem.eql(u8, opts.structure_span_chunk_samples, "0")) {
+        try train_args_list.appendSlice(allocator, &.{ "--structure-span-chunk-samples", opts.structure_span_chunk_samples });
+    }
     try runCommand(init, allocator, "train-gliner2-autodiff", train_gliner2_autodiff.main, train_args_list.items);
 
     const metal_required = std.mem.eql(u8, opts.backend, "metal");
@@ -283,8 +322,29 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .max_device_trainable_transfer_count = opts.max_device_trainable_transfer_count orelse opts.max_device_resident_transfer_count,
         .max_device_resident_transfer_count = opts.max_device_resident_transfer_count,
         .min_device_trainable_bytes = min_device_trainable_bytes,
+        .max_metal_tensor_device_owned_peak_live_bytes = opts.max_metal_tensor_device_owned_peak_live_bytes,
         .max_metal_runtime_total_bytes = opts.max_metal_runtime_total_bytes,
+        .max_metal_eager_arena_peak_bytes = opts.max_metal_eager_arena_peak_bytes,
+        .max_metal_eager_arena_spill_bytes = opts.max_metal_eager_arena_spill_bytes,
+        .max_metal_chunk_local_output_peak_bytes = opts.max_metal_chunk_local_output_peak_bytes,
+        .max_metal_chunk_local_output_spill_bytes = opts.max_metal_chunk_local_output_spill_bytes,
+        .max_metal_chunk_local_output_unconsumed_hints = opts.max_metal_chunk_local_output_unconsumed_hints,
+        .min_metal_chunk_local_output_consumed_hints = opts.min_metal_chunk_local_output_consumed_hints,
         .min_metal_runtime_reuse_hit_count = opts.min_metal_runtime_reuse_hit_count,
+        .max_graph_command_dispatch_count = opts.max_graph_command_dispatch_count,
+        .max_metal_frame_gpu_ms = opts.max_metal_frame_gpu_ms,
+        .max_metal_last_frame_compute_encoder_count = opts.max_metal_last_frame_compute_encoder_count,
+        .min_metal_frame_chunk_boundary_count = opts.min_metal_frame_chunk_boundary_count,
+        .min_metal_frame_chunk_promoted_value_count = opts.min_metal_frame_chunk_promoted_value_count,
+        .min_metal_frame_chunk_swept_value_count = opts.min_metal_frame_chunk_swept_value_count,
+        .min_graph_runtime_region_dispatch_count = opts.min_graph_runtime_region_dispatch_count,
+        .max_graph_runtime_region_fallback_count = opts.max_graph_runtime_region_fallback_count,
+        .min_graph_runtime_region_elided_node_count = opts.min_graph_runtime_region_elided_node_count,
+        .min_metal_deberta_ffn_forward_region_count = opts.min_metal_deberta_ffn_forward_region_count,
+        .min_metal_deberta_attention_flash_call_count = opts.min_metal_deberta_attention_flash_call_count,
+        .max_metal_deberta_attention_gemm_fallback_count = opts.max_metal_deberta_attention_gemm_fallback_count,
+        .min_metal_deberta_ffn_fused_call_count = opts.min_metal_deberta_ffn_fused_call_count,
+        .max_metal_deberta_ffn_fused_fallback_count = opts.max_metal_deberta_ffn_fused_fallback_count,
     });
     errdefer validation.freeRunValidationSummary(allocator, &run_summary);
 
@@ -521,6 +581,10 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\production_mlx_gate: {}
         \\backend: {s}
         \\compiled_required: {}
+        \\activation_checkpointing: {}
+        \\activation_checkpoint_interval: {s}
+        \\activation_checkpoint_strategy: {s}
+        \\structure_span_chunk_samples: {s}
         \\max_examples: {s}
         \\seq_len: {s}
         \\batch_size: {s}
@@ -529,6 +593,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\lora_dropout: {s}
         \\lora_only_trainables: {}
         \\span_loss: {s}
+        \\span_loss_reduction: {s}
         \\span_positive_weight: {s}
         \\span_label_positive_weights: {?s}
         \\span_negative_weight: {s}
@@ -549,6 +614,10 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.production_mlx_gate,
         opts.backend,
         opts.compiled_required,
+        opts.activation_checkpointing,
+        opts.activation_checkpoint_interval,
+        opts.activation_checkpoint_strategy,
+        opts.structure_span_chunk_samples,
         opts.max_examples,
         opts.seq_len,
         opts.batch_size,
@@ -557,6 +626,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.lora_dropout,
         opts.lora_only_trainables,
         opts.span_loss,
+        opts.span_loss_reduction,
         opts.span_positive_weight,
         opts.span_label_positive_weights,
         opts.span_negative_weight,
@@ -567,8 +637,29 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.min_device_trainable_bytes,
     });
     try writer.interface.print(
+        \\max_metal_tensor_device_owned_peak_live_bytes: {?}
         \\max_metal_runtime_total_bytes: {?}
+        \\max_metal_eager_arena_peak_bytes: {?}
+        \\max_metal_eager_arena_spill_bytes: {?}
+        \\max_metal_chunk_local_output_peak_bytes: {?}
+        \\max_metal_chunk_local_output_spill_bytes: {?}
+        \\max_metal_chunk_local_output_unconsumed_hints: {?}
+        \\min_metal_chunk_local_output_consumed_hints: {?}
         \\min_metal_runtime_reuse_hit_count: {?}
+        \\max_graph_command_dispatch_count: {?}
+        \\max_metal_frame_gpu_ms: {?}
+        \\max_metal_last_frame_compute_encoder_count: {?}
+        \\min_metal_frame_chunk_boundary_count: {?}
+        \\min_metal_frame_chunk_promoted_value_count: {?}
+        \\min_metal_frame_chunk_swept_value_count: {?}
+        \\min_graph_runtime_region_dispatch_count: {?}
+        \\max_graph_runtime_region_fallback_count: {?}
+        \\min_graph_runtime_region_elided_node_count: {?}
+        \\min_metal_deberta_ffn_forward_region_count: {?}
+        \\min_metal_deberta_attention_flash_call_count: {?}
+        \\max_metal_deberta_attention_gemm_fallback_count: {?}
+        \\min_metal_deberta_ffn_fused_call_count: {?}
+        \\max_metal_deberta_ffn_fused_fallback_count: {?}
         \\semantic_golden_count: {}
         \\quality_eval: {}
         \\quality_max_examples: {?s}
@@ -578,8 +669,29 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\semantic_eval_required: {}
         \\
     , .{
+        opts.max_metal_tensor_device_owned_peak_live_bytes,
         opts.max_metal_runtime_total_bytes,
+        opts.max_metal_eager_arena_peak_bytes,
+        opts.max_metal_eager_arena_spill_bytes,
+        opts.max_metal_chunk_local_output_peak_bytes,
+        opts.max_metal_chunk_local_output_spill_bytes,
+        opts.max_metal_chunk_local_output_unconsumed_hints,
+        opts.min_metal_chunk_local_output_consumed_hints,
         opts.min_metal_runtime_reuse_hit_count,
+        opts.max_graph_command_dispatch_count,
+        opts.max_metal_frame_gpu_ms,
+        opts.max_metal_last_frame_compute_encoder_count,
+        opts.min_metal_frame_chunk_boundary_count,
+        opts.min_metal_frame_chunk_promoted_value_count,
+        opts.min_metal_frame_chunk_swept_value_count,
+        opts.min_graph_runtime_region_dispatch_count,
+        opts.max_graph_runtime_region_fallback_count,
+        opts.min_graph_runtime_region_elided_node_count,
+        opts.min_metal_deberta_ffn_forward_region_count,
+        opts.min_metal_deberta_attention_flash_call_count,
+        opts.max_metal_deberta_attention_gemm_fallback_count,
+        opts.min_metal_deberta_ffn_fused_call_count,
+        opts.max_metal_deberta_ffn_fused_fallback_count,
         opts.semantic_golden_count,
         opts.quality_eval,
         opts.quality_max_examples,
@@ -642,6 +754,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.max_span_width = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-loss")) {
             opts.span_loss = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--span-loss-reduction")) {
+            opts.span_loss_reduction = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-positive-weight")) {
             opts.span_positive_weight = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--span-label-positive-weights")) {
@@ -660,6 +774,14 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.backend = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--compiled-required")) {
             opts.compiled_required = true;
+        } else if (std.mem.eql(u8, arg, "--activation-checkpointing")) {
+            opts.activation_checkpointing = true;
+        } else if (std.mem.eql(u8, arg, "--activation-checkpoint-interval")) {
+            opts.activation_checkpoint_interval = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--activation-checkpoint-strategy")) {
+            opts.activation_checkpoint_strategy = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--structure-span-chunk-samples")) {
+            opts.structure_span_chunk_samples = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--production-metal-gate")) {
             applyProductionMetalGateDefaults(&opts);
         } else if (std.mem.eql(u8, arg, "--production-mlx-gate")) {
@@ -701,10 +823,52 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             if (opts.max_device_trainable_transfer_count == null) opts.max_device_trainable_transfer_count = opts.max_device_resident_transfer_count;
         } else if (std.mem.eql(u8, arg, "--min-device-trainable-bytes")) {
             opts.min_device_trainable_bytes = try parseUsizeArg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-tensor-device-owned-peak-live-bytes")) {
+            opts.max_metal_tensor_device_owned_peak_live_bytes = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-metal-runtime-total-bytes")) {
             opts.max_metal_runtime_total_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-eager-arena-peak-bytes")) {
+            opts.max_metal_eager_arena_peak_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-eager-arena-spill-bytes")) {
+            opts.max_metal_eager_arena_spill_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-chunk-local-output-peak-bytes")) {
+            opts.max_metal_chunk_local_output_peak_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-chunk-local-output-spill-bytes")) {
+            opts.max_metal_chunk_local_output_spill_bytes = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-chunk-local-output-unconsumed-hints")) {
+            opts.max_metal_chunk_local_output_unconsumed_hints = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-chunk-local-output-consumed-hints")) {
+            opts.min_metal_chunk_local_output_consumed_hints = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-metal-runtime-reuse-hit-count")) {
             opts.min_metal_runtime_reuse_hit_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-graph-command-dispatch-count")) {
+            opts.max_graph_command_dispatch_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-frame-gpu-ms")) {
+            opts.max_metal_frame_gpu_ms = try parseF64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-last-frame-compute-encoder-count")) {
+            opts.max_metal_last_frame_compute_encoder_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-frame-chunk-boundary-count")) {
+            opts.min_metal_frame_chunk_boundary_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-frame-chunk-promoted-value-count")) {
+            opts.min_metal_frame_chunk_promoted_value_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-frame-chunk-swept-value-count")) {
+            opts.min_metal_frame_chunk_swept_value_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-graph-runtime-region-dispatch-count")) {
+            opts.min_graph_runtime_region_dispatch_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-graph-runtime-region-fallback-count")) {
+            opts.max_graph_runtime_region_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-graph-runtime-region-elided-node-count")) {
+            opts.min_graph_runtime_region_elided_node_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-ffn-forward-region-count")) {
+            opts.min_metal_deberta_ffn_forward_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-attention-flash-call-count")) {
+            opts.min_metal_deberta_attention_flash_call_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-attention-gemm-fallback-count")) {
+            opts.max_metal_deberta_attention_gemm_fallback_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--min-metal-deberta-ffn-fused-call-count")) {
+            opts.min_metal_deberta_ffn_fused_call_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-ffn-fused-fallback-count")) {
+            opts.max_metal_deberta_ffn_fused_fallback_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--allow-flat-loss")) {
             opts.require_loss_decrease = false;
         } else if (std.mem.eql(u8, arg, "--eval-text")) {
@@ -804,8 +968,13 @@ fn applyProductionMetalGateDefaults(opts: *Options) void {
     opts.max_examples = "200";
     opts.seq_len = "32";
     opts.span_loss = "bce";
+    opts.span_loss_reduction = "sum";
     opts.backend = "metal";
     opts.compiled_required = true;
+    opts.activation_checkpointing = true;
+    opts.activation_checkpoint_interval = "1";
+    opts.activation_checkpoint_strategy = "parameters-only";
+    opts.structure_span_chunk_samples = "8";
     opts.min_train_examples = 200;
     opts.min_eval_examples = 200;
     opts.min_total_entities = 100;
@@ -950,12 +1119,22 @@ fn printUsage() void {
         \\  --lora-only-trainables           Freeze regular task-head params (default)
         \\  --train-regular-head             Train regular task-head params too
         \\  --span-loss bce|mse              Span-start label loss (default: bce)
+        \\  --span-loss-reduction mean|sum   Span-start reduction (Metal gate default: sum)
         \\  --span-positive-weight FLOAT     Positive span-label loss weight (default: 32)
         \\  --span-label-positive-weights CSV Per-label positive weights, e.g. person=32,organization=96
         \\  --span-negative-weight FLOAT     Negative span-label loss weight (default: 1)
         \\  --span-hard-negative-weight FLOAT Extra negative weight for spans overlapping gold entities (default: 1)
         \\  --backend auto|metal|mlx|native  Training backend (default: auto)
         \\  --compiled-required              Fail if requested compiled backend falls back
+        \\  --activation-checkpointing       Recompute non-checkpoint activations during backward
+        \\  --activation-checkpoint-interval N
+        \\                                    Save every Nth checkpoint boundary (default: 1)
+        \\  --activation-checkpoint-strategy NAME
+        \\                                    every-n-layers, attention-outputs, or parameters-only
+        \\                                    (default: every-n-layers)
+        \\  --structure-span-chunk-samples N
+        \\                                    Chunk GLiNER2 structure loss by whole-sample groups
+        \\                                    (Metal gate default: 8)
         \\  --production-metal-gate          Canonical 200-step resident Metal gate
         \\  --production-mlx-gate            Canonical 200-step strict MLX gate
         \\  --materialized-dir DIR           Also materialize merged model artifacts
@@ -978,8 +1157,29 @@ fn printUsage() void {
         \\  --max-device-trainable-transfer-count N
         \\  --max-device-resident-transfer-count N
         \\  --min-device-trainable-bytes N
+        \\  --max-metal-tensor-device-owned-peak-live-bytes N
         \\  --max-metal-runtime-total-bytes N
+        \\  --max-metal-eager-arena-peak-bytes N
+        \\  --max-metal-eager-arena-spill-bytes N
+        \\  --max-metal-chunk-local-output-peak-bytes N
+        \\  --max-metal-chunk-local-output-spill-bytes N
+        \\  --max-metal-chunk-local-output-unconsumed-hints N
+        \\  --min-metal-chunk-local-output-consumed-hints N
         \\  --min-metal-runtime-reuse-hit-count N
+        \\  --max-graph-command-dispatch-count N
+        \\  --max-metal-frame-gpu-ms FLOAT
+        \\  --max-metal-last-frame-compute-encoder-count N
+        \\  --min-metal-frame-chunk-boundary-count N
+        \\  --min-metal-frame-chunk-promoted-value-count N
+        \\  --min-metal-frame-chunk-swept-value-count N
+        \\  --min-graph-runtime-region-dispatch-count N
+        \\  --max-graph-runtime-region-fallback-count N
+        \\  --min-graph-runtime-region-elided-node-count N
+        \\  --min-metal-deberta-ffn-forward-region-count N
+        \\  --min-metal-deberta-attention-flash-call-count N
+        \\  --max-metal-deberta-attention-gemm-fallback-count N
+        \\  --min-metal-deberta-ffn-fused-call-count N
+        \\  --max-metal-deberta-ffn-fused-fallback-count N
         \\
     , .{});
 }
@@ -1009,6 +1209,10 @@ test "production Metal gate defaults include shaped quality eval" {
     try std.testing.expect(opts.production_metal_gate);
     try std.testing.expectEqualStrings("metal", opts.backend);
     try std.testing.expect(opts.compiled_required);
+    try std.testing.expect(opts.activation_checkpointing);
+    try std.testing.expectEqualStrings("parameters-only", opts.activation_checkpoint_strategy);
+    try std.testing.expectEqualStrings("8", opts.structure_span_chunk_samples);
+    try std.testing.expectEqualStrings("sum", opts.span_loss_reduction);
     try std.testing.expect(opts.quality_eval);
     try std.testing.expectEqualStrings("25", opts.quality_max_examples.?);
     try std.testing.expectEqualStrings("0.15", opts.min_entity_f1.?);

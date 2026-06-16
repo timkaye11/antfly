@@ -125,6 +125,10 @@ const Options = struct {
     save_best: bool = false,
     report_to: ReportTo = .stdout,
     allow_large_memory: bool = false,
+    activation_checkpointing: bool = false,
+    activation_checkpoint_interval: u32 = 1,
+    activation_checkpoint_strategy: ml.graph.checkpoint.CheckpointStrategy = .every_n_layers,
+    structure_span_chunk_samples: u32 = 0,
 };
 
 const Gliner2TrainBackend = enum {
@@ -196,6 +200,10 @@ pub fn main(init: std.process.Init) !void {
     var save_best: bool = false;
     var report_to: ReportTo = .stdout;
     var allow_large_memory: bool = false;
+    var activation_checkpointing: bool = false;
+    var activation_checkpoint_interval: u32 = 1;
+    var activation_checkpoint_strategy: ml.graph.checkpoint.CheckpointStrategy = .every_n_layers;
+    var structure_span_chunk_samples: u32 = 0;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -304,6 +312,20 @@ pub fn main(init: std.process.Init) !void {
             save_best = true;
         } else if (std.mem.eql(u8, arg, "--allow-large-memory")) {
             allow_large_memory = true;
+        } else if (std.mem.eql(u8, arg, "--activation-checkpointing")) {
+            activation_checkpointing = true;
+        } else if (std.mem.eql(u8, arg, "--activation-checkpoint-interval")) {
+            const val = args.next() orelse return error.MissingActivationCheckpointInterval;
+            activation_checkpoint_interval = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--activation-checkpoint-strategy")) {
+            const val = args.next() orelse return error.MissingActivationCheckpointStrategy;
+            activation_checkpoint_strategy = parseCheckpointStrategy(val) orelse {
+                print("error: unsupported --activation-checkpoint-strategy '{s}' (expected every-n-layers, attention-outputs, or parameters-only)\n", .{val});
+                return error.InvalidActivationCheckpointStrategy;
+            };
+        } else if (std.mem.eql(u8, arg, "--structure-span-chunk-samples")) {
+            const val = args.next() orelse return error.MissingStructureSpanChunkSamples;
+            structure_span_chunk_samples = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--report-to")) {
             const val = args.next() orelse return error.MissingReportTo;
             report_to = parseReportTo(val) orelse {
@@ -391,6 +413,10 @@ pub fn main(init: std.process.Init) !void {
         .save_best = save_best,
         .report_to = report_to,
         .allow_large_memory = allow_large_memory,
+        .activation_checkpointing = activation_checkpointing,
+        .activation_checkpoint_interval = activation_checkpoint_interval,
+        .activation_checkpoint_strategy = activation_checkpoint_strategy,
+        .structure_span_chunk_samples = structure_span_chunk_samples,
     };
 
     try runTraining(allocator, opts);
@@ -941,6 +967,16 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     if (structure_max_instances > 1) {
         print("  structure max instances (per-instance struct loss): {d}\n", .{structure_max_instances});
     }
+    const max_schema_tasks: u32 = if (opts.objective == .gliner2_total_loss)
+        computeMaxSchemaTasks(training_records)
+    else
+        1;
+    if (opts.objective == .gliner2_total_loss) {
+        print("  max schema/task rows per sample: {d}\n", .{max_schema_tasks});
+        if (opts.structure_span_chunk_samples > 0) {
+            print("  structure span chunk samples: {d}\n", .{opts.structure_span_chunk_samples});
+        }
+    }
 
     var gliner_ctx = gliner2_autodiff.GlinerAutodiffCtx.init(.{
         .graph_config = graph_config,
@@ -951,6 +987,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         .span_start_positive_weight = opts.span_positive_weight,
         .span_start_negative_weight = opts.span_negative_weight,
         .structure_max_instances = structure_max_instances,
+        .max_schema_tasks = max_schema_tasks,
+        .structure_span_chunk_samples = opts.structure_span_chunk_samples,
     });
 
     // ------------------------------------------------------------------
@@ -996,7 +1034,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 else => .interpreter,
             },
             .compiled_required = opts.compiled_required,
-            .checkpoint_config = activationCheckpointConfig(),
+            .checkpoint_config = activationCheckpointConfig(opts.activation_checkpointing, opts.activation_checkpoint_interval, opts.activation_checkpoint_strategy),
         },
     );
     defer trainer.deinit();
@@ -1349,7 +1387,15 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                     @intCast(sl),
                 );
                 defer allocator.free(classification_logits);
-                try printGliner2ClassificationDebug(classification_logits, target_slice, targets_shape, entity_types.len);
+                const classification_targets = try compactGliner2TaskRowTargetsForDebug(
+                    allocator,
+                    target_slice,
+                    targets_shape,
+                    actual_batch,
+                    gliner_ctx.config.max_schema_tasks,
+                );
+                defer allocator.free(classification_targets.targets);
+                try printGliner2ClassificationDebug(classification_logits, classification_targets.targets, classification_targets.shape, entity_types.len);
             }
 
             const result = try trainer.step(trainer_input);
@@ -1518,6 +1564,30 @@ fn writeStepMetric(
         .graph_executor_interpreter_fallbacks = timing.profile.graph_executor_interpreter_fallbacks,
         .graph_executor_host_outputs = timing.profile.graph_executor_host_outputs,
         .graph_executor_device_outputs = timing.profile.graph_executor_device_outputs,
+        .graph_executor_metal_frame_chunk_boundaries = timing.profile.graph_executor_metal_frame_chunk_boundaries,
+        .graph_executor_metal_frame_chunk_promoted_values = timing.profile.graph_executor_metal_frame_chunk_promoted_values,
+        .graph_executor_metal_frame_chunk_swept_values = timing.profile.graph_executor_metal_frame_chunk_swept_values,
+        .graph_executor_metal_chunk_local_output_peak_bytes = timing.profile.graph_executor_metal_chunk_local_output_peak_bytes,
+        .graph_executor_metal_chunk_local_output_live_bytes = timing.profile.graph_executor_metal_chunk_local_output_live_bytes,
+        .graph_executor_metal_chunk_local_output_allocations = timing.profile.graph_executor_metal_chunk_local_output_allocations,
+        .graph_executor_metal_chunk_local_output_reuse_hits = timing.profile.graph_executor_metal_chunk_local_output_reuse_hits,
+        .graph_executor_metal_chunk_local_output_consumed_hints = timing.profile.graph_executor_metal_chunk_local_output_consumed_hints,
+        .graph_executor_metal_chunk_local_output_unconsumed_hints = timing.profile.graph_executor_metal_chunk_local_output_unconsumed_hints,
+        .graph_executor_metal_chunk_local_output_spill_bytes = timing.profile.graph_executor_metal_chunk_local_output_spill_bytes,
+        .graph_executor_metal_chunk_local_output_alias_conflicts = timing.profile.graph_executor_metal_chunk_local_output_alias_conflicts,
+        .graph_executor_metal_chunk_local_output_resets = timing.profile.graph_executor_metal_chunk_local_output_resets,
+        .graph_executor_metal_chunk_local_output_reset_freed_bytes = timing.profile.graph_executor_metal_chunk_local_output_reset_freed_bytes,
+        .graph_executor_metal_chunk_local_output_discard_freed_bytes = timing.profile.graph_executor_metal_chunk_local_output_discard_freed_bytes,
+        .graph_executor_metal_chunk_local_output_reset_live_carry_values = timing.profile.graph_executor_metal_chunk_local_output_reset_live_carry_values,
+        .graph_executor_metal_eager_arena_peak_bytes = timing.profile.graph_executor_metal_eager_arena_peak_bytes,
+        .graph_executor_metal_eager_arena_live_bytes = timing.profile.graph_executor_metal_eager_arena_live_bytes,
+        .graph_executor_metal_eager_arena_reuse_hits = timing.profile.graph_executor_metal_eager_arena_reuse_hits,
+        .graph_executor_metal_eager_arena_allocations = timing.profile.graph_executor_metal_eager_arena_allocations,
+        .graph_executor_metal_eager_arena_spill_bytes = timing.profile.graph_executor_metal_eager_arena_spill_bytes,
+        .graph_executor_metal_eager_arena_hazard_declines = timing.profile.graph_executor_metal_eager_arena_hazard_declines,
+        .graph_executor_metal_eager_arena_alias_conflicts = timing.profile.graph_executor_metal_eager_arena_alias_conflicts,
+        .graph_executor_metal_eager_arena_alias_reclaims = timing.profile.graph_executor_metal_eager_arena_alias_reclaims,
+        .graph_executor_metal_eager_arena_alias_reclaim_bytes = timing.profile.graph_executor_metal_eager_arena_alias_reclaim_bytes,
         .graph_executor_regions = timing.profile.graph_executor_regions,
         .graph_executor_region_ops = timing.profile.graph_executor_region_ops,
         .graph_executor_runtime_region_dispatches = timing.profile.graph_executor_runtime_region_dispatches,
@@ -1527,6 +1597,7 @@ fn writeStepMetric(
         .graph_executor_runtime_region_elided_nodes = timing.profile.graph_executor_runtime_region_elided_nodes,
         .graph_executor_runtime_region_plan_compiles = timing.profile.graph_executor_runtime_region_plan_compiles,
         .graph_executor_runtime_region_plan_reuses = timing.profile.graph_executor_runtime_region_plan_reuses,
+        .metal_deberta_ffn_forward_regions = timing.profile.metal_deberta_ffn_forward_regions,
         .graph_executor_runtime_frame_candidates = timing.profile.graph_executor_runtime_frame_candidates,
         .graph_executor_runtime_frame_eligible = timing.profile.graph_executor_runtime_frame_eligible,
         .graph_executor_plan_build_ms = nsToMillis(timing.profile.graph_executor_plan_build_ns),
@@ -1537,7 +1608,18 @@ fn writeStepMetric(
         .metal_frame_gpu_ms = nsToMillis(timing.profile.metal_frame_gpu_ns),
         .metal_tensor_device_owned_live_bytes = timing.profile.metal_tensor_device_owned_live_bytes,
         .metal_tensor_device_owned_peak_live_bytes = timing.profile.metal_tensor_device_owned_peak_live_bytes,
+        .metal_tensor_device_owned_peak_lt_256kb_bytes = timing.profile.metal_tensor_device_owned_peak_lt_256kb_bytes,
+        .metal_tensor_device_owned_peak_256kb_1mb_bytes = timing.profile.metal_tensor_device_owned_peak_256kb_1mb_bytes,
+        .metal_tensor_device_owned_peak_1mb_4mb_bytes = timing.profile.metal_tensor_device_owned_peak_1mb_4mb_bytes,
+        .metal_tensor_device_owned_peak_4mb_16mb_bytes = timing.profile.metal_tensor_device_owned_peak_4mb_16mb_bytes,
+        .metal_tensor_device_owned_peak_ge_16mb_bytes = timing.profile.metal_tensor_device_owned_peak_ge_16mb_bytes,
         .metal_runtime_total_bytes = timing.profile.metal_runtime_total_bytes,
+        .metal_runtime_scratch_bytes = timing.profile.metal_runtime_scratch_bytes,
+        .metal_runtime_scratch_pool_bytes = timing.profile.metal_runtime_scratch_pool_bytes,
+        .metal_runtime_graph_plan_bytes = timing.profile.metal_runtime_graph_plan_bytes,
+        .metal_runtime_dense_linear_bytes = timing.profile.metal_runtime_dense_linear_bytes,
+        .metal_runtime_attention_span_bytes = timing.profile.metal_runtime_attention_span_bytes,
+        .metal_runtime_hidden_state_bytes = timing.profile.metal_runtime_hidden_state_bytes,
         .metal_runtime_frame_retained_bytes = timing.profile.metal_runtime_frame_retained_bytes,
         .metal_runtime_reuse_pool_bytes = timing.profile.metal_runtime_reuse_pool_bytes,
         .metal_runtime_reuse_pool_slots = timing.profile.metal_runtime_reuse_pool_slots,
@@ -2524,6 +2606,21 @@ fn parseReportTo(value: []const u8) ?ReportTo {
     return null;
 }
 
+fn parseCheckpointStrategy(value: []const u8) ?ml.graph.checkpoint.CheckpointStrategy {
+    if (std.ascii.eqlIgnoreCase(value, "every-n-layers") or std.ascii.eqlIgnoreCase(value, "every_n_layers")) return .every_n_layers;
+    if (std.ascii.eqlIgnoreCase(value, "attention-outputs") or std.ascii.eqlIgnoreCase(value, "attention_outputs")) return .attention_outputs;
+    if (std.ascii.eqlIgnoreCase(value, "parameters-only") or std.ascii.eqlIgnoreCase(value, "parameters_only")) return .parameters_only;
+    return null;
+}
+
+fn checkpointStrategyName(strategy: ml.graph.checkpoint.CheckpointStrategy) []const u8 {
+    return switch (strategy) {
+        .every_n_layers => "every-n-layers",
+        .attention_outputs => "attention-outputs",
+        .parameters_only => "parameters-only",
+    };
+}
+
 fn selectBackend(
     requested: Gliner2TrainBackend,
     force_native: bool,
@@ -3228,6 +3325,44 @@ fn printGliner2ClassificationDebug(
     print("]}}\n", .{});
 }
 
+const CompactClassificationTargets = struct {
+    targets: []f32,
+    shape: ml.graph.Shape,
+};
+
+fn compactGliner2TaskRowTargetsForDebug(
+    allocator: std.mem.Allocator,
+    targets: []const f32,
+    targets_shape: ml.graph.Shape,
+    batch: u32,
+    max_schema_tasks: u32,
+) !CompactClassificationTargets {
+    if (targets_shape.rank() != 2 or batch == 0 or max_schema_tasks == 0) return error.InvalidGlinerSpanTargetShape;
+    const rows: usize = @intCast(targets_shape.dims[0]);
+    const width: usize = @intCast(targets_shape.dims[1]);
+    if (targets.len != rows * width) return error.InvalidGlinerSpanTargetShape;
+    if (@mod(rows, @as(usize, batch)) != 0) return error.InvalidGlinerSpanTargetShape;
+    const max_spans_per_sample = rows / @as(usize, batch);
+    const schema_tasks = @min(max_spans_per_sample, @as(usize, max_schema_tasks));
+    const compact_rows = @as(usize, batch) * schema_tasks;
+    const compact = try allocator.alloc(f32, compact_rows * width);
+    errdefer allocator.free(compact);
+    for (0..@as(usize, batch)) |sample_idx| {
+        for (0..schema_tasks) |task_idx| {
+            const src_row = sample_idx * max_spans_per_sample + task_idx;
+            const dst_row = sample_idx * schema_tasks + task_idx;
+            @memcpy(
+                compact[dst_row * width .. (dst_row + 1) * width],
+                targets[src_row * width .. (src_row + 1) * width],
+            );
+        }
+    }
+    return .{
+        .targets = compact,
+        .shape = ml.graph.Shape.init(.f32, &.{ @intCast(compact_rows), @intCast(width) }),
+    };
+}
+
 fn printSpanPreprocessDebug(batch: *const gliner2_data.EncodedBatch) void {
     const input_ids = batch.input_ids[0..batch.max_length];
     const attention_mask = batch.attention_mask[0..batch.max_length];
@@ -3466,6 +3601,16 @@ fn printUsage() void {
         \\  --save-best               Snapshot adapters to <out-dir>/best when the eval metric improves
         \\  --allow-large-memory      Proceed even when the estimated peak memory exceeds the safe
         \\                            budget (~60% of physical RAM); risks a system-wide OOM
+        \\  --activation-checkpointing Recompute non-checkpoint activations during backward to lower
+        \\                            Metal peak memory for large batch/seq runs
+        \\  --activation-checkpoint-interval <n>
+        \\                            Save every Nth checkpoint boundary (default: 1)
+        \\  --activation-checkpoint-strategy <name>
+        \\                            every-n-layers, attention-outputs, or parameters-only
+        \\                            (default: every-n-layers)
+        \\  --structure-span-chunk-samples <n>
+        \\                            Chunk GLiNER2 structure span loss by whole-sample groups
+        \\                            to reduce large span-head tensors (0 = disabled)
         \\  --report-to <name>        stdout or jsonl; jsonl emits one JSON object per step/eval to stdout
         \\  --dump-span-parity        Print first span-start batch logits/label/mask BCE stats as JSON
         \\  --dump-optimizer-parity   Print per-step LoRA weight/Adam m/v state heads as JSON
@@ -3590,18 +3735,36 @@ fn shuffleExamplesAndRecords(prng: *std.Random, examples: []gliner2_data.Example
 /// peak activation memory (trades ~1.3-2x forward compute for memory), needed
 /// for large batch/seq where the full activation tape OOMs the GPU. Optional
 /// `TERMITE_GLINER2_CHECKPOINT_INTERVAL=N` (default 1) saves every N layers.
-fn activationCheckpointConfig() ?ml.graph.checkpoint.CheckpointConfig {
-    const cstr = std.c.getenv("TERMITE_GLINER2_ACTIVATION_CHECKPOINTING") orelse return null;
-    const val = std.mem.span(cstr);
-    if (val.len == 0 or val[0] == '0') return null;
-    var interval: u32 = 1;
+/// `TERMITE_GLINER2_CHECKPOINT_STRATEGY=parameters-only` keeps only roots/loss
+/// and recomputes forward activations needed by backward.
+fn activationCheckpointConfig(
+    cli_enabled: bool,
+    cli_interval: u32,
+    cli_strategy: ml.graph.checkpoint.CheckpointStrategy,
+) ?ml.graph.checkpoint.CheckpointConfig {
+    const env_enabled = blk: {
+        const cstr = std.c.getenv("TERMITE_GLINER2_ACTIVATION_CHECKPOINTING") orelse break :blk false;
+        const val = std.mem.span(cstr);
+        break :blk val.len > 0 and val[0] != '0';
+    };
+    if (!cli_enabled and !env_enabled) return null;
+    var interval: u32 = if (cli_interval >= 1) cli_interval else 1;
     if (std.c.getenv("TERMITE_GLINER2_CHECKPOINT_INTERVAL")) |ic| {
         if (std.fmt.parseInt(u32, std.mem.trim(u8, std.mem.span(ic), " \t\r\n"), 10)) |n| {
             if (n >= 1) interval = n;
         } else |_| {}
     }
-    print("  activation checkpointing: ON (every {d} layer(s))\n", .{interval});
-    return .{ .strategy = .every_n_layers, .layer_interval = interval };
+    var strategy = cli_strategy;
+    if (std.c.getenv("TERMITE_GLINER2_CHECKPOINT_STRATEGY")) |sc| {
+        const trimmed = std.mem.trim(u8, std.mem.span(sc), " \t\r\n");
+        if (parseCheckpointStrategy(trimmed)) |parsed| {
+            strategy = parsed;
+        } else {
+            print("warning: ignoring unsupported TERMITE_GLINER2_CHECKPOINT_STRATEGY='{s}'\n", .{trimmed});
+        }
+    }
+    print("  activation checkpointing: ON (strategy={s} interval={d})\n", .{ checkpointStrategyName(strategy), interval });
+    return .{ .strategy = strategy, .layer_interval = interval };
 }
 
 /// Max structure `gold_count` (capped at upstream's 19) across all
@@ -3622,6 +3785,15 @@ fn computeMaxStructureInstances(records: []const gliner2_data.UpstreamRecord) u3
         }
     }
     return max_instances;
+}
+
+fn computeMaxSchemaTasks(records: []const gliner2_data.UpstreamRecord) u32 {
+    var max_tasks: u32 = 1;
+    for (records) |record| {
+        const count: u32 = @intCast(@max(record.tasks.len, @as(usize, 1)));
+        if (count > max_tasks) max_tasks = count;
+    }
+    return max_tasks;
 }
 
 fn fillGliner2TotalLossTargetsFromRecords(
