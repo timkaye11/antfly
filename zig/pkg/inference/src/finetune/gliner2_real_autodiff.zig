@@ -1624,6 +1624,15 @@ fn buildMaskedSpanStartBceLoss(
     negative_weight: f32,
     reduction: SpanStartLossReduction,
 ) !NodeId {
+    if (label_positive_weights == null) {
+        return bld.maskedBceWithLogitsLoss(logits, labels, mask, .{
+            .positive_weight = positive_weight,
+            .negative_weight = negative_weight,
+            .eps = 1e-6,
+            .reduction = if (reduction == .sum) .sum else .mean,
+        });
+    }
+
     const in_shape = bld.graph.node(logits).output_shape;
     const rank = in_shape.rank();
     var all_axes: [8]u8 = undefined;

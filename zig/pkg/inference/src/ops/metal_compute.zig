@@ -1014,6 +1014,86 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    fn dotGeneral2DManyOp(ctx: *anyopaque, request: *const ops.DotGeneral2DManyRequest) anyerror!?ops.DotGeneral2DManyResult {
+        const count = request.lhs.len;
+        if (count < 2 or count > 8 or request.rhs.len != count) return null;
+        if (request.m == 0 or request.n == 0 or request.k <= 1 or request.rhs_contract_axis > 1) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+
+        var lhs_mts: [8]MetalTensor = undefined;
+        var rhs_mts: [8]MetalTensor = undefined;
+        var out_mts: [8]MetalTensor = undefined;
+        var lhs_init: usize = 0;
+        var rhs_init: usize = 0;
+        var out_init: usize = 0;
+        var out_moved: [8]bool = [_]bool{false} ** 8;
+        defer {
+            for (lhs_mts[0..lhs_init]) |*tensor| tensor.deinit();
+        }
+        defer {
+            for (rhs_mts[0..rhs_init]) |*tensor| tensor.deinit();
+        }
+        errdefer {
+            for (out_mts[0..out_init], 0..) |*tensor, idx| {
+                if (!out_moved[idx]) tensor.deinit();
+            }
+        }
+
+        for (0..count) |idx| {
+            if (bufHasAnyQuantizedStorage(toBuf(request.lhs[idx])) or bufHasAnyQuantizedStorage(toBuf(request.rhs[idx]))) return null;
+            lhs_mts[idx] = lhs_tensor: {
+                for (0..idx) |prev| {
+                    if (request.lhs[idx] == request.lhs[prev]) break :lhs_tensor try lhs_mts[prev].retainedCopy();
+                }
+                break :lhs_tensor self.ownedDeviceMetalTensorFromCt(request.lhs[idx]) catch return null;
+            };
+            lhs_init += 1;
+            rhs_mts[idx] = rhs_tensor: {
+                for (0..idx) |prev| {
+                    if (request.rhs[idx] == request.rhs[prev]) break :rhs_tensor try rhs_mts[prev].retainedCopy();
+                }
+                break :rhs_tensor self.ownedDeviceMetalTensorFromCt(request.rhs[idx]) catch return null;
+            };
+            rhs_init += 1;
+            if (!lhs_mts[idx].isDevice() or !rhs_mts[idx].isDevice()) return null;
+            if (lhs_mts[idx].elemCount() != request.m * request.k or rhs_mts[idx].elemCount() != request.n * request.k) return null;
+            const out_shape = [_]i32{ @intCast(request.m), @intCast(request.n) };
+            out_mts[idx] = try MetalTensor.deviceAllocate(@ptrCast(runtime), request.m * request.n * @sizeOf(f32), .private, &out_shape);
+            out_init += 1;
+        }
+
+        const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(scope);
+        const ok = try metal_runtime.decoderRuntimeDotGeneral2DManyF32DeviceInto(
+            self.provider_impl,
+            lhs_mts[0..count],
+            rhs_mts[0..count],
+            out_mts[0..count],
+            request.m,
+            request.n,
+            request.k,
+            request.rhs_contract_axis,
+        );
+        if (!ok) {
+            for (out_mts[0..out_init]) |*tensor| tensor.deinit();
+            return null;
+        }
+
+        const outputs = try request.allocator.alloc(CT, count);
+        errdefer request.allocator.free(outputs);
+        var output_count: usize = 0;
+        errdefer {
+            for (outputs[0..output_count]) |ct| freeOp(ctx, ct);
+        }
+        for (0..count) |idx| {
+            outputs[idx] = try self.ctFromOwnedMetalTensor(out_mts[idx]);
+            out_moved[idx] = true;
+            output_count += 1;
+        }
+        return .{ .outputs = outputs };
+    }
+
     /// Last-axis reduce (kind_id: sum=0,max=1,mean=2) of `input` into pooled
     /// `out_ct`. Clean device-resident path only (declines lazy/quant/view,
     /// non-last-axis, multi-axis) → caller falls back.
@@ -8239,6 +8319,116 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         return self.hostFallbackSoftmax(input, last_dim_size, false);
+    }
+
+    fn maskedBceSigmoid(x: f32) f32 {
+        return if (x >= 0) 1.0 / (1.0 + @exp(-x)) else blk: {
+            const e = @exp(x);
+            break :blk e / (1.0 + e);
+        };
+    }
+
+    fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const out_shape_i32 = try self.i32ShapeFromI64(request.output_shape);
+        defer self.allocator.free(out_shape_i32);
+
+        device_path: {
+            if (toBuf(request.logits).quantized_storage != null or toBuf(request.labels).quantized_storage != null or toBuf(request.mask).quantized_storage != null) break :device_path;
+            var logits_mt = self.ownedDeviceMetalTensorFromCt(request.logits) catch break :device_path;
+            defer logits_mt.deinit();
+            var labels_mt = self.ownedDeviceMetalTensorFromCt(request.labels) catch break :device_path;
+            defer labels_mt.deinit();
+            var mask_mt = self.ownedDeviceMetalTensorFromCt(request.mask) catch break :device_path;
+            defer mask_mt.deinit();
+            if (try metal_runtime.decoderRuntimeMaskedBceWithLogitsLossDevice(
+                self.provider_impl,
+                logits_mt,
+                labels_mt,
+                mask_mt,
+                request.positive_weight,
+                request.negative_weight,
+                request.eps,
+                request.mean_reduction,
+                out_shape_i32,
+            )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        const logits = try hostSliceForBuf(toBuf(request.logits));
+        const labels = try hostSliceForBuf(toBuf(request.labels));
+        const mask = try hostSliceForBuf(toBuf(request.mask));
+        if (labels.len != logits.len or mask.len != logits.len) return error.ShapeMismatch;
+        var numerator: f32 = 0.0;
+        var denom: f32 = 0.0;
+        for (logits, 0..) |logit, i| {
+            const m = mask[i];
+            const safe_logit = logit * m;
+            const safe_label = labels[i] * m;
+            const bce = @max(safe_logit, 0.0) - safe_label * safe_logit + @log(1.0 + @exp(-@abs(safe_logit)));
+            const label_weight = safe_label * request.positive_weight + (1.0 - safe_label) * request.negative_weight;
+            numerator += bce * label_weight * m;
+            denom += m * label_weight;
+        }
+        const output = try self.allocator.alloc(f32, 1);
+        errdefer self.allocator.free(output);
+        output[0] = if (request.mean_reduction) numerator / (denom + request.eps) else numerator;
+        return denseBuf(self.allocator, output, true, out_shape_i32);
+    }
+
+    fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsBackwardRequest) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const logits_shape_i32 = try self.i32ShapeFromI64(request.logits_shape);
+        defer self.allocator.free(logits_shape_i32);
+
+        device_path: {
+            if (toBuf(request.logits).quantized_storage != null or toBuf(request.labels).quantized_storage != null or toBuf(request.mask).quantized_storage != null or toBuf(request.upstream).quantized_storage != null) break :device_path;
+            var logits_mt = self.ownedDeviceMetalTensorFromCt(request.logits) catch break :device_path;
+            defer logits_mt.deinit();
+            var labels_mt = self.ownedDeviceMetalTensorFromCt(request.labels) catch break :device_path;
+            defer labels_mt.deinit();
+            var mask_mt = self.ownedDeviceMetalTensorFromCt(request.mask) catch break :device_path;
+            defer mask_mt.deinit();
+            var upstream_mt = self.ownedDeviceMetalTensorFromCt(request.upstream) catch break :device_path;
+            defer upstream_mt.deinit();
+            if (try metal_runtime.decoderRuntimeMaskedBceWithLogitsBackwardDevice(
+                self.provider_impl,
+                logits_mt,
+                labels_mt,
+                mask_mt,
+                upstream_mt,
+                request.positive_weight,
+                request.negative_weight,
+                request.eps,
+                request.mean_reduction,
+            )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        }
+
+        const logits = try hostSliceForBuf(toBuf(request.logits));
+        const labels = try hostSliceForBuf(toBuf(request.labels));
+        const mask = try hostSliceForBuf(toBuf(request.mask));
+        const upstream = try hostSliceForBuf(toBuf(request.upstream));
+        if (labels.len != logits.len or mask.len != logits.len or upstream.len == 0) return error.ShapeMismatch;
+        var denom: f32 = 0.0;
+        if (request.mean_reduction) {
+            for (labels, 0..) |label, i| {
+                const m = mask[i];
+                const safe_label = label * m;
+                const label_weight = safe_label * request.positive_weight + (1.0 - safe_label) * request.negative_weight;
+                denom += m * label_weight;
+            }
+            denom += request.eps;
+        }
+        const scale = if (request.mean_reduction) upstream[0] / denom else upstream[0];
+        const output = try self.allocator.alloc(f32, logits.len);
+        errdefer self.allocator.free(output);
+        for (logits, 0..) |logit, i| {
+            const m = mask[i];
+            const safe_logit = logit * m;
+            const safe_label = labels[i] * m;
+            const label_weight = safe_label * request.positive_weight + (1.0 - safe_label) * request.negative_weight;
+            output[i] = scale * label_weight * m * m * (maskedBceSigmoid(safe_logit) - safe_label);
+        }
+        return denseBuf(self.allocator, output, true, logits_shape_i32);
     }
 
     fn scaledDotProductAttentionOp(
@@ -21614,6 +21804,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.transposeOp = primTransposeOp;
         vt.broadcastInDimOp = primBroadcastInDimOp;
         vt.dotGeneralOp = dotGeneralOp;
+        vt.dotGeneral2DMany = dotGeneral2DManyOp;
         vt.scatterAddOp = primScatterAddOp;
         vt.gatherAddBiasAxis0Op = primGatherAddBiasAxis0Op;
         vt.gatherOp = primGatherOp;
@@ -21621,6 +21812,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatPrimOp = concatPrimOp;
         vt.softmaxOp = softmaxOp;
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
+        vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;
+        vt.maskedBceWithLogitsBackward = maskedBceWithLogitsBackwardOp;
         vt.disentangledRelativeAttention = disentangledRelativeAttentionOp;
         vt.disentangledRelativeAttentionBackward = disentangledRelativeAttentionBackwardOp;
         vt.causalSelfAttention = causalSelfAttentionOp;

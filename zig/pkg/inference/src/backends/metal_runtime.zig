@@ -3554,6 +3554,84 @@ pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows:
     return output_device;
 }
 
+pub fn decoderRuntimeMaskedBceWithLogitsLossDevice(
+    self: anytype,
+    logits: MetalTensor,
+    labels: MetalTensor,
+    mask: MetalTensor,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: bool,
+    output_shape: []const i32,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!logits.isDevice() or !labels.isDevice() or !mask.isDevice()) return null;
+    const elem_count = logits.elemCount();
+    if (elem_count == 0 or labels.elemCount() != elem_count or mask.elemCount() != elem_count) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, @sizeOf(f32), .private, output_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_masked_bce_with_logits_loss_device(
+        runtime,
+        logits.deviceHandle(),
+        logits.deviceByteOffset(),
+        labels.deviceHandle(),
+        labels.deviceByteOffset(),
+        mask.deviceHandle(),
+        mask.deviceByteOffset(),
+        elem_count,
+        positive_weight,
+        negative_weight,
+        eps,
+        @intFromBool(mean_reduction),
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
+pub fn decoderRuntimeMaskedBceWithLogitsBackwardDevice(
+    self: anytype,
+    logits: MetalTensor,
+    labels: MetalTensor,
+    mask: MetalTensor,
+    upstream: MetalTensor,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: bool,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!logits.isDevice() or !labels.isDevice() or !mask.isDevice() or !upstream.isDevice()) return null;
+    const elem_count = logits.elemCount();
+    if (elem_count == 0 or labels.elemCount() != elem_count or mask.elemCount() != elem_count or upstream.elemCount() == 0) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, logits.shape());
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_masked_bce_with_logits_backward_device(
+        runtime,
+        logits.deviceHandle(),
+        logits.deviceByteOffset(),
+        labels.deviceHandle(),
+        labels.deviceByteOffset(),
+        mask.deviceHandle(),
+        mask.deviceByteOffset(),
+        upstream.deviceHandle(),
+        upstream.deviceByteOffset(),
+        elem_count,
+        positive_weight,
+        negative_weight,
+        eps,
+        @intFromBool(mean_reduction),
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
 pub fn decoderRuntimeReduceLastDimDevice(self: anytype, input: MetalTensor, rows: usize, dim: usize, kind: u32, output_shape: []const i32) !?MetalTensor {
     return decoderRuntimeReduceLastDimDeviceImpl(self, input, rows, dim, kind, output_shape, null);
 }
@@ -4328,6 +4406,56 @@ fn decoderRuntimeDotGeneral2DF32DeviceImpl(
     );
     if (rc != 0) return null;
     return output_device;
+}
+
+pub fn decoderRuntimeDotGeneral2DManyF32DeviceInto(
+    self: anytype,
+    lhs: []const MetalTensor,
+    rhs: []const MetalTensor,
+    outputs: []const MetalTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    const count = lhs.len;
+    if (count < 2 or count > 8 or rhs.len != count or outputs.len != count) return false;
+    if (m == 0 or n == 0 or k == 0 or rhs_contract_axis > 1) return false;
+    if (m > std.math.maxInt(usize) / k or m > std.math.maxInt(usize) / n or n > std.math.maxInt(usize) / k) return false;
+
+    var lhs_handles: [8]?*anyopaque = [_]?*anyopaque{null} ** 8;
+    var rhs_handles: [8]?*anyopaque = [_]?*anyopaque{null} ** 8;
+    var output_handles: [8]?*anyopaque = [_]?*anyopaque{null} ** 8;
+    var lhs_offsets: [8]usize = [_]usize{0} ** 8;
+    var rhs_offsets: [8]usize = [_]usize{0} ** 8;
+    var output_offsets: [8]usize = [_]usize{0} ** 8;
+    for (0..count) |idx| {
+        if (!lhs[idx].isDevice() or !rhs[idx].isDevice() or !outputs[idx].isDevice()) return false;
+        if (lhs[idx].elemCount() != m * k or rhs[idx].elemCount() != n * k or outputs[idx].elemCount() != m * n) return false;
+        lhs_handles[idx] = lhs[idx].deviceHandle();
+        rhs_handles[idx] = rhs[idx].deviceHandle();
+        output_handles[idx] = outputs[idx].deviceHandle();
+        lhs_offsets[idx] = lhs[idx].deviceByteOffset();
+        rhs_offsets[idx] = rhs[idx].deviceByteOffset();
+        output_offsets[idx] = outputs[idx].deviceByteOffset();
+    }
+    const rc = termite_metal_decode_runtime_dot_general_2d_many_f32_device(
+        runtime,
+        &lhs_handles,
+        &lhs_offsets,
+        &rhs_handles,
+        &rhs_offsets,
+        count,
+        m,
+        n,
+        k,
+        rhs_contract_axis,
+        &output_handles,
+        &output_offsets,
+    );
+    return rc == 0;
 }
 
 pub fn decoderRuntimeDotGeneralRank1F32Device(
@@ -8694,6 +8822,40 @@ pub extern fn termite_metal_decode_runtime_apply_softmax_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_masked_bce_with_logits_loss_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    labels_handle: ?*anyopaque,
+    labels_offset: usize,
+    mask_handle: ?*anyopaque,
+    mask_offset: usize,
+    elem_count: usize,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_masked_bce_with_logits_backward_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    labels_handle: ?*anyopaque,
+    labels_offset: usize,
+    mask_handle: ?*anyopaque,
+    mask_offset: usize,
+    upstream_handle: ?*anyopaque,
+    upstream_offset: usize,
+    elem_count: usize,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: u32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_reduce_last_dim_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,
@@ -8935,6 +9097,20 @@ pub extern fn termite_metal_decode_runtime_dot_general_2d_f32_device(
     rhs_contract_axis: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_dot_general_2d_many_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs_handles: [*c]const ?*anyopaque,
+    lhs_offsets: [*c]const usize,
+    rhs_handles: [*c]const ?*anyopaque,
+    rhs_offsets: [*c]const usize,
+    count: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+    output_handles: [*c]const ?*anyopaque,
+    output_offsets: [*c]const usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_dot_general_rank1_f32_device(
     runtime: ?*RawMetalDecodeRuntime,

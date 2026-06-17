@@ -2681,7 +2681,6 @@ fn fillUpstreamSpanGrid(
         if (task.kind == .classifications) continue;
         const count_state: i32 = @intCast(@min(task.count, @as(usize, 19)) + 1);
         for (task.fields) |field| {
-            const span_idx = locateUpstreamFieldSpanIdx(field, char_to_word, prefix_word_count, max_words, max_span_width) orelse continue;
             const label_idx = if (task.kind == .entities)
                 indexOfLabel(entity_types, field.name)
             else blk: {
@@ -2690,8 +2689,14 @@ fn fillUpstreamSpanGrid(
                 break :blk indexOfLabel(entity_types, label);
             };
             if (label_idx) |idx| {
-                span_labels[span_idx * num_entity_types + idx] = 1.0;
+                // The schema row is active even when its gold mention is not
+                // present in the text; upstream still trains those spans as
+                // negatives for this label.
                 entity_type_kind[idx] = count_state;
+            }
+            const span_idx = locateUpstreamFieldSpanIdx(field, char_to_word, prefix_word_count, max_words, max_span_width) orelse continue;
+            if (label_idx) |idx| {
+                span_labels[span_idx * num_entity_types + idx] = 1.0;
             }
         }
     }

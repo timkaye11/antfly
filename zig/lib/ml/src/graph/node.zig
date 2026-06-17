@@ -351,6 +351,18 @@ pub const SoftmaxAttrs = struct {
     dim: u32, // size of last dimension (softmax axis)
 };
 
+pub const MaskedBceReduction = enum(u8) {
+    sum,
+    mean,
+};
+
+pub const MaskedBceWithLogitsAttrs = struct {
+    positive_weight: f32 = 1.0,
+    negative_weight: f32 = 1.0,
+    eps: f32 = 1e-6,
+    reduction: MaskedBceReduction = .mean,
+};
+
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
@@ -435,6 +447,8 @@ pub const OpCode = union(enum) {
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,
     fused_log_softmax: SoftmaxAttrs,
+    fused_masked_bce_with_logits_loss: MaskedBceWithLogitsAttrs,
+    fused_masked_bce_with_logits_backward: MaskedBceWithLogitsAttrs,
 
     pub fn isFused(self: OpCode) bool {
         return switch (self) {

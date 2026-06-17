@@ -212,6 +212,7 @@ const RuntimeRegionKind = enum(u8) {
     q_linear,
     linear_qkv,
     grouped_linear_qkv_slice,
+    packed_linear_qkv_slice,
     rms_norm_grouped_linear_qkv_slice,
     attention_output_residual,
     rms_norm_gated_ffn_residual,
@@ -237,6 +238,7 @@ const RuntimeRegion = union(RuntimeRegionKind) {
     q_linear: QLinearPattern,
     linear_qkv: LinearNoBiasQkvPattern,
     grouped_linear_qkv_slice: GroupedLinearQkvSlicePattern,
+    packed_linear_qkv_slice: PackedLinearQkvSlicePattern,
     rms_norm_grouped_linear_qkv_slice: RmsNormGroupedLinearQkvSlicePattern,
     attention_output_residual: AttentionOutputResidualPattern,
     rms_norm_gated_ffn_residual: RmsNormGatedFfnResidualPattern,
@@ -311,6 +313,7 @@ const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     q_linear: PreparedLinearRegion,
     linear_qkv: PreparedQkvRegion,
     grouped_linear_qkv_slice: PreparedQkvRegion,
+    packed_linear_qkv_slice: PreparedQkvRegion,
     rms_norm_grouped_linear_qkv_slice: PreparedRmsNormGroupedQkvRegion,
     attention_output_residual: PreparedAttentionOutputResidualRegion,
     rms_norm_gated_ffn_residual: PreparedRmsNormGatedFfnResidualRegion,
@@ -1989,6 +1992,8 @@ pub const MetalPartitionExecutor = struct {
                     effective_exec_ctx,
                     &exec_state,
                     skipped_nodes,
+                    elision_protected_nodes,
+                    runtime_region_plan,
                     last_use,
                     rt_map,
                     donated,
@@ -3086,7 +3091,7 @@ fn recordMetalCommandDispatchFamily(stats: *PartitionExecutor.ExecutionStats, gr
         .fused_gelu, .fused_gelu_exact, .fused_relu, .fused_silu, .fused_quick_gelu, .fused_sigmoid, .fused_tanh_act => {
             stats.metal_command_activation_dispatches += 1;
         },
-        .fused_gelu_backward, .fused_gelu_exact_backward, .fused_layer_norm_backward, .fused_disentangled_attention_backward => {
+        .fused_gelu_backward, .fused_gelu_exact_backward, .fused_layer_norm_backward, .fused_disentangled_attention_backward, .fused_masked_bce_with_logits_backward => {
             stats.metal_command_activation_backward_dispatches += 1;
         },
         else => stats.metal_command_other_dispatches += 1,
@@ -3891,6 +3896,12 @@ fn headMlpForwardRuntimeRegionEnabled() bool {
         !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
 }
 
+fn groupedHeadDotRuntimeCommandEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GROUPED_HEAD_DOT", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+}
+
 /// When set, promote a gather's input operand to device residency before the
 /// gather command. Frozen embedding-table gathers otherwise run the host
 /// fallback (no_input_metal) and force a host-output drain. Default OFF; this
@@ -4147,6 +4158,12 @@ fn buildRuntimeRegionPlan(
         if (matchGroupedLinearQkvSlicePattern(graph, null_values, node_ids, node_pos, reachable, skipped)) |pattern| {
             regions[node_pos] = .{ .grouped_linear_qkv_slice = pattern };
             markGroupedLinearQkvSkipped(skipped, pattern);
+            region_count += 1;
+            continue;
+        }
+        if (matchPackedLinearQkvSlicePattern(graph, null_values, node_ids, node_pos, reachable, skipped)) |pattern| {
+            regions[node_pos] = .{ .packed_linear_qkv_slice = pattern };
+            markPackedLinearQkvSkipped(skipped, pattern);
             region_count += 1;
             continue;
         }
@@ -5021,6 +5038,13 @@ fn markGroupedLinearQkvSkipped(skipped: []bool, pattern: GroupedLinearQkvSlicePa
     markSkipped(skipped, pattern.v_slice_id);
 }
 
+fn markPackedLinearQkvSkipped(skipped: []bool, pattern: PackedLinearQkvSlicePattern) void {
+    markSkipped(skipped, pattern.linear_id);
+    markSkipped(skipped, pattern.q_slice_id);
+    markSkipped(skipped, pattern.k_slice_id);
+    markSkipped(skipped, pattern.v_slice_id);
+}
+
 fn markRmsNormGroupedLinearQkvSkipped(skipped: []bool, pattern: RmsNormGroupedLinearQkvSlicePattern) void {
     markSkipped(skipped, pattern.norm_id);
     markGroupedLinearQkvSkipped(skipped, pattern.qkv);
@@ -5220,11 +5244,28 @@ fn tryExecuteFusedMetalGraphPattern(
     exec_ctx: PartitionExecutor.ExecutionContext,
     exec_state: *interpreter.ExecState,
     skipped_nodes: []bool,
+    elision_protected_nodes: []const bool,
+    runtime_region_plan: RuntimeRegionPlan,
     last_use: []const u32,
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     if (fusedPatternProbingDisabled(exec_ctx)) return false;
+    if (try tryExecuteGroupedHeadDotPattern(
+        allocator,
+        graph,
+        cb,
+        values,
+        value_device,
+        node_ids,
+        node_pos,
+        reachable,
+        device_id,
+        skipped_nodes,
+        elision_protected_nodes,
+        runtime_region_plan,
+        exec_ctx.stats,
+    )) return true;
     if (try tryExecuteRmsNormGroupedLinearQkvSlicePattern(
         allocator,
         graph,
@@ -5364,7 +5405,7 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .rank_adapter_backward => 0,
         .ffn_gelu_backward => 0,
         .q_linear => 1,
-        .linear_qkv, .grouped_linear_qkv_slice => 3,
+        .linear_qkv, .grouped_linear_qkv_slice, .packed_linear_qkv_slice => 3,
         .rms_norm_grouped_linear_qkv_slice => 4,
         .attention_output_residual => |slots| 1 +
             @as(u64, if (slots.pre_linear_rms_norm_slot != null) 1 else 0) +
@@ -5527,6 +5568,65 @@ fn prepareGroupedLinearQkvSliceRegion(
         pattern.kv_out_dim,
         stats,
     );
+}
+
+fn ensurePreparedLinearSlotFromTensor(
+    cb: *const ComputeBackend,
+    weight: CT,
+    bias: CT,
+    in_dim: usize,
+    out_dim: usize,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?usize {
+    if (stats) |s| s.runtime_prepare_slot_calls += 1;
+    return try cb.decoderRuntimeEnsureLinearSlot(&.{
+        .weight = weight,
+        .bias = bias,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    });
+}
+
+fn preparePackedLinearQkvSliceRegion(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    pattern: PackedLinearQkvSlicePattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedQkvRegion {
+    const weight = valueFor(values, pattern.weight_id) orelse return null;
+    const bias = valueFor(values, pattern.bias_id) orelse return null;
+
+    const q_weight = try cb.sliceRows2D(allocator, weight, 0, pattern.q_out_dim, pattern.in_dim);
+    defer cb.free(q_weight);
+    const k_weight = try cb.sliceRows2D(allocator, weight, pattern.q_out_dim, pattern.kv_out_dim, pattern.in_dim);
+    defer cb.free(k_weight);
+    const v_weight = try cb.sliceRows2D(allocator, weight, pattern.q_out_dim + pattern.kv_out_dim, pattern.kv_out_dim, pattern.in_dim);
+    defer cb.free(v_weight);
+
+    const q_bias = try slicePackedBias(cb, bias, 0, pattern.q_out_dim, pattern.q_out_dim + pattern.kv_out_dim * 2);
+    defer cb.free(q_bias);
+    const k_bias = try slicePackedBias(cb, bias, pattern.q_out_dim, pattern.q_out_dim + pattern.kv_out_dim, pattern.q_out_dim + pattern.kv_out_dim * 2);
+    defer cb.free(k_bias);
+    const v_bias = try slicePackedBias(cb, bias, pattern.q_out_dim + pattern.kv_out_dim, pattern.q_out_dim + pattern.kv_out_dim * 2, pattern.q_out_dim + pattern.kv_out_dim * 2);
+    defer cb.free(v_bias);
+
+    const q_slot = (try ensurePreparedLinearSlotFromTensor(cb, q_weight, q_bias, pattern.in_dim, pattern.q_out_dim, stats)) orelse return null;
+    const k_slot = (try ensurePreparedLinearSlotFromTensor(cb, k_weight, k_bias, pattern.in_dim, pattern.kv_out_dim, stats)) orelse return null;
+    const v_slot = (try ensurePreparedLinearSlotFromTensor(cb, v_weight, v_bias, pattern.in_dim, pattern.kv_out_dim, stats)) orelse return null;
+    return .{
+        .q_slot = q_slot,
+        .k_slot = k_slot,
+        .v_slot = v_slot,
+    };
+}
+
+fn slicePackedBias(cb: *const ComputeBackend, bias: CT, start: usize, limit: usize, total: usize) !CT {
+    const starts = [_]i64{@intCast(start)};
+    const limits = [_]i64{@intCast(limit)};
+    const strides = [_]i64{1};
+    const shape = [_]i64{@intCast(total)};
+    return cb.primSlice(bias, &starts, &limits, &strides, &shape);
 }
 
 fn prepareRmsNormGroupedLinearQkvSliceRegion(
@@ -5810,6 +5910,9 @@ fn prepareRuntimeRegion(
         .grouped_linear_qkv_slice => |pattern| .{
             .grouped_linear_qkv_slice = (try prepareGroupedLinearQkvSliceRegion(cb, values, pattern, stats)) orelse return null,
         },
+        .packed_linear_qkv_slice => |pattern| .{
+            .packed_linear_qkv_slice = (try preparePackedLinearQkvSliceRegion(graph.allocator, cb, values, pattern, stats)) orelse return null,
+        },
         .rms_norm_grouped_linear_qkv_slice => |pattern| .{
             .rms_norm_grouped_linear_qkv_slice = (try prepareRmsNormGroupedLinearQkvSliceRegion(cb, values, pattern, stats)) orelse return null,
         },
@@ -6060,6 +6163,24 @@ fn tryExecutePlannedRuntimeRegion(
             pattern,
             switch (prepared) {
                 .grouped_linear_qkv_slice => |slots| slots,
+                else => return false,
+            },
+        ),
+        .packed_linear_qkv_slice => |pattern| executePackedLinearQkvSlicePattern(
+            allocator,
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx,
+            skipped_nodes,
+            last_use,
+            rt_map,
+            donated,
+            pattern,
+            switch (prepared) {
+                .packed_linear_qkv_slice => |slots| slots,
                 else => return false,
             },
         ),
@@ -7627,6 +7748,16 @@ const RuntimeDot2DResolvedRhs = struct {
     rhs_contract_axis: u32,
 };
 
+const GroupedHeadDotCandidate = struct {
+    node_id: NodeId,
+    lhs: CT,
+    rhs: CT,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+};
+
 fn executeLoraLinearPattern(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -8872,6 +9003,121 @@ fn runtimeDot2DRhs(
         .rhs_contract_axis = rhs.rhs_contract_axis,
         .k = @intCast(lhs_shape[1]),
     };
+}
+
+fn groupedHeadDotCandidate(
+    graph: *const Graph,
+    values: []?CT,
+    node_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) !?GroupedHeadDotCandidate {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const raw_id: usize = @intCast(node_id);
+    if (raw_id >= values.len) return null;
+    if (raw_id >= reachable.len or !reachable[raw_id]) return null;
+    if (raw_id < skipped_nodes.len and skipped_nodes[raw_id]) return null;
+    if (values[raw_id] != null) return null;
+    const node = graph.node(node_id);
+    const attrs = switch (node.op) {
+        .dot_general => |a| a,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, commandSourceClassification(graph, node_id, 4).family, "head")) return null;
+    if (node.output_shape.rank() != 2) return null;
+    const m = shapeDimUsize(node.output_shape, 0) orelse return null;
+    const n = shapeDimUsize(node.output_shape, 1) orelse return null;
+    const dot = (try runtimeDot2DInputs(graph, values, node.getInputs(), attrs)) orelse return null;
+    // ponytail: exact production head-dot shape only; widen after the gate proves it helps.
+    if (m != 96 or n != 2304 or dot.k != 768) return null;
+    return .{
+        .node_id = node_id,
+        .lhs = dot.lhs,
+        .rhs = dot.rhs,
+        .m = m,
+        .n = n,
+        .k = dot.k,
+        .rhs_contract_axis = dot.rhs_contract_axis,
+    };
+}
+
+fn tryExecuteGroupedHeadDotPattern(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    elision_protected_nodes: []const bool,
+    runtime_region_plan: RuntimeRegionPlan,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !bool {
+    if (!groupedHeadDotRuntimeCommandEnabled() or metalPartitionRuntimeCommandsDisabled()) return false;
+    if (node_pos >= node_ids.len) return false;
+
+    var candidates: [8]GroupedHeadDotCandidate = undefined;
+    const first = (try groupedHeadDotCandidate(graph, values, node_ids[node_pos], reachable, skipped_nodes)) orelse return false;
+    if (std.meta.activeTag(runtime_region_plan.regionAt(node_pos, first.node_id, node_ids)) != .none) return false;
+    candidates[0] = first;
+    var count: usize = 1;
+
+    const scan_end = @min(node_ids.len, node_pos + 64);
+    var scan_pos = node_pos + 1;
+    while (scan_pos < scan_end and count < candidates.len) : (scan_pos += 1) {
+        const candidate = (try groupedHeadDotCandidate(graph, values, node_ids[scan_pos], reachable, skipped_nodes)) orelse continue;
+        if (candidate.m != first.m or candidate.n != first.n or candidate.k != first.k or candidate.rhs_contract_axis != first.rhs_contract_axis) continue;
+        if (std.meta.activeTag(runtime_region_plan.regionAt(scan_pos, candidate.node_id, node_ids)) != .none) continue;
+        const raw_id: usize = @intCast(candidate.node_id);
+        if (raw_id < elision_protected_nodes.len and elision_protected_nodes[raw_id]) continue;
+        candidates[count] = candidate;
+        count += 1;
+    }
+    if (count < 2) return false;
+
+    var lhs: [8]CT = undefined;
+    var rhs: [8]CT = undefined;
+    for (candidates[0..count], 0..) |candidate, idx| {
+        lhs[idx] = candidate.lhs;
+        rhs[idx] = candidate.rhs;
+    }
+    const result = (try cb.dotGeneral2DMany(&.{
+        .allocator = allocator,
+        .lhs = lhs[0..count],
+        .rhs = rhs[0..count],
+        .m = first.m,
+        .n = first.n,
+        .k = first.k,
+        .rhs_contract_axis = first.rhs_contract_axis,
+    })) orelse return false;
+    defer allocator.free(result.outputs);
+    if (result.outputs.len != count) {
+        for (result.outputs) |ct| cb.free(ct);
+        return false;
+    }
+
+    for (candidates[0..count], 0..) |candidate, idx| {
+        const raw_id: usize = @intCast(candidate.node_id);
+        values[raw_id] = result.outputs[idx];
+        value_device[raw_id] = device_id;
+        if (idx > 0 and raw_id < skipped_nodes.len) skipped_nodes[raw_id] = true;
+    }
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .tail, @intCast(count));
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += @intCast(count - 1);
+        recordGemmaRuntimeResidency(s, graph, first.node_id, isMetalResidentOrQuantizedDescriptor(cb, result.outputs[0]));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: grouped_head_dot executed first={d} count={d} m={d} n={d} k={d} rhs_axis={d}\n",
+            .{ first.node_id, count, first.m, first.n, first.k, first.rhs_contract_axis },
+        );
+    }
+    return true;
 }
 
 fn resolvedRuntimeDot2DRhs(
@@ -12195,6 +12441,24 @@ const GroupedLinearQkvSlicePattern = struct {
     }
 };
 
+const PackedLinearQkvSlicePattern = struct {
+    linear_id: NodeId,
+    q_slice_id: NodeId,
+    k_slice_id: NodeId,
+    v_slice_id: NodeId,
+    input_id: NodeId,
+    weight_id: NodeId,
+    bias_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+
+    fn elidedNodeCount(_: PackedLinearQkvSlicePattern) u64 {
+        return 3;
+    }
+};
+
 const RmsNormGroupedLinearQkvSlicePattern = struct {
     norm_id: NodeId,
     norm_input_id: NodeId,
@@ -12526,6 +12790,93 @@ fn executeGroupedLinearQkvSlicePattern(
     return true;
 }
 
+fn executePackedLinearQkvSlicePattern(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    exec_ctx: PartitionExecutor.ExecutionContext,
+    skipped_nodes: []bool,
+    last_use: []const u32,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    donated: std.AutoHashMapUnmanaged(NodeId, void),
+    pattern: PackedLinearQkvSlicePattern,
+    prepared: PreparedQkvRegion,
+) !bool {
+    const input = valueFor(values, pattern.input_id) orelse return false;
+
+    const qkv = (try cb.decoderRuntimeApplyLinearQkv(&.{
+        .q_slot = prepared.q_slot,
+        .k_slot = prepared.k_slot,
+        .v_slot = prepared.v_slot,
+        .input = input,
+        .in_dim = pattern.in_dim,
+        .q_out_dim = pattern.q_out_dim,
+        .kv_out_dim = pattern.kv_out_dim,
+    })) orelse return traceQkvRegionDeclined("packed_backend_returned_null", pattern.linear_id);
+
+    values[@intCast(pattern.linear_id)] = qkv.first;
+    values[@intCast(pattern.q_slice_id)] = qkv.first;
+    values[@intCast(pattern.k_slice_id)] = qkv.second;
+    values[@intCast(pattern.v_slice_id)] = qkv.third;
+    value_device[@intCast(pattern.linear_id)] = device_id;
+    value_device[@intCast(pattern.q_slice_id)] = device_id;
+    value_device[@intCast(pattern.k_slice_id)] = device_id;
+    value_device[@intCast(pattern.v_slice_id)] = device_id;
+    skipped_nodes[@intCast(pattern.linear_id)] = true;
+    skipped_nodes[@intCast(pattern.q_slice_id)] = true;
+    skipped_nodes[@intCast(pattern.k_slice_id)] = true;
+    skipped_nodes[@intCast(pattern.v_slice_id)] = true;
+
+    if (exec_ctx.stats) |stats| {
+        recordMetalGraphRegion(stats, .qkv, 4);
+        stats.fused_graph_pattern_dispatches += 1;
+        stats.fused_graph_nodes_elided += pattern.elidedNodeCount();
+        stats.gemma_qkv_hits += 3;
+        const k_resident = isMetalResidentOrQuantizedDescriptor(cb, qkv.second);
+        const v_resident = isMetalResidentOrQuantizedDescriptor(cb, qkv.third);
+        if (k_resident) {
+            stats.device_resident_outputs += 1;
+        } else {
+            stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
+            if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.k_slice_id, "packed_qkv_region_k_host_output");
+        }
+        if (v_resident) {
+            stats.device_resident_outputs += 1;
+        } else {
+            stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
+            if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.v_slice_id, "packed_qkv_region_v_host_output");
+        }
+    }
+
+    _ = try freeExpiredInputs(
+        allocator,
+        graph,
+        cb,
+        values,
+        value_device,
+        pattern.linear_id,
+        device_id,
+        last_use,
+        null,
+        rt_map,
+        donated,
+        exec_ctx,
+    );
+
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: packed_qkv_region executed linear={d} q={d} k={d} v={d} rows={d} in={d} q_out={d} kv_out={d}\n",
+            .{ pattern.linear_id, pattern.q_slice_id, pattern.k_slice_id, pattern.v_slice_id, pattern.rows, pattern.in_dim, pattern.q_out_dim, pattern.kv_out_dim },
+        );
+    }
+    return true;
+}
+
 fn matchGroupedLinearQkvSlicePattern(
     graph: *const Graph,
     values: []?CT,
@@ -12594,6 +12945,66 @@ fn isGroupedLinearQkvCandidate(node: *const ml.graph.Node) bool {
         .fused_linear_no_bias => true,
         else => false,
     };
+}
+
+fn matchPackedLinearQkvSlicePattern(
+    graph: *const Graph,
+    values: []?CT,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?PackedLinearQkvSlicePattern {
+    const linear_id = node_ids[node_pos];
+    const linear_index: usize = @intCast(linear_id);
+    if (linear_index < values.len and values[linear_index] != null) return null;
+    const linear = graph.node(linear_id);
+    const attrs = switch (linear.op) {
+        .fused_linear => |linear_attrs| linear_attrs,
+        else => return null,
+    };
+    if (attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0) return null;
+    const inputs = linear.getInputs();
+    if (inputs.len < 3) return null;
+    const weight_name = linearWeightParameterName(graph, linear) orelse return null;
+    if (!isGlinerPackedQkvWeightName(weight_name)) return null;
+    if (attrs.out_dim % 3 != 0) return null;
+    const projection_dim = attrs.out_dim / 3;
+    if (projection_dim == 0) return null;
+
+    const rows = shapeDimUsize(linear.output_shape, 0) orelse return null;
+    const total_out_dim = shapeDimUsize(linear.output_shape, 1) orelse return null;
+    if (rows != attrs.rows or total_out_dim != attrs.out_dim) return null;
+    const weight_shape = graph.node(inputs[1]).output_shape;
+    if (weight_shape.rank() != 2 or weight_shape.dim(0) != attrs.out_dim or weight_shape.dim(1) != attrs.in_dim) return null;
+    const bias_shape = graph.node(inputs[2]).output_shape;
+    if (bias_shape.rank() != 1 or bias_shape.dim(0) != attrs.out_dim) return null;
+
+    const q_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, 0, projection_dim) orelse return null;
+    const k_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, projection_dim, projection_dim * 2) orelse return null;
+    const v_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, projection_dim * 2, projection_dim * 3) orelse return null;
+    if (!hasOnlyExpectedUses(graph, reachable, skipped_nodes, linear_id, &.{ q_slice, k_slice, v_slice })) return null;
+
+    return .{
+        .linear_id = linear_id,
+        .q_slice_id = q_slice,
+        .k_slice_id = k_slice,
+        .v_slice_id = v_slice,
+        .input_id = inputs[0],
+        .weight_id = inputs[1],
+        .bias_id = inputs[2],
+        .rows = attrs.rows,
+        .in_dim = attrs.in_dim,
+        .q_out_dim = projection_dim,
+        .kv_out_dim = projection_dim,
+    };
+}
+
+fn isGlinerPackedQkvWeightName(name: []const u8) bool {
+    return (std.mem.indexOf(u8, name, "count_embed.transformer.transformer.layers.") != null and
+        std.mem.endsWith(u8, name, ".self_attn.in_proj_weight")) or
+        std.mem.endsWith(u8, name, "count_embed.gru.weight_ih_l0") or
+        std.mem.endsWith(u8, name, "count_embed.gru.weight_hh_l0");
 }
 
 fn findNodePos(node_ids: []const NodeId, needle: NodeId) ?usize {
@@ -12734,8 +13145,16 @@ fn executeLinearNoBiasQkvPattern(
         recordMetalGraphRegion(stats, .qkv, 3);
         stats.fused_graph_pattern_dispatches += 1;
         stats.fused_graph_nodes_elided += 2;
+        const q_resident = isMetalResidentOrQuantizedDescriptor(cb, qkv.first);
         const k_resident = isMetalResidentOrQuantizedDescriptor(cb, qkv.second);
         const v_resident = isMetalResidentOrQuantizedDescriptor(cb, qkv.third);
+        if (q_resident) {
+            stats.device_resident_outputs += 1;
+        } else {
+            stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
+            if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.q_id, "qkv_region_q_host_output");
+        }
         if (k_resident) {
             stats.device_resident_outputs += 1;
         } else {
@@ -12750,6 +13169,7 @@ fn executeLinearNoBiasQkvPattern(
             stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.v_id, "qkv_region_v_host_output");
         }
+        recordGemmaRuntimeResidency(stats, graph, pattern.q_id, q_resident);
         recordGemmaRuntimeResidency(stats, graph, pattern.k_id, k_resident);
         recordGemmaRuntimeResidency(stats, graph, pattern.v_id, v_resident);
     }
@@ -13566,6 +13986,48 @@ fn tryExecuteMetalCommand(
         .reduce_mean => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .mean, output_hint, stats, resident_input_cache),
         .fused_softmax => |attrs| try executeRuntimeSoftmax(cb, values, inputs, attrs.dim),
         .fused_log_softmax => |attrs| try executeRuntimeLogSoftmax(cb, values, inputs, attrs.dim),
+        .fused_masked_bce_with_logits_loss => |attrs| blk: {
+            const logits = valueFor(values, inputs[0]) orelse break :blk null;
+            const labels = valueFor(values, inputs[1]) orelse break :blk null;
+            const mask = valueFor(values, inputs[2]) orelse break :blk null;
+            var out_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+            const out_shape = try fillShapeDims(n.output_shape, &out_shape_buf);
+            break :blk cb.maskedBceWithLogitsLoss(&.{
+                .logits = logits,
+                .labels = labels,
+                .mask = mask,
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .output_shape = out_shape,
+            }) catch |err| switch (err) {
+                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
+        .fused_masked_bce_with_logits_backward => |attrs| blk: {
+            const logits = valueFor(values, inputs[0]) orelse break :blk null;
+            const labels = valueFor(values, inputs[1]) orelse break :blk null;
+            const mask = valueFor(values, inputs[2]) orelse break :blk null;
+            const upstream = valueFor(values, inputs[3]) orelse break :blk null;
+            var logits_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+            const logits_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &logits_shape_buf);
+            break :blk cb.maskedBceWithLogitsBackward(&.{
+                .logits = logits,
+                .labels = labels,
+                .mask = mask,
+                .upstream = upstream,
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .logits_shape = logits_shape,
+            }) catch |err| switch (err) {
+                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
         .fused_sdpa => |attrs| try executeRuntimeSdpa(cb, values, inputs, attrs, op_plan, exec_state),
         .fused_gqa_causal_attention => |attrs| try executeRuntimeGqaCausalAttention(cb, values, inputs, attrs, n.num_inputs, exec_state),
         .dot_general => |attrs| try executeRuntimeDotGeneralHinted(graph, cb, values, inputs, attrs, op_plan, output_hint),
@@ -17838,6 +18300,69 @@ test "metal partition executor accepts singleton operands for scalar binary resu
     try std.testing.expect(!binaryBroadcastResultMatches(scalar, non_singleton_vector, scalar));
 }
 
+test "metal partition executor recognizes production grouped head dot candidate" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 96, 768 }));
+    const w = try b.parameter("classifier.weight", ml.graph.Shape.init(.f32, &.{ 2304, 768 }));
+    const w_t = try b.transpose(w, &.{ 1, 0 });
+    const dot = try b.matmul(x, w_t);
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    var x_sentinel: u8 = 0;
+    var w_sentinel: u8 = 0;
+    values[@intCast(x)] = @as(CT, @ptrCast(&x_sentinel));
+    values[@intCast(w)] = @as(CT, @ptrCast(&w_sentinel));
+
+    const candidate = (try groupedHeadDotCandidate(&g, values, dot, reachable, skipped)) orelse return error.ExpectedGroupedHeadDotCandidate;
+    try std.testing.expectEqual(dot, candidate.node_id);
+    try std.testing.expectEqual(@as(usize, 96), candidate.m);
+    try std.testing.expectEqual(@as(usize, 2304), candidate.n);
+    try std.testing.expectEqual(@as(usize, 768), candidate.k);
+    try std.testing.expectEqual(@as(u32, 1), candidate.rhs_contract_axis);
+    try std.testing.expect(candidate.lhs == values[@intCast(x)].?);
+    try std.testing.expect(candidate.rhs == values[@intCast(w)].?);
+}
+
+test "metal partition executor declines grouped head dot candidate for non-head parameter" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 96, 768 }));
+    const w = try b.parameter("encoder.weight", ml.graph.Shape.init(.f32, &.{ 2304, 768 }));
+    const w_t = try b.transpose(w, &.{ 1, 0 });
+    const dot = try b.matmul(x, w_t);
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    var x_sentinel: u8 = 0;
+    var w_sentinel: u8 = 0;
+    values[@intCast(x)] = @as(CT, @ptrCast(&x_sentinel));
+    values[@intCast(w)] = @as(CT, @ptrCast(&w_sentinel));
+
+    try std.testing.expect((try groupedHeadDotCandidate(&g, values, dot, reachable, skipped)) == null);
+}
+
 test "metal partition executor defers both same shape multiply add inputs" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -18381,6 +18906,103 @@ test "metal partition executor recognizes grouped qkv linear slice graph region"
         },
         else => return error.ExpectedPlannedGroupedQkvRegion,
     }
+}
+
+test "metal partition executor recognizes gliner packed biased qkv slice graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const hidden: usize = 8;
+    const dim: usize = 8;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w = try b.parameter("count_embed.transformer.transformer.layers.0.self_attn.in_proj_weight", ml.graph.Shape.init(.f32, &.{ dim * 3, hidden }));
+    const bias = try b.parameter("count_embed.transformer.transformer.layers.0.self_attn.in_proj_bias", ml.graph.Shape.init(.f32, &.{dim * 3}));
+    const qkv = try b.linear(x, w, bias, @intCast(rows), @intCast(hidden), @intCast(dim * 3));
+    const q = try b.sliceLastDim(qkv, 0, @intCast(dim));
+    const k = try b.sliceLastDim(qkv, @intCast(dim), @intCast(dim * 2));
+    const v = try b.sliceLastDim(qkv, @intCast(dim * 2), @intCast(dim * 3));
+    const kv = try b.add(k, v);
+    const out = try b.add(q, kv);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const values = try allocator.alloc(?CT, node_ids.len);
+    defer allocator.free(values);
+    @memset(values, null);
+
+    const pattern = matchPackedLinearQkvSlicePattern(&g, values, node_ids, @intCast(qkv), reachable, skipped) orelse return error.ExpectedPackedQkvRegion;
+    try std.testing.expectEqual(qkv, pattern.linear_id);
+    try std.testing.expectEqual(q, pattern.q_slice_id);
+    try std.testing.expectEqual(k, pattern.k_slice_id);
+    try std.testing.expectEqual(v, pattern.v_slice_id);
+    try std.testing.expectEqual(x, pattern.input_id);
+    try std.testing.expectEqual(w, pattern.weight_id);
+    try std.testing.expectEqual(bias, pattern.bias_id);
+    try std.testing.expectEqual(@as(usize, rows), pattern.rows);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.in_dim);
+    try std.testing.expectEqual(@as(usize, dim), pattern.q_out_dim);
+    try std.testing.expectEqual(@as(usize, dim), pattern.kv_out_dim);
+
+    var plan = try buildRuntimeRegionPlan(allocator, &g, node_ids, @intCast(g.nodeCount()), reachable, last_use);
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.region_count);
+    switch (plan.regionAt(@intCast(qkv), qkv, node_ids)) {
+        .packed_linear_qkv_slice => |planned| {
+            try std.testing.expectEqual(qkv, planned.linear_id);
+            try std.testing.expectEqual(q, planned.q_slice_id);
+            try std.testing.expectEqual(v, planned.v_slice_id);
+        },
+        else => return error.ExpectedPlannedPackedQkvRegion,
+    }
+}
+
+test "metal partition executor ignores non gliner packed biased qkv slice graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const hidden: usize = 8;
+    const dim: usize = 8;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w = try b.parameter("unrelated.in_proj_weight", ml.graph.Shape.init(.f32, &.{ dim * 3, hidden }));
+    const bias = try b.parameter("unrelated.in_proj_bias", ml.graph.Shape.init(.f32, &.{dim * 3}));
+    const qkv = try b.linear(x, w, bias, @intCast(rows), @intCast(hidden), @intCast(dim * 3));
+    const q = try b.sliceLastDim(qkv, 0, @intCast(dim));
+    const k = try b.sliceLastDim(qkv, @intCast(dim), @intCast(dim * 2));
+    const v = try b.sliceLastDim(qkv, @intCast(dim * 2), @intCast(dim * 3));
+    const kv = try b.add(k, v);
+    const out = try b.add(q, kv);
+    const escaped_qkv = try b.add(qkv, qkv);
+    try g.markOutput(out);
+    try g.markOutput(escaped_qkv);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const values = try allocator.alloc(?CT, node_ids.len);
+    defer allocator.free(values);
+    @memset(values, null);
+
+    try std.testing.expect(matchPackedLinearQkvSlicePattern(&g, values, node_ids, @intCast(qkv), reachable, skipped) == null);
 }
 
 test "metal partition executor recognizes rms norm grouped qkv graph region" {

@@ -841,6 +841,7 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         # perf/coverage signal gated by an explicit ceiling (regression guard
         # against drifting into broad interpreter-only execution).
         checks["graph_executor_fallback_reasons_empty"] = not graph_executor_fallback_reasons
+        checks["graph_executor_true_host_outputs_zero"] = total_true_host_outputs == 0
         checks["interpreter_fallbacks_within_threshold"] = total_interpreter_fallbacks <= max_interpreter_fallbacks
     elif zero_dispatches:
         warnings.append("Metal run reported no graph command/planned dispatches; check for interpreter-only execution")
@@ -1868,16 +1869,53 @@ if args.dump_parity:
             "valid_labels_head": [_finite(x) for x in labels[valid][:16].tolist()],
         }
 
+    def _merge_classification_debug_payloads(parts):
+        if not parts:
+            return None
+        logits_count = sum(int(part.get("logits_count") or 0) for part in parts)
+        valid_count = sum(int(part.get("valid_count") or 0) for part in parts)
+        logits_mean_num = sum(
+            float(part.get("logits_mean") or 0.0) * int(part.get("logits_count") or 0)
+            for part in parts
+        )
+        merged = {
+            "rows": sum(int(part.get("rows") or 0) for part in parts),
+            "entity_types": sum(int(part.get("entity_types") or 0) for part in parts),
+            "logits_count": logits_count,
+            "valid_count": valid_count,
+            "positive_count": sum(int(part.get("positive_count") or 0) for part in parts),
+            "label_sum": _finite(sum(float(part.get("label_sum") or 0.0) for part in parts)),
+            "mask_sum": _finite(sum(float(part.get("mask_sum") or 0.0) for part in parts)),
+            "logits_min": _finite(min(float(part.get("logits_min") or 0.0) for part in parts)),
+            "logits_max": _finite(max(float(part.get("logits_max") or 0.0) for part in parts)),
+            "logits_mean": _finite(logits_mean_num / logits_count) if logits_count else 0.0,
+            "bce_sum": _finite(sum(float(part.get("bce_sum") or 0.0) for part in parts)),
+            "logits_head": [],
+            "labels_head": [],
+            "mask_head": [],
+            "valid_logits_head": [],
+            "valid_labels_head": [],
+        }
+        for field in ("logits_head", "labels_head", "mask_head", "valid_logits_head", "valid_labels_head"):
+            values = []
+            for part in parts:
+                values.extend(part.get(field) or [])
+                if len(values) >= 16:
+                    break
+            merged[field] = values[:16]
+        return merged
+
     def compute_sample_loss_with_debug(self, *sample_args, **sample_kwargs):
         classifier_start = len(classifier_forward_outputs)
+        capture_first_batch_sample = len(sample_loss_debug) < args.batch_size
         out = original_compute_sample_loss(*sample_args, **sample_kwargs)
-        if len(sample_loss_debug) < args.batch_size:
+        if capture_first_batch_sample:
             sample_loss_debug.append({
                 "classification_loss": _finite(out["classification"].detach().cpu().item()),
                 "structure_loss": _finite(out["structure"].detach().cpu().item()),
                 "count_loss": _finite(out["count"].detach().cpu().item()),
             })
-        if not classification_debug:
+        if capture_first_batch_sample:
             task_types = sample_kwargs.get("task_types")
             structure_labels = sample_kwargs.get("structure_labels")
             if task_types is None and len(sample_args) >= 3:
@@ -2000,7 +2038,7 @@ payload = {
         }
         if sample_loss_debug else None
     ),
-    "gliner2_classification_debug": classification_debug[0] if classification_debug else None,
+    "gliner2_classification_debug": _merge_classification_debug_payloads(classification_debug) if classification_debug else None,
     "optimizer_parity_steps": optimizer_parity_steps,
 }
 (out / "comparison_metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -2563,6 +2601,12 @@ def main() -> int:
         help="Maximum absolute Python/Zig loss delta for valid loss parity when both sides run",
     )
     p.add_argument(
+        "--classification-debug-tolerance",
+        type=float,
+        default=None,
+        help="Maximum absolute Python/Zig classification-debug logit/stat delta (default: --loss-parity-tolerance)",
+    )
+    p.add_argument(
         "--metal-max-interpreter-fallbacks",
         type=int,
         default=64,
@@ -2807,7 +2851,7 @@ def main() -> int:
     classification_debug_matches, classification_debug_deltas = compare_classification_debug(
         python_classification_debug,
         zig_classification_debug,
-        args.loss_parity_tolerance,
+        args.classification_debug_tolerance or args.loss_parity_tolerance,
     )
     optimizer_parity: dict[str, Any] | None = None
     if args.dump_optimizer_parity:
@@ -3203,6 +3247,7 @@ def main() -> int:
         "zig_manifest_objective": zig_manifest.get("objective"),
         "metal_readiness": summarize_metal_readiness(args, report, zig_step_rows, zig_manifest),
         "loss_parity_tolerance": args.loss_parity_tolerance,
+        "classification_debug_tolerance": args.classification_debug_tolerance or args.loss_parity_tolerance,
         "valid_loss_parity": valid_loss_parity,
         "loss_parity_warning": loss_parity_warning,
         "perf_target_only_python": args.perf_target_only_python,
@@ -3299,6 +3344,7 @@ def main() -> int:
             "metal_device_resident_transfers_zero": _metal("device_resident_transfers_zero"),
             "metal_finite_step_loss": _metal("finite_step_loss"),
             "metal_graph_executor_fallback_reasons_empty": _metal("graph_executor_fallback_reasons_empty"),
+            "metal_graph_executor_true_host_outputs_zero": _metal("graph_executor_true_host_outputs_zero"),
             "metal_interpreter_fallbacks_within_threshold": _metal("interpreter_fallbacks_within_threshold"),
         })
     if args.require_full_task_parity:

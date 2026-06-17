@@ -353,6 +353,35 @@ fn executeNativePlannedNode(
         .fused_relu => try cb.relu(valueAt(values, inputs[0])),
         .fused_quick_gelu => try cb.quickGelu(valueAt(values, inputs[0])),
         .fused_softmax => |attrs| try cb.primSoftmax(valueAt(values, inputs[0]), attrs.dim),
+        .fused_masked_bce_with_logits_loss => |attrs| blk: {
+            var out_shape_buf: [8]i64 = undefined;
+            const out_shape = fillShapeDims(graph, node_id, &out_shape_buf);
+            break :blk try cb.maskedBceWithLogitsLoss(&.{
+                .logits = valueAt(values, inputs[0]),
+                .labels = valueAt(values, inputs[1]),
+                .mask = valueAt(values, inputs[2]),
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .output_shape = out_shape,
+            });
+        },
+        .fused_masked_bce_with_logits_backward => |attrs| blk: {
+            var logits_shape_buf: [8]i64 = undefined;
+            const logits_shape = fillShapeDims(graph, inputs[0], &logits_shape_buf);
+            break :blk try cb.maskedBceWithLogitsBackward(&.{
+                .logits = valueAt(values, inputs[0]),
+                .labels = valueAt(values, inputs[1]),
+                .mask = valueAt(values, inputs[2]),
+                .upstream = valueAt(values, inputs[3]),
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .logits_shape = logits_shape,
+            });
+        },
         .fused_conv2d => |attrs| blk: {
             const input_actual = cb.tensorShape(valueAt(values, inputs[0]), allocator) catch null;
             defer if (input_actual) |dims| allocator.free(dims);

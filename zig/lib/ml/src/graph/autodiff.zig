@@ -710,6 +710,17 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[2], d_beta);
         },
 
+        .fused_masked_bce_with_logits_loss => |attrs| {
+            const grad_logits = try b.graph.addNode(.{
+                .op = .{ .fused_masked_bce_with_logits_backward = attrs },
+                .output_shape = g.node(ins[0]).output_shape,
+                .inputs = .{ ins[0], ins[1], ins[2], adj },
+                .num_inputs = 4,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad_logits);
+        },
+
         // ── Fused ops should not appear after lowering ───────────────
         else => {
             // Fused ops should have been lowered. If we hit one, it had
@@ -1141,6 +1152,29 @@ test "gradient through fused gelu (lowered)" {
     defer result.deinit();
 
     try std.testing.expect(result.param_grads[0] != null_node);
+}
+
+test "gradient through fused masked BCE uses custom backward" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const logits = try bld.parameter("logits", Shape.init(.f32, &.{ 2, 3 }));
+    const labels = try bld.parameter("labels", Shape.init(.f32, &.{ 2, 3 }));
+    const mask = try bld.parameter("mask", Shape.init(.f32, &.{ 2, 3 }));
+    const loss = try bld.maskedBceWithLogitsLoss(logits, labels, mask, .{
+        .positive_weight = 2.0,
+        .negative_weight = 0.5,
+        .reduction = .mean,
+    });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{logits});
+    defer result.deinit();
+
+    try std.testing.expect(result.param_grads[0] != null_node);
+    try std.testing.expectEqual(.fused_masked_bce_with_logits_backward, std.meta.activeTag(result.graph.node(result.param_grads[0]).op));
 }
 
 test "gradient through fused linear (lowered)" {

@@ -299,6 +299,37 @@ test "GLiNER2 upstream task batch carries schema markers and structured span lab
     try std.testing.expectEqual(@as(i32, 2), batch.entity_type_kind[2 * labels.len + product_name_idx]);
 }
 
+test "GLiNER2 upstream negative entity task keeps schema active" {
+    const allocator = std.testing.allocator;
+
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_negative_smoke.jsonl", null);
+    defer loaded.deinit();
+
+    const labels = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, loaded.records, null);
+    defer {
+        for (labels) |label| allocator.free(label);
+        allocator.free(labels);
+    }
+
+    var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+
+    var batch = try gliner2_data.buildUpstreamTaskBatch(allocator, &tokenizer, loaded.records[0..2], labels, 64, 4, 2);
+    defer batch.deinit();
+
+    const person_idx = labelIndex(labels, "person").?;
+    try std.testing.expect(batch.e_token_positions[1 * labels.len + person_idx] >= 0);
+    try std.testing.expectEqual(@as(i32, 2), batch.entity_type_kind[1 * labels.len + person_idx]);
+
+    var positives: usize = 0;
+    for (0..batch.max_spans) |span_idx| {
+        if (batch.span_labels[(1 * batch.max_spans + span_idx) * labels.len + person_idx] > 0.0) {
+            positives += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), positives);
+}
+
 test "GLiNER2 label class capacity rejects collapsed label mappings" {
     const allocator = std.testing.allocator;
 

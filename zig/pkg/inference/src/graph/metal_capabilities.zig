@@ -102,6 +102,8 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_sdpa,
         .fused_softmax,
         .fused_log_softmax,
+        .fused_masked_bce_with_logits_loss,
+        .fused_masked_bce_with_logits_backward,
         .fused_conv1d,
         .fused_conv2d,
         .fused_take_rows,

@@ -79,6 +79,43 @@ pub const LinearNoBiasTripleResult = struct {
     third: CT,
 };
 
+pub const DotGeneral2DManyRequest = struct {
+    allocator: std.mem.Allocator,
+    lhs: []const CT,
+    rhs: []const CT,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+};
+
+pub const DotGeneral2DManyResult = struct {
+    outputs: []CT,
+};
+
+pub const MaskedBceWithLogitsRequest = struct {
+    logits: CT,
+    labels: CT,
+    mask: CT,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: bool,
+    output_shape: []const i64,
+};
+
+pub const MaskedBceWithLogitsBackwardRequest = struct {
+    logits: CT,
+    labels: CT,
+    mask: CT,
+    upstream: CT,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: bool,
+    logits_shape: []const i64,
+};
+
 pub const LoraLinearBranchResult = struct {
     after_a: CT,
     after_b: CT,
@@ -1715,6 +1752,8 @@ pub const ComputeBackend = struct {
         broadcastInDimOp: ?*const fn (ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT = null,
         /// Generalized dot product (matmul with contracting/batch dims).
         dotGeneralOp: ?*const fn (ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT = null,
+        /// Group several same-shape 2D dot products in one backend runtime call.
+        dotGeneral2DMany: ?*const fn (ctx: *anyopaque, request: *const DotGeneral2DManyRequest) anyerror!?DotGeneral2DManyResult = null,
         /// Scatter-add: accumulate updates into a zeroed output using indices.
         scatterAddOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT = null,
         /// Gather rows from `input + bias` without materializing the full
@@ -1732,6 +1771,10 @@ pub const ComputeBackend = struct {
         /// Log-softmax along last dimension: x - max - log(sum(exp(x-max))).
         /// `last_dim_size` is the size of the last dimension (not an axis index).
         logSoftmaxOp: ?*const fn (ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT = null,
+        /// GLiNER-style masked BCE-with-logits scalar loss.
+        maskedBceWithLogitsLoss: ?*const fn (ctx: *anyopaque, request: *const MaskedBceWithLogitsRequest) anyerror!CT = null,
+        /// Gradient of masked BCE-with-logits with respect to logits.
+        maskedBceWithLogitsBackward: ?*const fn (ctx: *anyopaque, request: *const MaskedBceWithLogitsBackwardRequest) anyerror!CT = null,
 
         /// Download multiple tensors to f32 in a single backend round-trip.
         /// Backends that support batched eval (e.g. MLX mlx_eval with a vector of
@@ -3296,6 +3339,10 @@ pub const ComputeBackend = struct {
         if (self.vtable.dotGeneralOp) |f| return f(self.ptr, lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
         return error.UnsupportedPrimitiveOp;
     }
+    pub fn dotGeneral2DMany(self: *const ComputeBackend, request: *const DotGeneral2DManyRequest) !?DotGeneral2DManyResult {
+        if (self.vtable.dotGeneral2DMany) |f| return f(self.ptr, request);
+        return null;
+    }
     pub fn primScatterAdd(self: *const ComputeBackend, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) !CT {
         if (self.vtable.scatterAddOp) |f| return f(self.ptr, input, indices, input_shape, indices_shape, axis);
         return error.UnsupportedPrimitiveOp;
@@ -3322,6 +3369,14 @@ pub const ComputeBackend = struct {
     }
     pub fn primLogSoftmax(self: *const ComputeBackend, input: CT, dim: u32) !CT {
         if (self.vtable.logSoftmaxOp) |f| return f(self.ptr, input, dim);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn maskedBceWithLogitsLoss(self: *const ComputeBackend, request: *const MaskedBceWithLogitsRequest) !CT {
+        if (self.vtable.maskedBceWithLogitsLoss) |f| return f(self.ptr, request);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn maskedBceWithLogitsBackward(self: *const ComputeBackend, request: *const MaskedBceWithLogitsBackwardRequest) !CT {
+        if (self.vtable.maskedBceWithLogitsBackward) |f| return f(self.ptr, request);
         return error.UnsupportedPrimitiveOp;
     }
 };

@@ -4471,6 +4471,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .logSoftmaxConsume = &logSoftmaxConsumeOp,
     .softmaxOp = &primSoftmaxOp,
     .logSoftmaxOp = &primLogSoftmaxOp,
+    .maskedBceWithLogitsLoss = &maskedBceWithLogitsLossOp,
+    .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
 };
 
 fn backendKind(_: *anyopaque) BackendKind {
@@ -38266,6 +38268,76 @@ fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     return self.makeBuf(owned, true);
 }
 
+fn bceSigmoid(x: f32) f32 {
+    return if (x >= 0) 1.0 / (1.0 + @exp(-x)) else blk: {
+        const e = @exp(x);
+        break :blk e / (1.0 + e);
+    };
+}
+
+fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const logits = getData(request.logits);
+    const labels = getData(request.labels);
+    const mask = getData(request.mask);
+    if (labels.len != logits.len or mask.len != logits.len) return error.ShapeMismatch;
+
+    var numerator: f32 = 0.0;
+    var denom: f32 = 0.0;
+    for (logits, 0..) |logit, i| {
+        const m = mask[i];
+        const safe_logit = logit * m;
+        const safe_label = labels[i] * m;
+        const bce = @max(safe_logit, 0.0) - safe_label * safe_logit + @log(1.0 + @exp(-@abs(safe_logit)));
+        const label_weight = safe_label * request.positive_weight + (1.0 - safe_label) * request.negative_weight;
+        numerator += bce * label_weight * m;
+        denom += m * label_weight;
+    }
+
+    const value = if (request.mean_reduction) numerator / (denom + request.eps) else numerator;
+    const output = try self.allocator.alloc(f32, 1);
+    output[0] = value;
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.output_shape);
+}
+
+fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsBackwardRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const logits = getData(request.logits);
+    const labels = getData(request.labels);
+    const mask = getData(request.mask);
+    const upstream = getData(request.upstream);
+    if (labels.len != logits.len or mask.len != logits.len or upstream.len == 0) return error.ShapeMismatch;
+
+    var denom: f32 = 0.0;
+    if (request.mean_reduction) {
+        for (labels, 0..) |label, i| {
+            const m = mask[i];
+            const safe_label = label * m;
+            const label_weight = safe_label * request.positive_weight + (1.0 - safe_label) * request.negative_weight;
+            denom += m * label_weight;
+        }
+        denom += request.eps;
+    }
+
+    const scale = if (request.mean_reduction) upstream[0] / denom else upstream[0];
+    const output = try self.allocator.alloc(f32, logits.len);
+    var raw_output: ?[]f32 = output;
+    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    for (logits, 0..) |logit, i| {
+        const m = mask[i];
+        const safe_logit = logit * m;
+        const safe_label = labels[i] * m;
+        const label_weight = safe_label * request.positive_weight + (1.0 - safe_label) * request.negative_weight;
+        output[i] = scale * label_weight * m * m * (bceSigmoid(safe_logit) - safe_label);
+    }
+    const result = try self.makeBuf(output, true);
+    raw_output = null;
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.logits_shape);
+}
+
 fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const owned = try self.allocator.dupe(f32, data);
@@ -46647,6 +46719,77 @@ fn referenceCrossSeqMajorAttention(
     }
 
     return ref;
+}
+
+test "ComputeBackend masked BCE with logits forward and backward" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+
+    var logits_data = [_]f32{ -2.0, 0.0, 3.0, 1.0 };
+    var labels_data = [_]f32{ 0.0, 1.0, 1.0, 0.0 };
+    var mask_data = [_]f32{ 1.0, 1.0, 0.0, 0.5 };
+    var upstream_data = [_]f32{1.25};
+    const logits = try compute.makeBuf(logits_data[0..], false);
+    defer freeTensor(&compute, logits);
+    const labels = try compute.makeBuf(labels_data[0..], false);
+    defer freeTensor(&compute, labels);
+    const mask = try compute.makeBuf(mask_data[0..], false);
+    defer freeTensor(&compute, mask);
+    const upstream = try compute.makeBuf(upstream_data[0..], false);
+    defer freeTensor(&compute, upstream);
+
+    const positive_weight: f32 = 2.0;
+    const negative_weight: f32 = 0.5;
+    const eps: f32 = 1e-6;
+    var expected_num: f32 = 0.0;
+    var expected_den: f32 = 0.0;
+    for (logits_data, 0..) |logit, i| {
+        const m = mask_data[i];
+        const safe_logit = logit * m;
+        const safe_label = labels_data[i] * m;
+        const bce = @max(safe_logit, 0.0) - safe_label * safe_logit + @log(1.0 + @exp(-@abs(safe_logit)));
+        const label_weight = safe_label * positive_weight + (1.0 - safe_label) * negative_weight;
+        expected_num += bce * label_weight * m;
+        expected_den += m * label_weight;
+    }
+    const expected_loss = expected_num / (expected_den + eps);
+
+    const loss = try cb.maskedBceWithLogitsLoss(&.{
+        .logits = logits,
+        .labels = labels,
+        .mask = mask,
+        .positive_weight = positive_weight,
+        .negative_weight = negative_weight,
+        .eps = eps,
+        .mean_reduction = true,
+        .output_shape = &.{ 1, 1 },
+    });
+    defer freeTensor(&compute, loss);
+    try std.testing.expectApproxEqAbs(expected_loss, getData(loss)[0], 1e-6);
+
+    const grad = try cb.maskedBceWithLogitsBackward(&.{
+        .logits = logits,
+        .labels = labels,
+        .mask = mask,
+        .upstream = upstream,
+        .positive_weight = positive_weight,
+        .negative_weight = negative_weight,
+        .eps = eps,
+        .mean_reduction = true,
+        .logits_shape = &.{ 2, 2 },
+    });
+    defer freeTensor(&compute, grad);
+    const grad_data = getData(grad);
+    for (logits_data, 0..) |logit, i| {
+        const m = mask_data[i];
+        const safe_logit = logit * m;
+        const safe_label = labels_data[i] * m;
+        const label_weight = safe_label * positive_weight + (1.0 - safe_label) * negative_weight;
+        const expected = upstream_data[0] / (expected_den + eps) * label_weight * m * m * (bceSigmoid(safe_logit) - safe_label);
+        try std.testing.expectApproxEqAbs(expected, grad_data[i], 1e-6);
+    }
 }
 
 test "ComputeBackend scaledDotProductAttention call site exercises flash layout" {

@@ -659,6 +659,34 @@ pub const Builder = struct {
         return fused;
     }
 
+    pub fn maskedBceWithLogitsLoss(
+        self: *Builder,
+        logits: NodeId,
+        labels: NodeId,
+        mask: NodeId,
+        attrs: node_mod.MaskedBceWithLogitsAttrs,
+    ) !NodeId {
+        const in_shape = self.graph.node(logits).output_shape;
+        if (!self.graph.node(labels).output_shape.eq(in_shape)) return error.ShapeMismatch;
+        if (!self.graph.node(mask).output_shape.eq(in_shape)) return error.ShapeMismatch;
+
+        var out_dims = in_shape.dims;
+        for (0..in_shape.rank()) |axis| out_dims[axis] = 1;
+        const out_shape = Shape{
+            .dtype = in_shape.dtype,
+            .dims = out_dims,
+            .rank_ = in_shape.rank_,
+        };
+
+        return self.graph.addNode(.{
+            .op = .{ .fused_masked_bce_with_logits_loss = attrs },
+            .output_shape = out_shape,
+            .inputs = .{ logits, labels, mask, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
     /// Cross-entropy loss: -mean(sum(target * log_softmax(logits), axis=-1)).
     /// Returns a scalar. No fused op — composes from existing ops.
     pub fn crossEntropyLoss(self: *Builder, logits: NodeId, targets: NodeId) !NodeId {

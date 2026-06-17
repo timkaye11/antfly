@@ -2010,6 +2010,37 @@ pub fn executeNode(
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
         },
 
+        .fused_masked_bce_with_logits_loss => |attrs| {
+            var out_shape_buf: [8]i64 = undefined;
+            const out_shape = fillShapeDims(graph, node_id, &out_shape_buf);
+            return cb.maskedBceWithLogitsLoss(&.{
+                .logits = V.get(ins[0]),
+                .labels = V.get(ins[1]),
+                .mask = V.get(ins[2]),
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .output_shape = out_shape,
+            });
+        },
+
+        .fused_masked_bce_with_logits_backward => |attrs| {
+            var logits_shape_buf: [8]i64 = undefined;
+            const logits_shape = fillShapeDims(graph, ins[0], &logits_shape_buf);
+            return cb.maskedBceWithLogitsBackward(&.{
+                .logits = V.get(ins[0]),
+                .labels = V.get(ins[1]),
+                .mask = V.get(ins[2]),
+                .upstream = V.get(ins[3]),
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .logits_shape = logits_shape,
+            });
+        },
+
         .fused_concat => |attrs| {
             return cb.concat(V.get(ins[0]), V.get(ins[1]), attrs.total, attrs.dim_a, attrs.dim_b);
         },
