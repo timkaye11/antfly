@@ -76,6 +76,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_gelu,
         .fused_gelu_exact,
         .fused_gelu_backward,
+        .fused_gelu_exact_backward,
         .fused_relu,
         .fused_silu,
         .fused_quick_gelu,

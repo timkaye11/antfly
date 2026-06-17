@@ -35,6 +35,13 @@ var aggregate_planned_operator_dispatches: AtomicU64 = .init(0);
 var aggregate_interpreter_fallbacks: AtomicU64 = .init(0);
 var aggregate_device_resident_outputs: AtomicU64 = .init(0);
 var aggregate_host_materialized_outputs: AtomicU64 = .init(0);
+var aggregate_host_materialized_command_outputs: AtomicU64 = .init(0);
+var aggregate_host_materialized_interpreter_outputs: AtomicU64 = .init(0);
+var aggregate_host_materialized_pre_materialized_constant_outputs: AtomicU64 = .init(0);
+var aggregate_host_materialized_runtime_region_outputs: AtomicU64 = .init(0);
+var aggregate_host_materialized_parameter_outputs: AtomicU64 = .init(0);
+var aggregate_host_materialized_unattributed_outputs: AtomicU64 = .init(0);
+var aggregate_device_resident_parameter_outputs: AtomicU64 = .init(0);
 var aggregate_boundary_output_materializations: AtomicU64 = .init(0);
 var aggregate_graph_output_owned_copies: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_boundaries: AtomicU64 = .init(0);
@@ -53,6 +60,13 @@ pub fn record(stats: ExecutionStats) void {
     _ = aggregate_interpreter_fallbacks.fetchAdd(stats.interpreter_fallbacks, .monotonic);
     _ = aggregate_device_resident_outputs.fetchAdd(stats.device_resident_outputs, .monotonic);
     _ = aggregate_host_materialized_outputs.fetchAdd(stats.host_materialized_outputs, .monotonic);
+    _ = aggregate_host_materialized_command_outputs.fetchAdd(stats.host_materialized_command_outputs, .monotonic);
+    _ = aggregate_host_materialized_interpreter_outputs.fetchAdd(stats.host_materialized_interpreter_outputs, .monotonic);
+    _ = aggregate_host_materialized_pre_materialized_constant_outputs.fetchAdd(stats.host_materialized_pre_materialized_constant_outputs, .monotonic);
+    _ = aggregate_host_materialized_runtime_region_outputs.fetchAdd(stats.host_materialized_runtime_region_outputs, .monotonic);
+    _ = aggregate_host_materialized_parameter_outputs.fetchAdd(stats.host_materialized_parameter_outputs, .monotonic);
+    _ = aggregate_host_materialized_unattributed_outputs.fetchAdd(stats.host_materialized_unattributed_outputs, .monotonic);
+    _ = aggregate_device_resident_parameter_outputs.fetchAdd(stats.device_resident_parameter_outputs, .monotonic);
     _ = aggregate_boundary_output_materializations.fetchAdd(stats.boundary_output_materializations, .monotonic);
     _ = aggregate_graph_output_owned_copies.fetchAdd(stats.graph_output_owned_copies, .monotonic);
     _ = aggregate_metal_frame_chunk_boundaries.fetchAdd(stats.metal_frame_chunk_boundaries, .monotonic);
@@ -73,6 +87,13 @@ pub fn snapshot() ExecutionStats {
         .interpreter_fallbacks = aggregate_interpreter_fallbacks.load(.monotonic),
         .device_resident_outputs = aggregate_device_resident_outputs.load(.monotonic),
         .host_materialized_outputs = aggregate_host_materialized_outputs.load(.monotonic),
+        .host_materialized_command_outputs = aggregate_host_materialized_command_outputs.load(.monotonic),
+        .host_materialized_interpreter_outputs = aggregate_host_materialized_interpreter_outputs.load(.monotonic),
+        .host_materialized_pre_materialized_constant_outputs = aggregate_host_materialized_pre_materialized_constant_outputs.load(.monotonic),
+        .host_materialized_runtime_region_outputs = aggregate_host_materialized_runtime_region_outputs.load(.monotonic),
+        .host_materialized_parameter_outputs = aggregate_host_materialized_parameter_outputs.load(.monotonic),
+        .host_materialized_unattributed_outputs = aggregate_host_materialized_unattributed_outputs.load(.monotonic),
+        .device_resident_parameter_outputs = aggregate_device_resident_parameter_outputs.load(.monotonic),
         .boundary_output_materializations = aggregate_boundary_output_materializations.load(.monotonic),
         .graph_output_owned_copies = aggregate_graph_output_owned_copies.load(.monotonic),
         .metal_frame_chunk_boundaries = aggregate_metal_frame_chunk_boundaries.load(.monotonic),
@@ -93,6 +114,13 @@ pub fn reset() void {
     aggregate_interpreter_fallbacks.store(0, .monotonic);
     aggregate_device_resident_outputs.store(0, .monotonic);
     aggregate_host_materialized_outputs.store(0, .monotonic);
+    aggregate_host_materialized_command_outputs.store(0, .monotonic);
+    aggregate_host_materialized_interpreter_outputs.store(0, .monotonic);
+    aggregate_host_materialized_pre_materialized_constant_outputs.store(0, .monotonic);
+    aggregate_host_materialized_runtime_region_outputs.store(0, .monotonic);
+    aggregate_host_materialized_parameter_outputs.store(0, .monotonic);
+    aggregate_host_materialized_unattributed_outputs.store(0, .monotonic);
+    aggregate_device_resident_parameter_outputs.store(0, .monotonic);
     aggregate_boundary_output_materializations.store(0, .monotonic);
     aggregate_graph_output_owned_copies.store(0, .monotonic);
     aggregate_metal_frame_chunk_boundaries.store(0, .monotonic);
@@ -136,6 +164,18 @@ pub fn print(stats: ExecutionStats) void {
         },
     );
     std.debug.print(
+        " host_output_command={d} host_output_interpreter={d} host_output_pre_materialized_constant={d} host_output_runtime_region={d} host_output_parameter={d} host_output_unattributed={d} device_output_parameter={d}",
+        .{
+            stats.host_materialized_command_outputs,
+            stats.host_materialized_interpreter_outputs,
+            stats.host_materialized_pre_materialized_constant_outputs,
+            stats.host_materialized_runtime_region_outputs,
+            stats.host_materialized_parameter_outputs,
+            stats.host_materialized_unattributed_outputs,
+            stats.device_resident_parameter_outputs,
+        },
+    );
+    std.debug.print(
         " metal_frame_chunk_boundaries={d} metal_frame_chunk_promoted_values={d} metal_frame_chunk_swept_values={d} metal_chunk_local_output_peak_bytes={d} metal_chunk_local_output_live_bytes={d} metal_chunk_local_output_allocations={d} metal_chunk_local_output_reuse_hits={d} metal_chunk_local_output_consumed_hints={d} metal_chunk_local_output_unconsumed_hints={d} metal_chunk_local_output_spill_bytes={d} metal_chunk_local_output_alias_conflicts={d} metal_chunk_local_output_resets={d} metal_chunk_local_output_reset_freed_bytes={d} metal_chunk_local_output_discard_freed_bytes={d} metal_chunk_local_output_reset_live_carry_values={d}",
         .{
             stats.metal_frame_chunk_boundaries,
@@ -156,7 +196,7 @@ pub fn print(stats: ExecutionStats) void {
         },
     );
     std.debug.print(
-        " metal_eager_arena_peak_bytes={d} metal_eager_arena_live_bytes={d} metal_eager_arena_reuse_hits={d} metal_eager_arena_allocations={d} metal_eager_arena_spill_bytes={d} metal_eager_arena_hazard_declines={d} metal_eager_arena_alias_conflicts={d} metal_eager_arena_alias_reclaims={d} metal_eager_arena_alias_reclaim_bytes={d} graph_plan_slots={d} graph_plan_bytes={d} runtime_plan_compiles={d} runtime_plan_regions={d} runtime_plan_dispatches={d} runtime_plan_reuses={d} runtime_prepare_slot_calls={d} runtime_prepare_slot_cache_hits={d} runtime_region_fallbacks={d}",
+        " metal_eager_arena_peak_bytes={d} metal_eager_arena_live_bytes={d} metal_eager_arena_reuse_hits={d} metal_eager_arena_allocations={d} metal_eager_arena_spill_bytes={d} metal_eager_arena_hazard_declines={d} metal_eager_arena_alias_conflicts={d} metal_eager_arena_alias_reclaims={d} metal_eager_arena_alias_reclaim_bytes={d} graph_plan_slots={d} graph_plan_bytes={d} runtime_plan_compiles={d} runtime_plan_regions={d} runtime_plan_dispatches={d} runtime_plan_reuses={d} runtime_region_pre_skipped_nodes={d} runtime_region_pre_skipped_transposes={d} runtime_region_pre_skip_declined_external_consumers={d} runtime_prepare_slot_calls={d} runtime_prepare_slot_cache_hits={d} runtime_region_fallbacks={d}",
         .{
             stats.metal_eager_arena_peak_bytes,
             stats.metal_eager_arena_live_bytes,
@@ -173,6 +213,9 @@ pub fn print(stats: ExecutionStats) void {
             stats.runtime_region_plan_regions,
             stats.runtime_region_plan_dispatches,
             stats.runtime_region_plan_reuses,
+            stats.runtime_region_pre_skipped_nodes,
+            stats.runtime_region_pre_skipped_transposes,
+            stats.runtime_region_pre_skip_declined_external_consumers,
             stats.runtime_prepare_slot_calls,
             stats.runtime_prepare_slot_cache_hits,
             stats.runtime_region_fallbacks,
@@ -197,15 +240,19 @@ pub fn print(stats: ExecutionStats) void {
     );
     if (hasMetalFusionStats(stats)) {
         std.debug.print(
-            "metal_graph_fusions: qkv_regions={d} attention_regions={d} ffn_regions={d} deberta_ffn_forward_regions={d} lora_linear_regions={d} lora_qkv_regions={d} lora_backward_regions={d} ffn_gelu_backward_regions={d} ple_regions={d} tail_regions={d} attention_output_residual={d} attention_output_residual_partial={d} gated_ffn_residual={d} linear_pair={d}\n",
+            "metal_graph_fusions: qkv_regions={d} attention_regions={d} ffn_regions={d} deberta_ffn_forward_regions={d} head_mlp_forward_regions={d} head_mlp_backward_regions={d} lora_linear_regions={d} lora_qkv_regions={d} lora_backward_regions={d} low_rank_lora_backward_regions={d} rank_adapter_backward_regions={d} ffn_gelu_backward_regions={d} ple_regions={d} tail_regions={d} attention_output_residual={d} attention_output_residual_partial={d} gated_ffn_residual={d} linear_pair={d}\n",
             .{
                 stats.metal_qkv_regions,
                 stats.metal_attention_regions,
                 stats.metal_ffn_regions,
                 stats.metal_deberta_ffn_forward_regions,
+                stats.metal_head_mlp_forward_regions,
+                stats.metal_head_mlp_backward_regions,
                 stats.metal_lora_linear_regions,
                 stats.metal_lora_qkv_regions,
                 stats.metal_lora_backward_regions,
+                stats.metal_low_rank_lora_backward_regions,
+                stats.metal_rank_adapter_backward_regions,
                 stats.metal_ffn_gelu_backward_regions,
                 stats.metal_ple_regions,
                 stats.metal_tail_regions,
@@ -213,6 +260,22 @@ pub fn print(stats: ExecutionStats) void {
                 stats.metal_attention_output_residual_partial_fallbacks,
                 stats.metal_gated_ffn_residual_fusions,
                 stats.metal_linear_pair_fusions,
+            },
+        );
+    }
+    if (hasMetalCommandFamilyStats(stats)) {
+        std.debug.print(
+            "metal_command_dispatch_families: dot_general={d} head_dot={d} transpose={d} gather={d} reduce={d} elementwise={d} activation={d} activation_backward={d} other={d}\n",
+            .{
+                stats.metal_command_dot_general_dispatches,
+                stats.metal_command_head_dot_dispatches,
+                stats.metal_command_transpose_dispatches,
+                stats.metal_command_gather_dispatches,
+                stats.metal_command_reduce_dispatches,
+                stats.metal_command_elementwise_dispatches,
+                stats.metal_command_activation_dispatches,
+                stats.metal_command_activation_backward_dispatches,
+                stats.metal_command_other_dispatches,
             },
         );
     }
@@ -248,9 +311,13 @@ fn hasMetalFusionStats(stats: ExecutionStats) bool {
         stats.metal_attention_regions != 0 or
         stats.metal_ffn_regions != 0 or
         stats.metal_deberta_ffn_forward_regions != 0 or
+        stats.metal_head_mlp_forward_regions != 0 or
+        stats.metal_head_mlp_backward_regions != 0 or
         stats.metal_lora_linear_regions != 0 or
         stats.metal_lora_qkv_regions != 0 or
         stats.metal_lora_backward_regions != 0 or
+        stats.metal_low_rank_lora_backward_regions != 0 or
+        stats.metal_rank_adapter_backward_regions != 0 or
         stats.metal_ffn_gelu_backward_regions != 0 or
         stats.metal_ple_regions != 0 or
         stats.metal_tail_regions != 0 or
@@ -258,6 +325,18 @@ fn hasMetalFusionStats(stats: ExecutionStats) bool {
         stats.metal_attention_output_residual_partial_fallbacks != 0 or
         stats.metal_gated_ffn_residual_fusions != 0 or
         stats.metal_linear_pair_fusions != 0;
+}
+
+fn hasMetalCommandFamilyStats(stats: ExecutionStats) bool {
+    return stats.metal_command_dot_general_dispatches != 0 or
+        stats.metal_command_head_dot_dispatches != 0 or
+        stats.metal_command_transpose_dispatches != 0 or
+        stats.metal_command_gather_dispatches != 0 or
+        stats.metal_command_reduce_dispatches != 0 or
+        stats.metal_command_elementwise_dispatches != 0 or
+        stats.metal_command_activation_dispatches != 0 or
+        stats.metal_command_activation_backward_dispatches != 0 or
+        stats.metal_command_other_dispatches != 0;
 }
 
 fn hasGemmaRuntimeResidencyStats(stats: ExecutionStats) bool {

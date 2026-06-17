@@ -9815,6 +9815,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn loraLinearBackwardBOp(ctx: *anyopaque, request: *const ops.LoraLinearBackwardBRequest) anyerror!?ops.LoraLinearBackwardBResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var after_a = try self.ownedDeviceMetalTensorFromCt(request.after_a);
+        defer after_a.deinit();
+        var lora_b = try self.ownedDeviceMetalTensorFromCt(request.lora_b);
+        defer lora_b.deinit();
+        var output_grad = try self.ownedDeviceMetalTensorFromCt(request.output_grad);
+        defer output_grad.deinit();
+        const result = (try metal_runtime.decoderRuntimeLoraLinearBackwardBF32Device(
+            self.provider_impl,
+            after_a,
+            lora_b,
+            output_grad,
+            request.rows,
+            request.rank,
+            request.out_dim,
+            request.scale,
+        )) orelse return null;
+
+        const grad_after_a = try self.ctFromOwnedMetalTensor(result.grad_after_a);
+        errdefer freeOp(ctx, grad_after_a);
+        const grad_b_transposed = try self.ctFromOwnedMetalTensor(result.grad_b_transposed);
+        errdefer freeOp(ctx, grad_b_transposed);
+        return .{
+            .grad_after_a = grad_after_a,
+            .grad_b_transposed = grad_b_transposed,
+        };
+    }
+
     fn deviceTensorMatchesLinearRows(input: *const MetalTensor, rows: usize, in_dim: usize) bool {
         if (!input.isDevice() or rows == 0 or in_dim == 0) return false;
         if (input.elemCount() != rows * in_dim) return false;
@@ -21344,6 +21373,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .input = input,
             .upstream_grad = upstream_grad,
             .dim = request.dim,
+            .exact = request.exact,
         }, &self.timing_stats)) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
     }
@@ -21380,6 +21410,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .intermediate_size = request.intermediate_size,
             .first_k = request.first_k,
             .second_k = request.second_k,
+            .exact = request.exact,
         }, &self.timing_stats)) orelse return null;
 
         const first = try self.ctFromOwnedMetalTensor(chain.first);
@@ -21432,6 +21463,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .intermediate_size = request.intermediate_size,
             .first_k = request.first_k,
             .second_k = request.second_k,
+            .exact = request.exact,
         }, &self.timing_stats)) orelse return null;
 
         const first = try self.ctFromOwnedMetalTensor(result.first);
@@ -21629,6 +21661,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
         vt.loraLinearBranch = loraLinearBranchOp;
         vt.loraLinearBackward = loraLinearBackwardOp;
+        vt.loraLinearBackwardB = loraLinearBackwardBOp;
         vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
         vt.splitLastDim3 = splitLastDim3Op;

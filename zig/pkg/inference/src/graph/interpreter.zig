@@ -1423,6 +1423,7 @@ fn executeGeluBackwardFallback(
     cb: *const ComputeBackend,
     input: CT,
     upstream_grad: CT,
+    exact: bool,
 ) !CT {
     const input_data = try cb.toFloat32(input, allocator);
     defer allocator.free(input_data);
@@ -1435,6 +1436,13 @@ fn executeGeluBackwardFallback(
     for (input_data, upstream_data, output) |x, upstream, *dst| {
         if (!std.math.isFinite(x)) {
             dst.* = 0.0;
+            continue;
+        }
+        if (exact) {
+            const cdf = 0.5 * (1.0 + erfApproxF32(x * 0.7071067811865476));
+            const pdf = std.math.exp(-0.5 * x * x) * 0.3989422804014327;
+            const derivative = cdf + x * pdf;
+            dst.* = if (std.math.isFinite(derivative)) upstream * derivative else 0.0;
             continue;
         }
         const x2 = x * x;
@@ -1936,8 +1944,21 @@ pub fn executeNode(
                 .input = V.get(ins[0]),
                 .upstream_grad = V.get(ins[1]),
                 .dim = @intCast(elem_count_i64),
+                .exact = false,
             })) |fused| return fused;
-            return executeGeluBackwardFallback(graph.allocator, graph.node(ins[0]).output_shape, cb, V.get(ins[0]), V.get(ins[1]));
+            return executeGeluBackwardFallback(graph.allocator, graph.node(ins[0]).output_shape, cb, V.get(ins[0]), V.get(ins[1]), false);
+        },
+
+        .fused_gelu_exact_backward => {
+            const elem_count_i64 = n.output_shape.numElements() orelse return error.UnsupportedShape;
+            if (elem_count_i64 <= 0) return error.UnsupportedShape;
+            if (try cb.decoderRuntimeApplyGeluBackward(&.{
+                .input = V.get(ins[0]),
+                .upstream_grad = V.get(ins[1]),
+                .dim = @intCast(elem_count_i64),
+                .exact = true,
+            })) |fused| return fused;
+            return executeGeluBackwardFallback(graph.allocator, graph.node(ins[0]).output_shape, cb, V.get(ins[0]), V.get(ins[1]), true);
         },
 
         .fused_relu => {

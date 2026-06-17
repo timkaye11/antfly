@@ -39,6 +39,7 @@
 //   --objective <name>           token or span-start (default: token)
 //   --max-span-width <n>         Max span width for span-start objective (default: 4)
 //   --max-examples <n>           Cap on training examples (0 = all, default: 0)
+//   --max-steps <n>              Exact optimizer-step count, cycling data if needed (0 = epochs)
 //   --max-grad-norm <f>          Gradient clipping norm (default: 1.0)
 //   --grad-accum <n>             Gradient accumulation steps (default: 1)
 //   --seed <n>                   RNG seed (default: 42)
@@ -110,6 +111,7 @@ const Options = struct {
     span_hard_negative_weight: f32 = 1.0,
     span_negative_mask_rate: f32 = 0.0,
     max_examples: usize = 0,
+    max_steps: u64 = 0,
     max_grad_norm: f32 = 1.0,
     grad_accum: u32 = 1,
     seed: u64 = 42,
@@ -185,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
     var span_hard_negative_weight: f32 = 1.0;
     var span_negative_mask_rate: f32 = 0.0;
     var max_examples: usize = 0;
+    var max_steps: u64 = 0;
     var max_grad_norm: f32 = 1.0;
     var grad_accum: u32 = 1;
     var seed: u64 = 42;
@@ -275,6 +278,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
             const val = args.next() orelse return error.MissingMaxExamples;
             max_examples = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--max-steps")) {
+            const val = args.next() orelse return error.MissingMaxSteps;
+            max_steps = try std.fmt.parseUnsigned(u64, val, 10);
         } else if (std.mem.eql(u8, arg, "--max-grad-norm")) {
             const val = args.next() orelse return error.MissingMaxGradNorm;
             max_grad_norm = try std.fmt.parseFloat(f32, val);
@@ -398,6 +404,7 @@ pub fn main(init: std.process.Init) !void {
         .span_hard_negative_weight = span_hard_negative_weight,
         .span_negative_mask_rate = span_negative_mask_rate,
         .max_examples = max_examples,
+        .max_steps = max_steps,
         .max_grad_norm = max_grad_norm,
         .grad_accum = grad_accum,
         .seed = seed,
@@ -457,6 +464,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_grad_norm,
         opts.grad_accum,
     });
+    if (opts.max_steps > 0) {
+        print("  max_steps={d} (exact-step mode; cycles training data as needed)\n", .{opts.max_steps});
+    }
     print("  objective={s} max_span_width={d} span_loss={s} span_loss_reduction={s} span_pos_weight={d:.3} span_neg_weight={d:.3} span_hard_neg_weight={d:.3}\n", .{
         objectiveName(opts.objective),
         opts.max_span_width,
@@ -1044,12 +1054,24 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     const total_examples = examples.len;
     const steps_per_epoch = (total_examples + opts.batch_size - 1) / opts.batch_size;
+    const steps_per_epoch_u64: u64 = @intCast(steps_per_epoch);
+    const target_total_steps: u64 = if (opts.max_steps > 0) opts.max_steps else @as(u64, opts.epochs) * steps_per_epoch_u64;
+    const planned_epoch_count: u64 = (target_total_steps + steps_per_epoch_u64 - 1) / steps_per_epoch_u64;
 
-    print("\nStarting training: {d} epochs x {d} steps/epoch ({d} examples)\n", .{
-        opts.epochs,
-        steps_per_epoch,
-        total_examples,
-    });
+    if (opts.max_steps > 0) {
+        print("\nStarting training: max_steps={d}, {d} steps/epoch ({d} examples), planned data passes={d}\n", .{
+            target_total_steps,
+            steps_per_epoch,
+            total_examples,
+            planned_epoch_count,
+        });
+    } else {
+        print("\nStarting training: {d} epochs x {d} steps/epoch ({d} examples)\n", .{
+            opts.epochs,
+            steps_per_epoch,
+            total_examples,
+        });
+    }
 
     // Pre-allocate batch buffers (sized to the fit-to-data effective length).
     const sl: usize = effective_seq_len;
@@ -1116,6 +1138,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
     var cumulative_loss: f64 = 0.0;
     var total_steps: u64 = 0;
+    var completed_epochs: u64 = 0;
     var run_target_stats = BatchTargetStats{};
     var metrics_jsonl: std.Io.Writer.Allocating = .init(allocator);
     defer metrics_jsonl.deinit();
@@ -1127,7 +1150,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var eval_window_loss: f64 = 0.0;
     var eval_window_steps: u64 = 0;
 
-    for (0..opts.epochs) |epoch| {
+    var epoch_idx: u64 = 0;
+    while (total_steps < target_total_steps) : (epoch_idx += 1) {
+        const epoch_number: usize = @intCast(epoch_idx + 1);
         // Shuffle examples at the start of each epoch.
         if (opts.objective == .gliner2_total_loss) {
             if (!opts.dump_span_parity) shuffleExamplesAndRecords(&prng, examples, training_records);
@@ -1141,7 +1166,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         var epoch_target_stats = BatchTargetStats{};
 
         var batch_start: usize = 0;
-        while (batch_start < total_examples) {
+        while (batch_start < total_examples and total_steps < target_total_steps) {
             const batch_end = @min(batch_start + bs, total_examples);
             // Pad a partial final batch up to the fixed graph batch size by
             // repeating the last real example; the padded targets are zero-
@@ -1419,18 +1444,18 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             }
             eval_window_loss += result.loss;
             eval_window_steps += 1;
-            try writeStepMetric(&metrics_jsonl.writer, epoch + 1, total_steps, epoch_steps, result.loss, result.grad_norm, result.optimizer_stepped, target_stats, timing);
+            try writeStepMetric(&metrics_jsonl.writer, epoch_number, total_steps, epoch_steps, result.loss, result.grad_norm, result.optimizer_stepped, target_stats, timing);
 
             if (opts.report_to == .jsonl) {
                 print(
                     "{{\"event\":\"step\",\"step\":{d},\"epoch\":{d},\"epoch_step\":{d},\"loss\":{d:.9},\"grad_norm\":{d:.9},\"lr\":{e:.6}}}\n",
-                    .{ total_steps, epoch + 1, epoch_steps, result.loss, result.grad_norm, opts.learning_rate },
+                    .{ total_steps, epoch_number, epoch_steps, result.loss, result.grad_norm, opts.learning_rate },
                 );
             }
-            if (total_steps % 10 == 0 or batch_end >= total_examples) {
+            if (total_steps % 10 == 0 or batch_end >= total_examples or total_steps >= target_total_steps) {
                 print("  [epoch {d}/{d}] step {d}/{d}  loss={d:.6}  grad_norm={d:.4}  supervised_tok/s={d:.2}{s}\n", .{
-                    epoch + 1,
-                    opts.epochs,
+                    epoch_number,
+                    planned_epoch_count,
                     epoch_steps,
                     steps_per_epoch,
                     result.loss,
@@ -1444,7 +1469,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 const eval_loss = eval_window_loss / @as(f64, @floatFromInt(eval_window_steps));
                 eval_window_loss = 0.0;
                 eval_window_steps = 0;
-                try emitEvalEvent(allocator, opts, &metrics_jsonl.writer, epoch + 1, total_steps, eval_loss, &best_eval_loss, &trainer);
+                try emitEvalEvent(allocator, opts, &metrics_jsonl.writer, epoch_number, total_steps, eval_loss, &best_eval_loss, &trainer);
             }
 
             batch_start = batch_end;
@@ -1452,6 +1477,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
         const avg_epoch_loss = if (epoch_steps > 0) epoch_loss / @as(f64, @floatFromInt(epoch_steps)) else 0.0;
         cumulative_loss += avg_epoch_loss;
+        completed_epochs += 1;
 
         // -- End-of-epoch evaluation summary --------------------------------
         // Cross-entropy loss is the primary eval metric for token
@@ -1462,8 +1488,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         for (examples) |ex| gold_ent_count += ex.entities.len;
 
         print("  epoch {d}/{d} complete -- avg_loss={d:.6}  ~acc={d:.1}%  ({d} gold entities)\n", .{
-            epoch + 1,
-            opts.epochs,
+            epoch_number,
+            planned_epoch_count,
             avg_epoch_loss,
             approx_acc,
             gold_ent_count,
@@ -1471,12 +1497,12 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         const epoch_timing = EpochTiming{
             .epoch_wall_ns = elapsedNs(epoch_started_ns, monotonicNowNs()),
         };
-        try writeEpochMetric(&metrics_jsonl.writer, epoch + 1, avg_epoch_loss, approx_acc, gold_ent_count, epoch_steps, epoch_target_stats, epoch_timing);
+        try writeEpochMetric(&metrics_jsonl.writer, epoch_number, avg_epoch_loss, approx_acc, gold_ent_count, epoch_steps, epoch_target_stats, epoch_timing);
 
         if (opts.eval_strategy == .epoch) {
             eval_window_loss = 0.0;
             eval_window_steps = 0;
-            try emitEvalEvent(allocator, opts, &metrics_jsonl.writer, epoch + 1, total_steps, avg_epoch_loss, &best_eval_loss, &trainer);
+            try emitEvalEvent(allocator, opts, &metrics_jsonl.writer, epoch_number, total_steps, avg_epoch_loss, &best_eval_loss, &trainer);
         }
     }
 
@@ -1511,8 +1537,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     defer allocator.free(metrics_path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = metrics_path, .data = metrics_jsonl.written() });
 
-    const final_avg = if (opts.epochs > 0) cumulative_loss / @as(f64, @floatFromInt(opts.epochs)) else 0.0;
-    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, effective_num_classes, entity_types, resolved_span_label_positive_weights, examples.len, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, regular_trainable_params, resolved_target_patterns, run_target_stats);
+    const final_avg = if (completed_epochs > 0) cumulative_loss / @as(f64, @floatFromInt(completed_epochs)) else 0.0;
+    try writeTrainingManifest(allocator, opts, backendLabel(selected_backend), deberta_config.hidden_size, effective_num_classes, entity_types, resolved_span_label_positive_weights, examples.len, completed_epochs, steps_per_epoch, total_steps, final_avg, trainer.lora_params.items.len, peft_export.exported_tensor_count, regular_export.exported_tensor_count, regular_trainable_params, resolved_target_patterns, run_target_stats);
     print("\nLoRA adapters saved to {s}\n", .{opts.out_dir});
 
     print("training complete -- {d} total steps, final avg loss={d:.6}\n", .{ total_steps, final_avg });
@@ -1563,7 +1589,15 @@ fn writeStepMetric(
         .graph_executor_planned_dispatches = timing.profile.graph_executor_planned_dispatches,
         .graph_executor_interpreter_fallbacks = timing.profile.graph_executor_interpreter_fallbacks,
         .graph_executor_host_outputs = timing.profile.graph_executor_host_outputs,
+        .graph_executor_true_host_outputs = timing.profile.graph_executor_true_host_outputs,
+        .graph_executor_host_output_command = timing.profile.graph_executor_host_output_command,
+        .graph_executor_host_output_interpreter = timing.profile.graph_executor_host_output_interpreter,
+        .graph_executor_host_output_pre_materialized_constant = timing.profile.graph_executor_host_output_pre_materialized_constant,
+        .graph_executor_host_output_runtime_region = timing.profile.graph_executor_host_output_runtime_region,
+        .graph_executor_host_output_parameter = timing.profile.graph_executor_host_output_parameter,
+        .graph_executor_host_output_unattributed = timing.profile.graph_executor_host_output_unattributed,
         .graph_executor_device_outputs = timing.profile.graph_executor_device_outputs,
+        .graph_executor_device_output_parameter = timing.profile.graph_executor_device_output_parameter,
         .graph_executor_metal_frame_chunk_boundaries = timing.profile.graph_executor_metal_frame_chunk_boundaries,
         .graph_executor_metal_frame_chunk_promoted_values = timing.profile.graph_executor_metal_frame_chunk_promoted_values,
         .graph_executor_metal_frame_chunk_swept_values = timing.profile.graph_executor_metal_frame_chunk_swept_values,
@@ -1579,6 +1613,22 @@ fn writeStepMetric(
         .graph_executor_metal_chunk_local_output_reset_freed_bytes = timing.profile.graph_executor_metal_chunk_local_output_reset_freed_bytes,
         .graph_executor_metal_chunk_local_output_discard_freed_bytes = timing.profile.graph_executor_metal_chunk_local_output_discard_freed_bytes,
         .graph_executor_metal_chunk_local_output_reset_live_carry_values = timing.profile.graph_executor_metal_chunk_local_output_reset_live_carry_values,
+        .graph_executor_metal_gather_input_promotions = timing.profile.graph_executor_metal_gather_input_promotions,
+        .graph_executor_metal_gather_input_promotion_bytes = timing.profile.graph_executor_metal_gather_input_promotion_bytes,
+        .graph_executor_metal_gather_input_promotion_ms = nsToMillis(timing.profile.graph_executor_metal_gather_input_promotion_ns),
+        .graph_executor_metal_gather_output_promotions = timing.profile.graph_executor_metal_gather_output_promotions,
+        .graph_executor_metal_gather_output_promotion_bytes = timing.profile.graph_executor_metal_gather_output_promotion_bytes,
+        .graph_executor_metal_gather_output_promotion_ms = nsToMillis(timing.profile.graph_executor_metal_gather_output_promotion_ns),
+        .graph_executor_metal_reduce_input_promotions = timing.profile.graph_executor_metal_reduce_input_promotions,
+        .graph_executor_metal_reduce_input_promotion_bytes = timing.profile.graph_executor_metal_reduce_input_promotion_bytes,
+        .graph_executor_metal_reduce_input_promotion_ms = nsToMillis(timing.profile.graph_executor_metal_reduce_input_promotion_ns),
+        .graph_executor_metal_resident_input_cache_hits = timing.profile.graph_executor_metal_resident_input_cache_hits,
+        .graph_executor_metal_resident_input_cache_misses = timing.profile.graph_executor_metal_resident_input_cache_misses,
+        .graph_executor_metal_resident_input_cache_unique_promotions = timing.profile.graph_executor_metal_resident_input_cache_unique_promotions,
+        .graph_executor_metal_resident_input_cache_retained_live_bytes = timing.profile.graph_executor_metal_resident_input_cache_retained_live_bytes,
+        .graph_executor_metal_resident_input_cache_retained_peak_bytes = timing.profile.graph_executor_metal_resident_input_cache_retained_peak_bytes,
+        .graph_executor_metal_resident_input_cache_reused_bytes = timing.profile.graph_executor_metal_resident_input_cache_reused_bytes,
+        .graph_executor_metal_resident_input_cache_released_bytes = timing.profile.graph_executor_metal_resident_input_cache_released_bytes,
         .graph_executor_metal_eager_arena_peak_bytes = timing.profile.graph_executor_metal_eager_arena_peak_bytes,
         .graph_executor_metal_eager_arena_live_bytes = timing.profile.graph_executor_metal_eager_arena_live_bytes,
         .graph_executor_metal_eager_arena_reuse_hits = timing.profile.graph_executor_metal_eager_arena_reuse_hits,
@@ -1597,11 +1647,29 @@ fn writeStepMetric(
         .graph_executor_runtime_region_elided_nodes = timing.profile.graph_executor_runtime_region_elided_nodes,
         .graph_executor_runtime_region_plan_compiles = timing.profile.graph_executor_runtime_region_plan_compiles,
         .graph_executor_runtime_region_plan_reuses = timing.profile.graph_executor_runtime_region_plan_reuses,
+        .graph_executor_runtime_region_pre_skipped_nodes = timing.profile.graph_executor_runtime_region_pre_skipped_nodes,
+        .graph_executor_runtime_region_pre_skipped_transposes = timing.profile.graph_executor_runtime_region_pre_skipped_transposes,
+        .graph_executor_runtime_region_pre_skip_declined_external_consumers = timing.profile.graph_executor_runtime_region_pre_skip_declined_external_consumers,
         .metal_deberta_ffn_forward_regions = timing.profile.metal_deberta_ffn_forward_regions,
         .metal_deberta_encoder_lora_layer_regions = timing.profile.metal_deberta_encoder_lora_layer_regions,
         .metal_deberta_encoder_lora_residual_layernorm_regions = timing.profile.metal_deberta_encoder_lora_residual_layernorm_regions,
         .metal_deberta_encoder_lora_layer_scaffold_regions = timing.profile.metal_deberta_encoder_lora_layer_scaffold_regions,
         .metal_deberta_encoder_lora_layer_fallbacks = timing.profile.metal_deberta_encoder_lora_layer_fallbacks,
+        .metal_lora_backward_regions = timing.profile.metal_lora_backward_regions,
+        .metal_low_rank_lora_backward_regions = timing.profile.metal_low_rank_lora_backward_regions,
+        .metal_rank_adapter_backward_regions = timing.profile.metal_rank_adapter_backward_regions,
+        .metal_ffn_gelu_backward_regions = timing.profile.metal_ffn_gelu_backward_regions,
+        .metal_head_mlp_forward_regions = timing.profile.metal_head_mlp_forward_regions,
+        .metal_head_mlp_backward_regions = timing.profile.metal_head_mlp_backward_regions,
+        .metal_command_dot_general_dispatches = timing.profile.metal_command_dot_general_dispatches,
+        .metal_command_head_dot_dispatches = timing.profile.metal_command_head_dot_dispatches,
+        .metal_command_transpose_dispatches = timing.profile.metal_command_transpose_dispatches,
+        .metal_command_gather_dispatches = timing.profile.metal_command_gather_dispatches,
+        .metal_command_reduce_dispatches = timing.profile.metal_command_reduce_dispatches,
+        .metal_command_elementwise_dispatches = timing.profile.metal_command_elementwise_dispatches,
+        .metal_command_activation_dispatches = timing.profile.metal_command_activation_dispatches,
+        .metal_command_activation_backward_dispatches = timing.profile.metal_command_activation_backward_dispatches,
+        .metal_command_other_dispatches = timing.profile.metal_command_other_dispatches,
         .graph_executor_runtime_frame_candidates = timing.profile.graph_executor_runtime_frame_candidates,
         .graph_executor_runtime_frame_eligible = timing.profile.graph_executor_runtime_frame_eligible,
         .graph_executor_runtime_frame_metadata_ready = timing.profile.graph_executor_runtime_frame_metadata_ready,
@@ -1756,6 +1824,8 @@ fn writeTrainingManifest(
     entity_labels: []const []const u8,
     span_label_positive_weights: []const f32,
     example_count: usize,
+    completed_epochs: u64,
+    steps_per_epoch: usize,
     total_steps: u64,
     final_avg_loss: f64,
     adapter_parameter_file_count: usize,
@@ -1792,7 +1862,13 @@ fn writeTrainingManifest(
         .eval_strategy = @tagName(opts.eval_strategy),
         .eval_steps = opts.eval_steps,
         .save_best = opts.save_best,
-        .epochs = opts.epochs,
+        .requested_epochs = opts.epochs,
+        .epochs = completed_epochs,
+        .max_steps = opts.max_steps,
+        .requested_max_steps = opts.max_steps,
+        .effective_steps = total_steps,
+        .steps_per_epoch = steps_per_epoch,
+        .cycled_epochs = if (completed_epochs > 0) completed_epochs - 1 else 0,
         .batch_size = opts.batch_size,
         .seq_len = opts.seq_len,
         .learning_rate = opts.learning_rate,
@@ -3601,6 +3677,7 @@ fn printUsage() void {
         \\  --span-hard-negative-weight <f> Extra negative weight for spans overlapping gold entities (default: 1)
         \\  --span-negative-mask-rate <f> Randomly mask this fraction of negative span labels (default: 0)
         \\  --max-examples <n>        Cap on training examples (default: 0 = all)
+        \\  --max-steps <n>           Exact optimizer-step count; cycles data as needed (default: 0 = use epochs)
         \\  --max-grad-norm <f>       Gradient clipping norm (default: 1.0)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --seed <n>                RNG seed (default: 42)

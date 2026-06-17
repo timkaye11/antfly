@@ -459,6 +459,7 @@ pub const DecoderRuntimeApplyGeluBackwardRequest = struct {
     input: CT,
     upstream_grad: CT,
     dim: usize,
+    exact: bool = false,
 };
 
 pub const DecoderRuntimeFfnGeluBackwardChainRequest = struct {
@@ -476,6 +477,7 @@ pub const DecoderRuntimeFfnGeluBackwardChainRequest = struct {
     intermediate_size: usize,
     first_k: usize,
     second_k: usize,
+    exact: bool = false,
 };
 
 pub const DecoderRuntimeFfnGeluBackwardChainResult = struct {

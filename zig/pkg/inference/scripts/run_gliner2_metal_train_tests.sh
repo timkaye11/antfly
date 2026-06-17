@@ -81,6 +81,10 @@ Options:
                         Fail readiness unless graph-level DeBERTa FFN forward regions run at least N times
   --min-metal-deberta-encoder-lora-layer-region-count N
                         Fail readiness unless LoRA-aware DeBERTa encoder-layer regions run at least N times
+  --min-metal-deberta-encoder-lora-residual-layernorm-region-count N
+                        Fail readiness unless encoder-layer regions include residual+LayerNorm at least N times
+  --max-metal-deberta-encoder-lora-layer-scaffold-count N
+                        Fail readiness if scaffold-only encoder-layer regions exceed N
   --max-metal-deberta-encoder-lora-layer-fallback-count N
                         Fail readiness if LoRA-aware DeBERTa encoder-layer fallbacks exceed N
   --min-metal-deberta-attention-flash-call-count N
@@ -174,6 +178,7 @@ min_graph_runtime_region_elided_node_count=""
 min_metal_deberta_ffn_forward_region_count=""
 min_metal_deberta_encoder_lora_layer_region_count=""
 min_metal_deberta_encoder_lora_residual_layernorm_region_count=""
+max_metal_deberta_encoder_lora_layer_scaffold_count=""
 max_metal_deberta_encoder_lora_layer_fallback_count=""
 min_metal_deberta_attention_flash_call_count=""
 max_metal_deberta_attention_gemm_fallback_count=""
@@ -356,6 +361,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --min-metal-deberta-encoder-lora-residual-layernorm-region-count)
       min_metal_deberta_encoder_lora_residual_layernorm_region_count="${2:?missing value for --min-metal-deberta-encoder-lora-residual-layernorm-region-count}"
+      shift 2
+      ;;
+    --max-metal-deberta-encoder-lora-layer-scaffold-count)
+      max_metal_deberta_encoder_lora_layer_scaffold_count="${2:?missing value for --max-metal-deberta-encoder-lora-layer-scaffold-count}"
       shift 2
       ;;
     --max-metal-deberta-encoder-lora-layer-fallback-count)
@@ -601,6 +610,9 @@ append_metal_runtime_threshold_args() {
   fi
   if [[ -n "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}" ]]; then
     cmd+=("--min-metal-deberta-encoder-lora-residual-layernorm-region-count" "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}")
+  fi
+  if [[ -n "${max_metal_deberta_encoder_lora_layer_scaffold_count}" ]]; then
+    cmd+=("--max-metal-deberta-encoder-lora-layer-scaffold-count" "${max_metal_deberta_encoder_lora_layer_scaffold_count}")
   fi
   if [[ -n "${max_metal_deberta_encoder_lora_layer_fallback_count}" ]]; then
     cmd+=("--max-metal-deberta-encoder-lora-layer-fallback-count" "${max_metal_deberta_encoder_lora_layer_fallback_count}")
@@ -1016,6 +1028,8 @@ run_train_profile() {
 
 run_batch32() {
   require_data
+  : "${TERMITE_METAL_ENABLE_DEBERTA_ENCODER_LAYER_LORA_REGION:=1}"
+  export TERMITE_METAL_ENABLE_DEBERTA_ENCODER_LAYER_LORA_REGION
   graph_stats=1
   op_profile=1
   partition_op_stats=1
@@ -1057,7 +1071,7 @@ run_batch32() {
     max_metal_runtime_total_bytes=536870912
   fi
   if [[ -z "${max_metal_tensor_device_owned_peak_live_bytes}" ]]; then
-    max_metal_tensor_device_owned_peak_live_bytes=4294967296
+    max_metal_tensor_device_owned_peak_live_bytes=5583457485
   fi
   if [[ -z "${min_graph_runtime_region_dispatch_count}" ]]; then
     min_graph_runtime_region_dispatch_count=1
@@ -1086,10 +1100,13 @@ run_batch32() {
     min_metal_deberta_ffn_forward_region_count=0
   fi
   if [[ -z "${min_metal_deberta_encoder_lora_layer_region_count}" ]]; then
-    min_metal_deberta_encoder_lora_layer_region_count=0
+    min_metal_deberta_encoder_lora_layer_region_count=12
   fi
   if [[ -z "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}" ]]; then
-    min_metal_deberta_encoder_lora_residual_layernorm_region_count=0
+    min_metal_deberta_encoder_lora_residual_layernorm_region_count=12
+  fi
+  if [[ -z "${max_metal_deberta_encoder_lora_layer_scaffold_count}" ]]; then
+    max_metal_deberta_encoder_lora_layer_scaffold_count=0
   fi
   if [[ -z "${max_metal_deberta_encoder_lora_layer_fallback_count}" ]]; then
     max_metal_deberta_encoder_lora_layer_fallback_count=0
@@ -1303,6 +1320,7 @@ run_production() {
     -n "${min_metal_deberta_ffn_forward_region_count}" ||
     -n "${min_metal_deberta_encoder_lora_layer_region_count}" ||
     -n "${min_metal_deberta_encoder_lora_residual_layernorm_region_count}" ||
+    -n "${max_metal_deberta_encoder_lora_layer_scaffold_count}" ||
     -n "${max_metal_deberta_encoder_lora_layer_fallback_count}" ||
     -n "${min_metal_deberta_attention_flash_call_count}" ||
     -n "${max_metal_deberta_attention_gemm_fallback_count}" ||

@@ -110,6 +110,7 @@ const Options = struct {
     min_metal_deberta_ffn_forward_region_count: ?u64 = null,
     min_metal_deberta_encoder_lora_layer_region_count: ?u64 = null,
     min_metal_deberta_encoder_lora_residual_layernorm_region_count: ?u64 = null,
+    max_metal_deberta_encoder_lora_layer_scaffold_count: ?u64 = null,
     max_metal_deberta_encoder_lora_layer_fallback_count: ?u64 = null,
     min_metal_deberta_attention_flash_call_count: ?u64 = null,
     max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
@@ -350,6 +351,7 @@ fn runReadiness(init: std.process.Init, allocator: std.mem.Allocator, opts: Opti
         .min_metal_deberta_ffn_forward_region_count = opts.min_metal_deberta_ffn_forward_region_count,
         .min_metal_deberta_encoder_lora_layer_region_count = opts.min_metal_deberta_encoder_lora_layer_region_count,
         .min_metal_deberta_encoder_lora_residual_layernorm_region_count = opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        .max_metal_deberta_encoder_lora_layer_scaffold_count = opts.max_metal_deberta_encoder_lora_layer_scaffold_count,
         .max_metal_deberta_encoder_lora_layer_fallback_count = opts.max_metal_deberta_encoder_lora_layer_fallback_count,
         .min_metal_deberta_attention_flash_call_count = opts.min_metal_deberta_attention_flash_call_count,
         .max_metal_deberta_attention_gemm_fallback_count = opts.max_metal_deberta_attention_gemm_fallback_count,
@@ -684,6 +686,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         \\min_metal_deberta_ffn_forward_region_count: {?}
         \\min_metal_deberta_encoder_lora_layer_region_count: {?}
         \\min_metal_deberta_encoder_lora_residual_layernorm_region_count: {?}
+        \\max_metal_deberta_encoder_lora_layer_scaffold_count: {?}
         \\max_metal_deberta_encoder_lora_layer_fallback_count: {?}
         \\min_metal_deberta_attention_flash_call_count: {?}
         \\max_metal_deberta_attention_gemm_fallback_count: {?}
@@ -708,6 +711,7 @@ fn printDryRun(init: std.process.Init, opts: Options) !void {
         opts.min_metal_deberta_ffn_forward_region_count,
         opts.min_metal_deberta_encoder_lora_layer_region_count,
         opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        opts.max_metal_deberta_encoder_lora_layer_scaffold_count,
         opts.max_metal_deberta_encoder_lora_layer_fallback_count,
         opts.min_metal_deberta_attention_flash_call_count,
         opts.max_metal_deberta_attention_gemm_fallback_count,
@@ -888,6 +892,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.min_metal_deberta_encoder_lora_layer_region_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-metal-deberta-encoder-lora-residual-layernorm-region-count")) {
             opts.min_metal_deberta_encoder_lora_residual_layernorm_region_count = try parseU64Arg(args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-scaffold-count")) {
+            opts.max_metal_deberta_encoder_lora_layer_scaffold_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-fallback-count")) {
             opts.max_metal_deberta_encoder_lora_layer_fallback_count = try parseU64Arg(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-metal-deberta-attention-flash-call-count")) {
@@ -1212,6 +1218,7 @@ fn printUsage() void {
         \\  --min-metal-deberta-ffn-forward-region-count N
         \\  --min-metal-deberta-encoder-lora-layer-region-count N
         \\  --min-metal-deberta-encoder-lora-residual-layernorm-region-count N
+        \\  --max-metal-deberta-encoder-lora-layer-scaffold-count N
         \\  --max-metal-deberta-encoder-lora-layer-fallback-count N
         \\  --min-metal-deberta-attention-flash-call-count N
         \\  --max-metal-deberta-attention-gemm-fallback-count N

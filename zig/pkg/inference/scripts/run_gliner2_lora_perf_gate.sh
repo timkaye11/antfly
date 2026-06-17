@@ -17,13 +17,64 @@ Options:
   --train-data FILE                Training JSONL (default: production diagnostic train data)
   --python-bin FILE                Python executable (default: /private/tmp/gliner2-parity-venv/bin/python)
   --include-python                 Run upstream Python side as timing target
+  --compare-steps N                Steps per comparison run (default: 1)
+  --production-batch32             Use the production batch-32/seq-128 LoRA profile
+  --production-ready               Use the strict repeated-run production batch-32 gate
+  --warm-research                  Batch-32 warm-step diagnostic: 1 warmup + 3 measured steps, non-strict
+  --warm-production-ready          Strict warm-step production target: median <=1.0x Python, any-run <=1.10x
   --op-stats                       Enable Metal partition op-stats collection
   --op-runs                        Enable grouped-dot candidate shape summaries
+  --loop-profile                   Enable executor loop-profile timing summaries
+  --hazard-profile                 Enable planned-access hazard timing summaries
+  --promote-gather-inputs          Enable Metal gather/reduce input promotion for low true-host-output probes (default for --production-batch32)
   --max-zig-median-ms N            Fail if Zig median trainer ms exceeds N
-  --max-host-output-median N       Fail if median host outputs exceeds N
+  --max-zig-python-step-ratio-median N
+                                   Fail if Zig/Python median step ratio exceeds N
+  --max-zig-python-step-ratio-any-run N
+                                   Fail if any successful run's Zig/Python step ratio exceeds N
+  --max-zig-python-warm-step-ratio-median N
+                                   Fail if Zig/Python median warm-step ratio exceeds N
+  --max-zig-python-warm-step-ratio-any-run N
+                                   Fail if any successful run's Zig/Python warm-step ratio exceeds N
+  --max-host-output-median N       Fail if median aggregate host outputs exceeds N
+  --max-true-host-output-median N  Fail if median true host outputs exceeds N
+  --max-parameter-materialization-median N
+                                   Fail if median parameter materializations exceeds N
+  --warn-parameter-materialization-median N
+                                   Warn if median parameter materializations exceeds N
   --max-fallback-median N          Fail if median interpreter fallbacks exceeds N
+  --max-command-dispatch-median N  Fail if median command dispatches exceeds N
   --max-dot-general-count-median N Fail if median dot_general command count exceeds N
   --max-dot-general-ms-median N    Fail if median dot_general total ms exceeds N
+  --max-gather-host-output-median N
+                                   Fail if median gather host outputs exceeds N
+  --max-zig-metal-peak-live-bytes-median N
+                                   Fail if median Zig Metal peak live bytes exceeds N
+  --max-zig-metal-planned-barriers-median N
+                                   Fail if median planned Metal barriers exceeds N
+  --max-zig-metal-planned-scopes-median N
+                                   Fail if median planned Metal scopes exceeds N
+  --max-zig-low-rank-lora-backward-region-median N
+                                   Fail if median low-rank LoRA-backward regions exceeds N
+  --min-zig-residual-layernorm-region-median N
+                                   Fail if median residual+LayerNorm regions is below N
+  --max-zig-scaffold-region-median N
+                                   Fail if median scaffold-only encoder regions exceeds N
+  --max-zig-encoder-lora-fallback-median N
+                                   Fail if median encoder LoRA region fallbacks exceeds N
+  --min-zig-lora-backward-region-median N
+                                   Fail if median LoRA-backward regions is below N
+  --min-zig-low-rank-lora-backward-region-median N
+                                   Fail if median low-rank LoRA-backward regions is below N
+  --min-zig-rank-adapter-backward-region-median N
+                                   Fail if median rank-adapter-backward regions is below N
+  --min-zig-ffn-gelu-backward-region-median N
+                                   Fail if median FFN GELU-backward regions is below N
+  --min-zig-head-mlp-forward-region-median N
+                                   Fail if median head-MLP forward regions is below N
+  --min-zig-head-mlp-backward-region-median N
+                                   Fail if median head-MLP backward regions is below N
+  --warn-zig-median-ms N           Report a warning if Zig median trainer ms exceeds N
   --require-zig-beats-python       Fail unless Zig median step beats Python median step
   --require-loss-parity            Fail unless all runs report valid_loss_parity=true
   --help                           Show this help
@@ -38,19 +89,54 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../../.." && pwd)"
 
 runs=3
+runs_explicit=0
 out_dir="/private/tmp/termite-gliner2-lora-perf-gate"
 model_dir="/private/tmp/termite-models/gliner2"
+model_dir_explicit=0
 python_model=""
 train_data="/private/tmp/termite-gliner2-production-diagnostic/train.jsonl"
+train_data_explicit=0
 python_bin="/private/tmp/gliner2-parity-venv/bin/python"
 include_python=0
+compare_steps=1
+compare_steps_explicit=0
+production_batch32=0
+production_ready=0
+warm_research=0
+warm_production_ready=0
 op_stats=0
 op_runs=0
+loop_profile=0
+hazard_profile=0
+promote_gather_inputs=0
 max_zig_median_ms=""
+max_zig_python_step_ratio_median=""
+max_zig_python_step_ratio_any_run=""
+max_zig_python_warm_step_ratio_median=""
+max_zig_python_warm_step_ratio_any_run=""
 max_host_output_median=""
+max_true_host_output_median=""
+max_parameter_materialization_median=""
+warn_parameter_materialization_median=""
 max_fallback_median=""
+max_command_dispatch_median=""
 max_dot_general_count_median=""
 max_dot_general_ms_median=""
+max_gather_host_output_median=""
+max_zig_metal_peak_live_bytes_median=""
+max_zig_metal_planned_barriers_median=""
+max_zig_metal_planned_scopes_median=""
+max_zig_low_rank_lora_backward_region_median=""
+min_zig_residual_layernorm_region_median=""
+max_zig_scaffold_region_median=""
+max_zig_encoder_lora_fallback_median=""
+min_zig_lora_backward_region_median=""
+min_zig_low_rank_lora_backward_region_median=""
+min_zig_rank_adapter_backward_region_median=""
+min_zig_ffn_gelu_backward_region_median=""
+min_zig_head_mlp_forward_region_median=""
+min_zig_head_mlp_backward_region_median=""
+warn_zig_median_ms=""
 require_zig_beats_python=0
 require_loss_parity=0
 extra_args=()
@@ -59,6 +145,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --runs)
       runs="${2:?missing value for --runs}"
+      runs_explicit=1
       shift 2
       ;;
     --out-dir)
@@ -67,6 +154,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model-dir)
       model_dir="${2:?missing value for --model-dir}"
+      model_dir_explicit=1
       shift 2
       ;;
     --python-model)
@@ -75,6 +163,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --train-data)
       train_data="${2:?missing value for --train-data}"
+      train_data_explicit=1
       shift 2
       ;;
     --python-bin)
@@ -85,6 +174,27 @@ while [[ $# -gt 0 ]]; do
       include_python=1
       shift
       ;;
+    --compare-steps)
+      compare_steps="${2:?missing value for --compare-steps}"
+      compare_steps_explicit=1
+      shift 2
+      ;;
+    --production-batch32)
+      production_batch32=1
+      shift
+      ;;
+    --production-ready)
+      production_ready=1
+      shift
+      ;;
+    --warm-research)
+      warm_research=1
+      shift
+      ;;
+    --warm-production-ready)
+      warm_production_ready=1
+      shift
+      ;;
     --op-stats)
       op_stats=1
       shift
@@ -93,16 +203,60 @@ while [[ $# -gt 0 ]]; do
       op_runs=1
       shift
       ;;
+    --loop-profile)
+      loop_profile=1
+      shift
+      ;;
+    --hazard-profile)
+      hazard_profile=1
+      shift
+      ;;
+    --promote-gather-inputs)
+      promote_gather_inputs=1
+      shift
+      ;;
     --max-zig-median-ms)
       max_zig_median_ms="${2:?missing value for --max-zig-median-ms}"
+      shift 2
+      ;;
+    --max-zig-python-step-ratio-median)
+      max_zig_python_step_ratio_median="${2:?missing value for --max-zig-python-step-ratio-median}"
+      shift 2
+      ;;
+    --max-zig-python-step-ratio-any-run)
+      max_zig_python_step_ratio_any_run="${2:?missing value for --max-zig-python-step-ratio-any-run}"
+      shift 2
+      ;;
+    --max-zig-python-warm-step-ratio-median)
+      max_zig_python_warm_step_ratio_median="${2:?missing value for --max-zig-python-warm-step-ratio-median}"
+      shift 2
+      ;;
+    --max-zig-python-warm-step-ratio-any-run)
+      max_zig_python_warm_step_ratio_any_run="${2:?missing value for --max-zig-python-warm-step-ratio-any-run}"
       shift 2
       ;;
     --max-host-output-median)
       max_host_output_median="${2:?missing value for --max-host-output-median}"
       shift 2
       ;;
+    --max-true-host-output-median)
+      max_true_host_output_median="${2:?missing value for --max-true-host-output-median}"
+      shift 2
+      ;;
+    --max-parameter-materialization-median)
+      max_parameter_materialization_median="${2:?missing value for --max-parameter-materialization-median}"
+      shift 2
+      ;;
+    --warn-parameter-materialization-median)
+      warn_parameter_materialization_median="${2:?missing value for --warn-parameter-materialization-median}"
+      shift 2
+      ;;
     --max-fallback-median)
       max_fallback_median="${2:?missing value for --max-fallback-median}"
+      shift 2
+      ;;
+    --max-command-dispatch-median)
+      max_command_dispatch_median="${2:?missing value for --max-command-dispatch-median}"
       shift 2
       ;;
     --max-dot-general-count-median)
@@ -111,6 +265,66 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-dot-general-ms-median)
       max_dot_general_ms_median="${2:?missing value for --max-dot-general-ms-median}"
+      shift 2
+      ;;
+    --max-gather-host-output-median)
+      max_gather_host_output_median="${2:?missing value for --max-gather-host-output-median}"
+      shift 2
+      ;;
+    --max-zig-metal-peak-live-bytes-median)
+      max_zig_metal_peak_live_bytes_median="${2:?missing value for --max-zig-metal-peak-live-bytes-median}"
+      shift 2
+      ;;
+    --max-zig-metal-planned-barriers-median)
+      max_zig_metal_planned_barriers_median="${2:?missing value for --max-zig-metal-planned-barriers-median}"
+      shift 2
+      ;;
+    --max-zig-metal-planned-scopes-median)
+      max_zig_metal_planned_scopes_median="${2:?missing value for --max-zig-metal-planned-scopes-median}"
+      shift 2
+      ;;
+    --max-zig-low-rank-lora-backward-region-median)
+      max_zig_low_rank_lora_backward_region_median="${2:?missing value for --max-zig-low-rank-lora-backward-region-median}"
+      shift 2
+      ;;
+    --min-zig-residual-layernorm-region-median)
+      min_zig_residual_layernorm_region_median="${2:?missing value for --min-zig-residual-layernorm-region-median}"
+      shift 2
+      ;;
+    --max-zig-scaffold-region-median)
+      max_zig_scaffold_region_median="${2:?missing value for --max-zig-scaffold-region-median}"
+      shift 2
+      ;;
+    --max-zig-encoder-lora-fallback-median)
+      max_zig_encoder_lora_fallback_median="${2:?missing value for --max-zig-encoder-lora-fallback-median}"
+      shift 2
+      ;;
+    --min-zig-lora-backward-region-median)
+      min_zig_lora_backward_region_median="${2:?missing value for --min-zig-lora-backward-region-median}"
+      shift 2
+      ;;
+    --min-zig-low-rank-lora-backward-region-median)
+      min_zig_low_rank_lora_backward_region_median="${2:?missing value for --min-zig-low-rank-lora-backward-region-median}"
+      shift 2
+      ;;
+    --min-zig-rank-adapter-backward-region-median)
+      min_zig_rank_adapter_backward_region_median="${2:?missing value for --min-zig-rank-adapter-backward-region-median}"
+      shift 2
+      ;;
+    --min-zig-ffn-gelu-backward-region-median)
+      min_zig_ffn_gelu_backward_region_median="${2:?missing value for --min-zig-ffn-gelu-backward-region-median}"
+      shift 2
+      ;;
+    --min-zig-head-mlp-forward-region-median)
+      min_zig_head_mlp_forward_region_median="${2:?missing value for --min-zig-head-mlp-forward-region-median}"
+      shift 2
+      ;;
+    --min-zig-head-mlp-backward-region-median)
+      min_zig_head_mlp_backward_region_median="${2:?missing value for --min-zig-head-mlp-backward-region-median}"
+      shift 2
+      ;;
+    --warn-zig-median-ms)
+      warn_zig_median_ms="${2:?missing value for --warn-zig-median-ms}"
       shift 2
       ;;
     --require-zig-beats-python)
@@ -138,9 +352,162 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if (( warm_research || warm_production_ready )); then
+  production_batch32=1
+  include_python=1
+  op_stats=1
+  loop_profile=1
+  hazard_profile=1
+  if (( ! compare_steps_explicit )); then
+    compare_steps=4
+  fi
+fi
+if (( warm_production_ready )); then
+  production_ready=1
+fi
+
+if (( production_ready )); then
+  production_batch32=1
+  include_python=1
+  op_stats=1
+  if (( ! runs_explicit )); then
+    if (( warm_production_ready )); then
+      runs=3
+    else
+      runs=5
+    fi
+  fi
+elif (( warm_research && ! runs_explicit )); then
+  runs=3
+fi
+
+if (( production_batch32 )); then
+  promote_gather_inputs=1
+  hf_gliner2_snapshot="/Users/timkaye/.cache/huggingface/hub/models--fastino--gliner2-base-v1/snapshots/f5b2ecedebe4381b088c1cf276f5bf72a52cac54"
+  if (( ! model_dir_explicit )) && [[ -d "${hf_gliner2_snapshot}" && ( ! -f "${model_dir}/model.safetensors" || ! -f "${model_dir}/config.json" || ! -f "${model_dir}/tokenizer.json" || ! -f "${model_dir}/encoder_config/config.json" ) ]]; then
+    model_dir="${hf_gliner2_snapshot}"
+  fi
+  if (( ! train_data_explicit )) && [[ "${train_data}" == "/private/tmp/termite-gliner2-production-diagnostic/train.jsonl" && -f /private/tmp/gliner2_ner_batch32_train.jsonl ]]; then
+    train_data="/private/tmp/gliner2_ner_batch32_train.jsonl"
+  elif (( ! train_data_explicit )) && [[ "${train_data}" == "/private/tmp/termite-gliner2-production-diagnostic/train.jsonl" && -f /private/tmp/gliner2_realistic.jsonl ]]; then
+    train_data="/private/tmp/gliner2_realistic.jsonl"
+  fi
+  if (( production_ready )) && [[ -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
+    max_zig_metal_peak_live_bytes_median=1717986918
+  elif [[ -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
+    max_zig_metal_peak_live_bytes_median=5583457485
+  fi
+  if [[ -z "${warn_zig_median_ms}" ]]; then
+    warn_zig_median_ms=3000
+  fi
+  if [[ -z "${max_zig_median_ms}" ]]; then
+    max_zig_median_ms=18000
+  fi
+  if [[ -z "${max_true_host_output_median}" ]]; then
+    if (( promote_gather_inputs )); then
+      max_true_host_output_median=0
+    else
+      max_true_host_output_median=23
+    fi
+  fi
+  if [[ -z "${warn_parameter_materialization_median}" ]]; then
+    warn_parameter_materialization_median=331
+  fi
+  if [[ -z "${max_fallback_median}" ]]; then
+    max_fallback_median=0
+  fi
+  if [[ -z "${max_command_dispatch_median}" ]]; then
+    max_command_dispatch_median=6250
+  fi
+  if (( op_stats )) && [[ -z "${max_dot_general_count_median}" ]]; then
+    max_dot_general_count_median=1100
+  fi
+  if (( op_stats && promote_gather_inputs )) && [[ -z "${max_gather_host_output_median}" ]]; then
+    max_gather_host_output_median=0
+  fi
+  if [[ -z "${max_zig_low_rank_lora_backward_region_median}" ]]; then
+    max_zig_low_rank_lora_backward_region_median=0
+  fi
+  if [[ -z "${min_zig_residual_layernorm_region_median}" ]]; then
+    min_zig_residual_layernorm_region_median=12
+  fi
+  if [[ -z "${max_zig_scaffold_region_median}" ]]; then
+    max_zig_scaffold_region_median=0
+  fi
+  if [[ -z "${max_zig_encoder_lora_fallback_median}" ]]; then
+    max_zig_encoder_lora_fallback_median=0
+  fi
+  if [[ -z "${min_zig_lora_backward_region_median}" ]]; then
+    min_zig_lora_backward_region_median=100
+  fi
+  if [[ -z "${min_zig_rank_adapter_backward_region_median}" ]]; then
+    min_zig_rank_adapter_backward_region_median=100
+  fi
+  if (( include_python && ! warm_research && ! warm_production_ready )) && [[ -z "${max_zig_python_step_ratio_median}" ]]; then
+    max_zig_python_step_ratio_median=1.5
+  fi
+  if (( production_ready && ! warm_production_ready )) && [[ -z "${max_zig_python_step_ratio_any_run}" ]]; then
+    max_zig_python_step_ratio_any_run=1.65
+  fi
+  if (( warm_production_ready )) && [[ -z "${max_zig_python_warm_step_ratio_median}" ]]; then
+    max_zig_python_warm_step_ratio_median=1.0
+  fi
+  if (( warm_production_ready )) && [[ -z "${max_zig_python_warm_step_ratio_any_run}" ]]; then
+    max_zig_python_warm_step_ratio_any_run=1.10
+  fi
+  if (( production_ready )) && [[ -z "${max_zig_metal_planned_barriers_median}" ]]; then
+    max_zig_metal_planned_barriers_median=40
+  fi
+  if (( production_ready )) && [[ -z "${max_zig_metal_planned_scopes_median}" ]]; then
+    max_zig_metal_planned_scopes_median=55
+  fi
+  export TERMITE_METAL_BUFFER_REUSE_STATS="${TERMITE_METAL_BUFFER_REUSE_STATS:-1}"
+  export TERMITE_METAL_FRAME_CHUNK_OPS="${TERMITE_METAL_FRAME_CHUNK_OPS:-128}"
+  export TERMITE_GRAPH_EXECUTOR_STATS="${TERMITE_GRAPH_EXECUTOR_STATS:-1}"
+  export TERMITE_METAL_ENABLE_DEBERTA_ENCODER_LAYER_LORA_REGION=1
+fi
+
+required_model_files=(
+  "model.safetensors"
+  "config.json"
+  "tokenizer.json"
+  "tokenizer_config.json"
+  "special_tokens_map.json"
+  "added_tokens.json"
+  "spm.model"
+  "encoder_config/config.json"
+)
+missing_model_files=()
+for required_model_file in "${required_model_files[@]}"; do
+  if [[ ! -e "${model_dir}/${required_model_file}" ]]; then
+    missing_model_files+=("${required_model_file}")
+  fi
+done
+if ((${#missing_model_files[@]})); then
+  echo "GLiNER2 perf gate model fixture is incomplete: ${model_dir}" >&2
+  printf '  missing: %s\n' "${missing_model_files[@]}" >&2
+  if (( model_dir_explicit )); then
+    echo "Pass a complete --model-dir, for example a Hugging Face snapshot directory." >&2
+  else
+    echo "Default model fixture is incomplete and no local Hugging Face snapshot fallback was available." >&2
+  fi
+  exit 2
+fi
+if [[ ! -f "${train_data}" ]]; then
+  echo "GLiNER2 perf gate training data is missing: ${train_data}" >&2
+  if (( train_data_explicit )); then
+    echo "Pass an existing --train-data JSONL file." >&2
+  else
+    echo "Default production diagnostic data was missing and no local fallback was available." >&2
+  fi
+  exit 2
+fi
+
 if [[ -z "${python_model}" ]]; then
   python_model="${model_dir}"
 fi
+
+echo "perf_gate_fixture: model_dir=${model_dir} train_data=${train_data}" >&2
 
 bench_args=(
   "--runs" "${runs}"
@@ -152,20 +519,95 @@ fi
 if (( op_runs )); then
   bench_args+=("--op-runs")
 fi
+if (( loop_profile )); then
+  bench_args+=("--loop-profile")
+fi
+if (( hazard_profile )); then
+  bench_args+=("--hazard-profile")
+fi
 if [[ -n "${max_zig_median_ms}" ]]; then
   bench_args+=("--max-zig-median-ms" "${max_zig_median_ms}")
+fi
+if [[ -n "${max_zig_python_step_ratio_median}" ]]; then
+  bench_args+=("--max-zig-python-step-ratio-median" "${max_zig_python_step_ratio_median}")
+fi
+if [[ -n "${max_zig_python_step_ratio_any_run}" ]]; then
+  bench_args+=("--max-zig-python-step-ratio-any-run" "${max_zig_python_step_ratio_any_run}")
+fi
+if [[ -n "${max_zig_python_warm_step_ratio_median}" ]]; then
+  bench_args+=("--max-zig-python-warm-step-ratio-median" "${max_zig_python_warm_step_ratio_median}")
+fi
+if [[ -n "${max_zig_python_warm_step_ratio_any_run}" ]]; then
+  bench_args+=("--max-zig-python-warm-step-ratio-any-run" "${max_zig_python_warm_step_ratio_any_run}")
 fi
 if [[ -n "${max_host_output_median}" ]]; then
   bench_args+=("--max-host-output-median" "${max_host_output_median}")
 fi
+if [[ -n "${max_true_host_output_median}" ]]; then
+  bench_args+=("--max-true-host-output-median" "${max_true_host_output_median}")
+fi
+if [[ -n "${max_parameter_materialization_median}" ]]; then
+  bench_args+=("--max-parameter-materialization-median" "${max_parameter_materialization_median}")
+fi
+if [[ -n "${warn_parameter_materialization_median}" ]]; then
+  bench_args+=("--warn-parameter-materialization-median" "${warn_parameter_materialization_median}")
+fi
 if [[ -n "${max_fallback_median}" ]]; then
   bench_args+=("--max-fallback-median" "${max_fallback_median}")
+fi
+if [[ -n "${max_command_dispatch_median}" ]]; then
+  bench_args+=("--max-command-dispatch-median" "${max_command_dispatch_median}")
 fi
 if [[ -n "${max_dot_general_count_median}" ]]; then
   bench_args+=("--max-dot-general-count-median" "${max_dot_general_count_median}")
 fi
 if [[ -n "${max_dot_general_ms_median}" ]]; then
   bench_args+=("--max-dot-general-ms-median" "${max_dot_general_ms_median}")
+fi
+if [[ -n "${max_gather_host_output_median}" ]]; then
+  bench_args+=("--max-gather-host-output-median" "${max_gather_host_output_median}")
+fi
+if [[ -n "${max_zig_metal_peak_live_bytes_median}" ]]; then
+  bench_args+=("--max-zig-metal-peak-live-bytes-median" "${max_zig_metal_peak_live_bytes_median}")
+fi
+if [[ -n "${max_zig_metal_planned_barriers_median}" ]]; then
+  bench_args+=("--max-zig-metal-planned-barriers-median" "${max_zig_metal_planned_barriers_median}")
+fi
+if [[ -n "${max_zig_metal_planned_scopes_median}" ]]; then
+  bench_args+=("--max-zig-metal-planned-scopes-median" "${max_zig_metal_planned_scopes_median}")
+fi
+if [[ -n "${max_zig_low_rank_lora_backward_region_median}" ]]; then
+  bench_args+=("--max-zig-low-rank-lora-backward-region-median" "${max_zig_low_rank_lora_backward_region_median}")
+fi
+if [[ -n "${min_zig_residual_layernorm_region_median}" ]]; then
+  bench_args+=("--min-zig-residual-layernorm-region-median" "${min_zig_residual_layernorm_region_median}")
+fi
+if [[ -n "${max_zig_scaffold_region_median}" ]]; then
+  bench_args+=("--max-zig-scaffold-region-median" "${max_zig_scaffold_region_median}")
+fi
+if [[ -n "${max_zig_encoder_lora_fallback_median}" ]]; then
+  bench_args+=("--max-zig-encoder-lora-fallback-median" "${max_zig_encoder_lora_fallback_median}")
+fi
+if [[ -n "${min_zig_lora_backward_region_median}" ]]; then
+  bench_args+=("--min-zig-lora-backward-region-median" "${min_zig_lora_backward_region_median}")
+fi
+if [[ -n "${min_zig_low_rank_lora_backward_region_median}" ]]; then
+  bench_args+=("--min-zig-low-rank-lora-backward-region-median" "${min_zig_low_rank_lora_backward_region_median}")
+fi
+if [[ -n "${min_zig_rank_adapter_backward_region_median}" ]]; then
+  bench_args+=("--min-zig-rank-adapter-backward-region-median" "${min_zig_rank_adapter_backward_region_median}")
+fi
+if [[ -n "${min_zig_ffn_gelu_backward_region_median}" ]]; then
+  bench_args+=("--min-zig-ffn-gelu-backward-region-median" "${min_zig_ffn_gelu_backward_region_median}")
+fi
+if [[ -n "${min_zig_head_mlp_forward_region_median}" ]]; then
+  bench_args+=("--min-zig-head-mlp-forward-region-median" "${min_zig_head_mlp_forward_region_median}")
+fi
+if [[ -n "${min_zig_head_mlp_backward_region_median}" ]]; then
+  bench_args+=("--min-zig-head-mlp-backward-region-median" "${min_zig_head_mlp_backward_region_median}")
+fi
+if [[ -n "${warn_zig_median_ms}" ]]; then
+  bench_args+=("--warn-zig-median-ms" "${warn_zig_median_ms}")
 fi
 if (( require_zig_beats_python )); then
   bench_args+=("--require-zig-beats-python")
@@ -182,7 +624,7 @@ compare_args=(
   "--python-bin" "${python_bin}"
   "--train-data" "${train_data}"
   "--entity-types" "person,organization,location"
-  "--steps" "1"
+  "--steps" "${compare_steps}"
   "--seq-len" "16"
   "--max-span-width" "2"
   "--lora-rank" "1"
@@ -194,12 +636,51 @@ compare_args=(
   "--span-loss-reduction" "sum"
   "--timeout-seconds" "900"
 )
+if (( production_batch32 )); then
+  compare_args=(
+    "--zig-backend" "metal"
+    "--zig-build-metal"
+    "--model-dir" "${model_dir}"
+    "--python-model" "${python_model}"
+    "--python-bin" "${python_bin}"
+    "--train-data" "${train_data}"
+    "--entity-types" "person,organization,location"
+    "--steps" "${compare_steps}"
+    "--batch-size" "32"
+    "--seq-len" "128"
+    "--max-span-width" "4"
+    "--lora-rank" "16"
+    "--lora-alpha" "32"
+    "--lora-dropout" "0"
+    "--span-positive-weight" "32"
+    "--span-negative-weight" "1"
+    "--span-hard-negative-weight" "1"
+    "--span-negative-mask-rate" "0"
+    "--span-loss-reduction" "mean"
+    "--zig-objective" "gliner2-total-loss"
+    "--activation-checkpointing"
+    "--activation-checkpoint-interval" "1"
+    "--activation-checkpoint-strategy" "parameters-only"
+    "--timeout-seconds" "900"
+  )
+fi
 if (( include_python )); then
   compare_args+=("--perf-target-only-python")
 else
   compare_args+=("--skip-python")
 fi
-compare_args+=("${extra_args[@]}")
+if ((${#extra_args[@]})); then
+  compare_args+=("${extra_args[@]}")
+fi
 
 cd "${repo_root}"
-exec python3 "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
+env_args=()
+if (( promote_gather_inputs )); then
+  env_args+=("TERMITE_METAL_GATHER_PROMOTE_INPUT=1")
+  env_args+=("TERMITE_METAL_REDUCE_PROMOTE_INPUT=1")
+fi
+if ((${#env_args[@]})); then
+  exec env "${env_args[@]}" python3 "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
+else
+  exec python3 "${script_dir}/benchmark_gliner2_lora_perf.py" "${bench_args[@]}" -- "${compare_args[@]}"
+fi

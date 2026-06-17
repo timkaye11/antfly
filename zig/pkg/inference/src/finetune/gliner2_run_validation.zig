@@ -63,6 +63,7 @@ pub const ValidationOptions = struct {
     min_metal_deberta_ffn_forward_region_count: ?u64 = null,
     min_metal_deberta_encoder_lora_layer_region_count: ?u64 = null,
     min_metal_deberta_encoder_lora_residual_layernorm_region_count: ?u64 = null,
+    max_metal_deberta_encoder_lora_layer_scaffold_count: ?u64 = null,
     max_metal_deberta_encoder_lora_layer_fallback_count: ?u64 = null,
     min_metal_deberta_attention_flash_call_count: ?u64 = null,
     max_metal_deberta_attention_gemm_fallback_count: ?u64 = null,
@@ -151,6 +152,9 @@ pub const RunValidationSummary = struct {
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
     total_graph_host_outputs: u64,
+    total_graph_true_host_outputs: u64,
+    total_graph_parameter_materializations: u64,
+    total_graph_device_parameter_outputs: u64,
     max_metal_frame_gpu_ms: f64,
     max_metal_last_frame_compute_encoders: u64,
     total_metal_frame_chunk_boundaries: u64,
@@ -348,6 +352,9 @@ pub fn validateRun(
     if (options.min_metal_deberta_encoder_lora_residual_layernorm_region_count) |min_regions| {
         if (metrics.total_metal_deberta_encoder_lora_residual_layernorm_regions < min_regions) return error.MetalDebertaEncoderLoraResidualLayerNormRegionCountBelowThreshold;
     }
+    if (options.max_metal_deberta_encoder_lora_layer_scaffold_count) |max_regions| {
+        if (metrics.total_metal_deberta_encoder_lora_layer_scaffold_regions > max_regions) return error.MetalDebertaEncoderLoraLayerScaffoldCountAboveThreshold;
+    }
     if (options.max_metal_deberta_encoder_lora_layer_fallback_count) |max_fallbacks| {
         if (metrics.total_metal_deberta_encoder_lora_layer_fallbacks > max_fallbacks) return error.MetalDebertaEncoderLoraLayerFallbackCountAboveThreshold;
     }
@@ -464,6 +471,9 @@ pub fn validateRun(
         .total_graph_command_dispatches = metrics.total_graph_command_dispatches,
         .total_graph_planned_dispatches = metrics.total_graph_planned_dispatches,
         .total_graph_host_outputs = metrics.total_graph_host_outputs,
+        .total_graph_true_host_outputs = metrics.total_graph_true_host_outputs,
+        .total_graph_parameter_materializations = metrics.total_graph_parameter_materializations,
+        .total_graph_device_parameter_outputs = metrics.total_graph_device_parameter_outputs,
         .max_metal_frame_gpu_ms = metrics.max_metal_frame_gpu_ms,
         .max_metal_last_frame_compute_encoders = metrics.max_metal_last_frame_compute_encoders,
         .total_metal_frame_chunk_boundaries = metrics.total_metal_frame_chunk_boundaries,
@@ -571,6 +581,9 @@ const MetricsInspection = struct {
     total_graph_command_dispatches: u64 = 0,
     total_graph_planned_dispatches: u64 = 0,
     total_graph_host_outputs: u64 = 0,
+    total_graph_true_host_outputs: u64 = 0,
+    total_graph_parameter_materializations: u64 = 0,
+    total_graph_device_parameter_outputs: u64 = 0,
     max_metal_frame_gpu_ms: f64 = 0,
     max_metal_last_frame_compute_encoders: u64 = 0,
     total_metal_frame_chunk_boundaries: u64 = 0,
@@ -823,6 +836,9 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
     total_graph_command_dispatches: u64,
     total_graph_planned_dispatches: u64,
     total_graph_host_outputs: u64,
+    total_graph_true_host_outputs: u64,
+    total_graph_parameter_materializations: u64,
+    total_graph_device_parameter_outputs: u64,
     max_metal_frame_gpu_ms: f64,
     max_metal_last_frame_compute_encoders: u64,
     total_metal_frame_chunk_boundaries: u64,
@@ -1002,6 +1018,16 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
             inspection.total_graph_command_dispatches += jsonU64(obj.get("graph_executor_command_dispatches")) orelse 0;
             inspection.total_graph_planned_dispatches += jsonU64(obj.get("graph_executor_planned_dispatches")) orelse 0;
             inspection.total_graph_host_outputs += jsonU64(obj.get("graph_executor_host_outputs")) orelse 0;
+            inspection.total_graph_true_host_outputs += jsonU64(obj.get("graph_executor_true_host_outputs")) orelse blk: {
+                const command_outputs = jsonU64(obj.get("graph_executor_host_output_command")) orelse 0;
+                const interpreter_outputs = jsonU64(obj.get("graph_executor_host_output_interpreter")) orelse 0;
+                const constant_outputs = jsonU64(obj.get("graph_executor_host_output_pre_materialized_constant")) orelse 0;
+                const runtime_region_outputs = jsonU64(obj.get("graph_executor_host_output_runtime_region")) orelse 0;
+                const unattributed_outputs = jsonU64(obj.get("graph_executor_host_output_unattributed")) orelse 0;
+                break :blk command_outputs + interpreter_outputs + constant_outputs + runtime_region_outputs + unattributed_outputs;
+            };
+            inspection.total_graph_parameter_materializations += jsonU64(obj.get("graph_executor_host_output_parameter")) orelse 0;
+            inspection.total_graph_device_parameter_outputs += jsonU64(obj.get("graph_executor_device_output_parameter")) orelse 0;
             inspection.total_metal_frame_chunk_boundaries += jsonU64(obj.get("graph_executor_metal_frame_chunk_boundaries")) orelse 0;
             inspection.total_metal_frame_chunk_promoted_values += jsonU64(obj.get("graph_executor_metal_frame_chunk_promoted_values")) orelse 0;
             inspection.total_metal_frame_chunk_swept_values += jsonU64(obj.get("graph_executor_metal_frame_chunk_swept_values")) orelse 0;
@@ -1113,6 +1139,9 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, bytes: []const u8) !struct 
         .total_graph_command_dispatches = inspection.total_graph_command_dispatches,
         .total_graph_planned_dispatches = inspection.total_graph_planned_dispatches,
         .total_graph_host_outputs = inspection.total_graph_host_outputs,
+        .total_graph_true_host_outputs = inspection.total_graph_true_host_outputs,
+        .total_graph_parameter_materializations = inspection.total_graph_parameter_materializations,
+        .total_graph_device_parameter_outputs = inspection.total_graph_device_parameter_outputs,
         .max_metal_frame_gpu_ms = inspection.max_metal_frame_gpu_ms,
         .max_metal_last_frame_compute_encoders = inspection.max_metal_last_frame_compute_encoders,
         .total_metal_frame_chunk_boundaries = inspection.total_metal_frame_chunk_boundaries,

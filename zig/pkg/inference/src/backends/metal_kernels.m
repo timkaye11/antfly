@@ -397,6 +397,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> lora_finish_f32_pipeline;
     id<MTLComputePipelineState> lora_rank1_linear_f32_pipeline;
     id<MTLComputePipelineState> lora_grad_b_f32_pipeline;
+    id<MTLComputePipelineState> lora_grad_b_transposed_f32_pipeline;
     id<MTLComputePipelineState> lora_grad_after_a_f32_pipeline;
     id<MTLComputePipelineState> lora_grad_a_f32_pipeline;
     id<MTLComputePipelineState> lora_rank1_grad_b_after_a_f32_pipeline;
@@ -728,6 +729,13 @@ typedef struct termite_metal_decode_runtime {
     uint64_t active_frame_blit_encoder_count;
     uint64_t active_frame_planned_compute_scope_count;
     uint64_t active_frame_planned_barrier_count;
+    uint64_t active_frame_planned_access_prepare_calls;
+    uint64_t active_frame_planned_access_ranges;
+    uint64_t active_frame_planned_access_range_scans;
+    uint64_t active_frame_planned_access_conflicts;
+    uint64_t active_frame_planned_access_capacity_flushes;
+    uint64_t active_frame_planned_access_barriers;
+    uint64_t active_frame_planned_access_nanos;
     uint64_t active_frame_mps_dense_linear_count;
     uint64_t submitted_frame_compute_encoder_count;
     uint64_t submitted_frame_blit_encoder_count;
@@ -3357,12 +3365,19 @@ static NSString *termite_metal_shader_source(void) {
            "    float x = input[gid];\n"
            "    if (!isfinite(x)) { output[gid] = 0.0f; return; }\n"
            "    float x2 = x * x;\n"
-           "    float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
-           "    if (inner > 10.0f) { output[gid] = upstream_grad[gid]; return; }\n"
-           "    if (inner < -10.0f) { output[gid] = 0.0f; return; }\n"
-           "    float t = tanh(inner);\n"
-           "    float sech2 = 1.0f - t * t;\n"
-           "    float derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    float derivative = 0.0f;\n"
+           "    if (p.activation_kind == 1u) {\n"
+           "        float cdf = 0.5f * (1.0f + termite_erf_approx(x * 0.7071067811865476f));\n"
+           "        float pdf = exp(-0.5f * x2) * 0.3989422804014327f;\n"
+           "        derivative = cdf + x * pdf;\n"
+           "    } else {\n"
+           "        float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
+           "        if (inner > 10.0f) { output[gid] = upstream_grad[gid]; return; }\n"
+           "        if (inner < -10.0f) { output[gid] = 0.0f; return; }\n"
+           "        float t = tanh(inner);\n"
+           "        float sech2 = 1.0f - t * t;\n"
+           "        derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    }\n"
            "    output[gid] = isfinite(derivative) ? upstream_grad[gid] * derivative : 0.0f;\n"
            "}\n"
            "kernel void termite_ffn_gelu_backward_rank1_branches(device const float *first_lhs [[buffer(0)]], device const float *first_rhs [[buffer(1)]], device const float *second_lhs [[buffer(2)]], device const float *second_rhs [[buffer(3)]], device const float *gelu_input [[buffer(4)]], device float *first_output [[buffer(5)]], device float *second_output [[buffer(6)]], device float *upstream_output [[buffer(7)]], device float *gelu_output [[buffer(8)]], constant termite_metal_apply_activation_params &p [[buffer(9)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -3377,12 +3392,19 @@ static NSString *termite_metal_shader_source(void) {
            "    float x = gelu_input[gid];\n"
            "    if (!isfinite(x)) { gelu_output[gid] = 0.0f; return; }\n"
            "    float x2 = x * x;\n"
-           "    float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
-           "    if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
-           "    if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
-           "    float t = tanh(inner);\n"
-           "    float sech2 = 1.0f - t * t;\n"
-           "    float derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    float derivative = 0.0f;\n"
+           "    if (p.activation_kind == 1u) {\n"
+           "        float cdf = 0.5f * (1.0f + termite_erf_approx(x * 0.7071067811865476f));\n"
+           "        float pdf = exp(-0.5f * x2) * 0.3989422804014327f;\n"
+           "        derivative = cdf + x * pdf;\n"
+           "    } else {\n"
+           "        float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
+           "        if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
+           "        if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
+           "        float t = tanh(inner);\n"
+           "        float sech2 = 1.0f - t * t;\n"
+           "        derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    }\n"
            "    gelu_output[gid] = isfinite(derivative) ? upstream * derivative : 0.0f;\n"
            "}\n"
            "kernel void termite_ffn_gelu_backward_rank1_output(device const float *first_lhs [[buffer(0)]], device const float *first_rhs [[buffer(1)]], device const float *second_lhs [[buffer(2)]], device const float *second_rhs [[buffer(3)]], device const float *gelu_input [[buffer(4)]], device float *first_output [[buffer(5)]], device float *gelu_output [[buffer(6)]], constant termite_metal_apply_activation_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -3394,12 +3416,19 @@ static NSString *termite_metal_shader_source(void) {
            "    float x = gelu_input[gid];\n"
            "    if (!isfinite(x)) { gelu_output[gid] = 0.0f; return; }\n"
            "    float x2 = x * x;\n"
-           "    float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
-           "    if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
-           "    if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
-           "    float t = tanh(inner);\n"
-           "    float sech2 = 1.0f - t * t;\n"
-           "    float derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    float derivative = 0.0f;\n"
+           "    if (p.activation_kind == 1u) {\n"
+           "        float cdf = 0.5f * (1.0f + termite_erf_approx(x * 0.7071067811865476f));\n"
+           "        float pdf = exp(-0.5f * x2) * 0.3989422804014327f;\n"
+           "        derivative = cdf + x * pdf;\n"
+           "    } else {\n"
+           "        float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
+           "        if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
+           "        if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
+           "        float t = tanh(inner);\n"
+           "        float sech2 = 1.0f - t * t;\n"
+           "        derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    }\n"
            "    gelu_output[gid] = isfinite(derivative) ? upstream * derivative : 0.0f;\n"
            "}\n"
            "kernel void termite_ffn_gelu_backward_rank1_first_output(device const float *first_lhs [[buffer(0)]], device const float *first_rhs [[buffer(1)]], device const float *second_output [[buffer(2)]], device const float *gelu_input [[buffer(3)]], device float *first_output [[buffer(4)]], device float *gelu_output [[buffer(5)]], constant termite_metal_apply_activation_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -3411,12 +3440,19 @@ static NSString *termite_metal_shader_source(void) {
            "    float x = gelu_input[gid];\n"
            "    if (!isfinite(x)) { gelu_output[gid] = 0.0f; return; }\n"
            "    float x2 = x * x;\n"
-           "    float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
-           "    if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
-           "    if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
-           "    float t = tanh(inner);\n"
-           "    float sech2 = 1.0f - t * t;\n"
-           "    float derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    float derivative = 0.0f;\n"
+           "    if (p.activation_kind == 1u) {\n"
+           "        float cdf = 0.5f * (1.0f + termite_erf_approx(x * 0.7071067811865476f));\n"
+           "        float pdf = exp(-0.5f * x2) * 0.3989422804014327f;\n"
+           "        derivative = cdf + x * pdf;\n"
+           "    } else {\n"
+           "        float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
+           "        if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
+           "        if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
+           "        float t = tanh(inner);\n"
+           "        float sech2 = 1.0f - t * t;\n"
+           "        derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    }\n"
            "    gelu_output[gid] = isfinite(derivative) ? upstream * derivative : 0.0f;\n"
            "}\n"
            "kernel void termite_ffn_gelu_backward_rank1_first_branch(device const float *first_lhs [[buffer(0)]], device const float *first_rhs [[buffer(1)]], device const float *second_output [[buffer(2)]], device const float *gelu_input [[buffer(3)]], device float *first_output [[buffer(4)]], device float *upstream_output [[buffer(5)]], device float *gelu_output [[buffer(6)]], constant termite_metal_apply_activation_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -3429,12 +3465,19 @@ static NSString *termite_metal_shader_source(void) {
            "    float x = gelu_input[gid];\n"
            "    if (!isfinite(x)) { gelu_output[gid] = 0.0f; return; }\n"
            "    float x2 = x * x;\n"
-           "    float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
-           "    if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
-           "    if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
-           "    float t = tanh(inner);\n"
-           "    float sech2 = 1.0f - t * t;\n"
-           "    float derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    float derivative = 0.0f;\n"
+           "    if (p.activation_kind == 1u) {\n"
+           "        float cdf = 0.5f * (1.0f + termite_erf_approx(x * 0.7071067811865476f));\n"
+           "        float pdf = exp(-0.5f * x2) * 0.3989422804014327f;\n"
+           "        derivative = cdf + x * pdf;\n"
+           "    } else {\n"
+           "        float inner = 0.7978845608028654f * (x + 0.044715f * x * x2);\n"
+           "        if (inner > 10.0f) { gelu_output[gid] = upstream; return; }\n"
+           "        if (inner < -10.0f) { gelu_output[gid] = 0.0f; return; }\n"
+           "        float t = tanh(inner);\n"
+           "        float sech2 = 1.0f - t * t;\n"
+           "        derivative = 0.5f * (1.0f + t) + 0.5f * x * sech2 * 0.7978845608028654f * (1.0f + 0.134145f * x2);\n"
+           "    }\n"
            "    gelu_output[gid] = isfinite(derivative) ? upstream * derivative : 0.0f;\n"
            "}\n"
            "kernel void termite_apply_bias_activation_2d(device const float *input [[buffer(0)]], device const float *bias [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_activation_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -4190,6 +4233,11 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint row = 0u; row < p.rows; ++row) acc += output_grad[row * p.out_dim + out] * after_a[row * p.rank + rk];\n"
            "    grad_b[gid] = acc * p.scale;\n"
            "}\n"
+           "kernel void termite_lora_grad_b_transposed_f32(device const float *output_grad [[buffer(0)]], device const float *after_a [[buffer(1)]], device float *grad_b_t [[buffer(2)]], constant termite_metal_lora_linear_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total = p.rank * p.out_dim; if (gid >= total || p.rows == 0u) return; uint rk = gid / p.out_dim; uint out = gid - rk * p.out_dim; float acc = 0.0f;\n"
+           "    for (uint row = 0u; row < p.rows; ++row) acc += after_a[row * p.rank + rk] * output_grad[row * p.out_dim + out];\n"
+           "    grad_b_t[gid] = acc * p.scale;\n"
+           "}\n"
            "kernel void termite_lora_grad_after_a_f32(device const float *output_grad [[buffer(0)]], device const float *lora_b [[buffer(1)]], device float *grad_after_a [[buffer(2)]], constant termite_metal_lora_linear_f32_params &p [[buffer(3)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {\n"
            "    uint total = p.rows * p.rank; if (group >= total || p.out_dim == 0u) return; uint row = group / p.rank; uint rk = group - row * p.rank; float acc = 0.0f;\n"
            "    for (uint out = uint(sgitg) * 32u + uint(lane); out < p.out_dim; out += 256u) acc += output_grad[row * p.out_dim + out] * lora_b[out * p.rank + rk];\n"
@@ -4883,9 +4931,45 @@ static bool termite_metal_planned_compute_barriers_enabled(termite_metal_decode_
     return true;
 }
 
+static bool termite_metal_planned_access_profile_enabled(void) {
+    const char *enabled = getenv("TERMITE_METAL_PLANNED_ACCESS_PROFILE");
+    return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
+}
+
 static void termite_metal_decode_runtime_reset_planned_compute_ranges(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL) return;
     runtime->active_planned_compute_range_count = 0;
+}
+
+static void termite_metal_decode_runtime_reset_planned_access_profile(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return;
+    runtime->active_frame_planned_access_prepare_calls = 0;
+    runtime->active_frame_planned_access_ranges = 0;
+    runtime->active_frame_planned_access_range_scans = 0;
+    runtime->active_frame_planned_access_conflicts = 0;
+    runtime->active_frame_planned_access_capacity_flushes = 0;
+    runtime->active_frame_planned_access_barriers = 0;
+    runtime->active_frame_planned_access_nanos = 0;
+}
+
+static void termite_metal_decode_runtime_print_planned_access_profile(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL || !termite_metal_planned_access_profile_enabled()) return;
+    const uint64_t calls = runtime->active_frame_planned_access_prepare_calls;
+    if (calls == 0) return;
+    const double total_ms = (double)runtime->active_frame_planned_access_nanos / 1000000.0;
+    const double avg_us = (double)runtime->active_frame_planned_access_nanos / (double)calls / 1000.0;
+    fprintf(
+        stderr,
+        "metal_planned_access_profile: calls=%llu:accesses=%llu:range_scans=%llu:conflicts=%llu:capacity_flushes=%llu:barriers=%llu:total_ms=%.3f:avg_us=%.3f\n",
+        (unsigned long long)runtime->active_frame_planned_access_prepare_calls,
+        (unsigned long long)runtime->active_frame_planned_access_ranges,
+        (unsigned long long)runtime->active_frame_planned_access_range_scans,
+        (unsigned long long)runtime->active_frame_planned_access_conflicts,
+        (unsigned long long)runtime->active_frame_planned_access_capacity_flushes,
+        (unsigned long long)runtime->active_frame_planned_access_barriers,
+        total_ms,
+        avg_us
+    );
 }
 
 static bool termite_metal_size_mul(size_t a, size_t b, size_t *out) {
@@ -4945,11 +5029,18 @@ static int termite_metal_decode_runtime_prepare_planned_compute_accesses(
     if (runtime == NULL || accesses == NULL || access_count == 0) return 0;
     if (runtime->active_frame_cb == nil || runtime->active_planned_compute_encoder == nil) return 0;
 
+    const bool collect_profile = termite_metal_planned_access_profile_enabled();
+    const uint64_t profile_start_ns = collect_profile ? termite_metal_clock_monotonic_nanos() : 0;
+    if (collect_profile) {
+        runtime->active_frame_planned_access_prepare_calls += 1;
+        runtime->active_frame_planned_access_ranges += (uint64_t)access_count;
+    }
     bool conflict = false;
     for (size_t i = 0; !conflict && i < access_count; ++i) {
         const termite_metal_planned_encoder_range *access = &accesses[i];
         if (access->buffer == nil) continue;
         for (size_t j = 0; j < runtime->active_planned_compute_range_count; ++j) {
+            if (collect_profile) runtime->active_frame_planned_access_range_scans += 1;
             if (termite_metal_planned_ranges_overlap(access, &runtime->active_planned_compute_ranges[j])) {
                 conflict = true;
                 break;
@@ -4957,12 +5048,18 @@ static int termite_metal_decode_runtime_prepare_planned_compute_accesses(
         }
     }
 
-    if (conflict || runtime->active_planned_compute_range_count + access_count > TERMITE_METAL_PLANNED_RANGE_CAPACITY) {
+    const bool capacity_flush = runtime->active_planned_compute_range_count + access_count > TERMITE_METAL_PLANNED_RANGE_CAPACITY;
+    if (conflict || capacity_flush) {
+        if (collect_profile) {
+            if (conflict) runtime->active_frame_planned_access_conflicts += 1;
+            if (capacity_flush) runtime->active_frame_planned_access_capacity_flushes += 1;
+        }
         id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
         if (encoder == nil) return failure_code;
         if (termite_metal_planned_compute_barriers_enabled(runtime)) {
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             runtime->active_frame_planned_barrier_count += 1;
+            if (collect_profile) runtime->active_frame_planned_access_barriers += 1;
         }
         termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
     }
@@ -4973,6 +5070,12 @@ static int termite_metal_decode_runtime_prepare_planned_compute_accesses(
         if (runtime->active_planned_compute_range_count >= TERMITE_METAL_PLANNED_RANGE_CAPACITY) return failure_code;
         runtime->active_planned_compute_ranges[runtime->active_planned_compute_range_count] = access;
         runtime->active_planned_compute_range_count += 1;
+    }
+    if (collect_profile) {
+        const uint64_t profile_end_ns = termite_metal_clock_monotonic_nanos();
+        if (profile_end_ns >= profile_start_ns) {
+            runtime->active_frame_planned_access_nanos += profile_end_ns - profile_start_ns;
+        }
     }
     return 0;
 }
@@ -11313,6 +11416,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->lora_finish_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_finish_f32");
         runtime->lora_rank1_linear_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_rank1_linear_f32");
         runtime->lora_grad_b_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_grad_b_f32");
+        runtime->lora_grad_b_transposed_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_grad_b_transposed_f32");
         runtime->lora_grad_after_a_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_grad_after_a_f32");
         runtime->lora_grad_a_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_grad_a_f32");
         runtime->lora_rank1_grad_b_after_a_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_lora_rank1_grad_b_after_a_f32");
@@ -11532,6 +11636,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             if (runtime->lora_finish_f32_pipeline == nil) fprintf(stderr, " lora_finish_f32");
             if (runtime->lora_rank1_linear_f32_pipeline == nil) fprintf(stderr, " lora_rank1_linear_f32");
             if (runtime->lora_grad_b_f32_pipeline == nil) fprintf(stderr, " lora_grad_b_f32");
+            if (runtime->lora_grad_b_transposed_f32_pipeline == nil) fprintf(stderr, " lora_grad_b_transposed_f32");
             if (runtime->lora_grad_after_a_f32_pipeline == nil) fprintf(stderr, " lora_grad_after_a_f32");
             if (runtime->lora_grad_a_f32_pipeline == nil) fprintf(stderr, " lora_grad_a_f32");
             if (runtime->lora_rank1_grad_b_after_a_f32_pipeline == nil) fprintf(stderr, " lora_rank1_grad_b_after_a_f32");
@@ -11773,6 +11878,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->lora_finish_f32_pipeline = nil;
     runtime->lora_rank1_linear_f32_pipeline = nil;
     runtime->lora_grad_b_f32_pipeline = nil;
+    runtime->lora_grad_b_transposed_f32_pipeline = nil;
     runtime->lora_grad_after_a_f32_pipeline = nil;
     runtime->lora_grad_a_f32_pipeline = nil;
     runtime->lora_rank1_grad_b_after_a_f32_pipeline = nil;
@@ -23530,6 +23636,86 @@ int termite_metal_decode_runtime_lora_backward_f32_device(
     }
 }
 
+int termite_metal_decode_runtime_lora_backward_b_f32_device(
+    termite_metal_decode_runtime *runtime,
+    void *after_a_handle,
+    size_t after_a_offset,
+    void *lora_b_handle,
+    size_t lora_b_offset,
+    void *output_grad_handle,
+    size_t output_grad_offset,
+    size_t rows,
+    size_t rank,
+    size_t out_dim,
+    float scale,
+    void *grad_after_a_handle,
+    size_t grad_after_a_offset,
+    void *grad_b_transposed_handle,
+    size_t grad_b_transposed_offset
+) {
+    if (runtime == NULL || after_a_handle == NULL || lora_b_handle == NULL || output_grad_handle == NULL || grad_after_a_handle == NULL || grad_b_transposed_handle == NULL) return -1;
+    if (runtime->lora_grad_b_transposed_f32_pipeline == nil || runtime->lora_grad_after_a_f32_pipeline == nil) return -2;
+    if (rows == 0 || rank == 0 || out_dim == 0 || rows > UINT32_MAX || rank > UINT32_MAX || out_dim > UINT32_MAX) return -3;
+    if (rows > SIZE_MAX / rank || rows > SIZE_MAX / out_dim || rank > SIZE_MAX / out_dim) return -4;
+    @autoreleasepool {
+        id<MTLBuffer> after_a_buffer = (__bridge id<MTLBuffer>)after_a_handle;
+        id<MTLBuffer> lora_b_buffer = (__bridge id<MTLBuffer>)lora_b_handle;
+        id<MTLBuffer> output_grad_buffer = (__bridge id<MTLBuffer>)output_grad_handle;
+        id<MTLBuffer> grad_after_a_buffer = (__bridge id<MTLBuffer>)grad_after_a_handle;
+        id<MTLBuffer> grad_b_transposed_buffer = (__bridge id<MTLBuffer>)grad_b_transposed_handle;
+        const size_t after_a_bytes = rows * rank * sizeof(float);
+        const size_t b_bytes = out_dim * rank * sizeof(float);
+        const size_t output_grad_bytes = rows * out_dim * sizeof(float);
+        const size_t grad_b_transposed_bytes = rank * out_dim * sizeof(float);
+        if (after_a_offset + after_a_bytes > after_a_buffer.length ||
+            lora_b_offset + b_bytes > lora_b_buffer.length ||
+            output_grad_offset + output_grad_bytes > output_grad_buffer.length ||
+            grad_after_a_offset + after_a_bytes > grad_after_a_buffer.length ||
+            grad_b_transposed_offset + grad_b_transposed_bytes > grad_b_transposed_buffer.length) return -5;
+        termite_metal_lora_linear_f32_params params = {
+            .rows = (uint32_t)rows,
+            .in_dim = 0u,
+            .rank = (uint32_t)rank,
+            .out_dim = (uint32_t)out_dim,
+            .scale = scale,
+            .reserved0 = 0u,
+            .reserved1 = 0u,
+            .reserved2 = 0u,
+        };
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -7;
+        if (!frame_owned) {
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, after_a_buffer) != 0) return -8;
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, lora_b_buffer) != 0) return -8;
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, output_grad_buffer) != 0) return -8;
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_after_a_buffer) != 0) return -8;
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, grad_b_transposed_buffer) != 0) return -8;
+        }
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR, &encoder_owned);
+        if (encoder == nil) return -9;
+        const size_t total_grad_b = rank * out_dim;
+        [encoder setComputePipelineState:runtime->lora_grad_b_transposed_f32_pipeline];
+        [encoder setBuffer:output_grad_buffer offset:output_grad_offset atIndex:0];
+        [encoder setBuffer:after_a_buffer offset:after_a_offset atIndex:1];
+        [encoder setBuffer:grad_b_transposed_buffer offset:grad_b_transposed_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(total_grad_b, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->lora_grad_b_transposed_f32_pipeline, total_grad_b), 1, 1)];
+        const size_t total_after_a = rows * rank;
+        [encoder setComputePipelineState:runtime->lora_grad_after_a_f32_pipeline];
+        [encoder setBuffer:output_grad_buffer offset:output_grad_offset atIndex:0];
+        [encoder setBuffer:lora_b_buffer offset:lora_b_offset atIndex:1];
+        [encoder setBuffer:grad_after_a_buffer offset:grad_after_a_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(256u * sizeof(float)) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(total_after_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
 int termite_metal_decode_runtime_lora_backward_rank1_f32_device(
     termite_metal_decode_runtime *runtime,
     void *input_handle,
@@ -23881,6 +24067,7 @@ int termite_metal_decode_runtime_apply_gelu_backward_device(
     void *upstream_grad_handle,
     size_t upstream_grad_offset,
     size_t dim,
+    uint32_t exact,
     void *output_handle,
     size_t output_offset
 ) {
@@ -23909,7 +24096,7 @@ int termite_metal_decode_runtime_apply_gelu_backward_device(
         termite_metal_apply_activation_params params = {
             .rows = 1,
             .dim = (uint32_t)dim,
-            .activation_kind = 0,
+            .activation_kind = exact ? 1u : 0u,
         };
         id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
         const BOOL planned_encoder = (encoder != nil);
@@ -24463,6 +24650,7 @@ static int termite_metal_decode_runtime_ffn_gelu_backward_rank1_branches_device(
     size_t gelu_input_offset,
     size_t rows,
     size_t intermediate_size,
+    uint32_t exact,
     void *first_output_handle,
     size_t first_output_offset,
     void *second_output_handle,
@@ -24530,7 +24718,7 @@ static int termite_metal_decode_runtime_ffn_gelu_backward_rank1_branches_device(
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL, &encoder_owned);
         if (encoder == nil) return -17;
         termite_metal_apply_activation_params params = {
-            .activation_kind = 0u,
+            .activation_kind = exact ? 1u : 0u,
             .rows = (uint32_t)rows,
             .dim = (uint32_t)intermediate_size,
         };
@@ -24564,6 +24752,7 @@ static int termite_metal_decode_runtime_ffn_gelu_backward_rank1_first_branch_dev
     size_t gelu_input_offset,
     size_t rows,
     size_t intermediate_size,
+    uint32_t exact,
     void *first_output_handle,
     size_t first_output_offset,
     void *upstream_output_handle,
@@ -24622,7 +24811,7 @@ static int termite_metal_decode_runtime_ffn_gelu_backward_rank1_first_branch_dev
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL, &encoder_owned);
         if (encoder == nil) return -15;
         termite_metal_apply_activation_params params = {
-            .activation_kind = 0u,
+            .activation_kind = exact ? 1u : 0u,
             .rows = (uint32_t)rows,
             .dim = (uint32_t)intermediate_size,
         };
@@ -24662,6 +24851,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
     size_t hidden_size,
     size_t intermediate_size,
     size_t second_k,
+    uint32_t exact,
     void *first_output_handle,
     size_t first_output_offset,
     void *gelu_output_handle,
@@ -24753,7 +24943,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL, &encoder_owned);
         if (encoder == nil) return -18;
         termite_metal_apply_activation_params params = {
-            .activation_kind = 0u,
+            .activation_kind = exact ? 1u : 0u,
             .rows = (uint32_t)rows,
             .dim = (uint32_t)intermediate_size,
         };
@@ -24819,6 +25009,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
     size_t intermediate_size,
     size_t first_k,
     size_t second_k,
+    uint32_t exact,
     void *first_output_handle,
     size_t first_output_offset,
     void *second_output_handle,
@@ -24859,6 +25050,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
             gelu_input_offset,
             rows,
             intermediate_size,
+            exact,
             first_output_handle,
             first_output_offset,
             second_output_handle,
@@ -24895,6 +25087,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
             gelu_input_offset,
             rows,
             intermediate_size,
+            exact,
             first_output_handle,
             first_output_offset,
             upstream_output_handle,
@@ -24949,6 +25142,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
             upstream_output_handle,
             upstream_output_offset,
             intermediate_elems,
+            exact,
             gelu_output_handle,
             gelu_output_offset);
         if (rc != 0) return -400 + rc;
@@ -35149,6 +35343,7 @@ int termite_metal_decode_runtime_reset_state(termite_metal_decode_runtime *runti
     runtime->submitted_frame_planned_barrier_count = 0;
     runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
     runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
+    termite_metal_decode_runtime_reset_planned_access_profile(runtime);
     memset(runtime->active_frame_compute_source_counts, 0, sizeof(runtime->active_frame_compute_source_counts));
     memset(runtime->submitted_frame_compute_source_counts, 0, sizeof(runtime->submitted_frame_compute_source_counts));
     memset(runtime->active_frame_compute_region_counts, 0, sizeof(runtime->active_frame_compute_region_counts));
@@ -35264,6 +35459,7 @@ int termite_metal_decode_runtime_begin_frame(termite_metal_decode_runtime *runti
         runtime->active_frame_planned_compute_scope_count = 0;
         runtime->active_frame_planned_barrier_count = 0;
         runtime->active_frame_planned_command_op_count = 0;
+        termite_metal_decode_runtime_reset_planned_access_profile(runtime);
         runtime->active_frame_host_staging_offset = 0;
         runtime->active_frame_host_staging_retained_buffer = nil;
         runtime->active_planned_compute_encoder = nil;
@@ -35306,6 +35502,7 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
             (unsigned long long)runtime->active_frame_planned_barrier_count
         );
     }
+    termite_metal_decode_runtime_print_planned_access_profile(runtime);
     runtime->last_frame_gpu_nanos = 0;
     [cb commit];
     runtime->submitted_frame_cb = cb;
@@ -35329,6 +35526,7 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     runtime->active_frame_planned_barrier_count = 0;
     runtime->active_frame_mps_dense_linear_count = 0;
     runtime->active_frame_planned_command_op_count = 0;
+    termite_metal_decode_runtime_reset_planned_access_profile(runtime);
     runtime->active_planned_compute_encoder = nil;
     termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
     runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
@@ -35395,6 +35593,7 @@ int termite_metal_decode_runtime_cancel_frame(termite_metal_decode_runtime *runt
     runtime->active_frame_planned_barrier_count = 0;
     runtime->active_frame_mps_dense_linear_count = 0;
     runtime->active_frame_planned_command_op_count = 0;
+    termite_metal_decode_runtime_reset_planned_access_profile(runtime);
     runtime->active_frame_host_staging_offset = 0;
     runtime->active_frame_host_staging_retained_buffer = nil;
     runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;

@@ -786,6 +786,27 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
     total_host_outputs = sum(
         int(row.get("graph_executor_host_outputs") or 0) for row in zig_step_rows
     )
+    def row_true_host_outputs(row: dict[str, Any]) -> int:
+        if row.get("graph_executor_true_host_outputs") is not None:
+            return int(row.get("graph_executor_true_host_outputs") or 0)
+        return sum(
+            int(row.get(key) or 0)
+            for key in (
+                "graph_executor_host_output_command",
+                "graph_executor_host_output_interpreter",
+                "graph_executor_host_output_pre_materialized_constant",
+                "graph_executor_host_output_runtime_region",
+                "graph_executor_host_output_unattributed",
+            )
+        )
+
+    total_true_host_outputs = sum(row_true_host_outputs(row) for row in zig_step_rows)
+    total_parameter_materializations = sum(
+        int(row.get("graph_executor_host_output_parameter") or 0) for row in zig_step_rows
+    )
+    total_device_parameter_outputs = sum(
+        int(row.get("graph_executor_device_output_parameter") or 0) for row in zig_step_rows
+    )
     graph_executor_fallback_reasons = sorted({
         str(row.get("graph_executor_fallback_reason"))
         for row in zig_step_rows
@@ -829,8 +850,10 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         )
     if total_interpreter_fallbacks > 0:
         warnings.append(f"Metal run reported {total_interpreter_fallbacks} interpreter fallbacks")
-    if total_host_outputs > 0:
-        warnings.append(f"Metal run reported {total_host_outputs} host outputs")
+    if total_true_host_outputs > 0:
+        warnings.append(f"Metal run reported {total_true_host_outputs} true host outputs")
+    if total_parameter_materializations > 0:
+        warnings.append(f"Metal run reported {total_parameter_materializations} parameter materializations")
     return {
         "ok": all(checks.values()),
         "checks": checks,
@@ -844,6 +867,9 @@ def summarize_metal_readiness(args: argparse.Namespace, report: dict[str, Any], 
         "total_graph_planned_dispatches": total_planned_dispatches,
         "total_graph_interpreter_fallbacks": total_interpreter_fallbacks,
         "total_graph_host_outputs": total_host_outputs,
+        "total_graph_true_host_outputs": total_true_host_outputs,
+        "total_graph_parameter_materializations": total_parameter_materializations,
+        "total_graph_device_parameter_outputs": total_device_parameter_outputs,
         "graph_executor_fallback_reasons": graph_executor_fallback_reasons,
         "max_interpreter_fallbacks_threshold": max_interpreter_fallbacks,
         "graph_executor_requested": graph_executor_requested,
@@ -878,12 +904,31 @@ def parse_zig_op_stats(output: str) -> dict[str, Any]:
         "metal_partition_command_ops:": "command_ops",
         "metal_partition_fallback_ops:": "fallback_ops",
         "metal_partition_host_output_ops:": "host_output_ops",
+        "metal_partition_host_output_reasons:": "host_output_reasons",
     }
     for line in output.splitlines():
         for prefix, key in prefixes.items():
             if line.startswith(prefix):
                 parsed[key] = parse_op_stat_items(line[len(prefix):].strip())
     return parsed
+
+
+def top_op_stat_items(stats: dict[str, dict[str, float]], limit: int = 16) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for name, values in stats.items():
+        count = values.get("count")
+        total_ms = values.get("total_ms")
+        avg_ms = values.get("avg_ms")
+        if count is None:
+            continue
+        items.append({
+            "name": name,
+            "count": count,
+            "total_ms": total_ms,
+            "avg_ms": avg_ms,
+        })
+    items.sort(key=lambda item: (float(item.get("count") or 0), float(item.get("total_ms") or 0.0)), reverse=True)
+    return items[:limit]
 
 
 def parse_bool_token(value: str) -> bool | None:
@@ -919,7 +964,7 @@ def parse_dot_shape_items(payload: str) -> list[dict[str, Any]]:
             "rhs": [int(groups["rhs0"]), int(groups["rhs1"])],
             "out": [int(groups["out0"]), int(groups["out1"])],
         }
-        for key in ("count",):
+        for key in ("count", "lhs_id", "rhs_id", "rhs_source"):
             if key in values:
                 shape[key] = int(values[key])
         for key in ("total_ms", "avg_ms"):
@@ -958,6 +1003,158 @@ def parse_zig_op_runs(output: str) -> dict[str, Any]:
         "dot_shapes": dot_shapes,
         "top_dot_shapes": dot_shapes[:16],
     }
+
+
+LOOP_PROFILE_VALUE_RE = re.compile(
+    r"^(?P<value>-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?:\(hits=(?P<hits>-?\d+)\))?$"
+)
+LOOP_PROFILE_AVG_KEYS = (
+    "partition_view_ms",
+    "graph_plan_ms",
+    "runtime_inputs_ms",
+    "parameters_ms",
+    "constants_ms",
+    "begin_frame_ms",
+    "runtime_plan_ms",
+    "execution_ms",
+    "planned_region_ms",
+    "fused_pattern_ms",
+    "command_path_ms",
+    "interpreter_ms",
+    "stats_ms",
+    "alias_clone_ms",
+    "free_expired_ms",
+    "submit_frame_ms",
+    "boundary_outputs_ms",
+    "accounted_ms",
+)
+LOOP_PROFILE_COUNT_KEYS = (
+    "nodes",
+    "executed",
+    "planned_region_hits",
+    "fused_pattern_hits",
+    "command_path_hits",
+    "interpreter_hits",
+)
+PLANNED_ACCESS_PROFILE_KEYS = (
+    "calls",
+    "accesses",
+    "range_scans",
+    "conflicts",
+    "capacity_flushes",
+    "barriers",
+    "total_ms",
+    "avg_us",
+)
+
+
+def parse_loop_profile_value(raw_value: str) -> tuple[float | int | None, int | None]:
+    match = LOOP_PROFILE_VALUE_RE.fullmatch(raw_value.strip())
+    if match is None:
+        return None, None
+    value_text = match.group("value")
+    if "." in value_text or "e" in value_text.lower():
+        value: float | int = float(value_text)
+    else:
+        value = int(value_text)
+    hits_text = match.group("hits")
+    hits = int(hits_text) if hits_text is not None else None
+    return value, hits
+
+
+def parse_zig_loop_profiles(output: str) -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    prefix = "metal_partition_loop_profile:"
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(prefix):
+            continue
+        profile: dict[str, Any] = {}
+        payload = line[len(prefix):].strip()
+        for part in payload.split(":"):
+            if "=" not in part:
+                continue
+            key, raw_value = part.split("=", 1)
+            key = key.strip()
+            value, hits = parse_loop_profile_value(raw_value)
+            if value is None:
+                continue
+            profile[key] = value
+            if hits is not None:
+                hit_key = key[:-3] + "_hits" if key.endswith("_ms") else f"{key}_hits"
+                profile[hit_key] = hits
+        if profile:
+            profiles.append(profile)
+    return profiles
+
+
+def parse_zig_planned_access_profiles(output: str) -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    prefix = "metal_planned_access_profile:"
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(prefix):
+            continue
+        profile: dict[str, Any] = {}
+        payload = line[len(prefix):].strip()
+        for part in payload.split(":"):
+            if "=" not in part:
+                continue
+            key, raw_value = part.split("=", 1)
+            value, _ = parse_loop_profile_value(raw_value)
+            if value is not None:
+                profile[key.strip()] = value
+        if profile:
+            profiles.append(profile)
+    return profiles
+
+
+def summarize_loop_profiles(profiles: list[dict[str, Any]]) -> dict[str, Any]:
+    def avg(rows: list[dict[str, Any]], key: str) -> float | None:
+        values: list[float] = []
+        for row in rows:
+            value = row.get(key)
+            if value is None:
+                continue
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                pass
+        return sum(values) / len(values) if values else None
+
+    warm_profiles = profiles[1:] if len(profiles) > 1 else []
+    summary: dict[str, Any] = {
+        "zig_loop_profile_count": len(profiles) if profiles else None,
+        "zig_loop_profile_warm_count": len(warm_profiles) if warm_profiles else None,
+    }
+    for key in LOOP_PROFILE_AVG_KEYS + LOOP_PROFILE_COUNT_KEYS:
+        summary[f"zig_loop_profile_{key}_avg"] = avg(profiles, key)
+        summary[f"zig_loop_profile_warm_{key}_avg"] = avg(warm_profiles, key)
+    return summary
+
+
+def summarize_planned_access_profiles(profiles: list[dict[str, Any]]) -> dict[str, Any]:
+    def avg(rows: list[dict[str, Any]], key: str) -> float | None:
+        values: list[float] = []
+        for row in rows:
+            value = row.get(key)
+            if value is None:
+                continue
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                pass
+        return sum(values) / len(values) if values else None
+
+    warm_profiles = profiles[1:] if len(profiles) > 1 else []
+    summary: dict[str, Any] = {
+        "zig_planned_access_profile_count": len(profiles) if profiles else None,
+        "zig_planned_access_profile_warm_count": len(warm_profiles) if warm_profiles else None,
+    }
+    for key in PLANNED_ACCESS_PROFILE_KEYS:
+        summary[f"zig_planned_access_profile_{key}_avg"] = avg(profiles, key)
+        summary[f"zig_planned_access_profile_warm_{key}_avg"] = avg(warm_profiles, key)
+    return summary
 
 
 def extract_prefixed_json(output: str, prefix: str) -> list[dict[str, Any]]:
@@ -2225,6 +2422,7 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "--epochs", "1",
         "--batch-size", str(args.batch_size),
         "--max-examples", str(args.steps * args.batch_size),
+        "--max-steps", str(args.steps),
         "--seq-len", str(args.seq_len),
         "--learning-rate", str(args.learning_rate),
         "--weight-decay", str(args.weight_decay),
@@ -2252,6 +2450,12 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         cmd.append("--lora-only-trainables")
     if args.deterministic:
         cmd.append("--deterministic")
+    if args.activation_checkpointing:
+        cmd.extend([
+            "--activation-checkpointing",
+            "--activation-checkpoint-interval", str(args.activation_checkpoint_interval),
+            "--activation-checkpoint-strategy", args.activation_checkpoint_strategy,
+        ])
     initial_adapter_checkpoint = out_dir / "python" / "initial_adapter" / "adapter_weights.safetensors"
     if initial_adapter_checkpoint.exists():
         cmd.extend(["--initial-adapter-checkpoint", str(initial_adapter_checkpoint)])
@@ -2311,6 +2515,13 @@ def main() -> int:
     p.add_argument("--lora-dropout", type=float, default=0.1)
     p.add_argument("--lora-targets", default=LORA_TARGETS)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--activation-checkpointing", action="store_true")
+    p.add_argument("--activation-checkpoint-interval", type=int, default=1)
+    p.add_argument(
+        "--activation-checkpoint-strategy",
+        default="parameters-only",
+        choices=["every-n-layers", "attention-outputs", "parameters-only"],
+    )
     p.add_argument("--zig-backend", default="native", choices=["native", "metal", "mlx", "auto"])
     p.add_argument(
         "--zig-training-graph-executor",
@@ -2555,6 +2766,13 @@ def main() -> int:
     )
     zig_op_stats = parse_zig_op_stats(report.get("zig", {}).get("output", ""))
     zig_op_runs = parse_zig_op_runs(report.get("zig", {}).get("output", ""))
+    zig_loop_profiles = parse_zig_loop_profiles(report.get("zig", {}).get("output", ""))
+    zig_planned_access_profiles = parse_zig_planned_access_profiles(report.get("zig", {}).get("output", ""))
+    if "zig" in report:
+        report["zig"]["op_stats"] = zig_op_stats
+        report["zig"]["op_runs"] = zig_op_runs
+        report["zig"]["loop_profiles"] = zig_loop_profiles
+        report["zig"]["planned_access_profiles"] = zig_planned_access_profiles
     python_trainer_elapsed = report.get("python", {}).get("metrics", {}).get("elapsed_seconds")
     python_step_timings = report.get("python", {}).get("metrics", {}).get("step_timings", [])
     python_total_step_ms = report.get("python", {}).get("metrics", {}).get("total_step_wall_ms")
@@ -2635,7 +2853,33 @@ def main() -> int:
         if zig_warm_total_trainer_ms is not None and zig_warm_step_rows
         else None
     )
+    zig_loop_profile_summary = summarize_loop_profiles(zig_loop_profiles)
+    zig_planned_access_profile_summary = summarize_planned_access_profiles(zig_planned_access_profiles)
     zig_epoch_metrics = next((row for row in report.get("zig", {}).get("training_metrics", []) if row.get("event") == "epoch"), {})
+    python_step_count = len(python_step_timings) if python_step_timings else (len(python_step_rows) if python_step_rows else None)
+    zig_step_count = len(zig_step_rows) if zig_step_rows else None
+    python_warm_step_count = len(python_warm_step_timings) if python_warm_step_timings else None
+    zig_warm_step_count = len(zig_warm_step_rows) if zig_warm_step_rows else None
+    python_step_count_matches_requested = None if args.skip_python else python_step_count == args.steps
+    zig_step_count_matches_requested = None if args.skip_zig else zig_step_count == args.steps
+    step_count_match = (
+        python_step_count == zig_step_count
+        if python_step_count is not None and zig_step_count is not None
+        else None
+    )
+    warm_step_count_match = (
+        python_warm_step_count == zig_warm_step_count
+        if python_warm_step_count is not None and zig_warm_step_count is not None
+        else None
+    )
+    step_count_valid = all(
+        value is not False and value is not None
+        for value in (
+            python_step_count_matches_requested if not args.skip_python else True,
+            zig_step_count_matches_requested if not args.skip_zig else True,
+            step_count_match if not args.skip_python and not args.skip_zig else True,
+        )
+    )
     def zig_step_sum(key: str) -> float | None:
         if not zig_step_rows:
             return None
@@ -2644,6 +2888,43 @@ def main() -> int:
     def zig_step_avg(key: str) -> float | None:
         total = zig_step_sum(key)
         return (total / len(zig_step_rows)) if total is not None and zig_step_rows else None
+
+    def zig_step_sum_avg(keys: tuple[str, ...]) -> float | None:
+        if not zig_step_rows:
+            return None
+        values = [zig_step_avg(key) for key in keys]
+        if all(value is None for value in values):
+            return None
+        return sum(value or 0.0 for value in values)
+
+    def zig_step_true_host_outputs_avg() -> float | None:
+        if not zig_step_rows:
+            return None
+        total = 0.0
+        for row in zig_step_rows:
+            if row.get("graph_executor_true_host_outputs") is not None:
+                total += float(row.get("graph_executor_true_host_outputs") or 0.0)
+            else:
+                total += sum(
+                    float(row.get(key) or 0.0)
+                    for key in (
+                        "graph_executor_host_output_command",
+                        "graph_executor_host_output_interpreter",
+                        "graph_executor_host_output_pre_materialized_constant",
+                        "graph_executor_host_output_runtime_region",
+                        "graph_executor_host_output_unattributed",
+                    )
+                )
+        return total / len(zig_step_rows)
+
+    def zig_op_stat_value(group: str, name: str, key: str) -> float | None:
+        stats_group = zig_op_stats.get(group)
+        if stats_group is None:
+            return None
+        values = stats_group.get(name)
+        if values is None:
+            return 0.0
+        return values.get(key)
 
     trainable_parity_warning = None if args.zig_lora_only_trainables else "Zig is training regular task-head params in addition to LoRA params; upstream GLiNER2 LoRA freezes non-LoRA params"
     non_entity_task_count = (
@@ -2730,16 +3011,22 @@ def main() -> int:
         "python_elapsed_seconds": report.get("python", {}).get("elapsed_seconds"),
         "zig_elapsed_seconds": report.get("zig", {}).get("elapsed_seconds"),
         "python_trainer_elapsed_seconds": python_trainer_elapsed,
-        "python_step_count": len(python_step_timings) if python_step_timings else None,
+        "requested_step_count": args.steps,
+        "step_count_match": step_count_match,
+        "warm_step_count_match": warm_step_count_match,
+        "python_step_count_matches_requested": python_step_count_matches_requested,
+        "zig_step_count_matches_requested": zig_step_count_matches_requested,
+        "step_count_valid": step_count_valid,
+        "python_step_count": python_step_count,
         "python_total_step_wall_ms": python_total_step_ms,
         "python_avg_step_wall_ms": python_avg_step_ms,
-        "python_warm_step_count": len(python_warm_step_timings) if python_warm_step_timings else None,
+        "python_warm_step_count": python_warm_step_count,
         "python_warm_total_step_wall_ms": python_warm_total_step_ms,
         "python_warm_avg_step_wall_ms": python_warm_avg_step_ms,
-        "zig_step_count": len(zig_step_rows) if zig_step_rows else None,
+        "zig_step_count": zig_step_count,
         "zig_total_trainer_ms": zig_total_trainer_ms,
         "zig_avg_trainer_ms": zig_avg_trainer_ms,
-        "zig_warm_step_count": len(zig_warm_step_rows) if zig_warm_step_rows else None,
+        "zig_warm_step_count": zig_warm_step_count,
         "zig_warm_total_trainer_ms": zig_warm_total_trainer_ms,
         "zig_warm_avg_trainer_ms": zig_warm_avg_trainer_ms,
         "zig_epoch_wall_ms": zig_epoch_metrics.get("epoch_wall_ms"),
@@ -2749,6 +3036,31 @@ def main() -> int:
         "zig_graph_executor_planned_dispatches_avg": zig_step_avg("graph_executor_planned_dispatches"),
         "zig_graph_executor_interpreter_fallbacks_avg": zig_step_avg("graph_executor_interpreter_fallbacks"),
         "zig_graph_executor_host_outputs_avg": zig_step_avg("graph_executor_host_outputs"),
+        "zig_graph_executor_true_host_outputs_avg": zig_step_true_host_outputs_avg(),
+        "zig_graph_executor_host_output_command_avg": zig_step_avg("graph_executor_host_output_command"),
+        "zig_graph_executor_host_output_interpreter_avg": zig_step_avg("graph_executor_host_output_interpreter"),
+        "zig_graph_executor_host_output_pre_materialized_constant_avg": zig_step_avg("graph_executor_host_output_pre_materialized_constant"),
+        "zig_graph_executor_host_output_runtime_region_avg": zig_step_avg("graph_executor_host_output_runtime_region"),
+        "zig_graph_executor_host_output_parameter_avg": zig_step_avg("graph_executor_host_output_parameter"),
+        "zig_graph_executor_parameter_materializations_avg": zig_step_avg("graph_executor_host_output_parameter"),
+        "zig_graph_executor_host_output_unattributed_avg": zig_step_avg("graph_executor_host_output_unattributed"),
+        "zig_graph_executor_device_output_parameter_avg": zig_step_avg("graph_executor_device_output_parameter"),
+        "zig_graph_executor_metal_gather_input_promotions_avg": zig_step_avg("graph_executor_metal_gather_input_promotions"),
+        "zig_graph_executor_metal_gather_input_promotion_bytes_avg": zig_step_avg("graph_executor_metal_gather_input_promotion_bytes"),
+        "zig_graph_executor_metal_gather_input_promotion_ms_avg": zig_step_avg("graph_executor_metal_gather_input_promotion_ms"),
+        "zig_graph_executor_metal_gather_output_promotions_avg": zig_step_avg("graph_executor_metal_gather_output_promotions"),
+        "zig_graph_executor_metal_gather_output_promotion_bytes_avg": zig_step_avg("graph_executor_metal_gather_output_promotion_bytes"),
+        "zig_graph_executor_metal_gather_output_promotion_ms_avg": zig_step_avg("graph_executor_metal_gather_output_promotion_ms"),
+        "zig_graph_executor_metal_reduce_input_promotions_avg": zig_step_avg("graph_executor_metal_reduce_input_promotions"),
+        "zig_graph_executor_metal_reduce_input_promotion_bytes_avg": zig_step_avg("graph_executor_metal_reduce_input_promotion_bytes"),
+        "zig_graph_executor_metal_reduce_input_promotion_ms_avg": zig_step_avg("graph_executor_metal_reduce_input_promotion_ms"),
+        "zig_graph_executor_metal_resident_input_cache_hits_avg": zig_step_avg("graph_executor_metal_resident_input_cache_hits"),
+        "zig_graph_executor_metal_resident_input_cache_misses_avg": zig_step_avg("graph_executor_metal_resident_input_cache_misses"),
+        "zig_graph_executor_metal_resident_input_cache_unique_promotions_avg": zig_step_avg("graph_executor_metal_resident_input_cache_unique_promotions"),
+        "zig_graph_executor_metal_resident_input_cache_retained_live_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_retained_live_bytes"),
+        "zig_graph_executor_metal_resident_input_cache_retained_peak_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_retained_peak_bytes"),
+        "zig_graph_executor_metal_resident_input_cache_reused_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_reused_bytes"),
+        "zig_graph_executor_metal_resident_input_cache_released_bytes_avg": zig_step_avg("graph_executor_metal_resident_input_cache_released_bytes"),
         "zig_graph_executor_regions_avg": zig_step_avg("graph_executor_regions"),
         "zig_graph_executor_runtime_region_dispatches_avg": zig_step_avg("graph_executor_runtime_region_dispatches"),
         "zig_graph_executor_runtime_region_active_regions_avg": zig_step_avg("graph_executor_runtime_region_active_regions"),
@@ -2756,12 +3068,27 @@ def main() -> int:
         "zig_graph_executor_runtime_region_elided_nodes_avg": zig_step_avg("graph_executor_runtime_region_elided_nodes"),
         "zig_graph_executor_runtime_region_plan_compiles_avg": zig_step_avg("graph_executor_runtime_region_plan_compiles"),
         "zig_graph_executor_runtime_region_plan_reuses_avg": zig_step_avg("graph_executor_runtime_region_plan_reuses"),
+        "zig_graph_executor_runtime_frame_candidates_avg": zig_step_avg("graph_executor_runtime_frame_candidates"),
+        "zig_graph_executor_runtime_frame_eligible_avg": zig_step_avg("graph_executor_runtime_frame_eligible"),
+        "zig_graph_executor_runtime_frame_metadata_ready_avg": zig_step_avg("graph_executor_runtime_frame_metadata_ready"),
+        "zig_graph_executor_runtime_frame_ineligible_no_regions_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_no_regions"),
+        "zig_graph_executor_runtime_frame_ineligible_missing_qkv_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_qkv"),
+        "zig_graph_executor_runtime_frame_ineligible_missing_attention_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_attention"),
+        "zig_graph_executor_runtime_frame_ineligible_missing_ffn_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_ffn"),
+        "zig_graph_executor_runtime_frame_ineligible_missing_ple_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_ple"),
+        "zig_graph_executor_runtime_frame_ineligible_single_row_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_single_row"),
+        "zig_graph_executor_runtime_frame_ineligible_non_layer_order_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_non_layer_order"),
+        "zig_graph_executor_runtime_frame_ineligible_shape_mismatch_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_shape_mismatch"),
+        "zig_graph_executor_runtime_frame_ineligible_missing_model_metadata_avg": zig_step_avg("graph_executor_runtime_frame_ineligible_missing_model_metadata"),
         "zig_graph_executor_plan_build_ms_avg": zig_step_avg("graph_executor_plan_build_ms"),
         "zig_graph_executor_buffer_plan_build_ms_avg": zig_step_avg("graph_executor_buffer_plan_build_ms"),
         "zig_graph_executor_plan_cache_hits_avg": zig_step_avg("graph_executor_plan_cache_hits"),
         "zig_graph_executor_plan_cache_misses_avg": zig_step_avg("graph_executor_plan_cache_misses"),
         "zig_metal_frame_wait_ms_avg": zig_step_avg("metal_frame_wait_ms"),
         "zig_metal_frame_gpu_ms_avg": zig_step_avg("metal_frame_gpu_ms"),
+        "zig_metal_tensor_device_owned_peak_live_bytes_avg": zig_step_avg("metal_tensor_device_owned_peak_live_bytes"),
+        "zig_metal_tensor_device_owned_live_bytes_avg": zig_step_avg("metal_tensor_device_owned_live_bytes"),
+        "zig_metal_runtime_total_bytes_avg": zig_step_avg("metal_runtime_total_bytes"),
         "zig_metal_last_frame_compute_encoders_avg": zig_step_avg("metal_last_frame_compute_encoders"),
         "zig_metal_last_frame_blit_encoders_avg": zig_step_avg("metal_last_frame_blit_encoders"),
         "zig_metal_last_frame_planned_scopes_avg": zig_step_avg("metal_last_frame_planned_scopes"),
@@ -2774,6 +3101,30 @@ def main() -> int:
         "zig_metal_deberta_encoder_layer_attempts_avg": zig_step_avg("metal_deberta_encoder_layer_attempts"),
         "zig_metal_deberta_encoder_layer_successes_avg": zig_step_avg("metal_deberta_encoder_layer_successes"),
         "zig_metal_deberta_encoder_layer_fallbacks_avg": zig_step_avg("metal_deberta_encoder_layer_fallbacks"),
+        "zig_metal_deberta_encoder_lora_layer_regions_avg": zig_step_avg("metal_deberta_encoder_lora_layer_regions"),
+        "zig_metal_deberta_encoder_lora_residual_layernorm_regions_avg": zig_step_avg("metal_deberta_encoder_lora_residual_layernorm_regions"),
+        "zig_metal_deberta_encoder_lora_layer_scaffold_regions_avg": zig_step_avg("metal_deberta_encoder_lora_layer_scaffold_regions"),
+        "zig_metal_deberta_encoder_lora_layer_fallbacks_avg": zig_step_avg("metal_deberta_encoder_lora_layer_fallbacks"),
+        "zig_metal_lora_backward_regions_avg": zig_step_avg("metal_lora_backward_regions"),
+        "zig_metal_low_rank_lora_backward_regions_avg": zig_step_avg("metal_low_rank_lora_backward_regions"),
+        "zig_metal_rank_adapter_backward_regions_avg": zig_step_avg("metal_rank_adapter_backward_regions"),
+        "zig_metal_lora_backward_total_regions_avg": zig_step_sum_avg((
+            "metal_lora_backward_regions",
+            "metal_low_rank_lora_backward_regions",
+            "metal_rank_adapter_backward_regions",
+        )),
+        "zig_metal_ffn_gelu_backward_regions_avg": zig_step_avg("metal_ffn_gelu_backward_regions"),
+        "zig_metal_head_mlp_forward_regions_avg": zig_step_avg("metal_head_mlp_forward_regions"),
+        "zig_metal_head_mlp_backward_regions_avg": zig_step_avg("metal_head_mlp_backward_regions"),
+        "zig_metal_command_dot_general_dispatches_avg": zig_step_avg("metal_command_dot_general_dispatches"),
+        "zig_metal_command_head_dot_dispatches_avg": zig_step_avg("metal_command_head_dot_dispatches"),
+        "zig_metal_command_transpose_dispatches_avg": zig_step_avg("metal_command_transpose_dispatches"),
+        "zig_metal_command_gather_dispatches_avg": zig_step_avg("metal_command_gather_dispatches"),
+        "zig_metal_command_reduce_dispatches_avg": zig_step_avg("metal_command_reduce_dispatches"),
+        "zig_metal_command_elementwise_dispatches_avg": zig_step_avg("metal_command_elementwise_dispatches"),
+        "zig_metal_command_activation_dispatches_avg": zig_step_avg("metal_command_activation_dispatches"),
+        "zig_metal_command_activation_backward_dispatches_avg": zig_step_avg("metal_command_activation_backward_dispatches"),
+        "zig_metal_command_other_dispatches_avg": zig_step_avg("metal_command_other_dispatches"),
         "zig_metal_deberta_relative_qk_pair_calls_avg": zig_step_avg("metal_deberta_relative_qk_pair_calls"),
         "zig_metal_deberta_relative_qk_pair_fallbacks_avg": zig_step_avg("metal_deberta_relative_qk_pair_fallbacks"),
         "zig_metal_deberta_ffn_fused_calls_avg": zig_step_avg("metal_deberta_ffn_fused_calls"),
@@ -2786,11 +3137,16 @@ def main() -> int:
         "zig_dot_general_command_count": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("count"),
         "zig_dot_general_command_total_ms": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("total_ms"),
         "zig_dot_general_command_avg_ms": zig_op_stats.get("command_ops", {}).get("dot_general", {}).get("avg_ms"),
-        "zig_gather_fallback_count": zig_op_stats.get("fallback_ops", {}).get("gather", {}).get("count"),
-        "zig_gather_fallback_total_ms": zig_op_stats.get("fallback_ops", {}).get("gather", {}).get("total_ms"),
-        "zig_gather_host_output_count": zig_op_stats.get("host_output_ops", {}).get("gather", {}).get("count"),
-        "zig_gather_host_output_total_ms": zig_op_stats.get("host_output_ops", {}).get("gather", {}).get("total_ms"),
+        "zig_gather_fallback_count": zig_op_stat_value("fallback_ops", "gather", "count"),
+        "zig_gather_fallback_total_ms": zig_op_stat_value("fallback_ops", "gather", "total_ms"),
+        "zig_gather_host_output_count": zig_op_stat_value("host_output_ops", "gather", "count"),
+        "zig_gather_host_output_total_ms": zig_op_stat_value("host_output_ops", "gather", "total_ms"),
         "zig_top_dot_shapes": zig_op_runs.get("top_dot_shapes", []),
+        "zig_top_host_output_families": top_op_stat_items(zig_op_stats.get("host_output_ops", {})),
+        "zig_top_fallback_families": top_op_stat_items(zig_op_stats.get("fallback_ops", {})),
+        "zig_top_host_output_reasons": top_op_stat_items(zig_op_stats.get("host_output_reasons", {})),
+        **zig_loop_profile_summary,
+        **zig_planned_access_profile_summary,
         "python_cpu_step_gate_ms": python_avg_step_ms,
         "zig_beats_python_cpu_step_time": (
             zig_avg_trainer_ms < python_avg_step_ms
@@ -2902,7 +3258,12 @@ def main() -> int:
     step_loss_applicable = both_sides_ran and not args.perf_target_only_python
     preprocess_applicable = both_sides_ran and args.dump_parity
     full_loss_applicable = both_sides_ran and is_total_loss_objective and not args.perf_target_only_python
-    roundtrip_applicable = bool(adapter_roundtrip.get("ran"))
+    roundtrip_applicable = bool(adapter_roundtrip.get("ran")) and not args.perf_target_only_python
+    step_count_gate_applicable = (
+        (not args.skip_python or not args.skip_zig)
+        and (args.skip_python or report.get("python", {}).get("returncode") == 0)
+        and (args.skip_zig or report.get("zig", {}).get("returncode") == 0)
+    )
     metal_readiness_summary = report["summary"].get("metal_readiness") or {}
     metal_readiness_checks = metal_readiness_summary.get("checks", {})
     metal_dispatch_check = metal_readiness_checks.get("graph_executor_dispatches_nonzero")
@@ -2913,6 +3274,7 @@ def main() -> int:
     )
     metal_dispatch_applicable = metal_dispatch_check is not None and metal_backend_ran
     strict_checks: dict[str, bool | None] = {
+        "requested_step_count_valid": bool(step_count_valid) if step_count_gate_applicable else None,
         "component_loss_parity_matches": component_loss_matches if component_loss_applicable else None,
         "classification_debug_matches": classification_debug_matches if classification_debug_applicable else None,
         "step_loss_parity_matches": step_loss_parity_matches if step_loss_applicable else None,

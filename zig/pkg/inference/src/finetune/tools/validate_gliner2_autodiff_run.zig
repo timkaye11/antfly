@@ -52,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var min_metal_deberta_ffn_forward_region_count: ?u64 = null;
     var min_metal_deberta_encoder_lora_layer_region_count: ?u64 = null;
     var min_metal_deberta_encoder_lora_residual_layernorm_region_count: ?u64 = null;
+    var max_metal_deberta_encoder_lora_layer_scaffold_count: ?u64 = null;
     var max_metal_deberta_encoder_lora_layer_fallback_count: ?u64 = null;
     var min_metal_deberta_attention_flash_call_count: ?u64 = null;
     var max_metal_deberta_attention_gemm_fallback_count: ?u64 = null;
@@ -261,6 +262,13 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArguments;
             };
             min_metal_deberta_encoder_lora_residual_layernorm_region_count = try std.fmt.parseUnsigned(u64, value, 10);
+        } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-scaffold-count")) {
+            const value = args.next() orelse {
+                std.debug.print("error: missing value for {s}\n", .{arg});
+                printUsage();
+                return error.InvalidArguments;
+            };
+            max_metal_deberta_encoder_lora_layer_scaffold_count = try std.fmt.parseUnsigned(u64, value, 10);
         } else if (std.mem.eql(u8, arg, "--max-metal-deberta-encoder-lora-layer-fallback-count")) {
             const value = args.next() orelse {
                 std.debug.print("error: missing value for {s}\n", .{arg});
@@ -354,6 +362,7 @@ pub fn main(init: std.process.Init) !void {
         .min_metal_deberta_ffn_forward_region_count = min_metal_deberta_ffn_forward_region_count,
         .min_metal_deberta_encoder_lora_layer_region_count = min_metal_deberta_encoder_lora_layer_region_count,
         .min_metal_deberta_encoder_lora_residual_layernorm_region_count = min_metal_deberta_encoder_lora_residual_layernorm_region_count,
+        .max_metal_deberta_encoder_lora_layer_scaffold_count = max_metal_deberta_encoder_lora_layer_scaffold_count,
         .max_metal_deberta_encoder_lora_layer_fallback_count = max_metal_deberta_encoder_lora_layer_fallback_count,
         .min_metal_deberta_attention_flash_call_count = min_metal_deberta_attention_flash_call_count,
         .max_metal_deberta_attention_gemm_fallback_count = max_metal_deberta_attention_gemm_fallback_count,
@@ -375,7 +384,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: validate-gliner2-autodiff-run <out_dir> [--require-loss-decrease] [--min-supervised-tokens-per-second <f64>] [--max-avg-step-wall-ms <f64>] [--max-total-execute-ms <f64>] [--max-peak-resident-bytes <n>] [--max-metal-eager-arena-peak-bytes <n>] [--max-metal-eager-arena-spill-bytes <n>] [--max-metal-chunk-local-output-peak-bytes <n>] [--max-metal-chunk-local-output-spill-bytes <n>] [--max-metal-chunk-local-output-unconsumed-hints <n>] [--min-metal-chunk-local-output-consumed-hints <n>] [--min-examples <n>] [--min-steps <n>] [--min-entity-labels <n>] [--min-supervised-tokens <n>] [--min-entity-tokens <n>] [--max-graph-command-dispatch-count <n>] [--max-graph-host-output-count <n>] [--max-metal-frame-gpu-ms <f64>] [--max-metal-last-frame-compute-encoder-count <n>] [--min-metal-frame-chunk-boundary-count <n>] [--min-metal-frame-chunk-promoted-value-count <n>] [--min-metal-frame-chunk-swept-value-count <n>] [--min-graph-runtime-region-dispatch-count <n>] [--max-graph-runtime-region-fallback-count <n>] [--min-graph-runtime-region-elided-node-count <n>] [--min-metal-deberta-ffn-forward-region-count <n>] [--min-metal-deberta-encoder-lora-layer-region-count <n>] [--min-metal-deberta-encoder-lora-residual-layernorm-region-count <n>] [--max-metal-deberta-encoder-lora-layer-fallback-count <n>] [--min-metal-deberta-attention-flash-call-count <n>] [--max-metal-deberta-attention-gemm-fallback-count <n>] [--min-metal-deberta-encoder-layer-success-count <n>] [--min-metal-deberta-ffn-fused-call-count <n>] [--max-metal-deberta-ffn-fused-fallback-count <n>] [--max-runtime-frame-ineligible-missing-model-metadata <n>]
+        \\usage: validate-gliner2-autodiff-run <out_dir> [--require-loss-decrease] [--min-supervised-tokens-per-second <f64>] [--max-avg-step-wall-ms <f64>] [--max-total-execute-ms <f64>] [--max-peak-resident-bytes <n>] [--max-metal-eager-arena-peak-bytes <n>] [--max-metal-eager-arena-spill-bytes <n>] [--max-metal-chunk-local-output-peak-bytes <n>] [--max-metal-chunk-local-output-spill-bytes <n>] [--max-metal-chunk-local-output-unconsumed-hints <n>] [--min-metal-chunk-local-output-consumed-hints <n>] [--min-examples <n>] [--min-steps <n>] [--min-entity-labels <n>] [--min-supervised-tokens <n>] [--min-entity-tokens <n>] [--max-graph-command-dispatch-count <n>] [--max-graph-host-output-count <n>] [--max-metal-frame-gpu-ms <f64>] [--max-metal-last-frame-compute-encoder-count <n>] [--min-metal-frame-chunk-boundary-count <n>] [--min-metal-frame-chunk-promoted-value-count <n>] [--min-metal-frame-chunk-swept-value-count <n>] [--min-graph-runtime-region-dispatch-count <n>] [--max-graph-runtime-region-fallback-count <n>] [--min-graph-runtime-region-elided-node-count <n>] [--min-metal-deberta-ffn-forward-region-count <n>] [--min-metal-deberta-encoder-lora-layer-region-count <n>] [--min-metal-deberta-encoder-lora-residual-layernorm-region-count <n>] [--max-metal-deberta-encoder-lora-layer-scaffold-count <n>] [--max-metal-deberta-encoder-lora-layer-fallback-count <n>] [--min-metal-deberta-attention-flash-call-count <n>] [--max-metal-deberta-attention-gemm-fallback-count <n>] [--min-metal-deberta-encoder-layer-success-count <n>] [--min-metal-deberta-ffn-fused-call-count <n>] [--max-metal-deberta-ffn-fused-fallback-count <n>] [--max-runtime-frame-ineligible-missing-model-metadata <n>]
         \\example: validate-gliner2-autodiff-run /tmp/gliner2-run --require-loss-decrease --min-supervised-tokens-per-second 10 --max-avg-step-wall-ms 1000 --max-total-execute-ms 50000 --max-peak-resident-bytes 2000000000 --min-examples 100 --min-steps 100 --min-entity-labels 2 --min-supervised-tokens 1000 --min-entity-tokens 100
         \\
         \\Validates a train-gliner2-autodiff output directory containing:

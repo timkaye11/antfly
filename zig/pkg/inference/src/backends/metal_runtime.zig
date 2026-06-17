@@ -3311,6 +3311,7 @@ pub fn decoderRuntimeApplyGeluBackward(self: anytype, request: anytype, stats: a
         request.upstream_grad.deviceHandle(),
         request.upstream_grad.deviceByteOffset(),
         request.dim,
+        if (request.exact) 1 else 0,
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
@@ -3391,6 +3392,7 @@ pub fn decoderRuntimeFfnGeluBackwardChainF32Device(
         request.intermediate_size,
         request.first_k,
         request.second_k,
+        if (request.exact) 1 else 0,
         first.deviceHandle(),
         first.deviceByteOffset(),
         second_branch.deviceHandle(),
@@ -3472,6 +3474,7 @@ pub fn decoderRuntimeFfnGeluBackwardOutputF32Device(
         request.hidden_size,
         request.intermediate_size,
         request.second_k,
+        if (request.exact) 1 else 0,
         first.deviceHandle(),
         first.deviceByteOffset(),
         gelu.deviceHandle(),
@@ -4375,6 +4378,11 @@ pub const LoraLinearBackwardF32DeviceResult = struct {
     grad_b: MetalTensor,
 };
 
+pub const LoraLinearBackwardBF32DeviceResult = struct {
+    grad_after_a: MetalTensor,
+    grad_b_transposed: MetalTensor,
+};
+
 pub fn decoderRuntimeLoraLinearF32Device(
     self: anytype,
     input: MetalTensor,
@@ -4508,6 +4516,52 @@ pub fn decoderRuntimeLoraLinearBackwardF32Device(
         .grad_after_a = grad_after_a,
         .grad_a = grad_a,
         .grad_b = grad_b,
+    };
+}
+
+pub fn decoderRuntimeLoraLinearBackwardBF32Device(
+    self: anytype,
+    after_a: MetalTensor,
+    lora_b: MetalTensor,
+    output_grad: MetalTensor,
+    rows: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+) !?LoraLinearBackwardBF32DeviceResult {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!after_a.isDevice() or !lora_b.isDevice() or !output_grad.isDevice()) return null;
+    if (rows == 0 or rank == 0 or out_dim == 0) return null;
+    if (after_a.elemCount() != rows * rank) return null;
+    if (lora_b.elemCount() != out_dim * rank or output_grad.elemCount() != rows * out_dim) return null;
+    const grad_after_a_shape = [_]i32{ @intCast(rows), @intCast(rank) };
+    const grad_b_transposed_shape = [_]i32{ @intCast(rank), @intCast(out_dim) };
+    var grad_after_a = try MetalTensor.deviceAllocate(runtime, rows * rank * @sizeOf(f32), .private, &grad_after_a_shape);
+    errdefer grad_after_a.deinit();
+    var grad_b_transposed = try MetalTensor.deviceAllocate(runtime, rank * out_dim * @sizeOf(f32), .private, &grad_b_transposed_shape);
+    errdefer grad_b_transposed.deinit();
+    const rc = termite_metal_decode_runtime_lora_backward_b_f32_device(
+        runtime,
+        after_a.deviceHandle(),
+        after_a.deviceByteOffset(),
+        lora_b.deviceHandle(),
+        lora_b.deviceByteOffset(),
+        output_grad.deviceHandle(),
+        output_grad.deviceByteOffset(),
+        rows,
+        rank,
+        out_dim,
+        scale,
+        grad_after_a.deviceHandle(),
+        grad_after_a.deviceByteOffset(),
+        grad_b_transposed.deviceHandle(),
+        grad_b_transposed.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return .{
+        .grad_after_a = grad_after_a,
+        .grad_b_transposed = grad_b_transposed,
     };
 }
 
@@ -8563,6 +8617,7 @@ pub extern fn termite_metal_decode_runtime_apply_gelu_backward_device(
     upstream_grad_handle: ?*anyopaque,
     upstream_grad_offset: usize,
     dim: usize,
+    exact: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -8588,6 +8643,7 @@ pub extern fn termite_metal_decode_runtime_ffn_gelu_backward_chain_f32_device(
     intermediate_size: usize,
     first_k: usize,
     second_k: usize,
+    exact: u32,
     first_output_handle: ?*anyopaque,
     first_output_offset: usize,
     second_output_handle: ?*anyopaque,
@@ -8620,6 +8676,7 @@ pub extern fn termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
     hidden_size: usize,
     intermediate_size: usize,
     second_k: usize,
+    exact: u32,
     first_output_handle: ?*anyopaque,
     first_output_offset: usize,
     gelu_output_handle: ?*anyopaque,
@@ -8935,6 +8992,23 @@ pub extern fn termite_metal_decode_runtime_lora_backward_f32_device(
     grad_a_offset: usize,
     grad_b_handle: ?*anyopaque,
     grad_b_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_lora_backward_b_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    after_a_handle: ?*anyopaque,
+    after_a_offset: usize,
+    lora_b_handle: ?*anyopaque,
+    lora_b_offset: usize,
+    output_grad_handle: ?*anyopaque,
+    output_grad_offset: usize,
+    rows: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+    grad_after_a_handle: ?*anyopaque,
+    grad_after_a_offset: usize,
+    grad_b_transposed_handle: ?*anyopaque,
+    grad_b_transposed_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_lora_backward_rank1_f32_device(
     runtime: ?*RawMetalDecodeRuntime,

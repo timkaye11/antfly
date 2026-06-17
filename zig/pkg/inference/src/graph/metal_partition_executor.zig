@@ -206,6 +206,8 @@ const RuntimeRegionKind = enum(u8) {
     deberta_ffn_forward,
     deberta_encoder_lora_layer,
     lora_backward,
+    low_rank_lora_backward,
+    rank_adapter_backward,
     ffn_gelu_backward,
     q_linear,
     linear_qkv,
@@ -229,6 +231,8 @@ const RuntimeRegion = union(RuntimeRegionKind) {
     deberta_ffn_forward: DebertaFfnForwardPattern,
     deberta_encoder_lora_layer: DebertaEncoderLoraLayerPattern,
     lora_backward: LoraBackwardPattern,
+    low_rank_lora_backward: LowRankLoraBackwardPattern,
+    rank_adapter_backward: RankAdapterBackwardPattern,
     ffn_gelu_backward: FfnGeluBackwardPattern,
     q_linear: QLinearPattern,
     linear_qkv: LinearNoBiasQkvPattern,
@@ -301,6 +305,8 @@ const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     deberta_ffn_forward: PreparedDebertaFfnForwardRegion,
     deberta_encoder_lora_layer: PreparedDebertaFfnForwardRegion,
     lora_backward: void,
+    low_rank_lora_backward: void,
+    rank_adapter_backward: void,
     ffn_gelu_backward: void,
     q_linear: PreparedLinearRegion,
     linear_qkv: PreparedQkvRegion,
@@ -320,14 +326,19 @@ const RuntimeRegionPlan = struct {
     regions_by_pos: []RuntimeRegion = &.{},
     prepared_by_pos: []PreparedRuntimeRegion = &.{},
     attention_input_max_first_node: []NodeId = &.{},
+    pre_skipped_by_region: []bool = &.{},
     region_count: usize = 0,
     covered_node_count: usize = 0,
     elided_node_count: usize = 0,
+    pre_skipped_node_count: usize = 0,
+    pre_skipped_transpose_count: usize = 0,
+    pre_skip_declined_external_consumer_count: usize = 0,
 
     fn deinit(self: *RuntimeRegionPlan, allocator: std.mem.Allocator) void {
         allocator.free(self.regions_by_pos);
         allocator.free(self.prepared_by_pos);
         allocator.free(self.attention_input_max_first_node);
+        allocator.free(self.pre_skipped_by_region);
         self.* = .{};
     }
 
@@ -335,6 +346,7 @@ const RuntimeRegionPlan = struct {
         if (self.regions_by_pos.len != node_ids.len) return false;
         if (self.prepared_by_pos.len != node_ids.len) return false;
         if (self.attention_input_max_first_node.len != value_count) return false;
+        if (self.pre_skipped_by_region.len != value_count) return false;
         if (self.node_count != node_ids.len or self.value_count != value_count) return false;
         if (node_ids.len == 0) return self.first_node == null_node and self.last_node == null_node;
         return self.first_node == node_ids[0] and self.last_node == node_ids[node_ids.len - 1];
@@ -510,6 +522,24 @@ const RuntimeFrameMetadata = struct {
     activation: ops_mod.DecoderRuntimeActivationKind,
 };
 
+const runtime_frame_max_layers = 128;
+
+const RuntimeFrameLayerBucket = struct {
+    qkv: ?RuntimeFrameQkvMetadata = null,
+    qkv_region: RuntimeRegion = .{ .none = {} },
+    qkv_input_id: NodeId = null_node,
+    attention: ?AttentionOutputResidualPattern = null,
+    ffn: RuntimeRegion = .{ .none = {} },
+    ple: ?PleResidualPattern = null,
+};
+
+const RuntimeFrameLayerCollection = struct {
+    buckets: [runtime_frame_max_layers]RuntimeFrameLayerBucket = [_]RuntimeFrameLayerBucket{.{}} ** runtime_frame_max_layers,
+    count: usize = 0,
+    completed_layers: usize = 0,
+    reason: RuntimeFrameIneligibleReason = .none,
+};
+
 pub fn isMetalDeviceResident(cb: *const ComputeBackend, tensor: CT) bool {
     if (cb.kind() != .metal) return false;
     if (comptime !build_options.enable_metal) return false;
@@ -591,6 +621,122 @@ fn temporaryMetalResidentValue(cb: *const ComputeBackend, tensor: CT) !Temporary
     }
     return .{ .value = tensor };
 }
+
+const ResidentInputCacheEntry = struct {
+    remaining_consumers: u32 = 0,
+    value: ?CT = null,
+    owned: bool = false,
+    bytes: u64 = 0,
+};
+
+const ResidentInputCache = struct {
+    entries: std.AutoHashMapUnmanaged(NodeId, ResidentInputCacheEntry) = .empty,
+    live_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+
+    fn init(self: *ResidentInputCache, allocator: std.mem.Allocator, graph: *const Graph, node_ids: []const NodeId) !void {
+        var counts = std.AutoHashMapUnmanaged(NodeId, u32).empty;
+        defer counts.deinit(allocator);
+
+        for (node_ids) |node_id| {
+            const source_id = lowSyncResidentInputSource(graph, node_id) orelse continue;
+            const entry = try counts.getOrPut(allocator, source_id);
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += 1;
+        }
+
+        var iter = counts.iterator();
+        while (iter.next()) |entry| {
+            const count = entry.value_ptr.*;
+            if (count < 2) continue;
+            try self.entries.put(allocator, entry.key_ptr.*, .{
+                .remaining_consumers = count,
+            });
+        }
+    }
+
+    fn deinit(self: *ResidentInputCache, allocator: std.mem.Allocator, cb: *const ComputeBackend) void {
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.owned) {
+                if (entry.value_ptr.value) |ct| cb.free(ct);
+            }
+        }
+        self.entries.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn hasEntries(self: *const ResidentInputCache) bool {
+        return self.entries.count() != 0;
+    }
+
+    fn residentValueForConsumer(
+        self: *ResidentInputCache,
+        cb: *const ComputeBackend,
+        graph: *const Graph,
+        source_id: NodeId,
+        source_value: CT,
+        stats: ?*PartitionExecutor.ExecutionStats,
+    ) !?CT {
+        const entry = self.entries.getPtr(source_id) orelse return null;
+        if (entry.value) |cached| {
+            if (stats) |s| {
+                s.metal_resident_input_cache_hits += 1;
+                s.metal_resident_input_cache_reused_bytes += entry.bytes;
+            }
+            return cached;
+        }
+        if (isMetalDeviceResident(cb, source_value)) return source_value;
+        if (stats) |s| s.metal_resident_input_cache_misses += 1;
+
+        const promoted = (try makeMetalDeviceResident(cb, source_value)) orelse return null;
+        if (!isMetalDeviceResident(cb, promoted)) return null;
+
+        const bytes = if (tensorElementCount(graph.node(source_id).output_shape)) |elems|
+            @as(u64, @intCast(elems * @sizeOf(f32)))
+        else
+            0;
+        entry.value = promoted;
+        entry.owned = promoted != source_value;
+        entry.bytes = bytes;
+        if (entry.owned) {
+            self.live_bytes += bytes;
+            self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+        }
+        if (stats) |s| {
+            s.metal_resident_input_cache_unique_promotions += 1;
+            s.metal_resident_input_cache_retained_live_bytes = self.live_bytes;
+            s.metal_resident_input_cache_retained_peak_bytes = @max(s.metal_resident_input_cache_retained_peak_bytes, self.peak_bytes);
+        }
+        return promoted;
+    }
+
+    fn releaseAfterConsumer(
+        self: *ResidentInputCache,
+        cb: *const ComputeBackend,
+        graph: *const Graph,
+        consumer_id: NodeId,
+        stats: ?*PartitionExecutor.ExecutionStats,
+    ) void {
+        const source_id = lowSyncResidentInputSource(graph, consumer_id) orelse return;
+        const entry = self.entries.getPtr(source_id) orelse return;
+        if (entry.remaining_consumers > 0) entry.remaining_consumers -= 1;
+        if (entry.remaining_consumers != 0) return;
+        if (entry.value) |ct| {
+            if (entry.owned) {
+                cb.free(ct);
+                if (self.live_bytes >= entry.bytes) self.live_bytes -= entry.bytes else self.live_bytes = 0;
+                if (stats) |s| {
+                    s.metal_resident_input_cache_released_bytes += entry.bytes;
+                    s.metal_resident_input_cache_retained_live_bytes = self.live_bytes;
+                    s.metal_resident_input_cache_retained_peak_bytes = @max(s.metal_resident_input_cache_retained_peak_bytes, self.peak_bytes);
+                }
+            }
+            entry.value = null;
+            entry.owned = false;
+        }
+    }
+};
 
 pub const MetalGraphPlanAllocation = struct {
     allocation: buffer_plan_mod.AllocationId,
@@ -1420,6 +1566,16 @@ pub const MetalPartitionExecutor = struct {
         if (chunk_local_outputs) {
             chunk_local_pool.init(allocator, buffer_plan.allocations.len, values.len) catch {};
         }
+        var resident_input_cache = ResidentInputCache{};
+        defer resident_input_cache.deinit(allocator, cb);
+        const resident_input_cache_enabled = self.owned and cb.kind() == .metal and (gatherPromoteInputEnabled() or reducePromoteInputEnabled());
+        if (resident_input_cache_enabled) {
+            try resident_input_cache.init(allocator, graph, node_ids);
+        }
+        const resident_input_cache_ptr: ?*ResidentInputCache = if (resident_input_cache_enabled and resident_input_cache.hasEntries())
+            &resident_input_cache
+        else
+            null;
 
         const options = exec_ctx.options orelse interpreter.ExecuteOptions{
             .attention = if (exec_ctx.attention) |attention| attention.* else null,
@@ -1611,8 +1767,10 @@ pub const MetalPartitionExecutor = struct {
             stats.runtime_region_plan_active_regions += runtime_region_plan.region_count;
             stats.runtime_region_plan_covered_nodes += runtime_region_plan.covered_node_count;
             stats.runtime_region_plan_elided_nodes += runtime_region_plan.elided_node_count;
-            recordRuntimeFrameEligibilityStats(stats, analyzeRuntimeFrameEligibility(runtime_region_plan));
-            if (runtimeFrameMetadataFromPlan(graph, runtime_region_plan) != null) {
+            stats.runtime_region_pre_skip_declined_external_consumers += runtime_region_plan.pre_skip_declined_external_consumer_count;
+            const frame_eligibility = analyzeRuntimeFrameEligibility(graph, runtime_region_plan);
+            recordRuntimeFrameEligibilityStats(stats, frame_eligibility);
+            if (frame_eligibility.eligible()) {
                 stats.runtime_frame_metadata_ready += 1;
             }
         }
@@ -1624,6 +1782,15 @@ pub const MetalPartitionExecutor = struct {
             value_device,
             device_id,
             runtime_region_plan,
+            exec_ctx.stats,
+        );
+
+        applyRuntimeRegionPreSkippedNodes(
+            graph,
+            runtime_region_plan,
+            skipped_nodes,
+            elision_protected_nodes,
+            rt_map,
             exec_ctx.stats,
         );
 
@@ -1726,6 +1893,7 @@ pub const MetalPartitionExecutor = struct {
                             stats.device_resident_outputs += 1;
                         } else {
                             stats.host_materialized_outputs += 1;
+                            stats.host_materialized_pre_materialized_constant_outputs += 1;
                             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, "pre_materialized_constant");
                         }
                     }
@@ -1734,7 +1902,16 @@ pub const MetalPartitionExecutor = struct {
                 }
             }
 
-            if (defer_allowed and !node_elision_protected and shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use)) {
+            // Activation transposes are only deferred in unchunked frames: a
+            // later chunk boundary may otherwise need to carry their output.
+            // Parameter transposes are different. Their source parameter is
+            // already stable for the full step, and the linear-dot command can
+            // consume it directly, so keep deferring them under chunked
+            // batch-32 training to avoid materializing hundreds of A/B/head
+            // weight transposes before their fused regions run.
+            if (!node_elision_protected and shouldDeferTransposeForLinearDot(graph, node_id, reachable, last_use) and
+                (defer_allowed or transposeSourceIsWeightParameter(graph, node_id)))
+            {
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -1860,7 +2037,7 @@ pub const MetalPartitionExecutor = struct {
                         break :blk null;
                     };
                     const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
-                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache)
+                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr)
                     else
                         null;
                     // Free an unconsumed pooled-output view (op didn't take the hint).
@@ -1950,6 +2127,7 @@ pub const MetalPartitionExecutor = struct {
                     switch (kind) {
                         .command => {
                             stats.backend_command_dispatches += 1;
+                            recordMetalCommandDispatchFamily(stats, graph, node_id);
                             if (op_plan != null) stats.planned_operator_dispatches += 1;
                             if (collect_op_stats) {
                                 op_execution_stats.recordCommand(op_name, elapsed_ns);
@@ -1972,6 +2150,11 @@ pub const MetalPartitionExecutor = struct {
                             stats.device_resident_outputs += 1;
                         } else {
                             stats.host_materialized_outputs += 1;
+                            if (execution_kind != null) {
+                                stats.host_materialized_command_outputs += 1;
+                            } else {
+                                stats.host_materialized_interpreter_outputs += 1;
+                            }
                             if (collect_op_stats) {
                                 op_execution_stats.recordHostOutput(op_name, elapsed_ns);
                                 op_execution_stats.recordHostOutputReason(hostOutputReasonName(execution_kind), elapsed_ns);
@@ -1986,6 +2169,7 @@ pub const MetalPartitionExecutor = struct {
                     stats.device_resident_outputs += 1;
                 } else {
                     stats.host_materialized_outputs += 1;
+                    stats.host_materialized_unattributed_outputs += 1;
                 }
             }
             if (collect_loop_profile) loop_profile.stats_ns += metalPartitionElapsedNs(stats_start_ns, metalPartitionNowNs());
@@ -1994,6 +2178,9 @@ pub const MetalPartitionExecutor = struct {
             const traced_command = if (execution_kind) |kind| kind == .command else false;
             if (trace_nodes) {
                 if (values[i]) |node_value| printMetalNodeTraceEnd(graph, cb, node_id, node_value, traced_command);
+            }
+            if (resident_input_cache_ptr) |cache| {
+                cache.releaseAfterConsumer(cb, graph, node_id, exec_ctx.stats);
             }
 
             const alias_clone_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
@@ -2470,6 +2657,9 @@ fn recordDotShapeExecutionSummary(
     const rhs_source = dotSourceInfo(graph, rhs_id);
 
     const summary = DotShapeExecutionSummary{
+        .first_lhs_id = lhs_id,
+        .first_rhs_id = rhs_id,
+        .first_rhs_source_id = rhs_source.source_id,
         .lhs0 = lhs_shape.dims[0],
         .lhs1 = lhs_shape.dims[1],
         .rhs0 = rhs_shape.dims[0],
@@ -2535,7 +2725,7 @@ fn printDotShapeExecutionStats(label: []const u8, summaries: []const DotShapeExe
         if (idx > 0) std.debug.print(",", .{});
         const avg_ms = if (entry.count == 0) 0.0 else nsToMs(entry.total_ns) / @as(f64, @floatFromInt(entry.count));
         std.debug.print(
-            "{d}x{d}*{d}x{d}->{d}x{d}:count={d}:total_ms={d:.3}:avg_ms={d:.3}:pos={d}-{d}:node={}-{}:phase={s}:family={s}:lhs={s}:rhs={s}:rhs_transpose={}:rhs_parameter={}:rhs_lora={}",
+            "{d}x{d}*{d}x{d}->{d}x{d}:count={d}:total_ms={d:.3}:avg_ms={d:.3}:pos={d}-{d}:node={}-{}:lhs_id={}:rhs_id={}:rhs_source={}:phase={s}:family={s}:lhs={s}:rhs={s}:rhs_transpose={}:rhs_parameter={}:rhs_lora={}",
             .{
                 entry.lhs0,
                 entry.lhs1,
@@ -2550,6 +2740,9 @@ fn printDotShapeExecutionStats(label: []const u8, summaries: []const DotShapeExe
                 entry.last_pos,
                 entry.first_node,
                 entry.last_node,
+                entry.first_lhs_id,
+                entry.first_rhs_id,
+                entry.first_rhs_source_id,
                 entry.phase,
                 entry.family,
                 entry.lhs_source_op,
@@ -2651,7 +2844,7 @@ fn materializeDeferredSkippedInputs(
         // deferred mul); resolve the producer's own skipped inputs first.
         try materializeDeferredSkippedInputs(allocator, graph, cb, values, value_device, device_id, input_id, skipped_nodes, exec_state, depth + 1);
         if (interpreterFallbackHasMissingInput(graph, values, input_id)) continue;
-        const materialized = (try tryExecuteMetalCommand(allocator, graph, cb, values, input_id, null, exec_state, null, null)) orelse
+        const materialized = (try tryExecuteMetalCommand(allocator, graph, cb, values, input_id, null, exec_state, null, null, null, null)) orelse
             try interpreter.executeNode(graph, cb, values, input_id, exec_state);
         values[input_index] = materialized;
         if (input_index < value_device.len) value_device[input_index] = device_id;
@@ -2709,6 +2902,10 @@ const LongOpRun = struct {
 };
 
 const DotShapeRunSummary = struct {
+    first_node: NodeId = null_node,
+    first_lhs_id: NodeId = null_node,
+    first_rhs_id: NodeId = null_node,
+    first_rhs_source_id: NodeId = null_node,
     lhs0: i64 = 0,
     lhs1: i64 = 0,
     rhs0: i64 = 0,
@@ -2727,6 +2924,9 @@ const DotShapeRunSummary = struct {
 };
 
 const DotShapeExecutionSummary = struct {
+    first_lhs_id: NodeId = null_node,
+    first_rhs_id: NodeId = null_node,
+    first_rhs_source_id: NodeId = null_node,
     lhs0: i64 = 0,
     lhs1: i64 = 0,
     rhs0: i64 = 0,
@@ -2750,6 +2950,7 @@ const DotShapeExecutionSummary = struct {
 
 const DotSourceInfo = struct {
     op_name: []const u8 = "",
+    source_id: NodeId = null_node,
     is_transpose: bool = false,
     is_parameter: bool = false,
     is_lora: bool = false,
@@ -2795,6 +2996,36 @@ fn commandSourceClassification(graph: *const Graph, node_id: NodeId, depth: usiz
     };
 }
 
+fn recordMetalCommandDispatchFamily(stats: *PartitionExecutor.ExecutionStats, graph: *const Graph, node_id: NodeId) void {
+    if (node_id == null_node or node_id >= graph.nodeCount()) {
+        stats.metal_command_other_dispatches += 1;
+        return;
+    }
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .dot_general => {
+            stats.metal_command_dot_general_dispatches += 1;
+            const classification = commandSourceClassification(graph, node_id, 4);
+            if (std.mem.eql(u8, classification.family, "head")) {
+                stats.metal_command_head_dot_dispatches += 1;
+            }
+        },
+        .transpose => stats.metal_command_transpose_dispatches += 1,
+        .gather => stats.metal_command_gather_dispatches += 1,
+        .reduce_sum, .reduce_max, .reduce_mean => stats.metal_command_reduce_dispatches += 1,
+        .add, .mul, .sub, .div, .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs, .less_than, .where_select, .broadcast_in_dim, .convert_dtype => {
+            stats.metal_command_elementwise_dispatches += 1;
+        },
+        .fused_gelu, .fused_gelu_exact, .fused_relu, .fused_silu, .fused_quick_gelu, .fused_sigmoid, .fused_tanh_act => {
+            stats.metal_command_activation_dispatches += 1;
+        },
+        .fused_gelu_backward, .fused_gelu_exact_backward, .fused_layer_norm_backward, .fused_disentangled_attention_backward => {
+            stats.metal_command_activation_backward_dispatches += 1;
+        },
+        else => stats.metal_command_other_dispatches += 1,
+    }
+}
+
 fn commandParameterName(graph: *const Graph, node_id: NodeId, depth: usize) ?[]const u8 {
     if (depth == 0 or node_id == null_node or node_id >= graph.nodeCount()) return null;
     const node = graph.node(node_id);
@@ -2824,13 +3055,14 @@ fn dotSourceInfo(graph: *const Graph, node_id: NodeId) DotSourceInfo {
     switch (node.op) {
         .transpose => {
             if (node.num_inputs == 0 or node.inputs[0] == null_node or node.inputs[0] >= graph.nodeCount()) {
-                return .{ .op_name = "transpose", .is_transpose = true };
+                return .{ .op_name = "transpose", .source_id = node_id, .is_transpose = true };
             }
             const source = graph.node(node.inputs[0]);
             if (std.meta.activeTag(source.op) == .parameter) {
                 const name = graph.parameterName(source);
                 return .{
                     .op_name = "transpose(parameter)",
+                    .source_id = node.inputs[0],
                     .is_transpose = true,
                     .is_parameter = true,
                     .is_lora = isLoRAAdapterParameterName(name),
@@ -2839,6 +3071,7 @@ fn dotSourceInfo(graph: *const Graph, node_id: NodeId) DotSourceInfo {
             }
             return .{
                 .op_name = if (std.meta.activeTag(source.op) == .dot_general) "transpose(dot_general)" else "transpose(other)",
+                .source_id = node.inputs[0],
                 .is_transpose = true,
             };
         },
@@ -2846,12 +3079,13 @@ fn dotSourceInfo(graph: *const Graph, node_id: NodeId) DotSourceInfo {
             const name = graph.parameterName(node);
             return .{
                 .op_name = "parameter",
+                .source_id = node_id,
                 .is_parameter = true,
                 .is_lora = isLoRAAdapterParameterName(name),
                 .parameter_name = name,
             };
         },
-        else => return .{ .op_name = @tagName(std.meta.activeTag(node.op)) },
+        else => return .{ .op_name = @tagName(std.meta.activeTag(node.op)), .source_id = node_id },
     }
 }
 
@@ -2958,6 +3192,10 @@ fn recordDotShapeRunSummary(
     const rhs_source = dotSourceInfo(graph, rhs_id);
 
     var summary = DotShapeRunSummary{
+        .first_node = node_id,
+        .first_lhs_id = lhs_id,
+        .first_rhs_id = rhs_id,
+        .first_rhs_source_id = rhs_source.source_id,
         .lhs0 = lhs_shape.dims[0],
         .lhs1 = lhs_shape.dims[1],
         .rhs0 = rhs_shape.dims[0],
@@ -3083,7 +3321,7 @@ fn printMetalPartitionOpRuns(
         for (dot_shapes[0..dot_limit], 0..) |entry, idx| {
             if (idx > 0) std.debug.print(",", .{});
             std.debug.print(
-                "{d}x{d}*{d}x{d}->{d}x{d}:count={d}:phase={s}:family={s}:lhs={s}:rhs={s}:rhs_transpose={}:rhs_parameter={}:rhs_lora={}:raw_linear={}",
+                "{d}x{d}*{d}x{d}->{d}x{d}:count={d}:node={}:lhs_id={}:rhs_id={}:rhs_source={}:phase={s}:family={s}:lhs={s}:rhs={s}:rhs_transpose={}:rhs_parameter={}:rhs_lora={}:raw_linear={}",
                 .{
                     entry.lhs0,
                     entry.lhs1,
@@ -3092,6 +3330,10 @@ fn printMetalPartitionOpRuns(
                     entry.out0,
                     entry.out1,
                     entry.count,
+                    entry.first_node,
+                    entry.first_lhs_id,
+                    entry.first_rhs_id,
+                    entry.first_rhs_source_id,
                     entry.phase,
                     entry.family,
                     entry.lhs_source_op,
@@ -3527,6 +3769,14 @@ fn traceDebertaFfnForwardMatchingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_FFN_FORWARD_MATCH", false);
 }
 
+fn traceFfnGeluBackwardMatchingEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_FFN_GELU_BACKWARD_MATCH", false) or traceMetalGraphFusionsEnabled();
+}
+
+fn traceRankAdapterBackwardMatchingEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_RANK_ADAPTER_BACKWARD_MATCH", false) or traceMetalGraphFusionsEnabled();
+}
+
 fn traceDebertaEncoderLoraLayerMatchingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_DEBERTA_ENCODER_LORA_LAYER_MATCH", false) or
         traceDebertaFfnForwardMatchingEnabled();
@@ -3541,6 +3791,13 @@ fn debertaFfnForwardRuntimeRegionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_DEBERTA_FFN_FORWARD_RUNTIME_REGION", false);
 }
 
+fn headMlpForwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_HEAD_MLP_FORWARD_RUNTIME_REGION", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_HEAD_MLP_FORWARD_RUNTIME_REGION", false)) return true;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+}
+
 /// When set, promote a gather's input operand to device residency before the
 /// gather command. Frozen embedding-table gathers otherwise run the host
 /// fallback (no_input_metal) and force a host-output drain. Default OFF; this
@@ -3550,6 +3807,22 @@ fn gatherPromoteInputEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_GATHER_PROMOTE_INPUT", false);
 }
 
+fn reducePromoteInputEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_REDUCE_PROMOTE_INPUT", false);
+}
+
+fn lowSyncResidentInputSource(graph: *const Graph, node_id: NodeId) ?NodeId {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    const inputs = node.getInputs();
+    if (inputs.len == 0 or inputs[0] == null_node) return null;
+    return switch (node.op) {
+        .gather => if (gatherPromoteInputEnabled()) inputs[0] else null,
+        .reduce_sum, .reduce_max, .reduce_mean => if (reducePromoteInputEnabled()) inputs[0] else null,
+        else => null,
+    };
+}
+
 fn runtimeRegionPlanDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RUNTIME_REGION_PLAN", false);
 }
@@ -3557,6 +3830,18 @@ fn runtimeRegionPlanDisabled() bool {
 fn loraBackwardRuntimeRegionEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LORA_BACKWARD_RUNTIME_REGION", false)) return false;
     return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_LORA_BACKWARD_RUNTIME_REGION", true);
+}
+
+fn lowRankLoraBackwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LOW_RANK_LORA_BACKWARD_RUNTIME_REGION", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_LOW_RANK_LORA_BACKWARD_RUNTIME_REGION", false);
+}
+
+fn rankAdapterBackwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RANK_ADAPTER_BACKWARD_RUNTIME_REGION", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RANK_ADAPTER_BACKWARD_RUNTIME_REGION", false)) return true;
+    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
 }
 
 fn ffnGeluBackwardRuntimeRegionEnabled() bool {
@@ -3630,20 +3915,24 @@ fn buildRuntimeRegionPlan(
     const prepared = try allocator.alloc(PreparedRuntimeRegion, node_ids.len);
     errdefer allocator.free(prepared);
     @memset(prepared, .{ .none = {} });
-    const attention_input_max_first_node = try allocator.alloc(NodeId, value_count);
-    errdefer allocator.free(attention_input_max_first_node);
-    @memset(attention_input_max_first_node, null_node);
-    const null_values = try allocator.alloc(?CT, value_count);
-    defer allocator.free(null_values);
-    @memset(null_values, null);
+        const attention_input_max_first_node = try allocator.alloc(NodeId, value_count);
+        errdefer allocator.free(attention_input_max_first_node);
+        @memset(attention_input_max_first_node, null_node);
+        const pre_skipped_by_region = try allocator.alloc(bool, value_count);
+        errdefer allocator.free(pre_skipped_by_region);
+        @memset(pre_skipped_by_region, false);
+        const null_values = try allocator.alloc(?CT, value_count);
+        defer allocator.free(null_values);
+        @memset(null_values, null);
 
     const skipped = try allocator.alloc(bool, value_count);
     defer allocator.free(skipped);
     @memset(skipped, false);
 
-    var region_count: usize = 0;
-    const raw_linear_regions_suppressed = rawLinearRuntimeRegionsSuppressedForTraining();
-    for (node_ids, 0..) |node_id, node_pos| {
+        var region_count: usize = 0;
+        var pre_skip_stats = RuntimeRegionPreSkipStats{};
+        const raw_linear_regions_suppressed = rawLinearRuntimeRegionsSuppressedForTraining();
+        for (node_ids, 0..) |node_id, node_pos| {
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
@@ -3658,6 +3947,14 @@ fn buildRuntimeRegionPlan(
         }
         if (debertaFfnForwardRuntimeRegionEnabled()) {
             if (matchDebertaFfnForwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .deberta_ffn_forward = pattern };
+                markDebertaFfnForwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (headMlpForwardRuntimeRegionEnabled()) {
+            if (matchHeadMlpForwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
                 regions[node_pos] = .{ .deberta_ffn_forward = pattern };
                 markDebertaFfnForwardSkipped(skipped, pattern);
                 region_count += 1;
@@ -3712,9 +4009,28 @@ fn buildRuntimeRegionPlan(
                 continue;
             }
         }
+        if (rankAdapterBackwardRuntimeRegionEnabled()) {
+            if (matchRankAdapterBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .rank_adapter_backward = pattern };
+                pre_skip_stats.add(markRankAdapterBackwardPreSkipped(graph, reachable, skipped, pre_skipped_by_region, pattern));
+                markRankAdapterBackwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (lowRankLoraBackwardRuntimeRegionEnabled()) {
+            if (matchLowRankLoraBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .low_rank_lora_backward = pattern };
+                pre_skip_stats.add(markLowRankLoraBackwardPreSkipped(graph, reachable, skipped, pre_skipped_by_region, pattern));
+                markLowRankLoraBackwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
         if (loraBackwardRuntimeRegionEnabled()) {
             if (matchLoraBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
                 regions[node_pos] = .{ .lora_backward = pattern };
+                pre_skip_stats.add(markLoraBackwardPreSkipped(graph, reachable, skipped, pre_skipped_by_region, pattern));
                 markLoraBackwardSkipped(skipped, pattern);
                 region_count += 1;
                 continue;
@@ -3793,9 +4109,13 @@ fn buildRuntimeRegionPlan(
         .regions_by_pos = regions,
         .prepared_by_pos = prepared,
         .attention_input_max_first_node = attention_input_max_first_node,
+        .pre_skipped_by_region = pre_skipped_by_region,
         .region_count = region_count,
         .covered_node_count = runtimeRegionCoveredNodeCount(node_ids, regions, skipped),
         .elided_node_count = runtimeRegionElidedNodeCount(node_ids, regions, skipped),
+        .pre_skipped_node_count = pre_skip_stats.nodes,
+        .pre_skipped_transpose_count = pre_skip_stats.transposes,
+        .pre_skip_declined_external_consumer_count = pre_skip_stats.declined_external_consumer,
     };
 }
 
@@ -3871,7 +4191,7 @@ fn printRuntimeRegionPlanSummary(graph: *const Graph, plan: RuntimeRegionPlan, p
     for (plan.regions_by_pos, 0..) |region, pos| {
         recordRuntimeRegionSummary(&summaries, &used, std.meta.activeTag(region), pos);
     }
-    const eligibility = analyzeRuntimeFrameEligibility(plan);
+    const eligibility = analyzeRuntimeFrameEligibility(graph, plan);
     const metadata_ready = runtimeFrameMetadataFromPlan(graph, plan) != null;
     std.debug.print(
         "runtime_region_plan_summary: partition={d} regions={d} frame_reason={s} frame_layers={d} metadata_ready={} kinds=",
@@ -4033,6 +4353,302 @@ fn runtimeFrameLayerMetadata(
     };
 }
 
+fn runtimeFrameQkvInputId(region: RuntimeRegion) NodeId {
+    return switch (region) {
+        .q_linear => |pattern| pattern.input_id,
+        .linear_qkv => |pattern| pattern.input_id,
+        .grouped_linear_qkv_slice => |pattern| pattern.input_id,
+        .rms_norm_grouped_linear_qkv_slice => |pattern| pattern.qkv.input_id,
+        .lora_linear_qkv => |pattern| pattern.q.input_id,
+        else => null_node,
+    };
+}
+
+fn runtimeFrameFfnResidualId(region: RuntimeRegion) NodeId {
+    return switch (region) {
+        .rms_norm_gated_ffn_residual => |pattern| pattern.ffn.residual_id,
+        .gated_ffn_residual => |pattern| pattern.residual_id,
+        else => null_node,
+    };
+}
+
+fn runtimeFrameFfnOutputId(region: RuntimeRegion) NodeId {
+    return switch (region) {
+        .rms_norm_gated_ffn_residual => |pattern| pattern.ffn.add_id,
+        .gated_ffn_residual => |pattern| pattern.add_id,
+        else => null_node,
+    };
+}
+
+fn runtimeFrameBucketHasFfn(bucket: RuntimeFrameLayerBucket) bool {
+    return runtimeFrameFfnOutputId(bucket.ffn) != null_node;
+}
+
+fn runtimeFrameCollectQkv(
+    graph: ?*const Graph,
+    collection: *RuntimeFrameLayerCollection,
+    region: RuntimeRegion,
+) bool {
+    const input_id = runtimeFrameQkvInputId(region);
+    if (input_id == null_node) {
+        collection.reason = .non_layer_order;
+        return false;
+    }
+    for (collection.buckets[0..collection.count]) |bucket| {
+        if (bucket.qkv_input_id == input_id) {
+            collection.reason = .non_layer_order;
+            return false;
+        }
+    }
+    if (collection.count >= runtime_frame_max_layers) {
+        collection.reason = .non_layer_order;
+        return false;
+    }
+    const qkv = if (graph) |g| runtimeFrameQkvMetadataFromRegion(g, region) else null;
+    collection.buckets[collection.count] = .{
+        .qkv = qkv,
+        .qkv_region = region,
+        .qkv_input_id = input_id,
+    };
+    collection.count += 1;
+    return true;
+}
+
+fn runtimeFrameAttachAttention(collection: *RuntimeFrameLayerCollection, pattern: AttentionOutputResidualPattern) bool {
+    for (collection.buckets[0..collection.count]) |*bucket| {
+        if (bucket.qkv_input_id == pattern.residual_id) {
+            if (bucket.attention != null) {
+                collection.reason = .non_layer_order;
+                return false;
+            }
+            bucket.attention = pattern;
+            return true;
+        }
+    }
+    for (collection.buckets[0..collection.count]) |*bucket| {
+        if (bucket.attention == null) {
+            bucket.attention = pattern;
+            return true;
+        }
+    }
+    collection.reason = .non_layer_order;
+    return false;
+}
+
+fn runtimeFrameAttachFfn(collection: *RuntimeFrameLayerCollection, region: RuntimeRegion) bool {
+    const residual_id = runtimeFrameFfnResidualId(region);
+    if (residual_id == null_node) {
+        collection.reason = .non_layer_order;
+        return false;
+    }
+    var saw_attention = false;
+    for (collection.buckets[0..collection.count]) |*bucket| {
+        const attention = bucket.attention orelse continue;
+        saw_attention = true;
+        if (attention.add_id == residual_id) {
+            if (runtimeFrameBucketHasFfn(bucket.*)) {
+                collection.reason = .non_layer_order;
+                return false;
+            }
+            bucket.ffn = region;
+            return true;
+        }
+    }
+    collection.reason = if (saw_attention) .non_layer_order else .missing_attention;
+    return false;
+}
+
+fn runtimeFrameAttachPle(collection: *RuntimeFrameLayerCollection, pattern: PleResidualPattern) bool {
+    var saw_ffn = false;
+    for (collection.buckets[0..collection.count]) |*bucket| {
+        if (!runtimeFrameBucketHasFfn(bucket.*)) continue;
+        saw_ffn = true;
+        if (runtimeFrameFfnOutputId(bucket.ffn) == pattern.hidden_id) {
+            if (bucket.ple != null) {
+                collection.reason = .non_layer_order;
+                return false;
+            }
+            bucket.ple = pattern;
+            return true;
+        }
+    }
+    collection.reason = if (saw_ffn) .non_layer_order else .missing_ffn;
+    return false;
+}
+
+fn runtimeFrameSortLayerBuckets(collection: *RuntimeFrameLayerCollection) void {
+    for (collection.buckets[0..collection.count]) |bucket| {
+        if (bucket.qkv == null) return;
+    }
+    var i: usize = 1;
+    while (i < collection.count) : (i += 1) {
+        const key = collection.buckets[i];
+        var j = i;
+        while (j > 0 and collection.buckets[j - 1].qkv.?.layer_index > key.qkv.?.layer_index) : (j -= 1) {
+            collection.buckets[j] = collection.buckets[j - 1];
+        }
+        collection.buckets[j] = key;
+    }
+}
+
+fn collectRuntimeFrameLayers(graph: ?*const Graph, plan: RuntimeRegionPlan) RuntimeFrameLayerCollection {
+    var collection = RuntimeFrameLayerCollection{};
+    if (plan.region_count == 0) {
+        collection.reason = .no_regions;
+        return collection;
+    }
+
+    var saw_frame_region = false;
+    var saw_attention_output_residual = false;
+    var saw_deberta_encoder_layer = false;
+    for (plan.regions_by_pos) |region| {
+        switch (region) {
+            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice, .lora_linear_qkv => {
+                saw_frame_region = true;
+                if (!runtimeFrameCollectQkv(graph, &collection, region)) return collection;
+            },
+            .attention_output_residual => {
+                saw_frame_region = true;
+                saw_attention_output_residual = true;
+            },
+            .deberta_encoder_lora_layer => {
+                saw_frame_region = true;
+                saw_deberta_encoder_layer = true;
+            },
+            .deberta_attention, .rms_norm_gated_ffn_residual, .gated_ffn_residual, .ple_residual => {
+                saw_frame_region = true;
+            },
+            else => {},
+        }
+    }
+    if (!saw_frame_region) {
+        collection.reason = .no_regions;
+        return collection;
+    }
+    if (collection.count == 0) {
+        collection.reason = .missing_qkv;
+        return collection;
+    }
+    if (!saw_attention_output_residual and saw_deberta_encoder_layer) {
+        collection.reason = .missing_model_metadata;
+        return collection;
+    }
+
+    for (plan.regions_by_pos) |region| {
+        switch (region) {
+            .attention_output_residual => |pattern| {
+                if (!runtimeFrameAttachAttention(&collection, pattern)) return collection;
+            },
+            else => {},
+        }
+    }
+    for (plan.regions_by_pos) |region| {
+        switch (region) {
+            .rms_norm_gated_ffn_residual, .gated_ffn_residual => {
+                if (!runtimeFrameAttachFfn(&collection, region)) return collection;
+            },
+            else => {},
+        }
+    }
+    for (plan.regions_by_pos) |region| {
+        switch (region) {
+            .ple_residual => |pattern| {
+                if (!runtimeFrameAttachPle(&collection, pattern)) return collection;
+            },
+            else => {},
+        }
+    }
+
+    runtimeFrameSortLayerBuckets(&collection);
+
+    var frame_rows: usize = 0;
+    for (collection.buckets[0..collection.count]) |bucket| {
+        const qkv_shape = runtimeFrameLayerShapeFromQkv(bucket.qkv_region) orelse {
+            collection.reason = .non_layer_order;
+            return collection;
+        };
+        const attention = bucket.attention orelse {
+            collection.reason = .missing_attention;
+            return collection;
+        };
+        const ffn_shape = runtimeFrameLayerShapeFromFfn(bucket.ffn) orelse {
+            collection.reason = .missing_ffn;
+            return collection;
+        };
+        const ple = bucket.ple orelse {
+            collection.reason = .missing_ple;
+            return collection;
+        };
+        const attention_shape = runtimeFrameLayerShapeFromAttention(attention);
+        const ple_shape = runtimeFrameLayerShapeFromPle(ple);
+        if (!runtimeFrameShapesMatch(qkv_shape, attention_shape) or
+            !runtimeFrameShapesMatch(qkv_shape, ffn_shape) or
+            !runtimeFrameShapesMatch(qkv_shape, ple_shape))
+        {
+            collection.reason = .shape_mismatch;
+            return collection;
+        }
+        if (frame_rows == 0) frame_rows = ple_shape.rows;
+        collection.completed_layers += 1;
+    }
+
+    if (collection.completed_layers == 0) {
+        collection.reason = .no_regions;
+        return collection;
+    }
+    if (frame_rows <= 1) {
+        collection.reason = .single_row;
+        return collection;
+    }
+    collection.reason = .none;
+    return collection;
+}
+
+fn traceRuntimeFrameOrder(graph: ?*const Graph, plan: RuntimeRegionPlan, collection: RuntimeFrameLayerCollection) void {
+    if (!platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_RUNTIME_FRAME_ORDER", false)) return;
+    std.debug.print(
+        "runtime_frame_order: regions={d} layers={d} completed={d} reason={s}\n",
+        .{ plan.region_count, collection.count, collection.completed_layers, @tagName(collection.reason) },
+    );
+    for (plan.regions_by_pos, 0..) |region, pos| {
+        switch (region) {
+            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice, .lora_linear_qkv => {
+                const qkv = if (graph) |g| runtimeFrameQkvMetadataFromRegion(g, region) else null;
+                std.debug.print(
+                    "runtime_frame_order_region: pos={d} kind={s} q_layer={d} q_input={d}\n",
+                    .{ pos, @tagName(region), if (qkv) |q| q.layer_index else std.math.maxInt(usize), runtimeFrameQkvInputId(region) },
+                );
+            },
+            .attention_output_residual => |pattern| std.debug.print(
+                "runtime_frame_order_region: pos={d} kind={s} residual={d} add={d} attention={d}\n",
+                .{ pos, @tagName(region), pattern.residual_id, pattern.add_id, pattern.attention_id },
+            ),
+            .rms_norm_gated_ffn_residual, .gated_ffn_residual => std.debug.print(
+                "runtime_frame_order_region: pos={d} kind={s} residual={d} output={d}\n",
+                .{ pos, @tagName(region), runtimeFrameFfnResidualId(region), runtimeFrameFfnOutputId(region) },
+            ),
+            .ple_residual => |pattern| std.debug.print(
+                "runtime_frame_order_region: pos={d} kind={s} hidden={d} add={d}\n",
+                .{ pos, @tagName(region), pattern.hidden_id, pattern.add_id },
+            ),
+            else => {},
+        }
+    }
+    for (collection.buckets[0..collection.count], 0..) |bucket, idx| {
+        std.debug.print(
+            "runtime_frame_order_bucket: idx={d} q_layer={d} q_input={d} attention_add={d} ffn_output={d} ple_add={d}\n",
+            .{
+                idx,
+                if (bucket.qkv) |q| q.layer_index else std.math.maxInt(usize),
+                bucket.qkv_input_id,
+                if (bucket.attention) |a| a.add_id else null_node,
+                runtimeFrameFfnOutputId(bucket.ffn),
+                if (bucket.ple) |p| p.add_id else null_node,
+            },
+        );
+    }
+}
+
 fn traceRuntimeFrameMetadataDeclined(
     reason: []const u8,
     layer_index: usize,
@@ -4063,12 +4679,24 @@ fn traceRuntimeFrameMetadataDeclined(
 }
 
 fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?RuntimeFrameMetadata {
-    if (plan.region_count == 0) return null;
+    const collection = collectRuntimeFrameLayers(graph, plan);
+    traceRuntimeFrameOrder(graph, plan, collection);
+    if (collection.reason != .none) {
+        const bucket = if (collection.count > collection.completed_layers)
+            collection.buckets[collection.completed_layers]
+        else
+            RuntimeFrameLayerBucket{};
+        traceRuntimeFrameMetadataDeclined(
+            @tagName(collection.reason),
+            collection.completed_layers,
+            bucket.qkv,
+            bucket.attention,
+            bucket.ffn,
+            bucket.ple,
+        );
+        return null;
+    }
 
-    var phase: enum { qkv, attention, ffn, ple } = .qkv;
-    var pending_qkv: ?RuntimeFrameQkvMetadata = null;
-    var pending_attention: ?AttentionOutputResidualPattern = null;
-    var pending_ffn: RuntimeRegion = .{ .none = {} };
     var rows: usize = 0;
     var hidden_size: usize = 0;
     var num_attention_heads: usize = 0;
@@ -4077,108 +4705,72 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
     var activation: ?ops_mod.DecoderRuntimeActivationKind = null;
     var layer_count: usize = 0;
 
-    for (plan.regions_by_pos) |region| {
-        switch (region) {
-            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .deberta_encoder_lora_layer, .lora_backward, .ffn_gelu_backward => continue,
-            .deberta_attention => {
-                if (phase != .attention or pending_qkv == null) {
-                    traceRuntimeFrameMetadataDeclined("attention_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
-                    return null;
-                }
-                phase = .ffn;
-                pending_attention = null;
-            },
-            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice, .lora_linear_qkv => {
-                if (phase != .qkv) {
-                    traceRuntimeFrameMetadataDeclined("qkv_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
-                    return null;
-                }
-                pending_qkv = runtimeFrameQkvMetadataFromRegion(graph, region) orelse {
-                    traceRuntimeFrameMetadataDeclined("qkv_metadata", layer_count, null, pending_attention, pending_ffn, null);
-                    return null;
-                };
-                phase = .attention;
-            },
-            .attention_output_residual => |pattern| {
-                if (phase != .attention or pending_qkv == null) {
-                    traceRuntimeFrameMetadataDeclined("attention_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
-                    return null;
-                }
-                pending_attention = pattern;
-                phase = .ffn;
-            },
-            .rms_norm_gated_ffn_residual, .gated_ffn_residual => {
-                if (phase != .ffn or pending_attention == null) {
-                    traceRuntimeFrameMetadataDeclined("ffn_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
-                    return null;
-                }
-                pending_ffn = region;
-                phase = .ple;
-            },
-            .ple_residual => |pattern| {
-                if (phase != .ple) {
-                    traceRuntimeFrameMetadataDeclined("ple_phase", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                    return null;
-                }
-                const layer = runtimeFrameLayerMetadata(
-                    graph,
-                    pending_qkv orelse return null,
-                    pending_attention orelse return null,
-                    pending_ffn,
-                    pattern,
-                ) orelse {
-                    traceRuntimeFrameMetadataDeclined("layer_metadata", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                    return null;
-                };
-                if (layer.layer_index != layer_count) {
-                    traceRuntimeFrameMetadataDeclined("layer_index_order", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                    return null;
-                }
-                if (rows == 0) {
-                    rows = pattern.rows;
-                    hidden_size = layer.hidden_size;
-                    ple_hidden_size = layer.ple_hidden_size;
-                    activation = layer.activation;
-                    num_attention_heads = if (layer.head_dim == 0) return null else layer.attention_input_size / layer.head_dim;
-                    global_head_dim = if (layer.shares_kv) layer.head_dim else 0;
-                } else {
-                    if (rows != pattern.rows or hidden_size != layer.hidden_size) {
-                        traceRuntimeFrameMetadataDeclined("frame_shape_mismatch", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                        return null;
-                    }
-                    if (ple_hidden_size != layer.ple_hidden_size) {
-                        traceRuntimeFrameMetadataDeclined("ple_size_mismatch", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                        return null;
-                    }
-                    if (activation.? != layer.activation) {
-                        traceRuntimeFrameMetadataDeclined("activation_mismatch", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                        return null;
-                    }
-                    const heads = if (layer.head_dim == 0) {
-                        traceRuntimeFrameMetadataDeclined("zero_head_dim", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                        return null;
-                    } else layer.attention_input_size / layer.head_dim;
-                    if (num_attention_heads != heads) {
-                        traceRuntimeFrameMetadataDeclined("num_heads_mismatch", layer_count, pending_qkv, pending_attention, pending_ffn, pattern);
-                        return null;
-                    }
-                    if (layer.shares_kv) {
-                        if (global_head_dim < layer.head_dim) {
-                            global_head_dim = layer.head_dim;
-                        }
-                    }
-                }
-                layer_count += 1;
-                pending_qkv = null;
-                pending_attention = null;
-                pending_ffn = .{ .none = {} };
-                phase = .qkv;
-            },
+    for (collection.buckets[0..collection.count]) |bucket| {
+        const qkv = bucket.qkv orelse {
+            traceRuntimeFrameMetadataDeclined("qkv_metadata", layer_count, null, bucket.attention, bucket.ffn, bucket.ple);
+            return null;
+        };
+        const attention = bucket.attention orelse {
+            traceRuntimeFrameMetadataDeclined("attention_phase", layer_count, bucket.qkv, null, bucket.ffn, bucket.ple);
+            return null;
+        };
+        const ple = bucket.ple orelse {
+            traceRuntimeFrameMetadataDeclined("ple_phase", layer_count, bucket.qkv, bucket.attention, bucket.ffn, null);
+            return null;
+        };
+        const layer = runtimeFrameLayerMetadata(
+            graph,
+            qkv,
+            attention,
+            bucket.ffn,
+            ple,
+        ) orelse {
+            traceRuntimeFrameMetadataDeclined("layer_metadata", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+            return null;
+        };
+        if (layer.layer_index != layer_count) {
+            traceRuntimeFrameMetadataDeclined("layer_index_order", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+            return null;
         }
+        if (rows == 0) {
+            rows = ple.rows;
+            hidden_size = layer.hidden_size;
+            ple_hidden_size = layer.ple_hidden_size;
+            activation = layer.activation;
+            num_attention_heads = if (layer.head_dim == 0) return null else layer.attention_input_size / layer.head_dim;
+            global_head_dim = if (layer.shares_kv) layer.head_dim else 0;
+        } else {
+            if (rows != ple.rows or hidden_size != layer.hidden_size) {
+                traceRuntimeFrameMetadataDeclined("frame_shape_mismatch", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+                return null;
+            }
+            if (ple_hidden_size != layer.ple_hidden_size) {
+                traceRuntimeFrameMetadataDeclined("ple_size_mismatch", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+                return null;
+            }
+            if (activation.? != layer.activation) {
+                traceRuntimeFrameMetadataDeclined("activation_mismatch", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+                return null;
+            }
+            const heads = if (layer.head_dim == 0) {
+                traceRuntimeFrameMetadataDeclined("zero_head_dim", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+                return null;
+            } else layer.attention_input_size / layer.head_dim;
+            if (num_attention_heads != heads) {
+                traceRuntimeFrameMetadataDeclined("num_heads_mismatch", layer_count, bucket.qkv, bucket.attention, bucket.ffn, bucket.ple);
+                return null;
+            }
+            if (layer.shares_kv) {
+                if (global_head_dim < layer.head_dim) {
+                    global_head_dim = layer.head_dim;
+                }
+            }
+        }
+        layer_count += 1;
     }
 
-    if (phase != .qkv or layer_count == 0) {
-        traceRuntimeFrameMetadataDeclined("final_phase", layer_count, pending_qkv, pending_attention, pending_ffn, null);
+    if (layer_count == 0) {
+        traceRuntimeFrameMetadataDeclined("final_phase", layer_count, null, null, .{ .none = {} }, null);
         return null;
     }
     return .{
@@ -4192,78 +4784,15 @@ fn runtimeFrameMetadataFromPlan(graph: *const Graph, plan: RuntimeRegionPlan) ?R
     };
 }
 
-fn analyzeRuntimeFrameEligibility(plan: RuntimeRegionPlan) RuntimeFrameEligibility {
-    if (plan.region_count == 0) return .{ .reason = .no_regions };
-
-    var phase: enum { qkv, attention, ffn, ple } = .qkv;
-    var layer_shape: ?RuntimeFrameLayerShape = null;
-    var frame_rows: usize = 0;
-    var layers: usize = 0;
-
-    for (plan.regions_by_pos) |region| {
-        switch (region) {
-            .none, .raw_linear_dot, .raw_linear_pair, .raw_linear_bias, .raw_linear_bias_pair, .lora_linear, .deberta_ffn_forward, .deberta_encoder_lora_layer, .lora_backward, .ffn_gelu_backward => continue,
-            .deberta_attention => {
-                if (phase != .attention) return .{ .layers = layers, .reason = .non_layer_order };
-                phase = .ffn;
-            },
-            .q_linear, .linear_qkv, .grouped_linear_qkv_slice, .rms_norm_grouped_linear_qkv_slice, .lora_linear_qkv => {
-                if (phase != .qkv) return .{ .layers = layers, .reason = .non_layer_order };
-                layer_shape = runtimeFrameLayerShapeFromQkv(region) orelse return .{ .layers = layers, .reason = .non_layer_order };
-                phase = .attention;
-            },
-            .attention_output_residual => |pattern| {
-                if (phase == .qkv) return .{ .layers = layers, .reason = .missing_qkv };
-                if (phase != .attention) return .{ .layers = layers, .reason = .non_layer_order };
-                const attention_shape = runtimeFrameLayerShapeFromAttention(pattern);
-                if (layer_shape) |shape| {
-                    if (!runtimeFrameShapesMatch(shape, attention_shape)) return .{ .layers = layers, .reason = .shape_mismatch };
-                } else {
-                    return .{ .layers = layers, .reason = .missing_qkv };
-                }
-                layer_shape = attention_shape;
-                phase = .ffn;
-            },
-            .rms_norm_gated_ffn_residual, .gated_ffn_residual => {
-                if (phase == .qkv) return .{ .layers = layers, .reason = .missing_qkv };
-                if (phase == .attention) return .{ .layers = layers, .reason = .missing_attention };
-                if (phase == .ple) return .{ .layers = layers, .reason = .non_layer_order };
-                const ffn_shape = runtimeFrameLayerShapeFromFfn(region) orelse return .{ .layers = layers, .reason = .non_layer_order };
-                if (layer_shape) |shape| {
-                    if (!runtimeFrameShapesMatch(shape, ffn_shape)) return .{ .layers = layers, .reason = .shape_mismatch };
-                } else {
-                    return .{ .layers = layers, .reason = .missing_attention };
-                }
-                phase = .ple;
-            },
-            .ple_residual => |pattern| {
-                if (phase == .qkv) return .{ .layers = layers, .reason = .missing_qkv };
-                if (phase == .attention) return .{ .layers = layers, .reason = .missing_attention };
-                if (phase == .ffn) return .{ .layers = layers, .reason = .missing_ffn };
-                const ple_shape = runtimeFrameLayerShapeFromPle(pattern);
-                if (layer_shape) |shape| {
-                    if (!runtimeFrameShapesMatch(shape, ple_shape)) return .{ .layers = layers, .reason = .shape_mismatch };
-                } else {
-                    return .{ .layers = layers, .reason = .missing_attention };
-                }
-                if (frame_rows == 0) frame_rows = ple_shape.rows;
-                layers += 1;
-                layer_shape = null;
-                phase = .qkv;
-            },
-        }
+fn analyzeRuntimeFrameEligibility(graph: ?*const Graph, plan: RuntimeRegionPlan) RuntimeFrameEligibility {
+    const collection = collectRuntimeFrameLayers(graph, plan);
+    traceRuntimeFrameOrder(graph, plan, collection);
+    if (collection.reason != .none) return .{ .layers = collection.completed_layers, .reason = collection.reason };
+    const g = graph orelse return .{ .layers = collection.completed_layers, .reason = .missing_model_metadata };
+    if (runtimeFrameMetadataFromPlan(g, plan) == null) {
+        return .{ .layers = collection.completed_layers, .reason = .missing_model_metadata };
     }
-
-    if (layers == 0 and phase == .qkv) return .{ .reason = .no_regions };
-    if (phase == .attention) return .{ .layers = layers, .reason = .missing_attention };
-    if (phase == .ffn) return .{ .layers = layers, .reason = .missing_ffn };
-    if (phase == .ple) return .{ .layers = layers, .reason = .missing_ple };
-    if (frame_rows <= 1) return .{ .layers = layers, .reason = .single_row };
-
-    // The current graph plan proves layer structure, but not yet the model
-    // metadata needed by the whole-frame decoder runtime: head layout, RoPE/KV
-    // policy, PLE vectors, and stable per-layer slot numbering.
-    return .{ .layers = layers, .reason = .missing_model_metadata };
+    return .{ .layers = collection.completed_layers, .reason = .none };
 }
 
 fn recordRuntimeFrameEligibilityStats(stats: *PartitionExecutor.ExecutionStats, eligibility: RuntimeFrameEligibility) void {
@@ -4704,6 +5233,8 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .deberta_ffn_forward => 2,
         .deberta_encoder_lora_layer => 2,
         .lora_backward => 0,
+        .low_rank_lora_backward => 0,
+        .rank_adapter_backward => 0,
         .ffn_gelu_backward => 0,
         .q_linear => 1,
         .linear_qkv, .grouped_linear_qkv_slice => 3,
@@ -5076,7 +5607,7 @@ fn prepareDebertaFfnForwardRegion(
         pattern.second_weight_id,
         pattern.second_bias_id,
         pattern.intermediate_size,
-        pattern.hidden_size,
+        pattern.output_size,
         stats,
     )) orelse return null;
     return .{ .first_slot = first_slot, .second_slot = second_slot };
@@ -5140,6 +5671,8 @@ fn prepareRuntimeRegion(
             .deberta_encoder_lora_layer = (try prepareDebertaEncoderLoraLayerRegion(graph, cb, values, value_device, device_id, pattern, stats)) orelse return null,
         },
         .lora_backward => .{ .lora_backward = {} },
+        .low_rank_lora_backward => .{ .low_rank_lora_backward = {} },
+        .rank_adapter_backward => .{ .rank_adapter_backward = {} },
         .ffn_gelu_backward => .{ .ffn_gelu_backward = {} },
         .q_linear => |pattern| .{
             .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
@@ -5314,6 +5847,26 @@ fn tryExecutePlannedRuntimeRegion(
             skipped_nodes,
         ),
         .lora_backward => |pattern| executeLoraBackwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
+        ),
+        .low_rank_lora_backward => |pattern| executeLowRankLoraBackwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
+        ),
+        .rank_adapter_backward => |pattern| executeRankAdapterBackwardPattern(
             graph,
             cb,
             values,
@@ -6833,11 +7386,15 @@ const DebertaFfnForwardPattern = struct {
     first_bias_id: NodeId,
     second_weight_id: NodeId,
     second_bias_id: NodeId,
+    activation_aux_id: NodeId = null_node,
     first_lora: ?LoraLinearPattern = null,
     second_lora: ?LoraLinearPattern = null,
     rows: usize,
     hidden_size: usize,
     intermediate_size: usize,
+    output_size: usize,
+    activation: ops_mod.DecoderRuntimeActivationKind = .gelu_exact,
+    is_head_mlp: bool = false,
 };
 
 const DebertaEncoderLoraLayerPattern = struct {
@@ -6879,6 +7436,39 @@ const LoraBackwardPattern = struct {
     rank: usize,
 };
 
+const LowRankLoraBackwardPattern = struct {
+    d_after_a_id: NodeId,
+    grad_b_dot_id: NodeId,
+    after_a_transpose_id: NodeId,
+    b_transpose_id: NodeId,
+    after_a_id: NodeId,
+    lora_b_id: NodeId,
+    output_grad_id: NodeId,
+    rows: usize,
+    out_dim: usize,
+    rank: usize,
+};
+
+const RankAdapterBackwardPattern = struct {
+    d_after_a_id: NodeId,
+    grad_a_dot_id: NodeId,
+    grad_a_id: NodeId,
+    grad_b_dot_id: NodeId,
+    grad_b_id: NodeId,
+    input_transpose_id: NodeId,
+    after_a_transpose_id: NodeId,
+    rhs_transpose_id: NodeId,
+    input_id: NodeId,
+    after_a_id: NodeId,
+    rhs_source_id: NodeId,
+    rhs_uses_transpose_value: bool,
+    output_grad_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    rank: usize,
+};
+
 const FfnGeluBackwardPattern = struct {
     first_dot_id: NodeId,
     second_branch_dot_id: NodeId,
@@ -6888,6 +7478,7 @@ const FfnGeluBackwardPattern = struct {
     rows: usize,
     hidden_size: usize,
     intermediate_size: usize,
+    exact: bool = false,
 };
 
 const RuntimeDot2DInputs = struct {
@@ -7209,10 +7800,10 @@ fn executeDebertaFfnForwardPattern(
 
     const gelu = (try cb.decoderRuntimeApplyActivation(&.{
         .input = first,
-        .kind = .gelu_exact,
+        .kind = pattern.activation,
         .dim = pattern.intermediate_size,
     })) orelse {
-        traceDebertaFfnForwardExecutionDecline("gelu_exact", pattern);
+        traceDebertaFfnForwardExecutionDecline("activation", pattern);
         return false;
     };
     errdefer cb.free(gelu);
@@ -7235,7 +7826,7 @@ fn executeDebertaFfnForwardPattern(
         prepared.second_slot,
         pattern.rows,
         pattern.intermediate_size,
-        pattern.hidden_size,
+        pattern.output_size,
     )) orelse {
         traceDebertaFfnForwardExecutionDecline("second_linear", pattern);
         return false;
@@ -7244,15 +7835,19 @@ fn executeDebertaFfnForwardPattern(
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 3);
-        s.metal_deberta_ffn_forward_regions += 1;
+        if (pattern.is_head_mlp) {
+            s.metal_head_mlp_forward_regions += 1;
+        } else {
+            s.metal_deberta_ffn_forward_regions += 1;
+        }
         s.fused_graph_pattern_dispatches += 1;
         s.fused_graph_nodes_elided += debertaFfnForwardElidedNodeCount(pattern);
         recordGemmaRuntimeResidency(s, graph, pattern.output_add_id, isMetalResidentOrQuantizedDescriptor(cb, output));
     }
     if (traceMetalGraphFusionsEnabled()) {
         std.debug.print(
-            "metal_graph_fusion_trace: deberta_ffn_forward_region executed first_dot={d} first_add={d} gelu={d} output_dot={d} output_add={d} rows={d} hidden={d} intermediate={d}\n",
-            .{ pattern.first_dot_id, pattern.first_add_id, pattern.gelu_id, pattern.output_dot_id, pattern.output_add_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size },
+            "metal_graph_fusion_trace: deberta_ffn_forward_region executed first_dot={d} first_add={d} activation={d} output_dot={d} output_add={d} rows={d} hidden={d} intermediate={d} output={d} activation_kind={s} head={}\n",
+            .{ pattern.first_dot_id, pattern.first_add_id, pattern.gelu_id, pattern.output_dot_id, pattern.output_add_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size, pattern.output_size, @tagName(pattern.activation), pattern.is_head_mlp },
         );
     }
     return true;
@@ -7447,6 +8042,7 @@ fn traceDebertaFfnForwardLinearDecline(
 
 fn debertaFfnForwardElidedNodeCount(pattern: DebertaFfnForwardPattern) u64 {
     var count: u64 = 5;
+    if (pattern.activation_aux_id != null_node) count += 1;
     if (pattern.first_lora != null) count += 4;
     if (pattern.second_lora != null) count += 4;
     return count;
@@ -7569,6 +8165,161 @@ fn executeLoraBackwardPattern(
     return true;
 }
 
+fn executeLowRankLoraBackwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: LowRankLoraBackwardPattern,
+    skipped_nodes: []bool,
+) !bool {
+    const after_a = valueFor(values, pattern.after_a_id) orelse return false;
+    const lora_b = valueFor(values, pattern.lora_b_id) orelse return false;
+    const output_grad = valueFor(values, pattern.output_grad_id) orelse return false;
+    const fused = (try cb.loraLinearBackwardB(&.{
+        .after_a = after_a,
+        .lora_b = lora_b,
+        .output_grad = output_grad,
+        .rows = pattern.rows,
+        .rank = pattern.rank,
+        .out_dim = pattern.out_dim,
+        .scale = 1.0,
+    })) orelse return false;
+
+    values[@intCast(pattern.d_after_a_id)] = fused.grad_after_a;
+    value_device[@intCast(pattern.d_after_a_id)] = device_id;
+    values[@intCast(pattern.grad_b_dot_id)] = fused.grad_b_transposed;
+    value_device[@intCast(pattern.grad_b_dot_id)] = device_id;
+    markLowRankLoraBackwardSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 2);
+        s.metal_low_rank_lora_backward_regions += 1;
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 2;
+        recordGemmaRuntimeResidency(s, graph, pattern.d_after_a_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_after_a));
+        recordGemmaRuntimeResidency(s, graph, pattern.grad_b_dot_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_b_transposed));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: low_rank_lora_backward_region executed d_after_a={d} grad_b_t={d} after_a={d} lora_b={d} rows={d} rank={d} out={d}\n",
+            .{ pattern.d_after_a_id, pattern.grad_b_dot_id, pattern.after_a_id, pattern.lora_b_id, pattern.rows, pattern.rank, pattern.out_dim },
+        );
+    }
+    return true;
+}
+
+fn executeRankAdapterBackwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: RankAdapterBackwardPattern,
+    skipped_nodes: []bool,
+) !bool {
+    const input = valueFor(values, pattern.input_id) orelse {
+        traceRankAdapterBackwardExecutionDecline("missing_input", pattern);
+        return false;
+    };
+    const after_a = valueFor(values, pattern.after_a_id) orelse {
+        traceRankAdapterBackwardExecutionDecline("missing_after_a", pattern);
+        return false;
+    };
+    const rhs_source = if (pattern.rhs_uses_transpose_value)
+        (try rankAdapterBackwardTransposeValue(graph, cb, values, value_device, device_id, pattern)) orelse {
+            traceRankAdapterBackwardExecutionDecline("missing_rhs_transpose", pattern);
+            return false;
+        }
+    else
+        valueFor(values, pattern.rhs_source_id) orelse {
+            traceRankAdapterBackwardExecutionDecline("missing_rhs_source", pattern);
+            return false;
+        };
+    const output_grad = valueFor(values, pattern.output_grad_id) orelse {
+        traceRankAdapterBackwardExecutionDecline("missing_output_grad", pattern);
+        return false;
+    };
+    const fused = (try cb.loraLinearBackward(&.{
+        .input = input,
+        .after_a = after_a,
+        .lora_b = rhs_source,
+        .output_grad = output_grad,
+        .rows = pattern.rows,
+        .in_dim = pattern.in_dim,
+        .rank = pattern.rank,
+        .out_dim = pattern.out_dim,
+        .scale = 1.0,
+    })) orelse {
+        traceRankAdapterBackwardExecutionDecline("backend_miss", pattern);
+        return false;
+    };
+
+    values[@intCast(pattern.d_after_a_id)] = fused.grad_after_a;
+    value_device[@intCast(pattern.d_after_a_id)] = device_id;
+    values[@intCast(pattern.grad_a_id)] = fused.grad_a;
+    value_device[@intCast(pattern.grad_a_id)] = device_id;
+    values[@intCast(pattern.grad_b_id)] = fused.grad_b;
+    value_device[@intCast(pattern.grad_b_id)] = device_id;
+    markRankAdapterBackwardSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 5);
+        s.metal_rank_adapter_backward_regions += 1;
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 4;
+        recordGemmaRuntimeResidency(s, graph, pattern.grad_a_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_a));
+        recordGemmaRuntimeResidency(s, graph, pattern.grad_b_id, isMetalResidentOrQuantizedDescriptor(cb, fused.grad_b));
+    }
+    if (traceMetalGraphFusionsEnabled() or traceRankAdapterBackwardMatchingEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: rank_adapter_backward_region executed d_after_a={d} grad_a={d} grad_b={d} input={d} after_a={d} rhs_source={d} rhs_uses_transpose={} rows={d} in={d} rank={d} out={d}\n",
+            .{ pattern.d_after_a_id, pattern.grad_a_id, pattern.grad_b_id, pattern.input_id, pattern.after_a_id, pattern.rhs_source_id, pattern.rhs_uses_transpose_value, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+        );
+    }
+    return true;
+}
+
+fn rankAdapterBackwardTransposeValue(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    pattern: RankAdapterBackwardPattern,
+) !?CT {
+    if (valueFor(values, pattern.rhs_transpose_id)) |value| return value;
+    const transpose_node = graph.node(pattern.rhs_transpose_id);
+    const attrs = switch (transpose_node.op) {
+        .transpose => |transpose_attrs| transpose_attrs,
+        else => return null,
+    };
+    if (transpose_node.num_inputs < 1 or transpose_node.inputs[0] != pattern.rhs_source_id) return null;
+    const input = valueFor(values, pattern.rhs_source_id) orelse return null;
+    var in_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+    const in_shape = try fillShapeDims(graph.node(pattern.rhs_source_id).output_shape, &in_shape_buf);
+    var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
+    const perm = transpose_utils.effectivePerm(attrs, graph.node(pattern.rhs_source_id).output_shape.rank(), &perm_buf);
+    const value = cb.primTranspose(input, perm, in_shape) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    values[@intCast(pattern.rhs_transpose_id)] = value;
+    value_device[@intCast(pattern.rhs_transpose_id)] = device_id;
+    return value;
+}
+
+fn traceRankAdapterBackwardExecutionDecline(reason: []const u8, pattern: RankAdapterBackwardPattern) void {
+    if (!traceRankAdapterBackwardMatchingEnabled()) return;
+    std.debug.print(
+        "rank_adapter_backward_match: execution_declined reason={s} d_after_a={d} grad_a={d} grad_b={d} input={d} after_a={d} rhs_source={d} rhs_uses_transpose={} rows={d} in={d} rank={d} out={d}\n",
+        .{ reason, pattern.d_after_a_id, pattern.grad_a_id, pattern.grad_b_id, pattern.input_id, pattern.after_a_id, pattern.rhs_source_id, pattern.rhs_uses_transpose_value, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+    );
+}
+
 fn executeFfnGeluBackwardPattern(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -7622,7 +8373,7 @@ fn executeFfnGeluBackwardPattern(
     value_device[@intCast(pattern.upstream_add_id)] = device_id;
 
     const gelu_node = graph.node(pattern.gelu_backward_id);
-    const gelu = (try executeRuntimeGeluBackward(cb, values, gelu_node.getInputs(), gelu_node.output_shape)) orelse {
+    const gelu = (try executeRuntimeGeluBackward(cb, values, gelu_node.getInputs(), gelu_node.output_shape, pattern.exact)) orelse {
         values[@intCast(pattern.upstream_add_id)] = null;
         values[@intCast(pattern.second_branch_dot_id)] = null;
         values[@intCast(pattern.first_dot_id)] = null;
@@ -7757,6 +8508,7 @@ fn executeFfnGeluBackwardOutputPattern(
         .intermediate_size = pattern.intermediate_size,
         .first_k = first.k,
         .second_k = second_branch.k,
+        .exact = pattern.exact,
     }) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
@@ -7844,7 +8596,13 @@ fn executeFfnGeluBackwardChainPattern(
     pattern: FfnGeluBackwardPattern,
     skipped_nodes: []bool,
 ) !bool {
-    if (!platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FFN_GELU_BACKWARD_CHAIN", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FFN_GELU_BACKWARD_CHAIN", false)) return false;
+    if (!platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FFN_GELU_BACKWARD_CHAIN", false) and
+        !(platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
+            !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)))
+    {
+        return false;
+    }
 
     const first_dot_node = graph.node(pattern.first_dot_id);
     const first_attrs = switch (first_dot_node.op) {
@@ -7886,6 +8644,7 @@ fn executeFfnGeluBackwardChainPattern(
         .intermediate_size = pattern.intermediate_size,
         .first_k = first.k,
         .second_k = second_branch.k,
+        .exact = pattern.exact,
     }) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
@@ -8106,50 +8865,101 @@ fn matchDecomposedLayerNormFromInput(
     if (input_shape.rank() != 2) return traceDecomposedLayerNormDecline("input_rank", producer_id, null);
     const hidden_size = shapeDimUsize(input_shape, 1) orelse return traceDecomposedLayerNormDecline("hidden_dim", producer_id, null);
 
-    const mean_id = singleUnaryConsumerByTag(graph, producer_id, reachable, skipped_nodes, .reduce_mean) orelse return traceDecomposedLayerNormDecline("mean", producer_id, null);
-    const mean_broadcast_id = singleUnaryConsumerByTag(graph, mean_id, reachable, skipped_nodes, .broadcast_in_dim) orelse return traceDecomposedLayerNormDecline("mean_broadcast", producer_id, mean_id);
-    if (!shapesEqual(graph.node(mean_broadcast_id).output_shape, input_shape)) return traceDecomposedLayerNormDecline("mean_broadcast_shape", producer_id, mean_broadcast_id);
+    var saw_mean = false;
+    var saw_mean_broadcast = false;
+    var saw_centered = false;
+    var saw_square = false;
+    var saw_variance = false;
+    var saw_variance_eps = false;
+    var saw_norm_scale = false;
+    var saw_normalized = false;
+    var saw_param_shape_mismatch = false;
 
-    const centered_id = binaryConsumerForPair(graph, producer_id, mean_broadcast_id, reachable, skipped_nodes, .sub) orelse return traceDecomposedLayerNormDecline("centered", producer_id, mean_broadcast_id);
-    const square_id = binaryConsumerForPair(graph, centered_id, centered_id, reachable, skipped_nodes, .mul) orelse return traceDecomposedLayerNormDecline("square", producer_id, centered_id);
-    const variance_id = singleUnaryConsumerByTag(graph, square_id, reachable, skipped_nodes, .reduce_mean) orelse return traceDecomposedLayerNormDecline("variance", producer_id, square_id);
-    const variance_eps_id = addConsumerWithScalar(graph, variance_id, reachable, skipped_nodes) orelse return traceDecomposedLayerNormDecline("variance_eps", producer_id, variance_id);
-    const eps = scalarOtherInputF32(graph, variance_eps_id, variance_id) orelse return traceDecomposedLayerNormDecline("eps", producer_id, variance_eps_id);
-    const norm_scale = matchLayerNormScale(graph, variance_eps_id, input_shape, reachable, skipped_nodes) orelse {
-        traceDecomposedLayerNormConsumers(graph, variance_eps_id, reachable, skipped_nodes);
-        return traceDecomposedLayerNormDecline("norm_scale", producer_id, variance_eps_id);
-    };
-    const normalized = normalizedLayerNormOutputCandidate(graph, centered_id, norm_scale.broadcast_id, norm_scale.normalize_op, reachable, skipped_nodes) orelse return traceDecomposedLayerNormDecline("normalized_output", producer_id, norm_scale.broadcast_id);
-    const normalized_id = normalized.normalized_id;
-    const scaled = normalized.scaled;
-    const output = normalized.output;
+    var mean_id: NodeId = 0;
+    while (mean_id < graph.nodeCount()) : (mean_id += 1) {
+        if (!isUnaryConsumerByTag(graph, mean_id, producer_id, reachable, skipped_nodes, .reduce_mean)) continue;
+        saw_mean = true;
 
-    const weight_shape = graph.node(scaled.param_id).output_shape;
-    const bias_shape = graph.node(output.param_id).output_shape;
-    if (weight_shape.rank() != 1 or bias_shape.rank() != 1) return traceDecomposedLayerNormDecline("param_rank", producer_id, output.consumer_id);
-    if (shapeDimUsize(weight_shape, 0) != hidden_size or shapeDimUsize(bias_shape, 0) != hidden_size) return traceDecomposedLayerNormDecline("param_dim", producer_id, output.consumer_id);
+        var mean_broadcast_id: NodeId = 0;
+        while (mean_broadcast_id < graph.nodeCount()) : (mean_broadcast_id += 1) {
+            if (!isUnaryConsumerByTag(graph, mean_broadcast_id, mean_id, reachable, skipped_nodes, .broadcast_in_dim)) continue;
+            if (!shapesEqual(graph.node(mean_broadcast_id).output_shape, input_shape)) continue;
+            saw_mean_broadcast = true;
 
-    var internal_nodes = [_]NodeId{null_node} ** 16;
-    const internal_count: usize = 9;
-    internal_nodes[0] = mean_id;
-    internal_nodes[1] = mean_broadcast_id;
-    internal_nodes[2] = centered_id;
-    internal_nodes[3] = square_id;
-    internal_nodes[4] = variance_id;
-    internal_nodes[5] = variance_eps_id;
-    internal_nodes[6] = norm_scale.scale_id;
-    internal_nodes[7] = norm_scale.broadcast_id;
-    internal_nodes[8] = normalized_id;
+            var centered_id: NodeId = 0;
+            while (centered_id < graph.nodeCount()) : (centered_id += 1) {
+                if (!isBinaryConsumerForPair(graph, centered_id, producer_id, mean_broadcast_id, reachable, skipped_nodes, .sub)) continue;
+                saw_centered = true;
 
-    return .{
-        .output_id = output.consumer_id,
-        .weight_id = scaled.param_id,
-        .bias_id = output.param_id,
-        .dim = hidden_size,
-        .eps = eps,
-        .internal_node_ids = internal_nodes,
-        .internal_node_count = internal_count,
-    };
+                var square_id: NodeId = 0;
+                while (square_id < graph.nodeCount()) : (square_id += 1) {
+                    if (!isBinaryConsumerForPair(graph, square_id, centered_id, centered_id, reachable, skipped_nodes, .mul)) continue;
+                    saw_square = true;
+
+                    var variance_id: NodeId = 0;
+                    while (variance_id < graph.nodeCount()) : (variance_id += 1) {
+                        if (!isUnaryConsumerByTag(graph, variance_id, square_id, reachable, skipped_nodes, .reduce_mean)) continue;
+                        saw_variance = true;
+
+                        var variance_eps_id: NodeId = 0;
+                        while (variance_eps_id < graph.nodeCount()) : (variance_eps_id += 1) {
+                            if (!isAddConsumerWithScalar(graph, variance_eps_id, variance_id, reachable, skipped_nodes)) continue;
+                            saw_variance_eps = true;
+                            const eps = scalarOtherInputF32(graph, variance_eps_id, variance_id) orelse continue;
+                            const norm_scale = matchLayerNormScale(graph, variance_eps_id, input_shape, reachable, skipped_nodes) orelse continue;
+                            saw_norm_scale = true;
+                            const normalized = normalizedLayerNormOutputCandidate(graph, centered_id, norm_scale.broadcast_id, norm_scale.normalize_op, reachable, skipped_nodes) orelse continue;
+                            saw_normalized = true;
+
+                            const weight_shape = graph.node(normalized.scaled.param_id).output_shape;
+                            const bias_shape = graph.node(normalized.output.param_id).output_shape;
+                            if (weight_shape.rank() != 1 or bias_shape.rank() != 1) {
+                                saw_param_shape_mismatch = true;
+                                continue;
+                            }
+                            if (shapeDimUsize(weight_shape, 0) != hidden_size or shapeDimUsize(bias_shape, 0) != hidden_size) {
+                                saw_param_shape_mismatch = true;
+                                continue;
+                            }
+
+                            var internal_nodes = [_]NodeId{null_node} ** 16;
+                            const internal_count: usize = 9;
+                            internal_nodes[0] = mean_id;
+                            internal_nodes[1] = mean_broadcast_id;
+                            internal_nodes[2] = centered_id;
+                            internal_nodes[3] = square_id;
+                            internal_nodes[4] = variance_id;
+                            internal_nodes[5] = variance_eps_id;
+                            internal_nodes[6] = norm_scale.scale_id;
+                            internal_nodes[7] = norm_scale.broadcast_id;
+                            internal_nodes[8] = normalized.normalized_id;
+
+                            return .{
+                                .output_id = normalized.output.consumer_id,
+                                .weight_id = normalized.scaled.param_id,
+                                .bias_id = normalized.output.param_id,
+                                .dim = hidden_size,
+                                .eps = eps,
+                                .internal_node_ids = internal_nodes,
+                                .internal_node_count = internal_count,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!saw_mean) return traceDecomposedLayerNormDecline("mean", producer_id, null);
+    if (!saw_mean_broadcast) return traceDecomposedLayerNormDecline("mean_broadcast", producer_id, null);
+    if (!saw_centered) return traceDecomposedLayerNormDecline("centered", producer_id, null);
+    if (!saw_square) return traceDecomposedLayerNormDecline("square", producer_id, null);
+    if (!saw_variance) return traceDecomposedLayerNormDecline("variance", producer_id, null);
+    if (!saw_variance_eps) return traceDecomposedLayerNormDecline("variance_eps", producer_id, null);
+    if (!saw_norm_scale) return traceDecomposedLayerNormDecline("norm_scale", producer_id, null);
+    if (!saw_normalized) return traceDecomposedLayerNormDecline("normalized_output", producer_id, null);
+    if (saw_param_shape_mismatch) return traceDecomposedLayerNormDecline("param_dim", producer_id, null);
+    return traceDecomposedLayerNormDecline("unknown", producer_id, null);
 }
 
 fn traceDecomposedLayerNormDecline(reason: []const u8, producer_id: NodeId, detail_id: ?NodeId) ?LayerNormForwardPattern {
@@ -8222,23 +9032,33 @@ fn matchLayerNormScale(
     reachable: []const bool,
     skipped_nodes: []const bool,
 ) ?LayerNormScalePattern {
-    if (firstUnaryConsumerByTag(graph, variance_eps_id, reachable, skipped_nodes, .rsqrt)) |rsqrt_id| {
-        const broadcast_id = singleUnaryConsumerByTag(graph, rsqrt_id, reachable, skipped_nodes, .broadcast_in_dim) orelse return null;
-        if (!shapesEqual(graph.node(broadcast_id).output_shape, input_shape)) return null;
-        return .{
-            .scale_id = rsqrt_id,
-            .broadcast_id = broadcast_id,
-            .normalize_op = .mul,
-        };
+    var rsqrt_id: NodeId = 0;
+    while (rsqrt_id < graph.nodeCount()) : (rsqrt_id += 1) {
+        if (!isUnaryConsumerByTag(graph, rsqrt_id, variance_eps_id, reachable, skipped_nodes, .rsqrt)) continue;
+        var broadcast_id: NodeId = 0;
+        while (broadcast_id < graph.nodeCount()) : (broadcast_id += 1) {
+            if (!isUnaryConsumerByTag(graph, broadcast_id, rsqrt_id, reachable, skipped_nodes, .broadcast_in_dim)) continue;
+            if (!shapesEqual(graph.node(broadcast_id).output_shape, input_shape)) continue;
+            return .{
+                .scale_id = rsqrt_id,
+                .broadcast_id = broadcast_id,
+                .normalize_op = .mul,
+            };
+        }
     }
-    if (firstUnaryConsumerByTag(graph, variance_eps_id, reachable, skipped_nodes, .sqrt)) |sqrt_id| {
-        const broadcast_id = singleUnaryConsumerByTag(graph, sqrt_id, reachable, skipped_nodes, .broadcast_in_dim) orelse return null;
-        if (!shapesEqual(graph.node(broadcast_id).output_shape, input_shape)) return null;
-        return .{
-            .scale_id = sqrt_id,
-            .broadcast_id = broadcast_id,
-            .normalize_op = .div,
-        };
+    var sqrt_id: NodeId = 0;
+    while (sqrt_id < graph.nodeCount()) : (sqrt_id += 1) {
+        if (!isUnaryConsumerByTag(graph, sqrt_id, variance_eps_id, reachable, skipped_nodes, .sqrt)) continue;
+        var broadcast_id: NodeId = 0;
+        while (broadcast_id < graph.nodeCount()) : (broadcast_id += 1) {
+            if (!isUnaryConsumerByTag(graph, broadcast_id, sqrt_id, reachable, skipped_nodes, .broadcast_in_dim)) continue;
+            if (!shapesEqual(graph.node(broadcast_id).output_shape, input_shape)) continue;
+            return .{
+                .scale_id = sqrt_id,
+                .broadcast_id = broadcast_id,
+                .normalize_op = .div,
+            };
+        }
     }
     return null;
 }
@@ -8261,6 +9081,19 @@ fn firstUnaryConsumerByTag(
     return null;
 }
 
+fn isUnaryConsumerByTag(
+    graph: *const Graph,
+    node_id: NodeId,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    tag: OpTag,
+) bool {
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) return false;
+    const node = graph.node(node_id);
+    return std.meta.activeTag(node.op) == tag and node.num_inputs >= 1 and node.inputs[0] == producer_id;
+}
+
 fn normalizedLayerNormOutputCandidate(
     graph: *const Graph,
     centered_id: NodeId,
@@ -8280,12 +9113,12 @@ fn normalizedLayerNormOutputCandidate(
         if (!exact and !commuted) continue;
         const scaled = binaryConsumerWithDebertaLayerNormParam(graph, node_id, reachable, skipped_nodes, .mul, "output.LayerNorm", ".weight") orelse continue;
         const output = binaryConsumerWithDebertaLayerNormParam(graph, scaled.consumer_id, reachable, skipped_nodes, .add, "output.LayerNorm", ".bias") orelse continue;
-        if (found != null) return null;
         found = .{
             .normalized_id = node_id,
             .scaled = scaled,
             .output = output,
         };
+        break;
     }
     return found;
 }
@@ -8333,6 +9166,23 @@ fn binaryConsumerForPair(
     return found;
 }
 
+fn isBinaryConsumerForPair(
+    graph: *const Graph,
+    node_id: NodeId,
+    lhs_id: NodeId,
+    rhs_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    tag: OpTag,
+) bool {
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) return false;
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) != tag or node.num_inputs < 2) return false;
+    const exact = node.inputs[0] == lhs_id and node.inputs[1] == rhs_id;
+    const commuted = tag != .sub and node.inputs[0] == rhs_id and node.inputs[1] == lhs_id;
+    return exact or commuted;
+}
+
 fn addConsumerWithScalar(
     graph: *const Graph,
     producer_id: NodeId,
@@ -8354,6 +9204,21 @@ fn addConsumerWithScalar(
         found = node_id;
     }
     return found;
+}
+
+fn isAddConsumerWithScalar(
+    graph: *const Graph,
+    node_id: NodeId,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) bool {
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) return false;
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) != .add or node.num_inputs < 2) return false;
+    if (node.inputs[0] == producer_id) return scalarConstantF32(graph, node.inputs[1]) != null;
+    if (node.inputs[1] == producer_id) return scalarConstantF32(graph, node.inputs[0]) != null;
+    return false;
 }
 
 fn scalarOtherInputF32(graph: *const Graph, binary_id: NodeId, producer_id: NodeId) ?f32 {
@@ -8387,8 +9252,8 @@ fn binaryConsumerWithDebertaLayerNormParam(
         else
             continue;
         const source_param_id = debertaLayerNormParamSource(graph, param_id, name_substring, suffix) orelse continue;
-        if (found != null) return null;
         found = .{ .consumer_id = node_id, .param_id = source_param_id };
+        break;
     }
     return found;
 }
@@ -8568,7 +9433,119 @@ fn matchDebertaFfnForwardPattern(
         .rows = first.rows,
         .hidden_size = first.in_dim,
         .intermediate_size = first.out_dim,
+        .output_size = second.out_dim,
     };
+}
+
+fn matchHeadMlpForwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?DebertaFfnForwardPattern {
+    const first = matchDebertaFfnLinearFromBaseDot(graph, node_ids, node_pos, reachable, skipped_nodes) orelse return null;
+    if (first.rows == 0 or first.in_dim == 0 or first.out_dim == 0) return traceDebertaFfnForwardMatchDecline("head_zero_shape", node_ids[node_pos], null, null, null);
+    const first_name = graph.parameterName(graph.node(first.weight_id));
+    if (!isGlinerHeadMlpFirstWeightName(first_name)) return null;
+    traceDebertaFfnForwardMatchCandidate("head_first_linear", first);
+
+    var relu_candidate_count: usize = 0;
+    var matched: ?DebertaFfnForwardPattern = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const relu = matchReluActivationConsumerNode(graph, reachable, skipped_nodes, node_id, first.output_id) orelse continue;
+        relu_candidate_count += 1;
+        const relu_node = graph.node(relu.output_id);
+        if (!relu_node.output_shape.eq(graph.node(first.output_id).output_shape)) {
+            _ = traceDebertaFfnForwardMatchDecline("head_relu_shape", first.dot_id, first.output_id, relu.output_id, null);
+            continue;
+        }
+
+        const output_dot_id = findHeadMlpBaseDotConsumer(graph, relu.output_id, first.rows, reachable, skipped_nodes) orelse {
+            _ = traceDebertaFfnForwardMatchDecline("head_missing_output_dot", first.dot_id, first.output_id, relu.output_id, null);
+            continue;
+        };
+        const output_pos = findNodePos(node_ids, output_dot_id) orelse {
+            _ = traceDebertaFfnForwardMatchDecline("head_missing_output_pos", first.dot_id, first.output_id, relu.output_id, output_dot_id);
+            continue;
+        };
+        const second = matchDebertaFfnLinearFromBaseDot(graph, node_ids, output_pos, reachable, skipped_nodes) orelse {
+            _ = traceDebertaFfnForwardMatchDecline("head_bad_second_linear", first.dot_id, first.output_id, relu.output_id, output_dot_id);
+            continue;
+        };
+        const second_name = graph.parameterName(graph.node(second.weight_id));
+        if (!isGlinerHeadMlpWeightPair(first_name, second_name)) {
+            _ = traceDebertaFfnForwardMatchDecline("head_weight_pair", first.dot_id, first.output_id, relu.output_id, second.dot_id);
+            continue;
+        }
+        if (second.input_id != relu.output_id) {
+            _ = traceDebertaFfnForwardMatchDecline("head_second_input", first.dot_id, first.output_id, relu.output_id, second.input_id);
+            continue;
+        }
+        if (second.rows != first.rows or second.in_dim != first.out_dim) {
+            _ = traceDebertaFfnForwardMatchDecline("head_second_shape", first.dot_id, first.output_id, relu.output_id, second.dot_id);
+            continue;
+        }
+        if (matched != null) return traceDebertaFfnForwardMatchDecline("head_ambiguous_match", first.dot_id, first.output_id, relu.output_id, second.dot_id);
+        traceDebertaFfnForwardMatchCandidate("head_matched", second);
+        matched = .{
+            .first_dot_id = first.dot_id,
+            .first_base_add_id = first.base_add_id,
+            .first_add_id = first.output_id,
+            .gelu_id = relu.output_id,
+            .output_dot_id = second.dot_id,
+            .output_base_add_id = second.base_add_id,
+            .output_add_id = second.output_id,
+            .input_id = first.input_id,
+            .first_weight_id = first.weight_id,
+            .first_bias_id = first.bias_id,
+            .second_weight_id = second.weight_id,
+            .second_bias_id = second.bias_id,
+            .activation_aux_id = relu.aux_id,
+            .first_lora = first.lora,
+            .second_lora = second.lora,
+            .rows = first.rows,
+            .hidden_size = first.in_dim,
+            .intermediate_size = first.out_dim,
+            .output_size = second.out_dim,
+            .activation = .relu,
+            .is_head_mlp = true,
+        };
+    }
+    if (matched) |pattern| return pattern;
+    if (relu_candidate_count == 0) {
+        traceDebertaFfnForwardConsumers(graph, reachable, skipped_nodes, first.output_id, "head_missing_relu");
+        return traceDebertaFfnForwardMatchDecline("head_missing_relu", first.dot_id, first.output_id, null, null);
+    }
+    return traceDebertaFfnForwardMatchDecline("head_no_matching_output", first.dot_id, first.output_id, null, null);
+}
+
+fn isGlinerHeadMlpFirstWeightName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, "classifier.0.weight") or
+        std.mem.endsWith(u8, name, "count_pred.0.weight") or
+        std.mem.endsWith(u8, name, "span_rep.span_rep_layer.project_start.0.weight") or
+        std.mem.endsWith(u8, name, "span_rep.span_rep_layer.project_end.0.weight") or
+        std.mem.endsWith(u8, name, "span_rep.span_rep_layer.out_project.0.weight") or
+        std.mem.endsWith(u8, name, "count_embed.transformer.out_projector.0.weight") or
+        std.mem.endsWith(u8, name, "count_embed.transformer.out_projector.2.weight");
+}
+
+fn isGlinerHeadMlpWeightPair(first_name: []const u8, second_name: []const u8) bool {
+    const pairs = [_]struct { first: []const u8, second: []const u8 }{
+        .{ .first = "classifier.0.weight", .second = "classifier.2.weight" },
+        .{ .first = "count_pred.0.weight", .second = "count_pred.2.weight" },
+        .{ .first = "span_rep.span_rep_layer.project_start.0.weight", .second = "span_rep.span_rep_layer.project_start.3.weight" },
+        .{ .first = "span_rep.span_rep_layer.project_end.0.weight", .second = "span_rep.span_rep_layer.project_end.3.weight" },
+        .{ .first = "span_rep.span_rep_layer.out_project.0.weight", .second = "span_rep.span_rep_layer.out_project.3.weight" },
+        .{ .first = "count_embed.transformer.out_projector.0.weight", .second = "count_embed.transformer.out_projector.2.weight" },
+        .{ .first = "count_embed.transformer.out_projector.2.weight", .second = "count_embed.transformer.out_projector.4.weight" },
+    };
+    for (pairs) |pair| {
+        if (std.mem.endsWith(u8, first_name, pair.first) and std.mem.endsWith(u8, second_name, pair.second)) return true;
+    }
+    return false;
 }
 
 fn traceDebertaFfnForwardMatchDecline(reason: []const u8, dot_id: NodeId, output_id: ?NodeId, gelu_id: ?NodeId, detail_id: ?NodeId) ?DebertaFfnForwardPattern {
@@ -8634,6 +9611,11 @@ const DebertaFfnLinearMatch = struct {
     rows: usize,
     in_dim: usize,
     out_dim: usize,
+};
+
+const ReluActivationConsumerMatch = struct {
+    output_id: NodeId,
+    aux_id: NodeId = null_node,
 };
 
 fn matchDebertaFfnLinearFromBaseDot(
@@ -8836,6 +9818,34 @@ fn findDebertaFfnBaseDotConsumer(
     return found;
 }
 
+fn findHeadMlpBaseDotConsumer(
+    graph: *const Graph,
+    producer_id: NodeId,
+    rows: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?NodeId {
+    var found: ?NodeId = null;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
+        const node = graph.node(node_id);
+        const attrs = switch (node.op) {
+            .dot_general => |dot_attrs| dot_attrs,
+            else => continue,
+        };
+        if (!isLinearDotAttrs(attrs) or node.num_inputs < 2 or node.inputs[0] != producer_id) continue;
+        const shape = node.output_shape;
+        if (shape.rank() != 2) continue;
+        if (shapeDimUsize(shape, 0) != rows) continue;
+        const weight_id = sourceParameterFromSimpleTranspose(graph, node.inputs[1]) orelse continue;
+        if (isLoRAAdapterParameterName(graph.parameterName(graph.node(weight_id)))) continue;
+        if (found != null) return null;
+        found = node_id;
+    }
+    return found;
+}
+
 fn singleExactGeluConsumerForInput(
     graph: *const Graph,
     producer_id: NodeId,
@@ -8856,6 +9866,44 @@ fn singleExactGeluConsumerForInput(
         found = node_id;
     }
     return found;
+}
+
+fn matchReluActivationConsumerNode(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    node_id: NodeId,
+    producer_id: NodeId,
+) ?ReluActivationConsumerMatch {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .fused_relu => {
+            if (node.num_inputs < 1 or node.inputs[0] != producer_id) return null;
+            return .{ .output_id = node_id };
+        },
+        .where_select => {
+            if (node.num_inputs < 3) return null;
+            if (node.inputs[2] != producer_id) return null;
+            const zero = scalarConstantF32(graph, node.inputs[1]) orelse return null;
+            if (zero != 0.0) return null;
+
+            const cmp_id = node.inputs[0];
+            if (cmp_id == null_node or !isReachableUnskippedNode(reachable, skipped_nodes, cmp_id)) return null;
+            const cmp = graph.node(cmp_id);
+            switch (cmp.op) {
+                .less_than => {},
+                else => return null,
+            }
+            if (cmp.num_inputs < 2 or cmp.inputs[0] != producer_id) return null;
+            const threshold = scalarConstantF32(graph, cmp.inputs[1]) orelse return null;
+            if (threshold != 0.0) return null;
+
+            const aux_id = if (hasOnlyExpectedUses(graph, reachable, skipped_nodes, cmp_id, &.{node_id})) cmp_id else null_node;
+            return .{ .output_id = node_id, .aux_id = aux_id };
+        },
+        else => return null,
+    }
 }
 
 fn linearBiasForAdd(graph: *const Graph, add_id: NodeId, producer_id: NodeId, expected_dim: usize) ?NodeId {
@@ -8884,6 +9932,7 @@ fn markDebertaFfnForwardSkipped(skipped: []bool, pattern: DebertaFfnForwardPatte
     markSkipped(skipped, pattern.first_dot_id);
     markSkipped(skipped, pattern.first_base_add_id);
     markSkipped(skipped, pattern.first_add_id);
+    if (pattern.activation_aux_id != null_node) markSkipped(skipped, pattern.activation_aux_id);
     markSkipped(skipped, pattern.gelu_id);
     markSkipped(skipped, pattern.output_dot_id);
     markSkipped(skipped, pattern.output_base_add_id);
@@ -8920,49 +9969,69 @@ fn matchFfnGeluBackwardPattern(
     const intermediate_size = shapeDimUsize(first_shape, 1) orelse return null;
     if (rows <= 1 or intermediate_size < 512) return null;
 
-    const upstream_add_id = singleAddConsumerForInput(graph, first_dot_id, reachable, skipped_nodes) orelse return null;
+    const upstream_add_id = singleAddConsumerForInput(graph, first_dot_id, reachable, skipped_nodes) orelse
+        return declineFfnGeluBackwardMatch(graph, "missing_upstream_add", first_dot_id, null_node);
     const upstream_add = graph.node(upstream_add_id);
-    if (!upstream_add.output_shape.eq(first_shape) or upstream_add.num_inputs < 2) return null;
+    if (!upstream_add.output_shape.eq(first_shape) or upstream_add.num_inputs < 2)
+        return declineFfnGeluBackwardMatch(graph, "bad_upstream_add", first_dot_id, upstream_add_id);
     const second_branch_dot_id = if (upstream_add.inputs[0] == first_dot_id)
         upstream_add.inputs[1]
     else if (upstream_add.inputs[1] == first_dot_id)
         upstream_add.inputs[0]
     else
-        return null;
-    if (second_branch_dot_id == null_node or !isReachableUnskippedNode(reachable, skipped_nodes, second_branch_dot_id)) return null;
+        return declineFfnGeluBackwardMatch(graph, "upstream_add_not_consumer", first_dot_id, upstream_add_id);
+    if (second_branch_dot_id == null_node or !isReachableUnskippedNode(reachable, skipped_nodes, second_branch_dot_id))
+        return declineFfnGeluBackwardMatch(graph, "second_branch_unreachable", first_dot_id, second_branch_dot_id);
     const second_branch_dot = graph.node(second_branch_dot_id);
     const second_branch_attrs = switch (second_branch_dot.op) {
         .dot_general => |attrs| attrs,
-        else => return null,
+        else => return declineFfnGeluBackwardMatch(graph, "second_branch_not_dot", first_dot_id, second_branch_dot_id),
     };
-    if (!isLinearDotAttrs(second_branch_attrs) or !second_branch_dot.output_shape.eq(first_shape)) return null;
+    if (!isLinearDotAttrs(second_branch_attrs) or !second_branch_dot.output_shape.eq(first_shape))
+        return declineFfnGeluBackwardMatch(graph, "bad_second_branch", first_dot_id, second_branch_dot_id);
 
-    const gelu_backward_id = singleFfnGeluBackwardConsumer(graph, upstream_add_id, reachable, skipped_nodes) orelse return null;
+    const gelu_backward_id = singleFfnGeluBackwardConsumer(graph, upstream_add_id, reachable, skipped_nodes) orelse {
+        traceFfnGeluBackwardConsumers(graph, upstream_add_id, reachable, skipped_nodes, "missing_gelu_backward");
+        return declineFfnGeluBackwardMatch(graph, "missing_gelu_backward", first_dot_id, upstream_add_id);
+    };
     const gelu_backward = graph.node(gelu_backward_id);
-    if (!gelu_backward.output_shape.eq(first_shape)) return null;
+    const exact_gelu_backward = switch (gelu_backward.op) {
+        .fused_gelu_exact_backward => true,
+        else => false,
+    };
+    if (!gelu_backward.output_shape.eq(first_shape))
+        return declineFfnGeluBackwardMatch(graph, "bad_gelu_backward_shape", first_dot_id, gelu_backward_id);
 
-    const output_dot_id = singleLinearDotConsumerForInput(graph, gelu_backward_id, reachable, skipped_nodes) orelse return null;
+    const output_dot_id = singleLinearDotConsumerForInput(graph, gelu_backward_id, reachable, skipped_nodes) orelse
+        return declineFfnGeluBackwardMatch(graph, "missing_output_dot", first_dot_id, gelu_backward_id);
     const output_dot = graph.node(output_dot_id);
     const output_attrs = switch (output_dot.op) {
         .dot_general => |attrs| attrs,
-        else => return null,
+        else => return declineFfnGeluBackwardMatch(graph, "output_not_dot", first_dot_id, output_dot_id),
     };
-    if (!isLinearDotAttrs(output_attrs) or output_dot.num_inputs < 2) return null;
-    if (output_dot.inputs[0] != gelu_backward_id) return null;
+    if (!isLinearDotAttrs(output_attrs) or output_dot.num_inputs < 2)
+        return declineFfnGeluBackwardMatch(graph, "bad_output_dot", first_dot_id, output_dot_id);
+    if (output_dot.inputs[0] != gelu_backward_id)
+        return declineFfnGeluBackwardMatch(graph, "output_dot_wrong_lhs", first_dot_id, output_dot_id);
     const output_shape = output_dot.output_shape;
-    if (output_shape.rank() != 2) return null;
-    if ((shapeDimUsize(output_shape, 0) orelse return null) != rows) return null;
-    const hidden_size = shapeDimUsize(output_shape, 1) orelse return null;
-    if (hidden_size == 0 or hidden_size >= intermediate_size) return null;
+    if (output_shape.rank() != 2) return declineFfnGeluBackwardMatch(graph, "bad_output_rank", first_dot_id, output_dot_id);
+    if ((shapeDimUsize(output_shape, 0) orelse return null) != rows)
+        return declineFfnGeluBackwardMatch(graph, "bad_output_rows", first_dot_id, output_dot_id);
+    const hidden_size = shapeDimUsize(output_shape, 1) orelse return declineFfnGeluBackwardMatch(graph, "missing_output_hidden", first_dot_id, output_dot_id);
+    if (hidden_size == 0 or hidden_size >= intermediate_size)
+        return declineFfnGeluBackwardMatch(graph, "bad_output_hidden", first_dot_id, output_dot_id);
 
     const rhs_id = output_dot.inputs[1];
-    if (rhs_id == null_node) return null;
-    if (!linearDotConsumesTranspose(graph, output_dot_id, rhs_id)) return null;
+    if (rhs_id == null_node) return declineFfnGeluBackwardMatch(graph, "missing_output_rhs", first_dot_id, output_dot_id);
+    if (!linearDotConsumesTranspose(graph, output_dot_id, rhs_id))
+        return declineFfnGeluBackwardMatch(graph, "output_rhs_not_transposed_weight", first_dot_id, rhs_id);
     const rhs_source_id = graph.node(rhs_id).inputs[0];
-    if (rhs_source_id == null_node) return null;
+    if (rhs_source_id == null_node) return declineFfnGeluBackwardMatch(graph, "missing_output_rhs_source", first_dot_id, rhs_id);
     const rhs_source_shape = graph.node(rhs_source_id).output_shape;
-    if ((shapeDimUsize(rhs_source_shape, 0) orelse return null) != hidden_size) return null;
-    if ((shapeDimUsize(rhs_source_shape, 1) orelse return null) != intermediate_size) return null;
+    if ((shapeDimUsize(rhs_source_shape, 0) orelse return null) != hidden_size)
+        return declineFfnGeluBackwardMatch(graph, "output_rhs_hidden_mismatch", first_dot_id, rhs_source_id);
+    if ((shapeDimUsize(rhs_source_shape, 1) orelse return null) != intermediate_size)
+        return declineFfnGeluBackwardMatch(graph, "output_rhs_intermediate_mismatch", first_dot_id, rhs_source_id);
 
     return .{
         .first_dot_id = first_dot_id,
@@ -8973,7 +10042,69 @@ fn matchFfnGeluBackwardPattern(
         .rows = rows,
         .hidden_size = hidden_size,
         .intermediate_size = intermediate_size,
+        .exact = exact_gelu_backward,
     };
+}
+
+fn declineFfnGeluBackwardMatch(
+    graph: *const Graph,
+    reason: []const u8,
+    node_id: NodeId,
+    aux_id: NodeId,
+) ?FfnGeluBackwardPattern {
+    if (!traceFfnGeluBackwardMatchingEnabled()) return null;
+    const node = graph.node(node_id);
+    const aux_op = if (aux_id != null_node and aux_id < graph.nodeCount()) @tagName(graph.node(aux_id).op) else "none";
+    const aux_shape = if (aux_id != null_node and aux_id < graph.nodeCount()) graph.node(aux_id).output_shape else Shape.scalar(.f32);
+    std.debug.print(
+        "metal_graph_fusion_trace: ffn_gelu_backward_match declined reason={s} node={d} op={s} shape={} aux={d} aux_op={s} aux_shape={}\n",
+        .{ reason, node_id, @tagName(node.op), node.output_shape, aux_id, aux_op, aux_shape },
+    );
+    return null;
+}
+
+fn traceFfnGeluBackwardConsumers(
+    graph: *const Graph,
+    producer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    reason: []const u8,
+) void {
+    if (!traceFfnGeluBackwardMatchingEnabled()) return;
+    var printed: usize = 0;
+    var node_id: NodeId = 0;
+    while (node_id < graph.nodeCount()) : (node_id += 1) {
+        const node = graph.node(node_id);
+        var consumes = false;
+        for (node.getInputs()) |input_id| {
+            if (input_id == producer_id) {
+                consumes = true;
+                break;
+            }
+        }
+        if (!consumes) continue;
+        if (printed == 0) {
+            std.debug.print("metal_graph_fusion_trace: ffn_gelu_backward_consumers reason={s} producer={d}", .{ reason, producer_id });
+        }
+        std.debug.print(
+            " {d}:{s}:reachable={}:skipped={}:rank={d}:dim0={d}:dim1={d}",
+            .{
+                node_id,
+                @tagName(node.op),
+                isReachableUnskippedNode(reachable, skipped_nodes, node_id),
+                node_id < skipped_nodes.len and skipped_nodes[@intCast(node_id)],
+                node.output_shape.rank(),
+                shapeDimForNodeOr(graph, node_id, 0, -1),
+                shapeDimForNodeOr(graph, node_id, 1, -1),
+            },
+        );
+        printed += 1;
+        if (printed >= 8) break;
+    }
+    if (printed == 0) {
+        std.debug.print("metal_graph_fusion_trace: ffn_gelu_backward_consumers reason={s} producer={d} none", .{ reason, producer_id });
+    }
+    std.debug.print("\n", .{});
 }
 
 fn markFfnGeluBackwardSkipped(skipped: []bool, pattern: FfnGeluBackwardPattern) void {
@@ -9002,7 +10133,7 @@ fn singleFfnGeluBackwardConsumer(
         if (!isReachableUnskippedNode(reachable, skipped_nodes, node_id)) continue;
         const node = graph.node(node_id);
         switch (node.op) {
-            .fused_gelu_backward => {},
+            .fused_gelu_backward, .fused_gelu_exact_backward => {},
             else => continue,
         }
         if (node.num_inputs < 2 or node.inputs[1] != producer_id) continue;
@@ -9116,9 +10247,181 @@ fn matchLoraBackwardPattern(
     };
 }
 
+fn matchLowRankLoraBackwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?LowRankLoraBackwardPattern {
+    const d_after_a_id = node_ids[node_pos];
+    const d_after_a = graph.node(d_after_a_id);
+    const d_after_attrs = switch (d_after_a.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(d_after_attrs) or d_after_a.num_inputs < 2) return null;
+    const output_grad_id = d_after_a.inputs[0];
+    const b_transpose_id = d_after_a.inputs[1];
+    if (output_grad_id == null_node or b_transpose_id == null_node) return null;
+    const lora_b_id = loraBParameterFromBackwardTranspose(graph, b_transpose_id) orelse return null;
+
+    const output_grad_shape = graph.node(output_grad_id).output_shape;
+    const d_after_shape = d_after_a.output_shape;
+    const lora_b_shape = graph.node(lora_b_id).output_shape;
+    if (output_grad_shape.rank() != 2 or d_after_shape.rank() != 2 or lora_b_shape.rank() != 2) return null;
+    const rows = shapeDimUsize(output_grad_shape, 0) orelse return null;
+    const out_dim = shapeDimUsize(output_grad_shape, 1) orelse return null;
+    const rank = shapeDimUsize(d_after_shape, 1) orelse return null;
+    if (rows == 0 or out_dim == 0 or rank == 0 or rank > 64) return null;
+    if (shapeDimUsize(d_after_shape, 0) != rows) return null;
+    if (shapeDimUsize(lora_b_shape, 0) != out_dim or shapeDimUsize(lora_b_shape, 1) != rank) return null;
+
+    const grad_b_match = findLowRankLoraBackwardGradBTransposed(graph, reachable, skipped_nodes, output_grad_id, rows, out_dim, rank) orelse return null;
+    if (!onlyReachableConsumerIs(graph, grad_b_match.after_a_transpose_id, grad_b_match.dot_id, reachable, skipped_nodes)) return null;
+    const after_a = graph.node(grad_b_match.after_a_id);
+    switch (after_a.op) {
+        .dot_general => {},
+        else => return null,
+    }
+
+    return .{
+        .d_after_a_id = d_after_a_id,
+        .grad_b_dot_id = grad_b_match.dot_id,
+        .after_a_transpose_id = grad_b_match.after_a_transpose_id,
+        .b_transpose_id = b_transpose_id,
+        .after_a_id = grad_b_match.after_a_id,
+        .lora_b_id = lora_b_id,
+        .output_grad_id = output_grad_id,
+        .rows = rows,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+}
+
+fn matchRankAdapterBackwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?RankAdapterBackwardPattern {
+    const d_after_a_id = node_ids[node_pos];
+    const d_after_a = graph.node(d_after_a_id);
+    const d_after_attrs = switch (d_after_a.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(d_after_attrs) or d_after_a.num_inputs < 2) return null;
+    const output_grad_id = d_after_a.inputs[0];
+    const rhs_transpose_id = d_after_a.inputs[1];
+    if (output_grad_id == null_node or rhs_transpose_id == null_node) return null;
+    const rhs_source_id = sourceFromSimpleTranspose(graph, rhs_transpose_id) orelse {
+        traceRankAdapterBackwardMatchDecline("rhs_not_simple_transpose", d_after_a_id, null_node, 0, 0, 0, 0);
+        return null;
+    };
+    if (isLoraParameter(graph, rhs_source_id, ".lora_B")) return null;
+
+    const output_grad_shape = graph.node(output_grad_id).output_shape;
+    const d_after_shape = d_after_a.output_shape;
+    const rhs_shape = graph.node(rhs_source_id).output_shape;
+    const rhs_transpose_shape = graph.node(rhs_transpose_id).output_shape;
+    if (output_grad_shape.rank() != 2 or d_after_shape.rank() != 2 or rhs_shape.rank() != 2 or rhs_transpose_shape.rank() != 2) {
+        traceRankAdapterBackwardMatchDecline("rank", d_after_a_id, rhs_source_id, 0, 0, 0, 0);
+        return null;
+    }
+    const rows = shapeDimUsize(output_grad_shape, 0) orelse return null;
+    const out_dim = shapeDimUsize(output_grad_shape, 1) orelse return null;
+    const rank = shapeDimUsize(d_after_shape, 1) orelse return null;
+    if (rows == 0 or out_dim == 0 or rank == 0 or rank > 64) {
+        traceRankAdapterBackwardMatchDecline("dims", d_after_a_id, rhs_source_id, rows, 0, rank, out_dim);
+        return null;
+    }
+    if (shapeDimUsize(d_after_shape, 0) != rows) return null;
+    if (shapeDimUsize(rhs_transpose_shape, 0) != out_dim or shapeDimUsize(rhs_transpose_shape, 1) != rank) {
+        traceRankAdapterBackwardMatchDecline("rhs_transpose_shape", d_after_a_id, rhs_source_id, rows, 0, rank, out_dim);
+        return null;
+    }
+
+    const rhs_rows = shapeDimUsize(rhs_shape, 0) orelse return null;
+    const rhs_cols = shapeDimUsize(rhs_shape, 1) orelse return null;
+    const rhs_uses_transpose_value = rhs_rows == rank and rhs_cols == out_dim;
+    if (!((rhs_rows == out_dim and rhs_cols == rank) or rhs_uses_transpose_value)) {
+        traceRankAdapterBackwardMatchDecline("rhs_source_shape", d_after_a_id, rhs_source_id, rows, 0, rank, out_dim);
+        return null;
+    }
+
+    const grad_b_match = findLoraBackwardGradB(graph, reachable, skipped_nodes, d_after_a_id, output_grad_id, rows, out_dim, rank) orelse {
+        traceRankAdapterBackwardMatchDecline("missing_grad_b", d_after_a_id, rhs_source_id, rows, 0, rank, out_dim);
+        return null;
+    };
+    const grad_a_match = findLoraBackwardGradA(graph, reachable, skipped_nodes, d_after_a_id, rows, rank) orelse {
+        traceRankAdapterBackwardMatchDecline("missing_grad_a", d_after_a_id, rhs_source_id, rows, 0, rank, out_dim);
+        return null;
+    };
+    const input_shape = graph.node(grad_a_match.input_id).output_shape;
+    const after_a_shape = graph.node(grad_b_match.after_a_id).output_shape;
+    if (input_shape.rank() != 2 or after_a_shape.rank() != 2) return null;
+    const in_dim = shapeDimUsize(input_shape, 1) orelse return null;
+    if (in_dim == 0) return null;
+    if (shapeDimUsize(input_shape, 0) != rows) return null;
+    if (shapeDimUsize(after_a_shape, 0) != rows or shapeDimUsize(after_a_shape, 1) != rank) return null;
+    if (shapeDimUsize(graph.node(grad_a_match.grad_a_id).output_shape, 0) != rank) return null;
+    if (shapeDimUsize(graph.node(grad_a_match.grad_a_id).output_shape, 1) != in_dim) return null;
+
+    const pattern: RankAdapterBackwardPattern = .{
+        .d_after_a_id = d_after_a_id,
+        .grad_a_dot_id = grad_a_match.dot_id,
+        .grad_a_id = grad_a_match.grad_a_id,
+        .grad_b_dot_id = grad_b_match.dot_id,
+        .grad_b_id = grad_b_match.grad_b_id,
+        .input_transpose_id = grad_a_match.input_transpose_id,
+        .after_a_transpose_id = grad_b_match.after_a_transpose_id,
+        .rhs_transpose_id = rhs_transpose_id,
+        .input_id = grad_a_match.input_id,
+        .after_a_id = grad_b_match.after_a_id,
+        .rhs_source_id = rhs_source_id,
+        .rhs_uses_transpose_value = rhs_uses_transpose_value,
+        .output_grad_id = output_grad_id,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+    if (traceRankAdapterBackwardMatchingEnabled()) {
+        std.debug.print(
+            "rank_adapter_backward_match: matched d_after_a={d} grad_a={d} grad_b={d} input={d} after_a={d} rhs_source={d} rhs_uses_transpose={} rows={d} in={d} rank={d} out={d}\n",
+            .{ pattern.d_after_a_id, pattern.grad_a_id, pattern.grad_b_id, pattern.input_id, pattern.after_a_id, pattern.rhs_source_id, pattern.rhs_uses_transpose_value, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+        );
+    }
+    return pattern;
+}
+
+fn traceRankAdapterBackwardMatchDecline(
+    reason: []const u8,
+    d_after_a_id: NodeId,
+    rhs_source_id: NodeId,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+) void {
+    if (!traceRankAdapterBackwardMatchingEnabled()) return;
+    std.debug.print(
+        "rank_adapter_backward_match: declined reason={s} d_after_a={d} rhs_source={d} rows={d} in={d} rank={d} out={d}\n",
+        .{ reason, d_after_a_id, rhs_source_id, rows, in_dim, rank, out_dim },
+    );
+}
+
 const LoraBackwardGradBMatch = struct {
     dot_id: NodeId,
     grad_b_id: NodeId,
+    after_a_transpose_id: NodeId,
+    after_a_id: NodeId,
+};
+
+const LowRankLoraBackwardGradBMatch = struct {
+    dot_id: NodeId,
     after_a_transpose_id: NodeId,
     after_a_id: NodeId,
 };
@@ -9129,6 +10432,38 @@ const LoraBackwardGradAMatch = struct {
     input_transpose_id: NodeId,
     input_id: NodeId,
 };
+
+fn findLowRankLoraBackwardGradBTransposed(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    output_grad_id: NodeId,
+    rows: usize,
+    out_dim: usize,
+    rank: usize,
+) ?LowRankLoraBackwardGradBMatch {
+    var dot_id: NodeId = 0;
+    while (dot_id < graph.nodeCount()) : (dot_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, dot_id)) continue;
+        const dot = graph.node(dot_id);
+        const attrs = switch (dot.op) {
+            .dot_general => |a| a,
+            else => continue,
+        };
+        if (!isLinearDotAttrs(attrs) or dot.num_inputs < 2 or dot.inputs[1] != output_grad_id) continue;
+        if (shapeDimUsize(dot.output_shape, 0) != rank or shapeDimUsize(dot.output_shape, 1) != out_dim) continue;
+        const after_a_transpose_id = dot.inputs[0];
+        const after_a_id = sourceFromSimpleTranspose(graph, after_a_transpose_id) orelse continue;
+        const after_a_shape = graph.node(after_a_id).output_shape;
+        if (shapeDimUsize(after_a_shape, 0) != rows or shapeDimUsize(after_a_shape, 1) != rank) continue;
+        return .{
+            .dot_id = dot_id,
+            .after_a_transpose_id = after_a_transpose_id,
+            .after_a_id = after_a_id,
+        };
+    }
+    return null;
+}
 
 fn findLoraBackwardGradB(
     graph: *const Graph,
@@ -9203,6 +10538,24 @@ fn findLoraBackwardGradA(
     return null;
 }
 
+fn onlyReachableConsumerIs(
+    graph: *const Graph,
+    producer_id: NodeId,
+    expected_consumer_id: NodeId,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) bool {
+    var consumer_id: NodeId = 0;
+    while (consumer_id < graph.nodeCount()) : (consumer_id += 1) {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, consumer_id)) continue;
+        const consumer = graph.node(consumer_id);
+        for (consumer.getInputs()) |input_id| {
+            if (input_id == producer_id and consumer_id != expected_consumer_id) return false;
+        }
+    }
+    return true;
+}
+
 fn findSimpleTransposeConsumer(
     graph: *const Graph,
     reachable: []const bool,
@@ -9250,6 +10603,32 @@ fn loraBParameterFromBackwardTranspose(graph: *const Graph, node_id: NodeId) ?No
 }
 
 fn markLoraBackwardSkipped(skipped: []bool, pattern: LoraBackwardPattern) void {
+    const ids = [_]NodeId{
+        pattern.grad_a_dot_id,
+        pattern.grad_a_id,
+        pattern.grad_b_dot_id,
+        pattern.grad_b_id,
+        pattern.input_transpose_id,
+        pattern.after_a_transpose_id,
+    };
+    for (ids) |node_id| {
+        const index: usize = @intCast(node_id);
+        if (index < skipped.len) skipped[index] = true;
+    }
+}
+
+fn markLowRankLoraBackwardSkipped(skipped: []bool, pattern: LowRankLoraBackwardPattern) void {
+    const ids = [_]NodeId{
+        pattern.grad_b_dot_id,
+        pattern.after_a_transpose_id,
+    };
+    for (ids) |node_id| {
+        const index: usize = @intCast(node_id);
+        if (index < skipped.len) skipped[index] = true;
+    }
+}
+
+fn markRankAdapterBackwardSkipped(skipped: []bool, pattern: RankAdapterBackwardPattern) void {
     const ids = [_]NodeId{
         pattern.grad_a_dot_id,
         pattern.grad_a_id,
@@ -10691,12 +12070,14 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.qkv.k_slice_id, "qkv_region_k_host_output");
         }
         if (v_resident) {
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.qkv.v_slice_id, "qkv_region_v_host_output");
         }
     }
@@ -10829,12 +12210,14 @@ fn executeGroupedLinearQkvSlicePattern(
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.k_slice_id, "qkv_region_k_host_output");
         }
         if (v_resident) {
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.v_slice_id, "qkv_region_v_host_output");
         }
     }
@@ -11077,12 +12460,14 @@ fn executeLinearNoBiasQkvPattern(
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.k_id, "qkv_region_k_host_output");
         }
         if (v_resident) {
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, pattern.v_id, "qkv_region_v_host_output");
         }
         recordGemmaRuntimeResidency(stats, graph, pattern.k_id, k_resident);
@@ -11342,6 +12727,7 @@ fn tryExecuteLinearNoBiasPairPattern(
             stats.device_resident_outputs += 1;
         } else {
             stats.host_materialized_outputs += 1;
+            stats.host_materialized_runtime_region_outputs += 1;
             if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, second_id, "linear_pair_second_host_output");
         }
         recordGemmaRuntimeResidency(stats, graph, second_id, second_resident);
@@ -11743,6 +13129,8 @@ fn tryExecuteMetalCommand(
     exec_state: *interpreter.ExecState,
     output_hint: ?CT,
     attn_mask_cache: ?*AttnMaskCache,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    resident_input_cache: ?*ResidentInputCache,
 ) !?CT {
     const n = graph.node(node_id);
     const inputs = n.getInputs();
@@ -11875,11 +13263,13 @@ fn tryExecuteMetalCommand(
         .abs => try executeRuntimeUnary(cb, values, inputs, .abs, output_hint),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
-        .gather => |attrs| try executeRuntimeGather(graph, cb, values, inputs, attrs),
-        .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, inputs, attrs),
+        .gather => |attrs| try executeRuntimeGather(graph, cb, values, node_id, inputs, attrs, stats, resident_input_cache),
+        .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, node_id, inputs, attrs),
+        .convert_dtype => |attrs| try executeRuntimeConvertDType(graph, cb, values, inputs, attrs),
         .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape, output_hint),
         .fused_gelu_exact => try executeRuntimeActivation(cb, values, inputs, .gelu_exact, n.output_shape, output_hint),
-        .fused_gelu_backward => try executeRuntimeGeluBackward(cb, values, inputs, n.output_shape),
+        .fused_gelu_backward => try executeRuntimeGeluBackward(cb, values, inputs, n.output_shape, false),
+        .fused_gelu_exact_backward => try executeRuntimeGeluBackward(cb, values, inputs, n.output_shape, true),
         .fused_relu => try executeRuntimeActivation(cb, values, inputs, .relu, n.output_shape, output_hint),
         .fused_silu => try executeRuntimeActivation(cb, values, inputs, .silu, n.output_shape, output_hint),
         .fused_quick_gelu => try executeRuntimeActivation(cb, values, inputs, .quick_gelu, n.output_shape, output_hint),
@@ -11891,9 +13281,9 @@ fn tryExecuteMetalCommand(
         .div => try executeRuntimeBinary(cb, values, inputs, .divide, output_hint),
         .less_than => try executeRuntimeBinary(cb, values, inputs, .less_than, null),
         .where_select => try executeRuntimeWhereSelect(cb, values, inputs),
-        .reduce_sum => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .sum, output_hint),
-        .reduce_max => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .max, output_hint),
-        .reduce_mean => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .mean, output_hint),
+        .reduce_sum => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .sum, output_hint, stats, resident_input_cache),
+        .reduce_max => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .max, output_hint, stats, resident_input_cache),
+        .reduce_mean => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .mean, output_hint, stats, resident_input_cache),
         .fused_softmax => |attrs| try executeRuntimeSoftmax(cb, values, inputs, attrs.dim),
         .fused_log_softmax => |attrs| try executeRuntimeLogSoftmax(cb, values, inputs, attrs.dim),
         .fused_sdpa => |attrs| try executeRuntimeSdpa(cb, values, inputs, attrs, op_plan, exec_state),
@@ -12142,10 +13532,31 @@ fn executeRuntimeScatterAdd(
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
+    node_id: NodeId,
     inputs: []const NodeId,
     attrs: anytype,
 ) !?CT {
-    if (attrs.axis != 0 or inputs.len != 3) return null;
+    if (attrs.axis != 0) return null;
+    if (inputs.len == 2) {
+        const update_values = valueFor(values, inputs[0]) orelse return null;
+        const indices = valueFor(values, inputs[1]) orelse return null;
+
+        var values_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+        var out_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+        const values_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &values_shape_buf);
+        const out_shape = try fillShapeDims(graph.node(node_id).output_shape, &out_shape_buf);
+
+        return cb.primScatterAdd(update_values, indices, values_shape, out_shape, attrs.axis) catch |err| switch (err) {
+            error.UnsupportedOperation,
+            error.UnsupportedPrimitiveOp,
+            error.UnsupportedTensorType,
+            error.UnsupportedShape,
+            error.ShapeMismatch,
+            => null,
+            else => return err,
+        };
+    }
+    if (inputs.len != 3) return null;
     const dest = valueFor(values, inputs[0]) orelse return null;
     const update_values = valueFor(values, inputs[1]) orelse return null;
     const indices = valueFor(values, inputs[2]) orelse return null;
@@ -12195,6 +13606,27 @@ fn executeRuntimeScatterAdd(
         return device_result;
     }
     return host_result;
+}
+
+fn executeRuntimeConvertDType(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    attrs: anytype,
+) !?CT {
+    if (inputs.len != 1) return null;
+    const input = valueFor(values, inputs[0]) orelse return null;
+    if (graph.node(inputs[0]).output_shape.dtype == attrs.target) return input;
+    return cb.tryConvertDType(input, attrs.target) catch |err| switch (err) {
+        error.UnsupportedOperation,
+        error.UnsupportedPrimitiveOp,
+        error.UnsupportedTensorType,
+        error.UnsupportedShape,
+        error.ShapeMismatch,
+        => null,
+        else => return err,
+    };
 }
 
 fn executeRuntimeEmbeddingLookup(
@@ -12283,26 +13715,50 @@ fn executeRuntimeReduce(
     attrs: anytype,
     comptime op: RuntimeReduceOp,
     output_hint: ?CT,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    resident_input_cache: ?*ResidentInputCache,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     var in_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
     const in_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &in_shape_buf);
     const axes = attrs.axes[0..attrs.num_axes];
+    var cached_input: ?CT = null;
+    if (resident_input_cache) |cache| {
+        cached_input = try cache.residentValueForConsumer(cb, graph, inputs[0], input, stats);
+    }
+    const promote_input = cached_input == null and cb.kind() == .metal and reducePromoteInputEnabled() and !isMetalDeviceResident(cb, input);
+    const promotion_start_ns = if (promote_input) metalPartitionNowNs() else 0;
+    const input_resident = if (cached_input) |cached|
+        TemporaryMetalResidentValue{ .value = cached }
+    else if (promote_input)
+        try temporaryMetalResidentValue(cb, input)
+    else
+        TemporaryMetalResidentValue{ .value = input };
+    defer input_resident.deinit(cb);
+    if (promote_input and isMetalDeviceResident(cb, input_resident.value)) {
+        if (stats) |s| {
+            s.metal_reduce_input_promotions += 1;
+            s.metal_reduce_input_promotion_ns += metalPartitionNowNs() - promotion_start_ns;
+            if (tensorElementCount(graph.node(inputs[0]).output_shape)) |elems| {
+                s.metal_reduce_input_promotion_bytes += @intCast(elems * @sizeOf(f32));
+            }
+        }
+    }
     // Slot-bound output: last-axis reduce directly into the pooled buffer.
     if (output_hint) |hint| {
-        if (isMetalDeviceResident(cb, input)) {
+        if (isMetalDeviceResident(cb, input_resident.value)) {
             const kind_id: u32 = switch (op) {
                 .sum => 0,
                 .max => 1,
                 .mean => 2,
             };
-            if (try metal_compute_mod.MetalCompute.reduceLastDimInto(cb, input, axes, in_shape, kind_id, hint)) |out| return out;
+            if (try metal_compute_mod.MetalCompute.reduceLastDimInto(cb, input_resident.value, axes, in_shape, kind_id, hint)) |out| return out;
         }
     }
     return switch (op) {
-        .sum => cb.primReduceSum(input, axes, in_shape),
-        .max => cb.primReduceMax(input, axes, in_shape),
-        .mean => cb.primReduceMean(input, axes, in_shape),
+        .sum => cb.primReduceSum(input_resident.value, axes, in_shape),
+        .max => cb.primReduceMax(input_resident.value, axes, in_shape),
+        .mean => cb.primReduceMean(input_resident.value, axes, in_shape),
     } catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
@@ -12659,6 +14115,14 @@ fn shouldDeferTransposeForLinearDot(
         compatible_consumers += 1;
     }
     return compatible_consumers > 0;
+}
+
+fn transposeSourceIsWeightParameter(graph: *const Graph, node_id: NodeId) bool {
+    const source_id = sourceFromSimpleTranspose(graph, node_id) orelse return false;
+    const source = graph.node(source_id);
+    if (std.meta.activeTag(source.op) != .parameter) return false;
+    const name = graph.parameterName(source);
+    return std.mem.indexOf(u8, name, "weight") != null;
 }
 
 fn linearDotConsumesTranspose(graph: *const Graph, consumer_id: NodeId, transpose_id: NodeId) bool {
@@ -13077,6 +14541,7 @@ fn executeRuntimeGeluBackward(
     values: []?CT,
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
+    exact: bool,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const upstream_grad = valueFor(values, inputs[1]) orelse return null;
@@ -13085,6 +14550,7 @@ fn executeRuntimeGeluBackward(
         .input = input,
         .upstream_grad = upstream_grad,
         .dim = dim,
+        .exact = exact,
     }) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
@@ -13095,8 +14561,11 @@ fn executeRuntimeGather(
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
+    node_id: NodeId,
     inputs: []const NodeId,
     attrs: anytype,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    resident_input_cache: ?*ResidentInputCache,
 ) !?CT {
     if (inputs.len < 2) return null;
     var input_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
@@ -13105,13 +14574,33 @@ fn executeRuntimeGather(
     const indices_value = valueFor(values, inputs[1]) orelse return null;
     const indices = try temporaryMetalResidentValue(cb, indices_value);
     defer indices.deinit(cb);
-    const input_resident = if (gatherPromoteInputEnabled())
+    var cached_input: ?CT = null;
+    if (resident_input_cache) |cache| {
+        cached_input = try cache.residentValueForConsumer(cb, graph, inputs[0], input_value, stats);
+    }
+    const input_bytes = if (tensorElementCount(graph.node(inputs[0]).output_shape)) |elems| elems * @sizeOf(f32) else 0;
+    const output_bytes = if (tensorElementCount(graph.node(node_id).output_shape)) |elems| elems * @sizeOf(f32) else 0;
+    const promote_output = cached_input == null and cb.kind() == .metal and gatherPromoteInputEnabled() and !isMetalDeviceResident(cb, input_value) and output_bytes > 0 and input_bytes > output_bytes;
+    const promote_input = cached_input == null and !promote_output and cb.kind() == .metal and gatherPromoteInputEnabled() and !isMetalDeviceResident(cb, input_value);
+    const promotion_start_ns = if (promote_input) metalPartitionNowNs() else 0;
+    const input_resident = if (cached_input) |cached|
+        TemporaryMetalResidentValue{ .value = cached }
+    else if (promote_input)
         try temporaryMetalResidentValue(cb, input_value)
     else
         TemporaryMetalResidentValue{ .value = input_value };
     defer input_resident.deinit(cb);
+    if (promote_input and isMetalDeviceResident(cb, input_resident.value)) {
+        if (stats) |s| {
+            s.metal_gather_input_promotions += 1;
+            s.metal_gather_input_promotion_ns += metalPartitionNowNs() - promotion_start_ns;
+            if (tensorElementCount(graph.node(inputs[0]).output_shape)) |elems| {
+                s.metal_gather_input_promotion_bytes += @intCast(elems * @sizeOf(f32));
+            }
+        }
+    }
 
-    if (attrs.axis == 0) gather_add_bias: {
+    if (!promote_output and attrs.axis == 0) gather_add_bias: {
         const input_node = graph.node(inputs[0]);
         if (input_node.op != .add) break :gather_add_bias;
         const add_inputs = input_node.getInputs();
@@ -13153,10 +14642,27 @@ fn executeRuntimeGather(
         if (fused) |output| return output;
     }
 
-    return cb.primGather(input_resident.value, indices.value, attrs.axis, input_shape) catch |err| switch (err) {
+    const gathered = cb.primGather(input_resident.value, indices.value, attrs.axis, input_shape) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape, error.ShapeMismatch, error.InvalidTensorShape => null,
         else => return err,
     };
+    if (promote_output) {
+        if (gathered) |host_result| {
+            if (!isMetalDeviceResident(cb, host_result)) {
+                const output_promotion_start_ns = metalPartitionNowNs();
+                if (try makeMetalDeviceResident(cb, host_result)) |device_result| {
+                    if (stats) |s| {
+                        s.metal_gather_output_promotions += 1;
+                        s.metal_gather_output_promotion_ns += metalPartitionNowNs() - output_promotion_start_ns;
+                        s.metal_gather_output_promotion_bytes += @intCast(output_bytes);
+                    }
+                    if (device_result != host_result) cb.free(host_result);
+                    return device_result;
+                }
+            }
+        }
+    }
+    return gathered;
 }
 
 fn executeRuntimeAdd(
@@ -13863,8 +15369,10 @@ fn materializePartitionParameters(
             s.descriptor_materializations += 1;
             if (isMetalResidentOrQuantizedDescriptor(cb, materialized)) {
                 s.device_resident_outputs += 1;
+                s.device_resident_parameter_outputs += 1;
             } else {
                 s.host_materialized_outputs += 1;
+                s.host_materialized_parameter_outputs += 1;
                 if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, "parameter_materialization_host_output");
             }
         }
@@ -15118,6 +16626,9 @@ test "metal partition executor recognizes deberta ffn forward graph region with 
     try std.testing.expectEqual(@as(usize, rows), pattern.rows);
     try std.testing.expectEqual(@as(usize, hidden), pattern.hidden_size);
     try std.testing.expectEqual(@as(usize, intermediate), pattern.intermediate_size);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.output_size);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.gelu_exact, pattern.activation);
+    try std.testing.expect(!pattern.is_head_mlp);
 }
 
 test "metal partition executor recognizes lora-wrapped deberta ffn forward graph region" {
@@ -15184,6 +16695,195 @@ test "metal partition executor recognizes lora-wrapped deberta ffn forward graph
     try std.testing.expectEqual(out, pattern.output_add_id);
     try std.testing.expect(pattern.first_lora != null);
     try std.testing.expect(pattern.second_lora != null);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.output_size);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.gelu_exact, pattern.activation);
+    try std.testing.expect(!pattern.is_head_mlp);
+}
+
+test "metal partition executor recognizes gliner head relu mlp forward graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const output_dim: usize = 1;
+    const x = try b.parameter("schema_hidden", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w1 = try b.parameter("classifier.0.weight", ml.graph.Shape.init(.f32, &.{ intermediate, hidden }));
+    const b1 = try b.parameter("classifier.0.bias", ml.graph.Shape.init(.f32, &.{intermediate}));
+    const w2 = try b.parameter("classifier.2.weight", ml.graph.Shape.init(.f32, &.{ output_dim, intermediate }));
+    const b2 = try b.parameter("classifier.2.bias", ml.graph.Shape.init(.f32, &.{output_dim}));
+
+    const w1_t = try b.transpose(w1, &.{ 1, 0 });
+    const first_dot = try b.matmul(x, w1_t);
+    const first_add = try b.add(first_dot, b1);
+    const relu = try b.relu(first_add);
+    const w2_t = try b.transpose(w2, &.{ 1, 0 });
+    const output_dot = try b.matmul(relu, w2_t);
+    const out = try b.add(output_dot, b2);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+
+    const pattern = matchHeadMlpForwardPattern(&g, node_ids, @intCast(first_dot), reachable, skipped) orelse return error.ExpectedHeadMlpForwardPattern;
+    try std.testing.expectEqual(first_dot, pattern.first_dot_id);
+    try std.testing.expectEqual(first_add, pattern.first_add_id);
+    try std.testing.expectEqual(relu, pattern.gelu_id);
+    try std.testing.expectEqual(output_dot, pattern.output_dot_id);
+    try std.testing.expectEqual(out, pattern.output_add_id);
+    try std.testing.expectEqual(w1, pattern.first_weight_id);
+    try std.testing.expectEqual(b1, pattern.first_bias_id);
+    try std.testing.expectEqual(w2, pattern.second_weight_id);
+    try std.testing.expectEqual(b2, pattern.second_bias_id);
+    try std.testing.expectEqual(@as(usize, rows), pattern.rows);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.hidden_size);
+    try std.testing.expectEqual(@as(usize, intermediate), pattern.intermediate_size);
+    try std.testing.expectEqual(@as(usize, output_dim), pattern.output_size);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.relu, pattern.activation);
+    try std.testing.expect(pattern.is_head_mlp);
+}
+
+test "metal partition executor recognizes gliner head decomposed relu mlp forward graph region" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const output_dim: usize = 1;
+    const x = try b.parameter("schema_hidden", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w1 = try b.parameter("classifier.0.weight", ml.graph.Shape.init(.f32, &.{ intermediate, hidden }));
+    const b1 = try b.parameter("classifier.0.bias", ml.graph.Shape.init(.f32, &.{intermediate}));
+    const w2 = try b.parameter("classifier.2.weight", ml.graph.Shape.init(.f32, &.{ output_dim, intermediate }));
+    const b2 = try b.parameter("classifier.2.bias", ml.graph.Shape.init(.f32, &.{output_dim}));
+
+    const w1_t = try b.transpose(w1, &.{ 1, 0 });
+    const first_dot = try b.matmul(x, w1_t);
+    const first_add = try b.add(first_dot, b1);
+    const zero = try b.scalarConst(.f32, 0.0);
+    const cmp = try g.addNode(.{
+        .op = .{ .less_than = {} },
+        .output_shape = g.node(first_add).output_shape,
+        .inputs = .{ first_add, zero, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const relu = try g.addNode(.{
+        .op = .{ .where_select = {} },
+        .output_shape = g.node(first_add).output_shape,
+        .inputs = .{ cmp, zero, first_add, null_node },
+        .num_inputs = 3,
+    });
+    const w2_t = try b.transpose(w2, &.{ 1, 0 });
+    const output_dot = try b.matmul(relu, w2_t);
+    const out = try b.add(output_dot, b2);
+    const cmp_probe = try b.add(cmp, zero);
+    try g.markOutput(out);
+    try g.markOutput(cmp_probe);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+
+    const pattern = matchHeadMlpForwardPattern(&g, node_ids, @intCast(first_dot), reachable, skipped) orelse return error.ExpectedHeadMlpForwardPattern;
+    try std.testing.expectEqual(first_dot, pattern.first_dot_id);
+    try std.testing.expectEqual(first_add, pattern.first_add_id);
+    try std.testing.expectEqual(relu, pattern.gelu_id);
+    try std.testing.expectEqual(null_node, pattern.activation_aux_id);
+    try std.testing.expectEqual(output_dot, pattern.output_dot_id);
+    try std.testing.expectEqual(out, pattern.output_add_id);
+    try std.testing.expectEqual(w1, pattern.first_weight_id);
+    try std.testing.expectEqual(w2, pattern.second_weight_id);
+    try std.testing.expectEqual(@as(usize, rows), pattern.rows);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.hidden_size);
+    try std.testing.expectEqual(@as(usize, intermediate), pattern.intermediate_size);
+    try std.testing.expectEqual(@as(usize, output_dim), pattern.output_size);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.relu, pattern.activation);
+    try std.testing.expect(pattern.is_head_mlp);
+}
+
+test "metal partition executor selects gliner head relu mlp among multiple activation consumers" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const output_dim: usize = 1;
+    const x = try b.parameter("schema_hidden", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const w1 = try b.parameter("classifier.0.weight", ml.graph.Shape.init(.f32, &.{ intermediate, hidden }));
+    const b1 = try b.parameter("classifier.0.bias", ml.graph.Shape.init(.f32, &.{intermediate}));
+    const probe_w2 = try b.parameter("classifier.probe.weight", ml.graph.Shape.init(.f32, &.{ output_dim, intermediate }));
+    const probe_b2 = try b.parameter("classifier.probe.bias", ml.graph.Shape.init(.f32, &.{output_dim}));
+    const w2 = try b.parameter("classifier.2.weight", ml.graph.Shape.init(.f32, &.{ output_dim, intermediate }));
+    const b2 = try b.parameter("classifier.2.bias", ml.graph.Shape.init(.f32, &.{output_dim}));
+
+    const w1_t = try b.transpose(w1, &.{ 1, 0 });
+    const first_dot = try b.matmul(x, w1_t);
+    const first_add = try b.add(first_dot, b1);
+    const zero = try b.scalarConst(.f32, 0.0);
+    const probe_cmp = try g.addNode(.{
+        .op = .{ .less_than = {} },
+        .output_shape = g.node(first_add).output_shape,
+        .inputs = .{ first_add, zero, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const probe_relu = try g.addNode(.{
+        .op = .{ .where_select = {} },
+        .output_shape = g.node(first_add).output_shape,
+        .inputs = .{ probe_cmp, zero, first_add, null_node },
+        .num_inputs = 3,
+    });
+    const probe_w2_t = try b.transpose(probe_w2, &.{ 1, 0 });
+    const probe_dot = try b.matmul(probe_relu, probe_w2_t);
+    const probe_out = try b.add(probe_dot, probe_b2);
+    const relu = try b.relu(first_add);
+    const w2_t = try b.transpose(w2, &.{ 1, 0 });
+    const output_dot = try b.matmul(relu, w2_t);
+    const out = try b.add(output_dot, b2);
+    try g.markOutput(probe_out);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, idx| node_id.* = @intCast(idx);
+    const skipped = try allocator.alloc(bool, node_ids.len);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+
+    const pattern = matchHeadMlpForwardPattern(&g, node_ids, @intCast(first_dot), reachable, skipped) orelse return error.ExpectedHeadMlpForwardPattern;
+    try std.testing.expectEqual(first_dot, pattern.first_dot_id);
+    try std.testing.expectEqual(first_add, pattern.first_add_id);
+    try std.testing.expectEqual(relu, pattern.gelu_id);
+    try std.testing.expectEqual(output_dot, pattern.output_dot_id);
+    try std.testing.expectEqual(out, pattern.output_add_id);
+    try std.testing.expectEqual(w1, pattern.first_weight_id);
+    try std.testing.expectEqual(w2, pattern.second_weight_id);
+    try std.testing.expectEqual(@as(usize, rows), pattern.rows);
+    try std.testing.expectEqual(@as(usize, hidden), pattern.hidden_size);
+    try std.testing.expectEqual(@as(usize, intermediate), pattern.intermediate_size);
+    try std.testing.expectEqual(@as(usize, output_dim), pattern.output_size);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.relu, pattern.activation);
+    try std.testing.expect(pattern.is_head_mlp);
 }
 
 test "metal partition executor recognizes gemma qkv sibling linear graph region" {
@@ -15839,6 +17539,61 @@ test "metal partition executor defers transpose shared by compatible linear dots
     try std.testing.expect(shouldDeferTransposeForLinearDot(&g, weight_t, reachable, last_use));
 }
 
+test "metal partition executor chunk-safe transpose defer is limited to weight parameters" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const y = try b.parameter("y", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.output.dense.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const input_like = try b.parameter("runtime_input", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const input_like_t = try b.transpose(input_like, &.{ 1, 0 });
+    const first = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const second = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ y, input_like_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(first);
+    try g.markOutput(second);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expect(shouldDeferTransposeForLinearDot(&g, weight_t, reachable, last_use));
+    try std.testing.expect(transposeSourceIsWeightParameter(&g, weight_t));
+    try std.testing.expect(shouldDeferTransposeForLinearDot(&g, input_like_t, reachable, last_use));
+    try std.testing.expect(!transposeSourceIsWeightParameter(&g, input_like_t));
+}
+
 test "metal partition executor recognizes grouped qkv linear slice graph region" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -16269,7 +18024,7 @@ test "metal partition executor runtime frame eligibility recognizes layer triple
         .region_count = regions.len,
     };
 
-    const eligibility = analyzeRuntimeFrameEligibility(plan);
+    const eligibility = analyzeRuntimeFrameEligibility(null, plan);
     try std.testing.expectEqual(@as(usize, 1), eligibility.layers);
     try std.testing.expectEqual(RuntimeFrameIneligibleReason.missing_model_metadata, eligibility.reason);
 
@@ -16287,7 +18042,7 @@ test "metal partition executor runtime frame eligibility recognizes layer triple
         .ple_residual => |*pattern| pattern.rows = 1,
         else => {},
     };
-    const single_row_eligibility = analyzeRuntimeFrameEligibility(plan);
+    const single_row_eligibility = analyzeRuntimeFrameEligibility(null, plan);
     try std.testing.expectEqual(@as(usize, 1), single_row_eligibility.layers);
     try std.testing.expectEqual(RuntimeFrameIneligibleReason.single_row, single_row_eligibility.reason);
 }
@@ -16340,9 +18095,61 @@ test "metal partition executor runtime frame eligibility rejects incomplete laye
         .region_count = regions.len,
     };
 
-    const eligibility = analyzeRuntimeFrameEligibility(plan);
+    const eligibility = analyzeRuntimeFrameEligibility(null, plan);
     try std.testing.expectEqual(@as(usize, 0), eligibility.layers);
     try std.testing.expectEqual(RuntimeFrameIneligibleReason.missing_ple, eligibility.reason);
+}
+
+test "metal partition executor runtime frame eligibility treats deberta encoder regions as non generic-frame metadata" {
+    var regions = [_]RuntimeRegion{
+        .{ .linear_qkv = .{
+            .q_id = 1,
+            .k_id = 2,
+            .v_id = 3,
+            .input_id = 0,
+            .q_weight_id = 4,
+            .k_weight_id = 5,
+            .v_weight_id = 6,
+            .rows = 2,
+            .in_dim = 8,
+            .q_out_dim = 16,
+            .kv_out_dim = 4,
+        } },
+        .{ .deberta_encoder_lora_layer = .{
+            .ffn = .{
+                .first_dot_id = 20,
+                .first_base_add_id = 21,
+                .first_add_id = 22,
+                .gelu_id = 23,
+                .output_dot_id = 24,
+                .output_base_add_id = 25,
+                .output_add_id = 26,
+                .input_id = 12,
+                .first_weight_id = 30,
+                .first_bias_id = 31,
+                .second_weight_id = 32,
+                .second_bias_id = 33,
+                .rows = 2,
+                .hidden_size = 8,
+                .intermediate_size = 32,
+                .output_size = 8,
+            },
+            .residual_add_id = 27,
+            .layer_norm_id = 28,
+            .layer_norm_weight_id = 34,
+            .layer_norm_bias_id = 35,
+            .layer_index = 0,
+            .norm_eps = 1e-7,
+        } },
+    };
+    const plan = RuntimeRegionPlan{
+        .regions_by_pos = regions[0..],
+        .region_count = regions.len,
+    };
+
+    const eligibility = analyzeRuntimeFrameEligibility(null, plan);
+    try std.testing.expectEqual(@as(usize, 0), eligibility.layers);
+    try std.testing.expectEqual(RuntimeFrameIneligibleReason.missing_model_metadata, eligibility.reason);
 }
 
 test "metal partition executor derives runtime frame metadata with variable shared head dims" {
@@ -16511,6 +18318,27 @@ test "metal partition executor derives runtime frame metadata with variable shar
     try std.testing.expectEqual(@as(usize, 8), metadata.global_head_dim);
     try std.testing.expectEqual(@as(usize, 4), metadata.ple_hidden_size);
     try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.gelu, metadata.activation);
+
+    var reordered_regions = [_]RuntimeRegion{
+        regions[0],
+        regions[4],
+        regions[1],
+        regions[2],
+        regions[3],
+        regions[5],
+        regions[6],
+        regions[7],
+    };
+    const reordered_plan = RuntimeRegionPlan{
+        .regions_by_pos = reordered_regions[0..],
+        .region_count = reordered_regions.len,
+    };
+    const reordered_eligibility = analyzeRuntimeFrameEligibility(&g, reordered_plan);
+    try std.testing.expectEqual(@as(usize, 2), reordered_eligibility.layers);
+    try std.testing.expectEqual(RuntimeFrameIneligibleReason.none, reordered_eligibility.reason);
+    const reordered_metadata = runtimeFrameMetadataFromPlan(&g, reordered_plan) orelse return error.ExpectedRuntimeFrameMetadata;
+    try std.testing.expectEqual(@as(usize, 2), reordered_metadata.layer_count);
+    try std.testing.expectEqual(@as(usize, 8), reordered_metadata.global_head_dim);
 }
 
 test "metal partition executor rejects gated ffn pattern with escaped intermediate" {
@@ -16605,7 +18433,7 @@ test "metal partition executor runtime add keeps resident input device backed" {
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state, null, null)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, sum, null, &exec_state, null, null, null, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 
@@ -16655,7 +18483,7 @@ test "metal partition executor runtime rms norm supports row-wise resident shape
         .options = .{},
         .last_use = &.{},
     };
-    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state, null, null)) orelse return error.UnsupportedPrimitiveOp;
+    const out = (try tryExecuteMetalCommand(allocator, &g, &cb, values, normed, null, &exec_state, null, null, null, null)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(out);
     try std.testing.expect(isMetalDeviceResident(&cb, out));
 

@@ -103,6 +103,11 @@ pub const LoraLinearBackwardResult = struct {
     grad_b: CT,
 };
 
+pub const LoraLinearBackwardBResult = struct {
+    grad_after_a: CT,
+    grad_b_transposed: CT,
+};
+
 pub const LoraLinearBackwardRequest = struct {
     input: CT,
     after_a: CT,
@@ -110,6 +115,16 @@ pub const LoraLinearBackwardRequest = struct {
     output_grad: CT,
     rows: usize,
     in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+};
+
+pub const LoraLinearBackwardBRequest = struct {
+    after_a: CT,
+    lora_b: CT,
+    output_grad: CT,
+    rows: usize,
     rank: usize,
     out_dim: usize,
     scale: f32,
@@ -1013,6 +1028,11 @@ pub const ComputeBackend = struct {
         /// grad_b = scale * output_grad^T @ after_a
         /// grad_a = scale * (output_grad @ lora_b)^T @ input
         loraLinearBackward: ?*const fn (ctx: *anyopaque, request: *const LoraLinearBackwardRequest) anyerror!?LoraLinearBackwardResult = null,
+
+        /// B-side LoRA backward branch in graph-native layout:
+        /// grad_after_a = scale * output_grad @ lora_b
+        /// grad_b_transposed = scale * after_a^T @ output_grad
+        loraLinearBackwardB: ?*const fn (ctx: *anyopaque, request: *const LoraLinearBackwardBRequest) anyerror!?LoraLinearBackwardBResult = null,
 
         /// Split a rank-2 [rows, 3*dim] tensor into three [rows, dim] tensors
         /// along the last dimension. Backends may implement this without a host
@@ -1930,6 +1950,11 @@ pub const ComputeBackend = struct {
 
     pub fn loraLinearBackward(self: *const ComputeBackend, request: *const LoraLinearBackwardRequest) !?LoraLinearBackwardResult {
         const op = self.vtable.loraLinearBackward orelse return null;
+        return op(self.ptr, request);
+    }
+
+    pub fn loraLinearBackwardB(self: *const ComputeBackend, request: *const LoraLinearBackwardBRequest) !?LoraLinearBackwardBResult {
+        const op = self.vtable.loraLinearBackwardB orelse return null;
         return op(self.ptr, request);
     }
 
