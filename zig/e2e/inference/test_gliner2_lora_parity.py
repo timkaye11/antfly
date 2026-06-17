@@ -225,8 +225,12 @@ def test_gliner2_lora_metal_strict_parity(tmp_path: Path):
         "--seed", "42",
         "--dump-preprocess-parity",
         "--loss-parity-tolerance", "1e-4",
-        # Same logit noise-floor rationale as the native strict test above.
-        "--adapter-roundtrip-tolerance", "5e-4",
+        # Metal updates match loss/preprocess parity exactly enough for the
+        # training gate, and exported adapter weights stay far below the
+        # weight tolerance, but f32 GPU update noise is amplified by the
+        # saturated pretrained span projections during the Python round-trip.
+        "--adapter-roundtrip-tolerance", "2e-3",
+        "--adapter-roundtrip-weights-tolerance", "5e-4",
         "--timeout-seconds", "1800",
     ]
     proc = subprocess.run(

@@ -693,6 +693,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return if (buf.metal_tensor) |metal_tensor| metal_tensor.isDevice() else false;
     }
 
+    pub fn debugHasDeviceLazyMultiply(cb: *const ops.ComputeBackend, tensor: CT) bool {
+        if (cb.kind() != .metal) return false;
+        const buf = toBuf(tensor);
+        const lazy = buf.lazy_multiply orelse return false;
+        return lazy.lhs.isDevice() and lazy.rhs.isDevice();
+    }
+
     pub fn debugSharesStorage(cb: *const ops.ComputeBackend, a: CT, b: CT) bool {
         if (cb.kind() != .metal) return false;
         const a_buf = toBuf(a);
@@ -21762,6 +21769,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn copyTensorInto(_: *const ops.ComputeBackend, _: CT, _: CT) !bool {
+        return false;
+    }
+
+    pub fn cloneOutputTensorOwned(_: *const ops.ComputeBackend, _: CT) !?CT {
+        return null;
+    }
+
+    pub fn debugHasDeviceLazyMultiply(_: *const ops.ComputeBackend, _: CT) bool {
         return false;
     }
 

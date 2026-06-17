@@ -550,6 +550,7 @@ fn isMetalResidentOrQuantizedDescriptor(cb: *const ComputeBackend, tensor: CT) b
     if (isMetalDeviceResident(cb, tensor)) return true;
     if (cb.kind() != .metal) return false;
     if (comptime !build_options.enable_metal) return false;
+    if (metal_compute_mod.MetalCompute.debugHasDeviceLazyMultiply(cb, tensor)) return true;
     return metal_compute_mod.MetalCompute.getQuantizedStorage(cb, tensor) != null;
 }
 
@@ -1812,8 +1813,9 @@ pub const MetalPartitionExecutor = struct {
                     }
                 }
                 const protected_output = i < elision_protected_nodes.len and elision_protected_nodes[i];
+                const region_pre_skipped = i < runtime_region_plan.pre_skipped_by_region.len and runtime_region_plan.pre_skipped_by_region[i];
                 const future_consumer = valueReferencedAfterBoundary(graph, node_ids, node_pos, node_id);
-                if (!protected_output and !future_consumer) continue;
+                if (!protected_output and (region_pre_skipped or !future_consumer)) continue;
                 if (future_consumer and values[i] != null) continue;
                 // A fused pattern / runtime region elided this node as
                 // fused-interior state, but its slot must escape the elided
@@ -1874,12 +1876,21 @@ pub const MetalPartitionExecutor = struct {
             // on a consumer fusing it — which writes the consumer's slot,
             // not this one.
             const node_elision_protected = i < elision_protected_nodes.len and elision_protected_nodes[i];
-            const defer_allowed = chunk_ops == 0;
+            const defer_allowed = deferredProducerConsumerStaysInFrameChunk(
+                node_ids,
+                node_pos,
+                node_id,
+                chunk_ops,
+                chunk_executed,
+                last_use,
+            );
             if (defer_allowed and !node_elision_protected and shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use)) {
+                traceMetalValueLifetime("defer_scale_mul_for_add", node_id, @intCast(last_use[i]));
                 skipped_nodes[i] = true;
                 continue;
             }
             if (defer_allowed and !node_elision_protected and shouldDeferElementwiseMulForAdd(graph, node_id, reachable, last_use)) {
+                traceMetalValueLifetime("defer_elementwise_mul_for_add", node_id, @intCast(last_use[i]));
                 skipped_nodes[i] = true;
                 continue;
             }
@@ -2843,12 +2854,33 @@ fn materializeDeferredSkippedInputs(
         // Deferred producers can chain (e.g. a deferred transpose feeding a
         // deferred mul); resolve the producer's own skipped inputs first.
         try materializeDeferredSkippedInputs(allocator, graph, cb, values, value_device, device_id, input_id, skipped_nodes, exec_state, depth + 1);
-        if (interpreterFallbackHasMissingInput(graph, values, input_id)) continue;
+        if (interpreterFallbackHasMissingInput(graph, values, input_id)) {
+            traceFirstMissingInput(graph, values, input_id, "materialize_deferred_missing_input");
+            continue;
+        }
         const materialized = (try tryExecuteMetalCommand(allocator, graph, cb, values, input_id, null, exec_state, null, null, null, null)) orelse
             try interpreter.executeNode(graph, cb, values, input_id, exec_state);
         values[input_index] = materialized;
         if (input_index < value_device.len) value_device[input_index] = device_id;
         skipped_nodes[input_index] = false;
+        traceMetalValueLifetime("materialize_deferred_input", input_id, input_id);
+    }
+}
+
+fn traceFirstMissingInput(
+    graph: *const Graph,
+    values: []?CT,
+    node_id: NodeId,
+    event: []const u8,
+) void {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return;
+    const node = graph.node(node_id);
+    for (node.getInputs()) |input_id| {
+        if (input_id == null_node) continue;
+        const input_index: usize = @intCast(input_id);
+        if (input_index < values.len and values[input_index] != null) continue;
+        traceMetalValueLifetime(event, node_id, input_id);
+        return;
     }
 }
 
@@ -2866,6 +2898,10 @@ fn metalPartitionResidencyStatsEnabled() bool {
 
 fn traceMetalHostOutputsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_HOST_OUTPUTS", false);
+}
+
+fn traceRuntimeCommandFallbacksEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_RUNTIME_COMMAND_FALLBACKS", false);
 }
 
 fn metalPartitionOpRunsEnabled() bool {
@@ -2887,6 +2923,37 @@ fn traceMetalHostOutput(graph: *const Graph, node_id: NodeId, reason: []const u8
         "metal_partition_host_output_trace: reason={s} node={d} op={s} shape={any}\n",
         .{ reason, node_id, @tagName(node.op), node.output_shape },
     );
+}
+
+fn traceRuntimeBinaryFallback(
+    graph: *const Graph,
+    node_id: NodeId,
+    op: RuntimeBinaryOp,
+    reason: []const u8,
+    lhs: ?RuntimeBinaryOperand,
+    rhs: ?RuntimeBinaryOperand,
+    output_shape: ml.graph.Shape,
+) void {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return;
+    const node = graph.node(node_id);
+    const inputs = node.getInputs();
+    const lhs_id = if (inputs.len > 0) inputs[0] else null_node;
+    const rhs_id = if (inputs.len > 1) inputs[1] else null_node;
+    std.debug.print(
+        "metal_runtime_command_fallback_trace: node={d} op={s} reason={s} out_shape={any} lhs_id={d} rhs_id={d}",
+        .{ node_id, @tagName(op), reason, output_shape, lhs_id, rhs_id },
+    );
+    if (lhs) |operand| {
+        std.debug.print(" lhs_shape={any}", .{operand.shape});
+    } else {
+        std.debug.print(" lhs_shape=null", .{});
+    }
+    if (rhs) |operand| {
+        std.debug.print(" rhs_shape={any}", .{operand.shape});
+    } else {
+        std.debug.print(" rhs_shape=null", .{});
+    }
+    std.debug.print("\n", .{});
 }
 
 const OpRunSummary = struct {
@@ -3636,12 +3703,38 @@ fn metalPartitionFrameDisabled() bool {
 /// releases that chunk's dead/pooled device buffers), then reopens a new frame
 /// and scope. Cross-chunk live values survive via their owned device CTs; only
 /// the dead working set frees, bounding peak device memory to the live set
-/// instead of the sum of every intermediate. Defer fusion is disabled while
-/// chunking so no deferred/lazy value straddles a boundary (regions already
-/// execute atomically within one iteration, so a node-boundary == a region
-/// boundary). 0 = disabled (single-frame, current behavior).
+/// instead of the sum of every intermediate. Deferred producer fusion is
+/// allowed only when the consumer is provably inside the current chunk, so no
+/// deferred/lazy value straddles a submit boundary (regions already execute
+/// atomically within one iteration, so a node-boundary == a region boundary).
+/// 0 = disabled (single-frame, current behavior).
 fn frameChunkOps() usize {
     return platform.env.getenvUsize("TERMITE_METAL_FRAME_CHUNK_OPS") orelse 0;
+}
+
+fn deferredProducerConsumerStaysInFrameChunk(
+    node_ids: []const NodeId,
+    node_pos: usize,
+    node_id: NodeId,
+    chunk_ops: usize,
+    chunk_executed: usize,
+    last_use: []const u32,
+) bool {
+    if (chunk_ops == 0) return true;
+    // Experimental byte-triggered boundaries can split the frame before the
+    // structural consumer even when it lies before the coarse op boundary.
+    if (metalFrameChunkExpiredBytesThreshold() > 0) return false;
+    const node_index: usize = @intCast(node_id);
+    if (node_index >= last_use.len) return false;
+    const consumer_id: NodeId = @intCast(last_use[node_index]);
+    if (consumer_id == null_node) return false;
+    const boundary_pos = currentFrameChunkBoundaryPos(node_ids.len, node_pos, chunk_ops, chunk_executed) orelse return false;
+    if (boundary_pos <= node_pos) return false;
+    var consumer_pos = node_pos + 1;
+    while (consumer_pos <= boundary_pos and consumer_pos < node_ids.len) : (consumer_pos += 1) {
+        if (node_ids[consumer_pos] == consumer_id) return true;
+    }
+    return false;
 }
 
 fn reservePartitionGraphPlanForExecution(chunk_ops: usize) bool {
@@ -3915,24 +4008,24 @@ fn buildRuntimeRegionPlan(
     const prepared = try allocator.alloc(PreparedRuntimeRegion, node_ids.len);
     errdefer allocator.free(prepared);
     @memset(prepared, .{ .none = {} });
-        const attention_input_max_first_node = try allocator.alloc(NodeId, value_count);
-        errdefer allocator.free(attention_input_max_first_node);
-        @memset(attention_input_max_first_node, null_node);
-        const pre_skipped_by_region = try allocator.alloc(bool, value_count);
-        errdefer allocator.free(pre_skipped_by_region);
-        @memset(pre_skipped_by_region, false);
-        const null_values = try allocator.alloc(?CT, value_count);
-        defer allocator.free(null_values);
-        @memset(null_values, null);
+    const attention_input_max_first_node = try allocator.alloc(NodeId, value_count);
+    errdefer allocator.free(attention_input_max_first_node);
+    @memset(attention_input_max_first_node, null_node);
+    const pre_skipped_by_region = try allocator.alloc(bool, value_count);
+    errdefer allocator.free(pre_skipped_by_region);
+    @memset(pre_skipped_by_region, false);
+    const null_values = try allocator.alloc(?CT, value_count);
+    defer allocator.free(null_values);
+    @memset(null_values, null);
 
     const skipped = try allocator.alloc(bool, value_count);
     defer allocator.free(skipped);
     @memset(skipped, false);
 
-        var region_count: usize = 0;
-        var pre_skip_stats = RuntimeRegionPreSkipStats{};
-        const raw_linear_regions_suppressed = rawLinearRuntimeRegionsSuppressedForTraining();
-        for (node_ids, 0..) |node_id, node_pos| {
+    var region_count: usize = 0;
+    var pre_skip_stats = RuntimeRegionPreSkipStats{};
+    const raw_linear_regions_suppressed = rawLinearRuntimeRegionsSuppressedForTraining();
+    for (node_ids, 0..) |node_id, node_pos| {
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
         if (i < skipped.len and skipped[i]) continue;
@@ -4158,6 +4251,40 @@ fn runtimeRegionElidedNodeCount(node_ids: []const NodeId, regions: []const Runti
         if (i < skipped.len and skipped[i]) count += 1;
     }
     return count;
+}
+
+fn applyRuntimeRegionPreSkippedNodes(
+    graph: *const Graph,
+    plan: RuntimeRegionPlan,
+    skipped_nodes: []bool,
+    elision_protected_nodes: []const bool,
+    rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    stats: ?*PartitionExecutor.ExecutionStats,
+) void {
+    var applied_nodes: u64 = 0;
+    var applied_transposes: u64 = 0;
+    for (plan.pre_skipped_by_region, 0..) |owned, raw_id| {
+        if (!owned) continue;
+        if (raw_id >= skipped_nodes.len or raw_id >= graph.nodeCount()) continue;
+        if (raw_id < elision_protected_nodes.len and elision_protected_nodes[raw_id]) continue;
+        const node_id: NodeId = @intCast(raw_id);
+        if (rt_map.contains(node_id)) continue;
+        const node = graph.node(node_id);
+        if (node.op == .parameter or isPreMaterializedConstantOp(node.op)) continue;
+        skipped_nodes[raw_id] = true;
+        applied_nodes += 1;
+        if (node.op == .transpose) applied_transposes += 1;
+        if (traceRuntimeRegionsEnabled()) {
+            std.debug.print(
+                "runtime_region_pre_skip: node={} op={s} reason=region_owned\n",
+                .{ node_id, @tagName(node.op) },
+            );
+        }
+    }
+    if (stats) |s| {
+        s.runtime_region_pre_skipped_nodes += applied_nodes;
+        s.runtime_region_pre_skipped_transposes += applied_transposes;
+    }
 }
 
 const RuntimeRegionSummary = struct {
@@ -7405,6 +7532,7 @@ const DebertaEncoderLoraLayerPattern = struct {
     layer_norm_bias_id: NodeId,
     layer_index: usize,
     norm_eps: f32,
+    residual_layer_norm_internal_only: bool = false,
 };
 
 const LayerNormForwardPattern = struct {
@@ -7907,28 +8035,36 @@ fn executeDebertaEncoderLoraLayerPattern(
         return false;
     };
 
-    const residual = cb.add(ffn_output, residual_input) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
-            if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
-            return false;
-        },
-        else => return err,
-    };
-    values[@intCast(pattern.residual_add_id)] = residual;
-    value_device[@intCast(pattern.residual_add_id)] = device_id;
+    const normed = fused: {
+        if (pattern.residual_layer_norm_internal_only) {
+            if (try cb.addLayerNorm(ffn_output, residual_input, ln_weight, ln_bias, pattern.ffn.hidden_size, pattern.norm_eps)) |fused_normed| {
+                break :fused fused_normed;
+            }
+        }
 
-    const normed = cb.layerNorm(
-        residual,
-        ln_weight,
-        ln_bias,
-        pattern.ffn.hidden_size,
-        pattern.norm_eps,
-    ) catch |err| switch (err) {
-        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
-            if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
-            return false;
-        },
-        else => return err,
+        const residual = cb.add(ffn_output, residual_input) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
+                if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+                return false;
+            },
+            else => return err,
+        };
+        values[@intCast(pattern.residual_add_id)] = residual;
+        value_device[@intCast(pattern.residual_add_id)] = device_id;
+
+        break :fused cb.layerNorm(
+            residual,
+            ln_weight,
+            ln_bias,
+            pattern.ffn.hidden_size,
+            pattern.norm_eps,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
+                if (stats) |s| s.metal_deberta_encoder_lora_layer_fallbacks += 1;
+                return false;
+            },
+            else => return err,
+        };
     };
 
     values[@intCast(pattern.layer_norm_id)] = normed;
@@ -8800,12 +8936,16 @@ fn matchDebertaEncoderLoraLayerPattern(
             .layer_norm_bias_id = null_node,
             .layer_index = layer_index,
             .norm_eps = 0,
+            .residual_layer_norm_internal_only = false,
         };
     };
     if (layer_norm.dim != ffn.hidden_size) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_dim", layer_norm.output_id, null);
     if (layerIndexForWeight(graph, layer_norm.weight_id) != layer_index) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_layer", layer_norm.output_id, layer_norm.weight_id);
     if (!isDebertaOutputLayerNormName(graph.parameterName(graph.node(layer_norm.weight_id)))) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_weight_name", layer_norm.output_id, layer_norm.weight_id);
     if (!isDebertaOutputLayerNormName(graph.parameterName(graph.node(layer_norm.bias_id)))) return traceDebertaEncoderLoraLayerMatchDecline("layer_norm_bias_name", layer_norm.output_id, layer_norm.bias_id);
+    const residual_layer_norm_internal_only = layer_norm.internal_node_count == 0 and
+        !graphOutputContains(graph, residual_add_id) and
+        hasOnlyExpectedUses(graph, reachable, skipped_nodes, residual_add_id, &.{layer_norm.output_id});
 
     return .{
         .ffn = ffn,
@@ -8815,6 +8955,7 @@ fn matchDebertaEncoderLoraLayerPattern(
         .layer_norm_bias_id = layer_norm.bias_id,
         .layer_index = layer_index,
         .norm_eps = layer_norm.eps,
+        .residual_layer_norm_internal_only = residual_layer_norm_internal_only,
     };
 }
 
@@ -10594,6 +10735,142 @@ fn sourceFromSimpleTranspose(graph: *const Graph, node_id: NodeId) ?NodeId {
     return node.inputs[0];
 }
 
+const RuntimeRegionPreSkipStats = struct {
+    nodes: usize = 0,
+    transposes: usize = 0,
+    declined_external_consumer: usize = 0,
+
+    fn add(self: *RuntimeRegionPreSkipStats, other: RuntimeRegionPreSkipStats) void {
+        self.nodes += other.nodes;
+        self.transposes += other.transposes;
+        self.declined_external_consumer += other.declined_external_consumer;
+    }
+};
+
+fn markLoraBackwardPreSkipped(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    pre_skipped: []bool,
+    pattern: LoraBackwardPattern,
+) RuntimeRegionPreSkipStats {
+    var stats = RuntimeRegionPreSkipStats{};
+    const input_consumers = [_]NodeId{pattern.grad_a_dot_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.input_transpose_id, input_consumers[0..]));
+    const after_a_consumers = [_]NodeId{pattern.grad_b_dot_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.after_a_transpose_id, after_a_consumers[0..]));
+    const b_consumers = [_]NodeId{pattern.d_after_a_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.b_transpose_id, b_consumers[0..]));
+    return stats;
+}
+
+fn markLowRankLoraBackwardPreSkipped(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    pre_skipped: []bool,
+    pattern: LowRankLoraBackwardPattern,
+) RuntimeRegionPreSkipStats {
+    var stats = RuntimeRegionPreSkipStats{};
+    const after_a_consumers = [_]NodeId{pattern.grad_b_dot_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.after_a_transpose_id, after_a_consumers[0..]));
+    const b_consumers = [_]NodeId{pattern.d_after_a_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.b_transpose_id, b_consumers[0..]));
+    return stats;
+}
+
+fn markRankAdapterBackwardPreSkipped(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    pre_skipped: []bool,
+    pattern: RankAdapterBackwardPattern,
+) RuntimeRegionPreSkipStats {
+    var stats = RuntimeRegionPreSkipStats{};
+    const input_consumers = [_]NodeId{pattern.grad_a_dot_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.input_transpose_id, input_consumers[0..]));
+    const after_a_consumers = [_]NodeId{pattern.grad_b_dot_id};
+    stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.after_a_transpose_id, after_a_consumers[0..]));
+    if (!pattern.rhs_uses_transpose_value) {
+        const rhs_consumers = [_]NodeId{pattern.d_after_a_id};
+        stats.add(markRegionOwnedTransposePreSkipped(graph, reachable, skipped_nodes, pre_skipped, pattern.rhs_transpose_id, rhs_consumers[0..]));
+    }
+    return stats;
+}
+
+fn markRegionOwnedTransposePreSkipped(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    pre_skipped: []bool,
+    node_id: NodeId,
+    allowed_consumers: []const NodeId,
+) RuntimeRegionPreSkipStats {
+    var stats = RuntimeRegionPreSkipStats{};
+    if (node_id == null_node or node_id >= graph.nodeCount()) return stats;
+    const index: usize = @intCast(node_id);
+    if (index >= reachable.len or !reachable[index]) return stats;
+    if (index >= pre_skipped.len) return stats;
+    if (graphOutputContains(graph, node_id)) return stats;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .transpose => {},
+        else => return stats,
+    }
+    if (sourceFromSimpleTranspose(graph, node_id) == null) return stats;
+    if (!allReachableConsumersAllowed(graph, reachable, skipped_nodes, node_id, allowed_consumers)) {
+        stats.declined_external_consumer += 1;
+        if (traceRuntimeRegionsEnabled()) {
+            std.debug.print(
+                "runtime_region_pre_skip_declined: node={} op={s} reason=external_consumer\n",
+                .{ node_id, @tagName(node.op) },
+            );
+        }
+        return stats;
+    }
+    if (!pre_skipped[index]) {
+        pre_skipped[index] = true;
+        stats.nodes += 1;
+        stats.transposes += 1;
+    }
+    return stats;
+}
+
+fn allReachableConsumersAllowed(
+    graph: *const Graph,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    producer_id: NodeId,
+    allowed_consumers: []const NodeId,
+) bool {
+    var consumer_id: NodeId = 0;
+    while (consumer_id < graph.nodeCount()) : (consumer_id += 1) {
+        const consumer_index: usize = @intCast(consumer_id);
+        if (consumer_index >= reachable.len or !reachable[consumer_index]) continue;
+        if (consumer_index < skipped_nodes.len and skipped_nodes[consumer_index]) continue;
+        const consumer = graph.node(consumer_id);
+        for (consumer.getInputs()) |input_id| {
+            if (input_id != producer_id) continue;
+            if (!nodeIdListContains(allowed_consumers, consumer_id)) return false;
+        }
+    }
+    return true;
+}
+
+fn nodeIdListContains(ids: []const NodeId, needle: NodeId) bool {
+    for (ids) |id| {
+        if (id == needle) return true;
+    }
+    return false;
+}
+
+fn graphOutputContains(graph: *const Graph, node_id: NodeId) bool {
+    for (graph.outputs.items) |output_id| {
+        if (output_id == node_id) return true;
+    }
+    return false;
+}
+
 fn loraBParameterFromBackwardTranspose(graph: *const Graph, node_id: NodeId) ?NodeId {
     const source_id = sourceFromSimpleTranspose(graph, node_id) orelse return null;
     if (isLoraParameter(graph, source_id, ".lora_B")) return source_id;
@@ -10610,6 +10887,7 @@ fn markLoraBackwardSkipped(skipped: []bool, pattern: LoraBackwardPattern) void {
         pattern.grad_b_id,
         pattern.input_transpose_id,
         pattern.after_a_transpose_id,
+        pattern.b_transpose_id,
     };
     for (ids) |node_id| {
         const index: usize = @intCast(node_id);
@@ -10621,6 +10899,7 @@ fn markLowRankLoraBackwardSkipped(skipped: []bool, pattern: LowRankLoraBackwardP
     const ids = [_]NodeId{
         pattern.grad_b_dot_id,
         pattern.after_a_transpose_id,
+        pattern.b_transpose_id,
     };
     for (ids) |node_id| {
         const index: usize = @intCast(node_id);
@@ -10636,6 +10915,7 @@ fn markRankAdapterBackwardSkipped(skipped: []bool, pattern: RankAdapterBackwardP
         pattern.grad_b_id,
         pattern.input_transpose_id,
         pattern.after_a_transpose_id,
+        pattern.rhs_transpose_id,
     };
     for (ids) |node_id| {
         const index: usize = @intCast(node_id);
@@ -13276,10 +13556,10 @@ fn tryExecuteMetalCommand(
         .fused_sigmoid => try executeRuntimeFusedUnary(cb, values, inputs, .sigmoid),
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
         .fused_elem_add, .add => try executeRuntimeAdd(graph, cb, values, inputs, n.output_shape, output_hint),
-        .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply, output_hint),
-        .sub => try executeRuntimeBinary(cb, values, inputs, .subtract, output_hint),
-        .div => try executeRuntimeBinary(cb, values, inputs, .divide, output_hint),
-        .less_than => try executeRuntimeBinary(cb, values, inputs, .less_than, null),
+        .fused_elem_multiply, .mul => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .multiply, output_hint),
+        .sub => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .subtract, output_hint),
+        .div => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .divide, output_hint),
+        .less_than => try executeRuntimeBinary(graph, cb, values, node_id, inputs, n.output_shape, .less_than, null),
         .where_select => try executeRuntimeWhereSelect(cb, values, inputs),
         .reduce_sum => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .sum, output_hint, stats, resident_input_cache),
         .reduce_max => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .max, output_hint, stats, resident_input_cache),
@@ -13773,14 +14053,29 @@ const RuntimeBinaryOp = enum {
 };
 
 fn executeRuntimeBinary(
+    graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
+    node_id: NodeId,
     inputs: []const NodeId,
+    output_shape: ml.graph.Shape,
     op: RuntimeBinaryOp,
     output_hint: ?CT,
 ) !?CT {
-    var lhs = valueFor(values, inputs[0]) orelse return null;
-    var rhs = valueFor(values, inputs[1]) orelse return null;
+    const lhs_operand = runtimeBinaryOperand(graph, values, inputs[0], output_shape) orelse {
+        if (traceRuntimeCommandFallbacksEnabled()) traceRuntimeBinaryFallback(graph, node_id, op, "missing_lhs", null, null, output_shape);
+        return null;
+    };
+    const rhs_operand = runtimeBinaryOperand(graph, values, inputs[1], output_shape) orelse {
+        if (traceRuntimeCommandFallbacksEnabled()) traceRuntimeBinaryFallback(graph, node_id, op, "missing_rhs", lhs_operand, null, output_shape);
+        return null;
+    };
+    if (!binaryBroadcastResultMatches(lhs_operand.shape, rhs_operand.shape, output_shape)) {
+        if (traceRuntimeCommandFallbacksEnabled()) traceRuntimeBinaryFallback(graph, node_id, op, "broadcast_mismatch", lhs_operand, rhs_operand, output_shape);
+        return null;
+    }
+    var lhs = lhs_operand.value;
+    var rhs = rhs_operand.value;
     var owned_lhs: ?CT = null;
     defer if (owned_lhs) |ct| cb.free(ct);
     var owned_rhs: ?CT = null;
@@ -13802,11 +14097,13 @@ fn executeRuntimeBinary(
         // force_barrier guards reused pooled buffers against non-declaring
         // consumer reads (conservative: barrier on every pooled write).
         if (output_hint) |hint| {
-            switch (op) {
-                .multiply => if (try metal_compute_mod.MetalCompute.multiplyInto(cb, lhs, rhs, hint, false)) |out| return out,
-                .subtract => if (try metal_compute_mod.MetalCompute.subtractInto(cb, lhs, rhs, hint)) |out| return out,
-                .divide => if (try metal_compute_mod.MetalCompute.divideInto(cb, lhs, rhs, hint)) |out| return out,
-                .less_than => {},
+            if (sameElementCount(lhs_operand.shape, rhs_operand.shape)) {
+                switch (op) {
+                    .multiply => if (try metal_compute_mod.MetalCompute.multiplyInto(cb, lhs, rhs, hint, false)) |out| return out,
+                    .subtract => if (try metal_compute_mod.MetalCompute.subtractInto(cb, lhs, rhs, hint)) |out| return out,
+                    .divide => if (try metal_compute_mod.MetalCompute.divideInto(cb, lhs, rhs, hint)) |out| return out,
+                    .less_than => {},
+                }
             }
         }
     }
@@ -13816,7 +14113,10 @@ fn executeRuntimeBinary(
         .divide => cb.primDivide(lhs, rhs),
         .less_than => cb.primLessThan(lhs, rhs),
     } catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => {
+            if (traceRuntimeCommandFallbacksEnabled()) traceRuntimeBinaryFallback(graph, node_id, op, @errorName(err), lhs_operand, rhs_operand, output_shape);
+            return null;
+        },
         else => return err,
     };
 }
@@ -14676,12 +14976,15 @@ fn executeRuntimeAdd(
     const dim = tensorElementCount(output_shape) orelse return null;
     if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
-    const lhs = valueFor(values, inputs[0]) orelse return null;
-    const rhs = valueFor(values, inputs[1]) orelse return null;
+    const lhs_operand = runtimeBinaryOperand(graph, values, inputs[0], output_shape) orelse return null;
+    const rhs_operand = runtimeBinaryOperand(graph, values, inputs[1], output_shape) orelse return null;
+    if (!binaryBroadcastResultMatches(lhs_operand.shape, rhs_operand.shape, output_shape)) return null;
+    const lhs = lhs_operand.value;
+    const rhs = rhs_operand.value;
     // Slot-bound output: same-shape elementwise add into the pooled buffer
     // (both operands already device-resident; addInto self-checks equal sizes).
     if (output_hint) |hint| {
-        if (isMetalDeviceResident(cb, lhs) and isMetalDeviceResident(cb, rhs)) {
+        if (isMetalDeviceResident(cb, lhs) and isMetalDeviceResident(cb, rhs) and sameElementCount(lhs_operand.shape, rhs_operand.shape)) {
             if (try metal_compute_mod.MetalCompute.addInto(cb, lhs, rhs, hint, false)) |out| return out;
         }
     }
@@ -14708,6 +15011,26 @@ const DeferredElementwiseMul = struct {
     lhs_id: NodeId,
     rhs_id: NodeId,
 };
+
+const RuntimeBinaryOperand = struct {
+    value: CT,
+    shape: ml.graph.Shape,
+    node_id: NodeId,
+};
+
+fn runtimeBinaryOperand(
+    graph: *const Graph,
+    values: []?CT,
+    node_id: NodeId,
+    output_shape: ml.graph.Shape,
+) ?RuntimeBinaryOperand {
+    _ = output_shape;
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    if (valueFor(values, node_id)) |value| {
+        return .{ .value = value, .shape = graph.node(node_id).output_shape, .node_id = node_id };
+    }
+    return null;
+}
 
 fn executeRuntimeScaledAddFromDeferredMul(
     graph: *const Graph,
@@ -15048,6 +15371,40 @@ fn isSameShapeElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape:
     return shapesEqual(node.output_shape, output_shape);
 }
 
+fn binaryBroadcastResultMatches(
+    lhs_shape: ml.graph.Shape,
+    rhs_shape: ml.graph.Shape,
+    output_shape: ml.graph.Shape,
+) bool {
+    if (lhs_shape.dtype != output_shape.dtype or rhs_shape.dtype != output_shape.dtype) return false;
+    const lhs_rank = lhs_shape.rank();
+    const rhs_rank = rhs_shape.rank();
+    const output_rank = output_shape.rank();
+    if (output_rank == 0) {
+        const lhs_count = tensorElementCount(lhs_shape) orelse return false;
+        const rhs_count = tensorElementCount(rhs_shape) orelse return false;
+        return lhs_count == 1 and rhs_count == 1;
+    }
+    if (lhs_rank > output_rank or rhs_rank > output_rank) return false;
+    var axis_from_end: usize = 0;
+    while (axis_from_end < output_rank) : (axis_from_end += 1) {
+        const output_axis = output_rank - 1 - axis_from_end;
+        const lhs_dim = if (axis_from_end < lhs_rank)
+            lhs_shape.dim(@intCast(lhs_rank - 1 - axis_from_end))
+        else
+            1;
+        const rhs_dim = if (axis_from_end < rhs_rank)
+            rhs_shape.dim(@intCast(rhs_rank - 1 - axis_from_end))
+        else
+            1;
+        const output_dim = output_shape.dim(@intCast(output_axis));
+        if (lhs_dim <= 0 or rhs_dim <= 0 or output_dim <= 0) return false;
+        const result_dim = if (lhs_dim == rhs_dim) lhs_dim else if (lhs_dim == 1) rhs_dim else if (rhs_dim == 1) lhs_dim else return false;
+        if (result_dim != output_dim) return false;
+    }
+    return true;
+}
+
 fn shouldDeferScaleMulForAdd(
     graph: *const Graph,
     node_id: NodeId,
@@ -15068,7 +15425,8 @@ fn shouldDeferScaleMulForAdd(
     }
     if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
     if (reachableUseCount(graph, node_id, reachable, 2) != 1) return false;
-    return deferredScaleMul(graph, node_id, consumer.output_shape) != null;
+    if (deferredScaleMul(graph, node_id, consumer.output_shape) == null) return false;
+    return deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use);
 }
 
 fn shouldDeferElementwiseMulForAdd(
@@ -15092,6 +15450,31 @@ fn shouldDeferElementwiseMulForAdd(
     if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
     if (reachableUseCount(graph, node_id, reachable, 2) != 1) return false;
     if (deferredElementwiseMul(graph, node_id, consumer.output_shape) == null) return false;
+    if (!deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use)) return false;
+    return true;
+}
+
+fn deferredProducerInputsLiveUntilConsumer(
+    graph: *const Graph,
+    producer_id: NodeId,
+    consumer_id: NodeId,
+    last_use: []const u32,
+) bool {
+    if (producer_id == null_node or producer_id >= graph.nodeCount()) return false;
+    const producer_index: usize = @intCast(producer_id);
+    const consumer_index: usize = @intCast(consumer_id);
+    const producer = graph.node(producer_id);
+    for (producer.getInputs()) |input_id| {
+        if (input_id == null_node or input_id >= graph.nodeCount()) return false;
+        const input_index: usize = @intCast(input_id);
+        if (input_index >= last_use.len) return false;
+        const input_last_use = last_use[input_index];
+        if (input_last_use == std.math.maxInt(u32)) continue;
+        const input_last_use_index: usize = @intCast(input_last_use);
+        if (input_last_use_index == producer_index) continue;
+        if (input_last_use_index >= consumer_index) continue;
+        return false;
+    }
     return true;
 }
 
@@ -17341,6 +17724,120 @@ test "metal partition executor defers same shape multiply for multiply-add" {
     try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use));
 }
 
+test "metal partition executor allows deferred multiply-add inside current frame chunk" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const multiplied = try b.mul(x, y);
+    const out = try b.add(multiplied, z);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const node_ids = [_]NodeId{ x, y, z, multiplied, out };
+    try std.testing.expect(deferredProducerConsumerStaysInFrameChunk(&node_ids, 3, multiplied, 4, 0, last_use));
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use));
+}
+
+test "metal partition executor does not defer multiply-add when producer input dies before add" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const residual = try b.parameter("residual", shape);
+    const multiplied = try b.mul(x, y);
+    const intervening_consumer = try b.add(x, z);
+    const out = try b.add(multiplied, residual);
+    try g.markOutput(intervening_consumer);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(u32, @intCast(intervening_consumer)), last_use[@intCast(x)]);
+    try std.testing.expect(!deferredProducerInputsLiveUntilConsumer(&g, multiplied, out, last_use));
+    try std.testing.expect(!shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use));
+}
+
+test "metal partition executor defers multiply-add when producer inputs live through add" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const residual = try b.parameter("residual", shape);
+    const multiplied = try b.mul(x, y);
+    const out = try b.add(multiplied, residual);
+    const later_consumer = try b.add(x, z);
+    try g.markOutput(out);
+    try g.markOutput(later_consumer);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(u32, @intCast(later_consumer)), last_use[@intCast(x)]);
+    try std.testing.expect(deferredProducerInputsLiveUntilConsumer(&g, multiplied, out, last_use));
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use));
+}
+
+test "metal partition executor declines deferred multiply-add across frame chunk boundary" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const multiplied = try b.mul(x, y);
+    const out = try b.add(multiplied, z);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const node_ids = [_]NodeId{ x, y, z, multiplied, out };
+    try std.testing.expect(!deferredProducerConsumerStaysInFrameChunk(&node_ids, 3, multiplied, 1, 0, last_use));
+    try std.testing.expect(!deferredProducerConsumerStaysInFrameChunk(&node_ids, 3, multiplied, 4, 3, last_use));
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, multiplied, reachable, last_use));
+}
+
+test "metal partition executor accepts singleton operands for scalar binary result" {
+    const scalar = Shape.scalar(.f32);
+    const singleton_vector = Shape.init(.f32, &.{1});
+    const singleton_matrix = Shape.init(.f32, &.{ 1, 1 });
+    const non_singleton_vector = Shape.init(.f32, &.{2});
+
+    try std.testing.expect(binaryBroadcastResultMatches(scalar, singleton_matrix, scalar));
+    try std.testing.expect(binaryBroadcastResultMatches(singleton_vector, singleton_matrix, scalar));
+    try std.testing.expect(!binaryBroadcastResultMatches(scalar, non_singleton_vector, scalar));
+}
+
 test "metal partition executor defers both same shape multiply add inputs" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -17592,6 +18089,235 @@ test "metal partition executor chunk-safe transpose defer is limited to weight p
     try std.testing.expect(transposeSourceIsWeightParameter(&g, weight_t));
     try std.testing.expect(shouldDeferTransposeForLinearDot(&g, input_like_t, reachable, last_use));
     try std.testing.expect(!transposeSourceIsWeightParameter(&g, input_like_t));
+}
+
+test "metal partition executor rank adapter backward pre-skips safe internal transposes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const in_dim: usize = 4;
+    const rank: usize = 2;
+    const out_dim: usize = 5;
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const after_a = try b.parameter("after_a", ml.graph.Shape.init(.f32, &.{ rows, rank }));
+    const output_grad = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+    const rhs = try b.parameter("adapter_b", ml.graph.Shape.init(.f32, &.{ rank, out_dim }));
+    const rhs_t = try b.transpose(rhs, &.{ 1, 0 });
+    const d_after_a = try b.matmul(output_grad, rhs_t);
+    const input_t = try b.transpose(input, &.{ 1, 0 });
+    const grad_a_dot = try b.matmul(input_t, d_after_a);
+    const grad_a = try b.transpose(grad_a_dot, &.{ 1, 0 });
+    const after_a_t = try b.transpose(after_a, &.{ 1, 0 });
+    const grad_b_dot = try b.matmul(after_a_t, output_grad);
+    const grad_b = try b.transpose(grad_b_dot, &.{ 1, 0 });
+    try g.markOutput(d_after_a);
+    try g.markOutput(grad_a);
+    try g.markOutput(grad_b);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const pre_skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(pre_skipped);
+    @memset(pre_skipped, false);
+
+    const pattern = RankAdapterBackwardPattern{
+        .d_after_a_id = d_after_a,
+        .grad_a_dot_id = grad_a_dot,
+        .grad_a_id = grad_a,
+        .grad_b_dot_id = grad_b_dot,
+        .grad_b_id = grad_b,
+        .input_transpose_id = input_t,
+        .after_a_transpose_id = after_a_t,
+        .rhs_transpose_id = rhs_t,
+        .input_id = input,
+        .after_a_id = after_a,
+        .rhs_source_id = rhs,
+        .rhs_uses_transpose_value = false,
+        .output_grad_id = output_grad,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+
+    const stats = markRankAdapterBackwardPreSkipped(&g, reachable, skipped, pre_skipped, pattern);
+    try std.testing.expectEqual(@as(usize, 3), stats.nodes);
+    try std.testing.expectEqual(@as(usize, 3), stats.transposes);
+    try std.testing.expectEqual(@as(usize, 0), stats.declined_external_consumer);
+    try std.testing.expect(pre_skipped[@intCast(input_t)]);
+    try std.testing.expect(pre_skipped[@intCast(after_a_t)]);
+    try std.testing.expect(pre_skipped[@intCast(rhs_t)]);
+}
+
+test "metal partition executor rank adapter backward pre-skip declines external transpose consumer" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const in_dim: usize = 4;
+    const rank: usize = 2;
+    const out_dim: usize = 5;
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const after_a = try b.parameter("after_a", ml.graph.Shape.init(.f32, &.{ rows, rank }));
+    const output_grad = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+    const rhs = try b.parameter("adapter_b", ml.graph.Shape.init(.f32, &.{ rank, out_dim }));
+    const rhs_t = try b.transpose(rhs, &.{ 1, 0 });
+    const rhs_probe = try b.parameter("rhs_probe", ml.graph.Shape.init(.f32, &.{ out_dim, rank }));
+    const escaped_rhs = try b.add(rhs_t, rhs_probe);
+    const d_after_a = try b.matmul(output_grad, rhs_t);
+    const input_t = try b.transpose(input, &.{ 1, 0 });
+    const grad_a_dot = try b.matmul(input_t, d_after_a);
+    const grad_a = try b.transpose(grad_a_dot, &.{ 1, 0 });
+    const after_a_t = try b.transpose(after_a, &.{ 1, 0 });
+    const grad_b_dot = try b.matmul(after_a_t, output_grad);
+    const grad_b = try b.transpose(grad_b_dot, &.{ 1, 0 });
+    try g.markOutput(d_after_a);
+    try g.markOutput(grad_a);
+    try g.markOutput(grad_b);
+    try g.markOutput(escaped_rhs);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const pre_skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(pre_skipped);
+    @memset(pre_skipped, false);
+
+    const pattern = RankAdapterBackwardPattern{
+        .d_after_a_id = d_after_a,
+        .grad_a_dot_id = grad_a_dot,
+        .grad_a_id = grad_a,
+        .grad_b_dot_id = grad_b_dot,
+        .grad_b_id = grad_b,
+        .input_transpose_id = input_t,
+        .after_a_transpose_id = after_a_t,
+        .rhs_transpose_id = rhs_t,
+        .input_id = input,
+        .after_a_id = after_a,
+        .rhs_source_id = rhs,
+        .rhs_uses_transpose_value = false,
+        .output_grad_id = output_grad,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+
+    const stats = markRankAdapterBackwardPreSkipped(&g, reachable, skipped, pre_skipped, pattern);
+    try std.testing.expectEqual(@as(usize, 2), stats.nodes);
+    try std.testing.expectEqual(@as(usize, 2), stats.transposes);
+    try std.testing.expectEqual(@as(usize, 1), stats.declined_external_consumer);
+    try std.testing.expect(pre_skipped[@intCast(input_t)]);
+    try std.testing.expect(pre_skipped[@intCast(after_a_t)]);
+    try std.testing.expect(!pre_skipped[@intCast(rhs_t)]);
+}
+
+test "metal partition executor rank adapter backward keeps rhs transpose when region needs transpose value" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 3;
+    const in_dim: usize = 4;
+    const rank: usize = 2;
+    const out_dim: usize = 5;
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const after_a = try b.parameter("after_a", ml.graph.Shape.init(.f32, &.{ rows, rank }));
+    const output_grad = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+    const rhs = try b.parameter("adapter_b", ml.graph.Shape.init(.f32, &.{ rank, out_dim }));
+    const rhs_t = try b.transpose(rhs, &.{ 1, 0 });
+    const d_after_a = try b.matmul(output_grad, rhs_t);
+    const input_t = try b.transpose(input, &.{ 1, 0 });
+    const grad_a_dot = try b.matmul(input_t, d_after_a);
+    const grad_a = try b.transpose(grad_a_dot, &.{ 1, 0 });
+    const after_a_t = try b.transpose(after_a, &.{ 1, 0 });
+    const grad_b_dot = try b.matmul(after_a_t, output_grad);
+    const grad_b = try b.transpose(grad_b_dot, &.{ 1, 0 });
+    try g.markOutput(d_after_a);
+    try g.markOutput(grad_a);
+    try g.markOutput(grad_b);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const pre_skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(pre_skipped);
+    @memset(pre_skipped, false);
+
+    const pattern = RankAdapterBackwardPattern{
+        .d_after_a_id = d_after_a,
+        .grad_a_dot_id = grad_a_dot,
+        .grad_a_id = grad_a,
+        .grad_b_dot_id = grad_b_dot,
+        .grad_b_id = grad_b,
+        .input_transpose_id = input_t,
+        .after_a_transpose_id = after_a_t,
+        .rhs_transpose_id = rhs_t,
+        .input_id = input,
+        .after_a_id = after_a,
+        .rhs_source_id = rhs,
+        .rhs_uses_transpose_value = true,
+        .output_grad_id = output_grad,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .rank = rank,
+    };
+
+    const stats = markRankAdapterBackwardPreSkipped(&g, reachable, skipped, pre_skipped, pattern);
+    try std.testing.expectEqual(@as(usize, 2), stats.nodes);
+    try std.testing.expectEqual(@as(usize, 2), stats.transposes);
+    try std.testing.expectEqual(@as(usize, 0), stats.declined_external_consumer);
+    try std.testing.expect(pre_skipped[@intCast(input_t)]);
+    try std.testing.expect(pre_skipped[@intCast(after_a_t)]);
+    try std.testing.expect(!pre_skipped[@intCast(rhs_t)]);
+}
+
+test "metal partition executor applies runtime region pre-skip mask before node execution" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const x_t = try b.transpose(x, &.{ 1, 0 });
+    const probe = try b.parameter("probe", ml.graph.Shape.init(.f32, &.{ 3, 2 }));
+    const out = try b.add(x_t, probe);
+    try g.markOutput(out);
+
+    const pre_skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(pre_skipped);
+    @memset(pre_skipped, false);
+    pre_skipped[@intCast(x_t)] = true;
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const protected = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(protected);
+    @memset(protected, false);
+    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    defer rt_map.deinit(allocator);
+    var stats = PartitionExecutor.ExecutionStats{};
+
+    const plan = RuntimeRegionPlan{ .pre_skipped_by_region = pre_skipped };
+    applyRuntimeRegionPreSkippedNodes(&g, plan, skipped, protected, rt_map, &stats);
+
+    try std.testing.expect(skipped[@intCast(x_t)]);
+    try std.testing.expectEqual(@as(u64, 1), stats.runtime_region_pre_skipped_nodes);
+    try std.testing.expectEqual(@as(u64, 1), stats.runtime_region_pre_skipped_transposes);
 }
 
 test "metal partition executor recognizes grouped qkv linear slice graph region" {

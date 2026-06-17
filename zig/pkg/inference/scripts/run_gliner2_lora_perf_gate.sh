@@ -20,6 +20,7 @@ Options:
   --compare-steps N                Steps per comparison run (default: 1)
   --production-batch32             Use the production batch-32/seq-128 LoRA profile
   --production-ready               Use the strict repeated-run production batch-32 gate
+  --allow-smoke-fallback           Allow checked-in smoke fixtures for non-production diagnostics
   --warm-research                  Batch-32 warm-step diagnostic: 1 warmup + 3 measured steps, non-strict
   --warm-production-ready          Strict warm-step production target: median <=1.0x Python, any-run <=1.10x
   --op-stats                       Enable Metal partition op-stats collection
@@ -104,6 +105,7 @@ production_batch32=0
 production_ready=0
 warm_research=0
 warm_production_ready=0
+allow_smoke_fallback=0
 op_stats=0
 op_runs=0
 loop_profile=0
@@ -185,6 +187,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --production-ready)
       production_ready=1
+      shift
+      ;;
+    --allow-smoke-fallback)
+      allow_smoke_fallback=1
       shift
       ;;
     --warm-research)
@@ -365,6 +371,9 @@ fi
 if (( warm_production_ready )); then
   production_ready=1
 fi
+if (( require_loss_parity )); then
+  include_python=1
+fi
 
 if (( production_ready )); then
   production_batch32=1
@@ -387,10 +396,12 @@ if (( production_batch32 )); then
   if (( ! model_dir_explicit )) && [[ -d "${hf_gliner2_snapshot}" && ( ! -f "${model_dir}/model.safetensors" || ! -f "${model_dir}/config.json" || ! -f "${model_dir}/tokenizer.json" || ! -f "${model_dir}/encoder_config/config.json" ) ]]; then
     model_dir="${hf_gliner2_snapshot}"
   fi
-  if (( ! train_data_explicit )) && [[ "${train_data}" == "/private/tmp/termite-gliner2-production-diagnostic/train.jsonl" && -f /private/tmp/gliner2_ner_batch32_train.jsonl ]]; then
-    train_data="/private/tmp/gliner2_ner_batch32_train.jsonl"
-  elif (( ! train_data_explicit )) && [[ "${train_data}" == "/private/tmp/termite-gliner2-production-diagnostic/train.jsonl" && -f /private/tmp/gliner2_realistic.jsonl ]]; then
-    train_data="/private/tmp/gliner2_realistic.jsonl"
+  if (( ! train_data_explicit && allow_smoke_fallback && ! production_ready && ! require_loss_parity )) && [[ "${train_data}" == "/private/tmp/termite-gliner2-production-diagnostic/train.jsonl" ]]; then
+    if [[ -f /private/tmp/gliner2_realistic.jsonl ]]; then
+      train_data="/private/tmp/gliner2_realistic.jsonl"
+    elif [[ -f /private/tmp/gliner2_ner_batch32_train.jsonl ]]; then
+      train_data="/private/tmp/gliner2_ner_batch32_train.jsonl"
+    fi
   fi
   if (( production_ready )) && [[ -z "${max_zig_metal_peak_live_bytes_median}" ]]; then
     max_zig_metal_peak_live_bytes_median=1717986918
@@ -502,6 +513,15 @@ if [[ ! -f "${train_data}" ]]; then
   fi
   exit 2
 fi
+case "${train_data}" in
+  */gliner2_ner_batch32_train.jsonl|*/gliner2_*_smoke.jsonl)
+    if (( production_ready || require_loss_parity )); then
+      echo "GLiNER2 production/loss-parity gate refuses smoke training data: ${train_data}" >&2
+      echo "Run scripts/prepare_gliner2_production_diagnostic.py or pass a real --train-data JSONL." >&2
+      exit 2
+    fi
+    ;;
+esac
 
 if [[ -z "${python_model}" ]]; then
   python_model="${model_dir}"
@@ -664,7 +684,9 @@ if (( production_batch32 )); then
     "--timeout-seconds" "900"
   )
 fi
-if (( include_python )); then
+if (( require_loss_parity )); then
+  compare_args+=("--deterministic")
+elif (( include_python )); then
   compare_args+=("--perf-target-only-python")
 else
   compare_args+=("--skip-python")
