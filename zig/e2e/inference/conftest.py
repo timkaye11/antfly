@@ -21,8 +21,9 @@ Usage:
     # Start server automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest e2e/inference
 
-    # Custom models directory:
+    # Custom AI and ML directories:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
+    ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
 
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
@@ -35,14 +36,18 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 
 import pytest
 import requests
 
-from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, models_dir
+from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, ml_dir, models_dir
 
 API_PREFIX = "/ai/v1"
+ML_API_PREFIX = "/ml/v1"
+DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
+SERVER_OUTPUT_LIMIT = 4000
 
 
 def env_first(*names: str) -> str | None:
@@ -56,8 +61,12 @@ def env_first(*names: str) -> str | None:
 def api_path(path: str) -> str:
     """Resolve bare API paths against the current antfly prefix."""
 
+    if path.startswith(ML_API_PREFIX + "/") or path == ML_API_PREFIX:
+        return path
     if path.startswith(API_PREFIX + "/") or path == API_PREFIX:
         return path
+    if path == "/predict" or path.startswith("/predict/"):
+        return ML_API_PREFIX + path
     if path.startswith("/"):
         return API_PREFIX + path
     return API_PREFIX + "/" + path
@@ -73,10 +82,10 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            r = requests.get(f"{url}/readyz", timeout=2)
+            r = requests.get(f"{url}/healthz", timeout=2)
             if r.ok:
                 return True
-        except requests.ConnectionError:
+        except requests.RequestException:
             pass
         time.sleep(0.5)
     return False
@@ -85,22 +94,36 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
 class InferenceServer:
     """Manages a local inference server process."""
 
-    def __init__(self, command_prefix: list[str], models_path: str, host: str, port: int):
+    def __init__(self, command_prefix: list[str], models_path: str, ml_path: str, host: str, port: int):
         self.url = f"http://{host}:{port}"
+        self.output = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen(
-            [*command_prefix, "run", "--host", host, "--port", str(port), "--models-dir", models_path],
-            stdout=subprocess.PIPE,
+            [
+                *command_prefix,
+                "run",
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--models-dir",
+                models_path,
+                "--ml-dir",
+                ml_path,
+            ],
+            stdout=self.output,
             stderr=subprocess.STDOUT,
         )
         if not wait_for_server(self.url):
-            # Capture output for debugging
-            out = ""
-            if self.proc.stdout:
-                out = self.proc.stdout.read().decode(errors="replace")[:2000]
-            self.stop()
+            self.stop(close_output=False)
+            out = self.read_output()
+            self.output.close()
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
 
-    def stop(self):
+    def read_output(self) -> str:
+        self.output.seek(0)
+        return self.output.read(SERVER_OUTPUT_LIMIT).decode(errors="replace")
+
+    def stop(self, close_output: bool = True):
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -108,6 +131,8 @@ class InferenceServer:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait()
+        if close_output:
+            self.output.close()
 
 
 @pytest.fixture(scope="session")
@@ -131,9 +156,10 @@ def base_url():
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
     models_path = str(models_dir())
+    ml_path = str(ml_dir())
 
     port = find_free_port()
-    server = InferenceServer(command_prefix, models_path, "127.0.0.1", port)
+    server = InferenceServer(command_prefix, models_path, ml_path, "127.0.0.1", port)
     yield server.url
     server.stop()
 
@@ -168,6 +194,7 @@ def api(base_url):
         def _request(self, method: str, path: str, *, json=None, retry_on_missing_model: bool = True, **kwargs):
             request = getattr(self.s, method)
             normalized_path = api_path(path)
+            kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
             response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
             if retry_on_missing_model and maybe_pull_missing_model(normalized_path, json, response):
                 response.close()

@@ -62,10 +62,6 @@ const metal_compute = if (build_options.enable_metal) @import("../ops/metal_comp
         };
     };
 };
-const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {
-    pub const MlxCompute = opaque {};
-};
-
 const training = @import("../graph/training.zig");
 
 const coord_mod = @import("training_memory_coordinator.zig");
@@ -183,8 +179,8 @@ pub const TrainerConfig = struct {
     /// Optional distributed gradient-reduction hook. Called exactly once per
     /// accumulation flush, immediately before the optimizer step, with a
     /// GradBlock per LoRA parameter. A typical DDP caller would wire this to
-    /// `mlx_compute.allSumFloat32InPlaceOnStream` (one all-reduce per block)
-    /// to fold LoRA gradients across ranks before AdamW updates.
+    /// a backend-specific all-reduce hook to fold LoRA gradients across ranks
+    /// before AdamW updates.
     reduce_grads: ?ReduceGradsFn = null,
     /// Opaque context pointer forwarded to `reduce_grads` on each call.
     reduce_grads_ctx: ?*anyopaque = null,
@@ -195,8 +191,8 @@ pub const TrainerConfig = struct {
     /// Opaque context pointer forwarded to `reduce_device_grads`.
     reduce_device_grads_ctx: ?*anyopaque = null,
     /// Execution engine for the gradient graph. The interpreter preserves
-    /// historical behavior. `compiled_metal` and `compiled_mlx` cache the
-    /// autodiff graph and keep trainable optimizer state on their device.
+    /// historical behavior. `compiled_metal` caches the autodiff graph and
+    /// keeps trainable optimizer state on Metal.
     execution_engine: TrainingExecutionEngine = .interpreter,
     /// When true, fail instead of silently falling back to interpreter if the
     /// requested compiled engine cannot be prepared.
@@ -212,7 +208,6 @@ pub const TrainerConfig = struct {
 pub const TrainingExecutionEngine = enum {
     interpreter,
     compiled_metal,
-    compiled_mlx,
 };
 
 // ── Step I/O ─────────────────────────────────────────────────────────────────
@@ -450,7 +445,7 @@ pub const StepProfile = struct {
     metal_deberta_attention_legacy_calls: u64 = 0,
 };
 
-pub const OptimizerBackend = enum { host, metal, mlx };
+pub const OptimizerBackend = enum { host, metal };
 
 const ExecutionMode = enum {
     train,
@@ -612,10 +607,6 @@ pub const RealAutodiffTrainer = struct {
         if (self.config.execution_engine == .interpreter) return false;
         if (self.config.execution_engine == .compiled_metal and self.compute_backend.kind() != .metal) {
             if (self.config.compiled_required) return error.CompiledMetalRequiresMetalBackend;
-            return false;
-        }
-        if (self.config.execution_engine == .compiled_mlx and self.compute_backend.kind() != .mlx) {
-            if (self.config.compiled_required) return error.CompiledMlxRequiresMlxBackend;
             return false;
         }
         if (self.compiled_session == null) {
@@ -1225,24 +1216,16 @@ pub const RealAutodiffTrainer = struct {
         return @ptrCast(@alignCast(self.compute_backend.ptr));
     }
 
-    fn mlxCompute(self: *RealAutodiffTrainer) !*mlx_compute.MlxCompute {
-        if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-        if (self.compute_backend.kind() != .mlx) return error.MlxBackendUnavailable;
-        return @ptrCast(@alignCast(self.compute_backend.ptr));
-    }
-
     fn deviceOptimizerRequested(self: *const RealAutodiffTrainer) bool {
         return switch (self.config.execution_engine) {
             .interpreter => false,
             .compiled_metal => self.compute_backend.kind() == .metal,
-            .compiled_mlx => self.compute_backend.kind() == .mlx,
         };
     }
 
     fn deviceOptimizerBackend(self: *const RealAutodiffTrainer) OptimizerBackend {
         return switch (self.compute_backend.kind()) {
             .metal => .metal,
-            .mlx => .mlx,
             else => .host,
         };
     }
@@ -1365,12 +1348,6 @@ pub const RealAutodiffTrainer = struct {
                 for (self.lora_params.items) |*slot| try self.ensureMetalDeviceOptimizerSlot(metal, slot);
                 for (self.regular_params.items) |*slot| try self.ensureMetalDeviceOptimizerSlot(metal, slot);
             },
-            .mlx => {
-                if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-                const mlx = try self.mlxCompute();
-                for (self.lora_params.items) |*slot| try self.ensureMlxDeviceOptimizerSlot(mlx, slot);
-                for (self.regular_params.items) |*slot| try self.ensureMlxDeviceOptimizerSlot(mlx, slot);
-            },
             else => return error.DeviceOptimizerBackendUnavailable,
         }
     }
@@ -1384,25 +1361,6 @@ pub const RealAutodiffTrainer = struct {
         const m = try metal.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(m);
         const v = try metal.trainingZeroF32(slot.weights.len, slot.dims);
-        errdefer self.compute_backend.free(v);
-        slot.device = .{
-            .weight = weight,
-            .grad_accum = grad_accum,
-            .m = m,
-            .v = v,
-        };
-        self.device_trainable_bytes += slot.weights.len * @sizeOf(f32) * 4;
-    }
-
-    fn ensureMlxDeviceOptimizerSlot(self: *RealAutodiffTrainer, mlx: *mlx_compute.MlxCompute, slot: *ParamSlot) !void {
-        if (slot.device != null) return;
-        const weight = try mlx.trainingUploadF32(slot.weights, slot.dims);
-        errdefer self.compute_backend.free(weight);
-        const grad_accum = try mlx.trainingZeroF32(slot.weights.len, slot.dims);
-        errdefer self.compute_backend.free(grad_accum);
-        const m = try mlx.trainingZeroF32(slot.weights.len, slot.dims);
-        errdefer self.compute_backend.free(m);
-        const v = try mlx.trainingZeroF32(slot.weights.len, slot.dims);
         errdefer self.compute_backend.free(v);
         slot.device = .{
             .weight = weight,
@@ -1461,13 +1419,6 @@ pub const RealAutodiffTrainer = struct {
                 if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
                 const metal = try self.metalCompute();
                 try metal.trainingAccumulateF32(device.grad_accum, grad_ct, slot.weights.len, scale, first);
-            },
-            .mlx => {
-                if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-                const mlx = try self.mlxCompute();
-                const next = try mlx.trainingAccumulateF32Replace(device.grad_accum, grad_ct, scale, first);
-                self.compute_backend.free(device.grad_accum);
-                slot.device.?.grad_accum = next;
             },
             else => return error.DeviceOptimizerBackendUnavailable,
         }
@@ -1657,11 +1608,6 @@ pub const RealAutodiffTrainer = struct {
                 const metal = try self.metalCompute();
                 break :blk try metal.trainingSumSquaresF32(input, elem_count);
             },
-            .mlx => blk: {
-                if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-                const mlx = try self.mlxCompute();
-                break :blk try mlx.trainingSumSquaresF32(input);
-            },
             else => error.DeviceOptimizerBackendUnavailable,
         };
     }
@@ -1832,30 +1778,6 @@ pub const RealAutodiffTrainer = struct {
                     .bias_correction2 = bias_correction2,
                     .grad_scale = grad_scale,
                 });
-            },
-            .mlx => {
-                if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-                const mlx = try self.mlxCompute();
-                const next = try mlx.trainingAdamWF32Replace(device.weight, grad, device.m, device.v, .{
-                    .lr = lr,
-                    .beta1 = opt.beta1,
-                    .beta2 = opt.beta2,
-                    .eps = opt.eps,
-                    .weight_decay = opt.weight_decay,
-                    .bias_correction1 = bias_correction1,
-                    .bias_correction2 = bias_correction2,
-                    .grad_scale = grad_scale,
-                });
-                self.compute_backend.free(device.weight);
-                if (grad != device.grad_accum) self.compute_backend.free(device.grad_accum);
-                self.compute_backend.free(device.m);
-                self.compute_backend.free(device.v);
-                slot.device = .{
-                    .weight = next.weight,
-                    .grad_accum = if (grad == device.grad_accum) next.grad_accum else try mlx.trainingZeroF32(slot.weights.len, slot.dims),
-                    .m = next.m,
-                    .v = next.v,
-                };
             },
             else => return error.DeviceOptimizerBackendUnavailable,
         }

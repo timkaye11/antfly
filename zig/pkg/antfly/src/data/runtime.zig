@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("../root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
@@ -204,7 +205,7 @@ const DataDescriptorFactory = struct {
                     .id = record.local_node_id,
                     .group_id = record.group_id,
                     .peers = peers,
-                    .election_tick = 5,
+                    .election_tick = 30,
                     .heartbeat_tick = 1,
                     .pre_vote = true,
                     .check_quorum = true,
@@ -470,7 +471,7 @@ pub const HealthSource = struct {
         try writeLsmNativeStorageMetrics(writer, self.data_server.write_source.lsmNativeStorageStatsBestEffort());
         try writeFullTextMemoryMetrics(writer, self.data_server.write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
         try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(self.data_server.write_source.cachedWriteDbCountBestEffort()));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_active", "gauge", "Whether the data server LSM maintenance background worker is currently active", if (self.data_server.lsm_maintenance_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_started_total", "counter", "Data server LSM maintenance background worker wake cycles started", self.data_server.lsm_maintenance_started.load(.monotonic));
@@ -548,6 +549,10 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads", stats.mutable_snapshot_clone_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read", stats.mutable_snapshot_clone_peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_active_bytes", "gauge", "Active bytes held by bulk-ingest current-scan mutable clones", stats.bulk_ingest_current_scan_clone_active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_peak_active_bytes", "gauge", "Peak active bytes held by bulk-ingest current-scan mutable clones", stats.bulk_ingest_current_scan_clone_peak_active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_budget_denials_total", "counter", "Bulk-ingest current-scan mutable clone fallbacks caused by clone memory budget", stats.bulk_ingest_current_scan_clone_budget_denials);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_oom_fallbacks_total", "counter", "Bulk-ingest current-scan mutable clone fallbacks caused by allocation failure", stats.bulk_ingest_current_scan_clone_oom_fallbacks);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotations_total", "counter", "LSM mutable memtable rotations triggered to serve broad read snapshots without cloning", stats.read_snapshot_mutable_rotations);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_bytes_total", "counter", "Mutable memtable bytes rotated into immutable state for broad read snapshots", stats.read_snapshot_mutable_rotation_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", "gauge", "Peak mutable memtable bytes rotated for one broad read snapshot", stats.read_snapshot_mutable_rotation_peak_bytes);
@@ -589,7 +594,25 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_runs", "gauge", "Cached write LSM lower-level runs over configured level targets", stats.level_overflow_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_bytes", "gauge", "Cached write LSM lower-level bytes over configured level targets", stats.level_overflow_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths", "gauge", "Cached write LSM obsolete table paths waiting for cleanup", stats.obsolete_paths);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_pinned_by_readers", "gauge", "Cached write LSM obsolete table paths retained by active readers", stats.obsolete_paths_pinned_by_readers);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_pinned_by_versions", "gauge", "Cached write LSM obsolete table paths retained by active versions", stats.obsolete_paths_pinned_by_versions);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_waiting_for_retry", "gauge", "Cached write LSM obsolete table paths waiting for delete retry or grace delay", stats.obsolete_paths_waiting_for_retry);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_reclaimable", "gauge", "Cached write LSM obsolete table paths currently eligible for deletion", stats.obsolete_paths_reclaimable);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_delete_failures_total", "counter", "Cached write LSM obsolete table file delete failures", stats.obsolete_delete_failures);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_delete_retries_total", "counter", "Cached write LSM obsolete table file delete retries scheduled", stats.obsolete_delete_retries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_readers", "gauge", "Cached write LSM readers currently retaining run or memtable snapshots", stats.active_readers);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_active_readers_by_kind", "gauge", "Cached write LSM readers currently retaining snapshots by owner class");
+    for (stats.active_readers_by_kind, 0..) |count, i| {
+        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_active_readers_by_kind", &labels, count);
+    }
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", "gauge", "Cached write LSM obsolete table paths retained by active readers by owner class");
+    for (stats.obsolete_paths_pinned_by_reader_kind, 0..) |count, i| {
+        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", &labels, count);
+    }
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_bulk_ingest_batches", "gauge", "Cached write LSM active bulk-ingest session batches", stats.active_bulk_ingest_batches);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_segments", "gauge", "Cached write LSM WAL segments still retained for replay", stats.wal_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_bytes", "gauge", "Cached write LSM WAL bytes still retained for replay", stats.wal_retained_bytes);
@@ -992,6 +1015,8 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_memory_available", "gauge", "Whether process memory metrics are available on this platform", if (stats.available) 1 else 0);
     if (!stats.available) return;
     try health_metrics.appendPromMetric(writer, "antfly_process_resident_bytes", "gauge", "Process resident bytes reported by the operating system", stats.resident_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", stats.anonymous_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", stats.private_dirty_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
@@ -1720,12 +1745,19 @@ pub const DataServer = struct {
     lsm_maintenance_bulk_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_lock_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
+    lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
+    dense_posting_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
     const lsm_maintenance_worker_bulk_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_pressure_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_max_steps_per_wake = 8;
+    // Dense posting repair is time-driven rather than score-driven: checking
+    // the backlog requires a posting-state scan, so the worker probes on a
+    // fixed cadence and retries quickly only while repairs are landing.
+    const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
+    const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
 
     const ProvisionedWarmupStats = struct {
         warmed_group_count: u64 = 0,
@@ -2212,12 +2244,36 @@ pub const DataServer = struct {
             _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
             return;
         }
-        if (self.write_source.lsmMaintenanceScoreBestEffort() == 0) return;
+        if (!self.backgroundMaintenanceDue(now_ns)) return;
         self.lsm_maintenance_wake.store(true, .release);
         if (self.lsm_maintenance_thread == null) {
             self.lsm_maintenance_stop.store(false, .release);
             self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
         }
+    }
+
+    fn densePostingMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        return now_ns >= self.dense_posting_maintenance_next_eligible_ns.load(.monotonic);
+    }
+
+    fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+            return true;
+        }
+        if (self.densePostingMaintenanceDue(now_ns)) return true;
+        const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+        if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
+        if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+            if (delay_ns > 0) {
+                self.deferLsmObsoleteReclaim(now_ns, delay_ns);
+                return false;
+            }
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+            return true;
+        }
+        self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+        return false;
     }
 
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
@@ -2238,6 +2294,14 @@ pub const DataServer = struct {
         self.lsm_maintenance_next_eligible_ns.store(now_ns +| delay_ns, .release);
     }
 
+    fn deferLsmObsoleteReclaim(self: *DataServer, now_ns: u64, delay_ns: u64) void {
+        const due_ns = now_ns +| delay_ns;
+        const current = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+        if (current == 0 or due_ns < current) {
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(due_ns, .release);
+        }
+    }
+
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
@@ -2246,7 +2310,7 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
-            if (!woke and self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
+            if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
@@ -2286,15 +2350,37 @@ pub const DataServer = struct {
                     if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                    } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                        if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                     }
                     completed = true;
                     break;
                 }
             }
-            if (steps >= lsm_maintenance_worker_max_steps_per_wake and self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
-                self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+            if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
+                if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                    self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
+                }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
+            // Bulk loads can leave leaf postings with stale quantized payloads
+            // (deferred splits), which forces exact member scoring on every
+            // query that visits them. Drain a bounded amount of that repair
+            // work alongside the regular LSM maintenance.
+            const posting_now_ns = platform_time.monotonicNs();
+            if (self.densePostingMaintenanceDue(posting_now_ns)) {
+                const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+                const next_delay_ns: u64 = if (posting_steps > 0)
+                    dense_posting_maintenance_retry_interval_ns
+                else
+                    dense_posting_maintenance_idle_interval_ns;
+                self.dense_posting_maintenance_next_eligible_ns.store(posting_now_ns +| next_delay_ns, .release);
+                if (posting_steps > 0) {
+                    std.log.info("dense posting maintenance repaired steps={d}", .{posting_steps});
+                }
+            }
             self.lsm_maintenance_active.store(false, .release);
         }
         self.lsm_maintenance_active.store(false, .release);
@@ -4505,6 +4591,7 @@ pub const DataServer = struct {
                     stats.groups_cleared += 1;
                 } else {
                     stats.debt_remaining = true;
+                    std.log.warn("provisioned startup catch-up debt persists group={} table={s}", .{ group_id, table.name });
                 }
             }
         }
@@ -5667,7 +5754,11 @@ pub const DataServer = struct {
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    // Bounded spin, then yield (platform_sync): this guards the raft round
+    // (which can run for milliseconds), and a pure spin here pins a core per
+    // waiter — on CPU-constrained hosts (CI runners) that starves the very
+    // threads that would release the lock.
+    platform_sync.lockYielding(mutex);
 }
 
 fn appendUniqueNodeId(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u64), node_id: u64) !void {
@@ -5896,6 +5987,13 @@ const RemoteMetadataSource = struct {
                 .drop_index = remoteDropIndex,
                 .wait_table_lifecycle = remoteWaitTableLifecycle,
                 .wait_table_projection = remoteWaitTableProjection,
+                .install_extension = remoteInstallExtension,
+                .update_extension = remoteUpdateExtension,
+                .drop_extension = remoteDropExtension,
+                .enable_extension = remoteEnableExtension,
+                .disable_extension = remoteDisableExtension,
+                .configure_extension = remoteConfigureExtension,
+                .restore_extensions = remoteRestoreExtensions,
             },
         };
     }
@@ -6064,6 +6162,139 @@ const RemoteMetadataSource = struct {
                 try client.dropIndex(base_uri, ctx.table_name, ctx.index_name);
             }
         }.call, .{ .table_name = table_name, .index_name = index_name });
+        self.invalidateCache();
+    }
+
+    fn remoteInstallExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.InstallExtensionRequest,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.installExtension(base_uri, ctx.extension_name, ctx.body);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name, .body = body });
+        if (!req.dry_run) self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteUpdateExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.UpdateExtensionRequest,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.updateExtension(base_uri, ctx.extension_name, ctx.body);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name, .body = body });
+        if (!req.dry_run) self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteDropExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.DropExtensionRequest,
+    ) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.dropExtension(base_uri, ctx.extension_name, ctx.body);
+            }
+        }.call, .{ .extension_name = extension_name, .body = body });
+        if (!req.dry_run) self.invalidateCache();
+    }
+
+    fn remoteEnableExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.enableExtension(base_uri, ctx.extension_name);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name });
+        self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteDisableExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.disableExtension(base_uri, ctx.extension_name);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name });
+        self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteConfigureExtension(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        req: antfly.extensions.ConfigureExtensionRequest,
+    ) !antfly.extensions.InstalledExtension {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, req);
+        defer alloc.free(body);
+        const installed = try self.withMetadataApiClient(antfly.extensions.InstalledExtension, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !antfly.extensions.InstalledExtension {
+                var parsed = try client.configureExtension(base_uri, ctx.extension_name, ctx.body);
+                defer parsed.deinit();
+                return try antfly.extensions.cloneInstalledExtensionAlloc(ctx.alloc, parsed.value);
+            }
+        }.call, .{ .alloc = alloc, .extension_name = extension_name, .body = body });
+        self.invalidateCache();
+        return installed;
+    }
+
+    fn remoteRestoreExtensions(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        installed: []const antfly.extensions.InstalledExtension,
+        members: []const antfly.extensions.ExtensionMember,
+        dependencies: []const antfly.extensions.ExtensionDependency,
+    ) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const body = try stringifyJsonAlloc(alloc, .{
+            .installed_extensions = installed,
+            .extension_members = members,
+            .extension_dependencies = dependencies,
+        });
+        defer alloc.free(body);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
+                try client.restoreExtensions(base_uri, ctx);
+            }
+        }.call, body);
         self.invalidateCache();
     }
 
@@ -6274,6 +6505,10 @@ fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_a
         .restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses),
         .replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses),
         .replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints),
+        .extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages),
+        .installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions),
+        .extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members),
+        .extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies),
         .split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions),
         .merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions),
         .split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations),
@@ -7147,6 +7382,26 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
         alloc.free(record.reseed_exact_cutover_path);
     }
     if (snapshot.replication_source_action_hints.len > 0) alloc.free(snapshot.replication_source_action_hints);
+    for (snapshot.extension_packages) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_packages.len > 0) alloc.free(snapshot.extension_packages);
+    for (snapshot.installed_extensions) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.installed_extensions.len > 0) alloc.free(snapshot.installed_extensions);
+    for (snapshot.extension_members) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_members.len > 0) alloc.free(snapshot.extension_members);
+    for (snapshot.extension_dependencies) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_dependencies.len > 0) alloc.free(snapshot.extension_dependencies);
     for (snapshot.split_transitions) |record| antfly.metadata.table_manager.freeSplitTransitionRecord(alloc, record);
     alloc.free(snapshot.split_transitions);
     for (snapshot.merge_transitions) |record| antfly.metadata.table_manager.freeMergeTransitionRecord(alloc, record);
@@ -7276,6 +7531,90 @@ fn cloneMergedGroupStatusesOwned(
     errdefer alloc.free(out);
     for (statuses, 0..) |status, i| {
         out[i] = status;
+    }
+    return out;
+}
+
+fn cloneExtensionPackagesOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.PackageManifest,
+) ![]antfly.extensions.PackageManifest {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.PackageManifest, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.clonePackageManifestAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneInstalledExtensionsOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.InstalledExtension,
+) ![]antfly.extensions.InstalledExtension {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.InstalledExtension, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.cloneInstalledExtensionAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExtensionMembersOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.ExtensionMember,
+) ![]antfly.extensions.ExtensionMember {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.ExtensionMember, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.cloneExtensionMemberAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExtensionDependenciesOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.extensions.ExtensionDependency,
+) ![]antfly.extensions.ExtensionDependency {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.extensions.ExtensionDependency, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.extensions.cloneExtensionDependencyAlloc(alloc, record);
+        initialized += 1;
     }
     return out;
 }
@@ -7460,6 +7799,9 @@ pub fn runFromIterator(
             .trusted_principal_issuer = trusted_principal_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
+            .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     }, metadata_api_urls.urls);
     defer data_server.deinit();
@@ -7487,7 +7829,7 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 25;
+    const tick_ms = cli.tick_ms orelse 100;
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
@@ -12616,6 +12958,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try writeProcessMemoryMetrics(&writer, .{
         .available = true,
         .resident_bytes = 11,
+        .anonymous_bytes = 12,
+        .private_dirty_bytes = 17,
         .footprint_bytes = 13,
         .wired_bytes = 19,
         .pageins = 23,
@@ -12625,6 +12969,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     });
     const process_memory_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_memory_available 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_anonymous_bytes 12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_private_dirty_bytes 17") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_footprint_bytes 13") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_pageins_total 23") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_malloc_allocated_bytes 29") != null);
@@ -12679,7 +13025,23 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .level_overflow_runs = 1,
         .level_overflow_bytes = 256,
         .obsolete_paths = 1,
+        .obsolete_paths_pinned_by_readers = 2,
+        .obsolete_paths_pinned_by_versions = 3,
+        .obsolete_paths_waiting_for_retry = 4,
+        .obsolete_paths_reclaimable = 5,
+        .obsolete_delete_failures = 6,
+        .obsolete_delete_retries = 7,
         .active_readers = 6,
+        .active_readers_by_kind = blk: {
+            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
+            counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 2;
+            break :blk counts;
+        },
+        .obsolete_paths_pinned_by_reader_kind = blk: {
+            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
+            counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 3;
+            break :blk counts;
+        },
         .manifest_dirty = true,
         .obsolete_manifest_dirty = true,
         .compaction_scheduler_active_oldest_age_ns = 99,
@@ -12710,7 +13072,15 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_write_stall_l0_byte_debt 16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_level_overflow_runs 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_readers 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_versions 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_waiting_for_retry 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_reclaimable 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_failures_total 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_retries_total 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers_by_kind{kind=\"compaction\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_reader_kind{kind=\"compaction\"} 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_manifest_dirty 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_active_oldest_age_ns 99") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_grants_total 3") != null);
@@ -13138,4 +13508,49 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     var reservation = try server.provisioned_storage.resource_manager.reserve(.lsm_compaction_work, 769 * 1024 * 1024);
     defer reservation.release();
     try std.testing.expect(server.resourcePressureDefersBackgroundMaintenance());
+}
+
+test "data runtime background maintenance is due for dense posting cadence without lsm debt" {
+    const alloc = std.testing.allocator;
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/tmp/unused-antfly-data-runtime-dense-posting-maintenance",
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-dense-posting-maintenance", FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), server.write_source.lsmMaintenanceScoreBestEffort());
+
+    server.dense_posting_maintenance_next_eligible_ns.store(100, .release);
+    try std.testing.expect(server.backgroundMaintenanceDue(100));
+    try std.testing.expect(server.backgroundMaintenanceDue(101));
+    try std.testing.expect(!server.backgroundMaintenanceDue(99));
 }

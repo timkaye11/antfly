@@ -31,11 +31,18 @@ fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" }) catch "./models";
 }
 
+/// Returns ~/.antfly/inference/ml if $HOME is set, otherwise falls back to ./ml.
+fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
+    const home = platform.env.getenv("HOME") orelse return "./ml";
+    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
+}
+
 const RunConfig = struct {
     models_dir: ?[]const u8 = null,
+    ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
-    allow_downloads: ?bool = null,
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -99,6 +106,8 @@ pub fn runFromArgs(
         try inference.native_embed.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "classify")) {
         try inference.native_classify.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "rerank")) {
+        try inference.native_rerank.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
         try inference.native_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
@@ -121,12 +130,20 @@ pub fn runFromArgs(
         try inference.compare_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "finetune")) {
         try inference.finetune_cli.main(init, command_args);
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        try inference.cuda_info.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "bench-cuda")) {
+        try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
         try inference.native_smoke.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "list")) {
         try listModels(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "pull")) {
         try pullModel(allocator, init.io, usage_name, command_args);
+    } else if (std.mem.eql(u8, command, "convert")) {
+        try inference.tabular.cli.convertMain(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "version")) {
+        printVersion();
     } else {
         print("unknown command: {s}\n", .{command});
         printUsage(usage_name);
@@ -139,8 +156,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(allocator);
+    var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var models_overridden = false;
+    var ml_overridden = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -154,6 +173,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             models_dir = args[i + 1];
             models_overridden = true;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--ml-dir") and i + 1 < args.len) {
+            ml_dir = args[i + 1];
+            ml_overridden = true;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
@@ -165,17 +188,21 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (!models_overridden) {
             if (cfg.models_dir) |value| models_dir = value;
         }
+        if (!ml_overridden) {
+            if (cfg.ml_dir) |value| ml_dir = value;
+        }
     }
 
     print("antfly inference v{s}\n", .{build_options.inference_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
-        build_options.enable_mlx,
+        build_options.enable_cuda,
     });
-    print("models: {s}\n", .{models_dir});
+    print("ai models: {s}\n", .{models_dir});
+    print("ml models: {s}\n", .{ml_dir});
     print("listening on {s}:{d}\n", .{ host, port });
 
     // Leave SIGINT/SIGTERM on the default OS behavior for now. The previous
@@ -184,11 +211,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
+        .ml_dir = ml_dir,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
-        if (cfg.allow_downloads) |value| node_cfg.allow_downloads = value;
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
@@ -223,11 +250,17 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
 fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
         print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>]\n", .{usage_name});
+        print("       {s} pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
+        print("       {s} pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
         print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
         print("CLIP/CLAP v0.2 example: {s} pull antflydb/clipclap:gguf:Q4_K\n", .{usage_name});
         return;
     }
     const ref = args[0];
+    if (inference.tabular.cli.isHttpUrl(ref) or isPredictorPull(args)) {
+        try inference.tabular.cli.pullMain(allocator, io, args, defaultMlDir(allocator));
+        return;
+    }
 
     // Parse optional --token flag
     var token: ?[]const u8 = null;
@@ -242,6 +275,8 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--models-dir") and i + 1 < args.len) {
             models_dir = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--ml-dir") and i + 1 < args.len) {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--tasks") and i + 1 < args.len) {
             tasks_csv = args[i + 1];
@@ -269,14 +304,24 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
     print("done.\n", .{});
 }
 
+fn isPredictorPull(args: []const []const u8) bool {
+    if (args.len == 0 or !inference.tabular.cli.isHuggingFaceRef(args[0])) return false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--type") and i + 1 < args.len) {
+            return std.mem.eql(u8, args[i + 1], "predictor") or std.mem.eql(u8, args[i + 1], "predictors");
+        }
+    }
+    return false;
+}
+
 pub fn printVersion() void {
     print("antfly inference v{s}\n", .{build_options.inference_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
-        build_options.enable_mlx,
         build_options.enable_cuda,
     });
 }
@@ -289,6 +334,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  run       Start the inference server
         \\  embed     Run native text/image/audio embedding from the command line
         \\  classify  Run native text classification from the command line
+        \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
@@ -301,20 +347,27 @@ fn printUsage(usage_name: []const u8) void {
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
+        \\  cuda-info Inspect CUDA Driver API availability and optionally run CUDA smoke checks
+        \\  bench-cuda Benchmark CUDA Q4_K, GLiNER2, and CLIP/CLAP kernel shapes
         \\  list      List available models
-        \\  pull      Download a model from HuggingFace Hub
+        \\  pull      Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
+        \\  convert   Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
+        \\  version   Print version information
         \\
         \\Run options:
         \\  --host <addr>     Listen address (default: 127.0.0.1)
         \\  --port <port>     Listen port (default: 8090)
-        \\  --models-dir <dir>    Models directory (default: ~/.antfly/inference/models)
+        \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
+        \\  --name <name>     Local predictor name when pulling a tabular model URL
         \\  --tasks <list>    Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
-        \\  --models-dir <dir>    Models directory (default: ~/.antfly/inference/models)
+        \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>        Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
         \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
@@ -327,6 +380,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\{
         \\  "api_url": "http://127.0.0.1:8082",
         \\  "models_dir": "/tmp/models",
+        \\  "ml_dir": "/tmp/ml",
         \\  "content_security": {
         \\    "block_private_ips": true
         \\  },
@@ -344,6 +398,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
+    try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);

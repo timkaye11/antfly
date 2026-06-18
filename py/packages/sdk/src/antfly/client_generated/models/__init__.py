@@ -49,13 +49,13 @@ from .batch_request_inserts_additional_property import BatchRequestInsertsAdditi
 from .batch_response import BatchResponse
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_generator_config import BedrockGeneratorConfig
-from .bing_search_config import BingSearchConfig
-from .bing_search_config_freshness import BingSearchConfigFreshness
 from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
+from .capability import Capability
+from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
 from .chat_message import ChatMessage
@@ -90,21 +90,49 @@ from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_generator_config import CohereGeneratorConfig
 from .cohere_reranker_config import CohereRerankerConfig
 from .confidence_step_config import ConfidenceStepConfig
+from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
+from .connected_model import ConnectedModel
+from .connected_model_type import ConnectedModelType
+from .connection import Connection
+from .connection_kind import ConnectionKind
+from .connection_status import ConnectionStatus
+from .connections_response import ConnectionsResponse
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .credentials import Credentials
+from .data_shape_decl import DataShapeDecl
+from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
 from .distance_range import DistanceRange
 from .distance_unit import DistanceUnit
 from .doc_id_query import DocIdQuery
+from .document_artifact_child_range import DocumentArtifactChildRange
+from .document_artifact_manifest import DocumentArtifactManifest
+from .document_artifact_manifest_list import DocumentArtifactManifestList
+from .document_artifact_reprocess_failure import DocumentArtifactReprocessFailure
+from .document_artifact_reprocess_job import DocumentArtifactReprocessJob
+from .document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
+from .document_artifact_reprocess_job_reprocess_status import DocumentArtifactReprocessJobReprocessStatus
+from .document_artifact_reprocess_job_start_request import DocumentArtifactReprocessJobStartRequest
+from .document_artifact_reprocess_response import DocumentArtifactReprocessResponse
+from .document_artifact_reprocess_response_reprocess import DocumentArtifactReprocessResponseReprocess
+from .document_artifact_reprocess_shard_cursor import DocumentArtifactReprocessShardCursor
+from .document_artifact_table_reprocess_request import DocumentArtifactTableReprocessRequest
+from .document_artifact_table_reprocess_response import DocumentArtifactTableReprocessResponse
+from .document_artifact_table_reprocess_response_reprocess import DocumentArtifactTableReprocessResponseReprocess
+from .document_artifact_table_reprocess_response_reprocess_status import (
+    DocumentArtifactTableReprocessResponseReprocessStatus,
+)
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
-from .duck_duck_go_search_config import DuckDuckGoSearchConfig
+from .drop_extension_request import DropExtensionRequest
+from .drop_extension_request_mode import DropExtensionRequestMode
+from .drop_extension_response import DropExtensionResponse
 from .dynamic_template import DynamicTemplate
 from .dynamic_template_match_mapping_type import DynamicTemplateMatchMappingType
 from .edge import Edge
@@ -120,6 +148,8 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
+from .enrichment_config import EnrichmentConfig
+from .enrichment_kind import EnrichmentKind
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -133,6 +163,16 @@ from .eval_summary import EvalSummary
 from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
+from .exa_search_config import ExaSearchConfig
+from .exa_search_config_search_type import ExaSearchConfigSearchType
+from .extension_error import ExtensionError
+from .extension_member import ExtensionMember
+from .extension_object_decl import ExtensionObjectDecl
+from .extension_object_kind import ExtensionObjectKind
+from .extension_scope import ExtensionScope
+from .extension_scope_kind import ExtensionScopeKind
+from .external_io_connection import ExternalIoConnection
+from .external_io_protocol import ExternalIoProtocol
 from .extraction_classification import ExtractionClassification
 from .extraction_classification_schema import ExtractionClassificationSchema
 from .extraction_entity import ExtractionEntity
@@ -180,10 +220,9 @@ from .geo_point import GeoPoint
 from .geo_shape_geometry_relation import GeoShapeGeometryRelation
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
+from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
-from .google_search_config import GoogleSearchConfig
-from .google_search_config_search_type import GoogleSearchConfigSearchType
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -198,6 +237,7 @@ from .graph_query_result import GraphQueryResult
 from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
+from .graph_result_node_evidence import GraphResultNodeEvidence
 from .ground_truth import GroundTruth
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
@@ -221,6 +261,8 @@ from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
 from .inference_config_model_strategies import InferenceConfigModelStrategies
 from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
+from .inference_connection import InferenceConnection
+from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
 from .inference_embed_request import InferenceEmbedRequest
@@ -275,6 +317,14 @@ from .inference_models_response_recognizers import InferenceModelsResponseRecogn
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
+from .inference_predict_request import InferencePredictRequest
+from .inference_predict_response import InferencePredictResponse
+from .inference_predictor_info import InferencePredictorInfo
+from .inference_predictor_task import InferencePredictorTask
+from .inference_predictors_response import InferencePredictorsResponse
+from .inference_predictors_response_object import InferencePredictorsResponseObject
+from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
+from .inference_provider_type import InferenceProviderType
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
@@ -317,6 +367,10 @@ from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
 from .inference_vad_options import InferenceVADOptions
 from .inferenceschemas_config import InferenceschemasConfig
+from .install_extension_request import InstallExtensionRequest
+from .install_manifest import InstallManifest
+from .installed_extension import InstalledExtension
+from .installed_extension_status import InstalledExtensionStatus
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -328,6 +382,10 @@ from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
 from .linear_merge_result import LinearMergeResult
+from .linkup_search_config import LinkupSearchConfig
+from .linkup_search_config_depth import LinkupSearchConfigDepth
+from .linkup_search_config_output_type import LinkupSearchConfigOutputType
+from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_response_200 import LookupKeyResponse200
 from .lsm_storage_status import LsmStorageStatus
@@ -362,6 +420,12 @@ from .open_ai_embedder_config import OpenAIEmbedderConfig
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_generator_config import OpenRouterGeneratorConfig
+from .package_artifact import PackageArtifact
+from .package_artifact_kind import PackageArtifactKind
+from .package_dependency import PackageDependency
+from .package_kind import PackageKind
+from .package_manifest import PackageManifest
+from .package_manifest_manifest_api_version import PackageManifestManifestApiVersion
 from .path import Path
 from .path_edge import PathEdge
 from .path_edge_metadata import PathEdgeMetadata
@@ -383,6 +447,11 @@ from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
 from .query_builder_request_example_documents_item import QueryBuilderRequestExampleDocumentsItem
 from .query_hit import QueryHit
+from .query_hit_hierarchy import QueryHitHierarchy
+from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
+from .query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
+from .query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
+from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
@@ -412,6 +481,8 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_decl import RuntimeDecl
+from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -491,15 +562,21 @@ from .traversal_result_document import TraversalResultDocument
 from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
+from .update_extension_request import UpdateExtensionRequest
+from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_reranker_config import VertexRerankerConfig
+from .vertex_search_config import VertexSearchConfig
+from .vertex_search_config_service import VertexSearchConfigService
 from .web_search_config import WebSearchConfig
+from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
 from .wildcard_query import WildcardQuery
+from .you_search_config import YouSearchConfig
 
 __all__ = (
     "AgentDecision",
@@ -551,13 +628,13 @@ __all__ = (
     "BatchResponse",
     "BedrockEmbedderConfig",
     "BedrockGeneratorConfig",
-    "BingSearchConfig",
-    "BingSearchConfigFreshness",
     "BooleanQuery",
     "BoolFieldQuery",
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "CalendarInterval",
+    "Capability",
+    "CdcConnection",
     "ChainCondition",
     "ChainLink",
     "ChatMessage",
@@ -592,21 +669,47 @@ __all__ = (
     "CohereGeneratorConfig",
     "CohereRerankerConfig",
     "ConfidenceStepConfig",
+    "ConfigureExtensionRequest",
     "ConjunctionQuery",
+    "ConnectedModel",
+    "ConnectedModelType",
+    "Connection",
+    "ConnectionKind",
+    "ConnectionsResponse",
+    "ConnectionStatus",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "DataShapeDecl",
+    "DataShapeKind",
     "DateRangeStringQuery",
     "DisjunctionQuery",
     "DistanceMetric",
     "DistanceRange",
     "DistanceUnit",
     "DocIdQuery",
+    "DocumentArtifactChildRange",
+    "DocumentArtifactManifest",
+    "DocumentArtifactManifestList",
+    "DocumentArtifactReprocessFailure",
+    "DocumentArtifactReprocessJob",
+    "DocumentArtifactReprocessJobPhase",
+    "DocumentArtifactReprocessJobReprocessStatus",
+    "DocumentArtifactReprocessJobStartRequest",
+    "DocumentArtifactReprocessResponse",
+    "DocumentArtifactReprocessResponseReprocess",
+    "DocumentArtifactReprocessShardCursor",
+    "DocumentArtifactTableReprocessRequest",
+    "DocumentArtifactTableReprocessResponse",
+    "DocumentArtifactTableReprocessResponseReprocess",
+    "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentSchema",
     "DocumentSchemaSchema",
-    "DuckDuckGoSearchConfig",
+    "DropExtensionRequest",
+    "DropExtensionRequestMode",
+    "DropExtensionResponse",
     "DynamicTemplate",
     "DynamicTemplateMatchMappingType",
     "Edge",
@@ -622,6 +725,8 @@ __all__ = (
     "EmbeddingsIndexStatsIndexType",
     "EmbeddingType1",
     "EmbeddingType3",
+    "EnrichmentConfig",
+    "EnrichmentKind",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -635,6 +740,16 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExaSearchConfig",
+    "ExaSearchConfigSearchType",
+    "ExtensionError",
+    "ExtensionMember",
+    "ExtensionObjectDecl",
+    "ExtensionObjectKind",
+    "ExtensionScope",
+    "ExtensionScopeKind",
+    "ExternalIoConnection",
+    "ExternalIoProtocol",
     "ExtractionClassification",
     "ExtractionClassificationSchema",
     "ExtractionEntity",
@@ -682,10 +797,9 @@ __all__ = (
     "GeoShapeGeometryRelation",
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
+    "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
-    "GoogleSearchConfig",
-    "GoogleSearchConfigSearchType",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -700,6 +814,7 @@ __all__ = (
     "GraphQueryType",
     "GraphResultNode",
     "GraphResultNodeDocument",
+    "GraphResultNodeEvidence",
     "GroundTruth",
     "ImageURL",
     "ImageURLContentPart",
@@ -723,6 +838,8 @@ __all__ = (
     "InferenceConfig",
     "InferenceConfigModelStrategies",
     "InferenceConfigModelStrategiesAdditionalProperty",
+    "InferenceConnection",
+    "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
     "InferenceEmbeddingObject",
@@ -777,6 +894,14 @@ __all__ = (
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",
+    "InferencePredictorInfo",
+    "InferencePredictorsResponse",
+    "InferencePredictorsResponseObject",
+    "InferencePredictorsResponsePredictors",
+    "InferencePredictorTask",
+    "InferencePredictRequest",
+    "InferencePredictResponse",
+    "InferenceProviderType",
     "InferenceReadObject",
     "InferenceReadObjectObject",
     "InferenceReadRequest",
@@ -819,6 +944,10 @@ __all__ = (
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
     "InferenceVADOptions",
+    "InstalledExtension",
+    "InstalledExtensionStatus",
+    "InstallExtensionRequest",
+    "InstallManifest",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -830,6 +959,10 @@ __all__ = (
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
     "LinearMergeResult",
+    "LinkupSearchConfig",
+    "LinkupSearchConfigDepth",
+    "LinkupSearchConfigOutputType",
+    "ListDocumentArtifactManifestsDetail",
     "ListUsersResponse200Item",
     "LookupKeyResponse200",
     "LsmStorageStatus",
@@ -864,6 +997,12 @@ __all__ = (
     "OpenAIGeneratorConfig",
     "OpenRouterEmbedderConfig",
     "OpenRouterGeneratorConfig",
+    "PackageArtifact",
+    "PackageArtifactKind",
+    "PackageDependency",
+    "PackageKind",
+    "PackageManifest",
+    "PackageManifestManifestApiVersion",
     "Path",
     "PathEdge",
     "PathEdgeMetadata",
@@ -885,6 +1024,11 @@ __all__ = (
     "QueryBuilderRequestConstraints",
     "QueryBuilderRequestExampleDocumentsItem",
     "QueryHit",
+    "QueryHitHierarchy",
+    "QueryHitHierarchyAncestors",
+    "QueryHitHierarchyArtifact",
+    "QueryHitHierarchyChunksItem",
+    "QueryHitHierarchyLevel",
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
@@ -914,6 +1058,8 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeDecl",
+    "RuntimeDeclMode",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -993,13 +1139,19 @@ __all__ = (
     "TraversalRules",
     "TraverseResponse",
     "TreeSearchConfig",
+    "UpdateExtensionRequest",
+    "UpdateManifestRef",
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",
     "VertexEmbedderConfig",
     "VertexGeneratorConfig",
     "VertexRerankerConfig",
+    "VertexSearchConfig",
+    "VertexSearchConfigService",
     "WebSearchConfig",
+    "WebSearchConnection",
     "WebSearchProvider",
     "WildcardQuery",
+    "YouSearchConfig",
 )

@@ -64,12 +64,6 @@ const LoadedWeight = weight_source_mod.LoadedWeight;
 const Tensor = inference.backends.Tensor;
 const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
 
-// MLX backend (Apple Silicon GPU acceleration).
-const mlx_mod = inference.backends.mlx;
-const mlx = if (build_options.enable_mlx) mlx_mod else struct {};
-const mlx_compute = if (build_options.enable_mlx) inference.native_compute.mlx else struct {};
-const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
-
 // Finetune module imports — accessed via the termite internal module tree.
 const gliner2_data = inference.finetune.gliner2_data;
 const gliner2_bundle = inference.finetune.gliner2;
@@ -136,7 +130,6 @@ const Options = struct {
 const Gliner2TrainBackend = enum {
     auto,
     metal,
-    mlx,
     native,
 };
 
@@ -536,16 +529,13 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 3. Set up compute backend + load weights
     //
-    // Use MLX (Apple Silicon GPU) when available, falling back to
-    // native CPU BLAS.
+    // Use Metal when available, falling back to native CPU/BLAS.
     // ------------------------------------------------------------------
     var st_path_buf: [512]u8 = undefined;
     const st_path = try std.fmt.bufPrint(&st_path_buf, "{s}/model.safetensors", .{opts.model_dir});
 
     // We need these variables to live for the whole function regardless
     // of which backend branch we take.
-    var mlx_ws: if (build_options.enable_mlx) mlx_compute.WeightStore else void = undefined;
-    var mlx_backend: if (build_options.enable_mlx) *mlx_compute.MlxCompute else void = undefined;
     var metal_ws: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
     var native_ws: native_compute.WeightStore = undefined;
@@ -560,22 +550,9 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         (!force_native and metal_runtime.metalDeviceAvailable())
     else
         false;
-    const mlx_runtime_available = if (comptime build_options.enable_mlx)
-        (!force_native and (mlx.metalDeviceAvailable() or mlx.allowCpuStreamWithoutMetal()))
-    else
-        false;
-    if (comptime build_options.enable_mlx) {
-        if (force_native) {
-            print("info: TERMITE_GLINER2_FORCE_NATIVE is set; using native CPU/BLAS\n", .{});
-        } else if (!mlx_runtime_available) {
-            print("warning: MLX build enabled but no Metal device is available; falling back to native CPU/BLAS\n", .{});
-        }
-    }
-
-    const selected_backend = selectBackend(opts.backend, force_native, metal_runtime_available, mlx_runtime_available) catch |err| {
+    const selected_backend = selectBackend(opts.backend, force_native, metal_runtime_available) catch |err| {
         switch (err) {
             error.MetalBackendUnavailable => print("error: --backend metal requested but Metal is not built or no Metal device is available\n", .{}),
-            error.MlxBackendUnavailable => print("error: --backend mlx requested but MLX is not built or unavailable\n", .{}),
         }
         return err;
     };
@@ -584,8 +561,6 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         if (comptime build_options.enable_metal) {
             metal_ws = .{
                 .allocator = allocator,
-                .resident_weights = if (comptime build_options.enable_mlx) mlx_c.mlx_map_string_to_array_new() else {},
-                .stream = if (comptime build_options.enable_mlx) mlx.openDefaultStream().stream else {},
                 .prefix = "",
                 .lazy_weights = .{},
             };
@@ -595,72 +570,6 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_ws, null);
             break :blk metal_backend.computeBackend();
         } else unreachable;
-    } else if (selected_backend == .mlx) blk: {
-        if (comptime !build_options.enable_mlx) unreachable;
-        // ── MLX path: load weights directly into MLX arrays ──────────
-        const raw_weights = try mlx.loadSafetensors(st_path, allocator, mlx.openDefaultStream().stream);
-        // Build a new map with "encoder." prefix stripped.
-        const stripped_weights = mlx_c.mlx_map_string_to_array_new();
-        const it = mlx_c.mlx_map_string_to_array_iterator_new(raw_weights);
-        defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
-        var loaded_count: usize = 0;
-        while (true) {
-            var key: [*c]const u8 = null;
-            var val = mlx_c.mlx_array_new();
-            if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-                _ = mlx_c.mlx_array_free(val);
-                break;
-            }
-            if (key == null) {
-                _ = mlx_c.mlx_array_free(val);
-                break;
-            }
-            const name = std.mem.span(key);
-            const stripped = stripEncoderPrefix(name);
-            const stripped_z = try allocator.dupeZ(u8, stripped);
-            defer allocator.free(stripped_z);
-            _ = mlx_c.mlx_map_string_to_array_insert(stripped_weights, stripped_z.ptr, val);
-            _ = mlx_c.mlx_array_free(val);
-            loaded_count += 1;
-        }
-        _ = mlx_c.mlx_map_string_to_array_free(raw_weights);
-        print("  loaded {d} weights via MLX from {s}\n", .{ loaded_count, st_path });
-
-        // Initialize classifier head as MLX arrays.
-        {
-            var rng_init = std.Random.DefaultPrng.init(opts.seed);
-            var prng_init = rng_init.random();
-            const H = deberta_config.hidden_size;
-            const C = opts.num_classes;
-
-            const w_data = try allocator.alloc(f32, C * H);
-            defer allocator.free(w_data);
-            const sd: f32 = 0.02;
-            for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
-            const w_shape = [_]i32{ @intCast(C), @intCast(H) };
-            const w_arr = mlx.arrayFromFloat32(w_data, &w_shape);
-            try mlx.insertWeight(stripped_weights, allocator, "task_classifier.weight", w_arr);
-
-            const b_data = try allocator.alloc(f32, C);
-            defer allocator.free(b_data);
-            @memset(b_data, 0.0);
-            const b_shape = [_]i32{@intCast(C)};
-            const b_arr = mlx.arrayFromFloat32(b_data, &b_shape);
-            try mlx.insertWeight(stripped_weights, allocator, "task_classifier.bias", b_arr);
-            print("  initialized classifier head (MLX): [{d}, {d}] + [{d}]\n", .{ C, H, C });
-        }
-        try initParityTopLevelWeightsMlx(allocator, stripped_weights, deberta_config.hidden_size);
-
-        mlx_ws = .{
-            .allocator = allocator,
-            .resident_weights = stripped_weights,
-            .stream = mlx.openDefaultStream().stream,
-            .prefix = "",
-            .lazy_weights = .{},
-        };
-        mlx_backend = try allocator.create(mlx_compute.MlxCompute);
-        mlx_backend.* = try mlx_compute.MlxCompute.init(allocator, &mlx_ws, null);
-        break :blk mlx_backend.computeBackend();
     } else blk: {
         // ── Native CPU/BLAS fallback ─────────────────────────────────
         native_ws = .{
@@ -725,7 +634,6 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     };
     defer switch (selected_backend) {
         .metal => if (comptime build_options.enable_metal) metal_backend.deinit(),
-        .mlx => if (comptime build_options.enable_mlx) mlx_backend.deinit(),
         else => {},
     };
 
@@ -1040,7 +948,6 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             .regular_trainable_params = regular_trainable_params,
             .execution_engine = switch (selected_backend) {
                 .metal => .compiled_metal,
-                .mlx => .compiled_mlx,
                 else => .interpreter,
             },
             .compiled_required = opts.compiled_required,
@@ -2679,7 +2586,6 @@ fn stripEncoderPrefix(name: []const u8) []const u8 {
 fn parseBackend(value: []const u8) ?Gliner2TrainBackend {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     return null;
 }
@@ -2716,13 +2622,11 @@ fn selectBackend(
     requested: Gliner2TrainBackend,
     force_native: bool,
     metal_available: bool,
-    mlx_available: bool,
 ) !Gliner2TrainBackend {
     if (force_native) return .native;
     return switch (requested) {
-        .auto => if (metal_available) .metal else if (mlx_available) .mlx else .native,
+        .auto => if (metal_available) .metal else .native,
         .metal => if (metal_available) .metal else error.MetalBackendUnavailable,
-        .mlx => if (mlx_available) .mlx else error.MlxBackendUnavailable,
         .native => .native,
     };
 }
@@ -2731,7 +2635,6 @@ fn backendLabel(backend: Gliner2TrainBackend) []const u8 {
     return switch (backend) {
         .auto => "auto",
         .metal => "Metal",
-        .mlx => "MLX (Apple Silicon)",
         .native => "native CPU/BLAS",
     };
 }
@@ -2875,37 +2778,6 @@ fn native_wsPutMissingOwned(
     try weight_store.resident_weights.put(allocator, owned_name, .{ .tensor = tensor });
 }
 
-fn initParityTopLevelWeightsMlx(
-    allocator: std.mem.Allocator,
-    weights: if (build_options.enable_mlx) mlx_c.mlx_map_string_to_array_t else void,
-    hidden_size: u32,
-) !void {
-    if (comptime !build_options.enable_mlx) return;
-    const specs = parityWeightSpecs(hidden_size);
-    for (specs) |spec| {
-        if (mlxMapContains(weights, spec.name)) continue;
-        const out_dim: usize = @intCast(spec.out_dim);
-        const in_dim: usize = @intCast(spec.in_dim);
-        const shape = [_]i32{ @intCast(out_dim), @intCast(in_dim) };
-        const data = try allocator.alloc(f32, out_dim * in_dim);
-        defer allocator.free(data);
-        fillRectIdentity(data, out_dim, in_dim);
-        const arr = mlx.arrayFromFloat32(data, &shape);
-        try mlx.insertWeight(weights, allocator, spec.name, arr);
-    }
-    const vector_specs = parityVectorSpecs(hidden_size);
-    for (vector_specs) |spec| {
-        if (mlxMapContains(weights, spec.name)) continue;
-        const dim: usize = @intCast(spec.dim);
-        const shape = [_]i32{@intCast(dim)};
-        const data = try allocator.alloc(f32, dim);
-        defer allocator.free(data);
-        fillVector(data, spec.fill);
-        const arr = mlx.arrayFromFloat32(data, &shape);
-        try mlx.insertWeight(weights, allocator, spec.name, arr);
-    }
-}
-
 fn initParityTopLevelWeightsMetal(
     allocator: std.mem.Allocator,
     weight_store: *MetalWeightStore,
@@ -3036,23 +2908,6 @@ fn parityVectorSpecs(hidden_size: u32) [26]ParityVectorSpec {
     };
 }
 
-fn mlxMapContains(weights: if (build_options.enable_mlx) mlx_c.mlx_map_string_to_array_t else void, name: []const u8) bool {
-    if (comptime !build_options.enable_mlx) return false;
-    const it = mlx_c.mlx_map_string_to_array_iterator_new(weights);
-    defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
-    while (true) {
-        var key: [*c]const u8 = null;
-        var val = mlx_c.mlx_array_new();
-        if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-            _ = mlx_c.mlx_array_free(val);
-            return false;
-        }
-        const found = key != null and std.mem.eql(u8, std.mem.span(key), name);
-        _ = mlx_c.mlx_array_free(val);
-        if (found) return true;
-    }
-}
-
 fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeightStore) void {
     if (comptime !build_options.enable_metal) return;
     metal_compute.deinitPrefetchQueue(weight_store);
@@ -3063,9 +2918,6 @@ fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *Metal
         if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
     }
     weight_store.lazy_weights.deinit(allocator);
-    if (comptime build_options.enable_mlx) {
-        _ = mlx_c.mlx_map_string_to_array_free(weight_store.resident_weights);
-    }
 }
 
 const SpanParityDebugStats = struct {
@@ -3683,7 +3535,7 @@ fn printUsage() void {
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --seed <n>                RNG seed (default: 42)
         \\  --initial-adapter-checkpoint <path> Seed LoRA weights from a PEFT safetensors checkpoint
-        \\  --backend <name>          auto, metal, mlx, or native (default: auto)
+        \\  --backend <name>          auto, metal, or native (default: auto)
         \\  --compiled-required       Fail if the requested compiled backend cannot run
         \\  --lora-only-trainables    Freeze regular task-head params; train LoRA params only
         \\  --deterministic           Disable per-step stochastic regularization (forces lora-dropout=0

@@ -157,15 +157,20 @@ class _Api:
         try:
             response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
         except requests.RequestException as exc:
+            # A timed-out write usually means a node wedged in memory without
+            # logging anything; capture native stacks before teardown so the
+            # CI failure is diagnosable.
+            stacks = self._server.native_stack_dumps()
             raise AssertionError(
                 f"batch insert timed out/failed table={table!r} key={doc_id!r} "
-                f"sync_level={sync_level!r}: {exc!r}\n[logs]\n{self._server.debug_logs()}"
+                f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
+                f"\n[logs]\n{self._server.debug_logs()}"
             ) from exc
         return self._check(response)
 
     def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:
         response = self.s.get(
-            f"{self.url}/tables/{table}/lookup/{quote(key, safe='')}", timeout=timeout
+            f"{self.url}/tables/{table}/documents/{quote(key, safe='')}", timeout=timeout
         )
         if response.status_code == 404:
             return None
@@ -272,7 +277,9 @@ def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _
     raise AssertionError(
         f"entities were not promoted within {deadline.timeout_s}s "
         f"(elapsed={deadline.elapsed():.1f}s, pending={sorted(pending)!r}, "
-        f"last={last!r}, last_error={last_error!r})\n{api.diagnostic()}"
+        f"last={last!r}, last_error={last_error!r})"
+        f"\n[native stacks]\n{api._server.native_stack_dumps()}"
+        f"\n{api.diagnostic()}"
     )
 
 

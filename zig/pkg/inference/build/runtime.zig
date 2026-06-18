@@ -22,11 +22,10 @@ pub const FfmpegPaths = struct {
 pub const BackendOptions = struct {
     enable_onnx: bool = false,
     onnx_root: []const u8 = "onnxruntime/unknown-unknown",
-    enable_mlx: bool = false,
-    mlx_root: ?[]const u8 = null,
     enable_metal: bool = false,
     enable_cuda: bool = false,
-    cuda_artifacts: []const u8 = "portable",
+    cuda_artifacts: []const u8 = "fatbin",
+    cuda_libraries: []const u8 = "auto",
     enable_pjrt: bool = false,
     enable_native: bool = true,
     enable_system_blas: bool = false,
@@ -66,6 +65,7 @@ pub const SharedModules = struct {
     protobuf: ?*std.Build.Module = null,
     sentencepiece_proto: ?*std.Build.Module = null,
     ml: ?*std.Build.Module = null,
+    ml_tabular: ?*std.Build.Module = null,
     onnx_graph: ?*std.Build.Module = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
@@ -103,6 +103,7 @@ pub const Graph = struct {
     protobuf_mod: *std.Build.Module,
     sentencepiece_proto_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
+    ml_tabular_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
     pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
@@ -181,6 +182,7 @@ pub fn create(config: Config) Graph {
     const protobuf_mod = shared.protobuf orelse protobuf_dep.module("protobuf");
     const sentencepiece_proto_mod = shared.sentencepiece_proto orelse addSentencePieceProtoModule(b, protobuf_dep, paths, config.register_public_modules);
     const ml_mod = shared.ml orelse createSharedModuleNamed(config, "ml", "lib/ml/src/root.zig");
+    const ml_tabular_mod = shared.ml_tabular orelse createSharedModuleNamed(config, "ml_tabular", "lib/ml/tabular/src/root.zig");
     const onnx_graph_mod = shared.onnx_graph orelse blk: {
         const mod = b.dependency("onnx_graph", .{
             .target = target,
@@ -276,6 +278,7 @@ pub fn create(config: Config) Graph {
         .scraping_mod = scraping_mod,
         .image_mod = image_mod,
         .ml_mod = ml_mod,
+        .ml_tabular_mod = ml_tabular_mod,
         .prometheus_mod = prometheus_mod,
         .structlog_mod = structlog_mod,
         .onnx_graph_mod = onnx_graph_mod,
@@ -301,6 +304,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("antfly_image", image_mod);
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
     inference_internal_mod.addImport("ml", ml_mod);
+    inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
     inference_internal_mod.addImport("pjrt", pjrt_mod);
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
@@ -329,6 +333,7 @@ pub fn create(config: Config) Graph {
         .protobuf_mod = protobuf_mod,
         .sentencepiece_proto_mod = sentencepiece_proto_mod,
         .ml_mod = ml_mod,
+        .ml_tabular_mod = ml_tabular_mod,
         .onnx_graph_mod = onnx_graph_mod,
         .pjrt_mod = pjrt_mod,
         .inference_api_mod = inference_api_mod,
@@ -378,6 +383,7 @@ const InferenceRootImports = struct {
     scraping_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
+    ml_tabular_mod: *std.Build.Module,
     prometheus_mod: *std.Build.Module,
     structlog_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
@@ -402,6 +408,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("antfly_scraping", imports.scraping_mod);
     module.addImport("antfly_image", imports.image_mod);
     module.addImport("ml", imports.ml_mod);
+    module.addImport("ml_tabular", imports.ml_tabular_mod);
     module.addImport("prometheus", imports.prometheus_mod);
     module.addImport("structlog", imports.structlog_mod);
     module.addImport("onnx_graph", imports.onnx_graph_mod);
@@ -429,10 +436,10 @@ fn addAudioOpenCorpusBuildOptions(b: *std.Build, backend: BackendOptions) *std.B
 
 fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) void {
     options.addOption(bool, "enable_onnx", backend.enable_onnx);
-    options.addOption(bool, "enable_mlx", backend.enable_mlx);
     options.addOption(bool, "enable_metal", backend.enable_metal);
     options.addOption(bool, "enable_cuda", backend.enable_cuda);
     options.addOption([]const u8, "cuda_artifacts", backend.cuda_artifacts);
+    options.addOption([]const u8, "cuda_libraries", backend.cuda_libraries);
     options.addOption(bool, "enable_pjrt", backend.enable_pjrt);
     options.addOption(bool, "enable_native", backend.enable_native);
     options.addOption(bool, "enable_system_blas", backend.enable_system_blas);
@@ -642,7 +649,6 @@ fn configureRuntimeLinks(
     }
     configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
-    configureMlx(b, module, target, backend.enable_mlx, backend.mlx_root);
     if (backend.ffmpeg_paths) |ffmpeg_paths| {
         module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
         module.addLibraryPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
@@ -703,21 +709,6 @@ pub fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
-}
-
-pub fn configureMlx(
-    b: *std.Build,
-    module: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
-) void {
-    if (!enable_mlx or target.result.os.tag != .macos) return;
-    if (mlx_root) |root| {
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-    }
-    module.linkSystemLibrary("mlxc", .{});
 }
 
 fn pathExists(b: *std.Build, path: []const u8) bool {

@@ -2506,13 +2506,6 @@ fn evalRuntimeStrategy(trainer: *const real_autodiff.RealAutodiffTrainer) !graph
             }
             break :blk if (trainer.config.compiled_required) .compiled_required else .compiled_preferred;
         },
-        .compiled_mlx => blk: {
-            if (trainer.compute_backend.kind() != .mlx) {
-                if (trainer.config.compiled_required) return error.CompiledMlxRequiresMlxBackend;
-                break :blk .interpreter;
-            }
-            break :blk if (trainer.config.compiled_required) .compiled_required else .compiled_preferred;
-        },
     };
 }
 

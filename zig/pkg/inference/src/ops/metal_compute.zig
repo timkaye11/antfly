@@ -20,22 +20,6 @@ const ops = @import("ops.zig");
 const gpu_hosted_store_mod = @import("gpu_hosted_store.zig");
 const native_compute_mod = @import("native_compute.zig");
 const native = @import("../backends/native.zig");
-// mlx.zig is only compiled under `-Dmlx=true`; the stub keeps `getWeightOp`'s
-// MLX fallback branch buildable when MLX is disabled.
-const mlx = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {
-    pub const c = struct {
-        pub const mlx_array = *anyopaque;
-        pub fn mlx_array_free(_: *anyopaque) callconv(.c) c_int {
-            unreachable;
-        }
-    };
-    pub fn getWeight(_: anytype, _: anytype) ?*anyopaque {
-        return null;
-    }
-    pub fn readFloat32(_: anytype, _: anytype) ![]f32 {
-        unreachable;
-    }
-};
 const activations_mod = @import("../backends/activations.zig");
 const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/metal_tensor.zig") else struct {
     pub const max_dims: usize = 8;
@@ -293,8 +277,7 @@ fn enableContiguousSliceDeviceView() bool {
 }
 
 pub const MetalCompute = if (build_options.enable_metal) struct {
-    // mlx_quant.zig is MLX-only; stub out the types we reference when MLX is off.
-    const mlx_quant = if (build_options.enable_mlx) @import("../backends/mlx_quant.zig") else struct {
+    const mlx_quant = struct {
         pub const Provider = void;
         pub const MetalProvider = void;
     };
@@ -567,8 +550,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     allocator: std.mem.Allocator,
     data: *WeightStore,
-    provider: if (build_options.enable_mlx) ?mlx_quant.Provider else void =
-        if (build_options.enable_mlx) null else {},
+    provider: if (false) ?mlx_quant.Provider else void =
+        if (false) null else {},
     provider_impl: *ProviderImpl,
     owned_native_provider: bool = false,
     backend_kv_cache: std.AutoHashMapUnmanaged(BackendKvCacheKey, BackendKvCacheEntry) = .empty,
@@ -616,14 +599,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         io: ?std.Io,
     ) !MetalCompute {
         _ = run_budget;
-        if (io == null and !builtin.is_test and comptime build_options.enable_mlx) {
+        if (io == null and !builtin.is_test and comptime false) {
             const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(provider_impl);
             provider_impl.* = try MetalNativeProvider.create();
             return .{
                 .allocator = allocator,
                 .data = data,
-                .provider = if (build_options.enable_mlx) null else {},
+                .provider = if (false) null else {},
                 .provider_impl = provider_impl,
                 .owned_native_provider = true,
                 .io = io,
@@ -641,7 +624,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{
             .allocator = allocator,
             .data = data,
-            .provider = if (build_options.enable_mlx) null else {},
+            .provider = if (false) null else {},
             .provider_impl = provider_impl,
             .owned_native_provider = false,
             .io = io,
@@ -2631,16 +2614,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
 
-    fn logicalShapeFromMlxArray(self: *MetalCompute, arr: mlx.c.mlx_array) ![]i64 {
-        if (comptime build_options.enable_mlx) {
-            const ndim: usize = @intCast(mlx.c.mlx_array_ndim(arr));
-            const shape = try self.allocator.alloc(i64, ndim);
-            for (0..ndim) |axis| shape[axis] = @intCast(mlx.c.mlx_array_dim(arr, @intCast(axis)));
-            return shape;
-        }
-        unreachable;
-    }
-
     fn logicalShapeFromTensor(self: *MetalCompute, tensor: *const tensor_mod.Tensor) ![]i64 {
         return self.allocator.dupe(i64, tensor.shape);
     }
@@ -3498,7 +3471,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.dynamic_linear_slots.deinit(self.allocator);
         self.dynamic_layer_norm_slots.deinit(self.allocator);
         self.dynamic_rms_norm_slots.deinit(self.allocator);
-        if (comptime build_options.enable_mlx) {
+        if (comptime false) {
             if (self.provider) |provider| provider.deinit();
         }
         if (self.owned_native_provider) {
@@ -3789,41 +3762,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!std.mem.eql(i32, device_tensor.shape(), expected_shape)) return error.InvalidTensorShape;
         cache.* = device_tensor;
         return cache.*.?.retainedCopy();
-    }
-
-    fn useSharedDebertaEmbeddingDeviceCache(self: *const MetalCompute) bool {
-        return build_options.enable_metal and !build_options.enable_mlx and !self.owned_native_provider;
-    }
-
-    fn cachedSharedDeviceTensorFromCt(
-        self: *MetalCompute,
-        cache: *?MetalTensor,
-        tensor: CT,
-        expected_shape: []const i32,
-    ) !MetalTensor {
-        const lock_io = lockSharedMetalData(self.data, self.io);
-        defer unlockSharedMetalData(self.data, lock_io);
-        return self.cachedDeviceTensorFromCt(cache, tensor, expected_shape);
-    }
-
-    fn cachedSharedDebertaEmbeddingWeightByName(self: *MetalCompute, name: []const u8) !?CT {
-        if (!self.useSharedDebertaEmbeddingDeviceCache()) return null;
-        var retained: ?MetalTensor = null;
-        const lock_io = lockSharedMetalData(self.data, self.io);
-        defer unlockSharedMetalData(self.data, lock_io);
-        if (std.mem.eql(u8, name, "embeddings.word_embeddings.weight")) {
-            if (self.data.shared_deberta_embedding_weight_device_cache) |*tensor| retained = try tensor.retainedCopy();
-        } else if (std.mem.eql(u8, name, "embeddings.LayerNorm.weight")) {
-            if (self.data.shared_deberta_embedding_ln_weight_device_cache) |*tensor| retained = try tensor.retainedCopy();
-        } else if (std.mem.eql(u8, name, "embeddings.LayerNorm.bias")) {
-            if (self.data.shared_deberta_embedding_ln_bias_device_cache) |*tensor| retained = try tensor.retainedCopy();
-        }
-        if (retained) |tensor| {
-            var owned = tensor;
-            errdefer owned.deinit();
-            return try self.ctFromOwnedMetalTensor(owned);
-        }
-        return null;
     }
 
     fn deviceTensorFromF32Slice(self: *MetalCompute, data: []const f32, shape: []const i32) !MetalTensor {
@@ -9559,21 +9497,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const cache_start_ns = if (trace) monotonicNowNs() else 0;
         const weight_shape = [_]i32{ weight_probe.dim(0), @intCast(request.hidden_size) };
         const norm_shape = [_]i32{@intCast(request.hidden_size)};
-        const use_shared_cache = self.useSharedDebertaEmbeddingDeviceCache();
-        var weight_mt = if (use_shared_cache)
-            try self.cachedSharedDeviceTensorFromCt(&self.data.shared_deberta_embedding_weight_device_cache, request.word_embeddings, &weight_shape)
-        else
-            try self.cachedDeviceTensorFromCt(&self.deberta_embedding_weight_device_cache, request.word_embeddings, &weight_shape);
+        var weight_mt = try self.cachedDeviceTensorFromCt(&self.deberta_embedding_weight_device_cache, request.word_embeddings, &weight_shape);
         defer weight_mt.deinit();
-        var gamma_mt = if (use_shared_cache)
-            try self.cachedSharedDeviceTensorFromCt(&self.data.shared_deberta_embedding_ln_weight_device_cache, request.layer_norm_weight, &norm_shape)
-        else
-            try self.cachedDeviceTensorFromCt(&self.deberta_embedding_ln_weight_device_cache, request.layer_norm_weight, &norm_shape);
+        var gamma_mt = try self.cachedDeviceTensorFromCt(&self.deberta_embedding_ln_weight_device_cache, request.layer_norm_weight, &norm_shape);
         defer gamma_mt.deinit();
-        var beta_mt = if (use_shared_cache)
-            try self.cachedSharedDeviceTensorFromCt(&self.data.shared_deberta_embedding_ln_bias_device_cache, request.layer_norm_bias, &norm_shape)
-        else
-            try self.cachedDeviceTensorFromCt(&self.deberta_embedding_ln_bias_device_cache, request.layer_norm_bias, &norm_shape);
+        var beta_mt = try self.cachedDeviceTensorFromCt(&self.deberta_embedding_ln_bias_device_cache, request.layer_norm_bias, &norm_shape);
         defer beta_mt.deinit();
         const cache_ns = if (trace) monotonicNowNs() - cache_start_ns else 0;
 
@@ -17044,10 +16972,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         const full_name = name_z[0..name_z.len];
 
-        if (try self.cachedSharedDebertaEmbeddingWeightByName(name)) |cached_device_weight| {
-            return cached_device_weight;
-        }
-
         if (self.dense_weight_cache.get(full_name)) |*cached| {
             return self.cachedDenseWeightBuf(cached);
         }
@@ -17058,7 +16982,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             gpu_hosted_store_mod.touchLazyWeight(self.data, entry);
             try gpu_hosted_store_mod.ensureHostLazyWeightLoadedSimple(self.data, entry);
 
-            if (!build_options.enable_mlx and preferHostLoadedWeightsDebug()) {
+            if (!false and preferHostLoadedWeightsDebug()) {
                 if (entry.host_loaded) |*loaded| {
                     const host = try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
                     errdefer self.allocator.free(host);
@@ -17080,10 +17004,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     // Keep the token-embedding data path dense while retaining
                     // a packed view for final-head runtime preparation.
                 } else {
-                    if (comptime !build_options.enable_mlx) {
+                    if (comptime !false) {
                         if (!metal_runtime.isMetalNativeSupported(storage.tensor_type)) {
                             std.log.err(
-                                "metal-native build cannot execute weight '{s}' with quant format {s}; rebuild with -Dmlx=true or requantize to a supported Metal quant format",
+                                "metal-native build cannot execute weight '{s}' with quant format {s}; requantize to a supported Metal quant format",
                                 .{ full_name, storage.tensor_type.name() },
                             );
                             return error.UnsupportedQuantFormatForMetalOnly;
@@ -17115,21 +17039,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
 
-        if (comptime build_options.enable_mlx) {
-            if (mlx.getWeight(self.data.resident_weights, name_z)) |arr| {
-                defer _ = mlx.c.mlx_array_free(arr);
-                var host = try mlx.readFloat32(arr, self.allocator);
-                errdefer self.allocator.free(host);
-                const shape = try self.logicalShapeFromMlxArray(arr);
-                errdefer self.allocator.free(shape);
-                if (isGpt2Conv1dWeight(full_name)) {
-                    host = try self.repackGpt2Conv1dResidentHostOrder(host, shape);
-                }
-                const cached = try self.getOrInsertCachedDenseWeight(full_name, host, shape, null, null, null, null);
-                return self.cachedDenseWeightBuf(cached);
-            }
-        }
-
         if (traceMissingWeightDebug()) {
             std.debug.print("metal_missing_weight: requested={s} full={s} prefix={s}\n", .{ name, full_name, self.data.prefix });
         }
@@ -17139,14 +17048,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn prefetchWeightHintOp(ctx: *anyopaque, name: []const u8, hint: u32) void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.data.prefetch_initialized) return;
-        if (build_options.enable_mlx) {
-            const name_z = self.allocator.dupeZ(u8, name) catch return;
-            defer self.allocator.free(name_z);
-            if (mlx.getWeight(self.data.resident_weights, name_z)) |arr| {
-                defer _ = mlx.c.mlx_array_free(arr);
-                return;
-            }
-        }
         self.data.prefetch.lock();
         defer self.data.prefetch.unlock();
         if (self.data.lazy_weights.getPtr(name)) |entry| {
@@ -22063,30 +21964,14 @@ fn unlockSharedMetalData(data: *WeightStore, lock_io: std.Io) void {
     data.shared_metal_native_provider_lock.unlock(lock_io);
 }
 
-fn deinitSharedDebertaEmbeddingDeviceCaches(data: *WeightStore) void {
-    if (data.shared_deberta_embedding_weight_device_cache) |*tensor| {
-        tensor.deinit();
-        data.shared_deberta_embedding_weight_device_cache = null;
-    }
-    if (data.shared_deberta_embedding_ln_weight_device_cache) |*tensor| {
-        tensor.deinit();
-        data.shared_deberta_embedding_ln_weight_device_cache = null;
-    }
-    if (data.shared_deberta_embedding_ln_bias_device_cache) |*tensor| {
-        tensor.deinit();
-        data.shared_deberta_embedding_ln_bias_device_cache = null;
-    }
-}
-
 pub fn deinitSharedNativeProvider(data: *WeightStore) void {
     if (comptime !build_options.enable_metal) return;
-    if (comptime build_options.enable_mlx) return;
+    if (comptime false) return;
     if (!data.shared_metal_native_provider_lock.tryLock()) {
         std.debug.assert(false);
         return;
     }
     defer data.shared_metal_native_provider_lock.unlock(std.Io.failing);
-    deinitSharedDebertaEmbeddingDeviceCaches(data);
     const provider = data.shared_metal_native_provider orelse return;
     provider.deinitOwned();
     std.heap.c_allocator.destroy(provider);
@@ -22094,19 +21979,8 @@ pub fn deinitSharedNativeProvider(data: *WeightStore) void {
 }
 
 fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
-    if (comptime build_options.enable_mlx) {
-        return .{
-            .allocator = allocator,
-            .resident_weights = .{},
-            .stream = .{},
-            .prefix = "",
-            .lazy_weights = .empty,
-        };
-    }
     return .{
         .allocator = allocator,
-        .resident_weights = {},
-        .stream = {},
         .prefix = "",
         .lazy_weights = .empty,
     };
@@ -22114,7 +21988,7 @@ fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
 
 test "metal_compute: native provider is shared across backend lifetimes" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    if (comptime build_options.enable_mlx) return error.SkipZigTest;
+    if (comptime false) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var metal_ws = testMetalWeightStoreInit(allocator);
     defer {

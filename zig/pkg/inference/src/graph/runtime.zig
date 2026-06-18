@@ -453,7 +453,6 @@ fn graphRuntimeRequireNoHostAssistedRequested() bool {
 fn parsePartitionReportTarget(value: []const u8) ?BackendKind {
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(value, "pjrt")) return .pjrt;
     if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
@@ -708,7 +707,6 @@ fn dumpPartitionReport(
 fn backendKindForPartition(kind: BackendKind) BackendKind {
     return switch (kind) {
         .metal => .metal,
-        .mlx => .mlx,
         .onnx => .onnx,
         .pjrt => .pjrt,
         .cuda => .cuda,

@@ -1170,10 +1170,14 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     var train_argv: std.ArrayList([]const u8) = .empty;
     try appendMany(allocator, &train_argv, &.{
         "train-gliner2-autodiff",
-        "--model-dir",  model_path,
-        "--train-data", train_path,
-        "--out-dir",    out_dir,
-        "--objective",  "gliner2-total-loss",
+        "--model-dir",
+        model_path,
+        "--train-data",
+        train_path,
+        "--out-dir",
+        out_dir,
+        "--objective",
+        "gliner2-total-loss",
     });
     if (recipe.optimizer.epochs) |epochs| try appendMany(allocator, &train_argv, &.{ "--epochs", try fmtInt(allocator, epochs) });
     if (recipe.optimizer.learning_rate) |lr| try appendMany(allocator, &train_argv, &.{ "--learning-rate", try fmtFloat(allocator, lr) });
@@ -1996,7 +2000,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
                 .inference_version = build_options.inference_version,
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
-                .enable_mlx = build_options.enable_mlx,
+                .enable_mlx = false,
                 .enable_pjrt = build_options.enable_pjrt,
                 .skip_openapi = build_options.skip_openapi,
             },

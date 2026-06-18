@@ -36,6 +36,7 @@
 //!   4. WAL.truncate(LSN)
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
@@ -512,7 +513,7 @@ const deletions_db_name = "deletions";
 var global_storage_mu: std.atomic.Mutex = .unlocked;
 
 fn lockPersistentStorage() void {
-    while (!global_storage_mu.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(&global_storage_mu);
 }
 
 fn unlockPersistentStorage() void {
@@ -1088,6 +1089,13 @@ pub const PersistentIndex = struct {
         return switch (self.main_store_owner) {
             .lmdb, .mem => 0,
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
+        };
+    }
+
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
+        return switch (self.main_store_owner) {
+            .lmdb, .mem => null,
+            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
         };
     }
 
@@ -1716,7 +1724,7 @@ pub const PersistentIndex = struct {
             const seg = &snap.segments[seg_idx];
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = seg.deleted,
+                .deleted = seg.shared.deleted,
             };
         }
 

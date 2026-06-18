@@ -112,6 +112,109 @@ pub fn removeIndexFromTableIndexesJson(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn addEnrichmentToTableIndexesJson(
+    alloc: std.mem.Allocator,
+    current_indexes_json: []const u8,
+    enrichment_name: []const u8,
+    enrichment_json: []const u8,
+) ![]u8 {
+    try validateEnrichmentConfigName(alloc, enrichment_name, enrichment_json);
+    var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
+    defer current.deinit();
+    var config = std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{}) catch return error.InvalidExtensionEnrichment;
+    defer config.deinit();
+
+    const root = switch (current.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    if (config.value != .object) return error.InvalidExtensionEnrichment;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+
+    var first = true;
+    var wrote_enrichments = false;
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (!first) try out.append(alloc, ',');
+        first = false;
+
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+            wrote_enrichments = true;
+            try appendJsonString(alloc, &out, "enrichments");
+            try out.append(alloc, ':');
+            try appendEnrichmentArrayWithReplacement(alloc, &out, entry.value_ptr.*, enrichment_name, config.value);
+            continue;
+        }
+
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendJsonValue(alloc, &out, entry.value_ptr.*);
+    }
+
+    if (!wrote_enrichments) {
+        if (!first) try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "enrichments");
+        try out.appendSlice(alloc, ":[");
+        try appendJsonValue(alloc, &out, config.value);
+        try out.append(alloc, ']');
+    }
+
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn removeEnrichmentFromTableIndexesJson(
+    alloc: std.mem.Allocator,
+    current_indexes_json: []const u8,
+    enrichment_name: []const u8,
+) !?[]u8 {
+    var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
+    defer current.deinit();
+
+    const root = switch (current.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const current_enrichments = root.get("enrichments") orelse return null;
+    if (current_enrichments != .array) return error.InvalidTableIndexMetadata;
+
+    var removed = false;
+    var remaining: usize = 0;
+    for (current_enrichments.array.items) |item| {
+        if (enrichmentValueNameEquals(item, enrichment_name)) {
+            removed = true;
+        } else {
+            remaining += 1;
+        }
+    }
+    if (!removed) return null;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+
+    var first = true;
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") and remaining == 0) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+            try appendEnrichmentArrayWithoutName(alloc, &out, entry.value_ptr.*, enrichment_name);
+        } else {
+            try appendJsonValue(alloc, &out, entry.value_ptr.*);
+        }
+    }
+
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn encodeIndexList(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -410,11 +513,42 @@ fn appendIndexConfig(
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-        defer alloc.free(encoded);
-        try out.appendSlice(alloc, encoded);
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+            try appendCanonicalIndexEnrichments(alloc, out, entry.value_ptr.*);
+        } else {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
     }
     try out.append(alloc, '}');
+}
+
+fn appendCanonicalIndexEnrichments(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+) !void {
+    if (value != .array) {
+        const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+        return;
+    }
+    try out.append(alloc, '[');
+    for (value.array.items, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        switch (item) {
+            .string => |name| try appendJsonString(alloc, out, name),
+            .object => |object| {
+                const name = object.get("name") orelse return error.InvalidTableIndexMetadata;
+                if (name != .string) return error.InvalidTableIndexMetadata;
+                try appendJsonString(alloc, out, name.string);
+            },
+            else => return error.InvalidTableIndexMetadata,
+        }
+    }
+    try out.append(alloc, ']');
 }
 
 fn canonicalIndexConfigJson(
@@ -486,6 +620,66 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+fn appendJsonValue(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn validateEnrichmentConfigName(alloc: std.mem.Allocator, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, alloc, enrichment_json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidExtensionEnrichment;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.name, enrichment_name)) return error.InvalidExtensionEnrichment;
+}
+
+fn enrichmentValueNameEquals(value: std.json.Value, enrichment_name: []const u8) bool {
+    if (value != .object) return false;
+    const name_value = value.object.get("name") orelse return false;
+    return name_value == .string and std.mem.eql(u8, name_value.string, enrichment_name);
+}
+
+fn appendEnrichmentArrayWithReplacement(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    enrichment_name: []const u8,
+    replacement: std.json.Value,
+) !void {
+    if (value != .array) return error.InvalidTableIndexMetadata;
+    try out.append(alloc, '[');
+    var first = true;
+    for (value.array.items) |item| {
+        if (enrichmentValueNameEquals(item, enrichment_name)) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonValue(alloc, out, item);
+    }
+    if (!first) try out.append(alloc, ',');
+    try appendJsonValue(alloc, out, replacement);
+    try out.append(alloc, ']');
+}
+
+fn appendEnrichmentArrayWithoutName(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    enrichment_name: []const u8,
+) !void {
+    if (value != .array) return error.InvalidTableIndexMetadata;
+    try out.append(alloc, '[');
+    var first = true;
+    for (value.array.items) |item| {
+        if (enrichmentValueNameEquals(item, enrichment_name)) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonValue(alloc, out, item);
+    }
+    try out.append(alloc, ']');
 }
 
 fn appendAlgebraicIndexStatsFields(
@@ -571,7 +765,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -584,7 +778,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, null, null, .{}, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -604,11 +798,12 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
+    load_error: ?[]const u8 = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -630,6 +825,9 @@ const AggregatedIndexStatus = struct {
     hbc_posting: db_mod.types.HbcPostingStats = .{},
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
+    resolution: db_mod.types.ReplayStageStats = .{},
+    promotion: db_mod.types.ReplayStageStats = .{},
+    resolver_replay: db_mod.types.ResolverReplayDiagnostics = .{},
     expected_group_count: u64 = 0,
     reported_group_count: u64 = 0,
     fresh_group_count: u64 = 0,
@@ -720,6 +918,7 @@ fn aggregateIndexStatus(
         const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
+        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -788,6 +987,9 @@ fn aggregateIndexStatus(
         }
         db_mod.types.accumulateAsyncIndexingStats(&aggregate.async_indexing, runtime.stats.async_indexing);
         aggregateEnrichmentStats(&aggregate.enrichment, runtime.stats.enrichment);
+        aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
+        aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
+        aggregateResolverReplayDiagnostics(&aggregate.resolver_replay, runtime.stats.resolver_replay);
         if (item.backfill_active) {
             aggregate.backfill_active = true;
             active_count += 1;
@@ -846,6 +1048,25 @@ fn algebraicCapabilityLifecycleRank(status: []const u8) u8 {
     return 5;
 }
 
+fn aggregateResolverReplayDiagnostics(dst: *db_mod.types.ResolverReplayDiagnostics, src: db_mod.types.ResolverReplayDiagnostics) void {
+    dst.resolver_count += src.resolver_count;
+    dst.resolution_runtime_present = dst.resolution_runtime_present or src.resolution_runtime_present;
+    dst.resolution_worker_started = dst.resolution_worker_started or src.resolution_worker_started;
+    dst.promotion_runtime_present = dst.promotion_runtime_present or src.promotion_runtime_present;
+    dst.promotion_worker_started = dst.promotion_worker_started or src.promotion_worker_started;
+    if (dst.resolvers.len == 0 and src.resolvers.len > 0) dst.resolvers = src.resolvers;
+}
+
+fn aggregateReplayStageStats(dst: *db_mod.types.ReplayStageStats, src: db_mod.types.ReplayStageStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.target_sequence += src.target_sequence;
+    dst.applied_sequence += src.applied_sequence;
+    dst.catch_up_required = dst.catch_up_required or src.catch_up_required;
+    dst.blocked = dst.blocked or src.blocked;
+    if (dst.blocked_reason.len == 0 and src.blocked_reason.len > 0) dst.blocked_reason = src.blocked_reason;
+    dst.error_count += src.error_count;
+}
+
 fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.types.EnrichmentStats) void {
     dst.enabled = dst.enabled or src.enabled;
     dst.lease_owned = dst.lease_owned and src.lease_owned;
@@ -864,6 +1085,21 @@ fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.type
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.skip_by_hash_count += src.skip_by_hash_count;
     dst.codec_decode_failures += src.codec_decode_failures;
+    dst.embed_batches_started += src.embed_batches_started;
+    dst.embed_batches_completed += src.embed_batches_completed;
+    dst.embed_items_started += src.embed_items_started;
+    dst.embed_items_completed += src.embed_items_completed;
+    dst.active_embed_batch_items += src.active_embed_batch_items;
+    dst.active_embed_batch_bytes += src.active_embed_batch_bytes;
+    dst.active_embed_batch_max_bytes = @max(dst.active_embed_batch_max_bytes, src.active_embed_batch_max_bytes);
+    dst.active_embed_batch_started_ms = @max(dst.active_embed_batch_started_ms, src.active_embed_batch_started_ms);
+    if (src.last_embed_batch_ns >= dst.last_embed_batch_ns) {
+        dst.last_embed_batch_items = src.last_embed_batch_items;
+        dst.last_embed_batch_bytes = src.last_embed_batch_bytes;
+        dst.last_embed_batch_max_bytes = src.last_embed_batch_max_bytes;
+        dst.last_embed_batch_ns = src.last_embed_batch_ns;
+    }
+    dst.total_embed_ns += src.total_embed_ns;
     dst.dense_artifact_bytes_written += src.dense_artifact_bytes_written;
     dst.sparse_artifact_bytes_written += src.sparse_artifact_bytes_written;
     dst.chunk_artifact_bytes_written += src.chunk_artifact_bytes_written;
@@ -1123,6 +1359,9 @@ fn appendSingleIndexRuntimeStatus(
     graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
+    resolution: ?db_mod.types.ReplayStageStats,
+    promotion: ?db_mod.types.ReplayStageStats,
+    resolver_replay: db_mod.types.ResolverReplayDiagnostics,
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
@@ -1168,6 +1407,17 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
+    // An index whose persisted artifacts failed to load is broken, not
+    // rebuilding/warming: report the load error and suppress activity flags
+    // so clients classify it as needing a drop+recreate.
+    const load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    if (load_error != null) {
+        backfill_active = false;
+        catch_up_active = false;
+        replay_catch_up_required = false;
+        catch_up_phase = .idle;
+    }
+
     try out.append(alloc, '{');
     if (index_type != .algebraic) {
         try appendJsonString(alloc, out, "index_type");
@@ -1201,7 +1451,17 @@ fn appendSingleIndexRuntimeStatus(
     defer alloc.free(progress);
     try out.appendSlice(alloc, progress);
     try out.appendSlice(alloc, ",\"backfill_state\":");
-    try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
+    if (load_error != null) {
+        try appendJsonString(alloc, out, "failed");
+    } else {
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
+    }
+    if (load_error) |err_name| {
+        const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
+        defer alloc.free(msg);
+        try out.appendSlice(alloc, ",\"error\":");
+        try appendJsonString(alloc, out, msg);
+    }
     try out.appendSlice(alloc, ",\"doc_count\":");
     try appendIntValue(alloc, out, item.doc_count);
     try out.appendSlice(alloc, ",\"term_count\":");
@@ -1276,6 +1536,9 @@ fn appendSingleIndexRuntimeStatus(
         false;
     try out.appendSlice(alloc, ",\"runtime_fresh\":");
     try out.appendSlice(alloc, if (runtime_fresh) "true" else "false");
+    if (resolution) |stats| try appendReplayStageStatus(alloc, out, "resolution", stats);
+    if (promotion) |stats| try appendReplayStageStatus(alloc, out, "promotion", stats);
+    if (index_type == .graph) try appendResolverReplayDiagnosticsStatus(alloc, out, resolver_replay);
     if (metadata) |md| {
         try out.appendSlice(alloc, ",\"runtime_source\":");
         try appendJsonString(alloc, out, statusSourceName(md.source));
@@ -1319,6 +1582,63 @@ fn appendSingleIndexRuntimeStatus(
     }
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
+    try out.append(alloc, '}');
+}
+
+fn appendResolverReplayDiagnosticsStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), stats: db_mod.types.ResolverReplayDiagnostics) !void {
+    try out.appendSlice(alloc, ",\"resolver_replay\":{");
+    try out.appendSlice(alloc, "\"resolver_count\":");
+    try appendIntValue(alloc, out, stats.resolver_count);
+    try out.appendSlice(alloc, ",\"resolution_runtime_present\":");
+    try out.appendSlice(alloc, if (stats.resolution_runtime_present) "true" else "false");
+    try out.appendSlice(alloc, ",\"resolution_worker_started\":");
+    try out.appendSlice(alloc, if (stats.resolution_worker_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"promotion_runtime_present\":");
+    try out.appendSlice(alloc, if (stats.promotion_runtime_present) "true" else "false");
+    try out.appendSlice(alloc, ",\"promotion_worker_started\":");
+    try out.appendSlice(alloc, if (stats.promotion_worker_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"resolvers\":[");
+    for (stats.resolvers, 0..) |resolver, i| {
+        if (i > 0) try out.appendSlice(alloc, ",");
+        try out.appendSlice(alloc, "{");
+        try appendJsonString(alloc, out, "name");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.name);
+        try out.appendSlice(alloc, ",");
+        try appendJsonString(alloc, out, "table");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.table);
+        try out.appendSlice(alloc, ",");
+        try appendJsonString(alloc, out, "source_artifact");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.source_artifact);
+        try out.appendSlice(alloc, ",");
+        try appendJsonString(alloc, out, "resolution_artifact");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.resolution_artifact);
+        try out.appendSlice(alloc, "}");
+    }
+    try out.appendSlice(alloc, "]}");
+}
+
+fn appendReplayStageStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, stats: db_mod.types.ReplayStageStats) !void {
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, name);
+    try out.appendSlice(alloc, ":{");
+    try out.appendSlice(alloc, "\"enabled\":");
+    try out.appendSlice(alloc, if (stats.enabled) "true" else "false");
+    try out.appendSlice(alloc, ",\"target_sequence\":");
+    try appendIntValue(alloc, out, stats.target_sequence);
+    try out.appendSlice(alloc, ",\"applied_sequence\":");
+    try appendIntValue(alloc, out, stats.applied_sequence);
+    try out.appendSlice(alloc, ",\"catch_up_required\":");
+    try out.appendSlice(alloc, if (stats.catch_up_required) "true" else "false");
+    try out.appendSlice(alloc, ",\"blocked\":");
+    try out.appendSlice(alloc, if (stats.blocked) "true" else "false");
+    try out.appendSlice(alloc, ",\"blocked_reason\":");
+    try appendJsonString(alloc, out, stats.blocked_reason);
+    try out.appendSlice(alloc, ",\"error_count\":");
+    try appendIntValue(alloc, out, stats.error_count);
     try out.append(alloc, '}');
 }
 
@@ -1742,6 +2062,30 @@ test "index config map encoder injects canonical name and type" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384}") != null);
 }
 
+test "index status encoder projects inline enrichment configs as names" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json =
+            \\{"document_text":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset"},{"name":"document_chunks_v1","kind":"chunk"}]},"document_vectors":{"type":"embeddings","enrichments":[{"name":"document_chunk_dense_v1","kind":"embedding"}]}}
+            ,
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded_list = (try encodeIndexList(std.testing.allocator, &snapshot, "docs", null)).?;
+    defer std.testing.allocator.free(encoded_list);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_list, "\"enrichments\":[\"document_units_v1\",\"document_chunks_v1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_list, "\"enrichments\":[\"document_chunk_dense_v1\"]") != null);
+}
+
 test "single index config encoder isolates requested index" {
     const encoded = (try encodeSingleIndexConfig(
         std.testing.allocator,
@@ -1821,6 +2165,34 @@ test "index metadata helpers add and remove entries" {
     defer std.testing.allocator.free(removed);
     try std.testing.expect(std.mem.indexOf(u8, removed, "\"default\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, removed, "\"embed_idx\"") != null);
+}
+
+test "index metadata helpers add replace and remove enrichments" {
+    const added = try addEnrichmentToTableIndexesJson(
+        std.testing.allocator,
+        "{\"default\":{\"type\":\"full_text\"}}",
+        "memory_embed",
+        "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}",
+    );
+    defer std.testing.allocator.free(added);
+    try std.testing.expect(std.mem.indexOf(u8, added, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, added, "\"memory_embed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, added, "\"default\"") != null);
+
+    const replaced = try addEnrichmentToTableIndexesJson(
+        std.testing.allocator,
+        added,
+        "memory_embed",
+        "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"summary\",\"expected_dims\":384}",
+    );
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expect(std.mem.indexOf(u8, replaced, "\"summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replaced, "\"body\"") == null);
+
+    const removed = (try removeEnrichmentFromTableIndexesJson(std.testing.allocator, replaced, "memory_embed")).?;
+    defer std.testing.allocator.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"memory_embed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"default\"") != null);
 }
 
 test "index encoders expose local shard runtime status" {

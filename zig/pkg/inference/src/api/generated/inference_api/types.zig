@@ -9,6 +9,45 @@ pub const Error = struct {
     @"error": []const u8,
 };
 
+pub const PredictRequest = struct {
+    /// Predictor name from the model catalog.
+    model: []const u8,
+    /// Batch of feature vectors. Max 10000 rows.
+    input: []const []const f32,
+};
+
+/// Task type for tabular predictors.
+pub const PredictorTask = enum {
+    regression,
+    binary_classification,
+    multiclass,
+    ranking,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .regression => "regression",
+            .binary_classification => "binary_classification",
+            .multiclass => "multiclass",
+            .ranking => "ranking",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "regression", .regression },
+            .{ "binary_classification", .binary_classification },
+            .{ "multiclass", .multiclass },
+            .{ "ranking", .ranking },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const TextContentPart = antfly_generating_openapi.TextContentPart;
 
 pub const ImageURL = antfly_generating_openapi.ImageURL;
@@ -340,8 +379,6 @@ pub const BackendRuntimes = struct {
     onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
-    /// Whether the MLX backend is built into this runtime
-    mlx: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
     cuda: ?bool = null,
     /// Whether the PJRT/XLA backend is built into this runtime
@@ -484,6 +521,26 @@ pub const EmbeddingUsage = struct {
     prompt_tokens: i64,
     /// Total tokens used
     total_tokens: i64,
+};
+
+pub const PredictResponse = struct {
+    model: []const u8,
+    task: PredictorTask,
+    /// Per-row prediction arrays. Length equals the model's `num_outputs` (1 for regression / binary, `num_classes` for multiclass).
+    predictions: []const []const f32,
+};
+
+/// Traditional ML predictor metadata.
+pub const PredictorInfo = struct {
+    task: PredictorTask,
+    /// Number of feature columns expected by the predictor.
+    num_features: i64,
+    /// Number of output values emitted per input row.
+    num_outputs: i64,
+    /// Optional feature names in input order.
+    feature_names: ?[]const []const u8 = null,
+    /// Source framework used to produce the predictor IR.
+    source_framework: ?[]const u8 = null,
 };
 
 /// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
@@ -761,6 +818,13 @@ pub const SchemasConfig = struct {
     style: ?Style = null,
 };
 
+pub const PredictorsResponse = struct {
+    /// Response object type.
+    object: []const u8,
+    /// Traditional ML predictors keyed by predictor name.
+    predictors: std.json.ArrayHashMap(PredictorInfo),
+};
+
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const EmbedResponse = struct {
     /// Object type, always "list"
@@ -880,7 +944,7 @@ pub const GenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
-    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native`, `metal`, and `mlx` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
+    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native` and `metal` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
     backend: ?[]const u8 = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
     mode: ?[]const u8 = null,
@@ -943,7 +1007,7 @@ pub const Config = struct {
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `mlx` - MLX backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const []const u8 = null,
     /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
     max_concurrent_requests: ?i64 = null,
