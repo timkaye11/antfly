@@ -71,6 +71,7 @@ const graph_weight_bridge = @import("graph_weight_bridge.zig");
 const ops = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const graph_runtime = @import("../graph/runtime.zig");
+const graph_training = @import("../graph/training.zig");
 
 const Builder = ml.graph.Builder;
 const Graph = ml.graph.Graph;
@@ -1777,7 +1778,7 @@ pub fn tokenLogitsForBatch(
         .shape = gs.graph.node(gs.targets_node).output_shape,
     };
 
-    try rt.put(allocator, gs.input_ids_node, try graph_input_binder.bindI64(trainer.compute_backend, allocator, input_placeholder, input_ids));
+    try rt.put(allocator, gs.input_ids_node, try bindEvalInputIds(trainer.compute_backend, allocator, input_placeholder, input_ids));
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, targets));
 
@@ -1906,7 +1907,7 @@ pub fn spanStartLogitsForBatch(
         .shape = gs.graph.node(gs.targets_node).output_shape,
     };
 
-    try rt.put(allocator, gs.input_ids_node, try graph_input_binder.bindI64(trainer.compute_backend, allocator, input_placeholder, input_ids));
+    try rt.put(allocator, gs.input_ids_node, try bindEvalInputIds(trainer.compute_backend, allocator, input_placeholder, input_ids));
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, span_targets));
 
@@ -2092,10 +2093,77 @@ fn evalScalarNodeForBatch(
     seq_len: u32,
     output_node: NodeId,
 ) !f64 {
+    if (trainer.compute_backend.kind() == .metal) {
+        return evalScalarNodeViaTrainStepForBatch(allocator, trainer, ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len, output_node);
+    }
     const values = try evalSpanStartNodeForBatch(allocator, trainer, ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len, output_node);
     defer allocator.free(values);
     if (values.len == 0) return error.InvalidTensorShape;
     return @floatCast(values[0]);
+}
+
+fn evalScalarNodeViaTrainStepForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    targets: []const f32,
+    targets_shape: Shape,
+    batch: u32,
+    seq_len: u32,
+    output_node: NodeId,
+) !f64 {
+    const rows: usize = @intCast(batch * seq_len);
+    if (input_ids.len != rows or attention_mask.len != rows) return error.InvalidGlinerBatchShape;
+
+    const trainer_input = makeTrainerInput(ctx, input_ids, attention_mask, targets, targets_shape, batch, seq_len);
+    try trainer.ensureGraphBuilt(trainer_input);
+    var gs = &trainer.graph_state.?;
+
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT).empty;
+    defer {
+        var it = rt.iterator();
+        while (it.next()) |entry| trainer.compute_backend.free(entry.value_ptr.*);
+        rt.deinit(allocator);
+    }
+
+    const input_placeholder = graph_input_binder.PlaceholderInfo{
+        .node_id = gs.input_ids_node,
+        .name = "__input_ids",
+        .shape = gs.graph.node(gs.input_ids_node).output_shape,
+    };
+    const mask_placeholder = graph_input_binder.PlaceholderInfo{
+        .node_id = gs.attention_mask_node,
+        .name = "__attention_mask",
+        .shape = gs.graph.node(gs.attention_mask_node).output_shape,
+    };
+    const targets_placeholder = graph_input_binder.PlaceholderInfo{
+        .node_id = gs.targets_node,
+        .name = "__targets",
+        .shape = gs.graph.node(gs.targets_node).output_shape,
+    };
+
+    try rt.put(allocator, gs.input_ids_node, try bindEvalInputIds(trainer.compute_backend, allocator, input_placeholder, input_ids));
+    try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
+    try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, targets));
+    for (trainer.lora_params.items) |slot| {
+        try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
+    }
+    for (trainer.regular_params.items) |slot| {
+        try rt.put(allocator, slot.node_id, try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims));
+    }
+    if (trainer_input.bind_arch_inputs) |bind_fn| {
+        try bind_fn(trainer_input.ctx, trainer.compute_backend, allocator, &gs.graph, &rt, batch, seq_len, attention_mask);
+    }
+    try bindEvalLoraDropoutMasks(allocator, trainer, gs, &rt);
+
+    const no_trainables: []const []const u8 = &.{};
+    var result = try graph_training.trainStep(allocator, &gs.graph, output_node, trainer.compute_backend, rt, .{
+        .trainable_params = no_trainables,
+    });
+    defer result.deinit();
+    return @floatCast(result.loss);
 }
 
 pub fn spanStartComponentDebugForBatch(
@@ -2309,7 +2377,7 @@ fn evalSpanStartNodeForBatch(
         .shape = gs.graph.node(gs.targets_node).output_shape,
     };
 
-    try rt.put(allocator, gs.input_ids_node, try graph_input_binder.bindI64(trainer.compute_backend, allocator, input_placeholder, input_ids));
+    try rt.put(allocator, gs.input_ids_node, try bindEvalInputIds(trainer.compute_backend, allocator, input_placeholder, input_ids));
     try rt.put(allocator, gs.attention_mask_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, mask_placeholder, attention_mask));
     try rt.put(allocator, gs.targets_node, try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, span_targets));
 
@@ -2399,13 +2467,26 @@ fn bindEvalLoraDropoutMasks(
     }
 }
 
+fn bindEvalInputIds(
+    backend: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    placeholder: graph_input_binder.PlaceholderInfo,
+    input_ids: []const i64,
+) !CT {
+    const input_ids_f32 = try allocator.alloc(f32, input_ids.len);
+    defer allocator.free(input_ids_f32);
+    for (input_ids, 0..) |id, i| input_ids_f32[i] = @floatFromInt(id);
+    return graph_input_binder.bindF32(backend, allocator, placeholder, input_ids_f32);
+}
+
 fn executeEvalGraphOutputToFloat32(
     allocator: std.mem.Allocator,
     trainer: *real_autodiff.RealAutodiffTrainer,
     graph: *const Graph,
     runtime_inputs: []const interpreter.RuntimeInput,
 ) ![]f32 {
-    const strategy = try evalRuntimeStrategy(trainer);
+    // ponytail: debug-only eval avoids Metal compiled transfer path; training still uses the configured executor.
+    const strategy: graph_runtime.Strategy = if (trainer.compute_backend.kind() == .metal) .interpreter else try evalRuntimeStrategy(trainer);
     var runtime = try graph_runtime.Runtime.init(allocator, graph, trainer.compute_backend, strategy);
     defer runtime.deinit();
 

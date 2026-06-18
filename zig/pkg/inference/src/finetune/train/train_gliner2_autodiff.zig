@@ -1356,7 +1356,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
                 // structure loss emits `[span_rows, max_gold * E]`, so skip
                 // those dumps there and still emit the component-loss debug
                 // (which the parity harness reads).
-                if (gliner_ctx.config.structure_max_instances == 1) {
+                // ponytail: Metal full-task parity only needs total/classification debug; the legacy span dump is schema-unsafe there.
+                if (gliner_ctx.config.structure_max_instances == 1 and selected_backend != .metal) {
                     const logits = try gliner2_autodiff.spanStartLogitsForBatch(
                         allocator,
                         &trainer,

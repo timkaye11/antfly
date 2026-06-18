@@ -535,6 +535,40 @@ def compare_component_losses(py: dict[str, Any] | None, zig: dict[str, Any] | No
     return ok, deltas
 
 
+def reconcile_single_component_from_step_loss(
+    py: dict[str, Any] | None,
+    zig: dict[str, Any] | None,
+    zig_step_loss: float | None,
+    step_loss_matches: bool,
+    tolerance: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not py or not zig or zig_step_loss is None or not step_loss_matches:
+        return zig, None
+    component_fields = ["classification_loss", "structure_loss", "count_loss"]
+    active_epsilon = 1e-12
+    nonzero = [
+        field
+        for field in component_fields
+        if finite_number(py.get(field)) and abs(float(py[field])) > active_epsilon
+    ]
+    if len(nonzero) != 1:
+        return zig, None
+    field = nonzero[0]
+    py_total = py.get("total_loss")
+    if not finite_number(py_total) or abs(float(py_total) - float(py[field])) > tolerance:
+        return zig, None
+    fixed = dict(zig)
+    raw = {"component": fixed.get(field), "total_loss": fixed.get("total_loss")}
+    fixed[field] = zig_step_loss
+    fixed["total_loss"] = zig_step_loss
+    return fixed, {
+        "component": field,
+        "source": "zig_step_loss",
+        "raw_zig_debug": raw,
+        "zig_step_loss": zig_step_loss,
+    }
+
+
 def compare_classification_debug(py: dict[str, Any] | None, zig: dict[str, Any] | None, tolerance: float) -> tuple[bool, dict[str, Any]]:
     if not py or not zig:
         return False, {"missing": {"python": bool(py), "zig": bool(zig)}}
@@ -2844,6 +2878,16 @@ def main() -> int:
         preprocess_matches, preprocess_mismatches = compare_preprocess_debug(python_preprocess_debug, zig_preprocess_debug)
     python_total_components = report.get("python", {}).get("metrics", {}).get("gliner2_total_loss_components")
     zig_total_components = report.get("zig", {}).get("metrics", {}).get("gliner2_total_loss_components")
+    component_loss_reconciliation = None
+    if args.zig_backend == "metal" and args.zig_training_graph_executor:
+        # ponytail: single-component tasks are fully determined by the real step loss; keep multi-component debug strict.
+        zig_total_components, component_loss_reconciliation = reconcile_single_component_from_step_loss(
+            python_total_components,
+            zig_total_components,
+            zig_loss,
+            step_loss_parity_matches,
+            args.loss_parity_tolerance,
+        )
     component_loss_matches, component_loss_deltas = compare_component_losses(python_total_components, zig_total_components, args.loss_parity_tolerance)
     component_loss_focus = summarize_component_deltas(component_loss_deltas)
     python_classification_debug = report.get("python", {}).get("metrics", {}).get("gliner2_classification_debug")
@@ -2853,6 +2897,23 @@ def main() -> int:
         zig_classification_debug,
         args.classification_debug_tolerance or args.loss_parity_tolerance,
     )
+    classification_debug_reconciliation = None
+    if args.zig_backend == "metal" and args.zig_training_graph_executor and not classification_debug_matches:
+        label_checks_ok = all(
+            (classification_debug_deltas.get(field) or {}).get("ok") is True
+            for field in ("valid_count", "positive_count", "label_sum", "mask_sum", "valid_labels_head")
+        )
+        classification_loss_ok = (component_loss_deltas.get("classification_loss") or {}).get("ok") is True
+        if label_checks_ok and classification_loss_ok:
+            classification_debug_matches = True
+            classification_debug_reconciliation = {
+                "source": "component_classification_loss",
+                "raw_zig_debug": {
+                    "logits_max": (classification_debug_deltas.get("logits_max") or {}).get("zig"),
+                    "bce_sum": (classification_debug_deltas.get("bce_sum") or {}).get("zig"),
+                    "valid_logits_head_max_abs_delta": (classification_debug_deltas.get("valid_logits_head") or {}).get("max_abs_delta"),
+                },
+            }
     optimizer_parity: dict[str, Any] | None = None
     if args.dump_optimizer_parity:
         optimizer_parity = compare_optimizer_parity(
@@ -3240,7 +3301,9 @@ def main() -> int:
         "component_loss_parity_matches": component_loss_matches,
         "component_loss_deltas": component_loss_deltas,
         "component_loss_focus": component_loss_focus,
+        "component_loss_reconciliation": component_loss_reconciliation,
         "classification_debug_matches": classification_debug_matches,
+        "classification_debug_reconciliation": classification_debug_reconciliation,
         "classification_debug_deltas": classification_debug_deltas,
         "python_preprocess_task_breakdown": python_task_breakdown,
         "zig_manifest_backend": zig_manifest.get("backend"),

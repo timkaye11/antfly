@@ -3891,9 +3891,8 @@ fn debertaFfnForwardRuntimeRegionEnabled() bool {
 
 fn headMlpForwardRuntimeRegionEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_HEAD_MLP_FORWARD_RUNTIME_REGION", false)) return false;
-    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_HEAD_MLP_FORWARD_RUNTIME_REGION", false)) return true;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    // ponytail: schema parity caught this fusion; keep it opt-in until the head-MLP contract is fixed.
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_HEAD_MLP_FORWARD_RUNTIME_REGION", false);
 }
 
 fn groupedHeadDotRuntimeCommandEnabled() bool {
