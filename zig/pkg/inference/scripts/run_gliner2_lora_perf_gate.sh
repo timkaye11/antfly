@@ -392,8 +392,13 @@ fi
 
 if (( production_batch32 )); then
   promote_gather_inputs=1
-  hf_gliner2_snapshot="/Users/timkaye/.cache/huggingface/hub/models--fastino--gliner2-base-v1/snapshots/f5b2ecedebe4381b088c1cf276f5bf72a52cac54"
-  if (( ! model_dir_explicit )) && [[ -d "${hf_gliner2_snapshot}" && ( ! -f "${model_dir}/model.safetensors" || ! -f "${model_dir}/config.json" || ! -f "${model_dir}/tokenizer.json" || ! -f "${model_dir}/encoder_config/config.json" ) ]]; then
+  hf_gliner2_snapshot=""
+  if [[ -n "${HF_HOME:-}" ]]; then
+    hf_gliner2_snapshot="${HF_HOME}/hub/models--fastino--gliner2-base-v1/snapshots/f5b2ecedebe4381b088c1cf276f5bf72a52cac54"
+  elif [[ -n "${HOME:-}" ]]; then
+    hf_gliner2_snapshot="${HOME}/.cache/huggingface/hub/models--fastino--gliner2-base-v1/snapshots/f5b2ecedebe4381b088c1cf276f5bf72a52cac54"
+  fi
+  if (( ! model_dir_explicit )) && [[ -n "${hf_gliner2_snapshot}" && -d "${hf_gliner2_snapshot}" && ( ! -f "${model_dir}/model.safetensors" || ! -f "${model_dir}/config.json" || ! -f "${model_dir}/tokenizer.json" || ! -f "${model_dir}/encoder_config/config.json" ) ]]; then
     model_dir="${hf_gliner2_snapshot}"
   fi
   if (( ! train_data_explicit && allow_smoke_fallback && ! production_ready && ! require_loss_parity )) && [[ "${train_data}" == "/private/tmp/termite-gliner2-production-diagnostic/train.jsonl" ]]; then

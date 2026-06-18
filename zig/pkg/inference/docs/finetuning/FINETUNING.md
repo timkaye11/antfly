@@ -111,7 +111,7 @@ antfly inference finetune smoke-fast
 
 ### GLiNER2 Production Readiness
 
-GLiNER2 resident Metal and MLX fine-tuning are production-ready at the
+GLiNER2 resident Metal fine-tuning is production-ready at the
 infrastructure level once the production-readiness gate passes on a non-toy
 train/eval dataset with a semantic adapter-reload golden and a nonzero quality
 floor. The current model-quality threshold is intentionally modest while
@@ -141,12 +141,6 @@ zig build -Dmetal=true gliner2-production-readiness -- \
 trainable bytes, finite/decreasing loss, and `avg_step_wall_ms <= 3000`.
 It also runs the same 25-example shaped quality eval and requires
 `f1 >= 0.15`.
-`--production-mlx-gate` is the canonical resident MLX preset: backend `mlx`,
-compiled required, 200 examples/steps, batch size 1, sequence length 32, MLX
-optimizer, zero trainable host/device transfers, nonzero resident trainable bytes,
-finite/decreasing loss, entity-like semantic/quality decoding, and
-`avg_step_wall_ms <= 10000`. It also runs a 25-example shaped quality eval by
-default and requires `f1 >= 0.15`.
 Span-start training defaults to
 `--span-loss bce --span-positive-weight 32 --span-negative-weight 1` to
 optimize sparse positive span labels with a weighted binary objective. Use
@@ -202,17 +196,6 @@ Initial per-label thresholds are available as a calibration control, but the
 current adapter still needs model-side quality work: a stricter candidate
 `person=0.30,organization=0.15,location=0.25` reduced predictions from 75 to
 67 and raised organization precision, but aggregate F1 fell to `0.1930`.
-
-Example 200-step resident MLX quality gate output from this rollout:
-`avg_step_wall_ms=537.53`,
-`supervised_tokens_per_second=242.83`, `optimizer_backend=mlx`,
-`max_device_trainable_transfer_count=0`, `max_device_trainable_bytes=9486400`,
-`max_peak_resident_bytes=1441054720`, and 25-example shaped quality
-`precision=0.1467`, `recall=0.2340`, `f1=0.1803` at threshold `0.03`.
-This gate uses the compiled MLX gradient
-session and keeps LoRA/task-head weights, gradient accumulators, and AdamW
-moments resident as MLX arrays. The trainable-transfer metric counts
-optimizer/trainable host round-trips, not the per-step runtime input rebinding.
 
 For custom thresholds, pass the explicit options instead of the preset:
 
