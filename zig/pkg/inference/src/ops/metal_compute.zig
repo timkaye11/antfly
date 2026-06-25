@@ -17725,6 +17725,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output = runtime_stats.q8_0_pair_activation_rms_scale_mmv_f16_output;
         stats.metal_runtime_q8_0_linear_mmv_f16_input = runtime_stats.q8_0_linear_mmv_f16_input;
         stats.metal_runtime_q8_0_linear_family_dispatch_counts = runtime_stats.q8_0_linear_family_dispatch_counts;
+        stats.metal_runtime_q4_0_linear_reduce = runtime_stats.q4_0_linear_reduce;
+        stats.metal_runtime_q4_0_pair = runtime_stats.q4_0_pair;
         stats.metal_runtime_q4_k_linear_reduce = runtime_stats.q4_k_linear_reduce;
         stats.metal_runtime_q4_k_pair_reduce = runtime_stats.q4_k_pair_reduce;
         stats.metal_runtime_q4_k_pair_activation_reduce = runtime_stats.q4_k_pair_activation_reduce;
@@ -17770,15 +17772,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     }
                     if (traceQuantRuntimeSlotsRequested()) {
                         const kind = metal_runtime.quantizedRuntimeLinearKind(storage);
+                        const tensor_type_label = switch (storage.tensor_type) {
+                            .known => |known| @tagName(known),
+                            .bitnet_tl2 => "bitnet_tl2",
+                            .unknown => "unknown",
+                        };
                         const mmap_eligible = storage.raw_mmap_backed and
                             !storage.raw_owned and
                             storage.preparedBytes(.row_major_blocks) == null and
                             storage.preparedBytes(.panel4) == null and
                             storage.preparedBytes(.panel8) == null;
                         std.debug.print(
-                            "metal_quant_runtime_slot: slot={d} kind={s} mode={s} raw_mb={d} prepared_mb={d} raw_owned={} raw_mmap_backed={} mmap_eligible={} disable_mapped={}\n",
+                            "metal_quant_runtime_slot: slot={d} tensor_type={s} kind={s} mode={s} raw_mb={d} prepared_mb={d} raw_owned={} raw_mmap_backed={} mmap_eligible={} disable_mapped={}\n",
                             .{
                                 slot,
+                                tensor_type_label,
                                 @tagName(kind),
                                 @tagName(provider.raw_linear_slot_runtime_prepared_modes[slot]),
                                 storage.raw_bytes.len / (1024 * 1024),

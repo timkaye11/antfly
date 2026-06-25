@@ -4503,6 +4503,7 @@ pub fn prepareDecodeRuntime(
         const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
         const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
         const attention_input_size = gpt_config.num_attention_heads * layer_head_dim;
+        const shares_kv = gpt_config.layerSharesKv(layer);
 
         started_at = monotonicNowNs();
         const attn_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.input_layernorm.weight", .{layer});
@@ -4601,20 +4602,22 @@ pub fn prepareDecodeRuntime(
             finished_at = monotonicNowNs();
             if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
-            started_at = monotonicNowNs();
-            const k_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
-            const k_head_norm_w = try gpt_arch.getModelWeight(cb, gpt_config, k_head_norm_name);
-            defer cb.free(k_head_norm_w);
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-            started_at = monotonicNowNs();
-            if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, kHeadNormSlot(configured_layer_count, layer), k_head_norm_w, layer_head_dim))) {
-                timing_stats.prepare_attn_pre_norm_failures += 1;
-                tracePrepareLayerFailure(layer, "k_head_norm", kHeadNormSlot(configured_layer_count, layer), layer_head_dim, layer_head_dim);
-                return false;
+            if (!shares_kv) {
+                started_at = monotonicNowNs();
+                const k_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+                const k_head_norm_w = try gpt_arch.getModelWeight(cb, gpt_config, k_head_norm_name);
+                defer cb.free(k_head_norm_w);
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+                started_at = monotonicNowNs();
+                if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, kHeadNormSlot(configured_layer_count, layer), k_head_norm_w, layer_head_dim))) {
+                    timing_stats.prepare_attn_pre_norm_failures += 1;
+                    tracePrepareLayerFailure(layer, "k_head_norm", kHeadNormSlot(configured_layer_count, layer), layer_head_dim, layer_head_dim);
+                    return false;
+                }
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
             }
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
         }
 
         started_at = monotonicNowNs();
@@ -4632,35 +4635,37 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const k_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
-        const k_w = try gpt_arch.getModelWeight(cb, gpt_config, k_name);
-        defer cb.free(k_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
-            timing_stats.prepare_attn_k_failures += 1;
-            tracePrepareLayerFailure(layer, "attn_k", linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
-            return false;
-        }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
+        if (!shares_kv) {
+            started_at = monotonicNowNs();
+            const k_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+            const k_w = try gpt_arch.getModelWeight(cb, gpt_config, k_name);
+            defer cb.free(k_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
+                timing_stats.prepare_attn_k_failures += 1;
+                tracePrepareLayerFailure(layer, "attn_k", linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
-        const v_w = try gpt_arch.getModelWeight(cb, gpt_config, v_name);
-        defer cb.free(v_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
-            timing_stats.prepare_attn_v_failures += 1;
-            tracePrepareLayerFailure(layer, "attn_v", linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
-            return false;
+            started_at = monotonicNowNs();
+            const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+            const v_w = try gpt_arch.getModelWeight(cb, gpt_config, v_name);
+            defer cb.free(v_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
+                timing_stats.prepare_attn_v_failures += 1;
+                tracePrepareLayerFailure(layer, "attn_v", linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
         }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
         started_at = monotonicNowNs();
         const attn_out_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
