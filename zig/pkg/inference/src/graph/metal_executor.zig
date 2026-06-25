@@ -650,9 +650,12 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_q4_0_dispatch: linear_reduce={d} pair_reduce={d} pair={d}\n",
+        "metal_q4_0_dispatch: linear_reduce={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} activation_rhs_reduce={d} pair_reduce={d} pair={d}\n",
         .{
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce,
             provider_stats.metal_runtime_q4_0_pair_reduce,
             provider_stats.metal_runtime_q4_0_pair,
         },

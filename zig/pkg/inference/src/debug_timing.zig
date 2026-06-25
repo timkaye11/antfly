@@ -265,10 +265,13 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_q4_0_dispatch: linear_reduce={d} pair_reduce={d} pair={d}\n",
+        "{s}_q4_0_dispatch: linear_reduce={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} activation_rhs_reduce={d} pair_reduce={d} pair={d}\n",
         .{
             prefix,
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce,
             provider_stats.metal_runtime_q4_0_pair_reduce,
             provider_stats.metal_runtime_q4_0_pair,
         },
