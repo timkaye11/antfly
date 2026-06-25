@@ -17727,6 +17727,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q8_0_linear_family_dispatch_counts = runtime_stats.q8_0_linear_family_dispatch_counts;
         stats.metal_runtime_q4_0_linear_reduce = runtime_stats.q4_0_linear_reduce;
         stats.metal_runtime_q4_0_pair = runtime_stats.q4_0_pair;
+        stats.metal_runtime_q4_0_pair_reduce = runtime_stats.q4_0_pair_reduce;
         stats.metal_runtime_q4_k_linear_reduce = runtime_stats.q4_k_linear_reduce;
         stats.metal_runtime_q4_k_pair_reduce = runtime_stats.q4_k_pair_reduce;
         stats.metal_runtime_q4_k_pair_activation_reduce = runtime_stats.q4_k_pair_activation_reduce;

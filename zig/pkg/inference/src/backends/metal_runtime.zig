@@ -6032,6 +6032,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
     q4_0_linear_reduce: u64 = 0,
     q4_0_pair: u64 = 0,
+    q4_0_pair_reduce: u64 = 0,
     q4_k_linear_reduce: u64 = 0,
     q4_k_pair_reduce: u64 = 0,
     q4_k_pair_activation_reduce: u64 = 0,
@@ -20195,7 +20196,7 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.UnexpectedNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    try std.testing.expect(after_direct.q4_0_pair > before_direct.q4_0_pair);
+    try std.testing.expect(after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce);
     try std.testing.expect(after_direct.q4_0_linear_reduce > before_direct.q4_0_linear_reduce);
 
     var expected_mut = expected_tensor;
@@ -20912,7 +20913,7 @@ test "metal native q4_0 attention ffn block works inside active frame" {
     try waitFrame(runtime);
     const after_block = runtimeMemorySnapshot(runtime);
     try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
-    try std.testing.expect(after_block.q4_0_pair > before_block.q4_0_pair);
+    try std.testing.expect(after_block.q4_0_pair_reduce > before_block.q4_0_pair_reduce);
 
     var expected_mut = expected;
     var fused_mut = fused;

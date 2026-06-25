@@ -2827,9 +2827,10 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_0_dispatch: linear_reduce={d} pair={d}\n",
+        "metal_q4_0_dispatch: linear_reduce={d} pair_reduce={d} pair={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_reduce,
             metal_snapshot.provider.metal_runtime_q4_0_pair,
         },
     );

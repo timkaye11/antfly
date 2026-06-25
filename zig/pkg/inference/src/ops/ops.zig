@@ -524,6 +524,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
     metal_runtime_q4_0_linear_reduce: u64 = 0,
     metal_runtime_q4_0_pair: u64 = 0,
+    metal_runtime_q4_0_pair_reduce: u64 = 0,
     metal_runtime_q4_k_linear_reduce: u64 = 0,
     metal_runtime_q4_k_pair_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce: u64 = 0,
