@@ -2074,7 +2074,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
         var qk_already_roped = false;
         var fused_q_rope: ?ops.CT = null;
         var fused_k_rope: ?ops.CT = null;
-        if (!shares_kv and gpt_config.family == .gemma and gpt_config.position_encoding == .rope and decode_context.query_sequence_len == 1) fused_blk: {
+        if (!shares_kv and (gpt_config.family == .gemma or gpt_config.family == .qwen3_5) and gpt_config.position_encoding == .rope and decode_context.query_sequence_len == 1) fused_blk: {
             const rope_dim = gpt_config.layerRopeActiveDim(layer);
             const rope_theta = theta_blk: {
                 const base_theta = gpt_config.layerRopeTheta(layer);

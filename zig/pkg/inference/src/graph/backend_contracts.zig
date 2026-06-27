@@ -423,6 +423,7 @@ pub const DecoderRuntimeActivationKind = enum(u8) {
     relu,
     quick_gelu,
     relu_squared,
+    sigmoid,
 };
 
 pub const PlannedLayerContract = struct {
@@ -536,6 +537,9 @@ pub const AttentionContext = struct {
     layer_index: usize = 0,
     /// When true, skip writing K/V to the cache (shared KV layers read from a donor layer).
     skip_kv_write: bool = false,
+    /// Internal/debug path for segmented CUDA graph capture: perform the device
+    /// KV suffix write, then return before the attention read/compute.
+    device_kv_write_only: bool = false,
     /// Optional attention-sink metadata for models that prepend per-head sinks
     /// to the attention score stream. Backends that do not implement sinks
     /// should leave this empty.
@@ -558,6 +562,7 @@ pub const RunGatedFfnResidualRequest = struct {
     down_linear_slot: usize,
     input: CT,
     residual: CT,
+    pre_input_rms_norm_slot: ?usize = null,
     post_gate_rms_norm_slot: ?usize = null,
     post_gate_rms_norm_weight: ?CT = null,
     post_down_rms_norm_slot: ?usize = null,

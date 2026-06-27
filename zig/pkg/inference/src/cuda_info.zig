@@ -164,6 +164,7 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         print("capability_florence2: {}\n", .{compute.supportsProfile(.florence2)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
         print("capability_gemma4: {}\n", .{compute.supportsProfile(.gemma4)});
+        print("capability_qwen35: {}\n", .{compute.supportsProfile(.qwen35)});
 
         if (smoke) {
             cuda_kernels.smokeFill(allocator) catch |err| {
@@ -201,6 +202,21 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: q6_k_embedding ok\n", .{});
+            cuda_kernels.smokeIQ4_XS(allocator) catch |err| {
+                print("smoke: iq4_xs_linear failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: iq4_xs_linear ok\n", .{});
+            cuda_kernels.smokeIQ3(allocator) catch |err| {
+                print("smoke: iq3_quant failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: iq3_quant ok\n", .{});
+            cuda_kernels.smokeQwen35LinearAttentionPrimitives(allocator) catch |err| {
+                print("smoke: qwen35_linear_attention failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: qwen35_linear_attention ok\n", .{});
             cuda_kernels.smokeGemma4Primitives(allocator) catch |err| {
                 print("smoke: gemma4_primitives failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -1672,6 +1688,7 @@ fn runNormRopeParityCase(
         case.rows,
         false,
         case.scale,
+        0.0,
     )) orelse return error.CudaKernelUnavailable;
     defer cb.free(output_ct);
 
@@ -1841,9 +1858,9 @@ fn runGemma4Layer0Parity(
     cpuRmsNormHeadsRope(expected_k, weights.k_norm, expected_k_rope, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0);
     const q_norm_w = try cb.getWeight("blk.0.attn_q_norm.weight");
     const k_norm_w = try cb.getWeight("blk.0.attn_k_norm.weight");
-    const q_rope_ct = (try cb.rmsNormHeadsRope(q_ct, q_norm_w, rows, q_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, @sqrt(@as(f32, @floatFromInt(head_dim))))) orelse return error.CudaKernelUnavailable;
+    const q_rope_ct = (try cb.rmsNormHeadsRope(q_ct, q_norm_w, rows, q_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, @sqrt(@as(f32, @floatFromInt(head_dim))), 0.0)) orelse return error.CudaKernelUnavailable;
     defer cb.free(q_rope_ct);
-    const k_rope_ct = (try cb.rmsNormHeadsRope(k_ct, k_norm_w, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0)) orelse return error.CudaKernelUnavailable;
+    const k_rope_ct = (try cb.rmsNormHeadsRope(k_ct, k_norm_w, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0, 0.0)) orelse return error.CudaKernelUnavailable;
     defer cb.free(k_rope_ct);
     try compareCudaStage(allocator, &cb, "layer0.q_rope", q_rope_ct, expected_q_rope, 0.001);
     try compareCudaStage(allocator, &cb, "layer0.k_rope", k_rope_ct, expected_k_rope, 0.001);
@@ -2024,9 +2041,9 @@ fn runGemma4Layer5AttentionParity(
     cpuRmsNormHeadsRope(expected_k, k_norm, expected_k_rope, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0);
     const q_norm_w = try cb.getWeight("blk.5.attn_q_norm.weight");
     const k_norm_w = try cb.getWeight("blk.5.attn_k_norm.weight");
-    const q_rope_ct = (try cb.rmsNormHeadsRope(q_ct, q_norm_w, rows, q_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, @sqrt(@as(f32, @floatFromInt(head_dim))))) orelse return error.CudaKernelUnavailable;
+    const q_rope_ct = (try cb.rmsNormHeadsRope(q_ct, q_norm_w, rows, q_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, @sqrt(@as(f32, @floatFromInt(head_dim))), 0.0)) orelse return error.CudaKernelUnavailable;
     defer cb.free(q_rope_ct);
-    const k_rope_ct = (try cb.rmsNormHeadsRope(k_ct, k_norm_w, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0)) orelse return error.CudaKernelUnavailable;
+    const k_rope_ct = (try cb.rmsNormHeadsRope(k_ct, k_norm_w, rows, kv_dim, head_dim, head_dim, eps, theta, 1.0, 0, rows, false, 1.0, 0.0)) orelse return error.CudaKernelUnavailable;
     defer cb.free(k_rope_ct);
     try compareCudaStage(allocator, &cb, "layer5.q_rope", q_rope_ct, expected_q_rope, 0.005);
     try compareCudaStage(allocator, &cb, "layer5.k_rope", k_rope_ct, expected_k_rope, 0.001);

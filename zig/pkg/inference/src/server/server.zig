@@ -246,6 +246,11 @@ fn serverGenerateTimingEnabled() bool {
     return platform.env.getenvBool("TERMITE_SERVER_GENERATE_TIMING");
 }
 
+fn nativeGenerateContinuousBatchingEnabled() bool {
+    if (platform.env.getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER")) return false;
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CONTINUOUS_BATCHING");
+}
+
 fn elapsedMs(from_ns: u128, to_ns: u128) u64 {
     if (to_ns <= from_ns) return 0;
     return @intCast(@divTrunc(to_ns - from_ns, std.time.ns_per_ms));
@@ -2489,8 +2494,9 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-        model.lockNativeGeneration();
-        defer model.unlockNativeGeneration();
+        const continuous_batching_enabled = nativeGenerateContinuousBatchingEnabled() and model.session.backend() == .cuda;
+        if (!continuous_batching_enabled) model.lockNativeGeneration();
+        defer if (!continuous_batching_enabled) model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
@@ -2498,12 +2504,16 @@ pub const Node = struct {
         defer if (native_generate_lease) |lease| {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
-        if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = try coordinator.acquire(.{
+        if (continuous_batching_enabled) {
+            const coordinator = model.native_generate_coordinator orelse return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "continuous batching requires native generate coordinator" });
+            native_generate_lease = coordinator.acquire(.{
                 .requested_units = queue_units,
                 .prompt_bytes = prompt_bytes,
                 .max_tokens = configured_max_tokens,
-            });
+            }) catch |err| switch (err) {
+                error.NativeGenerateQueueFull => return ctx.status(429).json(.{ .@"error" = "QUEUE_FULL", .message = "native generation continuous batching queue is full" }),
+                else => return err,
+            };
             config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
         }
 
@@ -2699,7 +2709,7 @@ pub const Node = struct {
         const graph_mode = backend_selection.graph_mode_requested or
             backend_selection.compiled_partition_backend != null or
             graphModeEnabled();
-        const use_scheduler = !graph_mode;
+        const use_scheduler = continuous_batching_enabled and !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
             model.session.backend() == .metal and

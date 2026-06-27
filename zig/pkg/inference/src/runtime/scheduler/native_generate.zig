@@ -44,6 +44,10 @@ pub const Policy = struct {
     /// Default query-token cap for a unified step. Decode items contribute 1
     /// token; prefill items contribute their `query_sequence_len`.
     max_step_query_tokens: usize = 512,
+    /// Optional cap on concurrently admitted scheduler units.
+    max_active_units: ?usize = null,
+    /// Optional cap on active/waiting scheduler entries.
+    max_waiting_requests: ?usize = null,
 
     pub fn defaultStepBudget(self: Policy) StepBudget {
         return .{
@@ -157,6 +161,10 @@ pub const NativeGenerateCoordinator = struct {
         return .{ .allocator = allocator };
     }
 
+    pub fn initWithPolicy(allocator: std.mem.Allocator, policy: Policy) NativeGenerateCoordinator {
+        return .{ .allocator = allocator, .policy = policy };
+    }
+
     pub fn deinit(self: *NativeGenerateCoordinator) void {
         self.entries.deinit(self.allocator);
         self.pending_prefill.deinit(self.allocator);
@@ -167,6 +175,12 @@ pub const NativeGenerateCoordinator = struct {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
         const reserved_units = @max(admission.requested_units, 1);
+        if (self.policy.max_waiting_requests) |limit| {
+            if (self.entries.items.len >= limit) return error.NativeGenerateQueueFull;
+        }
+        if (self.policy.max_active_units) |limit| {
+            if (self.active_units + reserved_units > limit) return error.NativeGenerateQueueFull;
+        }
         try self.entries.append(self.allocator, .{
             .id = request_id,
             .requested_units = reserved_units,
@@ -835,6 +849,48 @@ test "native generate coordinator tracks waiting prefill and decode phases" {
     snapshot = coordinator.snapshot();
     try std.testing.expectEqual(@as(usize, 1), snapshot.decode_requests);
     try std.testing.expectEqual(@as(usize, 32), coordinator.recommendPrefillChunkFor(second.request_id));
+}
+
+test "native generate coordinator rejects admission when waiting request cap is full" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.initWithPolicy(allocator, .{
+        .max_waiting_requests = 1,
+    });
+    defer coordinator.deinit();
+
+    const first = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 4096,
+        .max_tokens = 256,
+    });
+    defer coordinator.release(first);
+
+    try std.testing.expectError(error.NativeGenerateQueueFull, coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 4096,
+        .max_tokens = 256,
+    }));
+}
+
+test "native generate coordinator rejects admission when active unit cap is full" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.initWithPolicy(allocator, .{
+        .max_active_units = 2,
+    });
+    defer coordinator.deinit();
+
+    const first = try coordinator.acquire(.{
+        .requested_units = 2,
+        .prompt_bytes = 4096,
+        .max_tokens = 256,
+    });
+    defer coordinator.release(first);
+
+    try std.testing.expectError(error.NativeGenerateQueueFull, coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 4096,
+        .max_tokens = 256,
+    }));
 }
 
 test "native generate coordinator caps chunk by prompt size" {

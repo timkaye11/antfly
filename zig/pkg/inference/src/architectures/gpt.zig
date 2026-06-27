@@ -53,15 +53,18 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 pub const Qwen35LinearLayerState = struct {
     conv: []f32 = &.{},
     recurrent: []f32 = &.{},
+    backend_state: ops.OpaqueBackendState = .{},
     initialized: bool = false,
 
     fn deinit(self: *Qwen35LinearLayerState, allocator: std.mem.Allocator) void {
+        self.backend_state.deinit();
         if (self.conv.len > 0) allocator.free(self.conv);
         if (self.recurrent.len > 0) allocator.free(self.recurrent);
         self.* = .{};
     }
 
     fn reset(self: *Qwen35LinearLayerState) void {
+        self.backend_state.reset();
         if (self.conv.len > 0) @memset(self.conv, 0);
         if (self.recurrent.len > 0) @memset(self.recurrent, 0);
         self.initialized = false;
@@ -157,6 +160,9 @@ const LogitsTensorResult = struct {
     logits: CT,
     total_rows: usize,
 };
+
+const qwen36_decode_prefix_graph_label = "gpt.qwen36_prefix_decode";
+const qwen36_decode_layer3_graph_label = "gpt.qwen36_layer3_decode";
 
 const HiddenTensorResult = struct {
     hidden: CT,
@@ -294,6 +300,11 @@ pub const Layer0DecoderOverrides = struct {
     mlp_down_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
 };
 
+const DecoderBlockGraphOptions = struct {
+    force_skip_kv_write: bool = false,
+    device_kv_write_only: bool = false,
+};
+
 fn cudaPreparedDecoderSlotsEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREPARED_DECODER_SLOTS", true);
 }
@@ -356,24 +367,60 @@ fn layer0DecoderOverridesEmpty(overrides: Layer0DecoderOverrides) bool {
     return true;
 }
 
-fn buildCudaGemmaDecoderOverrides(config: Config, configured_layer_count: usize) Layer0DecoderOverrides {
+fn releasePendingLayer0DecoderOverrides(
+    cb: *const ComputeBackend,
+    attn_norm: *?CT,
+    fused_qkv: *?CT,
+    q: *?CT,
+    k: *?CT,
+    v: *?CT,
+) void {
+    if (attn_norm.*) |tensor| {
+        cb.free(tensor);
+        attn_norm.* = null;
+    }
+    if (fused_qkv.*) |tensor| {
+        cb.free(tensor);
+        fused_qkv.* = null;
+    }
+    if (q.*) |tensor| {
+        cb.free(tensor);
+        q.* = null;
+    }
+    if (k.*) |tensor| {
+        cb.free(tensor);
+        k.* = null;
+    }
+    if (v.*) |tensor| {
+        cb.free(tensor);
+        v.* = null;
+    }
+}
+
+fn buildCudaDecoderRuntimeOverrides(config: Config, configured_layer_count: usize) Layer0DecoderOverrides {
     const prepared_layer_count = cudaGemmaPreparedLayers(@min(configured_layer_count, @as(usize, @intCast(config.num_hidden_layers))));
     const override_level = cudaDecoderSlotOverrideLevel();
+    const qwen35 = config.family == .qwen3_5;
     var overrides = Layer0DecoderOverrides{};
     for (0..prepared_layer_count) |layer| {
+        const qwen35_linear_attention = qwen35 and config.layerUsesQwen35LinearAttention(layer);
         if (override_level >= 1) {
             overrides.attn_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_pre);
         }
-        if (override_level >= 2) {
+        if (override_level >= 2 and !qwen35_linear_attention) {
             overrides.attn_q_slots[layer] = cudaGemmaLinearSlot(layer, .attn_q);
             overrides.attn_k_slots[layer] = cudaGemmaLinearSlot(layer, .attn_k);
             overrides.attn_v_slots[layer] = cudaGemmaLinearSlot(layer, .attn_v);
             overrides.attn_out_proj_linear_slots[layer] = cudaGemmaLinearSlot(layer, .attn_out_proj);
         }
         if (override_level >= 3) {
-            overrides.attn_sub_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_post);
+            if (!qwen35) {
+                overrides.attn_sub_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_post);
+            }
             overrides.ffn_norm_slots[layer] = cudaGemmaNormSlot(layer, .ffn_pre);
-            overrides.mlp_sub_norm_slots[layer] = cudaGemmaNormSlot(layer, .ffn_post);
+            if (!qwen35) {
+                overrides.mlp_sub_norm_slots[layer] = cudaGemmaNormSlot(layer, .ffn_post);
+            }
         }
         if (override_level >= 4) {
             overrides.mlp_gate_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_gate);
@@ -393,7 +440,8 @@ fn maybePrepareCudaGemmaDecoderOverrides(
     decode_context: ?*const DecodeContext,
     trace_sink: ?*ActivationTraceSink,
 ) !Layer0DecoderOverrides {
-    if (cb.kind() != .cuda or config.family != .gemma or config.usesMoe()) return overrides;
+    const supported_family = config.family == .gemma or config.family == .qwen3_5;
+    if (cb.kind() != .cuda or !supported_family or config.usesMoe()) return overrides;
     if (!cudaPreparedDecoderSlotsEnabled() or trace_sink != null) return overrides;
     if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
 
@@ -406,7 +454,7 @@ fn maybePrepareCudaGemmaDecoderOverrides(
         configured_layer_count,
     );
     if (!prepare.prepared) return overrides;
-    return buildCudaGemmaDecoderOverrides(config, configured_layer_count);
+    return buildCudaDecoderRuntimeOverrides(config, configured_layer_count);
 }
 
 pub const GreedyDeviceTokenResult = struct {
@@ -1092,25 +1140,29 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     var capture_final_hidden = false;
     var final_hidden_input = hidden_input;
     var prepared_final_hidden_input = false;
-    if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (cudaCaptureFinalHiddenProbeEnabled(cb, config, batch, seq_len, decode_context)) {
         if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
             final_hidden_input = prepared;
             prepared_final_hidden_input = true;
-            cb.free(hidden_input);
+            original_hidden_input = hidden_input;
+            owns_original_hidden_input = true;
         }
         errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
         const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
-        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
-        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
-        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
-        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
-        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
-        const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+        try prepareCudaDecodeGraphScalars(cb, seq_len, decode_context);
+        const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, config, batch, seq_len, decode_context);
         if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
             if (prepared_final_hidden_input) {
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
+            }
+            if (owns_original_hidden_input) {
+                cb.free(original_hidden_input);
+                owns_original_hidden_input = false;
             }
             if (capture_greedy_token) {
                 return greedyResultFromTokenTensor(cb, allocator, replayed);
@@ -1127,49 +1179,646 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
 
     prepared_final_hidden_input = false;
-    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors);
-    errdefer cb.free(hidden_result.hidden);
+    const hidden_result = forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors) catch |err| {
+        if (capture_final_hidden and isCudaGraphCaptureUnsafeError(err) and owns_original_hidden_input) {
+            cb.debugCudaGraphCaptureEnd(false) catch {};
+            capture_final_hidden = false;
+            if (prepared_final_hidden_input) {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+            }
+            const fallback_input = original_hidden_input;
+            owns_original_hidden_input = false;
+            const fallback_hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            errdefer cb.free(fallback_hidden_result.hidden);
+            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, fallback_hidden_result);
+        }
+        return err;
+    };
+    if (owns_original_hidden_input and !capture_final_hidden) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    var hidden_result_owned = true;
+    errdefer if (hidden_result_owned) cb.free(hidden_result.hidden);
     if (capture_final_hidden) {
-        if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (cudaCaptureGreedyTokenProbeEnabled(cb, config, batch, seq_len, decode_context)) {
             if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
-                errdefer cb.free(token);
+                var token_owned = true;
+                errdefer if (token_owned) cb.free(token);
                 try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, token);
-                try cb.debugCudaGraphCaptureEnd(true);
+                cb.debugCudaGraphCaptureEnd(true) catch |err| {
+                    capture_final_hidden = false;
+                    cb.free(token);
+                    token_owned = false;
+                    cb.free(hidden_result.hidden);
+                    hidden_result_owned = false;
+                    const fallback_input = if (owns_original_hidden_input) blk: {
+                        owns_original_hidden_input = false;
+                        break :blk original_hidden_input;
+                    } else hidden_input;
+                    const fallback_hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+                    errdefer cb.free(fallback_hidden_result.hidden);
+                    if (!isCudaGraphCaptureUnsafeError(err)) return err;
+                    return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, fallback_hidden_result);
+                };
                 capture_final_hidden = false;
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
                 cb.free(hidden_result.hidden);
+                hidden_result_owned = false;
                 return greedyResultFromTokenTensor(cb, allocator, token);
             }
             try cb.debugCudaGraphCaptureEnd(false);
             capture_final_hidden = false;
+            if (owns_original_hidden_input) {
+                cb.free(original_hidden_input);
+                owns_original_hidden_input = false;
+            }
             return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
         }
         try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
-        try cb.debugCudaGraphCaptureEnd(true);
+        cb.debugCudaGraphCaptureEnd(true) catch |err| {
+            capture_final_hidden = false;
+            cb.free(hidden_result.hidden);
+            hidden_result_owned = false;
+            const fallback_input = if (owns_original_hidden_input) blk: {
+                owns_original_hidden_input = false;
+                break :blk original_hidden_input;
+            } else hidden_input;
+            const fallback_hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            errdefer cb.free(fallback_hidden_result.hidden);
+            if (!isCudaGraphCaptureUnsafeError(err)) return err;
+            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, fallback_hidden_result);
+        };
         capture_final_hidden = false;
+        if (owns_original_hidden_input) {
+            cb.free(original_hidden_input);
+            owns_original_hidden_input = false;
+        }
     }
     return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
 }
 
 fn cudaCaptureFinalHiddenProbeEnabled(
     cb: *const ComputeBackend,
+    config: Config,
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) bool {
-    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false)) return false;
     if (cb.kind() != .cuda) return false;
     if (batch != 1) return false;
+    const generic_enabled = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false);
+    const qwen36_enabled = qwen36DecodeGraphProbeEnabled(config, batch, seq_len, decode_context);
+    if (!generic_enabled and !qwen36_enabled) {
+        return false;
+    }
     return actualQuerySeqLen(seq_len, decode_context) == 1;
+}
+
+fn qwen36DecodeGraphProbeEnabled(
+    config: Config,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) bool {
+    _ = seq_len;
+    if (!qwen36DecodeGraphEnvEnabled()) return false;
+    if (!qwen36DecodeFullGraphInstantiateAllowedEnv()) return false;
+    if (!qwen36DecodeGraphModelMatches(config)) return false;
+    if (batch != 1) return false;
+    const dc = decode_context orelse return false;
+    if (dc.attention_mode != .paged_decode) return false;
+    if (dc.query_sequence_len != 1) return false;
+    if (dc.kv_storage == null or dc.kv_cache == null) return false;
+    if (dc.kv_sequence_len < dc.query_sequence_len) return false;
+    return true;
+}
+
+fn qwen36DecodeGraphEnvEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_DECODE_GRAPH", false) and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS", false);
+}
+
+fn cudaGraphCaptureProbeTraceLog(comptime fmt: []const u8, args: anytype) void {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GRAPH_CAPTURE_PROBE_TRACE", false)) {
+        std.log.info(fmt, args);
+    }
+}
+
+fn qwen36DecodeGraphInstantiateEnvEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_DECODE_GRAPH_INSTANTIATE", false);
+}
+
+fn qwen36DecodeGraphUnsafeFullInstantiateEnvEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_DECODE_GRAPH_UNSAFE_FULL_INSTANTIATE", false);
+}
+
+fn qwen36GraphProbeIsolationEnvEnabled() bool {
+    if (qwen36GraphProbeSafeStopAfterLayerEnv() != null) return true;
+    return false;
+}
+
+fn qwen36DecodeFullGraphInstantiateAllowedEnv() bool {
+    if (!qwen36DecodeGraphInstantiateEnvEnabled()) return false;
+    if (qwen36DecodeGraphUnsafeFullInstantiateEnvEnabled()) return true;
+    return qwen36GraphProbeIsolationEnvEnabled();
+}
+
+fn qwen36DecodePrefixGraphEnvEnabled() bool {
+    return qwen36DecodeGraphEnvEnabled() and
+        qwen36DecodeGraphInstantiateEnvEnabled() and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_PREFIX_GRAPH", true);
+}
+
+fn qwen36GraphSafeStopAfterLayerMaxEnv() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_SAFE_STOP_AFTER_LAYER_MAX") orelse 2;
+}
+
+fn qwen36GraphProbeSafeStopAfterLayerEnv() ?usize {
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_STOP_AFTER_LAYER") orelse return null;
+    if (qwen36DecodeGraphUnsafeFullInstantiateEnvEnabled()) return requested;
+    return if (requested <= qwen36GraphSafeStopAfterLayerMaxEnv()) requested else null;
+}
+
+fn qwen36DecodeGraphModelMatches(config: Config) bool {
+    return config.family == .qwen3_5 and
+        config.hidden_size == 5120 and
+        config.intermediate_size == 17408 and
+        config.num_hidden_layers == 64 and
+        config.qwen35_has_linear_attention;
+}
+
+fn qwen36GraphProbeIsolationEnabled(config: Config, decode_context: ?*const DecodeContext) bool {
+    return qwen36DecodeGraphEnvEnabled() and
+        qwen36DecodeGraphInstantiateEnvEnabled() and
+        qwen36DecodeFullGraphInstantiateAllowedEnv() and
+        qwen36DecodeGraphModelMatches(config) and
+        isDecodeStep(decode_context);
+}
+
+fn qwen36GraphProbeStopAfterLayer(config: Config, decode_context: ?*const DecodeContext) ?usize {
+    if (!qwen36GraphProbeIsolationEnabled(config, decode_context)) return null;
+    const requested = qwen36GraphProbeSafeStopAfterLayerEnv() orelse return null;
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    if (layer_count == 0) return null;
+    return @min(requested, layer_count - 1);
+}
+
+fn qwen36DecodePrefixGraphStopAfterLayer(
+    cb: *const ComputeBackend,
+    config: Config,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    trace_sink: ?*ActivationTraceSink,
+) ?usize {
+    if (cb.kind() != .cuda) return null;
+    if (!qwen36DecodePrefixGraphEnvEnabled()) return null;
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_STOP_AFTER_LAYER") != null) return null;
+    if (qwen36DecodeGraphUnsafeFullInstantiateEnvEnabled()) return null;
+    if (!qwen36DecodeGraphModelMatches(config)) return null;
+    if (trace_sink != null) return null;
+    if (batch != 1) return null;
+    if (actualQuerySeqLen(seq_len, decode_context) != 1) return null;
+    const dc = decode_context orelse return null;
+    if (dc.attention_mode != .paged_decode) return null;
+    if (dc.query_sequence_len != 1) return null;
+    if (dc.kv_storage == null or dc.kv_cache == null) return null;
+    if (dc.kv_sequence_len < dc.query_sequence_len) return null;
+
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    if (layer_count == 0) return null;
+    const safe_stop = @min(qwen36GraphSafeStopAfterLayerMaxEnv(), layer_count - 1);
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_PREFIX_GRAPH_STOP_AFTER_LAYER") orelse safe_stop;
+    return @min(requested, safe_stop);
+}
+
+fn qwen36DecodeLayer3GraphLayer(
+    cb: *const ComputeBackend,
+    config: Config,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    trace_sink: ?*ActivationTraceSink,
+) ?usize {
+    if (cb.kind() != .cuda) return null;
+    if (!qwen36DecodeGraphEnvEnabled() or !qwen36DecodeGraphInstantiateEnvEnabled()) return null;
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_LAYER3_GRAPH", true)) return null;
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_STOP_AFTER_LAYER") != null) return null;
+    if (qwen36DecodeGraphUnsafeFullInstantiateEnvEnabled()) return null;
+    if (!qwen36DecodeGraphModelMatches(config)) return null;
+    if (trace_sink != null) return null;
+    if (batch != 1) return null;
+    if (actualQuerySeqLen(seq_len, decode_context) != 1) return null;
+    const dc = decode_context orelse return null;
+    if (dc.attention_mode != .paged_decode) return null;
+    if (dc.query_sequence_len != 1) return null;
+    if (dc.kv_storage == null or dc.kv_cache == null) return null;
+    if (dc.kv_sequence_len < dc.query_sequence_len) return null;
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    if (layer_count <= 3) return null;
+    if (config.layerUsesQwen35LinearAttention(3)) return null;
+    return 3;
+}
+
+fn qwen36GraphProbeAttentionOnlyLayer(config: Config, decode_context: ?*const DecodeContext, layer: usize) bool {
+    if (!qwen36GraphProbeIsolationEnabled(config, decode_context)) return false;
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_ATTENTION_ONLY_LAYER") orelse return false;
+    return requested == layer;
+}
+
+fn qwen36GraphProbeQkvOnlyLayer(config: Config, decode_context: ?*const DecodeContext, layer: usize) bool {
+    if (!qwen36GraphProbeIsolationEnabled(config, decode_context)) return false;
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_QKV_ONLY_LAYER") orelse return false;
+    return requested == layer;
+}
+
+fn qwen36GraphProbeAttentionProjOnlyLayer(config: Config, decode_context: ?*const DecodeContext, layer: usize) bool {
+    if (!qwen36GraphProbeIsolationEnabled(config, decode_context)) return false;
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_ATTENTION_PROJ_ONLY_LAYER") orelse return false;
+    return requested == layer;
+}
+
+fn qwen36GraphProbeAttentionCoreOnlyLayer(config: Config, decode_context: ?*const DecodeContext, layer: usize) bool {
+    if (!qwen36GraphProbeIsolationEnabled(config, decode_context)) return false;
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_ATTENTION_CORE_ONLY_LAYER") orelse return false;
+    return requested == layer;
+}
+
+fn qwen36GraphProbeRawAttentionOnlyLayer(config: Config, decode_context: ?*const DecodeContext, layer: usize) bool {
+    if (!qwen36GraphProbeIsolationEnabled(config, decode_context)) return false;
+    const requested = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_QWEN36_GRAPH_RAW_ATTENTION_ONLY_LAYER") orelse return false;
+    return requested == layer;
+}
+
+fn isCudaGraphCaptureUnsafeError(err: anyerror) bool {
+    return switch (err) {
+        error.CudaGraphCaptureUnsafeHostCopy,
+        error.CudaGraphCaptureUnsafeTempAlloc,
+        error.CudaGraphCaptureUnsafeDeviceKvWrite,
+        error.CudaDriverError,
+        error.CudaSymbolMissing,
+        error.InvalidCudaState,
+        => true,
+        else => false,
+    };
 }
 
 fn cudaCaptureGreedyTokenProbeEnabled(
     cb: *const ComputeBackend,
+    config: Config,
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) bool {
-    if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
+    if (!cudaCaptureFinalHiddenProbeEnabled(cb, config, batch, seq_len, decode_context)) return false;
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY", false)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false);
+}
+
+fn prepareCudaDecodeGraphScalars(
+    cb: *const ComputeBackend,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !void {
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const pos_offset = positionOffset(seq_len, query_seq_len, decode_context);
+    const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+    const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+    const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+    _ = try cb.debugCudaGraphPrepareDecodeScalars(pos_offset, pos_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+}
+
+fn prewriteQwen36LayerDeviceKv(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    batch: usize,
+    seq_len: usize,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    overrides: Layer0DecoderOverrides,
+) !void {
+    const prewrite_result = try decoderBlock(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        num_kv_heads,
+        head_dim,
+        layer,
+        decode_context,
+        ple_vectors,
+        overrides,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        .{ .device_kv_write_only = true },
+    );
+    if (prewrite_result != hidden) cb.free(prewrite_result);
+}
+
+fn qwen36FastLayerKvPrewriteEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_FAST_KV_PREWRITE", true);
+}
+
+fn prewriteQwen36LayerDeviceKvFast(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    batch: usize,
+    seq_len: usize,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+    raw_overrides: Layer0DecoderOverrides,
+) !void {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    const kv_dim: usize = @as(usize, num_kv_heads) * head_dim;
+    const shares_kv = config.layerSharesKv(layer) and !disableSharedKvDebug();
+    if (shares_kv) return error.InvalidPagedKvState;
+
+    var name_buf: [256]u8 = undefined;
+    var attn_norm_slot = decoderOverrideLayerSlot(raw_overrides.attn_norm_slots, layer);
+    var attn_k_slot = decoderOverrideLayerSlot(raw_overrides.attn_k_slots, layer);
+    var attn_v_slot = decoderOverrideLayerSlot(raw_overrides.attn_v_slots, layer);
+    if (disablePreparedDecoderSlotsDebug()) {
+        attn_norm_slot = null;
+        attn_k_slot = null;
+        attn_v_slot = null;
+    }
+
+    const normed = if (attn_norm_slot != null) blk: {
+        const raw_norm = switch (config.norm_type) {
+            .layer_norm => try cb.decoderRuntimeApplyLayerNorm(&.{
+                .slot = attn_norm_slot.?,
+                .input = hidden,
+                .hidden_size = hidden_size,
+                .eps = config.norm_eps,
+            }),
+            .rms_norm => try cb.decoderRuntimeApplyRmsNorm(&.{
+                .slot = attn_norm_slot.?,
+                .input = hidden,
+                .hidden_size = hidden_size,
+                .eps = config.norm_eps,
+            }),
+        };
+        break :blk raw_norm orelse try applyAttnNorm(cb, allocator, config, hidden, layer, &name_buf);
+    } else try applyAttnNorm(cb, allocator, config, hidden, layer, &name_buf);
+    defer cb.free(normed);
+
+    const k: CT, const v_omitted: bool, const v: CT = if (attn_k_slot != null and attn_v_slot != null and config.family == .qwen3) blk_kv: {
+        const k_local = (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = attn_k_slot.?,
+            .input = normed,
+            .in_dim = hidden_size,
+            .out_dim = num_kv_heads * head_dim,
+        })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", &name_buf);
+        errdefer cb.free(k_local);
+        const v_local = (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = attn_v_slot.?,
+            .input = normed,
+            .in_dim = hidden_size,
+            .out_dim = num_kv_heads * head_dim,
+        })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", &name_buf);
+        break :blk_kv .{ k_local, false, v_local };
+    } else if (attn_k_slot != null and attn_v_slot != null and config.family != .gemma) blk_kv: {
+        const kv = (try cb.decoderRuntimeApplyLinearPair(&.{
+            .slot_a = attn_k_slot.?,
+            .slot_b = attn_v_slot.?,
+            .input = normed,
+            .in_dim = hidden_size,
+            .out_dim = num_kv_heads * head_dim,
+        })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+        break :blk_kv .{ kv.first, false, kv.second };
+    } else if (config.family == .gemma and !config.layerOmitsVProj(layer)) blk_kv: {
+        if (attn_k_slot != null and attn_v_slot != null) {
+            const kv = (try cb.decoderRuntimeApplyLinearPair(&.{
+                .slot_a = attn_k_slot.?,
+                .slot_b = attn_v_slot.?,
+                .input = normed,
+                .in_dim = hidden_size,
+                .out_dim = num_kv_heads * head_dim,
+            })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+            break :blk_kv .{ kv.first, false, kv.second };
+        }
+        const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+        break :blk_kv .{ kv.first, false, kv.second };
+    } else if (config.family == .bitnet) blk_kv: {
+        const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+        break :blk_kv .{ kv.first, false, kv.second };
+    } else blk_kv: {
+        const k_local = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", &name_buf);
+        errdefer cb.free(k_local);
+        const projected_v = attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", &name_buf);
+        break :blk_kv if (projected_v) |v_local|
+            .{ k_local, false, v_local }
+        else |err| switch (err) {
+            error.MissingWeight, error.WeightNotFound => if (config.layerOmitsVProj(layer))
+                .{ k_local, true, k_local }
+            else
+                return err,
+            else => return err,
+        };
+    };
+    defer cb.free(k);
+
+    const v_normed = blk: {
+        if (config.global_head_dim == 0) break :blk v;
+        const v_dim: usize = head_dim;
+        if (try cb.reshape2d(v, total * num_kv_heads, v_dim)) |reshaped| {
+            defer cb.free(reshaped);
+            if (try cb.rmsNormBare(reshaped, v_dim, config.norm_eps)) |normed_flat| {
+                defer cb.free(normed_flat);
+                const result = try reshape2dOwned(cb, allocator, normed_flat, total, kv_dim);
+                if (!v_omitted) cb.free(v);
+                break :blk result;
+            }
+        }
+
+        const ones = try allocator.alloc(f32, v_dim);
+        defer allocator.free(ones);
+        @memset(ones, 1.0);
+        const ones_shape = [_]i32{@intCast(v_dim)};
+        const ones_ct = try cb.fromFloat32Shape(ones, &ones_shape);
+        defer cb.free(ones_ct);
+
+        if (try cb.reshape2d(v, total * num_kv_heads, v_dim)) |reshaped| {
+            defer cb.free(reshaped);
+            const normed_flat = try cb.rmsNorm(reshaped, ones_ct, v_dim, config.norm_eps);
+            defer cb.free(normed_flat);
+            const result = try reshape2dOwned(cb, allocator, normed_flat, total, kv_dim);
+            if (!v_omitted) cb.free(v);
+            break :blk result;
+        }
+
+        const result = try cb.rmsNorm(v, ones_ct, v_dim, config.norm_eps);
+        if (!v_omitted) cb.free(v);
+        break :blk result;
+    };
+    defer if (v_normed != k) cb.free(v_normed);
+
+    var k_prepared_owned = false;
+    const k_prepared = blk: {
+        if (config.position_encoding == .rope and (config.family == .gemma or config.family == .qwen3_5) and total == 1) {
+            const rope_dim = config.layerRopeActiveDim(layer);
+            const rope_theta = blk_theta: {
+                const base_theta = config.layerRopeTheta(layer);
+                const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
+                const active_dim: f32 = @floatFromInt(rope_dim);
+                if (active_dim < freq_dim) break :blk_theta std.math.pow(f32, base_theta, active_dim / freq_dim);
+                break :blk_theta base_theta;
+            };
+            const offset = positionOffset(seq_len, total, decode_context);
+            const consecutive_pairs = config.rope_layout == .consecutive_pairs;
+            if (try maybeApplyQKHeadNormRope(cb, allocator, config, k, total, num_kv_heads * head_dim, layer, "k", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, 1.0, &name_buf)) |roped_k| {
+                k_prepared_owned = true;
+                break :blk roped_k;
+            }
+        }
+
+        const k_normed = if (try maybeApplyQKHeadNorm(cb, allocator, config, k, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf)) |normed_k| normed_k else k;
+        errdefer if (k_normed != k) cb.free(k_normed);
+        if (config.position_encoding != .rope) {
+            if (k_normed != k) k_prepared_owned = true;
+            break :blk k_normed;
+        }
+        const rope_dim = config.layerRopeActiveDim(layer);
+        const rope_theta = blk_theta: {
+            const base_theta = config.layerRopeTheta(layer);
+            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
+            const active_dim: f32 = @floatFromInt(rope_dim);
+            if (active_dim < freq_dim) break :blk_theta std.math.pow(f32, base_theta, active_dim / freq_dim);
+            break :blk_theta base_theta;
+        };
+        const offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const roped_k = try cb.rope(k_normed, query_seq_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, config.rope_layout == .consecutive_pairs);
+        if (k_normed != k) cb.free(k_normed);
+        k_prepared_owned = true;
+        break :blk roped_k;
+    };
+    defer if (k_prepared_owned) cb.free(k_prepared);
+
+    var attention = attentionContext(seq_len, decode_context);
+    attention.layer_index = layer;
+    attention.device_kv_write_only = true;
+    attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
+    if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
+
+    // The CUDA write-only path ignores q; reuse the prepared K tensor to avoid a dummy allocation.
+    const write_result = try cb.gqaPagedAttention(k_prepared, k_prepared, v_normed, null, attention, batch, num_kv_heads, num_kv_heads, head_dim);
+    cb.free(write_result);
+    cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_device_kv_fast_prewrite_layer={d}", .{layer});
+}
+
+fn tryQwen36DecodeLayerGraph(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    batch: usize,
+    seq_len: usize,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    overrides: Layer0DecoderOverrides,
+    trace_sink: ?*ActivationTraceSink,
+) !?CT {
+    const graph_layer = qwen36DecodeLayer3GraphLayer(cb, config, batch, seq_len, decode_context, trace_sink) orelse return null;
+    if (layer != graph_layer) return null;
+
+    if (qwen36FastLayerKvPrewriteEnabled()) {
+        try prewriteQwen36LayerDeviceKvFast(
+            cb,
+            allocator,
+            config,
+            hidden,
+            batch,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            layer,
+            decode_context,
+            overrides,
+        );
+    } else {
+        try prewriteQwen36LayerDeviceKv(
+            cb,
+            allocator,
+            config,
+            hidden,
+            batch,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            layer,
+            decode_context,
+            ple_vectors,
+            overrides,
+        );
+    }
+    try prepareCudaDecodeGraphScalars(cb, seq_len, decode_context);
+
+    const prepared_input = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(qwen36_decode_layer3_graph_label, hidden)) orelse return null;
+    defer cb.free(prepared_input);
+
+    if (try cb.debugCudaGraphReplayFinalHidden(prepared_input)) |replayed| {
+        return replayed;
+    }
+
+    const capture_active = try cb.debugCudaGraphCaptureBegin(qwen36_decode_layer3_graph_label);
+    if (!capture_active) return null;
+    var capture_open = true;
+    errdefer if (capture_open) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    try cb.debugCudaTraceTensor("gpt.qwen36_layer3_capture_input", prepared_input);
+    try cb.debugCudaGraphRegisterFinalHiddenReplayInput(prepared_input);
+    const captured_hidden = try decoderBlock(
+        cb,
+        allocator,
+        config,
+        prepared_input,
+        batch,
+        seq_len,
+        num_kv_heads,
+        head_dim,
+        layer,
+        decode_context,
+        ple_vectors,
+        overrides,
+        null,
+        null,
+        null,
+        null,
+        null,
+        trace_sink,
+        .{ .force_skip_kv_write = true },
+    );
+    errdefer if (captured_hidden != prepared_input) cb.free(captured_hidden);
+    try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(prepared_input, captured_hidden);
+    try cb.debugCudaGraphCaptureEnd(true);
+    capture_open = false;
+    cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_layer3_graph_capture layer={d}", .{layer});
+    return captured_hidden;
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -1849,8 +2498,57 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
-    prefetchGemmaCudaLayerWindow(cb, config, 0);
-    for (0..config.num_hidden_layers) |layer| {
+    const qwen36_graph_probe_stop_after_layer = qwen36GraphProbeStopAfterLayer(config, decode_context);
+    const qwen36_prefix_graph_stop_after_layer = qwen36DecodePrefixGraphStopAfterLayer(cb, config, batch, seq_len, decode_context, trace_sink);
+    var qwen36_prefix_capture_active = false;
+    var qwen36_prefix_original_hidden: CT = undefined;
+    var qwen36_prefix_owns_original_hidden = false;
+    errdefer if (qwen36_prefix_capture_active) cb.debugCudaGraphCaptureEnd(false) catch {};
+    errdefer if (qwen36_prefix_owns_original_hidden) cb.free(qwen36_prefix_original_hidden);
+
+    var decoder_start_layer: usize = 0;
+    if (qwen36_prefix_graph_stop_after_layer) |stop_after_layer| {
+        try prepareCudaDecodeGraphScalars(cb, seq_len, decode_context);
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(qwen36_decode_prefix_graph_label, hidden)) |prepared_input| {
+            if (try cb.debugCudaGraphReplayFinalHidden(prepared_input)) |replayed_prefix| {
+                cb.free(prepared_input);
+                if (owns_hidden) cb.free(hidden);
+                hidden = replayed_prefix;
+                owns_hidden = true;
+                decoder_start_layer = stop_after_layer + 1;
+                releasePendingLayer0DecoderOverrides(
+                    cb,
+                    &layer0_attn_norm_pending,
+                    &layer0_fused_qkv_pending,
+                    &layer0_q_pending,
+                    &layer0_k_pending,
+                    &layer0_v_pending,
+                );
+            } else {
+                qwen36_prefix_capture_active = try cb.debugCudaGraphCaptureBegin(qwen36_decode_prefix_graph_label);
+                if (qwen36_prefix_capture_active) {
+                    qwen36_prefix_original_hidden = hidden;
+                    qwen36_prefix_owns_original_hidden = owns_hidden;
+                    hidden = prepared_input;
+                    owns_hidden = true;
+                    try cb.debugCudaTraceTensor("gpt.qwen36_prefix_capture_input", hidden);
+                    try cb.debugCudaGraphRegisterFinalHiddenReplayInput(hidden);
+                } else {
+                    cb.free(prepared_input);
+                }
+            }
+        } else {
+            qwen36_prefix_capture_active = try cb.debugCudaGraphCaptureBegin(qwen36_decode_prefix_graph_label);
+            if (qwen36_prefix_capture_active) {
+                try cb.debugCudaTraceTensor("gpt.qwen36_prefix_capture_input", hidden);
+                try cb.debugCudaGraphRegisterFinalHiddenReplayInput(hidden);
+            }
+        }
+    }
+
+    const decoder_layer_count: usize = @intCast(config.num_hidden_layers);
+    prefetchGemmaCudaLayerWindow(cb, config, decoder_start_layer);
+    for (decoder_start_layer..decoder_layer_count) |layer| {
         prefetchGemmaCudaLayerWindow(cb, config, layer + 1);
         const layer_started_at = monotonicNowNs();
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
@@ -1858,7 +2556,21 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         }
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
-        const new_hidden = try decoderBlock(
+        const new_hidden = (try tryQwen36DecodeLayerGraph(
+            cb,
+            allocator,
+            config,
+            hidden,
+            batch,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            layer,
+            decode_context,
+            ple_vectors,
+            effective_overrides,
+            trace_sink,
+        )) orelse try decoderBlock(
             cb,
             allocator,
             config,
@@ -1877,6 +2589,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             layer0_k_pending,
             layer0_v_pending,
             trace_sink,
+            .{},
         );
         if (layer == 0) layer0_attn_norm_pending = null;
         if (layer == 0) layer0_fused_qkv_pending = null;
@@ -1915,6 +2628,29 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         try maybeCaptureActivationTrace(trace_sink, cb, allocator, "out", layer, hidden, hidden_size);
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} done\n", .{layer});
+        }
+        if (qwen36_graph_probe_stop_after_layer) |stop_after_layer| {
+            if (layer >= stop_after_layer) {
+                cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_stop_after_layer={d}", .{layer});
+                break;
+            }
+        }
+        if (qwen36_prefix_capture_active) {
+            if (qwen36_prefix_graph_stop_after_layer) |stop_after_layer| {
+                if (layer >= stop_after_layer) {
+                    try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(hidden, hidden);
+                    cb.debugCudaGraphCaptureEnd(true) catch |err| {
+                        qwen36_prefix_capture_active = false;
+                        return err;
+                    };
+                    qwen36_prefix_capture_active = false;
+                    if (qwen36_prefix_owns_original_hidden) {
+                        cb.free(qwen36_prefix_original_hidden);
+                        qwen36_prefix_owns_original_hidden = false;
+                    }
+                    cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_prefix_stop_after_layer={d}", .{layer});
+                }
+            }
         }
         if (cudaPrefillProfileEnabled() and cb.kind() == .cuda and ((layer + 1) % cudaPrefillProfileIntervalLayers() == 0 or layer + 1 == config.num_hidden_layers)) {
             debugPrint("cuda_prefill_layer: layer={d} elapsed_ms={d}\n", .{ layer, (monotonicNowNs() - layer_started_at) / std.time.ns_per_ms });
@@ -2117,6 +2853,7 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             null,
             null,
             null,
+            .{},
         );
         if (new_hidden != hidden) cb.free(hidden);
         hidden = new_hidden;
@@ -2276,7 +3013,7 @@ fn deepSeekV4AttentionUpdate(
     attention_config.sliding_window = if (path == .sliding) config.sliding_window else 0;
     const attn_started_at = monotonicNowNs();
     const attn_out_rotated = if (path == .sliding)
-        try applyAttentionWithSink(cb, attention_config, q_rope, k_rope, k_rope, weights.sinks, batch, seq_len, config.num_attention_heads, num_kv_heads, head_dim, layer, layer, false, decode_context)
+        try applyAttentionWithSink(cb, attention_config, q_rope, k_rope, k_rope, weights.sinks, batch, seq_len, config.num_attention_heads, num_kv_heads, head_dim, layer, layer, false, false, decode_context)
     else
         try deepSeekV4CompressedAttentionReference(cb, allocator, config, normed, q_a_normed, q_rope, k_rope, weights.sinks, batch, seq_len, total, num_heads, @intCast(num_kv_heads), @intCast(head_dim), layer, path, decode_context, name_buf);
     defer cb.free(attn_out_rotated);
@@ -3910,6 +4647,7 @@ fn decoderBlock(
     layer0_k_override: ?CT,
     layer0_v_override: ?CT,
     trace_sink: ?*ActivationTraceSink,
+    graph_options: DecoderBlockGraphOptions,
 ) !CT {
     const attn_started_at = monotonicNowNs();
     const hidden_size = config.hidden_size;
@@ -4004,10 +4742,78 @@ fn decoderBlock(
         defer cb.free(attn_out);
         const attn_res = try cb.add(attn_out, hidden);
         errdefer cb.free(attn_res);
+        if (qwen36GraphProbeAttentionOnlyLayer(config, decode_context, layer)) {
+            cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_attention_only_layer={d}", .{layer});
+            return attn_res;
+        }
 
-        const ffn_normed = try applyFFNNorm(cb, allocator, config, attn_res, layer, &name_buf);
+        if (qwen36FusedMlpPreRmsEnabled() and
+            !disableDecoderRuntimeActivationDebug() and
+            config.norm_type == .rms_norm and
+            ffn_norm_slot != null and
+            mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null)
+        {
+            const ffn_started_at = monotonicNowNs();
+            if (try cb.runGatedFfnResidual(&.{
+                .gate_linear_slot = mlp_gate_slot.?,
+                .up_linear_slot = mlp_up_slot.?,
+                .down_linear_slot = mlp_down_slot.?,
+                .input = attn_res,
+                .residual = attn_res,
+                .pre_input_rms_norm_slot = ffn_norm_slot.?,
+                .post_down_rms_norm_slot = null,
+                .hidden_size = hidden_size,
+                .intermediate_size = config.intermediateSize(layer),
+                .eps = config.norm_eps,
+                .activation = decoderRuntimeActivationKind(config.activation),
+            })) |fused| {
+                debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
+                cb.free(attn_res);
+                try dumpLayerLastRowStats(cb, allocator, layer, fused, hidden_size);
+                return fused;
+            }
+        }
+
+        const ffn_normed = if (ffn_norm_slot != null) blk: {
+            const raw_norm = switch (config.norm_type) {
+                .layer_norm => try cb.decoderRuntimeApplyLayerNorm(&.{
+                    .slot = ffn_norm_slot.?,
+                    .input = attn_res,
+                    .hidden_size = hidden_size,
+                    .eps = config.norm_eps,
+                }),
+                .rms_norm => try cb.decoderRuntimeApplyRmsNorm(&.{
+                    .slot = ffn_norm_slot.?,
+                    .input = attn_res,
+                    .hidden_size = hidden_size,
+                    .eps = config.norm_eps,
+                }),
+            };
+            break :blk raw_norm orelse try applyFFNNorm(cb, allocator, config, attn_res, layer, &name_buf);
+        } else try applyFFNNorm(cb, allocator, config, attn_res, layer, &name_buf);
         defer cb.free(ffn_normed);
         const ffn_started_at = monotonicNowNs();
+        if (!disableDecoderRuntimeActivationDebug() and
+            mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null)
+        {
+            if (try cb.runGatedFfnResidual(&.{
+                .gate_linear_slot = mlp_gate_slot.?,
+                .up_linear_slot = mlp_up_slot.?,
+                .down_linear_slot = mlp_down_slot.?,
+                .input = ffn_normed,
+                .residual = attn_res,
+                .post_down_rms_norm_slot = null,
+                .hidden_size = hidden_size,
+                .intermediate_size = config.intermediateSize(layer),
+                .eps = config.norm_eps,
+                .activation = decoderRuntimeActivationKind(config.activation),
+            })) |fused| {
+                debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
+                cb.free(attn_res);
+                try dumpLayerLastRowStats(cb, allocator, layer, fused, hidden_size);
+                return fused;
+            }
+        }
         const ffn_out = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
         defer cb.free(ffn_out);
         debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
@@ -4019,6 +4825,7 @@ fn decoderBlock(
     }
 
     const shares_kv = config.layerSharesKv(layer) and !disableSharedKvDebug();
+    const effective_skip_kv_write = shares_kv or graph_options.force_skip_kv_write;
     const kv_layer_index = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
     if (config.gemma4_mtp_assistant and traceGemma4MtpDonorDebug()) {
         const mode_name = if (decode_context) |ctx| @tagName(ctx.attention_mode) else "none";
@@ -4054,7 +4861,7 @@ fn decoderBlock(
             .attention = blk: {
                 var attention = attentionContext(seq_len, decode_context);
                 attention.layer_index = kv_layer_index;
-                attention.skip_kv_write = shares_kv;
+                attention.skip_kv_write = effective_skip_kv_write;
                 attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                 if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
                 break :blk attention;
@@ -4112,7 +4919,7 @@ fn decoderBlock(
             .attention = blk: {
                 var attention = attentionContext(seq_len, decode_context);
                 attention.layer_index = kv_layer_index;
-                attention.skip_kv_write = shares_kv;
+                attention.skip_kv_write = effective_skip_kv_write;
                 attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                 if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
                 break :blk attention;
@@ -4348,7 +5155,7 @@ fn decoderBlock(
     var qk_already_roped = false;
     var fused_q_rope: ?CT = null;
     var fused_k_rope: ?CT = null;
-    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and total == 1) fused_blk: {
+    if (!shares_kv and (config.family == .gemma or config.family == .qwen3_5) and config.position_encoding == .rope and total == 1) fused_blk: {
         const rope_dim = config.layerRopeActiveDim(layer);
         const rope_theta = blk: {
             const base_theta = config.layerRopeTheta(layer);
@@ -4421,6 +5228,11 @@ fn decoderBlock(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_attn", layer, V_normed, num_kv_heads * head_dim);
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
+    if (qwen36GraphProbeQkvOnlyLayer(config, decode_context, layer)) {
+        cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_qkv_only_layer={d}", .{layer});
+        return hidden;
+    }
+
     if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
         switch (config.family) {
             .gpt2 => {
@@ -4435,7 +5247,7 @@ fn decoderBlock(
                         .attention = blk: {
                             var attention = attentionContext(seq_len, decode_context);
                             attention.layer_index = kv_layer_index;
-                            attention.skip_kv_write = shares_kv;
+                            attention.skip_kv_write = effective_skip_kv_write;
                             attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                             if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
                             break :blk attention;
@@ -4474,7 +5286,7 @@ fn decoderBlock(
                         .attention = blk: {
                             var attention = attentionContext(seq_len, decode_context);
                             attention.layer_index = kv_layer_index;
-                            attention.skip_kv_write = shares_kv;
+                            attention.skip_kv_write = effective_skip_kv_write;
                             attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
                             if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
                             break :blk attention;
@@ -4617,12 +5429,21 @@ fn decoderBlock(
         // Attention (with optional RoPE)
         const attn_core_started_at = monotonicNowNs();
         const attn_out = if (qk_already_roped)
-            try applyPreparedAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context)
+            try applyPreparedAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, effective_skip_kv_write, graph_options.device_kv_write_only, decode_context)
         else
-            try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
+            try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, effective_skip_kv_write, graph_options.device_kv_write_only, decode_context);
         defer cb.free(attn_out);
         debug_timing_stats.attention_core_nanos += @intCast(monotonicNowNs() - attn_core_started_at);
+        if (graph_options.device_kv_write_only) {
+            cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_device_kv_prewrite_only_layer={d}", .{layer});
+            return hidden;
+        }
+        if (qwen36GraphProbeRawAttentionOnlyLayer(config, decode_context, layer)) {
+            cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_raw_attention_only_layer={d}", .{layer});
+            return hidden;
+        }
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
+            if (try cb.activationMultiply(gate, attn_out, .sigmoid)) |fused| break :blk_gate fused;
             const sigmoid_gate = try cb.sigmoid(gate);
             defer cb.free(sigmoid_gate);
             break :blk_gate try cb.multiply(attn_out, sigmoid_gate);
@@ -4632,6 +5453,10 @@ fn decoderBlock(
         try maybeDebugLayerTensor(cb, allocator, layer, "attn_out", gated_attn_out);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-out", gated_attn_out, num_heads * head_dim);
         try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_out", layer, gated_attn_out, num_heads * head_dim);
+        if (qwen36GraphProbeAttentionCoreOnlyLayer(config, decode_context, layer)) {
+            cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_attention_core_only_layer={d}", .{layer});
+            return hidden;
+        }
 
         const attn_proj_input = if (config.family == .bitnet)
             if (attn_sub_norm_slot != null)
@@ -4658,13 +5483,19 @@ fn decoderBlock(
             })) orelse try attnOutputProject(cb, allocator, config, attn_proj_input, total, num_heads * head_dim, hidden_size, layer, &name_buf)
         else
             try attnOutputProject(cb, allocator, config, attn_proj_input, total, num_heads * head_dim, hidden_size, layer, &name_buf);
-        defer cb.free(proj);
+        var owns_proj = true;
+        defer if (owns_proj) cb.free(proj);
         debug_timing_stats.attention_out_proj_nanos += @intCast(monotonicNowNs() - attn_out_proj_started_at);
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_proj", proj, hidden_size);
         try maybeDebugLayerTensor(cb, allocator, layer, "attn_proj", proj);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-proj", proj, hidden_size);
         try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_proj", layer, proj, hidden_size);
         debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
+        if (qwen36GraphProbeAttentionProjOnlyLayer(config, decode_context, layer)) {
+            cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_attention_proj_only_layer={d}", .{layer});
+            owns_proj = false;
+            return proj;
+        }
 
         if (config.family == .gemma) {
             const sa_out = blk_sa_out: {
@@ -4841,6 +5672,11 @@ fn decoderBlock(
         break :blk try cb.add(proj, hidden);
     };
 
+    if (qwen36GraphProbeAttentionOnlyLayer(config, decode_context, layer)) {
+        cudaGraphCaptureProbeTraceLog("cuda_graph_capture_probe: qwen36_attention_only_layer={d}", .{layer});
+        return attn_res;
+    }
+
     // --- FFN sublayer ---
     const ffn_normed = if (ffn_norm_slot != null) blk: {
         const raw_norm = switch (config.norm_type) {
@@ -4917,7 +5753,7 @@ fn decoderBlock(
             .out_dim = hidden_size,
         })) orelse try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
     } else if (mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and switch (config.family) {
-        .llama, .mistral, .qwen2, .gemma => true,
+        .llama, .mistral, .qwen2, .qwen3_5, .gemma => true,
         else => false,
     }) blk: {
         const inter_size = config.intermediateSize(layer);
@@ -5025,6 +5861,7 @@ pub fn debugDecoderBlockNoOverrides(
         null,
         null,
         null,
+        .{},
     );
 }
 
@@ -5171,6 +6008,7 @@ pub fn maybeApplyQKHeadNormRope(
     scale: f32,
     buf: *[256]u8,
 ) !?CT {
+    _ = allocator;
     switch (config.family) {
         .gemma, .qwen3, .qwen3_5 => {},
         else => return null,
@@ -5183,12 +6021,10 @@ pub fn maybeApplyQKHeadNormRope(
         else => return err,
     };
     defer cb.free(base_weight);
-    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
-    defer if (adjusted_weight != base_weight) cb.free(adjusted_weight);
 
     return try cb.rmsNormHeadsRope(
         tensor,
-        adjusted_weight,
+        base_weight,
         total_rows,
         total_dim,
         head_dim,
@@ -5200,6 +6036,7 @@ pub fn maybeApplyQKHeadNormRope(
         seq_len,
         consecutive_pairs,
         scale,
+        config.norm_weight_offset,
     );
 }
 
@@ -5345,6 +6182,11 @@ fn disablePleDebug() bool {
 fn disableDecoderRuntimeActivationDebug() bool {
     return getenvBool("TERMITE_METAL_DECODER_RUNTIME_DISABLE_ACTIVATION") or
         getenvBool("TERMITE_METAL_WHOLE_TOKEN_DISABLE_ACTIVATION");
+}
+
+fn qwen36FusedMlpPreRmsEnabled() bool {
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_QWEN36_FUSED_MLP_PRE_RMS")) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN36_FUSED_MLP_PRE_RMS", false);
 }
 
 fn disableDenseBlockFastPathDebug() bool {
@@ -5833,14 +6675,9 @@ pub fn qwen35LinearAttention(
     const b_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer}) catch return error.NameTooLong;
     const b_w = try getModelWeight(cb, config, b_w_name);
     defer cb.free(b_w);
-    const beta_proj = try cb.linearNoBias(input, b_w, total, hidden_size, value_heads);
-    defer cb.free(beta_proj);
-
     const a_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer}) catch return error.NameTooLong;
     const a_w = try getModelWeight(cb, config, a_w_name);
     defer cb.free(a_w);
-    const a_proj = try cb.linearNoBias(input, a_w, total, hidden_size, value_heads);
-    defer cb.free(a_proj);
 
     const conv_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.conv1d.weight", .{layer}) catch return error.NameTooLong;
     const conv_w = try getModelWeight(cb, config, conv_w_name);
@@ -5855,6 +6692,79 @@ pub fn qwen35LinearAttention(
     const norm_w = try getModelWeight(cb, config, norm_w_name);
     defer cb.free(norm_w);
 
+    const maybe_state = if (decode_context) |dc|
+        if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null
+    else
+        null;
+
+    if (seq_len == 1) {
+        if (try cb.qwen35LinearAttentionCore(&.{
+            .mixed = mixed,
+            .gate = z,
+            .input = input,
+            .beta_weight = b_w,
+            .alpha_weight = a_w,
+            .hidden_size = hidden_size,
+            .conv_weight = conv_w,
+            .a_log = a_log_w,
+            .dt_bias = dt_bias_w,
+            .norm_weight = norm_w,
+            .norm_weight_offset = config.norm_weight_offset,
+            .state = if (maybe_state) |state| &state.backend_state else null,
+            .state_initialized = if (maybe_state) |state| state.initialized else false,
+            .seq_len = seq_len,
+            .key_heads = key_heads,
+            .value_heads = value_heads,
+            .key_head_dim = key_head_dim,
+            .value_head_dim = value_head_dim,
+            .conv_kernel = conv_kernel,
+            .eps = config.norm_eps,
+        })) |core_ct| {
+            defer cb.free(core_ct);
+            if (maybe_state) |state| state.initialized = true;
+            const out_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+            const out_w = try getModelWeight(cb, config, out_w_name);
+            defer cb.free(out_w);
+            return cb.linearNoBias(core_ct, out_w, total, value_dim, hidden_size);
+        }
+    }
+
+    const alpha_beta = try cb.linearNoBiasPair(input, b_w, a_w, total, hidden_size, value_heads);
+    const beta_proj = alpha_beta.first;
+    const a_proj = alpha_beta.second;
+    defer cb.free(beta_proj);
+    defer cb.free(a_proj);
+
+    if (try cb.qwen35LinearAttentionCore(&.{
+        .mixed = mixed,
+        .gate = z,
+        .beta = beta_proj,
+        .alpha = a_proj,
+        .conv_weight = conv_w,
+        .a_log = a_log_w,
+        .dt_bias = dt_bias_w,
+        .norm_weight = norm_w,
+        .norm_weight_offset = config.norm_weight_offset,
+        .state = if (maybe_state) |state| &state.backend_state else null,
+        .state_initialized = if (maybe_state) |state| state.initialized else false,
+        .seq_len = seq_len,
+        .key_heads = key_heads,
+        .value_heads = value_heads,
+        .key_head_dim = key_head_dim,
+        .value_head_dim = value_head_dim,
+        .conv_kernel = conv_kernel,
+        .eps = config.norm_eps,
+    })) |core_ct| {
+        defer cb.free(core_ct);
+        if (maybe_state) |state| state.initialized = true;
+        const out_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+        const out_w = try getModelWeight(cb, config, out_w_name);
+        defer cb.free(out_w);
+        return cb.linearNoBias(core_ct, out_w, total, value_dim, hidden_size);
+    }
+
+    const adjusted_norm_w = try maybeAdjustNormWeight(cb, allocator, config, norm_w, value_head_dim);
+    defer if (adjusted_norm_w != norm_w) cb.free(adjusted_norm_w);
     const mixed_host = try cb.toFloat32(mixed, allocator);
     defer allocator.free(mixed_host);
     const z_host = try cb.toFloat32(z, allocator);
@@ -5869,15 +6779,8 @@ pub fn qwen35LinearAttention(
     defer allocator.free(a_log);
     const dt_bias = try cb.toFloat32(dt_bias_w, allocator);
     defer allocator.free(dt_bias);
-    const adjusted_norm_w = try maybeAdjustNormWeight(cb, allocator, config, norm_w, value_head_dim);
-    defer if (adjusted_norm_w != norm_w) cb.free(adjusted_norm_w);
     const norm_weight = try cb.toFloat32(adjusted_norm_w, allocator);
     defer allocator.free(norm_weight);
-
-    const maybe_state = if (decode_context) |dc|
-        if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null
-    else
-        null;
 
     const conv_out = try allocator.alloc(f32, total * conv_dim);
     defer allocator.free(conv_out);
@@ -6230,9 +7133,10 @@ pub fn applyAttention(
     layer: usize,
     kv_layer_index: usize,
     skip_kv_write: bool,
+    device_kv_write_only: bool,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return applyAttentionWithSink(cb, config, Q, K, V, null, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, skip_kv_write, decode_context);
+    return applyAttentionWithSink(cb, config, Q, K, V, null, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, skip_kv_write, device_kv_write_only, decode_context);
 }
 
 pub fn applyPreparedAttention(
@@ -6249,11 +7153,13 @@ pub fn applyPreparedAttention(
     layer: usize,
     kv_layer_index: usize,
     skip_kv_write: bool,
+    device_kv_write_only: bool,
     decode_context: ?*const DecodeContext,
 ) !CT {
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
     attention.skip_kv_write = skip_kv_write;
+    attention.device_kv_write_only = device_kv_write_only;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
     if (attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
@@ -6295,11 +7201,13 @@ fn applyAttentionWithSink(
     layer: usize,
     kv_layer_index: usize,
     skip_kv_write: bool,
+    device_kv_write_only: bool,
     decode_context: ?*const DecodeContext,
 ) !CT {
     var attention = attentionContext(seq_len, decode_context);
     attention.layer_index = kv_layer_index;
     attention.skip_kv_write = skip_kv_write;
+    attention.device_kv_write_only = device_kv_write_only;
     attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
     if (disableSlidingAttentionDebug()) {
         attention.sliding_window = 0;

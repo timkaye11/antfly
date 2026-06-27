@@ -126,6 +126,16 @@ required_symbols=(
   termite_linear_q4_0_argmax_rows_stage1_tile4
   termite_linear_q4_k_argmax_rows_stage1_tile4
   termite_argmax_reduce_rows_pairs_f32
+  termite_linear_q5_k_f32_tile4
+  termite_linear_iq3_s_f32_tile4
+  termite_linear_iq3_s_pair_nobias_f32_tile4
+  termite_linear_iq3_s_pair_nobias_f32_tile4_dual
+  termite_qwen36_iq3_s_gate_up_act_f32_tile4
+  termite_qwen36_iq3_s_gate_up_act_f32_tile8_v2
+  termite_qwen36_iq4_xs_down_residual_f32_tile4
+  termite_qwen36_iq4_xs_down_residual_f32_tile8_v2
+  termite_linear_iq4_xs_f32_tile4
+  termite_linear_iq4_xs_gated_down_f32_tile4
   termite_linear_q8_0_f32_tile4_r2
   termite_linear_q6_k_f32_tile4
   termite_linear_q6_k_gated_down_f32_tile4
@@ -168,8 +178,16 @@ required_symbols=(
   termite_linear_bf16_weight_f32_qkv_nobias_tiled
   termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled
   termite_embedding_lookup_i32_q4_k_f32
+  termite_embedding_lookup_q5_k_f32
+  termite_embedding_lookup_i32_q5_k_f32
+  termite_embedding_lookup_iq3_xxs_f32
+  termite_embedding_lookup_i32_iq3_xxs_f32
   termite_embedding_lookup_q6_k_f32
   termite_embedding_lookup_i32_q6_k_f32
+  termite_qwen35_decode_core_fused_f32
+  termite_qwen35_causal_conv_silu_f32
+  termite_qwen35_gated_delta_rule_f32
+  termite_qwen35_gated_rms_norm_f32
 )
 
 check_required_symbols() {

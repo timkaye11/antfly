@@ -140,11 +140,40 @@ pub const CublasLt = struct {
         in_dim: usize,
         out_dim: usize,
     ) Error!void {
+        return self.matmulBf16WeightF32OutImpl(ctx, dst, input_bf16, weight_bf16, null, rows, in_dim, out_dim);
+    }
+
+    pub fn matmulBf16WeightF32OutAdd(
+        self: *CublasLt,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_bf16: buffer_mod.DeviceBuffer,
+        weight_bf16: buffer_mod.DeviceBuffer,
+        residual_f32: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) Error!void {
+        return self.matmulBf16WeightF32OutImpl(ctx, dst, input_bf16, weight_bf16, residual_f32, rows, in_dim, out_dim);
+    }
+
+    fn matmulBf16WeightF32OutImpl(
+        self: *CublasLt,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_bf16: buffer_mod.DeviceBuffer,
+        weight_bf16: buffer_mod.DeviceBuffer,
+        residual_f32: ?buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) Error!void {
         if (rows == 0 or in_dim == 0 or out_dim == 0) return;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
         try checkRawBytes(input_bf16, rows * in_dim * @sizeOf(u16));
         try checkRawBytes(weight_bf16, out_dim * in_dim * @sizeOf(u16));
         try checkRawBytes(dst, rows * out_dim * @sizeOf(f32));
+        if (residual_f32) |residual| try checkRawBytes(residual, rows * out_dim * @sizeOf(f32));
 
         var op_desc: MatmulDesc = null;
         try self.check(self.fns.cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
@@ -180,7 +209,8 @@ pub const CublasLt = struct {
         if (returned <= 0 or heuristic[0].state != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnsupported;
 
         var alpha: f32 = 1.0;
-        var beta: f32 = 0.0;
+        var beta: f32 = if (residual_f32 != null) 1.0 else 0.0;
+        const c_buffer = residual_f32 orelse dst;
         ctx.makeCurrent() catch return error.CublasLtError;
         try self.check(self.fns.cublasLtMatmul(
             self.handle,
@@ -191,7 +221,7 @@ pub const CublasLt = struct {
             @ptrFromInt(input_bf16.ptr),
             b_desc,
             &beta,
-            @ptrFromInt(dst.ptr),
+            @ptrFromInt(c_buffer.ptr),
             c_desc,
             @ptrFromInt(dst.ptr),
             d_desc,

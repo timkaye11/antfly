@@ -498,11 +498,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     }
 
     const decoder_runtime_scheduler_override = false;
+    const scheduler_enabled = nativeGenerateSchedulerEnabled();
     var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
     defer if (native_generate_lease) |lease| {
         if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
     };
-    if (!decoder_runtime_scheduler_override) {
+    if (!decoder_runtime_scheduler_override and scheduler_enabled) {
         if (model.native_generate_coordinator) |coordinator| {
             native_generate_lease = try coordinator.acquire(.{
                 .requested_units = 1,
@@ -687,7 +688,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
 
-    const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
+    const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and scheduler_enabled;
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
     var pjrt_client: ?pjrt_lib.pjrt.Client = null;
@@ -1183,7 +1184,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_graph_capture_counts: begins={d} replays={d} discards={d} instantiates={d} update_successes={d} update_failures={d} update_unavailable={d} scalar_updates={d} persistent_replays={d} capacity_skips={d}\n",
+                        "cuda_generate_graph_capture_counts: begins={d} replays={d} discards={d} instantiates={d} update_successes={d} update_failures={d} update_unavailable={d} scalar_updates={d} persistent_replays={d} capacity_skips={d} eligibility_skips={d} unsafe_aborts={d} input_mismatch_skips={d} recaptures={d} capacity_recaptures={d}\n",
                         .{
                             generate_stats.cuda_graph_capture_begins,
                             generate_stats.cuda_graph_capture_replays,
@@ -1195,6 +1196,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.cuda_graph_capture_scalar_updates,
                             generate_stats.cuda_graph_capture_persistent_replays,
                             generate_stats.cuda_graph_capture_capacity_skips,
+                            generate_stats.cuda_graph_capture_eligibility_skips,
+                            generate_stats.cuda_graph_capture_unsafe_aborts,
+                            generate_stats.cuda_graph_capture_input_mismatch_skips,
+                            generate_stats.cuda_graph_capture_recaptures,
+                            generate_stats.cuda_graph_capture_capacity_recaptures,
                         },
                     );
                     print(
@@ -1206,7 +1212,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
+                        "cuda_generate_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_iq4_xs={d} gated_down_bf16={d} gated_down_fallbacks={d}\n",
                         .{
                             generate_stats.activation_multiply_fused,
                             generate_stats.add_mul_scalar_fused,
@@ -1215,7 +1221,44 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.rms_norm_add_output_scale_fallbacks,
                             generate_stats.gated_down_fused_q8,
                             generate_stats.gated_down_fused_q4,
+                            generate_stats.gated_down_fused_iq4_xs,
+                            generate_stats.gated_down_fused_bf16,
                             generate_stats.gated_down_fallbacks,
+                        },
+                    );
+                    print(
+                        "cuda_generate_qwen36_mlp_counts: fused_attempts={d} fused_hits={d} fused_fallbacks={d} pre_rms_hits={d} pre_rms_fallbacks={d}\n",
+                        .{
+                            generate_stats.qwen36_mlp_fused_attempts,
+                            generate_stats.qwen36_mlp_fused_hits,
+                            generate_stats.qwen36_mlp_fused_fallbacks,
+                            generate_stats.qwen36_mlp_pre_rms_fused_hits,
+                            generate_stats.qwen36_mlp_pre_rms_fused_fallbacks,
+                        },
+                    );
+                    print(
+                        "cuda_generate_qwen36_mlp_v2_counts: attempts={d} hits={d} fallbacks={d} gate_up_us={d} down_us={d}\n",
+                        .{
+                            generate_stats.qwen36_mlp_v2_attempts,
+                            generate_stats.qwen36_mlp_v2_hits,
+                            generate_stats.qwen36_mlp_v2_fallbacks,
+                            generate_stats.qwen36_mlp_v2_gate_up_us,
+                            generate_stats.qwen36_mlp_v2_down_us,
+                        },
+                    );
+                    print(
+                        "cuda_generate_qwen36_triton_counts: mlp_attempts={d} mlp_hits={d} mlp_fallbacks={d} kv_write_attempts={d} kv_write_hits={d} kv_write_fallbacks={d} attention_attempts={d} attention_hits={d} attention_fallbacks={d} attention_graph_bypasses={d}\n",
+                        .{
+                            generate_stats.qwen36_triton_mlp_attempts,
+                            generate_stats.qwen36_triton_mlp_hits,
+                            generate_stats.qwen36_triton_mlp_fallbacks,
+                            generate_stats.qwen36_triton_kv_write_attempts,
+                            generate_stats.qwen36_triton_kv_write_hits,
+                            generate_stats.qwen36_triton_kv_write_fallbacks,
+                            generate_stats.qwen36_triton_attention_attempts,
+                            generate_stats.qwen36_triton_attention_hits,
+                            generate_stats.qwen36_triton_attention_fallbacks,
+                            generate_stats.qwen36_triton_attention_graph_bypasses,
                         },
                     );
                     print(
@@ -1479,11 +1522,57 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_linear_pair_counts: fused_q8={d} fused_q4={d} fallbacks={d}\n",
+                    "cuda_linear_pair_counts: fused_q8={d} fused_q4={d} fused_iq3_s={d} fused_bf16={d} fallbacks={d}\n",
                     .{
                         cuda_stats.linear_pair_fused_q8,
                         cuda_stats.linear_pair_fused_q4,
+                        cuda_stats.linear_pair_fused_iq3_s,
+                        cuda_stats.linear_pair_fused_bf16,
                         cuda_stats.linear_pair_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_qwen35_counts: decode_core_fused={d} decode_core_fallbacks={d} decode_core_ab_fused={d} decode_core_ab_fallbacks={d}\n",
+                    .{
+                        cuda_stats.qwen35_decode_core_fused,
+                        cuda_stats.qwen35_decode_core_fallbacks,
+                        cuda_stats.qwen35_decode_core_ab_fused,
+                        cuda_stats.qwen35_decode_core_ab_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_qwen36_mlp_counts: fused_attempts={d} fused_hits={d} fused_fallbacks={d} pre_rms_hits={d} pre_rms_fallbacks={d}\n",
+                    .{
+                        cuda_stats.qwen36_mlp_fused_attempts,
+                        cuda_stats.qwen36_mlp_fused_hits,
+                        cuda_stats.qwen36_mlp_fused_fallbacks,
+                        cuda_stats.qwen36_mlp_pre_rms_fused_hits,
+                        cuda_stats.qwen36_mlp_pre_rms_fused_fallbacks,
+                    },
+                );
+                print(
+                    "cuda_qwen36_mlp_v2_counts: attempts={d} hits={d} fallbacks={d} gate_up_us={d} down_us={d}\n",
+                    .{
+                        cuda_stats.qwen36_mlp_v2_attempts,
+                        cuda_stats.qwen36_mlp_v2_hits,
+                        cuda_stats.qwen36_mlp_v2_fallbacks,
+                        cuda_stats.qwen36_mlp_v2_gate_up_us,
+                        cuda_stats.qwen36_mlp_v2_down_us,
+                    },
+                );
+                print(
+                    "cuda_qwen36_triton_counts: mlp_attempts={d} mlp_hits={d} mlp_fallbacks={d} kv_write_attempts={d} kv_write_hits={d} kv_write_fallbacks={d} attention_attempts={d} attention_hits={d} attention_fallbacks={d} attention_graph_bypasses={d}\n",
+                    .{
+                        cuda_stats.qwen36_triton_mlp_attempts,
+                        cuda_stats.qwen36_triton_mlp_hits,
+                        cuda_stats.qwen36_triton_mlp_fallbacks,
+                        cuda_stats.qwen36_triton_kv_write_attempts,
+                        cuda_stats.qwen36_triton_kv_write_hits,
+                        cuda_stats.qwen36_triton_kv_write_fallbacks,
+                        cuda_stats.qwen36_triton_attention_attempts,
+                        cuda_stats.qwen36_triton_attention_hits,
+                        cuda_stats.qwen36_triton_attention_fallbacks,
+                        cuda_stats.qwen36_triton_attention_graph_bypasses,
                     },
                 );
                 print(
@@ -1495,7 +1584,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_fallbacks={d}\n",
+                    "cuda_epilogue_fusion_counts: activation_multiply={d} add_mul_scalar={d} rms_norm_add={d} rms_norm_add_output_scale={d} rms_norm_add_output_scale_fallbacks={d} gated_down_q8={d} gated_down_q4={d} gated_down_iq4_xs={d} gated_down_bf16={d} gated_down_fallbacks={d}\n",
                     .{
                         cuda_stats.activation_multiply_fused,
                         cuda_stats.add_mul_scalar_fused,
@@ -1504,6 +1593,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.rms_norm_add_output_scale_fallbacks,
                         cuda_stats.gated_down_fused_q8,
                         cuda_stats.gated_down_fused_q4,
+                        cuda_stats.gated_down_fused_iq4_xs,
+                        cuda_stats.gated_down_fused_bf16,
                         cuda_stats.gated_down_fallbacks,
                     },
                 );
@@ -2043,6 +2134,7 @@ fn writeJsonTiming(
                 \\"cross_backend_event_records":{d},
                 \\"cross_backend_event_waits":{d},
                 \\"cross_backend_sync_fallbacks":{d},
+                \\"device_allocated_bytes":{d},
                 \\
             ,
                 .{
@@ -2061,6 +2153,7 @@ fn writeJsonTiming(
                     cuda_stats.cross_backend_event_records,
                     cuda_stats.cross_backend_event_waits,
                     cuda_stats.cross_backend_sync_fallbacks,
+                    cuda_stats.device_allocated_bytes,
                 },
             );
             try appendFmt(
@@ -2086,6 +2179,11 @@ fn writeJsonTiming(
                 \\"graph_capture_scalar_updates":{d},
                 \\"graph_capture_persistent_replays":{d},
                 \\"graph_capture_capacity_skips":{d},
+                \\"graph_capture_eligibility_skips":{d},
+                \\"graph_capture_unsafe_aborts":{d},
+                \\"graph_capture_input_mismatch_skips":{d},
+                \\"graph_capture_recaptures":{d},
+                \\"graph_capture_capacity_recaptures":{d},
                 \\
             ,
                 .{
@@ -2109,6 +2207,11 @@ fn writeJsonTiming(
                     cuda_stats.cuda_graph_capture_scalar_updates,
                     cuda_stats.cuda_graph_capture_persistent_replays,
                     cuda_stats.cuda_graph_capture_capacity_skips,
+                    cuda_stats.cuda_graph_capture_eligibility_skips,
+                    cuda_stats.cuda_graph_capture_unsafe_aborts,
+                    cuda_stats.cuda_graph_capture_input_mismatch_skips,
+                    cuda_stats.cuda_graph_capture_recaptures,
+                    cuda_stats.cuda_graph_capture_capacity_recaptures,
                 },
             );
             try appendFmt(
@@ -2150,6 +2253,8 @@ fn writeJsonTiming(
                 \\"rms_norm_add_output_scale_fallbacks":{d},
                 \\"gated_down_fused_q8":{d},
                 \\"gated_down_fused_q4":{d},
+                \\"gated_down_fused_iq4_xs":{d},
+                \\"gated_down_fused_bf16":{d},
                 \\"gated_down_fallbacks":{d},
                 \\"qkv_fused_q8":{d},
                 \\"qkv_fused_q4":{d},
@@ -2159,12 +2264,103 @@ fn writeJsonTiming(
                 \\"qkv_kernel_unavailable":{d},
                 \\"linear_pair_fused_q8":{d},
                 \\"linear_pair_fused_q4":{d},
+                \\"linear_pair_fused_iq3_s":{d},
+                \\"linear_pair_fused_bf16":{d},
                 \\"linear_pair_fallbacks":{d},
                 \\"lm_head_argmax_fused_q8":{d},
                 \\"lm_head_argmax_fused_q4":{d},
                 \\"lm_head_argmax_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.activation_multiply_fused,
+                    cuda_stats.add_mul_scalar_fused,
+                    cuda_stats.rms_norm_add_output_scale_fused,
+                    cuda_stats.rms_norm_add_output_scale_fallbacks,
+                    cuda_stats.gated_down_fused_q8,
+                    cuda_stats.gated_down_fused_q4,
+                    cuda_stats.gated_down_fused_iq4_xs,
+                    cuda_stats.gated_down_fused_bf16,
+                    cuda_stats.gated_down_fallbacks,
+                    cuda_stats.qkv_fused_q8,
+                    cuda_stats.qkv_fused_q4,
+                    cuda_stats.qkv_fused_q4_q4_f32,
+                    cuda_stats.qkv_fused_f32,
+                    cuda_stats.qkv_fallback_unsupported,
+                    cuda_stats.qkv_kernel_unavailable,
+                    cuda_stats.linear_pair_fused_q8,
+                    cuda_stats.linear_pair_fused_q4,
+                    cuda_stats.linear_pair_fused_iq3_s,
+                    cuda_stats.linear_pair_fused_bf16,
+                    cuda_stats.linear_pair_fallbacks,
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fallbacks,
+                    cuda_stats.q4k_decode_fast_hits,
+                    cuda_stats.q4k_decode_fast_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"qwen35_decode_core_fused":{d},
+                \\"qwen35_decode_core_fallbacks":{d},
+                \\"qwen35_decode_core_ab_fused":{d},
+                \\"qwen35_decode_core_ab_fallbacks":{d},
+                \\"qwen36_mlp_fused_attempts":{d},
+                \\"qwen36_mlp_fused_hits":{d},
+                \\"qwen36_mlp_fused_fallbacks":{d},
+                \\"qwen36_mlp_pre_rms_fused_hits":{d},
+                \\"qwen36_mlp_pre_rms_fused_fallbacks":{d},
+                \\"qwen36_mlp_v2_attempts":{d},
+                \\"qwen36_mlp_v2_hits":{d},
+                \\"qwen36_mlp_v2_fallbacks":{d},
+                \\"qwen36_mlp_v2_gate_up_us":{d},
+                \\"qwen36_mlp_v2_down_us":{d},
+                \\"qwen36_triton_mlp_attempts":{d},
+                \\"qwen36_triton_mlp_hits":{d},
+                \\"qwen36_triton_mlp_fallbacks":{d},
+                \\"qwen36_triton_kv_write_attempts":{d},
+                \\"qwen36_triton_kv_write_hits":{d},
+                \\"qwen36_triton_kv_write_fallbacks":{d},
+                \\"qwen36_triton_attention_attempts":{d},
+                \\"qwen36_triton_attention_hits":{d},
+                \\"qwen36_triton_attention_fallbacks":{d},
+                \\"qwen36_triton_attention_graph_bypasses":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.qwen35_decode_core_fused,
+                    cuda_stats.qwen35_decode_core_fallbacks,
+                    cuda_stats.qwen35_decode_core_ab_fused,
+                    cuda_stats.qwen35_decode_core_ab_fallbacks,
+                    cuda_stats.qwen36_mlp_fused_attempts,
+                    cuda_stats.qwen36_mlp_fused_hits,
+                    cuda_stats.qwen36_mlp_fused_fallbacks,
+                    cuda_stats.qwen36_mlp_pre_rms_fused_hits,
+                    cuda_stats.qwen36_mlp_pre_rms_fused_fallbacks,
+                    cuda_stats.qwen36_mlp_v2_attempts,
+                    cuda_stats.qwen36_mlp_v2_hits,
+                    cuda_stats.qwen36_mlp_v2_fallbacks,
+                    cuda_stats.qwen36_mlp_v2_gate_up_us,
+                    cuda_stats.qwen36_mlp_v2_down_us,
+                    cuda_stats.qwen36_triton_mlp_attempts,
+                    cuda_stats.qwen36_triton_mlp_hits,
+                    cuda_stats.qwen36_triton_mlp_fallbacks,
+                    cuda_stats.qwen36_triton_kv_write_attempts,
+                    cuda_stats.qwen36_triton_kv_write_hits,
+                    cuda_stats.qwen36_triton_kv_write_fallbacks,
+                    cuda_stats.qwen36_triton_attention_attempts,
+                    cuda_stats.qwen36_triton_attention_hits,
+                    cuda_stats.qwen36_triton_attention_fallbacks,
+                    cuda_stats.qwen36_triton_attention_graph_bypasses,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
@@ -2178,27 +2374,6 @@ fn writeJsonTiming(
                 \\
             ,
                 .{
-                    cuda_stats.activation_multiply_fused,
-                    cuda_stats.add_mul_scalar_fused,
-                    cuda_stats.rms_norm_add_output_scale_fused,
-                    cuda_stats.rms_norm_add_output_scale_fallbacks,
-                    cuda_stats.gated_down_fused_q8,
-                    cuda_stats.gated_down_fused_q4,
-                    cuda_stats.gated_down_fallbacks,
-                    cuda_stats.qkv_fused_q8,
-                    cuda_stats.qkv_fused_q4,
-                    cuda_stats.qkv_fused_q4_q4_f32,
-                    cuda_stats.qkv_fused_f32,
-                    cuda_stats.qkv_fallback_unsupported,
-                    cuda_stats.qkv_kernel_unavailable,
-                    cuda_stats.linear_pair_fused_q8,
-                    cuda_stats.linear_pair_fused_q4,
-                    cuda_stats.linear_pair_fallbacks,
-                    cuda_stats.lm_head_argmax_fused_q8,
-                    cuda_stats.lm_head_argmax_fused_q4,
-                    cuda_stats.lm_head_argmax_fallbacks,
-                    cuda_stats.q4k_decode_fast_hits,
-                    cuda_stats.q4k_decode_fast_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,
@@ -2462,6 +2637,11 @@ fn writeJsonTiming(
                 \\"graph_capture_scalar_updates":{d},
                 \\"graph_capture_persistent_replays":{d},
                 \\"graph_capture_capacity_skips":{d},
+                \\"graph_capture_eligibility_skips":{d},
+                \\"graph_capture_unsafe_aborts":{d},
+                \\"graph_capture_input_mismatch_skips":{d},
+                \\"graph_capture_recaptures":{d},
+                \\"graph_capture_capacity_recaptures":{d},
                 \\"launch_linear":{d},
                 \\"launch_linear_qkv":{d},
                 \\
@@ -2477,6 +2657,11 @@ fn writeJsonTiming(
                     cuda_stats.cuda_graph_capture_scalar_updates,
                     cuda_stats.cuda_graph_capture_persistent_replays,
                     cuda_stats.cuda_graph_capture_capacity_skips,
+                    cuda_stats.cuda_graph_capture_eligibility_skips,
+                    cuda_stats.cuda_graph_capture_unsafe_aborts,
+                    cuda_stats.cuda_graph_capture_input_mismatch_skips,
+                    cuda_stats.cuda_graph_capture_recaptures,
+                    cuda_stats.cuda_graph_capture_capacity_recaptures,
                     cuda_stats.launch_linear,
                     cuda_stats.launch_linear_qkv,
                 },
@@ -2561,6 +2746,11 @@ fn writeJsonTiming(
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
+                \\"linear_pair_fused_q8":{d},
+                \\"linear_pair_fused_q4":{d},
+                \\"linear_pair_fused_iq3_s":{d},
+                \\"linear_pair_fused_bf16":{d},
+                \\"linear_pair_fallbacks":{d},
                 \\"lm_head_argmax_fused_q8":{d},
                 \\"lm_head_argmax_fused_q4":{d},
                 \\"lm_head_argmax_fallbacks":{d},
@@ -2586,6 +2776,11 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                    cuda_stats.linear_pair_fused_q8,
+                    cuda_stats.linear_pair_fused_q4,
+                    cuda_stats.linear_pair_fused_iq3_s,
+                    cuda_stats.linear_pair_fused_bf16,
+                    cuda_stats.linear_pair_fallbacks,
                     cuda_stats.lm_head_argmax_fused_q8,
                     cuda_stats.lm_head_argmax_fused_q4,
                     cuda_stats.lm_head_argmax_fallbacks,
@@ -2598,6 +2793,62 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_generate_out,
+                \\"qwen35_decode_core_fused":{d},
+                \\"qwen35_decode_core_fallbacks":{d},
+                \\"qwen35_decode_core_ab_fused":{d},
+                \\"qwen35_decode_core_ab_fallbacks":{d},
+                \\"qwen36_mlp_fused_attempts":{d},
+                \\"qwen36_mlp_fused_hits":{d},
+                \\"qwen36_mlp_fused_fallbacks":{d},
+                \\"qwen36_mlp_pre_rms_fused_hits":{d},
+                \\"qwen36_mlp_pre_rms_fused_fallbacks":{d},
+                \\"qwen36_mlp_v2_attempts":{d},
+                \\"qwen36_mlp_v2_hits":{d},
+                \\"qwen36_mlp_v2_fallbacks":{d},
+                \\"qwen36_mlp_v2_gate_up_us":{d},
+                \\"qwen36_mlp_v2_down_us":{d},
+                \\"qwen36_triton_mlp_attempts":{d},
+                \\"qwen36_triton_mlp_hits":{d},
+                \\"qwen36_triton_mlp_fallbacks":{d},
+                \\"qwen36_triton_kv_write_attempts":{d},
+                \\"qwen36_triton_kv_write_hits":{d},
+                \\"qwen36_triton_kv_write_fallbacks":{d},
+                \\"qwen36_triton_attention_attempts":{d},
+                \\"qwen36_triton_attention_hits":{d},
+                \\"qwen36_triton_attention_fallbacks":{d},
+                \\"qwen36_triton_attention_graph_bypasses":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.qwen35_decode_core_fused,
+                    cuda_stats.qwen35_decode_core_fallbacks,
+                    cuda_stats.qwen35_decode_core_ab_fused,
+                    cuda_stats.qwen35_decode_core_ab_fallbacks,
+                    cuda_stats.qwen36_mlp_fused_attempts,
+                    cuda_stats.qwen36_mlp_fused_hits,
+                    cuda_stats.qwen36_mlp_fused_fallbacks,
+                    cuda_stats.qwen36_mlp_pre_rms_fused_hits,
+                    cuda_stats.qwen36_mlp_pre_rms_fused_fallbacks,
+                    cuda_stats.qwen36_mlp_v2_attempts,
+                    cuda_stats.qwen36_mlp_v2_hits,
+                    cuda_stats.qwen36_mlp_v2_fallbacks,
+                    cuda_stats.qwen36_mlp_v2_gate_up_us,
+                    cuda_stats.qwen36_mlp_v2_down_us,
+                    cuda_stats.qwen36_triton_mlp_attempts,
+                    cuda_stats.qwen36_triton_mlp_hits,
+                    cuda_stats.qwen36_triton_mlp_fallbacks,
+                    cuda_stats.qwen36_triton_kv_write_attempts,
+                    cuda_stats.qwen36_triton_kv_write_hits,
+                    cuda_stats.qwen36_triton_kv_write_fallbacks,
+                    cuda_stats.qwen36_triton_attention_attempts,
+                    cuda_stats.qwen36_triton_attention_hits,
+                    cuda_stats.qwen36_triton_attention_fallbacks,
+                    cuda_stats.qwen36_triton_attention_graph_bypasses,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
                 \\"activation_multiply_fused":{d},
                 \\"add_mul_scalar_fused":{d},
                 \\"rms_norm_add_fused":{d},
@@ -2605,6 +2856,8 @@ fn writeJsonTiming(
                 \\"rms_norm_add_output_scale_fallbacks":{d},
                 \\"gated_down_fused_q8":{d},
                 \\"gated_down_fused_q4":{d},
+                \\"gated_down_fused_iq4_xs":{d},
+                \\"gated_down_fused_bf16":{d},
                 \\"gated_down_fallbacks":{d},
                 \\"deferred_free_queued":{d},
                 \\"deferred_free_drains":{d},
@@ -2620,6 +2873,8 @@ fn writeJsonTiming(
                     cuda_stats.rms_norm_add_output_scale_fallbacks,
                     cuda_stats.gated_down_fused_q8,
                     cuda_stats.gated_down_fused_q4,
+                    cuda_stats.gated_down_fused_iq4_xs,
+                    cuda_stats.gated_down_fused_bf16,
                     cuda_stats.gated_down_fallbacks,
                     cuda_stats.deferred_free_queued,
                     cuda_stats.deferred_free_drains,
@@ -4491,7 +4746,8 @@ fn graphModeEnabled() bool {
 }
 
 fn nativeGenerateSchedulerEnabled() bool {
-    return !getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER");
+    if (getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER")) return false;
+    return getenvBool("ANTFLY_INFERENCE_CONTINUOUS_BATCHING");
 }
 
 fn effectiveGenerationKvDType(

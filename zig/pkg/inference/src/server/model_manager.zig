@@ -994,6 +994,23 @@ pub const LoadedModel = struct {
     }
 };
 
+fn nativeGenerateCoordinatorPolicyFromEnv() runtime.scheduler.native_generate.Policy {
+    var policy = runtime.scheduler.native_generate.Policy{};
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CONTINUOUS_BATCHING_MAX_DECODE_BATCH")) |value| {
+        policy.max_step_items = @max(value, 1);
+    }
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CONTINUOUS_BATCHING_MAX_QUERY_TOKENS")) |value| {
+        policy.max_step_query_tokens = @max(value, 1);
+    }
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CONTINUOUS_BATCHING_MAX_ACTIVE_SEQUENCES")) |value| {
+        policy.max_active_units = if (value == 0) null else value;
+    }
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CONTINUOUS_BATCHING_MAX_QUEUED_REQUESTS")) |value| {
+        policy.max_waiting_requests = if (value == 0) null else value;
+    }
+    return policy;
+}
+
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
         (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
@@ -1153,7 +1170,7 @@ pub const ModelManager = struct {
         };
         const native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = if (session_factory.getGptConfig(session)) |_| blk: {
             const coordinator = try self.allocator.create(runtime.scheduler.native_generate.NativeGenerateCoordinator);
-            coordinator.* = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(self.allocator);
+            coordinator.* = runtime.scheduler.native_generate.NativeGenerateCoordinator.initWithPolicy(self.allocator, nativeGenerateCoordinatorPolicyFromEnv());
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);

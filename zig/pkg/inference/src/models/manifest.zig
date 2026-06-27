@@ -70,6 +70,28 @@ const gemma4_chat_template =
     "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
     "{%- endif -%}";
 
+/// Built-in ChatML template for Qwen 3.5/3.6 GGUFs whose upstream template
+/// uses Jinja features outside the local renderer subset.
+const qwen35_chat_template =
+    "{%- for message in messages -%}" ++
+    "{{ '<|im_start|>' + message['role'] + '\\n' }}" ++
+    "{%- if message['content'] is string -%}" ++
+    "{{ message['content'] }}" ++
+    "{%- elif message['content'] is iterable -%}" ++
+    "{%- for item in message['content'] -%}" ++
+    "{%- if item['type'] == 'text' -%}" ++
+    "{{ item['text'] }}" ++
+    "{%- elif item['type'] == 'image' -%}" ++
+    "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}" ++
+    "{%- endif -%}" ++
+    "{%- endfor -%}" ++
+    "{%- endif -%}" ++
+    "{{ '<|im_end|>\\n' }}" ++
+    "{%- endfor -%}" ++
+    "{%- if add_generation_prompt -%}" ++
+    "{{ '<|im_start|>assistant\\n' }}" ++
+    "{%- endif -%}";
+
 pub const ModelType = enum {
     embedder,
     reranker,
@@ -806,7 +828,12 @@ fn applyGgufTokenizerMetadata(
     if (view.getString("tokenizer.chat_template")) |value| {
         if (std.mem.trim(u8, value, &.{ ' ', '\t', '\n', '\r' }).len > 0) {
             const selected = if (gguf_model_name) |model_name|
-                if (shouldUseBuiltInGemma4GgufChatTemplate(model_name, value)) gemma4_chat_template else value
+                if (shouldUseBuiltInGemma4GgufChatTemplate(model_name, value))
+                    gemma4_chat_template
+                else if (shouldUseBuiltInQwen35GgufChatTemplate(model_name, value))
+                    qwen35_chat_template
+                else
+                    value
             else
                 value;
             if (manifest.chat_template) |old| allocator.free(old);
@@ -829,6 +856,24 @@ fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
 
 fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
     return std.mem.eql(u8, model_name, "gemma4") and gemma4ChatTemplateRequiresBuiltInFallback(chat_template);
+}
+
+fn qwen35ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
+    return std.mem.indexOf(u8, chat_template, "enable_thinking") != null or
+        std.mem.indexOf(u8, chat_template, "tools is defined") != null or
+        std.mem.indexOf(u8, chat_template, "namespace(") != null or
+        std.mem.indexOf(u8, chat_template, "raise_exception") != null or
+        std.mem.indexOf(u8, chat_template, "{% generation %}") != null or
+        std.mem.indexOf(u8, chat_template, "{%- generation -%}") != null;
+}
+
+fn shouldUseBuiltInQwen35GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
+    const qwen_model = std.mem.eql(u8, model_name, "qwen35") or
+        std.mem.eql(u8, model_name, "qwen3_5") or
+        std.mem.eql(u8, model_name, "qwen3_6") or
+        std.mem.startsWith(u8, model_name, "qwen");
+    const qwen_chatml_template = std.mem.indexOf(u8, chat_template, "<|im_start|>") != null;
+    return (qwen_model or qwen_chatml_template) and qwen35ChatTemplateRequiresBuiltInFallback(chat_template);
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -2836,6 +2881,26 @@ test "gemma4 gguf tool chat template uses built-in fallback" {
     try std.testing.expect(shouldUseBuiltInGemma4GgufChatTemplate("gemma4", gguf_tool_template));
     try std.testing.expect(!shouldUseBuiltInGemma4GgufChatTemplate("llama", gguf_tool_template));
     try std.testing.expect(!shouldUseBuiltInGemma4GgufChatTemplate("gemma4", "{{ bos_token }}{{ messages[0]['content'] }}"));
+}
+
+test "qwen35 gguf tool chat template uses built-in fallback" {
+    const qwen_tool_template =
+        "{{ '<|im_start|>system\\n' }}" ++
+        "{%- if tools is defined -%}" ++
+        "{{ raise_exception('tool calls are not supported here') }}" ++
+        "{%- endif -%}" ++
+        "{%- if enable_thinking is defined -%}{{ '<think>' }}{%- endif -%}";
+    const generic_tool_template =
+        "{%- if tools is defined -%}" ++
+        "{{ raise_exception('tool calls are not supported here') }}" ++
+        "{%- endif -%}" ++
+        "{%- if enable_thinking is defined -%}{{ '<think>' }}{%- endif -%}";
+
+    try std.testing.expect(shouldUseBuiltInQwen35GgufChatTemplate("qwen3_6", qwen_tool_template));
+    try std.testing.expect(shouldUseBuiltInQwen35GgufChatTemplate("qwen3_5", qwen_tool_template));
+    try std.testing.expect(shouldUseBuiltInQwen35GgufChatTemplate("custom", qwen_tool_template));
+    try std.testing.expect(!shouldUseBuiltInQwen35GgufChatTemplate("llama", generic_tool_template));
+    try std.testing.expect(!shouldUseBuiltInQwen35GgufChatTemplate("qwen3_6", "{{ '<|im_start|>user\\n' }}"));
 }
 
 test "manifest detects layoutlmv3 as classifier-native bundle" {

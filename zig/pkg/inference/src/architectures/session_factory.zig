@@ -72,6 +72,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gliner2,
     florence2,
     gemma4,
+    qwen35,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
@@ -959,6 +960,13 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    var mf = try manifest_mod.loadFromDir(allocator, model_path);
+    defer mf.deinit();
+    const arch_config = try detectArchitecture(allocator, model_path, mf);
+    if (mf.gguf_path != null and cudaSupportsArch(arch_config)) {
+        return createCudaLazyGgufSessionWithTaskOverride(allocator, model_path, override, mf, arch_config, debug_cuda_session);
+    }
+
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
     errdefer cuda_compute.deinit();
@@ -992,10 +1000,220 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .arch_config = native_impl.arch_config,
         .task = native_impl.task,
         .backend_type = .cuda,
-        .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
+        .backend_data = .{ .cuda = .{
+            .compute = cuda_compute,
+            .host_store = emptyCudaHostStore(allocator),
+        } },
     };
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+fn createCudaLazyGgufSessionWithTaskOverride(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    mf: manifest_mod.ModelManifest,
+    detected_arch_config: ArchConfig,
+    debug_cuda_session: bool,
+) !Session {
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+
+    if (debug_cuda_session) std.log.info("cuda-session: init lazy cuda compute start path={s}", .{model_path});
+    var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
+    var cuda_compute_owned = true;
+    errdefer if (cuda_compute_owned) cuda_compute.deinit();
+    if (debug_cuda_session) std.log.info("cuda-session: init lazy cuda compute done path={s}", .{model_path});
+
+    var arch_config = detected_arch_config;
+    var store = try tensor_store_mod.openFromManifest(allocator, mf);
+    var store_owned = true;
+    errdefer if (store_owned) store.deinit();
+    if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
+        defer {
+            var r = report;
+            r.deinit();
+        }
+        try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
+    }
+    const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
+    const all_names = try source.listNames(allocator);
+    defer allocator.free(all_names);
+    try maybeInferGptAttentionLayoutFromStore(allocator, store, all_names, &arch_config);
+
+    const cuda_profile = cudaProfileForArch(arch_config) orelse return error.UnsupportedCudaArchitecture;
+    if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
+    try cuda_compute.requireProfile(cuda_profile);
+
+    const direct_quant_enabled = directQuantEnabled();
+    const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
+    const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
+    const budget_policy = gpuHostedBudgetPolicy(.cuda, model_weight_bytes, mf, arch_config, quant_mode);
+    const plan_context = budget_policy.plan_context;
+
+    const actual_prefix = detectActualWeightPrefix(allocator, arch_config, all_names, false);
+    var lazy_weights = std.StringHashMapUnmanaged(LazyWeightEntry){};
+    var lazy_weights_owned = true;
+    errdefer if (lazy_weights_owned) deinitNativeLazyWeights(allocator, &lazy_weights);
+
+    for (all_names) |full_name| {
+        if (try appendPackedMoeLazyWeights(allocator, &lazy_weights, store, arch_config, full_name, plan_context)) {
+            continue;
+        }
+        const base_key = if (actual_prefix.len > 0 and std.mem.startsWith(u8, full_name, actual_prefix) and full_name.len > actual_prefix.len and full_name[actual_prefix.len] == '.')
+            full_name[actual_prefix.len + 1 ..]
+        else
+            full_name;
+        var key_buf: [256]u8 = undefined;
+        const key = try normalizeWeightKey(store.kind(), arch_config, base_key, &key_buf);
+        if (lazy_weights.contains(key)) continue;
+        const expert_coord = parseMoeExpertCoord(key);
+        const tensor_ref = try store.describeTensor(allocator, full_name);
+        try lazy_weights.put(allocator, try allocator.dupe(u8, key), .{
+            .tensor_ref = tensor_ref,
+            .expert_coord = expert_coord,
+            .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
+            .placement = runtime.tier.planner.planForContext(plan_context, key, tensor_ref.byte_len),
+        });
+    }
+    if (debug_cuda_session) std.log.info("cuda-session: registered lazy weights count={d}", .{lazy_weights.count()});
+
+    const moe_num_experts = switch (arch_config) {
+        .gpt => |cfg| cfg.num_local_experts,
+        else => 0,
+    };
+    const residency = if (lazy_weights.count() > 0 and moe_num_experts > 0)
+        runtime.moe.residency.SharedResidency.init(allocator, defaultResidentExpertsPerLayer(arch_config))
+    else
+        null;
+    var residency_owned = true;
+    errdefer if (residency_owned) {
+        if (residency) |value| {
+            var v = value;
+            v.deinit();
+        }
+    };
+
+    const tier_cache = if (lazy_weights.count() > 0) blk: {
+        var budget = runtime.tier.cache.defaultBudgetForBackend(.gpu);
+        budget.host_limit_bytes = @max(budget.host_limit_bytes, budget_policy.shared_cache_floor.host_limit_bytes);
+        budget.backend_limit_bytes = @max(budget.backend_limit_bytes, budget_policy.shared_cache_floor.backend_limit_bytes);
+        break :blk runtime.tier.cache.SharedCache.init(budget);
+    } else null;
+
+    const impl = try allocator.create(ArchSession);
+    var impl_raw_owned = true;
+    errdefer if (impl_raw_owned) allocator.destroy(impl);
+    impl.* = .{
+        .allocator = allocator,
+        .arch_config = arch_config,
+        .task = sessionTaskForModelType(mf.model_type, override),
+        .backend_type = .cuda,
+        .budget_floor = budget_policy.budget_floor,
+        .shared_cache_budget_floor = budget_policy.shared_cache_floor,
+        .backend_data = .{ .cuda = .{
+            .compute = cuda_compute,
+            .host_store = .{
+                .allocator = allocator,
+                .resident_weights = .{},
+                .lazy_weights = lazy_weights,
+                .tensor_store = store,
+                .moe_num_experts = @intCast(moe_num_experts),
+                .residency = residency,
+                .tier_cache = tier_cache,
+                .allow_direct_quant = direct_quant_enabled,
+                .prepare_direct_quant_storage = false,
+            },
+        } },
+    };
+    cuda_compute_owned = false;
+    store_owned = false;
+    lazy_weights_owned = false;
+    residency_owned = false;
+    impl_raw_owned = false;
+    errdefer archClose(impl);
+    try impl.backend_data.cuda.compute.attachLazyHostStore(&impl.backend_data.cuda.host_store);
+    if (debug_cuda_session) std.log.info("cuda-session: return lazy session path={s}", .{model_path});
+    return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+fn detectActualWeightPrefix(
+    allocator: std.mem.Allocator,
+    arch_config: ArchConfig,
+    names: [][]const u8,
+    is_gliner: bool,
+) []const u8 {
+    _ = allocator;
+    const prefix: []const u8 = switch (arch_config) {
+        .bert => |cfg| cfg.effectivePrefix(),
+        .deberta => "deberta",
+        .t5, .gpt, .whisper, .florence, .clip, .clap => "",
+        .gliner => "encoder",
+        .layoutlmv3 => |cfg| cfg.effectivePrefix(),
+    };
+    if (is_gliner) return prefix;
+    switch (arch_config) {
+        .gpt => |cfg| if (cfg.weight_prefix.len != 0) return "",
+        else => {},
+    }
+    var detected_prefix = prefix;
+    for (names) |name| {
+        if (std.mem.startsWith(u8, name, "bert.")) {
+            detected_prefix = "bert";
+            break;
+        } else if (std.mem.startsWith(u8, name, "deberta.")) {
+            detected_prefix = "deberta";
+            break;
+        } else if (std.mem.startsWith(u8, name, "roberta.")) {
+            detected_prefix = "roberta";
+            break;
+        } else if (std.mem.startsWith(u8, name, "distilbert.")) {
+            detected_prefix = "distilbert";
+            break;
+        } else if (std.mem.startsWith(u8, name, "layoutlmv3.")) {
+            detected_prefix = "layoutlmv3";
+            break;
+        } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "model.language_model.")) {
+            detected_prefix = "model.language_model";
+            break;
+        } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "language_model.")) {
+            detected_prefix = "language_model";
+            break;
+        }
+    }
+    return detected_prefix;
+}
+
+fn emptyCudaHostStore(allocator: std.mem.Allocator) NativeData {
+    return .{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+}
+
+fn deinitNativeLazyWeights(allocator: std.mem.Allocator, lazy_weights: *std.StringHashMapUnmanaged(LazyWeightEntry)) void {
+    var lazy_it = lazy_weights.iterator();
+    while (lazy_it.next()) |entry| {
+        if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+        entry.value_ptr.tensor_ref.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    lazy_weights.deinit(allocator);
+}
+
+fn deinitCudaHostStore(allocator: std.mem.Allocator, store: *NativeData) void {
+    var resident_it = store.resident_weights.iterator();
+    while (resident_it.next()) |entry| {
+        var weight = entry.value_ptr.*;
+        weight.deinit();
+        allocator.free(entry.key_ptr.*);
+    }
+    store.resident_weights.deinit(allocator);
+    deinitNativeLazyWeights(allocator, &store.lazy_weights);
+    native_mod.deinitPrefetchQueue(store);
+    if (store.residency) |*residency| residency.deinit();
+    if (store.tensor_store) |tensor_store| tensor_store.deinit();
 }
 
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
@@ -1008,7 +1226,11 @@ fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
-        .gpt => |cfg| if (cfg.family == .gemma) .gemma4 else null,
+        .gpt => |cfg| switch (cfg.family) {
+            .gemma => .gemma4,
+            .qwen3_5 => .qwen35,
+            else => null,
+        },
         else => null,
     };
 }
@@ -1027,6 +1249,7 @@ test "cuda support gate admits only supported encoder architectures" {
         try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.qwen35, cudaProfileForArch(.{ .gpt = .{ .family = .qwen3_5 } }).?);
     }
 }
 fn eagerLoadResidentsFromStore(
@@ -1882,7 +2105,7 @@ fn shouldRecordUnmappedGgufTensor(arch_config: ArchConfig, raw_name: []const u8,
     if (!std.mem.eql(u8, raw_name, normalized_name)) return false;
     return switch (arch_config) {
         .gpt => |cfg| switch (cfg.family) {
-            .llama, .mistral, .qwen2, .gemma, .bitnet, .phi, .deepseek_v4 => std.mem.startsWith(u8, raw_name, "blk."),
+            .llama, .mistral, .qwen2, .qwen3_5, .gemma, .bitnet, .phi, .deepseek_v4 => std.mem.startsWith(u8, raw_name, "blk."),
             else => false,
         },
         else => false,
@@ -1974,23 +2197,39 @@ fn collectMissingRequiredGptWeights(
         if (config.family == .phi or config.family == .gptj or config.family == .gpt_neox) {
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.input_layernorm.bias", .{layer});
         }
-        try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
-        if (config.family == .qwen2 or config.family == .phi) {
-            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.bias", .{layer});
-        }
-        if (!config.layerSharesKv(layer)) {
-            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+        if (config.layerUsesQwen35LinearAttention(layer)) {
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.in_proj_qkv.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.in_proj_z.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.conv1d.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.A_log", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.dt_bias", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.norm.weight", .{layer});
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer});
+        } else {
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
             if (config.family == .qwen2 or config.family == .phi) {
-                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.bias", .{layer});
+                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_proj.bias", .{layer});
             }
-            if (!config.layerOmitsVProj(layer)) {
-                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+            if (!config.layerSharesKv(layer)) {
+                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
                 if (config.family == .qwen2 or config.family == .phi) {
-                    try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.v_proj.bias", .{layer});
+                    try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_proj.bias", .{layer});
+                }
+                if (!config.layerOmitsVProj(layer)) {
+                    try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+                    if (config.family == .qwen2 or config.family == .phi) {
+                        try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.v_proj.bias", .{layer});
+                    }
                 }
             }
+            try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
+            if (config.family == .qwen3_5) {
+                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer});
+                try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+            }
         }
-        try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
         try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.post_attention_layernorm.weight", .{layer});
         if (config.family == .phi or config.family == .gptj or config.family == .gpt_neox) {
             try appendMissingFmt(allocator, names, missing, &buf, "model.layers.{d}.post_attention_layernorm.bias", .{layer});
@@ -2120,6 +2359,8 @@ fn tensorTypeSupported(tensor_type: gguf_mod.tensor_types.TensorType) bool {
             .I2_S,
             .I8_S,
             .TL1,
+            .IQ3_XXS,
+            .IQ3_S,
             .IQ4_NL,
             .IQ4_XS,
             => true,
@@ -2271,7 +2512,7 @@ fn leadingTensorDim(
 
 fn normalizeGgufGptWeightKey(config: gpt_mod.Config, key: []const u8, buf: *[256]u8) ?[]const u8 {
     switch (config.family) {
-        .llama, .mistral, .qwen2, .gemma, .bitnet, .phi, .deepseek_v4 => {},
+        .llama, .mistral, .qwen2, .qwen3_5, .gemma, .bitnet, .phi, .deepseek_v4 => {},
         else => return null,
     }
 
@@ -2305,6 +2546,36 @@ fn normalizeGgufGptWeightKey(config: gpt_mod.Config, key: []const u8, buf: *[256
 
     if (config.family == .deepseek_v4) {
         return deepseek_v4_arch.normalizeGgufWeightKey(layer, suffix, buf);
+    }
+
+    if (config.family == .qwen3_5) {
+        if (std.mem.eql(u8, suffix, "attn_qkv.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.in_proj_qkv.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "attn_gate.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.in_proj_z.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_beta.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_alpha.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_conv1d.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.conv1d.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_a")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.A_log", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_dt.bias")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.dt_bias", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_norm.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.norm.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "ssm_out.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch null;
+        }
     }
 
     if (std.mem.eql(u8, suffix, "attn_norm.weight")) {
@@ -2774,6 +3045,8 @@ fn isCudaResidentEmbeddingQuantType(tensor_type: gguf_mod.tensor_types.TensorTyp
     return std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_K }) or
+        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q5_K }) or
+        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .IQ3_XXS }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q6_K });
 }
 
@@ -4045,14 +4318,15 @@ const PjrtData = struct {
         if (build_options.enable_pjrt) null else {},
 };
 
-const CudaData = struct {
-    compute: if (build_options.enable_cuda) cuda_compute_mod.CudaCompute else void,
-};
+const CudaData = if (build_options.enable_cuda) struct {
+    compute: cuda_compute_mod.CudaCompute,
+    host_store: NativeData,
+} else void;
 
 const BackendData = union {
     native: NativeData,
     metal: if (build_options.enable_metal) GpuHostedData else void,
-    cuda: if (build_options.enable_cuda) CudaData else void,
+    cuda: CudaData,
     pjrt: PjrtData,
 };
 
@@ -4168,7 +4442,14 @@ fn makeComputeBackend(
                     .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
                 });
             },
-            .cuda => {},
+            .cuda => if (comptime build_options.enable_cuda) {
+                if (self.backend_data.cuda.host_store.tier_cache) |*tier_cache| {
+                    tier_cache.widenToAtLeast(.{
+                        .host_limit_bytes = @max(budget.limits.host_limit_bytes, self.shared_cache_budget_floor.host_limit_bytes),
+                        .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
+                    });
+                }
+            },
             .onnx => {},
             .wasm => {},
         }
@@ -4195,10 +4476,10 @@ fn makeComputeBackend(
                 NativeCompute.init(allocator, &self.backend_data.pjrt.native, run_budget);
             break :blk compute.computeBackend();
         },
-        .cuda => if (comptime build_options.enable_cuda)
-            self.backend_data.cuda.compute.computeBackend()
-        else
-            return error.CudaNotEnabled,
+        .cuda => if (comptime build_options.enable_cuda) blk: {
+            self.backend_data.cuda.compute.configureRunBudget(run_budget);
+            break :blk self.backend_data.cuda.compute.computeBackend();
+        } else return error.CudaNotEnabled,
         .onnx => return error.OnnxNotSupportedHere,
         .wasm => return error.WasmNotSupportedHere,
     };
@@ -4251,7 +4532,7 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
 pub fn recommendedKvDTypeForGptConfig(config: gpt_mod.Config, backend_kind: runtime.kv.pool.BackendKind) runtime.kv.pool.KvDType {
     return switch (backend_kind) {
         .native => .f32,
-        .cuda => if (config.family == .gemma) .f32 else .f16,
+        .cuda => if (config.family == .gemma or config.family == .qwen3_5) .f32 else .f16,
         .metal => if (config.family == .gemma) metalGemmaKvDTypeOverride() orelse .f16 else .f16,
     };
 }
@@ -4273,8 +4554,10 @@ test "parseMetalGemmaKvDTypeOverride only accepts staged Gemma Metal dtypes" {
 test "recommendedKvDTypeForGptConfig keeps backend defaults without a session" {
     const gemma = gpt_mod.Config{ .family = .gemma };
     const llama = gpt_mod.Config{ .family = .llama };
+    const qwen35 = gpt_mod.Config{ .family = .qwen3_5 };
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .native));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(gemma, .cuda));
+    try std.testing.expectEqual(runtime.kv.pool.KvDType.f32, recommendedKvDTypeForGptConfig(qwen35, .cuda));
     try std.testing.expectEqual(runtime.kv.pool.KvDType.f16, recommendedKvDTypeForGptConfig(llama, .metal));
 }
 
@@ -5536,6 +5819,7 @@ fn archClose(ptr: *anyopaque) void {
         .cuda => {
             if (comptime build_options.enable_cuda) {
                 self.backend_data.cuda.compute.deinit();
+                deinitCudaHostStore(self.allocator, &self.backend_data.cuda.host_store);
             }
         },
         .onnx => {},
@@ -5618,6 +5902,34 @@ test "gemma gguf norm aliases stay distinct" {
     try std.testing.expectEqualStrings("model.layers.0.pre_feedforward_layernorm.weight", ffn);
     try std.testing.expectEqualStrings("model.layers.0.post_attention_layernorm.weight", post_attn);
     try std.testing.expectEqualStrings("model.layers.0.post_feedforward_layernorm.weight", post_ffn);
+}
+
+test "qwen35 gguf linear attention tensors map to architecture weights" {
+    const cfg: gpt_mod.Config = .{ .family = .qwen3_5 };
+
+    var buf0: [256]u8 = undefined;
+    var buf1: [256]u8 = undefined;
+    var buf2: [256]u8 = undefined;
+    var buf3: [256]u8 = undefined;
+    var buf4: [256]u8 = undefined;
+    var buf5: [256]u8 = undefined;
+    var buf6: [256]u8 = undefined;
+    var buf7: [256]u8 = undefined;
+    var buf8: [256]u8 = undefined;
+    var buf9: [256]u8 = undefined;
+    var buf10: [256]u8 = undefined;
+
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.in_proj_qkv.weight", normalizeGgufGptWeightKey(cfg, "blk.0.attn_qkv.weight", &buf0).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.in_proj_z.weight", normalizeGgufGptWeightKey(cfg, "blk.0.attn_gate.weight", &buf1).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.in_proj_b.weight", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_beta.weight", &buf2).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.in_proj_a.weight", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_alpha.weight", &buf3).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.conv1d.weight", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_conv1d.weight", &buf4).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.A_log", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_a", &buf5).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.dt_bias", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_dt.bias", &buf6).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.norm.weight", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_norm.weight", &buf7).?);
+    try std.testing.expectEqualStrings("model.layers.0.linear_attn.out_proj.weight", normalizeGgufGptWeightKey(cfg, "blk.0.ssm_out.weight", &buf8).?);
+    try std.testing.expectEqualStrings("model.layers.3.self_attn.q_proj.weight", normalizeGgufGptWeightKey(cfg, "blk.3.attn_q.weight", &buf9).?);
+    try std.testing.expectEqualStrings("model.layers.3.self_attn.q_norm.weight", normalizeGgufGptWeightKey(cfg, "blk.3.attn_q_norm.weight", &buf10).?);
 }
 
 test "overlay gpt structural config keeps gguf gemma norm offset" {
@@ -5855,6 +6167,93 @@ test "gemma4 shared kv tail does not require per-layer k/v tensors" {
     try std.testing.expectEqual(@as(usize, 0), missing.items.len);
 }
 
+test "qwen35 hybrid required tensors accept linear and full attention layers" {
+    const allocator = std.testing.allocator;
+    var names = std.StringHashMapUnmanaged(void){};
+    defer {
+        var it = names.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        names.deinit(allocator);
+    }
+
+    const present = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.layers.0.linear_attn.in_proj_z.weight",
+        "model.layers.0.linear_attn.in_proj_b.weight",
+        "model.layers.0.linear_attn.in_proj_a.weight",
+        "model.layers.0.linear_attn.conv1d.weight",
+        "model.layers.0.linear_attn.A_log",
+        "model.layers.0.linear_attn.dt_bias",
+        "model.layers.0.linear_attn.norm.weight",
+        "model.layers.0.linear_attn.out_proj.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.1.input_layernorm.weight",
+        "model.layers.1.linear_attn.in_proj_qkv.weight",
+        "model.layers.1.linear_attn.in_proj_z.weight",
+        "model.layers.1.linear_attn.in_proj_b.weight",
+        "model.layers.1.linear_attn.in_proj_a.weight",
+        "model.layers.1.linear_attn.conv1d.weight",
+        "model.layers.1.linear_attn.A_log",
+        "model.layers.1.linear_attn.dt_bias",
+        "model.layers.1.linear_attn.norm.weight",
+        "model.layers.1.linear_attn.out_proj.weight",
+        "model.layers.1.post_attention_layernorm.weight",
+        "model.layers.1.mlp.gate_proj.weight",
+        "model.layers.1.mlp.up_proj.weight",
+        "model.layers.1.mlp.down_proj.weight",
+        "model.layers.2.input_layernorm.weight",
+        "model.layers.2.linear_attn.in_proj_qkv.weight",
+        "model.layers.2.linear_attn.in_proj_z.weight",
+        "model.layers.2.linear_attn.in_proj_b.weight",
+        "model.layers.2.linear_attn.in_proj_a.weight",
+        "model.layers.2.linear_attn.conv1d.weight",
+        "model.layers.2.linear_attn.A_log",
+        "model.layers.2.linear_attn.dt_bias",
+        "model.layers.2.linear_attn.norm.weight",
+        "model.layers.2.linear_attn.out_proj.weight",
+        "model.layers.2.post_attention_layernorm.weight",
+        "model.layers.2.mlp.gate_proj.weight",
+        "model.layers.2.mlp.up_proj.weight",
+        "model.layers.2.mlp.down_proj.weight",
+        "model.layers.3.input_layernorm.weight",
+        "model.layers.3.self_attn.q_proj.weight",
+        "model.layers.3.self_attn.k_proj.weight",
+        "model.layers.3.self_attn.v_proj.weight",
+        "model.layers.3.self_attn.o_proj.weight",
+        "model.layers.3.self_attn.q_norm.weight",
+        "model.layers.3.self_attn.k_norm.weight",
+        "model.layers.3.post_attention_layernorm.weight",
+        "model.layers.3.mlp.gate_proj.weight",
+        "model.layers.3.mlp.up_proj.weight",
+        "model.layers.3.mlp.down_proj.weight",
+    };
+    for (present) |name| {
+        try names.put(allocator, try allocator.dupe(u8, name), {});
+    }
+
+    var missing = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (missing.items) |name| allocator.free(name);
+        missing.deinit(allocator);
+    }
+
+    try collectMissingRequiredGptWeights(allocator, .{
+        .family = .qwen3_5,
+        .num_hidden_layers = 4,
+        .position_encoding = .rope,
+        .qwen35_has_linear_attention = true,
+        .qwen35_full_attention_interval = 4,
+    }, &names, &missing, false);
+
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+}
+
 test "deepseek v4 required tensors use canonical hf names" {
     const allocator = std.testing.allocator;
     var names = std.StringHashMapUnmanaged(void){};
@@ -6085,8 +6484,10 @@ test "bitnet gguf tensor names map to architecture weights" {
     try std.testing.expectEqualStrings("model.layers.0.mlp.down_proj.weight", down_proj);
 }
 
-test "bitnet i2_s tensor type is supported for gguf inspection" {
+test "quant tensor types used by bitnet and qwen35 are supported for gguf inspection" {
     try std.testing.expect(tensorTypeSupported(.{ .known = .I2_S }));
+    try std.testing.expect(tensorTypeSupported(.{ .known = .IQ3_XXS }));
+    try std.testing.expect(tensorTypeSupported(.{ .known = .IQ3_S }));
 }
 
 test "gemma4 gguf shared expert weight names map correctly" {
@@ -6177,6 +6578,8 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
     try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q8_0 }));
     try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q4_0 }));
     try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q4_K }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q5_K }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .IQ3_XXS }));
     try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q6_K }));
 
     const llama_cfg: gpt_mod.Config = .{ .family = .llama };

@@ -209,6 +209,10 @@ pub const Config = struct {
     qwen35_linear_value_head_dim: u32 = 0,
     qwen35_linear_num_key_heads: u32 = 0,
     qwen35_linear_num_value_heads: u32 = 0,
+    qwen35_ssm_state_size: u32 = 0,
+    qwen35_ssm_group_count: u32 = 0,
+    qwen35_ssm_time_step_rank: u32 = 0,
+    qwen35_ssm_inner_size: u32 = 0,
     qwen35_attn_output_gate: bool = false,
     qwen35_mrope_interleaved: bool = false,
     qwen35_mrope_section: [3]u32 = .{ 0, 0, 0 },
@@ -1182,6 +1186,9 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     {
         config.rope_partial_factor = 0.25;
     }
+    if (config.family == .qwen3_5) {
+        applyQwen35GgufMetadata(view, &key_buf, arch, &config);
+    }
 
     // Gemma 4: Per-Layer Embeddings (PLE).
     if (metaU32(view, &key_buf, arch, "embedding_length_per_layer_input")) |value| config.ple_hidden_size = value;
@@ -1213,6 +1220,53 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     applyGgufTokenizerStopMetadata(view, &config);
 
     return config;
+}
+
+fn applyQwen35GgufMetadata(view: gguf_metadata.View, key_buf: *[96]u8, arch: []const u8, config: *Config) void {
+    var saw_ssm = false;
+    if (metaU32(view, key_buf, arch, "full_attention_interval")) |value| {
+        config.qwen35_full_attention_interval = value;
+        if (value > 0) config.qwen35_has_linear_attention = true;
+    }
+    if (metaU32(view, key_buf, arch, "ssm.conv_kernel")) |value| {
+        config.qwen35_linear_conv_kernel_dim = value;
+        saw_ssm = true;
+    }
+    if (metaU32(view, key_buf, arch, "ssm.state_size")) |value| {
+        config.qwen35_ssm_state_size = value;
+        if (config.qwen35_linear_key_head_dim == 0) config.qwen35_linear_key_head_dim = value;
+        if (config.qwen35_linear_value_head_dim == 0) config.qwen35_linear_value_head_dim = value;
+        saw_ssm = true;
+    }
+    if (metaU32(view, key_buf, arch, "ssm.group_count")) |value| {
+        config.qwen35_ssm_group_count = value;
+        if (config.qwen35_linear_num_key_heads == 0) config.qwen35_linear_num_key_heads = value;
+        saw_ssm = true;
+    }
+    if (metaU32(view, key_buf, arch, "ssm.time_step_rank")) |value| {
+        config.qwen35_ssm_time_step_rank = value;
+        if (config.qwen35_linear_num_value_heads == 0) config.qwen35_linear_num_value_heads = value;
+        saw_ssm = true;
+    }
+    if (metaU32(view, key_buf, arch, "ssm.inner_size")) |value| {
+        config.qwen35_ssm_inner_size = value;
+        if (config.qwen35_linear_value_head_dim > 0 and value % config.qwen35_linear_value_head_dim == 0) {
+            config.qwen35_linear_num_value_heads = value / config.qwen35_linear_value_head_dim;
+        }
+        saw_ssm = true;
+    }
+    if (saw_ssm) {
+        config.qwen35_has_linear_attention = true;
+        config.qwen35_attn_output_gate = true;
+    }
+
+    const section_0 = metaI32FromArrayAt(view, key_buf, arch, "rope.dimension_sections", 0);
+    const section_1 = metaI32FromArrayAt(view, key_buf, arch, "rope.dimension_sections", 1);
+    const section_2 = metaI32FromArrayAt(view, key_buf, arch, "rope.dimension_sections", 2);
+    if (section_0 != null and section_1 != null and section_2 != null) {
+        config.qwen35_mrope_interleaved = true;
+        config.qwen35_mrope_section = .{ section_0.?, section_1.?, section_2.? };
+    }
 }
 
 fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) void {
@@ -1344,8 +1398,11 @@ fn detectFamily(model_type: []const u8) ModelFamily {
         .{ "colqwen2", ModelFamily.qwen2 },
         .{ "qwen3", ModelFamily.qwen3 },
         .{ "jina_embeddings_v5", ModelFamily.qwen3 },
+        .{ "qwen35", ModelFamily.qwen3_5 },
         .{ "qwen3_5", ModelFamily.qwen3_5 },
         .{ "qwen3_5_text", ModelFamily.qwen3_5 },
+        .{ "qwen3_6", ModelFamily.qwen3_5 },
+        .{ "qwen3_6_text", ModelFamily.qwen3_5 },
         .{ "deepseek_v4", ModelFamily.deepseek_v4 },
         .{ "deepseek_v4_text", ModelFamily.deepseek_v4 },
         .{ "deepseek_v4_flash", ModelFamily.deepseek_v4 },
@@ -2101,6 +2158,8 @@ test "isGenerativeModel" {
     try std.testing.expect(isGenerativeModel("mistral"));
     try std.testing.expect(isGenerativeModel("bitnet"));
     try std.testing.expect(isGenerativeModel("bitnet-b1.58"));
+    try std.testing.expect(isGenerativeModel("qwen35"));
+    try std.testing.expect(isGenerativeModel("qwen3_6"));
     try std.testing.expect(isGenerativeModel("deepseek_v4"));
     try std.testing.expect(isGenerativeModel("deepseek-v4-flash"));
     try std.testing.expect(!isGenerativeModel("jina_embeddings_v5"));
@@ -2139,6 +2198,64 @@ test "parse gguf metadata for llama config" {
     try std.testing.expectEqual(@as(u32, 14336), config.intermediate_size);
     try std.testing.expectEqual(@as(u32, 8192), config.max_position_embeddings);
     try std.testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_theta, 1e-3);
+}
+
+test "parse gguf metadata for qwen35 hybrid config" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 19);
+
+    try appendMetadataString(allocator, &data, "general.architecture", "qwen35");
+    try appendMetadataU32(allocator, &data, "qwen35.embedding_length", 5120);
+    try appendMetadataU32(allocator, &data, "qwen35.block_count", 64);
+    try appendMetadataU32(allocator, &data, "qwen35.context_length", 262144);
+    try appendMetadataU32(allocator, &data, "qwen35.feed_forward_length", 17408);
+    try appendMetadataU32(allocator, &data, "qwen35.attention.head_count", 24);
+    try appendMetadataU32(allocator, &data, "qwen35.attention.head_count_kv", 4);
+    try appendMetadataU32(allocator, &data, "qwen35.attention.key_length", 256);
+    try appendMetadataU32(allocator, &data, "qwen35.attention.value_length", 256);
+    try appendMetadataF32(allocator, &data, "qwen35.attention.layer_norm_rms_epsilon", 0.000001);
+    try appendMetadataF32(allocator, &data, "qwen35.rope.freq_base", 10000000.0);
+    try appendMetadataU32(allocator, &data, "qwen35.rope.dimension_count", 64);
+    try appendMetadataU32Array(allocator, &data, "qwen35.rope.dimension_sections", &.{ 11, 11, 10, 0 });
+    try appendMetadataU32(allocator, &data, "qwen35.ssm.conv_kernel", 4);
+    try appendMetadataU32(allocator, &data, "qwen35.ssm.state_size", 128);
+    try appendMetadataU32(allocator, &data, "qwen35.ssm.group_count", 16);
+    try appendMetadataU32(allocator, &data, "qwen35.ssm.time_step_rank", 48);
+    try appendMetadataU32(allocator, &data, "qwen35.ssm.inner_size", 6144);
+    try appendMetadataU32(allocator, &data, "qwen35.full_attention_interval", 4);
+
+    var parsed = try @import("../gguf/format.zig").parse(allocator, data.items);
+    defer parsed.deinit(allocator);
+
+    const config = parseGgufMetadata(gguf_metadata.View.init(&parsed)).?;
+    try std.testing.expectEqual(ModelFamily.qwen3_5, config.family);
+    try std.testing.expectEqual(@as(u32, 5120), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 64), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 24), config.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 4), config.effectiveKVHeads());
+    try std.testing.expectEqual(@as(u32, 256), config.headDim());
+    try std.testing.expectEqual(@as(u32, 17408), config.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 262144), config.max_position_embeddings);
+    try std.testing.expectApproxEqAbs(@as(f32, 10000000.0), config.rope_theta, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), config.rope_partial_factor, 1e-6);
+    try std.testing.expect(config.qwen35_has_linear_attention);
+    try std.testing.expect(config.qwen35_attn_output_gate);
+    try std.testing.expectEqual(@as(u32, 4), config.qwen35_full_attention_interval);
+    try std.testing.expectEqual(@as(u32, 4), config.qwen35_linear_conv_kernel_dim);
+    try std.testing.expectEqual(@as(u32, 128), config.qwen35_linear_key_head_dim);
+    try std.testing.expectEqual(@as(u32, 128), config.qwen35_linear_value_head_dim);
+    try std.testing.expectEqual(@as(u32, 16), config.qwen35_linear_num_key_heads);
+    try std.testing.expectEqual(@as(u32, 48), config.qwen35_linear_num_value_heads);
+    try std.testing.expect(config.qwen35_mrope_interleaved);
+    try std.testing.expectEqual([3]u32{ 11, 11, 10 }, config.qwen35_mrope_section);
+    try std.testing.expect(config.layerUsesQwen35LinearAttention(0));
+    try std.testing.expect(!config.layerUsesQwen35LinearAttention(3));
 }
 
 test "parse gguf metadata for bitnet config" {

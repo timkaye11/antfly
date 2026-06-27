@@ -294,6 +294,51 @@ pub const DebertaEmbeddingsRequest = struct {
     eps: f32,
 };
 
+pub const OpaqueBackendState = struct {
+    ptr: ?*anyopaque = null,
+    owner_tag: usize = 0,
+    deinitFn: ?*const fn (*anyopaque) void = null,
+    resetFn: ?*const fn (*anyopaque) void = null,
+
+    pub fn deinit(self: *OpaqueBackendState) void {
+        if (self.ptr) |ptr| {
+            if (self.deinitFn) |deinit_fn| deinit_fn(ptr);
+        }
+        self.* = .{};
+    }
+
+    pub fn reset(self: *OpaqueBackendState) void {
+        if (self.ptr) |ptr| {
+            if (self.resetFn) |reset_fn| reset_fn(ptr);
+        }
+    }
+};
+
+pub const Qwen35LinearAttentionCoreRequest = struct {
+    mixed: CT,
+    gate: CT,
+    beta: ?CT = null,
+    alpha: ?CT = null,
+    input: ?CT = null,
+    beta_weight: ?CT = null,
+    alpha_weight: ?CT = null,
+    hidden_size: usize = 0,
+    conv_weight: CT,
+    a_log: CT,
+    dt_bias: CT,
+    norm_weight: CT,
+    norm_weight_offset: f32 = 0.0,
+    state: ?*OpaqueBackendState = null,
+    state_initialized: bool = false,
+    seq_len: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    conv_kernel: usize,
+    eps: f32,
+};
+
 /// Fused MoE forward: route selection + expert compute + scatter-add,
 /// entirely on GPU with no CPU round-trips for routing.
 pub const MoeForwardFusedRequest = struct {
@@ -946,6 +991,12 @@ pub const ComputeBackend = struct {
         /// Backends may return null to use the generic embedding/layernorm/multiply path.
         debertaEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaEmbeddingsRequest) anyerror!?CT = null,
 
+        /// Qwen3.5/3.6 hybrid linear-attention core after input projections:
+        /// causal depthwise conv, gated delta recurrence, and gated RMSNorm.
+        /// Backends may keep the recurrent state resident; callers fall back to
+        /// the host reference path when this returns null.
+        qwen35LinearAttentionCore: ?*const fn (ctx: *anyopaque, request: *const Qwen35LinearAttentionCoreRequest) anyerror!?CT = null,
+
         /// Gather rows from a [total, dim] tensor along axis 0.
         takeRows: ?*const fn (ctx: *anyopaque, request: *const TakeRowsRequest) anyerror!?CT = null,
 
@@ -1036,7 +1087,7 @@ pub const ComputeBackend = struct {
 
         /// Y = rope(rms_norm_heads(input, weight, eps), ...), optionally scaled.
         /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
-        rmsNormHeadsRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT = null,
+        rmsNormHeadsRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32, norm_weight_offset: f32) anyerror!?CT = null,
 
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
@@ -2896,9 +2947,9 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, weight, residual, scalar, dim, eps);
     }
 
-    pub fn rmsNormHeadsRope(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) !?CT {
+    pub fn rmsNormHeadsRope(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32, norm_weight_offset: f32) !?CT {
         const op = self.vtable.rmsNormHeadsRope orelse return null;
-        return op(self.ptr, input, weight, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale);
+        return op(self.ptr, input, weight, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale, norm_weight_offset);
     }
 
     pub fn rope(self: *const ComputeBackend, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !CT {
@@ -3462,6 +3513,13 @@ pub const ComputeBackend = struct {
 
     pub fn runAttentionOutputResidual(self: *const ComputeBackend, request: *const RunAttentionOutputResidualRequest) !?CT {
         if (self.vtable.runAttentionOutputResidual) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn qwen35LinearAttentionCore(self: *const ComputeBackend, request: *const Qwen35LinearAttentionCoreRequest) !?CT {
+        if (self.vtable.qwen35LinearAttentionCore) |op| {
             return op(self.ptr, request);
         }
         return null;

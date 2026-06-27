@@ -764,6 +764,7 @@ pub const WeightStore = struct {
     tier_cache: ?tier_cache_mod.SharedCache = null,
     shared_prefetch: ?*tier_shared_mod.SharedPrefetchState = null,
     allow_direct_quant: bool = true,
+    prepare_direct_quant_storage: bool = true,
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
     gliner_head_dense_cache_lock: std.atomic.Mutex = .unlocked,
@@ -4721,7 +4722,10 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
     if (data.allow_direct_quant) {
         direct_quant_storage = try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref);
         if (direct_quant_storage) |*storage| {
-            expected_bytes = expectedQuantizedStorageLoadBytes(storage);
+            expected_bytes = if (data.prepare_direct_quant_storage)
+                expectedQuantizedStorageLoadBytes(storage)
+            else
+                quantizedStorageBudgetBytes(storage);
         }
     }
     if (entry.expert_coord) |coord| {
@@ -4746,7 +4750,9 @@ pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory
 
     if (data.allow_direct_quant) {
         if (direct_quant_storage) |*storage_ref| {
-            try prepareNativeQuantizedStorageBudgetedLocked(data, run_budget, storage_ref);
+            if (data.prepare_direct_quant_storage) {
+                try prepareNativeQuantizedStorageBudgetedLocked(data, run_budget, storage_ref);
+            }
             entry.loaded = .{
                 .tensor = .{
                     .data = empty_u8[0..],

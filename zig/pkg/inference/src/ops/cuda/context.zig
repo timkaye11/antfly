@@ -57,6 +57,16 @@ fn graphInstantiateResultName(result: CUgraphInstantiateResult) []const u8 {
     };
 }
 
+fn envFlag(comptime name: [:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.span(raw);
+    if (value.len == 0) return false;
+    return !(std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "off"));
+}
+
 pub const ProfileEventPair = struct {
     start: CUevent = null,
     end: CUevent = null,
@@ -197,7 +207,9 @@ pub const CudaContext = struct {
     pub fn instantiateGraph(self: *CudaContext, graph: CUgraph) driver_mod.Error!CUgraphExec {
         try self.makeCurrent();
         var exec: CUgraphExec = null;
-        if (self.driver.fns.cuGraphInstantiateWithParams) |instantiate_with_params| {
+        const use_legacy_instantiate = envFlag("ANTFLY_INFERENCE_CUDA_GRAPH_INSTANTIATE_LEGACY");
+        if (!use_legacy_instantiate and self.driver.fns.cuGraphInstantiateWithParams != null) {
+            const instantiate_with_params = self.driver.fns.cuGraphInstantiateWithParams.?;
             var params = driver_mod.CUDA_GRAPH_INSTANTIATE_PARAMS{};
             const result = instantiate_with_params(&exec, graph, &params);
             if (result != driver_mod.CUDA_SUCCESS or params.result_out != driver_mod.CUDA_GRAPH_INSTANTIATE_SUCCESS) {
