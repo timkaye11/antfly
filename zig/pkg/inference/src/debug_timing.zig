@@ -265,13 +265,24 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_q4_0_dispatch: linear_reduce={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} activation_rhs_reduce={d} pair_reduce={d} pair={d}\n",
+        "{s}_attention_dispatch: paged_1x={d}\n",
+        .{ prefix, provider_stats.metal_runtime_paged_attention_1x_calls },
+    );
+    std.debug.print(
+        "{s}_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             prefix,
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_sumsq,
             provider_stats.metal_runtime_q4_0_pair_activation_reduce,
             provider_stats.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output,
             provider_stats.metal_runtime_q4_0_activation_rhs_reduce,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_rms_norm_add_sumsq,
             provider_stats.metal_runtime_q4_0_pair_reduce,
             provider_stats.metal_runtime_q4_0_pair,
         },
@@ -287,6 +298,14 @@ pub fn printBackendTimingDetails(
             provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    std.debug.print(
+        "{s}_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_ple_linear_reduce_f16_input,
         },
     );
     std.debug.print(

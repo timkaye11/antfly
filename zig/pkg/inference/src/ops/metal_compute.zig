@@ -3253,6 +3253,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(cloned);
     }
 
+    fn copyTensorFromBackendOp(
+        ctx: *anyopaque,
+        src_ctx: *anyopaque,
+        src_kind: ops.BackendKind,
+        src_tensor: CT,
+    ) anyerror!?CT {
+        if (src_kind != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const src_self: *MetalCompute = @ptrCast(@alignCast(src_ctx));
+        const src_buf = toBuf(src_tensor);
+        if (src_buf.quantized_storage != null or
+            src_buf.runtime_quantized_storage != null or
+            src_buf.owned_quantized_storage != null)
+        {
+            return null;
+        }
+        if (src_buf.native_dense_bytes != null and src_buf.native_dense_dtype != null and src_buf.data.len == 0) {
+            return null;
+        }
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var src_metal = try src_self.ownedMetalTensorFromCt(src_tensor);
+        defer src_metal.deinit();
+        var copied = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            src_metal.deviceByteLen(),
+            uploadStorageMode(src_metal.deviceByteLen()),
+            src_metal.shape(),
+        );
+        errdefer copied.deinit();
+        try src_metal.copyInto(&copied);
+        return self.ctFromOwnedMetalTensor(copied);
+    }
+
     fn withLogicalShape(self: *MetalCompute, tensor: CT, shape: []const i64) !CT {
         if (toBuf(tensor).logical_shape) |old_shape| self.allocator.free(old_shape);
         toBuf(tensor).logical_shape = try self.allocator.dupe(i64, shape);
@@ -15513,14 +15546,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var attention_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
         defer attention_region_scope.deinit();
 
-        const can_use_layer_planned_block_scope =
+        const layer_plan_has_ple =
             ple_input_for_block != null and
             layer.ple_gate_linear_slot != null and
             layer.ple_proj_linear_slot != null and
             layer.ple_post_norm_slot != null and
+            request.ple_hidden_size != 0;
+        const can_use_layer_planned_block_scope =
             layer.ffn_pre_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
             layer.ffn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
-            layer.attn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity;
+            layer.attn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
+            (ple_input_for_block == null or layer_plan_has_ple);
         const layer_quant_formats: ?metal_command_planner.LayerQuantFormats = if (can_use_layer_planned_block_scope) blk: {
             const q_format = self.preparedLinearMatmulFormatForLinearSlot(layer.q_linear_slot, request.hidden_size, attention_input_size) orelse break :blk null;
             const k_format = if (layer.shares_kv)
@@ -15535,8 +15571,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse break :blk null;
             const up_format = self.preparedLinearMatmulFormatForLinearSlot(layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse break :blk null;
             const down_format = self.preparedLinearMatmulFormatForLinearSlot(layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size) orelse break :blk null;
-            const ple_gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse break :blk null;
-            const ple_projection_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse break :blk null;
+            const ple_gate_format = if (layer_plan_has_ple)
+                self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse break :blk null
+            else
+                .q8_0;
+            const ple_projection_format = if (layer_plan_has_ple)
+                self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse break :blk null
+            else
+                .q8_0;
             break :blk .{
                 .q = q_format,
                 .k = k_format,
@@ -15601,9 +15643,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .up_linear_slot = layer.up_ffn_linear_slot,
                 .down_linear_slot = layer.down_ffn_linear_slot,
                 .ffn_post_norm_slot = layer.ffn_post_norm_slot,
-                .ple_gate_linear_slot = layer.ple_gate_linear_slot orelse unreachable,
-                .ple_proj_linear_slot = layer.ple_proj_linear_slot orelse unreachable,
-                .ple_post_norm_slot = layer.ple_post_norm_slot orelse unreachable,
+                .include_ple = layer_plan_has_ple,
+                .ple_gate_linear_slot = if (layer_plan_has_ple) layer.ple_gate_linear_slot.? else 0,
+                .ple_proj_linear_slot = if (layer_plan_has_ple) layer.ple_proj_linear_slot.? else 0,
+                .ple_post_norm_slot = if (layer_plan_has_ple) layer.ple_post_norm_slot.? else 0,
                 .source = @intFromEnum(attention_setup_source),
                 .region = @intFromEnum(attention_setup_region),
                 .hidden_size = request.hidden_size,
@@ -15616,7 +15659,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .quant_formats = layer_quant_formats orelse unreachable,
                 .activation_dtype = .f16,
                 .intermediate_size = layer.intermediate_size,
-                .ple_hidden_size = request.ple_hidden_size,
+                .ple_hidden_size = if (layer_plan_has_ple) request.ple_hidden_size else 0,
             }) catch {};
             planned_command_view = layer_plan_storage.commandView();
             planned_view = planned_command_view.planView();
@@ -15980,13 +16023,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         queued_token_id: *bool,
         immediate_token_id: *u32,
         queued_final_input: *?MetalTensor,
+        queued_output_hidden: *?MetalTensor,
     ) !bool {
         const trace = traceDecoderRuntimeDecode();
         queued_token_id.* = false;
         queued_final_input.* = null;
+        queued_output_hidden.* = null;
         if (request.items.len != 1) {
             self.timing_stats.active_decode_frame_batch_fallbacks += 1;
             if (trace) std.debug.print("decoder-runtime-decode: fallback reason=batch-size batch={d}\n", .{request.items.len});
+            return false;
+        }
+        if (request.output_hidden != null and !metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            self.timing_stats.active_decode_frame_tail_fallbacks += 1;
+            if (trace) std.debug.print("decoder-runtime-decode: fallback reason=output-hidden-without-frame\n", .{});
             return false;
         }
         var initial_tensors = (try prepareDecodeBatchInitialTensors(self, request, batch_inputs)) orelse {
@@ -16447,6 +16497,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 &planned_tail_command_op_storage,
                 0,
             );
+            if (request.output_hidden != null) {
+                const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                    .slot = request.final_norm_slot,
+                    .input = hidden,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.norm_eps,
+                })) orelse break :final_tail_blk;
+                defer freeOp(ctx, final_hidden);
+                const final_hidden_mt = self.borrowedMetalTensorFromCt(final_hidden) catch break :final_tail_blk;
+                if (!final_hidden_mt.isDevice()) break :final_tail_blk;
+                queued_output_hidden.* = try final_hidden_mt.retainedCopy();
+            }
             if (!try metal_runtime.decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self.provider_impl, .{
                 .input = final_input,
                 .norm_slot = request.final_norm_slot,
@@ -16454,6 +16516,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
                 .out_dim = request.vocab_size,
+                .suppress_token_ids = request.suppress_token_ids,
                 .planned_layer_contract = planned_tail_contract,
             })) break :final_tail_blk;
             queued_token_id.* = true;
@@ -16477,6 +16540,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .eps = request.norm_eps,
             .out_dim = request.vocab_size,
+            .suppress_token_ids = request.suppress_token_ids,
         })) orelse {
             if (trace) std.debug.print("decoder-runtime-decode: fallback reason=final-argmax\n", .{});
             return false;
@@ -16581,6 +16645,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer self.allocator.free(shape);
             if (shape.len != 1 or shape[0] != @as(i64, @intCast(request.items.len))) return false;
         }
+        if (request.output_hidden) |output_hidden| {
+            if (output_hidden.* != null) return false;
+        }
         if (request.layer_count == 0 or request.layers.len != request.layer_count) return false;
         if (request.hidden_size == 0 or request.vocab_size == 0 or request.num_attention_heads == 0) return false;
         if (request.final_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity) return false;
@@ -16660,13 +16727,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var immediate_token_id: u32 = 0;
         var queued_final_input: ?MetalTensor = null;
         defer if (queued_final_input) |*tensor| tensor.deinit();
-        if (try runActiveDecoderRuntimeDecode(ctx, self, request, &batch_inputs, &queued_token_id, &immediate_token_id, &queued_final_input)) {
+        var queued_output_hidden: ?MetalTensor = null;
+        defer if (queued_output_hidden) |*tensor| tensor.deinit();
+        if (try runActiveDecoderRuntimeDecode(ctx, self, request, &batch_inputs, &queued_token_id, &immediate_token_id, &queued_final_input, &queued_output_hidden)) {
             try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
             const token_id = if (queued_token_id)
                 (try metal_runtime.decoderRuntimeReadTokenId(self.provider_impl)) orelse return false
             else
                 @as(usize, immediate_token_id);
             request.output_token_ids[0] = @intCast(token_id);
+            if (request.output_hidden) |output_hidden| {
+                var hidden_tensor = queued_output_hidden orelse return false;
+                queued_output_hidden = null;
+                errdefer hidden_tensor.deinit();
+                output_hidden.* = try self.ctFromOwnedMetalTensor(hidden_tensor);
+            }
             self.timing_stats.active_decode_frame_successes += 1;
             return true;
         }
@@ -17673,6 +17748,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_graph_plan_count = runtime_stats.graph_plan_count;
         stats.metal_runtime_graph_plan_allocations = runtime_stats.graph_plan_allocations;
         stats.metal_runtime_graph_plan_reuses = runtime_stats.graph_plan_reuses;
+        stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
         stats.metal_runtime_compute_encoder_count = runtime_stats.compute_encoder_count;
         stats.metal_runtime_blit_encoder_count = runtime_stats.blit_encoder_count;
         stats.metal_runtime_last_frame_compute_encoder_count = runtime_stats.last_frame_compute_encoder_count;
@@ -17726,11 +17802,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q8_0_linear_mmv_f16_input = runtime_stats.q8_0_linear_mmv_f16_input;
         stats.metal_runtime_q8_0_linear_family_dispatch_counts = runtime_stats.q8_0_linear_family_dispatch_counts;
         stats.metal_runtime_q4_0_linear_reduce = runtime_stats.q4_0_linear_reduce;
+        stats.metal_runtime_q4_0_linear_reduce_f16_input = runtime_stats.q4_0_linear_reduce_f16_input;
+        stats.metal_runtime_q4_0_linear_reduce_f16_output = runtime_stats.q4_0_linear_reduce_f16_output;
+        stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output = runtime_stats.q4_0_linear_reduce_f16_input_f16_output;
+        stats.metal_runtime_q4_0_linear_reduce_sumsq = runtime_stats.q4_0_linear_reduce_sumsq;
         stats.metal_runtime_q4_0_pair = runtime_stats.q4_0_pair;
         stats.metal_runtime_q4_0_pair_reduce = runtime_stats.q4_0_pair_reduce;
         stats.metal_runtime_q4_0_pair_activation_reduce = runtime_stats.q4_0_pair_activation_reduce;
         stats.metal_runtime_q4_0_pair_activation_reduce_f16_output = runtime_stats.q4_0_pair_activation_reduce_f16_output;
+        stats.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output = runtime_stats.q4_0_pair_activation_rms_scale_reduce_f16_output;
         stats.metal_runtime_q4_0_activation_rhs_reduce = runtime_stats.q4_0_activation_rhs_reduce;
+        stats.metal_runtime_q4_0_activation_rhs_reduce_f16_output = runtime_stats.q4_0_activation_rhs_reduce_f16_output;
+        stats.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output = runtime_stats.q4_0_ple_activation_rhs_reduce_f16_output;
+        stats.metal_runtime_q4_0_ple_linear_reduce_f16_input = runtime_stats.q4_0_ple_linear_reduce_f16_input;
+        stats.metal_runtime_q4_0_linear_reduce_encode_nanos = runtime_stats.q4_0_linear_reduce_encode_nanos;
+        stats.metal_runtime_q4_0_pair_reduce_encode_nanos = runtime_stats.q4_0_pair_reduce_encode_nanos;
+        stats.metal_runtime_q4_0_pair_activation_reduce_encode_nanos = runtime_stats.q4_0_pair_activation_reduce_encode_nanos;
+        stats.metal_runtime_q4_0_activation_rhs_reduce_encode_nanos = runtime_stats.q4_0_activation_rhs_reduce_encode_nanos;
         stats.metal_runtime_q4_k_linear_reduce = runtime_stats.q4_k_linear_reduce;
         stats.metal_runtime_q4_k_pair_reduce = runtime_stats.q4_k_pair_reduce;
         stats.metal_runtime_q4_k_pair_activation_reduce = runtime_stats.q4_k_pair_activation_reduce;
@@ -17738,6 +17826,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q4_k_activation_rhs_reduce = runtime_stats.q4_k_activation_rhs_reduce;
         stats.metal_runtime_q6_k_linear_reduce = runtime_stats.q6_k_linear_reduce;
         stats.metal_runtime_q6_k_linear_reduce_f16_input = runtime_stats.q6_k_linear_reduce_f16_input;
+        stats.metal_runtime_rms_norm_add_sumsq = runtime_stats.rms_norm_add_sumsq;
 
         const provider = self.provider_impl;
         stats.metal_provider_quantized_runtime_private_nanos = provider.raw_quant_runtime_private_prepare_nanos;
@@ -18150,6 +18239,115 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return best_idx;
     }
 
+    fn argmaxRowsOp(
+        ctx: *anyopaque,
+        tensor: CT,
+        row_start: usize,
+        row_count: usize,
+        dim: usize,
+        allocator: std.mem.Allocator,
+    ) anyerror!?[]u32 {
+        const no_suppress = [_]i32{};
+        return argmaxRowsSuppressOp(ctx, tensor, row_start, row_count, dim, no_suppress[0..], allocator);
+    }
+
+    fn linearNoBiasArgmaxRowsSuppressOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_token_ids: []const i32,
+        allocator: std.mem.Allocator,
+    ) anyerror!?[]u32 {
+        if (rows == 0 or in_dim == 0 or out_dim == 0) return error.InvalidTensorShape;
+        const logits = try linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim);
+        defer freeOp(ctx, logits);
+        return argmaxRowsSuppressOp(ctx, logits, 0, rows, out_dim, suppress_token_ids, allocator);
+    }
+
+    fn gemma4MtpTokenIsEos(token: usize, eos_token_ids: []const i32) bool {
+        for (eos_token_ids) |eos| {
+            if (eos >= 0 and token == @as(usize, @intCast(eos))) return true;
+        }
+        return false;
+    }
+
+    fn gemma4MtpVerifyCommitOp(ctx: *anyopaque, request: *const ops.Gemma4MtpVerifyCommitRequest) anyerror!?ops.Gemma4MtpVerifyCommitResult {
+        if (request.draft_tokens.len == 0) return null;
+        const verify_len = request.draft_tokens.len + 1;
+        if (request.rows < verify_len) return error.InvalidTensorShape;
+        const target_choices = (try linearNoBiasArgmaxRowsSuppressOp(
+            ctx,
+            request.input,
+            request.weight,
+            verify_len,
+            request.in_dim,
+            request.out_dim,
+            request.suppress_token_ids,
+            request.allocator,
+        )) orelse return null;
+        errdefer request.allocator.free(target_choices);
+        if (target_choices.len < verify_len) return error.InvalidTensorShape;
+
+        var matched_drafts: usize = 0;
+        var accepted: usize = 0;
+        var correction_added = false;
+        var hit_eos = false;
+
+        for (request.draft_tokens, 0..) |draft_token_raw, i| {
+            if (draft_token_raw < 0) return error.InvalidModelOutput;
+            const draft_token: usize = @intCast(draft_token_raw);
+            const target_choice: usize = @intCast(target_choices[i]);
+            if (target_choice == draft_token) {
+                matched_drafts += 1;
+                accepted += 1;
+                if (gemma4MtpTokenIsEos(target_choice, request.eos_token_ids)) {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                correction_added = true;
+                accepted = matched_drafts + 1;
+                if (gemma4MtpTokenIsEos(target_choice, request.eos_token_ids)) {
+                    hit_eos = true;
+                }
+                break;
+            }
+        }
+
+        const can_bonus = matched_drafts == request.draft_tokens.len and !hit_eos;
+        const had_bonus = can_bonus and request.accept_bonus;
+        const bonus_skipped = can_bonus and !request.accept_bonus;
+        if (had_bonus) {
+            const bonus_token: usize = @intCast(target_choices[request.draft_tokens.len]);
+            accepted += 1;
+            if (gemma4MtpTokenIsEos(bonus_token, request.eos_token_ids)) {
+                hit_eos = true;
+            }
+        }
+
+        const commit_forward_required = correction_added or had_bonus;
+        const accepted_hidden_row: ?usize = if (accepted != 0 and !commit_forward_required)
+            accepted - 1
+        else
+            null;
+
+        return .{
+            .target_choices = target_choices,
+            .target_choices_owned = true,
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
+            .correction_added = correction_added,
+            .had_bonus = had_bonus,
+            .bonus_skipped = bonus_skipped,
+            .hit_eos = hit_eos,
+            .commit_forward_required = commit_forward_required,
+            .accepted_hidden_row = accepted_hidden_row,
+        };
+    }
+
     fn argmaxRowsSuppressOp(
         ctx: *anyopaque,
         tensor: CT,
@@ -18334,6 +18532,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .eps = request.eps,
             .out_dim = request.out_dim,
+            .suppress_token_ids = request.suppress_token_ids,
         });
     }
 
@@ -18654,10 +18853,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.toFloat32 = toFloat32Op;
         vt.exportTensorData = null;
         vt.cloneTensorShape = cloneTensorShapeOp;
+        vt.copyTensorFromBackend = copyTensorFromBackendOp;
         vt.tensorShape = tensorShapeOp;
         vt.sliceLastDim = sliceLastDimOp;
         vt.evalTensor = evalTensorOp;
         vt.argmaxLastRow = argmaxLastRowOp;
+        vt.argmaxRows = argmaxRowsOp;
         vt.argmaxRowsSuppress = argmaxRowsSuppressOp;
         vt.argmaxLastRowSuppressTensor = argmaxLastRowSuppressTensorOp;
         vt.sampleLastRow = sampleLastRowOp;
@@ -18731,6 +18932,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearNoBias = linearNoBiasOp;
         vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
         vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
+        vt.linearNoBiasArgmaxRowsSuppress = linearNoBiasArgmaxRowsSuppressOp;
+        vt.gemma4MtpVerifyCommit = gemma4MtpVerifyCommitOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
         vt.splitLastDim3 = splitLastDim3Op;
         vt.linearPair = linearPairOp;

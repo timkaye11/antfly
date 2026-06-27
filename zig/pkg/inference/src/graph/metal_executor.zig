@@ -650,14 +650,30 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_q4_0_dispatch: linear_reduce={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} activation_rhs_reduce={d} pair_reduce={d} pair={d}\n",
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
+            provider_stats.metal_runtime_q4_0_linear_reduce_sumsq,
             provider_stats.metal_runtime_q4_0_pair_activation_reduce,
             provider_stats.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output,
             provider_stats.metal_runtime_q4_0_activation_rhs_reduce,
+            provider_stats.metal_runtime_q4_0_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_rms_norm_add_sumsq,
             provider_stats.metal_runtime_q4_0_pair_reduce,
             provider_stats.metal_runtime_q4_0_pair,
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_encode_us: linear_reduce={d} pair_reduce={d} pair_act_reduce={d} activation_rhs_reduce={d}\n",
+        .{
+            @divTrunc(provider_stats.metal_runtime_q4_0_linear_reduce_encode_nanos, 1000),
+            @divTrunc(provider_stats.metal_runtime_q4_0_pair_reduce_encode_nanos, 1000),
+            @divTrunc(provider_stats.metal_runtime_q4_0_pair_activation_reduce_encode_nanos, 1000),
+            @divTrunc(provider_stats.metal_runtime_q4_0_activation_rhs_reduce_encode_nanos, 1000),
         },
     );
     std.debug.print(
@@ -670,6 +686,13 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
+            provider_stats.metal_runtime_q4_0_ple_linear_reduce_f16_input,
         },
     );
     const q8_family_dispatch = provider_stats.metal_runtime_q8_0_linear_family_dispatch_counts;

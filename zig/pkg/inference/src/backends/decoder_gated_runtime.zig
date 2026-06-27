@@ -1357,7 +1357,37 @@ fn supportsDirectGemmaRuntime(gpt_config: gpt_mod.Config, configured_layer_count
     return decode_context.attention_mode == .paged_decode or decode_context.attention_mode == .paged_prefill;
 }
 
-fn tryBackendOwnedGreedyToken(
+const BackendOwnedGreedyTokenResult = struct {
+    token_id: i64,
+    final_hidden: ?ops.CT = null,
+
+    fn deinit(self: *BackendOwnedGreedyTokenResult, cb: *const ops.ComputeBackend) void {
+        if (self.final_hidden) |hidden| cb.free(hidden);
+        self.* = undefined;
+    }
+};
+
+pub const GreedyTokenAndFinalHidden = struct {
+    token_id: i64,
+    final_hidden: ops.CT,
+
+    pub fn deinit(self: *GreedyTokenAndFinalHidden, cb: *const ops.ComputeBackend) void {
+        cb.free(self.final_hidden);
+        self.* = undefined;
+    }
+};
+
+pub const FinalHiddenRows = struct {
+    final_hidden: ops.CT,
+    rows: usize,
+
+    pub fn deinit(self: *FinalHiddenRows, cb: *const ops.ComputeBackend) void {
+        cb.free(self.final_hidden);
+        self.* = undefined;
+    }
+};
+
+fn tryBackendOwnedGreedyTokenResult(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     gpt_config: gpt_mod.Config,
@@ -1365,7 +1395,8 @@ fn tryBackendOwnedGreedyToken(
     token_id: i64,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
-) !?i64 {
+    capture_final_hidden: bool,
+) !?BackendOwnedGreedyTokenResult {
     if (gatedFamilyCompareRequested()) return null;
     if (!supportsDirectGemmaRuntime(gpt_config, configured_layer_count, decode_context)) return null;
     if (!gpt_config.hasPle()) return null;
@@ -1400,6 +1431,8 @@ fn tryBackendOwnedGreedyToken(
         .attention = attention,
     }};
     var output_token_ids = [_]i64{0};
+    var output_hidden: ?ops.CT = null;
+    errdefer if (output_hidden) |hidden| cb.free(hidden);
     const token_embedding_weight = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_embedding_weight);
     const ple_token_embedding_weight = gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
@@ -1430,10 +1463,47 @@ fn tryBackendOwnedGreedyToken(
         .items = items[0..],
         .token_embedding_weight = token_embedding_weight,
         .ple_token_embedding_weight = ple_token_embedding_weight,
+        .suppress_token_ids = gpt_config.suppressTokenIds(),
+        .output_hidden = if (capture_final_hidden) &output_hidden else null,
         .output_token_ids = output_token_ids[0..],
     };
-    if (try cb.decoderRuntimeDecodeBatch(&request)) return output_token_ids[0];
+    if (try cb.decoderRuntimeDecodeBatch(&request)) {
+        if (capture_final_hidden and output_hidden == null) return error.UnexpectedNull;
+        const result = BackendOwnedGreedyTokenResult{
+            .token_id = output_token_ids[0],
+            .final_hidden = output_hidden,
+        };
+        output_hidden = null;
+        return result;
+    }
+    if (output_hidden) |hidden| {
+        cb.free(hidden);
+        output_hidden = null;
+    }
     return null;
+}
+
+fn tryBackendOwnedGreedyToken(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?i64 {
+    var result = (try tryBackendOwnedGreedyTokenResult(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+    )) orelse return null;
+    defer result.deinit(cb);
+    return result.token_id;
 }
 
 fn shouldUseDecoderRuntimeFrame(
@@ -5068,6 +5138,39 @@ pub fn forwardGreedyToken(
     return token;
 }
 
+pub fn forwardGreedyTokenAndFinalHidden(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?GreedyTokenAndFinalHidden {
+    if (!supportsConfig(gpt_config)) return null;
+    if (decode_context.query_sequence_len != 1) return null;
+    if (decode_context.attention_mode != .paged_decode) return null;
+    timing_stats.greedy_calls += 1;
+
+    var result = (try tryBackendOwnedGreedyTokenResult(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        true,
+    )) orelse return null;
+    errdefer result.deinit(cb);
+    const hidden = result.final_hidden orelse return error.UnexpectedNull;
+    result.final_hidden = null;
+    return .{
+        .token_id = result.token_id,
+        .final_hidden = hidden,
+    };
+}
+
 pub fn forwardLastLogits(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -5290,6 +5393,98 @@ pub fn forwardPrefillLastPreparedTail(
         .hidden_size = gpt_config.hidden_size,
         .vocab_size = gpt_config.vocab_size,
         .norm_eps = gpt_config.norm_eps,
+    };
+}
+
+pub fn forwardFinalHiddenRows(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?FinalHiddenRows {
+    if (!supportsConfig(gpt_config)) return null;
+    if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
+    if (decode_context.attention_mode != .paged_prefill and decode_context.attention_mode != .paged_decode) return null;
+
+    const phase: BlockTimingPhase = if (decode_context.attention_mode == .paged_decode) .greedy else .prefill;
+    var started_at = monotonicNowNs();
+    const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) {
+        if (phase == .greedy) {
+            timing_stats.greedy_embed_nanos += finished_at - started_at;
+        } else {
+            timing_stats.prefill_embed_nanos += finished_at - started_at;
+        }
+    }
+
+    started_at = monotonicNowNs();
+    const direct_ple_vectors = try computePleVectorsDirect(
+        cb,
+        gpt_config,
+        configured_layer_count,
+        input_ids,
+        hidden,
+        input_ids.len,
+    );
+    const ple_vectors = if (direct_ple_vectors) |direct_ple|
+        direct_ple
+    else blk: {
+        const fallback_started_at = monotonicNowNs();
+        const fallback_ple = try gpt_arch.computePleVectors(cb, allocator, gpt_config, input_ids, hidden, input_ids.len);
+        const fallback_finished_at = monotonicNowNs();
+        if (fallback_finished_at > fallback_started_at) {
+            timing_stats.prefill_ple_fallback_nanos += fallback_finished_at - fallback_started_at;
+        }
+        break :blk fallback_ple;
+    };
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.prefill_ple_prepare_nanos += finished_at - started_at;
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    started_at = monotonicNowNs();
+    const direct_hidden_result = try forwardFinalHiddenTensorDirect(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        hidden,
+        seq_len,
+        decode_context,
+        phase,
+        ple_vectors,
+    );
+    if (direct_hidden_result == null) {
+        cb.free(hidden);
+        return null;
+    }
+    const hidden_result = direct_hidden_result.?;
+    var decoder_frame_active = hidden_result.decoder_frame_active;
+    defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
+    finished_at = monotonicNowNs();
+    if (finished_at > started_at) {
+        if (phase == .greedy) {
+            timing_stats.greedy_block_nanos += finished_at - started_at;
+        } else {
+            timing_stats.prefill_block_nanos += finished_at - started_at;
+        }
+    }
+    const final_hidden = (try cb.decoderRuntimeApplyRmsNorm(&.{
+        .slot = finalNormSlot(configured_layer_count),
+        .input = hidden_result.hidden,
+        .hidden_size = gpt_config.hidden_size,
+        .eps = gpt_config.norm_eps,
+    })) orelse {
+        cb.free(hidden_result.hidden);
+        return null;
+    };
+    if (final_hidden != hidden_result.hidden) cb.free(hidden_result.hidden);
+    return .{
+        .final_hidden = final_hidden,
+        .rows = hidden_result.total_rows,
     };
 }
 

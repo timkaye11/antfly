@@ -397,7 +397,7 @@ fn printMtpPairValidation(
     try printGgufSummary(&draft_manifest, draft_report);
 
     const target_cfg = if (target_report) |report| report.gpt_config else null;
-    const draft_cfg = if (draft_report) |report| report.gpt_config else null;
+    const draft_cfg = if (draft_report) |report| report.gpt_config else try loadGptConfigFromManifestConfig(allocator, &draft_manifest);
     const target_tokenizer = try tokenizerFingerprint(allocator, target_model_dir);
     defer if (target_tokenizer) |fp| allocator.free(fp);
     const draft_tokenizer = try tokenizerFingerprint(allocator, draft_model_dir);
@@ -441,6 +441,18 @@ fn printMtpPairValidation(
 
     const verdict = mtpPairVerdict(target_cfg, draft_cfg, tokenizer_match);
     print("mtp_pair_verdict: {s}\n", .{mtpPairVerdictName(verdict)});
+}
+
+fn loadGptConfigFromManifestConfig(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+) !?gpt_mod.Config {
+    const config_path = manifest.config_path orelse return null;
+    const config_bytes = c_file.readFile(allocator, config_path) catch return null;
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return null;
+    if (cfg.family == .other) return null;
+    return cfg;
 }
 
 fn mtpPairVerdict(target_cfg: ?gpt_mod.Config, draft_cfg: ?gpt_mod.Config, tokenizer_match: bool) MtpPairVerdict {

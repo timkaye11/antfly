@@ -321,6 +321,7 @@ pub const DecoderRuntimeApplyRmsNormLinearArgmaxRequest = struct {
     hidden_size: usize,
     eps: f32,
     out_dim: usize,
+    suppress_token_ids: []const i32 = &.{},
 };
 
 pub const DecoderRuntimeApplyRmsNormLinearRequest = struct {
@@ -846,6 +847,10 @@ pub const DecoderRuntimeDecodeRequest = struct {
     items: []const DecoderRuntimeDecodeItem,
     token_embedding_weight: ?CT = null,
     ple_token_embedding_weight: ?CT = null,
+    /// Token ids excluded from greedy argmax. This is part of the greedy
+    /// decode contract because the backend-owned path commits KV before the
+    /// token id is handed back to the caller.
+    suppress_token_ids: []const i32 = &.{},
     /// Optional backend tensor containing one token id per item. When null,
     /// `items[*].token_id` is authoritative.
     input_token_ids: ?CT = null,
@@ -855,6 +860,9 @@ pub const DecoderRuntimeDecodeRequest = struct {
     /// Optional backend-owned token-id output tensor for the next decode step.
     /// Backends may leave this null and use host writeback only.
     output_token_ids_tensor: ?*CT = null,
+    /// Optional backend-owned final hidden output for single-token decode.
+    /// When set, successful calls populate it with the row after final norm.
+    output_hidden: ?*?CT = null,
     /// Host-visible token writeback for each item. Backends may keep token ids
     /// device-owned internally, but successful calls must populate this slice.
     output_token_ids: []i64,

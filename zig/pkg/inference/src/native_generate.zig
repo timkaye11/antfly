@@ -120,9 +120,15 @@ const Options = struct {
     json_timing_path: ?[]const u8 = null,
 };
 
+fn shouldDisableMetalAutoDraft(opts: Options) bool {
+    return opts.backend == .metal and
+        opts.speculation_policy == .auto and
+        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO");
+}
+
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    const effective_draft_model = if (opts.speculation_policy == .off) null else opts.draft_model;
+    const effective_draft_model = if (opts.speculation_policy == .off or shouldDisableMetalAutoDraft(opts)) null else opts.draft_model;
     try native_backend_choice.validate(opts.backend);
     const require_server = requireWarmServer(opts);
     if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
@@ -210,7 +216,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .prefill_chunk_size = opts.prefill_chunk_size,
         .draft_model = effective_draft_model,
         .speculative_k = opts.speculative_k,
-        .speculation_requested = opts.draft_model != null,
+        .speculation_requested = effective_draft_model != null,
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
@@ -2827,12 +2833,23 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_0_dispatch: linear_reduce={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} activation_rhs_reduce={d} pair_reduce={d} pair={d}\n",
+        "metal_attention_dispatch: paged_1x={d}\n",
+        .{metal_snapshot.provider.metal_runtime_paged_attention_1x_calls},
+    );
+    print(
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_sumsq,
             metal_snapshot.provider.metal_runtime_q4_0_pair_activation_reduce,
             metal_snapshot.provider.metal_runtime_q4_0_pair_activation_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_0_activation_rhs_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_activation_rhs_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_rms_norm_add_sumsq,
             metal_snapshot.provider.metal_runtime_q4_0_pair_reduce,
             metal_snapshot.provider.metal_runtime_q4_0_pair,
         },
@@ -2847,6 +2864,13 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q4_k_activation_rhs_reduce,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    print(
+        "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
+            metal_snapshot.provider.metal_runtime_q4_0_ple_linear_reduce_f16_input,
         },
     );
 }
