@@ -1,0 +1,61 @@
+{
+  "baselines": [
+    {
+      "provider": "provider-name",
+      "metric": "resident_e2e_tok_s",
+      "tok_s": 16.0,
+      "min_ratio": 1.0,
+      "model": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+      "hardware": "NVIDIA L4 or provider hardware class",
+      "tokens": 512,
+      "workload": "antfly-resident-index-explanation-512",
+      "measured_at": "2026-06-25",
+      "source_url": "https://provider.example/benchmark-or-run-artifact",
+      "context": {
+        "backend": "provider-api-or-engine",
+        "cache_dtype": "f32",
+        "temperature": 0,
+        "stream": false
+      },
+      "notes": "Use the same prompt, max tokens, sampling settings, model revision, and hardware class as the Antfly gate."
+    },
+    {
+      "provider": "provider-name-compressed-kv",
+      "metric": "compressed_kv_decode_tok_s",
+      "tok_s": 40.0,
+      "min_ratio": 1.0,
+      "model": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+      "hardware": "NVIDIA L4 or provider hardware class",
+      "tokens": 512,
+      "workload": "antfly-compressed-kv-raw-ants-512",
+      "measured_at": "2026-06-25",
+      "source_url": "https://provider.example/benchmark-or-run-artifact",
+      "context": {
+        "backend": "provider-api-or-engine",
+        "cache_dtype": "polar4",
+        "temperature": 0,
+        "stream": false
+      },
+      "notes": "Use for the paged Polar4 KV production-speed path. Compare against matching cache dtype, prompt shape, generated tokens, sampling settings, model revision, and hardware class."
+    },
+    {
+      "provider": "provider-name-target-decode",
+      "metric": "target_decode_tok_s",
+      "tok_s": 17.0,
+      "min_ratio": 1.0,
+      "model": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+      "hardware": "NVIDIA L4 or provider hardware class",
+      "tokens": 512,
+      "workload": "antfly-target-raw-ants-512",
+      "measured_at": "2026-06-25",
+      "source_url": "https://provider.example/benchmark-or-run-artifact",
+      "context": {
+        "backend": "provider-api-or-engine",
+        "cache_dtype": "f32",
+        "temperature": 0,
+        "stream": false
+      },
+      "notes": "Supported metrics: compressed_kv_decode_tok_s, target_decode_tok_s, long_decode_tok_s, resident_e2e_tok_s, soak_aggregate_tok_s, backpressure_accepted_e2e_tok_s."
+    }
+  ]
+}

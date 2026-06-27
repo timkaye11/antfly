@@ -614,8 +614,7 @@ pub fn forwardHiddenOnly(
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
-    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -649,8 +648,7 @@ pub fn forwardGreedyLastToken(
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
-    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -683,8 +681,7 @@ pub fn forwardGreedyLastTokenWithFinalHidden(
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
-    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -720,7 +717,6 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) !?GreedyDeviceTokenResult {
-    if (config.hasPle()) return null;
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -728,10 +724,36 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
-    const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
-    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
 
-    return try forwardGreedyLastTokenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, null);
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    return try forwardGreedyLastTokenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
+}
+
+pub fn forwardGreedyLastTokenTensorOnlyFromTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !?CT {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    if (batch != 1 or query_seq_len != 1 or total != 1) return null;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    return try forwardGreedyLastTokenTensorOnlyFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }
 
 pub fn forwardFromEmbeddings(
@@ -1092,13 +1114,17 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     var capture_final_hidden = false;
     var final_hidden_input = hidden_input;
     var prepared_final_hidden_input = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
     if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
         if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
             final_hidden_input = prepared;
             prepared_final_hidden_input = true;
-            cb.free(hidden_input);
+            original_hidden_input = hidden_input;
+            owns_original_hidden_input = true;
         }
         errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
         const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
         const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
@@ -1111,6 +1137,10 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
             if (prepared_final_hidden_input) {
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
+            }
+            if (owns_original_hidden_input) {
+                cb.free(original_hidden_input);
+                owns_original_hidden_input = false;
             }
             if (capture_greedy_token) {
                 return greedyResultFromTokenTensor(cb, allocator, replayed);
@@ -1127,7 +1157,24 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
 
     prepared_final_hidden_input = false;
-    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors);
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
     errdefer cb.free(hidden_result.hidden);
     if (capture_final_hidden) {
         if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
@@ -1141,6 +1188,7 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
             }
             try cb.debugCudaGraphCaptureEnd(false);
             capture_final_hidden = false;
+            if (cudaDecodeGraphReplayRequired()) return error.CudaGraphReplayRequired;
             return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
         }
         try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
@@ -1150,13 +1198,132 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
 }
 
+fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+) !?CT {
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var prepared_final_hidden_input = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
+            final_hidden_input = prepared;
+            prepared_final_hidden_input = true;
+            original_hidden_input = hidden_input;
+            owns_original_hidden_input = true;
+        }
+        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+        const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+        if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+            if (prepared_final_hidden_input) {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+            }
+            if (owns_original_hidden_input) {
+                cb.free(original_hidden_input);
+                owns_original_hidden_input = false;
+            }
+            if (capture_greedy_token) return replayed;
+            defer cb.free(replayed);
+            return try greedyLastTokenTensorOnlyFromFinalHiddenRetain(cb, config, .{
+                .hidden = replayed,
+                .total_rows = batch * query_seq_len,
+            });
+        }
+        capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
+        if (capture_final_hidden) try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
+            if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
+                errdefer cb.free(token);
+                try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, token);
+                try cb.debugCudaGraphCaptureEnd(true);
+                capture_final_hidden = false;
+                cb.free(hidden_result.hidden);
+                return token;
+            }
+            try cb.debugCudaGraphCaptureEnd(false);
+            capture_final_hidden = false;
+            if (cudaDecodeGraphReplayRequired()) return error.CudaGraphReplayRequired;
+            return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, hidden_result);
+        }
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
+    return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, hidden_result);
+}
+
+const CudaDecodeGraphReplayMode = enum {
+    off,
+    auto,
+    required,
+};
+
+fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
+    const raw = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") orelse return .off;
+    if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "no")) return .off;
+    if (std.mem.eql(u8, raw, "required") or std.mem.eql(u8, raw, "require") or std.mem.eql(u8, raw, "force")) return .required;
+    if (std.mem.eql(u8, raw, "auto") or std.mem.eql(u8, raw, "on") or std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "yes")) return .auto;
+    return .off;
+}
+
+fn cudaDecodeGraphReplayRequested() bool {
+    return cudaDecodeGraphReplayMode() != .off;
+}
+
+fn cudaDecodeGraphReplayRequired() bool {
+    return cudaDecodeGraphReplayMode() == .required;
+}
+
 fn cudaCaptureFinalHiddenProbeEnabled(
     cb: *const ComputeBackend,
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) bool {
-    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false)) return false;
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false) and
+        !cudaDecodeGraphReplayRequested()) return false;
     if (cb.kind() != .cuda) return false;
     if (batch != 1) return false;
     return actualQuerySeqLen(seq_len, decode_context) == 1;
@@ -1169,7 +1336,8 @@ fn cudaCaptureGreedyTokenProbeEnabled(
     decode_context: ?*const DecodeContext,
 ) bool {
     if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false) or
+        cudaDecodeGraphReplayRequested();
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -1247,6 +1415,16 @@ fn forwardGreedyLastTokenTensorFromFinalHidden(
     return greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, config, hidden_result);
 }
 
+fn forwardGreedyLastTokenTensorOnlyFromFinalHidden(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden_result: HiddenTensorResult,
+) !?CT {
+    const hidden = hidden_result.hidden;
+    defer cb.free(hidden);
+    return greedyLastTokenTensorOnlyFromFinalHiddenRetain(cb, config, hidden_result);
+}
+
 fn greedyLastTokenTensorFromFinalHiddenRetain(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1291,6 +1469,30 @@ fn greedyLastTokenTensorFromFinalHiddenRetain(
     return .{ .token_id = activations.argmax(last) };
 }
 
+fn greedyLastTokenTensorOnlyFromFinalHiddenRetain(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden_result: HiddenTensorResult,
+) !?CT {
+    const hidden = hidden_result.hidden;
+    if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
+        return token;
+    }
+
+    if (!canUseFastGreedyArgmaxForConfig(config)) return null;
+    const lm_w = if (config.weight_tying)
+        try getEmbeddingWeight(cb, config)
+    else
+        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    defer cb.free(lm_w);
+
+    const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
+    defer cb.free(logits);
+
+    const suppress_token_ids = config.suppressTokenIds();
+    return try cb.argmaxLastRowSuppressTensor(logits, hidden_result.total_rows, config.vocab_size, suppress_token_ids);
+}
+
 fn tryGreedyLastTokenTensorFastPathFromFinalHidden(
     cb: *const ComputeBackend,
     config: Config,
@@ -1319,17 +1521,44 @@ fn tryGreedyLastTokenTensorFastPathFromFinalHidden(
     return null;
 }
 
+pub fn resolveGreedyDeviceTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    token: CT,
+) !usize {
+    if (try cb.exportTensorData(token, allocator)) |exported| {
+        defer switch (exported.payload) {
+            .bytes => |bytes| allocator.free(bytes),
+            .quantized_f32 => |storage| {
+                allocator.free(storage.raw_bytes);
+                allocator.free(storage.shape);
+            },
+        };
+        switch (exported.payload) {
+            .bytes => |bytes| {
+                if (exported.dtype == .i32 and bytes.len == @sizeOf(i32)) {
+                    const token_id = std.mem.readInt(i32, bytes[0..@sizeOf(i32)], .little);
+                    if (token_id < 0) return error.InvalidTensorShape;
+                    return @intCast(token_id);
+                }
+            },
+            .quantized_f32 => {},
+        }
+    }
+    const ids = try cb.toFloat32(token, allocator);
+    defer allocator.free(ids);
+    if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+    return @intFromFloat(ids[0]);
+}
+
 fn greedyResultFromTokenTensor(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     token: CT,
 ) !GreedyDeviceTokenResult {
     errdefer cb.free(token);
-    const ids = try cb.toFloat32(token, allocator);
-    defer allocator.free(ids);
-    if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
     return .{
-        .token_id = @intFromFloat(ids[0]),
+        .token_id = try resolveGreedyDeviceTokenTensor(cb, allocator, token),
         .token_tensor = token,
     };
 }
@@ -1423,7 +1652,7 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
     ple_vectors: ?CT,
     label: []const u8,
 ) !HiddenTensorResult {
-    if (!cudaMtpTargetReplayEnabled(cb, config, batch, seq_len, decode_context)) {
+    if (!cudaMtpFinalHiddenReplayEnabled(cb, config, batch, seq_len, decode_context, label)) {
         return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
             cb,
             allocator,
@@ -1437,12 +1666,30 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
         );
     }
 
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+    const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+    const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+    const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+    var replay_label_buf: [192]u8 = undefined;
+    const replay_label = cudaMtpReplayContextLabel(
+        label,
+        batch,
+        seq_len,
+        query_seq_len,
+        position_offset,
+        kv_seq_len,
+        total_sequence_len,
+        kv_position_offset,
+        &replay_label_buf,
+    );
+
     var capture_final_hidden = false;
     var final_hidden_input = hidden_input;
     var prepared_final_hidden_input = false;
     var original_hidden_input: CT = undefined;
     var owns_original_hidden_input = false;
-    const prepared = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(label, hidden_input)) orelse
+    const prepared = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) orelse
         return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
             cb,
             allocator,
@@ -1461,11 +1708,6 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
     errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
     errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
-    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
-    const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
-    const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
-    const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
-    const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
     _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
     if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
         if (prepared_final_hidden_input) {
@@ -1482,7 +1724,7 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
         };
     }
 
-    capture_final_hidden = try cb.debugCudaGraphCaptureBegin(label);
+    capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
     if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.mtp_capture_input", final_hidden_input);
     if (capture_final_hidden) try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
     errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
@@ -1535,15 +1777,53 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
     return hidden_result;
 }
 
-fn cudaMtpTargetReplayEnabled(
+fn cudaMtpReplayContextKeyEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_REPLAY_CONTEXT_KEY", true);
+}
+
+fn cudaMtpReplayContextLabel(
+    base_label: []const u8,
+    batch: usize,
+    seq_len: usize,
+    query_seq_len: usize,
+    position_offset: usize,
+    kv_seq_len: usize,
+    total_sequence_len: usize,
+    kv_position_offset: usize,
+    buf: []u8,
+) []const u8 {
+    if (!cudaMtpReplayContextKeyEnabled()) return base_label;
+    return std.fmt.bufPrint(
+        buf,
+        "{s}|b={d}|seq={d}|q={d}|pos={d}|kv={d}|tot={d}|kvo={d}",
+        .{
+            base_label,
+            batch,
+            seq_len,
+            query_seq_len,
+            position_offset,
+            kv_seq_len,
+            total_sequence_len,
+            kv_position_offset,
+        },
+    ) catch base_label;
+}
+
+fn cudaMtpFinalHiddenReplayEnabled(
     cb: *const ComputeBackend,
     config: Config,
     batch: usize,
     seq_len: usize,
     decode_context: ?*const DecodeContext,
+    label: []const u8,
 ) bool {
-    const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
-    if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
+    const assistant_replay = std.mem.indexOf(u8, label, "mtp_assistant") != null;
+    if (assistant_replay) {
+        if (!platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ASSISTANT_REPLAY", false)) return false;
+    } else {
+        const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
+        if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
+    }
     if (cb.kind() != .cuda) return false;
     if (config.family != .gemma or config.usesMoe()) return false;
     if (batch != 1) return false;
@@ -1556,7 +1836,7 @@ fn cudaMtpTargetReplayEnabled(
 
 fn cudaMtpReplayRowAllowed(rows: usize) bool {
     if (rows == 0) return false;
-    const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_REPLAY_VERIFY_ROWS") orelse "1";
+    const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_REPLAY_VERIFY_ROWS") orelse "1,2,3,4,5";
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part_raw| {
         const part = std.mem.trim(u8, part_raw, " \t\r\n");
@@ -5243,6 +5523,36 @@ pub fn maybeScaleTokenEmbeddings(
     return result;
 }
 
+pub fn lookupScaledTokenEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    embed_w: CT,
+    input_ids: []const i64,
+    total: usize,
+    hidden_size: usize,
+) !CT {
+    const scale = config.tokenEmbeddingScale();
+    if (try cb.embeddingLookupScaled(embed_w, input_ids, total, hidden_size, scale)) |scaled| return scaled;
+    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+    return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+}
+
+pub fn lookupScaledTokenEmbeddingsTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    embed_w: CT,
+    input_token: CT,
+    total: usize,
+    hidden_size: usize,
+) !?CT {
+    const scale = config.tokenEmbeddingScale();
+    if (try cb.embeddingLookupTensorScaled(embed_w, input_token, total, hidden_size, scale)) |scaled| return scaled;
+    const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
+    return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+}
+
 pub fn maybeAdjustNormWeight(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -8084,7 +8394,7 @@ fn applyNormAt(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: 
     }
 }
 
-fn applyFinalNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT) !CT {
+pub fn applyFinalNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT) !CT {
     const dim = config.hidden_size;
     switch (config.family) {
         .deepseek_v4 => {
@@ -8898,6 +9208,103 @@ pub fn computePleVectors(
     const token_embd_raw = try cb.embeddingLookup(token_w, input_ids, total, ple_total_dim);
     defer cb.free(token_embd_raw);
 
+    return try computePleVectorsFromTokenPath(cb, allocator, config, token_embd_raw, hidden, total, ple_dim, num_layers, ple_total_dim);
+}
+
+pub fn computePleVectorsFromTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    hidden: CT,
+    total: usize,
+) !?CT {
+    if (!config.hasPle() or disablePleDebug()) return null;
+    const ple_dim: usize = config.ple_hidden_size;
+    const num_layers: usize = config.num_hidden_layers;
+    const ple_total_dim: usize = ple_dim * num_layers;
+
+    const token_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelWeight(cb, config, "model.embed_tokens_per_layer.weight"),
+        else => return err,
+    };
+    defer cb.free(token_w);
+
+    if (try computePleVectorsFromTokenEmbeddingTensorPath(cb, allocator, config, token_w, input_token, hidden, total, ple_dim, num_layers, ple_total_dim)) |fused| {
+        return fused;
+    }
+
+    const token_embd_raw = (try cb.embeddingLookupTensor(token_w, input_token, total, ple_total_dim)) orelse return null;
+    defer cb.free(token_embd_raw);
+
+    return try computePleVectorsFromTokenPath(cb, allocator, config, token_embd_raw, hidden, total, ple_dim, num_layers, ple_total_dim);
+}
+
+fn computePleVectorsFromTokenEmbeddingTensorPath(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_w: CT,
+    input_token: CT,
+    hidden: CT,
+    total: usize,
+    ple_dim: usize,
+    num_layers: usize,
+    ple_total_dim: usize,
+) !?CT {
+    if (cb.kind() != .cuda) return null;
+    const proj_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_model_proj.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelWeight(cb, config, "model.per_layer_model_projection.weight"),
+        else => return err,
+    };
+    defer cb.free(proj_w);
+    const model_proj_raw = try cb.linearNoBias(hidden, proj_w, total, config.hidden_size, ple_total_dim);
+
+    const proj_norm_base_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_proj_norm.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelWeight(cb, config, "model.per_layer_projection_norm.weight"),
+        else => return err,
+    };
+    defer cb.free(proj_norm_base_w);
+    const proj_norm_w = try maybeAdjustNormWeight(cb, allocator, config, proj_norm_base_w, ple_dim);
+    defer if (proj_norm_w != proj_norm_base_w) cb.free(proj_norm_w);
+
+    const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+    const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.norm_eps, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
+        cb.free(model_proj_raw);
+        return fused;
+    }
+
+    if (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) |reshaped| {
+        defer cb.free(model_proj_raw);
+        defer cb.free(reshaped);
+
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.norm_eps);
+        defer cb.free(normed_flat);
+
+        const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
+            return error.ReshapeFailed;
+        defer cb.free(normed_proj);
+
+        return try cb.addWeightedEmbeddingTensor(token_w, input_token, normed_proj, total, ple_total_dim, embed_scale_val * combine_scale_val, combine_scale_val);
+    }
+
+    cb.free(model_proj_raw);
+    return null;
+}
+
+fn computePleVectorsFromTokenPath(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_embd_raw: CT,
+    hidden: CT,
+    total: usize,
+    ple_dim: usize,
+    num_layers: usize,
+    ple_total_dim: usize,
+) !CT {
+
     // Context-aware path: project hidden → all-layer PLE space,
     // then scale by 1/sqrt(hidden_size).
     const proj_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_model_proj.weight") catch |err| switch (err) {
@@ -8934,22 +9341,27 @@ pub fn computePleVectors(
         // HF: (RMSNorm(proj) + embed * sqrt(ple_dim)) * (1/sqrt(2))
         // RMSNorm is scale-invariant so 1/sqrt(hidden) pre-norm factor washes out.
         const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+        const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+        if (try cb.addWeightedScalars(token_embd_raw, normed_proj, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
+            return fused;
+        }
+
         const scale_shape = [_]i32{1};
-        const embed_scale_ct = try cb.fromFloat32Shape(&[_]f32{embed_scale_val}, &scale_shape);
-        defer cb.free(embed_scale_ct);
-
-        const token_scaled = try cb.multiply(token_embd_raw, embed_scale_ct);
-        defer cb.free(token_scaled);
-
-        const combined = try cb.add(token_scaled, normed_proj);
+        const combined = blk: {
+            const embed_scale_ct = try cb.fromFloat32Shape(&[_]f32{embed_scale_val}, &scale_shape);
+            defer cb.free(embed_scale_ct);
+            if (try cb.addMultiplyScalarTensor(token_embd_raw, normed_proj, embed_scale_ct)) |fused| break :blk fused;
+            const token_scaled = try cb.multiply(token_embd_raw, embed_scale_ct);
+            defer cb.free(token_scaled);
+            break :blk try cb.add(token_scaled, normed_proj);
+        };
         defer cb.free(combined);
 
-        const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+        if (try cb.multiplyScalar(combined, combine_scale_val)) |scaled| return scaled;
+
         const combine_ct = try cb.fromFloat32Shape(&[_]f32{combine_scale_val}, &scale_shape);
         defer cb.free(combine_ct);
-
-        const result = try cb.multiply(combined, combine_ct);
-        return result;
+        return try cb.multiply(combined, combine_ct);
     }
 
     // CPU fallback (native path): rmsNorm handles chunked dim natively.
@@ -9008,12 +9420,12 @@ pub fn applyPle(
         else => return err,
     };
     defer cb.free(gate_w);
-    const gate_proj = try cb.linearNoBias(hidden, gate_w, total, hidden_size, ple_dim);
-    defer cb.free(gate_proj);
 
     // 2. Element-wise multiply gate with this layer's PLE conditioning vector.
     const activation_kind = decoderRuntimeActivationKind(config.activation);
-    const gated = if (try cb.activationMultiplySliceLastDim(gate_proj, ple_vectors, ple_offset, ple_offset + ple_dim, activation_kind)) |fused| fused else blk: {
+    const gated = if (try cb.linearNoBiasActivationSliceLastDim(hidden, gate_w, ple_vectors, total, hidden_size, ple_dim, ple_offset, activation_kind)) |fused| fused else blk: {
+        const gate_proj = try cb.linearNoBias(hidden, gate_w, total, hidden_size, ple_dim);
+        defer cb.free(gate_proj);
         const ple_ct = try cb.sliceLastDim(ple_vectors, ple_offset, ple_offset + ple_dim);
         defer cb.free(ple_ct);
         if (try cb.activationMultiply(gate_proj, ple_ct, activation_kind)) |fused| {

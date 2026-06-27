@@ -256,11 +256,601 @@ Current CUDA behavior:
   `ANTFLY_CUDA_DISABLE_TURBOQUANT_KV=1` fall back to the existing non-compressed
   path.
 
-Status checked on 2026-06-21 on an NVIDIA L4 (`sm_89`) with CUDA Toolkit 13.2
+Gemma4 CUDA decode graph replay is controlled by
+`ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY=off|auto|required`. The E4B QAT
+production gate uses `required` with stable temp reuse, delayed capture, device
+decode scalars, and persistent replay. The gate defaults are:
+`ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1`,
+`ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED=1`,
+`ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ=10000`,
+`ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=0`, and
+`ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=1024`.
+For f32 KV decode, the production Gemma4 path also uses the scalar-replay-aware
+fast GQA kernel when the shape is `batch=1`, `q_seq_len=1`, no mask/bias, and a
+32-aligned head dimension up to 512. Set `ANTFLY_CUDA_DISABLE_FAST_GQA_DECODE=1`
+to force the legacy scalar replay kernel. JSON timing exposes
+`launch_attention_gqa_decode_fast` and
+`launch_attention_gqa_decode_fast_fallbacks`; the E4B QAT gate requires fast
+hits to be non-zero and fast fallbacks to remain zero.
+
+Tiny decode scalar uploads and downloads use pinned host staging by default.
+Set `ANTFLY_INFERENCE_CUDA_DISABLE_PINNED_SCALAR_UPLOADS=1` or
+`ANTFLY_INFERENCE_CUDA_DISABLE_PINNED_SCALAR_DOWNLOADS=1` to restore the older
+host transfer paths for A/B testing.
+
+Greedy CUDA generation also carries the previous token as a backend tensor when
+the native pipeline can prove pure greedy decode, no grammar, CUDA backend, and
+resident decode KV. This now supports Gemma4 PLE/QAT token embeddings. Set
+`ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF=0` to disable that
+token-tensor handoff for A/B testing. JSON timing exposes
+`generation_decoder_runtime.device_token_handoff_attempts`, `*_hits`,
+`*_fallbacks`, and `*_seeds`; the E4B QAT 512-token validation requires
+handoff hits to match post-seed decode steps. The same gate also requires the
+raw i32 token export path for greedy token reads, reported as
+`cuda_generate.to_float32_calls=0` and `cuda_generate.to_float32_bytes=0`, so
+single-token extraction does not fall back through the float-conversion
+download path.
+
+Pure-greedy non-streaming CUDA decode can delay host-visible token readback by
+one decode step with `ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK=1`.
+The path keeps the argmax token as a backend tensor, enqueues an async pinned
+4-byte i32 download, speculatively reserves the next KV slot, launches the
+following decode, and then resolves the prior token id from the completed event.
+EOS rollback truncates the speculative slot and synchronizes the discarded
+lookahead tensor before stop. The E4B QAT production gate enables this path and
+requires `cuda.download_syncs<=4` for each 512-token target run.
+
+The deeper Gemma4 gated-runtime token-tensor decode experiment is behind
+`ANTFLY_INFERENCE_CUDA_GATED_TOKEN_TENSOR_DECODE=1` and is off by default. It
+tries to keep the token id tensor inside the Gemma4 PLE/gated runtime instead of
+only handing the token tensor to the shared GPT decode path. On the current L4
+diagnostic this regressed throughput by losing replay/handoff efficiency
+(`/tmp/gemma4-e4b-qat-gated-tensor-16.json` reported
+`decode_tok_per_s=11.503`, `graph_capture_persistent_replays=0`, and zero
+device-token handoff hits), so it is retained only as an opt-in implementation
+probe. The default path was revalidated after gating this off:
+`/tmp/gemma4-e4b-qat-gated-default-16.json` reported
+`decode_tok_per_s=18.265`, `device_token_handoff_hits=15`,
+`device_token_handoff_fallbacks=0`, and
+`graph_capture_persistent_replays=4`.
+
+The earlier 2026-06-25 512-token E4B QAT default-path L4 validation
+(`/tmp/gemma4-e4b-qat-gated-default-512.json`) reported
+`decode_tok_per_s=15.019`, `device_token_handoff_hits=511`,
+`device_token_handoff_fallbacks=0`, `device_token_handoff_seeds=1`,
+`graph_capture_persistent_replays=500`, `launches_per_token=25.867`, and zero
+fast-GQA or Q4_0 fused-kernel fallbacks. This cleared the then-current numeric
+gate in that run, but previous repeats landed just under 15 tok/s, so it
+motivated the later Q4_0 kernel and token-export work below.
+
+Q4_0 tile8 decode kernels are compiled and smoke-tested. The global
+`ANTFLY_INFERENCE_CUDA_Q4_0_DECODE_TILE8=1` switch still enables all tile8
+variants for A/B testing, but the E4B QAT L4 production gate now defaults the
+tile8 family off. The isolated 128-token matrix showed QKV tile8 and gate/up-pair
+tile8 slower than tile4, and later 512-token compressed-KV gates were faster
+with Q4_0 gated-down precompute on the tile4 path. Per-kernel controls are
+available as
+`ANTFLY_INFERENCE_CUDA_Q4_0_QKV_TILE8=1`,
+`ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_TILE8=1`,
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8=1`, and
+`ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_TILE8=1`.
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE16=1` is compiled only as a wider
+tile experiment. The 128-token L4 run
+`/tmp/gemma4-e4b-qat-tile-split-down16-128.json` reported
+`decode_tok_per_s=16.028`, slower than the tile4 baseline and gated-down tile8,
+so it is not part of the production gate.
+
+The Q4_0 decode kernels also precompute the packed-nibble offset and high-nibble
+flag once per input lane before the inner column loop. This keeps the original
+per-lane scale load behavior but removes repeated lane branch/address work in
+the hot Q4_0 tile, embedding, QKV, pair, gated-down, and argmax kernels. The
+first warp-broadcast scale experiment regressed and was removed
+(`/tmp/gemma4-e4b-qat-warp-scale-128.json` reported
+`decode_tok_per_s=14.735`). The branch-hoisted candidate fed the current
+production path: `/tmp/gemma4-e4b-qat-q4nibble-128.json` reported
+`decode_tok_per_s=19.997`; after applying the same helper to Q4_0 embedding
+lookup, `/tmp/gemma4-e4b-qat-q4nibble-embed-128.json` reported
+`decode_tok_per_s=19.913`. The 512-token repeats
+`/tmp/gemma4-e4b-qat-q4nibble-512.json` and
+`/tmp/gemma4-e4b-qat-q4nibble-512-r2.json` were historical tile8 A/B runs and
+reported `17.376` and `17.227` tok/s with
+`graph_capture_persistent_replays=500`, device-token handoff hits for all
+post-seed decode steps, and zero Q4_0 fused-kernel fallbacks. Later 512-token
+production gates defaulted tile8 off after the tile4 gated-down precompute path
+proved faster.
+
+CUDA greedy token extraction now exports the 1x i32 token tensor directly
+instead of converting it through `toFloat32`. The 128-token check
+`/tmp/gemma4-e4b-qat-i32-export-128.json` reported
+`decode_tok_per_s=19.953` with `cuda_generate.to_float32_calls=0` and
+`cuda_generate.to_float32_bytes=0`. PLE combine now uses the CUDA
+`addWeightedScalars` fusion, replacing the previous add-multiply-plus-scale
+sequence with one weighted combine launch, and the hot device-token PLE path
+fuses the Q6_K per-layer token embedding lookup into that weighted combine. The
+current target-vs-Q4_K production gate at
+`/tmp/gemma4-q4-target-vs-q4k-new-defaults-gate-20260625-r1` ran one 512-token E4B Q4_K
+baseline and one 512-token E4B QAT Q4_0 target pass with delayed token readback,
+PLE fusion, scaled embedding lookup, and fused PLE embedding-combine enabled.
+The Q4_K baseline reported `decode_tok_per_s=16.676`; QAT reported
+`30.125` tok/s, a `1.806x` QAT-over-Q4_K ratio against the gate's default
+`MIN_E4B_QAT_OVER_Q4K_RATIO=1.25` floor. The QAT run kept
+`graph_capture_persistent_replays=500`, `launches_per_token=21.787`,
+`launch_embedding=513`, `launch_scalar=0`, `add_mul_scalar_fused=512`,
+`linear_activation_slice_fused_q4_0=504`, `qkv_fused_q4_0=288`,
+`linear_pair_fused_q4_0=504`, `gated_down_fused_q4_0=504`,
+`gated_down_fused_q4_0_precompute=462`, `gated_down_fused_q4_0_tile8=0`,
+`device_token_handoff_hits=511`, Q4_0 fused fallbacks at zero,
+`graph_capture_capacity_skips=0`, and `download_syncs=2`.
+The default E4B QAT production gate is now `E4B_QAT_REPEATS=2`,
+`MIN_E4B_QAT_TOK_S=24.0`, `MIN_E4B_QAT_RUN_TOK_S=24.0`,
+`E4B_QAT_PENDING_TOKEN_READBACK=1`, `E4B_QAT_MAX_DOWNLOAD_SYNCS=4`,
+`E4B_QAT_REQUIRE_PLE_FUSION=1`, `E4B_QAT_Q4_0_GATED_DOWN_TILE8=0`,
+`E4B_QAT_REQUIRE_GATED_DOWN_TILE8=0`,
+`E4B_QAT_Q4_0_PLE_GATE_FUSION=1`, `E4B_QAT_PLE_RMS_EMBED_FUSION=0`,
+`E4B_QAT_MAX_LAUNCHES_PER_TOKEN=22.5`, and, when an `E4B_Q4K_BASELINE` is
+present, `MIN_E4B_QAT_OVER_Q4K_RATIO=1.25` on the L4 gate.
+
+The long-context replay gate is opt-in so the normal 512-token production gate
+stays fast:
+
+```bash
+RUN_BUILD=0 RUN_SMOKE=0 RUN_MICROBENCH=0 RUN_DEFAULT_POLICY=0 \
+RUN_TARGET_ONLY=0 RUN_E4B_Q4K_BASELINE=off RUN_E4B_QAT=off \
+RUN_E4B_QAT_LONG=required E4B_QAT_LONG_MIN_TOKENS=900 \
+RUN_12B_MTP=0 RUN_E2B_MTP=0 RUN_TIMEOUT=720s \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+The top-level gate also has an opt-in QAT resident soak check for serving
+stability under concurrent HTTP load. It reuses the preloaded QAT server after
+the warm pass, sends concurrent requests, gates aggregate throughput, and
+requires per-request throughput, p95 latency, and graph replay coverage across
+the warm plus soak tokens:
+
+```bash
+RUN_BUILD=0 RUN_SMOKE=0 RUN_MICROBENCH=0 RUN_DEFAULT_POLICY=0 \
+RUN_TARGET_ONLY=0 RUN_E4B_QAT_LONG=off RUN_E4B_QAT_RESIDENT=required \
+RUN_E4B_QAT_RESIDENT_SOAK=required RUN_E4B_Q4K_RESIDENT_BASELINE=off \
+RUN_12B_MTP=0 RUN_E2B_MTP=0 \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+For overload behavior, the top-level gate can also start the resident server
+with bounded weighted request capacity and require excess concurrent generation
+requests to fail quickly with HTTP 503 instead of sitting in a long queue:
+
+```bash
+RUN_BUILD=0 RUN_SMOKE=0 RUN_MICROBENCH=0 RUN_DEFAULT_POLICY=0 \
+RUN_TARGET_ONLY=0 RUN_E4B_QAT_LONG=off RUN_E4B_QAT_RESIDENT=required \
+RUN_E4B_QAT_RESIDENT_BACKPRESSURE=required \
+E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS=6 \
+RUN_E4B_Q4K_RESIDENT_BASELINE=off RUN_12B_MTP=0 RUN_E2B_MTP=0 \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+The gate passes this through to `antfly-inference run` as
+`--max-concurrent-requests 6`; operators can use the same flag directly for
+per-replica admission control. The top-level and package-local gates both fail
+before starting a resident server if soak/backpressure is enabled without
+`RUN_E4B_QAT_RESIDENT`, or if backpressure is enabled without
+`E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS`, so CI catches admission-control
+misconfiguration without spending a model warmup.
+The resident server also exports admission-control telemetry from `/metrics`:
+`antfly_inference_request_queue_capacity`,
+`antfly_inference_request_queue_depth`,
+`antfly_inference_request_queue_available`,
+`antfly_inference_request_queue_active_requests`,
+`antfly_inference_request_queue_rejections_total`, and
+`antfly_inference_request_queue_rejected_units_total`. The metrics-backed
+top-level run at
+`/tmp/gemma4-cuda-top-resident-backpressure-metrics-20260625-r1` reported two
+accepted and two rejected requests, `queue_rejections=2`,
+`queue_rejected_units=6`, queue depth `0`, queue active requests `0`, and queue
+available `6` after the accepted requests completed.
+
+The current integrated run at
+`/tmp/gemma4-cuda-production-gate-20260625-integrated` requested 1024 tokens,
+forced graph replay KV capacity to 2048, required at least 900 generated tokens,
+and generated 936 tokens before EOS. It reported `decode_tok_per_s=15.844`,
+`graph_capture_persistent_replays=926`, `graph_capture_capacity_skips=0`,
+`launches_per_token=14.238`, `launch_embedding=939` (the long gate allows
+`tokens+3` for EOS/lookahead cleanup), `launch_scalar=0`,
+`add_mul_scalar_fused=938`, `device_token_handoff_hits=937`,
+`device_token_handoff_fallbacks=0`, `download_syncs=1`, and zero Q4_0/GQA
+fallback counters.
+
+The preloaded resident serving gate is opt-in in the package-local production
+gate. It starts `antfly-inference run` with `--preload-model
+generator:cuda:<E4B_QAT>`, keeps the model resident, then measures warm HTTP
+generation requests through `/ai/v1/generate`:
+
+```bash
+RUN_MTP=off RUN_RESIDENT=off RUN_E4B_QAT=off RUN_E4B_QAT_LONG=off \
+RUN_E4B_QAT_RESIDENT=required RUN_E4B_Q4K_BASELINE=off \
+RUN_E4B_Q4K_RESIDENT_BASELINE=required \
+E4B_Q4K_BASELINE_MODEL=/home/timkaye/tim/antfly/.models/google/gemma-4-E4B-it-q4_k \
+E4B_QAT_RESIDENT_TOKENS=512 E4B_QAT_RESIDENT_WARM_REPEATS=2 \
+E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY=required \
+E4B_Q4K_RESIDENT_DECODE_GRAPH_REPLAY=required \
+MIN_E4B_QAT_RESIDENT_WARM_TOK_S=15.0 \
+MIN_E4B_QAT_RESIDENT_OVER_Q4K_RATIO=1.05 \
+zig/pkg/inference/scripts/gemma4_cuda_production_gate.sh --mtp-only
+```
+
+The top-level production gate exposes the same opt-in serving check:
+
+```bash
+RUN_BUILD=0 RUN_SMOKE=0 RUN_MICROBENCH=0 RUN_DEFAULT_POLICY=0 \
+RUN_TARGET_ONLY=0 RUN_E4B_QAT_LONG=off RUN_E4B_QAT_RESIDENT=required \
+RUN_E4B_Q4K_RESIDENT_BASELINE=required RUN_12B_MTP=0 RUN_E2B_MTP=0 \
+E4B_Q4K_BASELINE=/home/timkaye/tim/antfly/.models/google/gemma-4-E4B-it-q4_k \
+E4B_QAT_RESIDENT_TOKENS=512 E4B_QAT_RESIDENT_WARM_REPEATS=2 \
+E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY=required \
+E4B_Q4K_RESIDENT_DECODE_GRAPH_REPLAY=required \
+MIN_E4B_QAT_RESIDENT_WARM_TOK_S=15.0 \
+MIN_E4B_QAT_RESIDENT_OVER_Q4K_RATIO=1.05 \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+The current forced-replay resident run at
+`/tmp/gemma4-cuda-qat-resident-replay-20260625-r3` preloaded and warmed the E4B
+QAT CUDA model, then completed two 128-token warm HTTP requests at `17.013` and
+`17.043` tok/s E2E (`avg=17.028`). The gate also asserted serving graph replay
+from the server log and reported `replays=246` with a `floor=42`. The serving
+path now mirrors CLI generation by attaching `KvStorageRuntime` to the decode
+state so CUDA can use device KV; CUDA graph slots are invalidated when a new
+per-request KV device hook is provisioned so a graph captured for one request
+cannot replay against freed KV buffers in the next request.
+The package-local QAT-vs-Q4_K serving ratio gate at
+`/tmp/gemma4-cuda-pkg-resident-q4k-ratio-20260625-r1` reported QAT resident
+warm requests at `17.049` and `17.030` tok/s E2E (`avg=17.040`) and Q4_K
+resident warm requests at `12.861` and `12.831` tok/s E2E (`avg=12.846`), for a
+serving ratio of `1.326x` against the `1.05x` floor.
+The package-local 512-token serving gate at
+`/tmp/gemma4-cuda-pkg-resident-q4k-ratio-512-20260625-r1` reported QAT
+resident warm requests at `16.211` and `16.061` tok/s E2E (`avg=16.136`) and
+Q4_K resident warm requests at `12.711` and `12.827` tok/s E2E (`avg=12.769`),
+for a serving ratio of `1.264x` against the `1.05x` floor with
+`graph_replays=1014` for both resident paths. The resident gate now defaults to
+512 generated tokens, requires CUDA graph replay, and uses a 15.0 tok/s warm
+floor; set `E4B_QAT_RESIDENT_TOKENS=128` only for shorter smoke checks.
+The top-level resident replay-only result at
+`/tmp/gemma4-cuda-top-resident-replay-20260625-r2` reported `17.111` and
+`17.134` tok/s E2E (`avg=17.123`) with `graph_replays=246`. The serving
+QAT-vs-Q4_K ratio gate at
+`/tmp/gemma4-cuda-top-resident-q4k-ratio-20260625-r3` reported QAT resident
+warm requests at `17.000` and `17.013` tok/s E2E (`avg=17.007`) and Q4_K
+resident warm requests at `12.796` and `12.785` tok/s E2E (`avg=12.790`), for a
+serving ratio of `1.330x` against the `1.05x` floor. The top-level
+`readiness.json` includes the resident, Q4_K baseline, and ratio step outcomes
+for downstream automation. New runs also emit `cuda_environment.json` and copy
+that object into `readiness.json` under `environment.cuda_smoke`; compare
+throughput artifacts together with `device_name`, `compute_capability`,
+`driver_version`, `artifacts`, and the CUDA smoke/capability map before
+promoting thresholds across GPUs. The package-local gate emits the same
+`cuda_environment.json` and `PASS cuda_environment` summary line by default
+(`RUN_CUDA_ENV=off` disables it; `RUN_CUDA_ENV=required` makes missing CUDA
+environment metadata fatal). Both gates also emit
+`e4b_qat_production_summary.json`, which gathers target QAT/Q4_K ratios,
+long-context QAT throughput, resident warm QAT/Q4_K ratios, soak latency and
+aggregate throughput, backpressure/queue metrics, graph replay counts, and the
+CUDA environment into a single artifact for CI dashboards and cross-GPU
+threshold review. The summary includes a `verdict` section; when a gate phase
+is enabled, the gate passes the same thresholds into the summary so missing
+evidence or sub-threshold QAT/Q4_K ratios are reported as structured
+`verdict.failures`, not just as free-form log output.
+For industry-style throughput targets, keep base decode and speculative decode
+separate. Public `40+ tok/s` Gemma 4 claims are usually measured on different
+hardware/runtime stacks, and the `120 tok/s` 12B QAT result used MTP/speculative
+decoding rather than one-token-at-a-time decode. The top-level gate can now run
+an E4B QAT MTP matrix with the official assistant path:
+
+```sh
+RUN_E4B_QAT_MTP=required \
+E4B_QAT_ASSISTANT_Q8=.models/google/gemma-4-E4B-it-assistant \
+E4B_QAT_MTP_TOKENS=512 \
+E4B_QAT_MTP_SPEC_KS="2 4 6" \
+E4B_QAT_MTP_PROMPT_FILTER="ants_chat code_chat" \
+RUN_12B_MTP=0 RUN_E2B_MTP=0 \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+The matrix writes `mtp_e4b_qat/summary.tsv`; `e4b_qat_production_summary.json`
+also includes it under `mtp.mtp_e4b_qat` with `best` and `best_active` rows.
+Use that artifact to track acceptance, active/disabled policy decisions,
+decode tok/s, and speedup versus target-only rows before treating MTP as a
+provider-competitive path.
+The top-level gate also has an opt-in compressed-KV QAT check:
+
+```sh
+RUN_TARGET_ONLY=0 RUN_E4B_QAT_LONG=off RUN_E4B_QAT_RESIDENT=off \
+RUN_E4B_QAT_COMPRESSED_KV=required RUN_12B_MTP=0 RUN_E2B_MTP=0 \
+RUN_E4B_QAT_MTP=off \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+This forces the requested `--cache-dtype` path with
+`E4B_QAT_COMPRESSED_KV_DTYPE=polar4` and
+`E4B_QAT_COMPRESSED_KV_TURBOQUANT_MIN_TOKENS=0`, then validates 512 generated
+tokens, decode tok/s, persistent graph replays, download syncs, page-boundary
+capacity skips, and compressed-V read/write counters. On 2026-06-25 the
+artifact `/tmp/gemma4-q4-compressed-kv-new-defaults-gate-20260625-r1` reported
+`38.823 tok/s`, `500` persistent replays, `501` graph replays, `2` download
+syncs, `0` capacity skips, `462` fast compressed-GQA launches, `504`
+compressed-V reads, `288` compressed-V writes, `24` paged block-table uploads,
+`504` fused PLE gate projections, `462` Q4_0 gated-down precompute hits, zero
+Q4_0 gated-down tile8 hits, and `22.303` launches/token. The attention-read
+path now elides the block-table lookup when the paged KV allocation is
+identity-contiguous while retaining the normal block-table path for
+non-contiguous pages. The final validation artifact
+`/tmp/gemma4-q4-compressed-kv-identity-attn-only-gate-20260625-r1` reported
+`38.956 tok/s`, `504` identity attention reads, `24` paged block-table uploads,
+`500` persistent graph replays, `2` download syncs, and `0` capacity skips;
+earlier attention-only repeats landed at `39.354` and `39.219` tok/s. This
+closes the page-boundary graph-break blocker, enables the paged/block-table
+Polar4 compressed attention fast path, defaults the row-1 Q4_0 gate/up pair
+kernel to the 4-warp tile4 variant, defaults Q4_0 gated-down to precompute
+`activation(gate) * up` once before the down projection, and leaves the fused
+PLE RMS/embed construction opt-in via
+`ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION=1` because it lowers launch count
+but has not beaten the default path reliably in gate runs. The combined gate/up
+activation kernel also remains opt-in via
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1` because it
+regressed to `37.185 tok/s` on the same gate. Write-side block-table elision was
+tested and backed out after regressing to `38.850 tok/s`. Treat the repeatable
+near-39.5 tok/s result as the focused production target; the full-release
+blocking floor is set to `36.0 tok/s` to avoid flaking on mixed-gate
+run-to-run variance, with
+`40 tok/s` kept as a stretch/provider-reference target rather than a hard
+blocker. The industry-grade focused gate at
+`/tmp/gemma4-e4b-qat-industry-compressed-gate-20260625-r1` passed with
+`39.102 tok/s`, `500` persistent graph replays, `2` download syncs, `0`
+capacity skips, `504` compressed-V reads, `288` compressed-V writes, `24` paged
+block-table uploads, `504` identity attention reads, `462` fast GQA launches,
+and `0` compressed-KV write fallbacks.
+For a fixed industry-style floor without a provider baseline, enable the
+competitive-floor verdict explicitly:
+
+```sh
+RUN_E4B_QAT_COMPETITIVE_FLOOR=required \
+RUN_E4B_QAT_COMPRESSED_KV=required \
+E4B_QAT_COMPETITIVE_FLOORS="compressed_kv_decode_tok_s=36.0" \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+When `RUN_E4B_QAT_COMPRESSED_KV=required`, the gate and
+`e4b_qat_production_summary.json` now require more than speed: at least the
+configured token count, persistent graph replays, bounded download syncs, zero
+capacity skips, compressed V reads/writes, paged block-table uploads, identity
+attention fast-path hits for the fresh contiguous benchmark, fast GQA launches,
+and zero compressed-KV write fallbacks. This keeps a provider-readiness artifact
+from passing if the benchmark silently falls back to f32 KV, non-paged attention,
+or host-heavy decode.
+
+Supported floor metrics are the same local metrics used for provider
+comparison: `compressed_kv_decode_tok_s`, `target_decode_tok_s`,
+`long_decode_tok_s`, `resident_e2e_tok_s`, `soak_aggregate_tok_s`, and
+`backpressure_accepted_e2e_tok_s`. The fixed local floor should target
+`compressed_kv_decode_tok_s` because that is the paged Polar4 KV production
+speed path; the f32 target metric remains useful for QAT/Q4_K apples-to-apples
+kernel comparisons. This gate is intentionally separate from the QAT/Q4_K ratio
+check, so CI can report "faster than Q4_K", "near-40 compressed KV floor", and
+"provider baseline ratio" as distinct readiness claims.
+Provider comparisons are optional but enforceable: set
+`RUN_E4B_QAT_PROVIDER_COMPARISON=required`,
+`E4B_QAT_PROVIDER_BASELINE_JSON=/path/to/provider-baselines.json` or
+`E4B_QAT_PROVIDER_BASELINE_INLINE='{"baselines":[...]}'`, and
+`MIN_E4B_QAT_PROVIDER_RATIO=1.0` to require local QAT throughput to meet or
+beat external/provider baselines. Each baseline entry can name a `provider`, a
+`metric` (`compressed_kv_decode_tok_s`, `target_decode_tok_s`,
+`long_decode_tok_s`, `resident_e2e_tok_s`, `soak_aggregate_tok_s`, or
+`backpressure_accepted_e2e_tok_s`), and a `tok_s` value; per-entry `min_ratio`
+overrides the global ratio. These comparisons are recorded under
+`provider_comparison` and fail the summary verdict on missing metrics, load
+errors, or local/provider ratios below the floor.
+`E4B_QAT_REQUIRE_PROVIDER_METADATA=1` is the default for provider comparisons;
+release baselines must also provide `model`, `hardware`, `tokens`, `workload`,
+`measured_at`, and `source_url` so the provider claim is auditable and matched
+to the same workload shape.
+Use `zig/pkg/inference/scripts/gemma4_qat_provider_baselines.example.json` as
+the template for real external measurements. Before making provider comparison
+required in CI, validate the baseline file independently:
+
+```sh
+python3 zig/pkg/inference/scripts/gemma4_qat_production_summary.py \
+  --validate-provider-baselines-only \
+  --provider-baseline /path/to/provider-baselines.json \
+  --output /tmp/gemma4-provider-baseline-validation.json
+```
+
+This standalone mode checks that the file loads, uses supported metrics, and
+contains the required provenance fields. The full production gate still performs
+the local/provider throughput ratio check using the metrics from that gate run.
+For OpenAI-compatible providers, collect a matching non-streaming 512-token
+baseline with the provider benchmark helper instead of hand-authoring the JSON:
+
+```sh
+PROVIDER_API_KEY=... \
+python3 zig/pkg/inference/scripts/gemma4_qat_provider_benchmark.py \
+  --base-url https://provider.example/v1 \
+  --api-key-env PROVIDER_API_KEY \
+  --provider provider-name \
+  --model google/gemma-4-E4B-it-qat-q4_0-gguf \
+  --hardware "provider GPU or instance class" \
+  --source-url https://provider.example/run-or-dashboard \
+  --tokens 512 \
+  --min-completion-tokens 512 \
+  --repeats 2 \
+  --warmup 1 \
+  --baseline-stats avg,median,min \
+  --output /tmp/gemma4-provider-baselines.json \
+  --rows-tsv /tmp/gemma4-provider-baselines.tsv
+```
+
+The helper writes `baselines[]` in the same schema consumed by
+`E4B_QAT_PROVIDER_BASELINE_JSON` and records per-request rows for audit. For
+production comparisons, keep `avg,median,min` so the summary emits separate,
+labeled provider comparison checks from one measured provider run; use
+`--baseline-stat avg` only for narrow experiments.
+For providers that publish or optimize for streaming throughput, collect a
+streamed decode baseline and compare it to Antfly's local decode-rate metric:
+
+```sh
+PROVIDER_API_KEY=... \
+python3 zig/pkg/inference/scripts/gemma4_qat_provider_benchmark.py \
+  --base-url https://provider.example/v1 \
+  --api-key-env PROVIDER_API_KEY \
+  --provider provider-name \
+  --model google/gemma-4-E4B-it-qat-q4_0-gguf \
+  --hardware "provider GPU or instance class" \
+  --source-url https://provider.example/run-or-dashboard \
+  --metric target_decode_tok_s \
+  --stream \
+  --rate-source stream_decode \
+  --tokens 512 \
+  --min-completion-tokens 512 \
+  --baseline-stats avg,median,min \
+  --output /tmp/gemma4-provider-stream-baselines.json
+```
+
+Streaming mode requests OpenAI-compatible `stream_options.include_usage=true`
+by default so completion-token counts remain provider-reported; use
+`--no-stream-include-usage --allow-token-fallback` only for providers that lack
+usage-bearing stream chunks and only when the prompt is known to complete at the
+requested token limit.
+The production gates can also collect that provider baseline inline before
+writing `e4b_qat_production_summary.json`:
+
+```sh
+PROVIDER_API_KEY=... \
+RUN_E4B_QAT_PROVIDER_BENCHMARK=required \
+RUN_E4B_QAT_PROVIDER_COMPARISON=required \
+E4B_QAT_PROVIDER_BASE_URL=https://provider.example/v1 \
+E4B_QAT_PROVIDER_API_KEY_ENV=PROVIDER_API_KEY \
+E4B_QAT_PROVIDER_NAME=provider-name \
+E4B_QAT_PROVIDER_HARDWARE="provider GPU or instance class" \
+E4B_QAT_PROVIDER_SOURCE_URL=https://provider.example/run-or-dashboard \
+E4B_QAT_PROVIDER_BASELINE_STATS=avg,median,min \
+scripts/gemma4_cuda_production_gate.sh
+```
+
+For streamed provider comparisons, add
+`E4B_QAT_PROVIDER_STREAM=1`,
+`E4B_QAT_PROVIDER_RATE_SOURCE=stream_decode`, and usually
+`E4B_QAT_PROVIDER_METRIC=target_decode_tok_s`.
+
+This writes `e4b_qat_provider_baselines.json`,
+`e4b_qat_provider_baselines.tsv`, `e4b_qat_provider_benchmark.log`, and
+`e4b_qat_provider_baseline_validation.json` in the gate output directory, then
+feeds the generated JSON into the provider comparison verdict. The top-level
+gate also copies these paths plus the parsed validation result into
+`readiness.json` under `provider_benchmark`. `RUN_E4B_QAT_PROVIDER_BENCHMARK=auto`
+skips cleanly when `E4B_QAT_PROVIDER_BASE_URL` is unset.
+For merge/release readiness, run the CUDA release wrapper:
+
+```sh
+scripts/ci/gemma4-qat-cuda-release-gate.sh
+```
+
+The wrapper requires long-context decode, Polar4 compressed-KV decode, resident
+warm, resident soak, resident backpressure, resident Q4_K comparison, and the
+E4B QAT MTP safety matrix. It also re-checks
+`readiness.json` and `e4b_qat_production_summary.json` for the exact
+compressed-KV fast-path counters used by the release gate. The matching GitHub
+Actions workflow is `Gemma4 QAT CUDA Release Gate`; it is manual because it
+requires a GPU runner, local model artifacts, and optional provider credentials.
+Use `provider_mode=baseline` with `provider_baseline_json` to validate a
+pre-collected provider artifact, or `provider_mode=benchmark` with provider
+inputs plus `PROVIDER_API_KEY` to collect a fresh OpenAI-compatible provider
+baseline. Do not make an external provider claim from the local gate alone.
+The local release-wrapper validation at
+`/tmp/gemma4-e4b-qat-release-wrapper-gate-20260625-r2` passed `readiness=ok`
+and the wrapper post-check with compressed-KV `36.726` tok/s, `500` persistent
+graph replays, `504` compressed-V reads, `288` compressed-V writes, `24` paged
+block-table uploads, `504` identity attention reads, `462` fast GQA launches,
+and zero compressed-KV write fallbacks. The same run reported long-context QAT
+`26.181` tok/s over 936 generated tokens, resident QAT warm `27.093` tok/s
+E2E, resident Q4_K warm `17.818` tok/s E2E, resident ratio `1.521x`, soak
+aggregate `29.613` tok/s, soak p95 `17390.3` ms, backpressure `2` accepted and
+`2` rejected requests with max reject latency `6.7` ms, no unsafe resident graph
+markers, and zero active MTP candidates.
+The current required-phase top-level run at
+`/tmp/gemma4-current-local-required-20260625-r3` required CUDA smoke, target
+QAT/Q4_K, long-context QAT, resident QAT, resident Q4_K, soak, and
+backpressure phases after merging latest `main`. It passed `readiness=ok` with
+`verdict=ok`, zero verdict failures, L4 `sm_89` metadata, target QAT
+`avg=16.982` tok/s, target Q4_K `avg=11.596` tok/s, target ratio `1.464x`,
+long-context QAT `15.847` tok/s over 936 generated tokens, resident QAT
+`avg=16.108` tok/s E2E, resident Q4_K `avg=12.758` tok/s E2E, resident ratio
+`1.263x`, soak aggregate `16.896` tok/s, soak p95 `15476.5` ms, and
+backpressure with one accepted and three HTTP 503 rejected requests in at most
+`8.1` ms.
+The top-level 512-token serving gate at
+`/tmp/gemma4-cuda-top-resident-q4k-ratio-512-20260625-r1` reported QAT
+resident warm requests at `16.563` and `16.384` tok/s E2E (`avg=16.474`) and
+Q4_K resident warm requests at `12.745` and `12.815` tok/s E2E (`avg=12.780`),
+for a serving ratio of `1.289x` against the `1.05x` floor with
+`graph_replays=1014` for both resident paths.
+After tightening the defaults, the top-level default-settings run at
+`/tmp/gemma4-cuda-top-resident-defaults-512-20260625-r1` omitted the explicit
+token, replay, and warm-floor overrides and still ran 512-token resident
+requests. It reported QAT `avg=16.215` tok/s E2E, Q4_K `avg=12.768` tok/s E2E,
+`ratio=1.270x`, and `graph_replays=1014`. The package-local default-settings
+run at `/tmp/gemma4-cuda-pkg-resident-defaults-512-20260625-r1` likewise used
+512-token resident requests by default and reported QAT `avg=16.179` tok/s E2E,
+Q4_K `avg=12.762` tok/s E2E, `ratio=1.268x`, and `graph_replays=1014`.
+Package-local serving coverage now also includes the same post-warm soak and
+CLI-backed overload probes as the top-level gate. The combined package-local
+run at `/tmp/gemma4-cuda-pkg-resident-soak-backpressure-20260625-r1` used
+`--max-concurrent-requests 6`, reported QAT warm `avg=16.505` tok/s E2E,
+completed the six-request concurrency-two soak at aggregate `16.966` tok/s with
+minimum request `8.444` tok/s E2E and `p95=30317.3` ms, then accepted two and
+rejected two overload requests with HTTP 503 in at most `3.5` ms. The run kept
+graph replay coverage at `2544` against a `2496` soak floor and `3054` against
+a `1504` backpressure floor. The metrics-backed package-local backpressure run
+at `/tmp/gemma4-cuda-pkg-resident-backpressure-metrics-20260625-r1` reported
+QAT warm `avg=16.158` tok/s E2E, accepted two and rejected two requests,
+`queue_rejections=2`, `queue_rejected_units=6`, and post-run queue depth `0`.
+The first top-level soak run at
+`/tmp/gemma4-cuda-top-resident-soak-20260625-r1` completed the default two
+512-token warm requests at QAT `avg=16.303` tok/s E2E, then ran six 256-token
+HTTP requests with concurrency two against the same preloaded server. The soak
+step reported aggregate `16.933` tok/s, per-request `avg=9.875` tok/s E2E
+(queue time included), `graph_replays=2544`, and `graph_floor=2496`, with no
+unsafe graph-capture markers in the server log.
+After adding latency distribution gates, the stricter run at
+`/tmp/gemma4-cuda-top-resident-soak-latency-20260625-r1` completed the same
+profile with QAT warm `avg=16.336` tok/s E2E, soak aggregate `16.934` tok/s,
+minimum request `8.430` tok/s E2E against the 8.0 tok/s floor, `p50=30146.0`
+ms, `p95=30366.4` ms against the 35000 ms ceiling, `p99=30366.4` ms,
+`graph_replays=2544`, and `graph_floor=2496`.
+The longer 12-request soak at
+`/tmp/gemma4-cuda-top-resident-soak-12req-20260625-r1` kept the same
+concurrency-two, 256-token request shape and passed the same latency gates. It
+reported QAT warm `avg=16.154` tok/s E2E, soak aggregate `16.972` tok/s,
+minimum request `8.477` tok/s E2E, `p50=30176.4` ms, `p95=30200.7` ms,
+`p99=30200.7` ms, `graph_replays=4074`, and `graph_floor=3984`.
+The unconstrained concurrency-four probe at
+`/tmp/gemma4-cuda-top-resident-soak-c4-20260625-r1` kept aggregate throughput
+stable at `16.962` tok/s, but failed the per-request latency gate because queued
+requests stretched to `p95=105720.2` ms and individual request rates fell as low
+as `2.421` tok/s E2E. That is a production backpressure signal, not a decode
+kernel regression. The CLI-backed capacity gate at
+`/tmp/gemma4-cuda-top-resident-backpressure-cli-20260625-r2` started
+`antfly-inference run` with `--max-concurrent-requests 6`; with four concurrent
+256-token requests it accepted two, rejected two with HTTP 503 in at most
+`5.2` ms, completed the accepted requests at `avg=12.854` tok/s E2E, and kept
+graph replay coverage at `1524` against a `1504` floor.
+
+Status checked on 2026-06-25 on an NVIDIA L4 (`sm_89`) with CUDA Toolkit 13.2
 and driver R580:
 
 - `zig build -Dcuda=true`, `regen-cuda-artifacts.sh --check --all`,
   `antfly-inference cuda-info --smoke`, and `zig build test -Dcuda=true` pass.
+- After the resident default tightening, `/home/timkaye/tim/antfly/.tools/zig-x86_64-linux-0.16.0/zig build -Dcuda=true`
+  and `/home/timkaye/tim/antfly/.tools/zig-x86_64-linux-0.16.0/zig build test -Dcuda=true`
+  passed from `zig/pkg/inference`; the test run selected 1836 tests with 1750
+  passed and 86 skipped.
 - `polar4` is a production-candidate opt-in compressed-K/compressed-V path. It
   stays fully resident on CUDA with zero host attention fallback in the E2B and
   12B Q4 checks below.

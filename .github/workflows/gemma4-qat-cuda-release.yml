@@ -1,0 +1,120 @@
+name: Gemma4 QAT CUDA Release Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "GPU runner label"
+        required: true
+        default: "arc-antfly-gpu"
+      provider_mode:
+        description: "External provider comparison mode"
+        required: true
+        type: choice
+        default: "off"
+        options:
+          - "off"
+          - "baseline"
+          - "benchmark"
+      provider_baseline_json:
+        description: "Path to provider baseline JSON already present on the runner"
+        required: false
+        default: ""
+      provider_base_url:
+        description: "OpenAI-compatible provider base URL for benchmark mode"
+        required: false
+        default: ""
+      provider_name:
+        description: "Provider name for benchmark provenance"
+        required: false
+        default: ""
+      provider_hardware:
+        description: "Provider hardware/instance class for benchmark provenance"
+        required: false
+        default: ""
+      provider_source_url:
+        description: "Provider run/dashboard URL for benchmark provenance"
+        required: false
+        default: ""
+      provider_stream:
+        description: "Use streaming provider benchmark"
+        required: true
+        type: choice
+        default: "0"
+        options:
+          - "0"
+          - "1"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  release-gate:
+    name: QAT CUDA release gate
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git python3 ca-certificates
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Check CUDA device
+        run: nvidia-smi
+
+      - name: Configure optional provider comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          mode="${{ inputs.provider_mode }}"
+          if [[ "$mode" == "baseline" ]]; then
+            if [[ -z "${{ inputs.provider_baseline_json }}" ]]; then
+              echo "provider_mode=baseline requires provider_baseline_json" >&2
+              exit 1
+            fi
+            echo "E4B_QAT_PROVIDER_BASELINE_JSON=${{ inputs.provider_baseline_json }}" >> "$GITHUB_ENV"
+            echo "RUN_E4B_QAT_PROVIDER_COMPARISON=required" >> "$GITHUB_ENV"
+          elif [[ "$mode" == "benchmark" ]]; then
+            for value in \
+              "${{ inputs.provider_base_url }}" \
+              "${{ inputs.provider_name }}" \
+              "${{ inputs.provider_hardware }}" \
+              "${{ inputs.provider_source_url }}"; do
+              if [[ -z "$value" ]]; then
+                echo "provider_mode=benchmark requires provider URL, name, hardware, and source URL" >&2
+                exit 1
+              fi
+            done
+            echo "E4B_QAT_PROVIDER_BASE_URL=${{ inputs.provider_base_url }}" >> "$GITHUB_ENV"
+            echo "E4B_QAT_PROVIDER_NAME=${{ inputs.provider_name }}" >> "$GITHUB_ENV"
+            echo "E4B_QAT_PROVIDER_HARDWARE=${{ inputs.provider_hardware }}" >> "$GITHUB_ENV"
+            echo "E4B_QAT_PROVIDER_SOURCE_URL=${{ inputs.provider_source_url }}" >> "$GITHUB_ENV"
+            echo "E4B_QAT_PROVIDER_STREAM=${{ inputs.provider_stream }}" >> "$GITHUB_ENV"
+            echo "RUN_E4B_QAT_PROVIDER_BENCHMARK=required" >> "$GITHUB_ENV"
+            echo "RUN_E4B_QAT_PROVIDER_COMPARISON=required" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run release gate
+        env:
+          ZIG: zig
+          PROVIDER_API_KEY: ${{ secrets.PROVIDER_API_KEY }}
+          OUT_DIR: ${{ runner.temp }}/gemma4-qat-cuda-release-gate
+        run: scripts/ci/gemma4-qat-cuda-release-gate.sh
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: gemma4-qat-cuda-release-gate
+          path: ${{ runner.temp }}/gemma4-qat-cuda-release-gate
+          if-no-files-found: warn
