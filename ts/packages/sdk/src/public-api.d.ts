@@ -44,6 +44,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List configured external connections
+         * @description Enumerates public external connections configured on this node under
+         *     top-level `connections`: inference providers, web search providers,
+         *     external IO endpoints, and CDC replication sources.
+         *
+         *     The default response is config-derived and avoids slow provider calls.
+         *     With include=models, each inference provider is queried live for its
+         *     available models where the provider exposes a listing API. Connections
+         *     that fail to respond are reported with status "error" instead of
+         *     failing the whole response. A status of "configured" means the
+         *     connection exists but was not live-probed in this response.
+         */
+        get: operations["listConnections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/secrets": {
         parameters: {
             query?: never;
@@ -937,22 +966,241 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/lookup/{key}": {
+    "/db/v1/tables/{tableName}/documents/{key}": {
         parameters: {
             query?: never;
             header?: never;
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Key of the record to lookup */
+                /** @description Key of the document to retrieve */
                 key: string;
             };
             cookie?: never;
         };
-        /** Lookup a key in a table */
+        /** Retrieve a document by key */
         get: operations["lookupKey"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List derived document artifact manifests
+         * @description Returns the derived document artifact manifests currently available for
+         *     a source document. This lets clients discover artifact names before
+         *     inspecting a single manifest or triggering reprocessing.
+         */
+        get: operations["listDocumentArtifactManifests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reprocess a derived document artifact across a table range
+         * @description Runs a bounded operational repair pass for a derived document artifact
+         *     across source rows in key order. Use `next_key` from the response as
+         *     the next request's `from_key` for simple single-cursor continuation.
+         *     Distributed repair controllers should persist `shard_cursors` from the
+         *     response and pass them back on the next request to resume each shard
+         *     independently when scanning large sharded tables.
+         */
+        post: operations["reprocessDocumentArtifactRange"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a derived document artifact reprocess job
+         * @description Creates a durable user-facing repair job for a derived document
+         *     artifact. The job advances through the same bounded per-shard repair
+         *     primitive used by `/reprocess`, and stores returned continuation
+         *     cursors so hosted controllers can resume large sharded table repairs
+         *     without collapsing progress into a single global key cursor.
+         */
+        post: operations["startDocumentArtifactReprocessJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get derived document artifact reprocess job status */
+        get: operations["getDocumentArtifactReprocessJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a derived document artifact reprocess job
+         * @description Runs one bounded repair pass and persists the resulting job state.
+         */
+        post: operations["advanceDocumentArtifactReprocessJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a derived document artifact reprocess job */
+        post: operations["cancelDocumentArtifactReprocessJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Inspect a derived document artifact manifest
+         * @description Returns manifest and processing state for a derived document artifact,
+         *     such as the document-unit hierarchy extracted from a PDF, HTML page, or
+         *     text field. The route is shard-aware; hosted deployments route the
+         *     request to the data group that owns the source document key.
+         */
+        get: operations["getDocumentArtifactManifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reprocess a derived document artifact
+         * @description Invalidates the current artifact state and requests the producer to
+         *     rebuild the derived document hierarchy for the source document.
+         */
+        post: operations["reprocessDocumentArtifact"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1813,6 +2061,194 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/extensions/v1/packages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List available packages. */
+        get: operations["listExtensionPackages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/packages/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get available package metadata. */
+        get: operations["getExtensionPackage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/packages/{name}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a specific immutable package version. */
+        get: operations["getExtensionPackageVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List installed extensions. */
+        get: operations["listInstalledExtensions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an installed extension. */
+        get: operations["getInstalledExtension"];
+        put?: never;
+        /** Install a package as an extension. */
+        post: operations["installExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update an installed extension. */
+        post: operations["updateInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/drop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Drop an installed extension. */
+        post: operations["dropInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/objects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List objects owned by an installed extension. */
+        get: operations["listInstalledExtensionObjects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Enable a disabled installed extension. */
+        post: operations["enableInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Disable an installed extension without dropping owned state. */
+        post: operations["disableInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Replace installed extension configuration. */
+        put: operations["configureInstalledExtension"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1869,6 +2305,485 @@ export interface components {
             ranges?: components["schemas"]["ClusterDataRangeStatus"][];
             replicas?: components["schemas"]["ClusterDataReplicaStatus"][];
             groups?: components["schemas"]["ClusterDataGroupStatus"][];
+        };
+        /**
+         * @description Kind of external connection configured on this node.
+         * @enum {string}
+         */
+        ConnectionKind: "inference" | "web_search" | "external_io" | "cdc";
+        /**
+         * @description Connection status. "connected" means a live probe or listing succeeded,
+         *     "error" means the probe failed (see the error field), "configured" means
+         *     the connection is present but was not probed, and "unsupported" means
+         *     no probe is available for this connection kind or provider.
+         * @enum {string}
+         */
+        ConnectionStatus: "connected" | "error" | "configured" | "unsupported";
+        /**
+         * @description Inference provider type for a connection.
+         * @enum {string}
+         */
+        InferenceProviderType: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "anthropic" | "antfly" | "mock";
+        /**
+         * @description Model task type. Mirrors the inference registry taxonomy; "other" is
+         *     used for models whose task type the provider's listing API does not
+         *     classify.
+         * @enum {string}
+         */
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "recognizer" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModel: {
+            /** @description Model identifier as reported by the provider. */
+            name: string;
+            /** @description Human-readable model name when the provider reports one. */
+            display_name?: string;
+            /** @description Embedding output dimension when known. */
+            dimensions?: number;
+            /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
+            configured?: boolean;
+        };
+        InferenceConnection: {
+            provider: components["schemas"]["InferenceProviderType"];
+            /** @description Resolved endpoint URL when applicable. */
+            url?: string;
+            /** @description Cloud region (Bedrock). */
+            region?: string;
+            /** @description Google Cloud project (Vertex). */
+            project_id?: string;
+            /** @description Google Cloud location (Vertex). */
+            location?: string;
+            /** @description Named registry entries from node config that resolve to this provider instance. */
+            names?: string[];
+            /** @description Model types this instance is configured for. */
+            configured_model_types?: components["schemas"]["ConnectedModelType"][];
+            /**
+             * @description Models reported by the provider, grouped by model type. Keys are
+             *     pluralized ConnectedModelType values ("embedders", "generators",
+             *     "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+             *     "readers", "transcribers", "extractors") plus "other" for models
+             *     the provider's listing API does not classify by task. Populated
+             *     only when the request includes the "models" expansion.
+             */
+            models?: {
+                [key: string]: components["schemas"]["ConnectedModel"][];
+            };
+        };
+        /**
+         * @description External IO transport protocol.
+         * @enum {string}
+         */
+        ExternalIoProtocol: "s3" | "gcs" | "filesystem" | "http";
+        WebSearchConnection: {
+            /** @description Provider-specific service flavor, such as agent_search for provider vertex. */
+            service?: string;
+            /** @description Maximum ranked results this connection is configured to return. */
+            max_results?: number;
+            /** @description Provider request timeout in milliseconds. */
+            timeout_ms?: number;
+            /** @description Whether safe-search filtering is requested. */
+            safe_search?: boolean;
+            /** @description Preferred result language. */
+            language?: string;
+            /** @description Preferred result region. */
+            region?: string;
+            /** @description Whether extracted content is requested when supported. */
+            include_content?: boolean;
+            /** @description Whether highlighted passages are requested when supported. */
+            include_highlights?: boolean;
+            /** @description Provider endpoint override when configured. */
+            endpoint?: string;
+            /** @description Google Cloud project for provider vertex. */
+            project_id?: string;
+            /** @description Google Cloud location for provider vertex. */
+            location?: string;
+            /** @description Agent Search data store ID for provider vertex. */
+            data_store?: string;
+            /** @description Agent Search serving config ID for provider vertex. */
+            serving_config?: string;
+            /** @description Domain allowlist when configured. */
+            include_domains?: string[];
+            /** @description Domain denylist when configured. */
+            exclude_domains?: string[];
+            /** @description True when required credentials/config are present. Secret values are never returned. */
+            configured?: boolean;
+        };
+        ExternalIoConnection: {
+            protocol: components["schemas"]["ExternalIoProtocol"];
+            /** @description Custom endpoint URL when configured. */
+            endpoint?: string;
+            /** @description Buckets this connection is configured for. */
+            buckets?: string[];
+            /** @description Key prefix when configured. */
+            prefix?: string;
+            /** @description Hosts or base URLs this connection applies to. */
+            hosts?: string[];
+        };
+        CdcConnection: {
+            /**
+             * @description CDC provider type. Currently "postgres"; future CDC providers may add new values.
+             * @example postgres
+             */
+            provider: string;
+            /** @description Antfly table receiving changes from this CDC source. */
+            table_name: string;
+            /**
+             * Format: uint32
+             * @description Zero-based ordinal of the replication source within the table config.
+             */
+            source_ordinal: number;
+            /** @description Source-side table or stream name when reported by the provider. */
+            external_table?: string;
+            /** @description Provider replication cursor or slot name when applicable. */
+            slot_name?: string;
+            /** @description Provider publication or stream grouping name when applicable. */
+            publication_name?: string;
+            /** @description Runtime CDC phase such as snapshot, streaming, configured, or failed. */
+            phase?: string;
+            /**
+             * Format: uint64
+             * @description Source records behind, when reported by the runtime.
+             */
+            lag_records?: number;
+            /**
+             * Format: uint64
+             * @description Source commit lag in milliseconds, when reported by the runtime.
+             */
+            lag_millis?: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+             */
+            last_success_at_ms?: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock timestamp of the last applied source change, in milliseconds.
+             */
+            last_change_applied_at_ms?: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+             */
+            updated_at_ms?: number;
+        };
+        Connection: {
+            /** @description Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path. */
+            id: string;
+            /** @description Human-readable short name for this connection instance. */
+            name: string;
+            /** @description Optional display name for UIs. */
+            display_name?: string;
+            /** @description Provider token for connection kinds that have a provider-level service identity, such as web_search. */
+            provider?: string;
+            kind: components["schemas"]["ConnectionKind"];
+            status: components["schemas"]["ConnectionStatus"];
+            /** @description Failure detail when status is "error". */
+            error?: string;
+            /** @description Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream. */
+            capabilities: string[];
+            /**
+             * @description Where this connection was configured, e.g.
+             *     "config:embedders/openai-small" or "table:docs/index:body_vec".
+             */
+            sources?: string[];
+            inference?: components["schemas"]["InferenceConnection"];
+            web_search?: components["schemas"]["WebSearchConnection"];
+            external_io?: components["schemas"]["ExternalIoConnection"];
+            cdc?: components["schemas"]["CdcConnection"];
+        };
+        ConnectionsResponse: {
+            connections: components["schemas"]["Connection"][];
+        };
+        /** @description Parsed child-range descriptor from a derived document artifact manifest. */
+        DocumentArtifactChildRange: {
+            /** @description Stable range identifier within the artifact manifest generation. */
+            range_id: string;
+            /** @description Kind of children covered by this range, such as unit or chunk. */
+            range_kind: string;
+            /** @description Artifact namespace covered by this range. */
+            artifact_name: string;
+            /** @description Logical boundary used for splitting this range. */
+            split_boundary: string;
+            /** @description Current placement summary for the range. */
+            placement: string;
+            /**
+             * Format: uint64
+             * @description Owner group for this child artifact range, when assigned.
+             */
+            owner_group_id?: number | null;
+            /**
+             * Format: uint64
+             * @description Placement generation for range ownership metadata.
+             */
+            placement_generation?: number | null;
+            /** @description Current routing status for child writes in this range. */
+            route_status?: string | null;
+            /** @description Whether this range may split at its configured split boundary. */
+            split_eligible?: boolean | null;
+            /** @description Inclusive first internal child key covered by this range. */
+            start_key: string;
+            /** @description Exclusive end internal child key, or empty for the final range. */
+            end_key_exclusive: string;
+            /** @description Inclusive last internal child key covered by this range. */
+            last_key: string;
+            /** @description Number of child records covered by this range. */
+            child_count: number;
+            /** @description Approximate extracted text bytes covered by this range when available. */
+            text_bytes?: number | null;
+        };
+        /**
+         * @description Inspection view for a derived document artifact produced from a source
+         *     table row. The typed fields form the stable summary contract. The
+         *     embedded manifest/state JSON fields are optional raw detail intended
+         *     for admin/debug inspection so producers can evolve their internal unit
+         *     schema without changing this route contract.
+         */
+        DocumentArtifactManifest: {
+            /** @description Stable identity of the source document. */
+            document_id: string;
+            /**
+             * @description Name of the derived artifact.
+             * @example document_units_v1
+             */
+            artifact_name: string;
+            /** @description Stable identity of this artifact under the document. */
+            artifact_id: string;
+            /**
+             * Format: uint64
+             * @description Version of the opaque manifest payload schema.
+             */
+            manifest_version: number;
+            /**
+             * Format: uint64
+             * @description Monotonic generation for the current artifact state.
+             */
+            generation: number;
+            /** @description Source URL or source identifier used to derive this artifact. */
+            source_url: string;
+            /** @description Fingerprint of the source bytes and extractor configuration. */
+            source_fingerprint: string;
+            /** @description Effective source content type selected during extraction. */
+            content_type: string;
+            /**
+             * @description Producer route selected for the source content.
+             * @example pdf
+             */
+            route_type: string;
+            /** @description Reason extraction was skipped, when the source type is unsupported. */
+            unsupported_reason?: string | null;
+            /** @description Number of extracted document units. */
+            unit_count: number;
+            /** @description Number of indexable chunks derived from the units. */
+            chunk_count: number;
+            /** @description Parsed child range descriptors for this artifact generation. */
+            child_ranges: components["schemas"]["DocumentArtifactChildRange"][];
+            /** @description Number of storage child ranges used by this artifact. */
+            child_range_count: number;
+            /** @description Current materialization or merge status. */
+            merge_status: string;
+            /**
+             * Format: uint64
+             * @description Previous artifact generation used by the current merge plan.
+             */
+            merge_from_generation: number;
+            /**
+             * Format: uint64
+             * @description Target artifact generation produced by the current merge plan.
+             */
+            merge_to_generation: number;
+            /** @description Granularity used when computing merge-plan operations. */
+            merge_operation_granularity: string;
+            /** @description Number of merge operations recorded for this artifact. */
+            merge_operation_count: number;
+            /** @description Last extraction or materialization error code, when the current artifact generation failed. */
+            last_error_code?: string | null;
+            /** @description Human-readable last extraction or materialization error summary, when available. */
+            last_error_message?: string | null;
+            /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. */
+            manifest_json?: string;
+            /** @description Optional opaque JSON state for incremental processing. Present only for raw detail responses. */
+            state_json?: string | null;
+        };
+        /** @description Available derived document artifact manifests for a source document. */
+        DocumentArtifactManifestList: {
+            /** @description Stable identity of the source document. */
+            document_id: string;
+            artifacts: components["schemas"]["DocumentArtifactManifest"][];
+        };
+        DocumentArtifactReprocessResponse: {
+            /**
+             * @description Indicates that reprocessing was accepted.
+             * @enum {string}
+             */
+            reprocess: "triggered";
+        };
+        /** @description Bounded request for reprocessing a derived artifact across source rows in key order. */
+        DocumentArtifactTableReprocessRequest: {
+            /**
+             * @description Exclusive lower bound source document key. Use the prior response next_key to continue.
+             * @default
+             */
+            from_key?: string;
+            /**
+             * @description Inclusive upper bound source document key, or empty for the end of the table/range.
+             * @default
+             */
+            to_key?: string;
+            /**
+             * Format: uint32
+             * @description Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+             * @default 100
+             */
+            limit?: number;
+            /** @description Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span. */
+            shard_cursors?: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
+        };
+        DocumentArtifactReprocessFailure: {
+            /** @description Source document key that failed during reprocessing. */
+            key: string;
+            /** @description Stable error code for the failed document reprocess attempt. */
+            error_code: string;
+        };
+        DocumentArtifactReprocessShardCursor: {
+            /**
+             * Format: uint64
+             * @description Physical table group that produced this cursor, when known.
+             */
+            group_id?: number | null;
+            /** @description Source key cursor for resuming this shard-local repair pass. */
+            next_key: string;
+            /** @description Number of source rows scanned by this shard-local pass. */
+            scanned: number;
+            /** @description Number of source rows whose artifact was reprocessed by this shard-local pass. */
+            reprocessed: number;
+            /** @description Number of scanned source rows that no longer had a reprocessable source document in this shard-local pass. */
+            skipped: number;
+            /** @description Number of scanned source rows that failed in this shard-local pass. */
+            failed: number;
+            /**
+             * Format: uint32
+             * @description Effective scan limit used by this shard-local pass.
+             */
+            limit: number;
+        };
+        DocumentArtifactTableReprocessResponse: {
+            /**
+             * @description Indicates that reprocessing was accepted.
+             * @enum {string}
+             */
+            reprocess: "triggered";
+            /**
+             * @description Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+             * @enum {string}
+             */
+            reprocess_status: "in_progress" | "complete";
+            /** @description Name of the derived artifact that was reprocessed. */
+            artifact_name: string;
+            /** @description Number of source rows scanned by this bounded pass. */
+            scanned: number;
+            /** @description Number of source rows whose artifact was reprocessed. */
+            reprocessed: number;
+            /** @description Number of scanned source rows that no longer had a reprocessable source document. */
+            skipped: number;
+            /** @description Number of scanned source rows that failed before recording a normal artifact manifest. */
+            failed: number;
+            /**
+             * Format: uint32
+             * @description Effective scan limit used by the bounded pass.
+             */
+            limit: number;
+            /** @description Source key cursor for the next bounded pass, when more rows may remain. */
+            next_key?: string | null;
+            /** @description Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete. */
+            pending_shards: number;
+            failures: components["schemas"]["DocumentArtifactReprocessFailure"][];
+            /** @description Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor. */
+            shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
+        };
+        /** @description Request to create a durable table artifact reprocess job. */
+        DocumentArtifactReprocessJobStartRequest: {
+            /**
+             * @description Exclusive lower bound source document key.
+             * @default
+             */
+            from_key?: string;
+            /**
+             * @description Inclusive upper bound source document key, or empty for the end of the table/range.
+             * @default
+             */
+            to_key?: string;
+            /**
+             * Format: uint32
+             * @description Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description When true, immediately runs the first bounded pass before returning the job state.
+             * @default true
+             */
+            advance?: boolean;
+        };
+        DocumentArtifactReprocessJob: {
+            /**
+             * Format: uint64
+             * @description Server-assigned durable repair job identifier.
+             */
+            job_id: number;
+            /** @description Table containing the source documents being repaired. */
+            table_name: string;
+            /** @description Name of the derived artifact being repaired. */
+            artifact_name: string;
+            /**
+             * @description Lifecycle phase of the repair job.
+             * @enum {string}
+             */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            /**
+             * @description User-facing completion status derived from the phase and remaining cursors.
+             * @enum {string}
+             */
+            reprocess_status: "in_progress" | "complete" | "stopped";
+            /** @description Original exclusive lower bound for the job. */
+            from_key: string;
+            /** @description Original inclusive upper bound for the job, or empty for the end of the table/range. */
+            to_key: string;
+            /**
+             * Format: uint32
+             * @description Current per-shard bounded pass limit.
+             */
+            limit: number;
+            /** @description Single-shard continuation key when no shard cursors are present. */
+            next_key?: string | null;
+            /** @description Cumulative source rows scanned by completed passes. */
+            scanned: number;
+            /** @description Cumulative source rows whose artifact was reprocessed. */
+            reprocessed: number;
+            /** @description Cumulative source rows skipped by completed passes. */
+            skipped: number;
+            /** @description Cumulative source rows that failed during completed passes. */
+            failed: number;
+            /** @description Number of shard-local continuations still pending. */
+            pending_shards: number;
+            /** @description Failures from the most recent completed pass. */
+            failures: components["schemas"]["DocumentArtifactReprocessFailure"][];
+            /** @description Per-shard continuation cursors to resume on the next advance operation. */
+            shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
+            /** @description Last terminal or transient job error, when available. */
+            last_error?: string | null;
+            /**
+             * Format: uint64
+             * @description Monotonic server timestamp when the job was created.
+             */
+            created_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Monotonic server timestamp when the job was last updated.
+             */
+            last_updated_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Monotonic server timestamp after which the retained job status may be removed.
+             */
+            expires_at_millis: number;
         };
         ClusterDataNodeStatus: {
             /** Format: uint64 */
@@ -2351,11 +3266,167 @@ export interface components {
             /** Format: uint64 */
             l0_bytes?: number;
             /** Format: uint64 */
+            lower_level_run_count?: number;
+            /** Format: uint64 */
+            lower_level_bytes?: number;
+            /** Format: uint64 */
+            max_level?: number;
+            /** Format: uint64 */
+            compactable_l0_run_count?: number;
+            /** Format: uint64 */
+            overlapping_l0_run_count?: number;
+            /** Format: uint64 */
+            soft_limit_l0_run_count?: number;
+            /** Format: uint64 */
+            hard_limit_l0_run_count?: number;
+            /** Format: uint64 */
+            write_stall_l0_run_debt?: number;
+            /** Format: uint64 */
+            soft_limit_l0_bytes?: number;
+            /** Format: uint64 */
+            hard_limit_l0_bytes?: number;
+            /** Format: uint64 */
+            write_stall_l0_byte_debt?: number;
+            /** Format: uint64 */
+            level_overflow_run_count?: number;
+            /** Format: uint64 */
+            level_overflow_bytes?: number;
+            /** Format: uint64 */
+            obsolete_path_count?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_readers?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_versions?: number;
+            /** Format: uint64 */
+            obsolete_paths_waiting_for_retry?: number;
+            /** Format: uint64 */
+            obsolete_paths_reclaimable?: number;
+            /** Format: uint64 */
+            obsolete_delete_failures?: number;
+            /** Format: uint64 */
+            obsolete_delete_retries?: number;
+            /** Format: uint64 */
+            current_manifest_bytes?: number;
+            /** Format: uint64 */
+            mutable_entry_count?: number;
+            /** Format: uint64 */
+            mutable_bytes?: number;
+            /** Format: uint64 */
+            immutable_memtable_count?: number;
+            /** Format: uint64 */
+            immutable_entry_count?: number;
+            /** Format: uint64 */
+            immutable_bytes?: number;
+            /** Format: uint64 */
+            mutable_snapshot_clone_count?: number;
+            /** Format: uint64 */
+            mutable_snapshot_clone_bytes?: number;
+            /** Format: uint64 */
+            mutable_snapshot_clone_peak_bytes?: number;
+            /** Format: uint64 */
+            read_snapshot_mutable_rotation_count?: number;
+            /** Format: uint64 */
+            read_snapshot_mutable_rotation_bytes?: number;
+            /** Format: uint64 */
             wal_retained_bytes?: number;
             /** Format: uint64 */
             compaction_backlog_bytes?: number;
             /** Format: uint64 */
             active_readers?: number;
+            /** Format: uint64 */
+            active_readers_bound_read_txn?: number;
+            /** Format: uint64 */
+            active_readers_namespace_read_txn?: number;
+            /** Format: uint64 */
+            active_readers_probe_txn?: number;
+            /** Format: uint64 */
+            active_readers_current_scan?: number;
+            /** Format: uint64 */
+            active_readers_write_txn?: number;
+            /** Format: uint64 */
+            active_readers_compaction?: number;
+            /** Format: uint64 */
+            active_readers_other?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_bound_read_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_namespace_read_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_probe_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_current_scan?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_write_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_compaction?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_other?: number;
+            /** Format: uint64 */
+            active_bulk_ingest_batches?: number;
+            manifest_dirty?: boolean;
+            obsolete_manifest_dirty?: boolean;
+            /** Format: uint64 */
+            maintenance_score?: number;
+            /** Format: uint64 */
+            maintenance_debt_hint?: number;
+            /** Format: uint64 */
+            flush_count?: number;
+            /** Format: uint64 */
+            flush_output_run_count?: number;
+            /** Format: uint64 */
+            flush_output_bytes?: number;
+            /** Format: uint64 */
+            sorted_ingest_run_count?: number;
+            /** Format: uint64 */
+            sorted_ingest_bytes?: number;
+            /** Format: uint64 */
+            manifest_write_count?: number;
+            /** Format: uint64 */
+            manifest_bytes?: number;
+            /** Format: uint64 */
+            write_pressure_event_count?: number;
+            /** Format: uint64 */
+            write_pressure_compaction_count?: number;
+            /** Format: uint64 */
+            write_pressure_compaction_step_count?: number;
+            /** Format: uint64 */
+            write_pressure_overload_count?: number;
+            /** Format: uint64 */
+            write_pressure_overload_l0_run_debt?: number;
+            /** Format: uint64 */
+            immutable_rotation_count?: number;
+            /** Format: uint64 */
+            immutable_flush_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_attempt_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_success_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_entry_count?: number;
+            /** Format: uint64 */
+            bulk_append_attempt_count?: number;
+            /** Format: uint64 */
+            bulk_append_entry_count?: number;
+            /** Format: uint64 */
+            bulk_append_direct_success_count?: number;
+            /** Format: uint64 */
+            bulk_append_direct_entry_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_backend_pending_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_below_threshold_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_duplicate_key_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_to_mutable_entry_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_direct_entry_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_fallback_unsupported_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_fallback_backend_mutable_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_fallback_below_threshold_count?: number;
         };
         StorageStatus: {
             /**
@@ -4440,6 +5511,38 @@ export interface components {
                 [key: string]: unknown;
             };
             /**
+             * @description Stable ancestry envelope for derived document hierarchy hits. Present when
+             *     the hit is a derived unit/chunk/embedding artifact or when a source-level
+             *     rollup includes child chunks. Standard fields include `level`,
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+             *     `ancestors` with response-local or requested DB-backed source/unit context when available.
+             */
+            hierarchy?: {
+                /**
+                 * @description Hierarchy level represented by this hit.
+                 * @enum {string}
+                 */
+                level?: "source" | "unit" | "chunk" | "artifact" | "embedding";
+                /** @description Source document key that owns this derived hit. */
+                parent_doc_key?: string;
+                /** @description Unit identifier when the hit is attached to a document unit. */
+                parent_unit_id?: string;
+                /** @description Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`. */
+                artifact?: {
+                    [key: string]: unknown;
+                };
+                /** @description Ancestor context. Includes `source.id` for derived hits, `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct unit hits or requested unit hydration when the unit payload is present. */
+                ancestors?: {
+                    [key: string]: unknown;
+                };
+                /** @description Child chunk hits included for source-level rollups. */
+                chunks?: {
+                    [key: string]: unknown;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
+            /**
              * @description Sort key values for this hit. Pass as search_after or search_before
              *     to paginate to the next/previous page. Only present when order_by is specified.
              */
@@ -6130,6 +7233,10 @@ export interface components {
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
+            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            embedding_name?: string;
+            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
@@ -6226,6 +7333,35 @@ export interface components {
          * @enum {string}
          */
         IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        /**
+         * @description Managed generated artifact kind.
+         * @enum {string}
+         */
+        EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
+        EnrichmentConfig: {
+            /** @description Stable generated artifact name. */
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            /** @description Source field to read from the source document or source artifact payload. */
+            field?: string;
+            /** @description Optional template for generated text input. */
+            template?: string;
+            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts. */
+            source_artifact_name?: string;
+            /** @description Expected embedding dimension for embedding enrichments. */
+            expected_dims?: number;
+            /** @description Chunk size for chunk enrichments. */
+            chunk_size?: number;
+            /** @description Chunk overlap for chunk enrichments. */
+            chunk_overlap?: number;
+            /** @description Serialized chunker configuration for chunk enrichments. */
+            chunker_json?: string;
+            /** @description Produced asset content type for asset enrichments. */
+            content_type?: string;
+            /** @description Serialized asset producer configuration. */
+            producer_json?: string;
+        };
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -6239,13 +7375,25 @@ export interface components {
              */
             version?: number;
             /**
-             * @description List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level.
+             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
              * @example [
-             *       "semantic_chunks",
-             *       "summary"
+             *       {
+             *         "name": "document_chunks_v1",
+             *         "kind": "chunk",
+             *         "field": "text",
+             *         "source_artifact_name": "document_units_v1",
+             *         "chunk_size": 512
+             *       },
+             *       {
+             *         "name": "document_chunk_dense_v1",
+             *         "kind": "embedding",
+             *         "field": "text",
+             *         "source_artifact_name": "document_chunks_v1",
+             *         "expected_dims": 768
+             *       }
              *     ]
              */
-            enrichments?: string[];
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
         } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Defines the structure of a document type */
         DocumentSchema: {
@@ -6760,7 +7908,7 @@ export interface components {
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
          *     - search: Execute semantic searches (legacy, use semantic_search for retrieval)
-         *     - websearch: Search the web (requires websearch_config)
+         *     - websearch: Search the web (requires websearch_connection or websearch_config)
          *     - fetch: Fetch URL content (subject to security controls)
          *     - semantic_search: Execute semantic/vector search against an index
          *     - full_text_search: Execute full-text BM25 search against an index
@@ -6772,81 +7920,53 @@ export interface components {
         /**
          * @description The web search provider to use.
          *
-         *     - **google**: Google Custom Search API (requires CSE setup)
-         *     - **bing**: Microsoft Bing Web Search API
+         *     - **exa**: Exa neural/semantic web search API
          *     - **serper**: Serper.dev Google Search API (simpler setup)
          *     - **tavily**: Tavily AI Search API (optimized for RAG)
          *     - **brave**: Brave Search API
-         *     - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+         *     - **you**: You.com Search API for agent and research workflows
+         *     - **linkup**: Linkup Search API for web search and content retrieval
+         *     - **vertex**: Google Cloud Agent Search / Vertex AI Search
          * @enum {string}
          */
-        WebSearchProvider: "google" | "bing" | "serper" | "tavily" | "brave" | "duckduckgo";
+        WebSearchProvider: "exa" | "serper" | "tavily" | "brave" | "you" | "linkup" | "vertex";
         /**
-         * @description Configuration for Google Custom Search API.
+         * @description Configuration for Exa neural/semantic web search.
          *
-         *     Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console.
+         *     Exa is optimized for semantic web search, highlights, and retrieved page
+         *     contents for RAG and agent workflows.
          *
          *     **Setup:**
-         *     1. Create a project at https://console.cloud.google.com
-         *     2. Enable Custom Search API
-         *     3. Create a Custom Search Engine at https://cse.google.com
-         *     4. Get API key and CSE ID
+         *     1. Sign up at https://exa.ai
+         *     2. Get API key from dashboard
          *
-         *     **Docs:** https://developers.google.com/custom-search/v1/overview
+         *     **Docs:** https://docs.exa.ai
          */
-        GoogleSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Google API key (or set GOOGLE_CSE_API_KEY env var) */
+        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description Exa API key (or set EXA_API_KEY env var) */
             api_key?: string;
-            /** @description Custom Search Engine ID (or set GOOGLE_CSE_ID env var) */
-            cse_id?: string;
             /**
-             * @description Type of search to perform
-             * @default web
+             * @description Search mode to request from Exa
+             * @default auto
              * @enum {string}
              */
-            search_type?: "web" | "image";
-            /**
-             * @description Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)
-             * @example m1
-             */
-            date_restrict?: string;
+            search_type?: "auto" | "neural" | "keyword";
+            /** @description Provider-specific result count override */
+            num_results?: number;
+            /** @description ISO date/time lower bound for published date filtering */
+            start_published_date?: string;
+            /** @description ISO date/time upper bound for published date filtering */
+            end_published_date?: string;
+            /** @description Only include results from these domains */
+            include_domains?: string[];
+            /** @description Exclude results from these domains */
+            exclude_domains?: string[];
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
-            provider: "google";
-        };
-        /**
-         * @description Configuration for Microsoft Bing Web Search API.
-         *
-         *     **Setup:**
-         *     1. Create Azure account at https://portal.azure.com
-         *     2. Create a Bing Search resource
-         *     3. Get API key from resource keys
-         *
-         *     **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
-         */
-        BingSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Bing Search API key (or set BING_SEARCH_API_KEY env var) */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description Bing API endpoint URL
-             * @default https://api.bing.microsoft.com/v7.0/search
-             */
-            endpoint?: string;
-            /**
-             * @description Filter results by freshness
-             * @enum {string}
-             */
-            freshness?: "Day" | "Week" | "Month";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "bing";
+            provider: "exa";
         };
         /**
          * @description Configuration for Serper.dev Google Search API.
@@ -6962,33 +8082,109 @@ export interface components {
             provider: "brave";
         };
         /**
-         * @description Configuration for DuckDuckGo Instant Answer API.
+         * @description Configuration for You.com Search API.
          *
-         *     DuckDuckGo provides limited free search without requiring an API key.
-         *     Best for simple queries; may not return results for all searches.
+         *     You.com is useful for agentic search and research-oriented result
+         *     retrieval.
          *
-         *     **Note:** This uses the Instant Answer API which has limitations.
-         *     For production use, consider other providers.
+         *     **Setup:**
+         *     1. Sign up for You.com API access
+         *     2. Get API key from dashboard
          *
-         *     **Docs:** https://duckduckgo.com/api
+         *     **Docs:** https://api.you.com
          */
-        DuckDuckGoSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+        YouSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description You.com API key (or set YOU_API_KEY env var) */
+            api_key?: string;
             /**
-             * @description Skip HTTP redirect for bang queries
-             * @default true
+             * Format: uri
+             * @description You.com API endpoint URL
              */
-            no_redirect?: boolean;
-            /**
-             * @description Remove HTML from results
-             * @default true
-             */
-            no_html?: boolean;
+            endpoint?: string;
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
-            provider: "duckduckgo";
+            provider: "you";
+        };
+        /**
+         * @description Configuration for Linkup Search API.
+         *
+         *     Linkup is useful for web search, source retrieval, and structured
+         *     research workflows.
+         *
+         *     **Setup:**
+         *     1. Sign up at https://linkup.so
+         *     2. Get API key from dashboard
+         *
+         *     **Docs:** https://docs.linkup.so
+         */
+        LinkupSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description Linkup API key (or set LINKUP_API_KEY env var) */
+            api_key?: string;
+            /**
+             * @description Search depth to request from Linkup
+             * @default standard
+             * @enum {string}
+             */
+            depth?: "standard" | "deep";
+            /**
+             * @description Linkup response shape to request
+             * @default searchResults
+             * @enum {string}
+             */
+            output_type?: "searchResults" | "sourcedAnswer";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "linkup";
+        };
+        /**
+         * @description Configuration for Google Cloud Agent Search / Vertex AI Search.
+         *
+         *     Use this for bounded Google Cloud search over configured data stores or
+         *     verified websites. The provider token is `vertex` to match Antfly's
+         *     existing Google Cloud provider convention.
+         *
+         *     **Setup:**
+         *     1. Enable Discovery Engine API in Google Cloud
+         *     2. Create an Agent Search app/data store
+         *     3. Grant service account access to query the serving config
+         *
+         *     **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+         */
+        VertexSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /**
+             * @description Google Cloud search service flavor
+             * @default agent_search
+             * @enum {string}
+             */
+            service?: "agent_search";
+            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /**
+             * @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
+             * @default global
+             */
+            location?: string;
+            /** @description Agent Search data store ID. */
+            data_store?: string;
+            /**
+             * @description Agent Search serving config ID.
+             * @default default_config
+             */
+            serving_config?: string;
+            /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
+            credentials_path?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
         };
         /**
          * @description A unified configuration for web search providers.
@@ -6997,14 +8193,30 @@ export interface components {
          *     provider-specific config or set common options at the top level.
          *
          *     **Environment Variables (fallbacks):**
-         *     - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID
-         *     - BING_SEARCH_API_KEY
+         *     - EXA_API_KEY
          *     - SERPER_API_KEY
          *     - TAVILY_API_KEY
          *     - BRAVE_API_KEY
+         *     - YOU_API_KEY
+         *     - LINKUP_API_KEY
+         *     - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
          */
         WebSearchConfig: {
             provider: components["schemas"]["WebSearchProvider"];
+            /** @description Provider API key or secret reference. Prefer named web_search connections for production use. */
+            api_key?: string;
+            /** @description Provider endpoint override when applicable */
+            endpoint?: string;
+            /** @description Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /** @description Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global. */
+            location?: string;
+            /** @description Agent Search data store ID for provider vertex. */
+            data_store?: string;
+            /** @description Agent Search serving config ID for provider vertex. Defaults to default_config. */
+            serving_config?: string;
+            /** @description Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC. */
+            credentials_path?: string;
             /**
              * @description Maximum number of search results to return
              * @default 5
@@ -7030,6 +8242,16 @@ export interface components {
              * @example us
              */
             region?: string;
+            /**
+             * @description Ask the provider to return extracted page content when supported
+             * @default false
+             */
+            include_content?: boolean;
+            /**
+             * @description Ask the provider to return highlighted passages when supported
+             * @default false
+             */
+            include_highlights?: boolean;
         };
         Credentials: {
             /**
@@ -7125,10 +8347,18 @@ export interface components {
              */
             enabled_tools?: components["schemas"]["ChatToolName"][];
             /**
-             * @description Web search provider configuration. Required when websearch tool is enabled.
-             *     See specs/openapi/antfly/websearch.yaml for provider-specific options.
+             * @description Inline web search provider configuration. Prefer websearch_connection for
+             *     configured production agents; inline config remains useful for CLI/dev
+             *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
+             *     options.
              */
             websearch_config?: components["schemas"]["WebSearchConfig"];
+            /**
+             * @description Name of a configured connections.<id> resource with kind web_search.
+             *     Request-level tool options may reduce scope, but cannot expand the
+             *     connection's configured capabilities or policy.
+             */
+            websearch_connection?: string;
             /**
              * @description URL fetching configuration. See specs/openapi/antfly/websearch.yaml
              *     for available options and security controls.
@@ -7651,9 +8881,9 @@ export interface components {
              * @example semantic-ranker-default@latest
              */
             model: string;
-            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
+            /** @description Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
             project_id?: string;
-            /** @description Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
+            /** @description Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
             credentials_path?: string;
             /** @description Maximum number of records to return. If not specified, returns all documents with scores. */
             top_n?: number;
@@ -7869,6 +9099,10 @@ export interface components {
             path_edges?: components["schemas"]["PathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
+            /** @description Parsed evidence envelope for provenance labels and edge metadata */
+            evidence?: {
+                [key: string]: unknown;
+            };
             /** @description Connected edges (when include_edges=true) */
             edges?: components["schemas"]["Edge"][];
         };
@@ -8611,7 +9845,7 @@ export interface components {
              * @description Optional backend override for this request.
              *     `auto` keeps the node default behavior.
              *     `onnx` forces ONNX generation when the model/package supports it.
-             *     `native`, `metal`, and `mlx` force the native host backend choice.
+             *     `native` and `metal` force the native host backend choice.
              *     `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
              *     requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
              *     `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
@@ -8619,7 +9853,7 @@ export interface components {
              *     `mode: "compiled"` to request WebGPU graph partition execution.
              * @enum {string}
              */
-            backend?: "auto" | "onnx" | "native" | "metal" | "mlx" | "xla" | "webgpu";
+            backend?: "auto" | "onnx" | "native" | "metal" | "xla" | "webgpu";
             /**
              * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
              *     `compiled` runs inference graph planning, partitioning, and backend executor attachment.
@@ -8806,7 +10040,6 @@ export interface components {
              *     - `native` - Native CPU backend
              *     - `onnx` - ONNX Runtime backend
              *     - `metal` - Apple Metal backend
-             *     - `mlx` - MLX backend
              *     - `cuda` - NVIDIA CUDA backend
              *     - `xla` - PJRT/XLA compiled backend
              *
@@ -8922,11 +10155,6 @@ export interface components {
              * @example true
              */
             metal?: boolean;
-            /**
-             * @description Whether the MLX backend is built into this runtime
-             * @example true
-             */
-            mlx?: boolean;
             /**
              * @description Whether the CUDA backend is built into this runtime
              * @example false
@@ -9095,6 +10323,175 @@ export interface components {
             /** @description Total tokens used */
             total_tokens: number;
         };
+        /** @enum {string} */
+        PackageKind: "extension";
+        /** @description Path-safe extension or package identifier. */
+        ExtensionIdentifier: string;
+        /** @description Capability identifier. Capability names may use colon-delimited namespaces such as read:table. */
+        CapabilityName: string;
+        /** @enum {string} */
+        ExtensionScopeKind: "cluster" | "table" | "embedded_db";
+        ExtensionScope: {
+            kind: components["schemas"]["ExtensionScopeKind"];
+            /** @description Required when kind is table. */
+            table_name?: string;
+        };
+        Capability: {
+            /** @example read:table */
+            name: components["schemas"]["CapabilityName"];
+            /** @example memoryaf.memories */
+            scope?: string;
+        };
+        PackageDependency: {
+            /** @example antfly_core */
+            name: components["schemas"]["ExtensionIdentifier"];
+            /** @example >=1.0.0 */
+            version_requirement?: string;
+            /** @default false */
+            optional?: boolean;
+        };
+        PackageArtifact: {
+            /** @enum {string} */
+            kind: "manifest" | "wasm" | "native_library" | "asset";
+            /** @example extension.json */
+            path: string;
+            /** @example sha256:abc123 */
+            digest?: string;
+        };
+        /** @enum {string} */
+        DataShapeKind: "document" | "row" | "generated_artifact" | "extension_relation" | "endpoint_schema" | "tool_schema";
+        DataShapeDecl: {
+            /** @example memory_record */
+            name: components["schemas"]["ExtensionIdentifier"];
+            kind: components["schemas"]["DataShapeKind"];
+            /** @default 1 */
+            version?: string;
+            /**
+             * @description JSON object encoded as a string until the public shape language is finalized.
+             * @default {}
+             */
+            schema_json?: string;
+        };
+        /** @enum {string} */
+        ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
+        ExtensionObjectDecl: {
+            kind: components["schemas"]["ExtensionObjectKind"];
+            name: components["schemas"]["ExtensionIdentifier"];
+            shape?: string;
+            table_name?: string;
+            /** @default {} */
+            config_json?: string;
+        };
+        RuntimeDecl: {
+            name: components["schemas"]["ExtensionIdentifier"];
+            /**
+             * @default manifest_only
+             * @enum {string}
+             */
+            mode?: "manifest_only" | "antfly_api_template" | "workflow" | "wasm" | "sidecar" | "native";
+            artifact?: string;
+            /** @default {} */
+            config_json?: string;
+        };
+        UpdateManifestRef: {
+            /** @example 1.0.0 */
+            from_version: string;
+            /** @example 1.1.0 */
+            to_version: string;
+            /** @example updates/1.0.0-1.1.0.json */
+            path: string;
+            /** @example sha256:def456 */
+            digest?: string;
+        };
+        InstallManifest: {
+            scopes_supported: components["schemas"]["ExtensionScopeKind"][];
+            shapes?: components["schemas"]["DataShapeDecl"][];
+            objects?: components["schemas"]["ExtensionObjectDecl"][];
+            runtimes?: components["schemas"]["RuntimeDecl"][];
+            /** @default {} */
+            config_schema_json?: string;
+        };
+        PackageManifest: {
+            /** @enum {string} */
+            manifest_api_version: "extensions/v1";
+            name: components["schemas"]["ExtensionIdentifier"];
+            version: string;
+            kind: components["schemas"]["PackageKind"];
+            description?: string;
+            digest: string;
+            antfly_min_version?: string;
+            antfly_max_version?: string;
+            /** @default false */
+            trusted?: boolean;
+            /** @default false */
+            relocatable?: boolean;
+            capabilities_requested?: components["schemas"]["Capability"][];
+            dependencies?: components["schemas"]["PackageDependency"][];
+            artifacts?: components["schemas"]["PackageArtifact"][];
+            install: components["schemas"]["InstallManifest"];
+            updates?: components["schemas"]["UpdateManifestRef"][];
+        };
+        InstalledExtension: {
+            name: components["schemas"]["ExtensionIdentifier"];
+            package_name: components["schemas"]["ExtensionIdentifier"];
+            package_version: string;
+            package_digest: string;
+            scope: components["schemas"]["ExtensionScope"];
+            /** @default {} */
+            config_json?: string;
+            granted_capabilities?: components["schemas"]["Capability"][];
+            /** Format: int64 */
+            installed_at_epoch_ms?: number;
+            /** @enum {string} */
+            status: "installing" | "ready" | "disabled" | "updating" | "dropping" | "error_state";
+        };
+        ExtensionMember: {
+            extension_name: components["schemas"]["ExtensionIdentifier"];
+            scope: components["schemas"]["ExtensionScope"];
+            object_kind: components["schemas"]["ExtensionObjectKind"];
+            object_name: components["schemas"]["ExtensionIdentifier"];
+            table_name?: string;
+            shape_kind?: components["schemas"]["DataShapeKind"];
+            shape_name?: string;
+            shape_version?: string;
+            /** @default {} */
+            owner_metadata_json?: string;
+        };
+        InstallExtensionRequest: {
+            version?: string;
+            scope: components["schemas"]["ExtensionScope"];
+            /** @default {} */
+            config_json?: string;
+            grants?: components["schemas"]["Capability"][];
+            /** @default false */
+            dry_run?: boolean;
+        };
+        UpdateExtensionRequest: {
+            target_version?: string;
+            /** @default false */
+            dry_run?: boolean;
+        };
+        DropExtensionRequest: {
+            /**
+             * @default restrict
+             * @enum {string}
+             */
+            mode?: "restrict" | "cascade";
+            /** @default false */
+            dry_run?: boolean;
+        };
+        DropExtensionResponse: {
+            dropped: components["schemas"]["ExtensionIdentifier"];
+            /** @default false */
+            dry_run: boolean;
+        };
+        ConfigureExtensionRequest: {
+            /** @default {} */
+            config_json: string;
+        };
+        ExtensionError: {
+            error: string;
+        };
         ExtractionToken: {
             text: string;
             box?: number[];
@@ -9251,6 +10648,24 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Method not allowed for this resource */
+        MethodNotAllowed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Service is temporarily unavailable */
+        ServiceUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description Unsupported request media or content encoding */
         UnsupportedMediaType: {
             headers: {
@@ -9331,6 +10746,54 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterTopology"];
+                };
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listConnections: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Comma-separated list of connection kinds to include
+                 *     (e.g. "inference,external_io,cdc"). Defaults to all
+                 *     kinds. This filters by the response "kind" field.
+                 */
+                types?: string;
+                /**
+                 * @description Comma-separated list of expansions. Supported value: "models" —
+                 *     live-query each inference provider's model listing API.
+                 */
+                include?: string;
+                /**
+                 * @description Set to "true" to bypass the short server-side cache for live
+                 *     provider model listings and probes. This does not force a node
+                 *     config or metadata reload.
+                 */
+                refresh?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Configured connections retrieved successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionsResponse"];
                 };
             };
             /** @description Unauthorized - authentication required */
@@ -10472,7 +11935,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Key of the record to lookup */
+                /** @description Key of the document to retrieve */
                 key: string;
             };
             cookie?: never;
@@ -10499,6 +11962,280 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listDocumentArtifactManifests: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Response detail level. `summary` returns typed manifest fields only.
+                 *     `raw` also includes opaque manifest/state JSON and requires table
+                 *     admin permission when authentication is enabled.
+                 */
+                detail?: "summary" | "raw";
+            };
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact manifest list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactManifestList"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    reprocessDocumentArtifactRange: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DocumentArtifactTableReprocessRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded reprocessing pass was accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactTableReprocessResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    startDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DocumentArtifactReprocessJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Reprocess job was created */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocess job status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocess job was already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            /** @description Reprocess job advanced */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    cancelDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocess job was cancelled or already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getDocumentArtifactManifest: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Response detail level. `summary` returns typed manifest fields only.
+                 *     `raw` also includes opaque manifest/state JSON and requires table
+                 *     admin permission when authentication is enabled.
+                 */
+                detail?: "summary" | "raw";
+            };
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact manifest found */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactManifest"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    reprocessDocumentArtifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocessing was accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listIndexes: {
@@ -12486,6 +14223,292 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listExtensionPackages: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Available package manifests. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PackageManifest"][];
+                };
+            };
+        };
+    };
+    getExtensionPackage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Package metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PackageManifest"];
+                };
+            };
+            /** @description Package not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtensionError"];
+                };
+            };
+        };
+    };
+    getExtensionPackageVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+                version: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Package version metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PackageManifest"];
+                };
+            };
+        };
+    };
+    listInstalledExtensions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed extensions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"][];
+                };
+            };
+        };
+    };
+    getInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    installExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Installed extension or dry-run result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    updateInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated extension or dry-run result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    dropInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DropExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Drop result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DropExtensionResponse"];
+                };
+            };
+        };
+    };
+    listInstalledExtensionObjects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Extension member objects. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtensionMember"][];
+                };
+            };
+        };
+    };
+    enableInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Enabled extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    disableInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Disabled extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    configureInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfigureExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Reconfigured extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
                 };
             };
         };

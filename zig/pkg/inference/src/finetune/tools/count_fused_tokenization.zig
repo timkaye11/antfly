@@ -37,7 +37,7 @@ fn hashI32(hash: *u64, value: i32) void {
 
 fn usage() void {
     std.debug.print(
-        \\usage: count-fused-tokenization --data <jsonl> --model-dir <dir> [--split <name>] [--max-seq-len <n>] [--max-chunks <n>] [--batch-size <n>] [--limit <n>] [--json] [--dump-first] [--dump-batch]
+        \\usage: count-fused-tokenization --data <jsonl> --model-dir <dir> [--split <name>] [--max-seq-len <n>] [--max-chunks <n>] [--batch-size <n>] [--offset <n>] [--limit <n>] [--json] [--dump-first] [--dump-batch]
         \\
     , .{});
 }
@@ -56,6 +56,15 @@ fn printUsizeArray(values: []const usize) void {
     for (values, 0..) |v, i| {
         if (i > 0) std.debug.print(",", .{});
         std.debug.print("{d}", .{v});
+    }
+    std.debug.print("]", .{});
+}
+
+fn printUsizeArrayWithOffset(values: []const usize, offset: usize) void {
+    std.debug.print("[", .{});
+    for (values, 0..) |v, i| {
+        if (i > 0) std.debug.print(",", .{});
+        std.debug.print("{d}", .{offset + v});
     }
     std.debug.print("]", .{});
 }
@@ -151,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
     var max_seq_len: usize = 384;
     var max_chunks: usize = 32;
     var batch_size: usize = 8;
+    var sample_offset: usize = 0;
     var limit: usize = 0;
     var dump_first = false;
     var dump_batch = false;
@@ -169,6 +179,8 @@ pub fn main(init: std.process.Init) !void {
             max_chunks = try std.fmt.parseUnsigned(usize, args.next() orelse return error.MissingMaxChunks, 10);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
             batch_size = try std.fmt.parseUnsigned(usize, args.next() orelse return error.MissingBatchSize, 10);
+        } else if (std.mem.eql(u8, arg, "--offset")) {
+            sample_offset = try std.fmt.parseUnsigned(usize, args.next() orelse return error.MissingOffset, 10);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             limit = try std.fmt.parseUnsigned(usize, args.next() orelse return error.MissingLimit, 10);
         } else if (std.mem.eql(u8, arg, "--dump-first")) {
@@ -198,7 +210,12 @@ pub fn main(init: std.process.Init) !void {
 
     var loaded = try fused_chunker_data.loadSamples(allocator, path, split);
     defer loaded.deinit();
-    const samples = if (limit > 0 and limit < loaded.samples.len) loaded.samples[0..limit] else loaded.samples;
+    if (sample_offset > loaded.samples.len) return error.InvalidOffset;
+    const sample_end = if (limit > 0)
+        @min(sample_offset + limit, loaded.samples.len)
+    else
+        loaded.samples.len;
+    const samples = loaded.samples[sample_offset..sample_end];
     const dataset_stats = fused_chunker_data.computeStats(samples);
 
     var tokenizer = try TokenizerBatch.loadFromDir(allocator, mdir, max_seq_len);
@@ -223,7 +240,7 @@ pub fn main(init: std.process.Init) !void {
         const indices = try allocator.alloc(usize, count);
         defer allocator.free(indices);
         for (indices, 0..) |*idx, i| idx.* = start + i;
-        for (indices) |idx| hashU64(&sample_indices_hash, idx);
+        for (indices) |idx| hashU64(&sample_indices_hash, sample_offset + idx);
 
         var batch = try fused_chunker_data.assembleTokenBatch(
             allocator,
@@ -286,8 +303,9 @@ pub fn main(init: std.process.Init) !void {
     const gold_rate = if (valid == 0) 0.0 else @as(f64, @floatFromInt(gold)) / @as(f64, @floatFromInt(valid));
     if (json_output) {
         std.debug.print(
-            "{{\"tool\":\"zig_fused_tokenization_parity\",\"schema_version\":2,\"samples\":{d},\"batches\":{d},\"max_seq_len\":{d},\"max_chunks\":{d},\"valid_tokens\":{d},\"boundary_gold_tokens\":{d},\"gold_rate\":{d:.9},\"samples_with_active_boundary_labels\":{d},\"contrastive_pos_samples\":{d},\"boundary_target_samples\":{d},\"boundary_targets\":{d},\"hashes\":{{\"sample_indices\":\"{x}\",\"input_ids\":\"{x}\",\"attention_mask\":\"{x}\",\"offsets\":\"{x}\",\"labels\":\"{x}\",\"chunks\":\"{x}\"}}",
+            "{{\"tool\":\"zig_fused_tokenization_parity\",\"schema_version\":2,\"offset\":{d},\"samples\":{d},\"batches\":{d},\"max_seq_len\":{d},\"max_chunks\":{d},\"valid_tokens\":{d},\"boundary_gold_tokens\":{d},\"gold_rate\":{d:.9},\"samples_with_active_boundary_labels\":{d},\"contrastive_pos_samples\":{d},\"boundary_target_samples\":{d},\"boundary_targets\":{d},\"hashes\":{{\"sample_indices\":\"{x}\",\"input_ids\":\"{x}\",\"attention_mask\":\"{x}\",\"offsets\":\"{x}\",\"labels\":\"{x}\",\"chunks\":\"{x}\"}}",
             .{
+                sample_offset,
                 samples.len,
                 batches,
                 max_seq_len,
@@ -309,8 +327,9 @@ pub fn main(init: std.process.Init) !void {
         );
     } else {
         std.debug.print(
-            "zig samples={d} batches={d} valid={d} gold={d} gold_rate={d:.6} active_boundary_samples={d} contrastive_pos_samples={d} boundary_target_samples={d} boundary_targets={d} sample_indices_hash={x} ids_hash={x} mask_hash={x} offsets_hash={x} labels_hash={x} chunks_hash={x}\n",
+            "zig offset={d} samples={d} batches={d} valid={d} gold={d} gold_rate={d:.6} active_boundary_samples={d} contrastive_pos_samples={d} boundary_target_samples={d} boundary_targets={d} sample_indices_hash={x} ids_hash={x} mask_hash={x} offsets_hash={x} labels_hash={x} chunks_hash={x}\n",
             .{
+                sample_offset,
                 samples.len,
                 batches,
                 valid,
@@ -418,7 +437,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (json_output) {
             std.debug.print(",\"first_batch\":{{\"sample_indices\":", .{});
-            printUsizeArray(batch.sample_indices);
+            printUsizeArrayWithOffset(batch.sample_indices, sample_offset);
             std.debug.print(",\"samples\":[", .{});
             for (0..count) |bi| {
                 if (bi > 0) std.debug.print(",", .{});
@@ -430,7 +449,7 @@ pub fn main(init: std.process.Init) !void {
                 const mask_slice = batch.attention_mask[seq_start..seq_end];
                 const labels_slice = batch.boundary_labels[seq_start..seq_end];
                 std.debug.print("{{\"sample_index\":{d},\"valid_tokens\":{d},\"input_ids\":", .{
-                    batch.sample_indices[bi],
+                    sample_offset + batch.sample_indices[bi],
                     validTokenCount(mask_slice),
                 });
                 printI32Array(ids_slice);
@@ -458,20 +477,20 @@ pub fn main(init: std.process.Init) !void {
                 @memset(mask, 0);
                 const n_tokens = TokenFnCtx.call(&tok_ctx, samples[sample_index].text, ids, mask, offsets);
                 const active_offsets = offsets[0..@min(n_tokens, max_seq_len)];
-                std.debug.print("{{\"sample_index\":{d},\"mappings\":", .{sample_index});
+                std.debug.print("{{\"sample_index\":{d},\"mappings\":", .{sample_offset + sample_index});
                 printSourceTokenMappings(samples[sample_index].chunk_boundaries, active_offsets);
                 std.debug.print("}}", .{});
             }
             std.debug.print("]", .{});
         } else {
             std.debug.print("first_batch sample_indices=", .{});
-            printUsizeArray(batch.sample_indices);
+            printUsizeArrayWithOffset(batch.sample_indices, sample_offset);
             std.debug.print("\n", .{});
             for (0..count) |bi| {
                 const seq_start = bi * max_seq_len;
                 const chunk_start = bi * max_chunks;
                 std.debug.print("batch sample {d} valid={d} boundary_positions=", .{
-                    batch.sample_indices[bi],
+                    sample_offset + batch.sample_indices[bi],
                     validTokenCount(batch.attention_mask[seq_start .. seq_start + max_seq_len]),
                 });
                 printBoundaryPositions(

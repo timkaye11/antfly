@@ -3170,6 +3170,7 @@ fn rebuild(
 
     // Build old->new ID mapping in topological order.
     const id_map = try allocator.alloc(NodeId, count);
+    defer allocator.free(id_map);
     @memset(id_map, null_node);
 
     var new_count: u32 = 0;
@@ -3225,7 +3226,15 @@ fn rebuild(
         }
     }
 
-    return .{ .graph = new_graph, .id_map = id_map, .num_rewrites = num_rewrites };
+    const caller_map = try allocator.alloc(NodeId, count);
+    errdefer allocator.free(caller_map);
+    for (0..count) |old_raw| {
+        const old_id: NodeId = @intCast(old_raw);
+        const redir = resolve(redirect, old_id);
+        caller_map[old_raw] = if (redir < count) id_map[redir] else null_node;
+    }
+
+    return .{ .graph = new_graph, .id_map = caller_map, .num_rewrites = num_rewrites };
 }
 
 fn markReachable(graph: *const Graph, reachable: []bool, redirect: []const NodeId, id: NodeId) void {
@@ -4494,6 +4503,7 @@ test "fuse detects matmul (no bias) as fused_linear_no_bias" {
     defer result.deinit();
 
     const out_id = result.graph.outputs.items[0];
+    try std.testing.expectEqual(out_id, result.id_map[out]);
     const tag = std.meta.activeTag(result.graph.node(out_id).op);
     try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .fused_linear_no_bias), tag);
     const a = result.graph.node(out_id).op.fused_linear_no_bias;

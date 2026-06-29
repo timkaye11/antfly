@@ -38,6 +38,7 @@
 //   --backend native|metal|auto Select compute backend (default: auto)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const native_compute = @import("../../ops/native_compute.zig");
@@ -56,22 +57,12 @@ const metal_runtime = if (build_options.enable_metal) @import("../../backends/me
 };
 const ops_mod = @import("../../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_mod = if (build_options.enable_mlx) @import("../../backends/mlx.zig") else struct {
-    pub const c = struct {
-        pub fn mlx_map_string_to_array_new() void {}
-        pub fn mlx_map_string_to_array_free(_: void) void {}
-        pub const mlx_array = void;
-        pub const mlx_map_string_to_array = void;
-    };
-    pub fn openDefaultStream() struct { stream: void } {
-        return .{ .stream = {} };
-    }
-};
 const fused_chunker_train = @import("../fused_chunker_train.zig");
 const fused_chunker_data = @import("../fused_chunker_data.zig");
 const fused_chunker_mod = @import("../fused_chunker.zig");
 const fused_chunker_splade = @import("../fused_chunker_splade.zig");
 const fused_chunker_loss = @import("../fused_chunker_loss.zig");
+const infonce_cpu = @import("../infonce_cpu.zig");
 const safetensors_checkpoint = @import("../safetensors_checkpoint.zig");
 const compat = @import("../../io/compat.zig");
 const modern_bert = @import("../../architectures/modern_bert.zig");
@@ -84,9 +75,12 @@ const TokenizerBatch = tokenizer_batch_mod.TokenizerBatch;
 const TokenFnCtx = tokenizer_batch_mod.TokenFnCtx;
 const fused_chunker_lora = @import("../lora_adapter_set.zig");
 const tensor_mod = @import("../../backends/tensor.zig");
+const safetensors = @import("../../models/safetensors.zig");
 const lora = @import("../lora.zig");
+const graph_input_binder = @import("../graph_input_binder.zig");
 const segmented_encoder = @import("../../graph/segmented_encoder.zig");
 const graph_training = @import("../../graph/training.zig");
+const debug_timing = @import("../../debug_timing.zig");
 const ml = @import("ml");
 
 const fused_chunker_lora_target_modules = [_][]const u8{
@@ -104,6 +98,13 @@ const TrainStepSummary = fused_chunker_train.TrainStepSummary;
 const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
 
 const print = std.debug.print;
+
+const fused_manifest_file_name = "fused_training_manifest.json";
+const fused_metrics_file_name = "fused_training_metrics.jsonl";
+const fused_manifest_schema_version = "fused_chunker_training/v1";
+const fused_artifact_family_version = "fused_chunker_phase20/v1";
+const fnv_offset: u64 = 14695981039346656037;
+const fnv_prime: u64 = 1099511628211;
 
 // ---------------------------------------------------------------------------
 // CLI options
@@ -165,6 +166,8 @@ const Options = struct {
     boundary_focus_lambda_embed: f32 = 0.1,
     boundary_focal_gamma: f32 = 2.0,
     boundary_focal_alpha: f32 = 0.75,
+    contrastive_focal_gamma: f32 = 0.0,
+    contrastive_focal_alpha: f32 = 0.75,
     boundary_pos_weight: f32 = 5.0,
     boundary_dropout: f32 = 0.1,
     boundary_loss_type: BoundaryLossType = .ce,
@@ -193,6 +196,7 @@ const Options = struct {
     schedule_free: bool = false,
     // Feature 5: NEFTune
     neftune_alpha: f32 = 0.0,
+    encoder_neftune: bool = true,
     // Feature 1: XBM
     xbm_capacity: usize = 0,
     // Feature 6: LLRD
@@ -208,7 +212,6 @@ const Options = struct {
     // Feature 8: length bucketing
     length_bucketing: bool = false,
     bucket_size: usize = 256,
-    // mixed precision flag (stored for downstream use)
     mixed_precision: bool = false,
     // SPLADE sparse embedding head
     splade: bool = false,
@@ -221,10 +224,27 @@ const Options = struct {
     // Checkpoint resumption
     resume_from: []const u8 = "",
     save_optimizer_state: bool = false,
+    deterministic: bool = false,
+    go_epoch_shuffle: bool = false,
+    report_to: ?[]const u8 = null,
+    manifest_path: ?[]const u8 = null,
+    memory_sample_every: u32 = 1,
+    memory_warn_rss_bytes: u64 = 0,
+    memory_abort_rss_bytes: u64 = 0,
     debug_first_boundary_step: bool = false,
     debug_first_boundary_step_exit: bool = false,
     debug_boundary_step: u32 = 0,
     debug_boundary_step_exit: bool = false,
+    debug_update_step: u32 = 0,
+    debug_update_step_exit: bool = false,
+    debug_step_json_path: ?[]const u8 = null,
+    debug_batch_offset: ?usize = null,
+    debug_encoder_probe_layer: u32 = 0,
+    debug_encoder_layer_inputs_only: bool = false,
+    debug_encoder_replay_input_path: ?[]const u8 = null,
+    debug_encoder_replay_upstream_path: ?[]const u8 = null,
+    debug_layer_backward_decomp: bool = false,
+    debug_qkv_split_vjp: bool = false,
 };
 
 const StepTiming = struct {
@@ -261,6 +281,38 @@ const TimingTotals = struct {
         self.train_ns += timing.train_ns;
         self.lora_update_ns += timing.lora_update_ns;
         self.splade_ns += timing.splade_ns;
+    }
+};
+
+const ProcessMemorySnapshot = struct {
+    available: bool = false,
+    resident_bytes: u64 = 0,
+    footprint_bytes: u64 = 0,
+};
+
+const MemoryTracker = struct {
+    peak_resident_bytes: u64 = 0,
+    first_resident_bytes: u64 = 0,
+    last_resident_bytes: u64 = 0,
+    warning_emitted: bool = false,
+
+    fn observe(self: *MemoryTracker) ProcessMemorySnapshot {
+        const snapshot = processMemorySnapshot();
+        if (!snapshot.available) return snapshot;
+        if (self.first_resident_bytes == 0) self.first_resident_bytes = snapshot.resident_bytes;
+        self.last_resident_bytes = snapshot.resident_bytes;
+        self.peak_resident_bytes = @max(self.peak_resident_bytes, snapshot.resident_bytes);
+        return snapshot;
+    }
+};
+
+const SupervisionCounts = struct {
+    valid_tokens: u64 = 0,
+    boundary_positive_tokens: u64 = 0,
+
+    fn ignoredTokens(self: SupervisionCounts, total_tokens: usize) u64 {
+        const total: u64 = @intCast(total_tokens);
+        return if (total > self.valid_tokens) total - self.valid_tokens else 0;
     }
 };
 
@@ -307,6 +359,39 @@ inline fn isFiniteF64(x: f64) bool {
     return !std.math.isNan(x) and x != std.math.inf(f64) and x != -std.math.inf(f64);
 }
 
+fn getenvU32OrNull(name: [*:0]const u8) ?u32 {
+    const raw = platform.env.getenv(name) orelse return null;
+    return std.fmt.parseUnsigned(u32, raw, 10) catch null;
+}
+
+fn segmentVJPParityReferenceStrategy() graph_training.CompiledExecutionStrategy {
+    const raw = platform.env.getenv("TERMITE_SEGMENT_VJP_PARITY_REFERENCE") orelse return .partitioned_required;
+    if (std.mem.eql(u8, raw, "interpreter")) return .interpreter;
+    if (std.mem.eql(u8, raw, "partitioned") or std.mem.eql(u8, raw, "partitioned_required") or
+        std.mem.eql(u8, raw, "metal") or std.mem.eql(u8, raw, "metal_required"))
+    {
+        return .partitioned_required;
+    }
+    if (std.mem.eql(u8, raw, "mpsgraph") or std.mem.eql(u8, raw, "mpsgraph_required")) return .mpsgraph_required;
+    return .partitioned_required;
+}
+
+fn segmentVJPStrategyName(strategy: graph_training.CompiledExecutionStrategy) []const u8 {
+    return switch (strategy) {
+        .interpreter => "interpreter",
+        .partitioned_preferred => "partitioned_preferred",
+        .partitioned_required => "partitioned_required",
+        .mpsgraph_preferred => "mpsgraph_preferred",
+        .mpsgraph_required => "mpsgraph_required",
+    };
+}
+
+fn segmentVJPProfileRuntimeName(profile: segmented_encoder.SegmentVJPProfile) []const u8 {
+    if (profile.mpsgraph_runtime) return "mpsgraph";
+    if (profile.partitioned_runtime) return "partitioned";
+    return "interpreter";
+}
+
 fn isFiniteTrainStepSummary(summary: TrainStepSummary) bool {
     return isFiniteF32(summary.boundary_loss) and
         isFiniteF64(summary.contrastive_loss) and
@@ -327,40 +412,322 @@ fn sanitizeLoRAAdapterSet(adapters: *fused_chunker_lora.LoRAAdapterSet) usize {
     return repaired;
 }
 
-fn sanitizeAndClipLoRAGrads(layers: []fused_chunker_lora.LoRALayer, max_norm: f32) void {
+const FloatSliceStats = struct {
+    elems: usize = 0,
+    nonzero: usize = 0,
+    sum_abs: f64 = 0,
+    sum_sq: f64 = 0,
+    max_abs: f32 = 0,
+
+    fn addValue(self: *FloatSliceStats, value: f32) void {
+        const abs_value = absF32(value);
+        self.elems += 1;
+        if (value != 0.0) self.nonzero += 1;
+        self.sum_abs += @as(f64, @floatCast(abs_value));
+        self.sum_sq += @as(f64, value) * @as(f64, value);
+        self.max_abs = @max(self.max_abs, abs_value);
+    }
+
+    fn addSlice(self: *FloatSliceStats, values: []const f32) void {
+        for (values) |value| self.addValue(value);
+    }
+
+    fn addDelta(self: *FloatSliceStats, before: []const f32, after: []const f32) !void {
+        if (before.len != after.len) return error.UpdateDiagnosticShapeMismatch;
+        for (before, after) |old, new| self.addValue(new - old);
+    }
+
+    fn l2(self: FloatSliceStats) f64 {
+        return @sqrt(self.sum_sq);
+    }
+
+    fn meanAbs(self: FloatSliceStats) f64 {
+        if (self.elems == 0) return 0.0;
+        return self.sum_abs / @as(f64, @floatFromInt(self.elems));
+    }
+};
+
+const StepParityTensorSliceStats = struct {
+    stats: FloatSliceStats = .{},
+    sample: [16]f32 = [_]f32{0} ** 16,
+    sample_len: usize = 0,
+
+    fn addValue(self: *StepParityTensorSliceStats, value: f32) void {
+        if (self.sample_len < self.sample.len) {
+            self.sample[self.sample_len] = value;
+            self.sample_len += 1;
+        }
+        self.stats.addValue(value);
+    }
+
+    fn addSlice(self: *StepParityTensorSliceStats, values: []const f32) void {
+        for (values) |value| self.addValue(value);
+    }
+
+    fn addStats(self: *StepParityTensorSliceStats, other: StepParityTensorSliceStats) void {
+        self.stats.elems += other.stats.elems;
+        self.stats.nonzero += other.stats.nonzero;
+        self.stats.sum_abs += other.stats.sum_abs;
+        self.stats.sum_sq += other.stats.sum_sq;
+        self.stats.max_abs = @max(self.stats.max_abs, other.stats.max_abs);
+        const remaining = self.sample.len - self.sample_len;
+        const copy_len = @min(remaining, other.sample_len);
+        if (copy_len > 0) {
+            @memcpy(self.sample[self.sample_len .. self.sample_len + copy_len], other.sample[0..copy_len]);
+            self.sample_len += copy_len;
+        }
+    }
+};
+
+const StepParitySoftmaxVJPCase = struct {
+    name: []const u8,
+    status: []const u8 = "captured",
+    reason: []const u8 = "",
+    outer: usize = 0,
+    queries: usize = 0,
+    keys: usize = 0,
+    mask_bias: f32 = 0.0,
+    has_mask: bool = false,
+    scores_masked: StepParityTensorSliceStats = .{},
+    probs: StepParityTensorSliceStats = .{},
+    upstream_probs_grad: StepParityTensorSliceStats = .{},
+    scores_masked_grad: StepParityTensorSliceStats = .{},
+    cpu_scores_masked_grad: StepParityTensorSliceStats = .{},
+    cpu_abs_error: StepParityTensorSliceStats = .{},
+    valid_scores_masked_grad: StepParityTensorSliceStats = .{},
+    masked_scores_masked_grad: StepParityTensorSliceStats = .{},
+};
+
+const StepParitySoftmaxVJPProbe = struct {
+    status: []const u8 = "captured",
+    version: u32 = 1,
+    runtime: []const u8 = "mpsgraph",
+    cases: []StepParitySoftmaxVJPCase = &.{},
+
+    fn deinit(self: *StepParitySoftmaxVJPProbe, allocator: std.mem.Allocator) void {
+        if (self.cases.len > 0) allocator.free(self.cases);
+        self.* = undefined;
+    }
+};
+
+const StepParityNamedTensorStats = struct {
+    name: []u8,
+    stats: StepParityTensorSliceStats,
+
+    fn deinit(self: *StepParityNamedTensorStats, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const StepParityQKVSplitVJPCase = struct {
+    name: []const u8,
+    status: []const u8 = "captured",
+    reason: []const u8 = "",
+    batch: usize = 0,
+    seq_len: usize = 0,
+    num_heads: usize = 0,
+    head_dim: usize = 0,
+    hidden_size: usize = 0,
+    outer: usize = 0,
+    components: []StepParityNamedTensorStats = &.{},
+
+    fn deinit(self: *StepParityQKVSplitVJPCase, allocator: std.mem.Allocator) void {
+        for (self.components) |*entry| entry.deinit(allocator);
+        if (self.components.len > 0) allocator.free(self.components);
+        self.* = undefined;
+    }
+};
+
+const StepParityQKVSplitVJPProbe = struct {
+    status: []const u8 = "captured",
+    version: u32 = 1,
+    runtime: []const u8 = "mpsgraph",
+    cases: []StepParityQKVSplitVJPCase = &.{},
+
+    fn deinit(self: *StepParityQKVSplitVJPProbe, allocator: std.mem.Allocator) void {
+        for (self.cases) |*case| case.deinit(allocator);
+        if (self.cases.len > 0) allocator.free(self.cases);
+        self.* = undefined;
+    }
+};
+
+const StepParitySegmentVJPProbe = struct {
+    target_layer: u32 = 0,
+    segment_start: u32 = 0,
+    segment_end: u32 = 0,
+    include_hidden_grad: bool = false,
+    include_adapter_grads: bool = false,
+    runtime: []const u8 = "unknown",
+    profile: segmented_encoder.SegmentVJPProfile = .{},
+    upstream: StepParityTensorSliceStats = .{},
+    hidden_grad: StepParityTensorSliceStats = .{},
+    adapter_a: StepParityTensorSliceStats = .{},
+    adapter_b: StepParityTensorSliceStats = .{},
+    adapter_a_by_name: []StepParityNamedTensorStats = &.{},
+    adapter_b_by_name: []StepParityNamedTensorStats = &.{},
+
+    fn deinit(self: *StepParitySegmentVJPProbe, allocator: std.mem.Allocator) void {
+        for (self.adapter_a_by_name) |*entry| entry.deinit(allocator);
+        allocator.free(self.adapter_a_by_name);
+        for (self.adapter_b_by_name) |*entry| entry.deinit(allocator);
+        allocator.free(self.adapter_b_by_name);
+        self.* = undefined;
+    }
+};
+
+const StepParityBackwardDecompComponent = struct {
+    name: []u8,
+    stats: StepParityTensorSliceStats,
+
+    fn deinit(self: *StepParityBackwardDecompComponent, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const StepParityBackwardDecompStage = struct {
+    status: []const u8 = "missing",
+    reason: []const u8 = "",
+    stats: StepParityTensorSliceStats = .{},
+    components: []StepParityBackwardDecompComponent = &.{},
+    adapter_a: StepParityTensorSliceStats = .{},
+    adapter_b: StepParityTensorSliceStats = .{},
+    adapter_a_by_name: []StepParityNamedTensorStats = &.{},
+    adapter_b_by_name: []StepParityNamedTensorStats = &.{},
+
+    fn deinit(self: *StepParityBackwardDecompStage, allocator: std.mem.Allocator) void {
+        for (self.components) |*entry| entry.deinit(allocator);
+        if (self.components.len > 0) allocator.free(self.components);
+        for (self.adapter_a_by_name) |*entry| entry.deinit(allocator);
+        if (self.adapter_a_by_name.len > 0) allocator.free(self.adapter_a_by_name);
+        for (self.adapter_b_by_name) |*entry| entry.deinit(allocator);
+        if (self.adapter_b_by_name.len > 0) allocator.free(self.adapter_b_by_name);
+        self.* = undefined;
+    }
+};
+
+const StepParityLayerBackwardDecompProbe = struct {
+    status: []const u8 = "captured",
+    version: u32 = 4,
+    target_layer: u32 = 0,
+    segment_start: u32 = 0,
+    segment_end: u32 = 0,
+    runtime: []const u8 = "unknown",
+    incoming_upstream: StepParityBackwardDecompStage = .{},
+    full_layer_hidden_grad: StepParityBackwardDecompStage = .{},
+    mlp_wo: StepParityBackwardDecompStage = .{},
+    mlp_gelu_input: StepParityBackwardDecompStage = .{},
+    mlp_gate_value: StepParityBackwardDecompStage = .{},
+    mlp_gate_input: StepParityBackwardDecompStage = .{},
+    mlp_wi_output: StepParityBackwardDecompStage = .{},
+    mlp_norm_output: StepParityBackwardDecompStage = .{},
+    mlp_hidden_after_attn: StepParityBackwardDecompStage = .{},
+    attn_out_proj: StepParityBackwardDecompStage = .{},
+    attention_core: StepParityBackwardDecompStage = .{},
+    attention_core_post_rope: StepParityBackwardDecompStage = .{},
+    attention_scores_raw: StepParityBackwardDecompStage = .{},
+    attention_scores_masked: StepParityBackwardDecompStage = .{},
+    attention_probs: StepParityBackwardDecompStage = .{},
+    qkv_proj: StepParityBackwardDecompStage = .{},
+    qkv_proj_split: StepParityBackwardDecompStage = .{},
+    attn_norm_hidden_in: StepParityBackwardDecompStage = .{},
+
+    fn deinit(self: *StepParityLayerBackwardDecompProbe, allocator: std.mem.Allocator) void {
+        self.incoming_upstream.deinit(allocator);
+        self.full_layer_hidden_grad.deinit(allocator);
+        self.mlp_wo.deinit(allocator);
+        self.mlp_gelu_input.deinit(allocator);
+        self.mlp_gate_value.deinit(allocator);
+        self.mlp_gate_input.deinit(allocator);
+        self.mlp_wi_output.deinit(allocator);
+        self.mlp_norm_output.deinit(allocator);
+        self.mlp_hidden_after_attn.deinit(allocator);
+        self.attn_out_proj.deinit(allocator);
+        self.attention_core.deinit(allocator);
+        self.attention_core_post_rope.deinit(allocator);
+        self.attention_scores_raw.deinit(allocator);
+        self.attention_scores_masked.deinit(allocator);
+        self.attention_probs.deinit(allocator);
+        self.qkv_proj.deinit(allocator);
+        self.qkv_proj_split.deinit(allocator);
+        self.attn_norm_hidden_in.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const LoRAGradClipSummary = struct {
+    elems: usize = 0,
+    nonfinite_repaired: usize = 0,
+    lora_norm_before_clip: f64 = 0,
+    lora_norm_after_clip: f64 = 0,
+    extra_norm_before_clip: f64 = 0,
+    extra_norm_after_clip: f64 = 0,
+    norm_before_clip: f64 = 0,
+    norm_after_clip: f64 = 0,
+    max_abs_before_clip: f32 = 0,
+    max_abs_after_clip: f32 = 0,
+    clip_scale: f32 = 1.0,
+};
+
+fn sanitizeAndClipLoRAGrads(layers: []fused_chunker_lora.LoRALayer, max_norm: f32, extra_norm: f64) LoRAGradClipSummary {
     var total_sq: f64 = 0;
+    var out = LoRAGradClipSummary{};
     for (layers) |*ll| {
         for (ll.grad_A) |*g| {
             if (!isFiniteF32(g.*)) {
                 g.* = 0;
+                out.nonfinite_repaired += 1;
                 continue;
             }
+            out.elems += 1;
+            out.max_abs_before_clip = @max(out.max_abs_before_clip, absF32(g.*));
             total_sq += @as(f64, g.*) * @as(f64, g.*);
         }
         for (ll.grad_B) |*g| {
             if (!isFiniteF32(g.*)) {
                 g.* = 0;
+                out.nonfinite_repaired += 1;
                 continue;
             }
+            out.elems += 1;
+            out.max_abs_before_clip = @max(out.max_abs_before_clip, absF32(g.*));
             total_sq += @as(f64, g.*) * @as(f64, g.*);
         }
         if (ll.grad_magnitude) |gm| {
             for (gm) |*g| {
                 if (!isFiniteF32(g.*)) {
                     g.* = 0;
+                    out.nonfinite_repaired += 1;
                     continue;
                 }
+                out.elems += 1;
+                out.max_abs_before_clip = @max(out.max_abs_before_clip, absF32(g.*));
                 total_sq += @as(f64, g.*) * @as(f64, g.*);
             }
         }
     }
 
-    if (max_norm <= 0) return;
+    const extra_sq = if (std.math.isFinite(extra_norm) and extra_norm > 0) extra_norm * extra_norm else 0;
+    const combined_sq = total_sq + extra_sq;
+    out.lora_norm_before_clip = @sqrt(total_sq);
+    out.lora_norm_after_clip = out.lora_norm_before_clip;
+    out.extra_norm_before_clip = @sqrt(extra_sq);
+    out.extra_norm_after_clip = out.extra_norm_before_clip;
+    out.norm_before_clip = @sqrt(combined_sq);
+    out.norm_after_clip = out.norm_before_clip;
+    out.max_abs_after_clip = out.max_abs_before_clip;
+    if (max_norm <= 0) return out;
 
-    const total_norm: f32 = @floatCast(@sqrt(total_sq));
-    if (!isFiniteF32(total_norm) or total_norm <= max_norm) return;
+    const total_norm: f32 = @floatCast(@sqrt(combined_sq));
+    if (!isFiniteF32(total_norm) or total_norm <= max_norm) return out;
 
     const scale = max_norm / (total_norm + 1e-6);
+    out.clip_scale = scale;
+    out.lora_norm_after_clip = out.lora_norm_before_clip * @as(f64, scale);
+    out.extra_norm_after_clip = out.extra_norm_before_clip * @as(f64, scale);
+    out.norm_after_clip = @as(f64, total_norm) * @as(f64, scale);
+    out.max_abs_after_clip = out.max_abs_before_clip * scale;
     for (layers) |*ll| {
         for (ll.grad_A) |*g| g.* *= scale;
         for (ll.grad_B) |*g| g.* *= scale;
@@ -368,6 +735,2139 @@ fn sanitizeAndClipLoRAGrads(layers: []fused_chunker_lora.LoRALayer, max_norm: f3
             for (gm) |*g| g.* *= scale;
         }
     }
+    return out;
+}
+
+const LoRAUpdateDebugAggregate = struct {
+    active_layers: usize = 0,
+    active_matrices: usize = 0,
+    detail_printed: usize = 0,
+    param_stats: FloatSliceStats = .{},
+    update_stats: FloatSliceStats = .{},
+    adam_m_stats: FloatSliceStats = .{},
+    adam_v_stats: FloatSliceStats = .{},
+    matrix_stats: std.ArrayListUnmanaged(LoRAUpdateMatrixDebug) = .empty,
+
+    fn deinit(self: *LoRAUpdateDebugAggregate, allocator: std.mem.Allocator) void {
+        for (self.matrix_stats.items) |*entry| entry.deinit(allocator);
+        self.matrix_stats.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const LoRAUpdateMatrixDebug = struct {
+    name: []u8,
+    update_stats: FloatSliceStats = .{},
+    adam_m_stats: FloatSliceStats = .{},
+    adam_v_stats: FloatSliceStats = .{},
+
+    fn deinit(self: *LoRAUpdateMatrixDebug, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn appendLoRAUpdateMatrixDebug(
+    allocator: std.mem.Allocator,
+    update_debug: *LoRAUpdateDebugAggregate,
+    layer_idx: u32,
+    module_name: []const u8,
+    matrix_name: []const u8,
+    before: []const f32,
+    after: []const f32,
+    maybe_state: ?optimizers.ParamState,
+) !void {
+    var entry = LoRAUpdateMatrixDebug{
+        .name = try std.fmt.allocPrint(
+            allocator,
+            "layer_{d:0>2}_{s}_{s}",
+            .{ layer_idx, module_name, matrix_name },
+        ),
+    };
+    errdefer entry.deinit(allocator);
+    try entry.update_stats.addDelta(before, after);
+    if (maybe_state) |state| {
+        entry.adam_m_stats.addSlice(state.m);
+        entry.adam_v_stats.addSlice(state.v);
+    }
+    try update_debug.matrix_stats.append(allocator, entry);
+}
+
+const StepParityBatchHashes = struct {
+    sample_indices: u64 = fnv_offset,
+    input_ids: u64 = fnv_offset,
+    attention_mask: u64 = fnv_offset,
+    labels: u64 = fnv_offset,
+    chunks: u64 = fnv_offset,
+};
+
+const StepParityBoundaryContext = struct {
+    batch_stats: BoundaryBatchDebugStats,
+    debug: fused_chunker_train.BoundaryStepDebugSummary,
+    embedding_probe: EmbeddingProbe = .{},
+    embedding_table_rows: []const EmbeddingRowProbe = &.{},
+    embedding_lookup_rows: []const EmbeddingRowProbe = &.{},
+    final_norm_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    final_norm_bias: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    encoder_activation_inputs: []const EncoderActivationInputProbe = &.{},
+    encoder_projection_decompositions: []const EncoderProjectionDecompositionProbe = &.{},
+    encoder_attention_internals: []const EncoderAttentionInternalProbe = &.{},
+    encoder_attention_rows: []const EncoderAttentionRowProbe = &.{},
+    encoder_layer_inputs: []const EncoderLayerInputProbe = &.{},
+    encoder_layer_states: []const EncoderLayerStateProbe = &.{},
+    encoder_replay_input: ?EncoderReplayInputProbe = null,
+};
+
+const StepParityContrastiveContext = struct {
+    active_chunks: usize = 0,
+    first_active_index: ?usize = null,
+    first_active_doc_id: ?u32 = null,
+    embedding_stats: FloatSliceStats = .{},
+    grad_stats: FloatSliceStats = .{},
+    contrastive_loss: f64 = 0,
+    total_loss: f64 = 0,
+    first_active_embedding_sample: [16]f32 = [_]f32{0} ** 16,
+    first_active_embedding_sample_len: usize = 0,
+    first_active_grad_sample: [16]f32 = [_]f32{0} ** 16,
+    first_active_grad_sample_len: usize = 0,
+    active_doc_id_sample: [8]u32 = [_]u32{0} ** 8,
+    active_doc_id_sample_len: usize = 0,
+    active_embedding_norm_sample: [8]f32 = [_]f32{0} ** 8,
+    active_embedding_norm_sample_len: usize = 0,
+    active_grad_norm_sample: [8]f32 = [_]f32{0} ** 8,
+    active_grad_norm_sample_len: usize = 0,
+};
+
+const EmbeddingProbe = struct {
+    word_embedding_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    token_lookup: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    layer_norm_output: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    layer_norm_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    layer_norm_bias: fused_chunker_train.BoundaryProbeTensorStats = .{},
+};
+
+const EmbeddingRowProbe = struct {
+    position: usize,
+    token_id: i32,
+    stats: fused_chunker_train.BoundaryProbeTensorStats = .{},
+};
+
+const EncoderLayerInputProbe = struct {
+    layer_idx: u32,
+    stats: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const EncoderLayerStateProbe = struct {
+    layer_idx: u32,
+    name: []const u8,
+    stats: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const EncoderReplayInputProbe = struct {
+    path: []const u8,
+    layer_idx: u32,
+    batch_size: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    elems: usize,
+    stats: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const EncoderReplayUpstreamProbe = struct {
+    path: []const u8,
+    target_layer: u32,
+    segment_start: u32,
+    segment_end: u32,
+    batch_size: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    elems: usize,
+    stats: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const StepParityNamedProbeTensorStats = struct {
+    name: []u8,
+    stats: fused_chunker_train.BoundaryProbeTensorStats = .{},
+
+    fn deinit(self: *StepParityNamedProbeTensorStats, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const StepParityUpstreamGradProbe = struct {
+    status: []const u8 = "captured",
+    target_layer: u32 = 0,
+    boundary_features_grad: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    contrastive_features_grad: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    combined_features_grad: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    final_norm_input: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    final_norm_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_output_grad: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    target_segment_upstream: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    upper_encoder_ladder: []StepParityNamedProbeTensorStats = &.{},
+
+    fn deinit(self: *StepParityUpstreamGradProbe, allocator: std.mem.Allocator) void {
+        for (self.upper_encoder_ladder) |*entry| entry.deinit(allocator);
+        if (self.upper_encoder_ladder.len > 0) allocator.free(self.upper_encoder_ladder);
+        self.* = undefined;
+    }
+};
+
+const EncoderActivationInputProbe = struct {
+    layer_idx: u32,
+    module_name: []const u8,
+    stats: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const EncoderProjectionDecompositionProbe = struct {
+    layer_idx: u32,
+    name: []const u8,
+    input: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    base: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_a: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_b: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    delta: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    output: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    bias: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_a_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_b_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    base_reference_error: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_a_reference_error: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    lora_b_reference_error: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    delta_reference_error: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    output_reference_error: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    scale: f32 = 0,
+    rank: usize = 0,
+    rows: usize = 0,
+    in_dim: usize = 0,
+    out_dim: usize = 0,
+    has_bias: bool = false,
+};
+
+const EncoderAttentionInternalProbe = struct {
+    layer_idx: u32,
+    name: []const u8,
+    stats: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const EncoderAttentionRowProbe = struct {
+    layer_idx: u32,
+    name: []const u8,
+    batch_idx: usize,
+    head_idx: usize,
+    query_idx: usize,
+    valid_keys: usize,
+    score_mean: f64,
+    score_rms: f64,
+    score_min: f32,
+    score_max: f32,
+    score_argmax: usize,
+    prob_entropy: f64,
+    prob_max: f32,
+    prob_argmax: usize,
+    prob_top2_gap: f32,
+    query_rms: f64,
+    query_max_abs: f32,
+    key_query_rms: f64,
+    key_query_max_abs: f32,
+    value_query_rms: f64,
+    value_query_max_abs: f32,
+    output_mean: f64,
+    output_rms: f64,
+    output_max_abs: f32,
+    query_sample_len: usize,
+    query_sample: [attention_row_sample_max]f32,
+    key_query_sample_len: usize,
+    key_query_sample: [attention_row_sample_max]f32,
+    value_query_sample_len: usize,
+    value_query_sample: [attention_row_sample_max]f32,
+    score_sample_len: usize,
+    score_sample: [attention_row_sample_max]f32,
+    prob_sample_len: usize,
+    prob_sample: [attention_row_sample_max]f32,
+    output_sample_len: usize,
+    output_sample: [attention_row_sample_max]f32,
+};
+
+const Layer0SdpaReferenceProbeStats = struct {
+    token_ref: fused_chunker_train.BoundaryProbeTensorStats,
+    token_delta: fused_chunker_train.BoundaryProbeTensorStats,
+    kernel_ref: fused_chunker_train.BoundaryProbeTensorStats,
+    kernel_delta: fused_chunker_train.BoundaryProbeTensorStats,
+};
+
+const embedding_row_probe_max = 8;
+const attention_row_sample_max = 16;
+
+const StepParityUpdateSummary = struct {
+    grad_clip: LoRAGradClipSummary,
+    active_adapters: usize,
+    active_matrices: usize,
+    base_lr: f32,
+    lora_plus_ratio: f32,
+    optimizer_step_count: u64,
+    param_elems: usize,
+    param_norm: f64,
+    update_elems: usize,
+    update_norm: f64,
+    update_max_abs: f32,
+    update_mean_abs: f64,
+    update_to_param: f64,
+    adam_m_norm: f64,
+    adam_v_norm: f64,
+    repaired_after_update: usize,
+    matrix_stats: []const LoRAUpdateMatrixDebug = &.{},
+};
+
+fn hashU64(hash: *u64, value: u64) void {
+    var v = value;
+    for (0..8) |_| {
+        hash.* ^= v & 0xff;
+        hash.* *%= fnv_prime;
+        v >>= 8;
+    }
+}
+
+fn hashI32(hash: *u64, value: i32) void {
+    hashU64(hash, @as(u32, @bitCast(value)));
+}
+
+fn computeStepParityBatchHashes(
+    batch: *const fused_chunker_data.FusedBatch,
+    total_tokens: usize,
+) StepParityBatchHashes {
+    var out = StepParityBatchHashes{};
+    for (batch.sample_indices) |idx| hashU64(&out.sample_indices, idx);
+    for (0..total_tokens) |i| {
+        hashI32(&out.input_ids, batch.input_ids[i]);
+        hashI32(&out.attention_mask, batch.attention_mask[i]);
+        hashU64(&out.labels, if (batch.boundary_labels[i] > 0.5) 1 else 0);
+    }
+    for (0..batch.batch_size * batch.max_chunks) |i| {
+        hashI32(&out.chunks, batch.chunk_starts[i]);
+        hashI32(&out.chunks, batch.chunk_ends[i]);
+        hashU64(&out.chunks, if (batch.chunk_mask[i] > 0.5) 1 else 0);
+    }
+    return out;
+}
+
+fn writeUsizeJsonArray(writer: anytype, values: []const usize) !void {
+    try writer.interface.writeByte('[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("{d}", .{value});
+    }
+    try writer.interface.writeByte(']');
+}
+
+fn writeProbeF32SliceJson(writer: anytype, values: []const f32) !void {
+    try writer.interface.writeByte('[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("{d:.9}", .{value});
+    }
+    try writer.interface.writeByte(']');
+}
+
+fn writeProbeFloatSampleJson(writer: anytype, stats: fused_chunker_train.BoundaryProbeTensorStats) !void {
+    try writeProbeF32SliceJson(writer, stats.sample[0..stats.sample_len]);
+}
+
+fn writeProbeU64SampleJson(writer: anytype, values: []const u64) !void {
+    try writer.interface.writeByte('[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("{d}", .{value});
+    }
+    try writer.interface.writeByte(']');
+}
+
+fn writeProbeTensorStatsJson(writer: anytype, stats: fused_chunker_train.BoundaryProbeTensorStats) !void {
+    try writer.interface.print(
+        "{{\"elems\":{d},\"mean\":{d:.9},\"rms\":{d:.9},\"max_abs\":{d:.9},\"max_abs_index\":{d},\"max_abs_value\":{d:.9},\"hash\":\"{x}\",\"sample\":",
+        .{ stats.elems, stats.mean, stats.rms, stats.max_abs, stats.max_abs_index, stats.max_abs_value, stats.hash },
+    );
+    try writeProbeFloatSampleJson(writer, stats);
+    try writer.interface.writeAll(",\"top_abs_indices\":");
+    try writeProbeU64SampleJson(writer, stats.top_abs_indices[0..stats.top_abs_len]);
+    try writer.interface.writeAll(",\"top_abs_values\":");
+    try writeProbeF32SliceJson(writer, stats.top_abs_values[0..stats.top_abs_len]);
+    try writer.interface.writeByte('}');
+}
+
+fn writeBoundaryForwardProbeJson(writer: anytype, probe: fused_chunker_train.BoundaryForwardProbe) !void {
+    try writer.interface.writeAll("{\"final_norm_input\":");
+    try writeProbeTensorStatsJson(writer, probe.final_norm_input);
+    try writer.interface.writeAll(",\"boundary_head_input\":");
+    try writeProbeTensorStatsJson(writer, probe.boundary_head_input);
+    try writer.interface.writeAll(",\"dense1_pre_activation\":");
+    try writeProbeTensorStatsJson(writer, probe.dense1_pre_activation);
+    try writer.interface.writeAll(",\"dense1_post_activation\":");
+    try writeProbeTensorStatsJson(writer, probe.dense1_post_activation);
+    try writer.interface.writeAll(",\"logits\":");
+    try writeProbeTensorStatsJson(writer, probe.logits);
+    try writer.interface.writeByte('}');
+}
+
+fn writeBoundaryCheckpointProbeJson(
+    writer: anytype,
+    probe: fused_chunker_train.BoundaryCheckpointProbe,
+    final_norm_weight: fused_chunker_train.BoundaryProbeTensorStats,
+    final_norm_bias: fused_chunker_train.BoundaryProbeTensorStats,
+) !void {
+    try writer.interface.writeAll("{\"final_norm_weight\":");
+    try writeProbeTensorStatsJson(writer, final_norm_weight);
+    try writer.interface.writeAll(",\"final_norm_bias\":");
+    try writeProbeTensorStatsJson(writer, final_norm_bias);
+    try writer.interface.writeAll(",\"w1\":");
+    try writeProbeTensorStatsJson(writer, probe.w1);
+    try writer.interface.writeAll(",\"b1\":");
+    try writeProbeTensorStatsJson(writer, probe.b1);
+    try writer.interface.writeAll(",\"w2\":");
+    try writeProbeTensorStatsJson(writer, probe.w2);
+    try writer.interface.writeAll(",\"b2\":");
+    try writeProbeTensorStatsJson(writer, probe.b2);
+    try writer.interface.writeByte('}');
+}
+
+fn writeEmbeddingProbeJson(writer: anytype, probe: EmbeddingProbe) !void {
+    try writer.interface.writeAll("{\"word_embedding_weight\":");
+    try writeProbeTensorStatsJson(writer, probe.word_embedding_weight);
+    try writer.interface.writeAll(",\"token_lookup\":");
+    try writeProbeTensorStatsJson(writer, probe.token_lookup);
+    try writer.interface.writeAll(",\"layer_norm_output\":");
+    try writeProbeTensorStatsJson(writer, probe.layer_norm_output);
+    try writer.interface.writeAll(",\"layer_norm_weight\":");
+    try writeProbeTensorStatsJson(writer, probe.layer_norm_weight);
+    try writer.interface.writeAll(",\"layer_norm_bias\":");
+    try writeProbeTensorStatsJson(writer, probe.layer_norm_bias);
+    try writer.interface.writeByte('}');
+}
+
+fn writeEmbeddingRowProbeJson(writer: anytype, probes: []const EmbeddingRowProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"pos_{d:0>3}_id_{d}\":", .{ probe.position, probe.token_id });
+        try writeProbeTensorStatsJson(writer, probe.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeEncoderLayerInputProbeJson(writer: anytype, probes: []const EncoderLayerInputProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"layer_{d:0>2}\":", .{probe.layer_idx});
+        try writeProbeTensorStatsJson(writer, probe.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeEncoderLayerStateProbeJson(writer: anytype, probes: []const EncoderLayerStateProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"layer_{d:0>2}_{s}\":", .{ probe.layer_idx, probe.name });
+        try writeProbeTensorStatsJson(writer, probe.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeEncoderReplayInputProbeJson(writer: anytype, maybe_probe: ?EncoderReplayInputProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"status\":\"captured\",\"path\":\"{s}\",\"layer_idx\":{d},\"batch_size\":{d},\"seq_len\":{d},\"hidden_size\":{d},\"elems\":{d},\"dtype\":\"f32\",\"endianness\":\"little\",\"stats\":",
+        .{
+            probe.path,
+            probe.layer_idx,
+            probe.batch_size,
+            probe.seq_len,
+            probe.hidden_size,
+            probe.elems,
+        },
+    );
+    try writeProbeTensorStatsJson(writer, probe.stats);
+    try writer.interface.writeByte('}');
+}
+
+fn writeEncoderReplayUpstreamProbeJson(writer: anytype, maybe_probe: ?EncoderReplayUpstreamProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"status\":\"captured\",\"path\":\"{s}\",\"target_layer\":{d},\"segment_start\":{d},\"segment_end\":{d},\"batch_size\":{d},\"seq_len\":{d},\"hidden_size\":{d},\"elems\":{d},\"dtype\":\"f32\",\"endianness\":\"little\",\"stats\":",
+        .{
+            probe.path,
+            probe.target_layer,
+            probe.segment_start,
+            probe.segment_end,
+            probe.batch_size,
+            probe.seq_len,
+            probe.hidden_size,
+            probe.elems,
+        },
+    );
+    try writeProbeTensorStatsJson(writer, probe.stats);
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityNamedProbeTensorStatsMapJson(writer: anytype, entries: []const StepParityNamedProbeTensorStats) !void {
+    try writer.interface.writeByte('{');
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"{s}\":", .{entry.name});
+        try writeProbeTensorStatsJson(writer, entry.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityUpstreamGradProbeJson(writer: anytype, maybe_probe: ?StepParityUpstreamGradProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"status\":\"{s}\",\"target_layer\":{d},\"stages\":{{\"boundary_features_grad\":",
+        .{ probe.status, probe.target_layer },
+    );
+    try writeProbeTensorStatsJson(writer, probe.boundary_features_grad);
+    try writer.interface.writeAll(",\"contrastive_features_grad\":");
+    try writeProbeTensorStatsJson(writer, probe.contrastive_features_grad);
+    try writer.interface.writeAll(",\"combined_features_grad\":");
+    try writeProbeTensorStatsJson(writer, probe.combined_features_grad);
+    try writer.interface.writeAll(",\"final_norm_input\":");
+    try writeProbeTensorStatsJson(writer, probe.final_norm_input);
+    try writer.interface.writeAll(",\"final_norm_weight\":");
+    try writeProbeTensorStatsJson(writer, probe.final_norm_weight);
+    try writer.interface.writeAll(",\"lora_output_grad\":");
+    try writeProbeTensorStatsJson(writer, probe.lora_output_grad);
+    try writer.interface.writeAll(",\"target_segment_upstream\":");
+    try writeProbeTensorStatsJson(writer, probe.target_segment_upstream);
+    try writer.interface.writeAll("},\"upper_encoder_ladder\":");
+    try writeStepParityNamedProbeTensorStatsMapJson(writer, probe.upper_encoder_ladder);
+    try writer.interface.writeByte('}');
+}
+
+fn writeEncoderActivationInputProbeJson(writer: anytype, probes: []const EncoderActivationInputProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"layer_{d:0>2}_{s}\":", .{ probe.layer_idx, probe.module_name });
+        try writeProbeTensorStatsJson(writer, probe.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn fusedProbeStatsFromModernBert(stats: modern_bert.TensorProbeStats) fused_chunker_train.BoundaryProbeTensorStats {
+    return .{
+        .elems = stats.elems,
+        .mean = stats.mean,
+        .rms = stats.rms,
+        .max_abs = stats.max_abs,
+        .max_abs_index = stats.max_abs_index,
+        .max_abs_value = stats.max_abs_value,
+        .hash = stats.hash,
+        .sample_len = stats.sample_len,
+        .sample = stats.sample,
+        .top_abs_len = stats.top_abs_len,
+        .top_abs_indices = stats.top_abs_indices,
+        .top_abs_values = stats.top_abs_values,
+    };
+}
+
+fn writeEncoderProjectionDecompositionProbeJson(writer: anytype, probes: []const EncoderProjectionDecompositionProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print(
+            "\"layer_{d:0>2}_{s}\":{{\"scale\":{d:.9},\"rank\":{d},\"rows\":{d},\"in_dim\":{d},\"out_dim\":{d},\"has_bias\":{},\"input\":",
+            .{
+                probe.layer_idx,
+                probe.name,
+                probe.scale,
+                probe.rank,
+                probe.rows,
+                probe.in_dim,
+                probe.out_dim,
+                probe.has_bias,
+            },
+        );
+        try writeProbeTensorStatsJson(writer, probe.input);
+        try writer.interface.writeAll(",\"base\":");
+        try writeProbeTensorStatsJson(writer, probe.base);
+        try writer.interface.writeAll(",\"lora_a\":");
+        try writeProbeTensorStatsJson(writer, probe.lora_a);
+        try writer.interface.writeAll(",\"lora_b\":");
+        try writeProbeTensorStatsJson(writer, probe.lora_b);
+        try writer.interface.writeAll(",\"delta\":");
+        try writeProbeTensorStatsJson(writer, probe.delta);
+        try writer.interface.writeAll(",\"output\":");
+        try writeProbeTensorStatsJson(writer, probe.output);
+        try writer.interface.writeAll(",\"weight\":");
+        try writeProbeTensorStatsJson(writer, probe.weight);
+        try writer.interface.writeAll(",\"bias\":");
+        try writeProbeTensorStatsJson(writer, probe.bias);
+        try writer.interface.writeAll(",\"lora_a_weight\":");
+        try writeProbeTensorStatsJson(writer, probe.lora_a_weight);
+        try writer.interface.writeAll(",\"lora_b_weight\":");
+        try writeProbeTensorStatsJson(writer, probe.lora_b_weight);
+        try writer.interface.writeAll(",\"base_reference_error\":");
+        try writeProbeTensorStatsJson(writer, probe.base_reference_error);
+        try writer.interface.writeAll(",\"lora_a_reference_error\":");
+        try writeProbeTensorStatsJson(writer, probe.lora_a_reference_error);
+        try writer.interface.writeAll(",\"lora_b_reference_error\":");
+        try writeProbeTensorStatsJson(writer, probe.lora_b_reference_error);
+        try writer.interface.writeAll(",\"delta_reference_error\":");
+        try writeProbeTensorStatsJson(writer, probe.delta_reference_error);
+        try writer.interface.writeAll(",\"output_reference_error\":");
+        try writeProbeTensorStatsJson(writer, probe.output_reference_error);
+        try writer.interface.writeByte('}');
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeEncoderAttentionInternalProbeJson(writer: anytype, probes: []const EncoderAttentionInternalProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"layer_{d:0>2}_{s}\":", .{ probe.layer_idx, probe.name });
+        try writeProbeTensorStatsJson(writer, probe.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeF32LittleEndianFile(allocator: std.mem.Allocator, path: []const u8, values: []const f32) !void {
+    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+    defer file.close(compat.io());
+    const bytes = try allocator.alloc(u8, values.len * @sizeOf(f32));
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| {
+        std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(value), .little);
+    }
+    try file.writeStreamingAll(compat.io(), bytes);
+}
+
+fn writeFixedF32SampleJson(writer: anytype, sample: []const f32) !void {
+    try writer.interface.writeByte('[');
+    for (sample, 0..) |value, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("{d:.9}", .{value});
+    }
+    try writer.interface.writeByte(']');
+}
+
+fn writeFixedU32SampleJson(writer: anytype, sample: []const u32) !void {
+    try writer.interface.writeByte('[');
+    for (sample, 0..) |value, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("{d}", .{value});
+    }
+    try writer.interface.writeByte(']');
+}
+
+fn writeEncoderAttentionRowProbeJson(writer: anytype, probes: []const EncoderAttentionRowProbe) !void {
+    try writer.interface.writeByte('{');
+    for (probes, 0..) |probe, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print(
+            "\"layer_{d:0>2}_{s}\":{{\"batch\":{d},\"head\":{d},\"query\":{d},\"valid_keys\":{d},\"score_mean\":{d:.9},\"score_rms\":{d:.9},\"score_min\":{d:.9},\"score_max\":{d:.9},\"score_argmax\":{d},\"prob_entropy\":{d:.9},\"prob_max\":{d:.9},\"prob_argmax\":{d},\"prob_top2_gap\":{d:.9},\"query_rms\":{d:.9},\"query_max_abs\":{d:.9},\"key_query_rms\":{d:.9},\"key_query_max_abs\":{d:.9},\"value_query_rms\":{d:.9},\"value_query_max_abs\":{d:.9},\"output_mean\":{d:.9},\"output_rms\":{d:.9},\"output_max_abs\":{d:.9},\"query_sample\":",
+            .{
+                probe.layer_idx,
+                probe.name,
+                probe.batch_idx,
+                probe.head_idx,
+                probe.query_idx,
+                probe.valid_keys,
+                probe.score_mean,
+                probe.score_rms,
+                probe.score_min,
+                probe.score_max,
+                probe.score_argmax,
+                probe.prob_entropy,
+                probe.prob_max,
+                probe.prob_argmax,
+                probe.prob_top2_gap,
+                probe.query_rms,
+                probe.query_max_abs,
+                probe.key_query_rms,
+                probe.key_query_max_abs,
+                probe.value_query_rms,
+                probe.value_query_max_abs,
+                probe.output_mean,
+                probe.output_rms,
+                probe.output_max_abs,
+            },
+        );
+        try writeFixedF32SampleJson(writer, probe.query_sample[0..probe.query_sample_len]);
+        try writer.interface.writeAll(",\"key_query_sample\":");
+        try writeFixedF32SampleJson(writer, probe.key_query_sample[0..probe.key_query_sample_len]);
+        try writer.interface.writeAll(",\"value_query_sample\":");
+        try writeFixedF32SampleJson(writer, probe.value_query_sample[0..probe.value_query_sample_len]);
+        try writer.interface.writeAll(",\"score_sample\":");
+        try writeFixedF32SampleJson(writer, probe.score_sample[0..probe.score_sample_len]);
+        try writer.interface.writeAll(",\"prob_sample\":");
+        try writeFixedF32SampleJson(writer, probe.prob_sample[0..probe.prob_sample_len]);
+        try writer.interface.writeAll(",\"output_sample\":");
+        try writeFixedF32SampleJson(writer, probe.output_sample[0..probe.output_sample_len]);
+        try writer.interface.writeByte('}');
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeFloatSliceStatsJson(writer: anytype, stats: FloatSliceStats) !void {
+    try writer.interface.print(
+        "{{\"elems\":{d},\"nonzero\":{d},\"l2\":{d:.9},\"max_abs\":{d:.9},\"mean_abs\":{d:.9}}}",
+        .{
+            stats.elems,
+            stats.nonzero,
+            stats.l2(),
+            stats.max_abs,
+            stats.meanAbs(),
+        },
+    );
+}
+
+fn writeLoRAUpdateMatrixStatsJson(writer: anytype, entries: []const LoRAUpdateMatrixDebug) !void {
+    try writer.interface.writeByte('{');
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"{s}\":{{\"update\":", .{entry.name});
+        try writeFloatSliceStatsJson(writer, entry.update_stats);
+        try writer.interface.writeAll(",\"adam_m\":");
+        try writeFloatSliceStatsJson(writer, entry.adam_m_stats);
+        try writer.interface.writeAll(",\"adam_v\":");
+        try writeFloatSliceStatsJson(writer, entry.adam_v_stats);
+        try writer.interface.writeByte('}');
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeFloatSliceStatsFromSliceJson(writer: anytype, values: []const f32, scale: f32) !void {
+    var stats = FloatSliceStats{};
+    const sample_len = @min(values.len, 16);
+    for (values) |value| stats.addValue(value * scale);
+    try writer.interface.print(
+        "{{\"elems\":{d},\"nonzero\":{d},\"l2\":{d:.9},\"max_abs\":{d:.9},\"mean_abs\":{d:.9},\"sample\":",
+        .{
+            stats.elems,
+            stats.nonzero,
+            stats.l2(),
+            stats.max_abs,
+            stats.meanAbs(),
+        },
+    );
+    try writer.interface.writeByte('[');
+    for (values[0..sample_len], 0..) |value, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("{d:.9}", .{value * scale});
+    }
+    try writer.interface.writeAll("]}");
+}
+
+fn writeStepParityTensorSliceStatsJson(writer: anytype, value: StepParityTensorSliceStats) !void {
+    try writer.interface.print(
+        "{{\"elems\":{d},\"nonzero\":{d},\"l2\":{d:.9},\"max_abs\":{d:.9},\"mean_abs\":{d:.9},\"sample\":",
+        .{
+            value.stats.elems,
+            value.stats.nonzero,
+            value.stats.l2(),
+            value.stats.max_abs,
+            value.stats.meanAbs(),
+        },
+    );
+    try writeFixedF32SampleJson(writer, value.sample[0..value.sample_len]);
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityNamedTensorStatsMapJson(writer: anytype, entries: []const StepParityNamedTensorStats) !void {
+    try writer.interface.writeByte('{');
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"{s}\":", .{entry.name});
+        try writeStepParityTensorSliceStatsJson(writer, entry.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParitySegmentVJPProbeJson(writer: anytype, maybe_probe: ?StepParitySegmentVJPProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"target_layer\":{d},\"segment_start\":{d},\"segment_end\":{d},\"include_hidden_grad\":{},\"include_adapter_grads\":{},\"runtime\":\"{s}\",\"profile\":{{\"runtime_input_ms\":{d:.9},\"compiled_execute_ms\":{d:.9},\"compiled_extract_ms\":{d:.9},\"compiled_total_ms\":{d:.9},\"accumulate_ms\":{d:.9},\"total_ms\":{d:.9},\"mpsgraph_runtime\":{},\"partitioned_runtime\":{},\"partitions_executed\":{d},\"backend_command_dispatches\":{d},\"planned_operator_dispatches\":{d},\"graph_region_dispatches\":{d},\"interpreter_fallbacks\":{d}}},\"upstream\":",
+        .{
+            probe.target_layer,
+            probe.segment_start,
+            probe.segment_end,
+            probe.include_hidden_grad,
+            probe.include_adapter_grads,
+            probe.runtime,
+            nsToMs(probe.profile.runtime_input_ns),
+            nsToMs(probe.profile.compiled_execute_ns),
+            nsToMs(probe.profile.compiled_extract_ns),
+            nsToMs(probe.profile.compiled_total_ns),
+            nsToMs(probe.profile.accumulate_ns),
+            nsToMs(probe.profile.total_ns),
+            probe.profile.mpsgraph_runtime,
+            probe.profile.partitioned_runtime,
+            probe.profile.partitions_executed,
+            probe.profile.backend_command_dispatches,
+            probe.profile.planned_operator_dispatches,
+            probe.profile.graph_region_dispatches,
+            probe.profile.interpreter_fallbacks,
+        },
+    );
+    try writeStepParityTensorSliceStatsJson(writer, probe.upstream);
+    try writer.interface.writeAll(",\"hidden_grad\":");
+    try writeStepParityTensorSliceStatsJson(writer, probe.hidden_grad);
+    try writer.interface.writeAll(",\"adapter_a\":");
+    try writeStepParityTensorSliceStatsJson(writer, probe.adapter_a);
+    try writer.interface.writeAll(",\"adapter_b\":");
+    try writeStepParityTensorSliceStatsJson(writer, probe.adapter_b);
+    try writer.interface.writeAll(",\"adapter_a_by_name\":");
+    try writeStepParityNamedTensorStatsMapJson(writer, probe.adapter_a_by_name);
+    try writer.interface.writeAll(",\"adapter_b_by_name\":");
+    try writeStepParityNamedTensorStatsMapJson(writer, probe.adapter_b_by_name);
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityBackwardDecompComponentsJson(writer: anytype, entries: []const StepParityBackwardDecompComponent) !void {
+    try writer.interface.writeByte('{');
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"{s}\":", .{entry.name});
+        try writeStepParityTensorSliceStatsJson(writer, entry.stats);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityBackwardDecompStageJson(writer: anytype, stage: StepParityBackwardDecompStage) !void {
+    try writer.interface.print("{{\"status\":\"{s}\",\"reason\":\"{s}\"", .{ stage.status, stage.reason });
+    if (std.mem.eql(u8, stage.status, "captured")) {
+        try writer.interface.writeAll(",\"stats\":");
+        try writeStepParityTensorSliceStatsJson(writer, stage.stats);
+        try writer.interface.writeAll(",\"components\":");
+        try writeStepParityBackwardDecompComponentsJson(writer, stage.components);
+        try writer.interface.writeAll(",\"adapter_a\":");
+        try writeStepParityTensorSliceStatsJson(writer, stage.adapter_a);
+        try writer.interface.writeAll(",\"adapter_b\":");
+        try writeStepParityTensorSliceStatsJson(writer, stage.adapter_b);
+        try writer.interface.writeAll(",\"adapter_a_by_name\":");
+        try writeStepParityNamedTensorStatsMapJson(writer, stage.adapter_a_by_name);
+        try writer.interface.writeAll(",\"adapter_b_by_name\":");
+        try writeStepParityNamedTensorStatsMapJson(writer, stage.adapter_b_by_name);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityLayerBackwardDecompProbeJson(writer: anytype, maybe_probe: ?StepParityLayerBackwardDecompProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"status\":\"{s}\",\"version\":{d},\"target_layer\":{d},\"segment_start\":{d},\"segment_end\":{d},\"runtime\":\"{s}\",\"stages\":{{\"incoming_upstream\":",
+        .{
+            probe.status,
+            probe.version,
+            probe.target_layer,
+            probe.segment_start,
+            probe.segment_end,
+            probe.runtime,
+        },
+    );
+    try writeStepParityBackwardDecompStageJson(writer, probe.incoming_upstream);
+    try writer.interface.writeAll(",\"full_layer_hidden_grad\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.full_layer_hidden_grad);
+    try writer.interface.writeAll(",\"mlp_wo\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_wo);
+    try writer.interface.writeAll(",\"mlp_gelu_input\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_gelu_input);
+    try writer.interface.writeAll(",\"mlp_gate_value\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_gate_value);
+    try writer.interface.writeAll(",\"mlp_gate_input\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_gate_input);
+    try writer.interface.writeAll(",\"mlp_wi_output\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_wi_output);
+    try writer.interface.writeAll(",\"mlp_norm_output\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_norm_output);
+    try writer.interface.writeAll(",\"mlp_hidden_after_attn\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.mlp_hidden_after_attn);
+    try writer.interface.writeAll(",\"attn_out_proj\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attn_out_proj);
+    try writer.interface.writeAll(",\"attention_core\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attention_core);
+    try writer.interface.writeAll(",\"attention_core_post_rope\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attention_core_post_rope);
+    try writer.interface.writeAll(",\"attention_scores_raw\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attention_scores_raw);
+    try writer.interface.writeAll(",\"attention_scores_masked\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attention_scores_masked);
+    try writer.interface.writeAll(",\"attention_probs\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attention_probs);
+    try writer.interface.writeAll(",\"qkv_proj\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.qkv_proj);
+    try writer.interface.writeAll(",\"qkv_proj_split\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.qkv_proj_split);
+    try writer.interface.writeAll(",\"attn_norm_hidden_in\":");
+    try writeStepParityBackwardDecompStageJson(writer, probe.attn_norm_hidden_in);
+    try writer.interface.writeAll("}}");
+}
+
+fn writeStepParitySoftmaxVJPCaseJson(writer: anytype, case: StepParitySoftmaxVJPCase) !void {
+    try writer.interface.print(
+        "{{\"status\":\"{s}\",\"reason\":\"{s}\",\"outer\":{d},\"queries\":{d},\"keys\":{d},\"has_mask\":{},\"mask_bias\":{d}",
+        .{
+            case.status,
+            case.reason,
+            case.outer,
+            case.queries,
+            case.keys,
+            case.has_mask,
+            case.mask_bias,
+        },
+    );
+    try writer.interface.writeAll(",\"scores_masked\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.scores_masked);
+    try writer.interface.writeAll(",\"probs\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.probs);
+    try writer.interface.writeAll(",\"upstream_probs_grad\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.upstream_probs_grad);
+    try writer.interface.writeAll(",\"scores_masked_grad\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.scores_masked_grad);
+    try writer.interface.writeAll(",\"cpu_scores_masked_grad\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.cpu_scores_masked_grad);
+    try writer.interface.writeAll(",\"cpu_abs_error\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.cpu_abs_error);
+    try writer.interface.writeAll(",\"valid_scores_masked_grad\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.valid_scores_masked_grad);
+    try writer.interface.writeAll(",\"masked_scores_masked_grad\":");
+    try writeStepParityTensorSliceStatsJson(writer, case.masked_scores_masked_grad);
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParitySoftmaxVJPProbeJson(writer: anytype, maybe_probe: ?StepParitySoftmaxVJPProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"status\":\"{s}\",\"version\":{d},\"runtime\":\"{s}\",\"cases\":{{",
+        .{ probe.status, probe.version, probe.runtime },
+    );
+    for (probe.cases, 0..) |case, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"{s}\":", .{case.name});
+        try writeStepParitySoftmaxVJPCaseJson(writer, case);
+    }
+    try writer.interface.writeAll("}}");
+}
+
+fn writeStepParityQKVSplitVJPCaseJson(writer: anytype, case: StepParityQKVSplitVJPCase) !void {
+    try writer.interface.print(
+        "{{\"status\":\"{s}\",\"reason\":\"{s}\",\"batch\":{d},\"seq_len\":{d},\"num_heads\":{d},\"head_dim\":{d},\"hidden_size\":{d},\"outer\":{d},\"components\":",
+        .{
+            case.status,
+            case.reason,
+            case.batch,
+            case.seq_len,
+            case.num_heads,
+            case.head_dim,
+            case.hidden_size,
+            case.outer,
+        },
+    );
+    try writeStepParityNamedTensorStatsMapJson(writer, case.components);
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityQKVSplitVJPProbeJson(writer: anytype, maybe_probe: ?StepParityQKVSplitVJPProbe) !void {
+    const probe = maybe_probe orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.print(
+        "{{\"status\":\"{s}\",\"version\":{d},\"runtime\":\"{s}\",\"cases\":{{",
+        .{ probe.status, probe.version, probe.runtime },
+    );
+    for (probe.cases, 0..) |case, i| {
+        if (i > 0) try writer.interface.writeByte(',');
+        try writer.interface.print("\"{s}\":", .{case.name});
+        try writeStepParityQKVSplitVJPCaseJson(writer, case);
+    }
+    try writer.interface.writeAll("}}");
+}
+
+fn writeStepParityLoRAGradMatrixStatsJson(
+    writer: anytype,
+    adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    scale: f32,
+) !void {
+    const la = adapters orelse {
+        try writer.interface.writeAll("null");
+        return;
+    };
+    try writer.interface.writeByte('{');
+    var first = true;
+    for (la.layers) |*ll| {
+        if (!first) try writer.interface.writeByte(',');
+        first = false;
+        try writer.interface.print("\"layer_{d:0>2}_{s}_A\":", .{ ll.layer_idx, ll.module_name });
+        try writeFloatSliceStatsFromSliceJson(writer, ll.grad_A, scale);
+
+        try writer.interface.print(",\"layer_{d:0>2}_{s}_B\":", .{ ll.layer_idx, ll.module_name });
+        try writeFloatSliceStatsFromSliceJson(writer, ll.grad_B, scale);
+    }
+    try writer.interface.writeByte('}');
+}
+
+fn writeStepParityContrastiveJson(writer: anytype, maybe_ctx: ?StepParityContrastiveContext) !void {
+    if (maybe_ctx) |ctx| {
+        try writer.interface.print(
+            "{{\"active_chunks\":{d},\"contrastive_loss\":{d:.9},\"total_loss\":{d:.9},\"embeddings\":",
+            .{
+                ctx.active_chunks,
+                ctx.contrastive_loss,
+                ctx.total_loss,
+            },
+        );
+        try writeFloatSliceStatsJson(writer, ctx.embedding_stats);
+        try writer.interface.writeAll(",\"grad\":");
+        try writeFloatSliceStatsJson(writer, ctx.grad_stats);
+        try writer.interface.writeAll(",\"first_active_index\":");
+        if (ctx.first_active_index) |index| {
+            try writer.interface.print("{d}", .{index});
+        } else {
+            try writer.interface.writeAll("null");
+        }
+        try writer.interface.writeAll(",\"first_active_doc_id\":");
+        if (ctx.first_active_doc_id) |doc_id| {
+            try writer.interface.print("{d}", .{doc_id});
+        } else {
+            try writer.interface.writeAll("null");
+        }
+        try writer.interface.writeAll(",\"first_active_embedding_sample\":");
+        try writeFixedF32SampleJson(writer, ctx.first_active_embedding_sample[0..ctx.first_active_embedding_sample_len]);
+        try writer.interface.writeAll(",\"first_active_grad_sample\":");
+        try writeFixedF32SampleJson(writer, ctx.first_active_grad_sample[0..ctx.first_active_grad_sample_len]);
+        try writer.interface.writeAll(",\"active_doc_id_sample\":");
+        try writeFixedU32SampleJson(writer, ctx.active_doc_id_sample[0..ctx.active_doc_id_sample_len]);
+        try writer.interface.writeAll(",\"active_embedding_norm_sample\":");
+        try writeFixedF32SampleJson(writer, ctx.active_embedding_norm_sample[0..ctx.active_embedding_norm_sample_len]);
+        try writer.interface.writeAll(",\"active_grad_norm_sample\":");
+        try writeFixedF32SampleJson(writer, ctx.active_grad_norm_sample[0..ctx.active_grad_norm_sample_len]);
+        try writer.interface.writeByte('}');
+    } else {
+        try writer.interface.writeAll("null");
+    }
+}
+
+fn writeStepParityJson(
+    path: []const u8,
+    phase: []const u8,
+    opts: *const Options,
+    effective_lambda_embed: f32,
+    epoch: usize,
+    local_step: u32,
+    global_step: u32,
+    trainer_step_count: u32,
+    batch_indices: []const usize,
+    batch: *const fused_chunker_data.FusedBatch,
+    total_tokens: usize,
+    boundary_ctx: StepParityBoundaryContext,
+    contrastive_ctx: ?StepParityContrastiveContext,
+    upstream_grad_probe: ?StepParityUpstreamGradProbe,
+    encoder_replay_upstream_probe: ?EncoderReplayUpstreamProbe,
+    segment_vjp_probe: ?StepParitySegmentVJPProbe,
+    layer_backward_decomp_probe: ?StepParityLayerBackwardDecompProbe,
+    softmax_vjp_probe: ?StepParitySoftmaxVJPProbe,
+    qkv_split_vjp_probe: ?StepParityQKVSplitVJPProbe,
+    update_summary: ?StepParityUpdateSummary,
+    lora_grad_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+) !void {
+    const effective_boundary_dropout: f32 = if (opts.deterministic) 0.0 else opts.boundary_dropout;
+    const hashes = computeStepParityBatchHashes(batch, total_tokens);
+    const gold_rate = if (boundary_ctx.batch_stats.valid_tokens > 0)
+        @as(f64, @floatFromInt(boundary_ctx.batch_stats.gold_positives)) / @as(f64, @floatFromInt(boundary_ctx.batch_stats.valid_tokens))
+    else
+        0.0;
+    const pre_clip_lora_grad_scale: f32 = if (update_summary) |u|
+        if (u.grad_clip.clip_scale > 0.0) 1.0 / u.grad_clip.clip_scale else 1.0
+    else
+        1.0;
+
+    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+    defer file.close(compat.io());
+    var buf: [8192]u8 = undefined;
+    var writer = file.writerStreaming(compat.io(), &buf);
+    try writer.interface.print(
+        "{{\"tool\":\"zig_fused_step_parity\",\"schema_version\":1,\"phase\":\"{s}\",\"epoch\":{d},\"local_step\":{d},\"global_step\":{d},\"trainer_step_count\":{d},\"batch_size\":{d},\"max_seq_len\":{d},\"max_chunks\":{d},\"deterministic\":{},\"mixed_precision\":{},\"target_probe_layer\":{d},\"boundary_loss_type\":\"{s}\",\"pos_weight\":{d},\"boundary_dropout\":{d},\"boundary_focal_gamma\":{d},\"boundary_focal_alpha\":{d},\"contrastive_focal_gamma\":{d},\"contrastive_focal_alpha\":{d},\"lambda_chunk\":{d},\"lambda_embed\":{d},\"configured_lambda_embed\":{d},\"hashes\":{{\"sample_indices\":\"{x}\",\"input_ids\":\"{x}\",\"attention_mask\":\"{x}\",\"labels\":\"{x}\",\"chunks\":\"{x}\"}},\"batch_indices\":",
+        .{
+            phase,
+            epoch + 1,
+            local_step + 1,
+            global_step,
+            trainer_step_count,
+            batch.batch_size,
+            batch.max_seq_len,
+            batch.max_chunks,
+            opts.deterministic,
+            opts.mixed_precision,
+            opts.debug_encoder_probe_layer,
+            @tagName(opts.boundary_loss_type),
+            opts.boundary_pos_weight,
+            effective_boundary_dropout,
+            opts.boundary_focal_gamma,
+            opts.boundary_focal_alpha,
+            opts.contrastive_focal_gamma,
+            opts.contrastive_focal_alpha,
+            opts.lambda_chunk,
+            effective_lambda_embed,
+            opts.lambda_embed,
+            hashes.sample_indices,
+            hashes.input_ids,
+            hashes.attention_mask,
+            hashes.labels,
+            hashes.chunks,
+        },
+    );
+    try writeUsizeJsonArray(&writer, batch_indices);
+    try writer.interface.print(
+        ",\"supervision\":{{\"valid_tokens\":{d},\"gold_positives\":{d},\"gold_rate\":{d:.9}}},\"features\":{{\"mean\":{d:.9},\"rms\":{d:.9},\"max_abs\":{d:.9}}},\"boundary\":{{\"loss\":{d:.9},\"eval_f1\":{d:.9},\"tp\":{d},\"fp\":{d},\"fn\":{d},\"predicted_positives\":{d},\"prob_gold_pos\":{d:.9},\"prob_gold_neg\":{d:.9},\"grad_norm_w1\":{d:.9},\"grad_norm_b1\":{d:.9},\"grad_norm_w2\":{d:.9},\"grad_norm_b2\":{d:.9},\"grad_max_abs_w1\":{d:.9},\"grad_max_abs_b1\":{d:.9},\"grad_max_abs_w2\":{d:.9},\"grad_max_abs_b2\":{d:.9},\"features_grad_norm\":{d:.9},\"features_grad_max_abs\":{d:.9},\"has_features_grad\":{}}}",
+        .{
+            boundary_ctx.batch_stats.valid_tokens,
+            boundary_ctx.batch_stats.gold_positives,
+            gold_rate,
+            boundary_ctx.batch_stats.feature_mean,
+            boundary_ctx.batch_stats.feature_rms,
+            boundary_ctx.batch_stats.feature_max_abs,
+            boundary_ctx.debug.boundary_loss,
+            boundary_ctx.debug.eval_f1,
+            boundary_ctx.debug.eval_tp,
+            boundary_ctx.debug.eval_fp,
+            boundary_ctx.debug.eval_fn,
+            boundary_ctx.debug.eval_predicted_positives,
+            boundary_ctx.debug.eval_mean_prob_gold_positive,
+            boundary_ctx.debug.eval_mean_prob_gold_negative,
+            boundary_ctx.debug.grad_norm_w1,
+            boundary_ctx.debug.grad_norm_b1,
+            boundary_ctx.debug.grad_norm_w2,
+            boundary_ctx.debug.grad_norm_b2,
+            boundary_ctx.debug.grad_max_abs_w1,
+            boundary_ctx.debug.grad_max_abs_b1,
+            boundary_ctx.debug.grad_max_abs_w2,
+            boundary_ctx.debug.grad_max_abs_b2,
+            boundary_ctx.debug.features_grad_norm,
+            boundary_ctx.debug.features_grad_max_abs,
+            boundary_ctx.debug.has_features_grad,
+        },
+    );
+    try writer.interface.writeAll(",\"contrastive\":");
+    try writeStepParityContrastiveJson(&writer, contrastive_ctx);
+    try writer.interface.writeAll(",\"boundary_forward_probe\":");
+    try writeBoundaryForwardProbeJson(&writer, boundary_ctx.debug.boundary_forward_probe);
+    try writer.interface.writeAll(",\"embedding_probe\":");
+    try writeEmbeddingProbeJson(&writer, boundary_ctx.embedding_probe);
+    try writer.interface.writeAll(",\"embedding_table_row_probe\":");
+    try writeEmbeddingRowProbeJson(&writer, boundary_ctx.embedding_table_rows);
+    try writer.interface.writeAll(",\"embedding_lookup_row_probe\":");
+    try writeEmbeddingRowProbeJson(&writer, boundary_ctx.embedding_lookup_rows);
+    try writer.interface.writeAll(",\"boundary_checkpoint_probe\":");
+    try writeBoundaryCheckpointProbeJson(
+        &writer,
+        boundary_ctx.debug.boundary_checkpoint_probe,
+        boundary_ctx.final_norm_weight,
+        boundary_ctx.final_norm_bias,
+    );
+    try writer.interface.writeAll(",\"encoder_activation_input_probe\":");
+    try writeEncoderActivationInputProbeJson(&writer, boundary_ctx.encoder_activation_inputs);
+    try writer.interface.writeAll(",\"encoder_projection_decomposition_probe\":");
+    try writeEncoderProjectionDecompositionProbeJson(&writer, boundary_ctx.encoder_projection_decompositions);
+    try writer.interface.writeAll(",\"encoder_attention_internal_probe\":");
+    try writeEncoderAttentionInternalProbeJson(&writer, boundary_ctx.encoder_attention_internals);
+    try writer.interface.writeAll(",\"encoder_attention_row_probe\":");
+    try writeEncoderAttentionRowProbeJson(&writer, boundary_ctx.encoder_attention_rows);
+    try writer.interface.writeAll(",\"encoder_layer_input_probe\":");
+    try writeEncoderLayerInputProbeJson(&writer, boundary_ctx.encoder_layer_inputs);
+    try writer.interface.writeAll(",\"encoder_layer_state_probe\":");
+    try writeEncoderLayerStateProbeJson(&writer, boundary_ctx.encoder_layer_states);
+    try writer.interface.writeAll(",\"encoder_replay_input\":");
+    try writeEncoderReplayInputProbeJson(&writer, boundary_ctx.encoder_replay_input);
+    try writer.interface.writeAll(",\"encoder_replay_upstream\":");
+    try writeEncoderReplayUpstreamProbeJson(&writer, encoder_replay_upstream_probe);
+    try writer.interface.writeAll(",\"upstream_grad_probe\":");
+    try writeStepParityUpstreamGradProbeJson(&writer, upstream_grad_probe);
+    try writer.interface.writeAll(",\"segment_vjp_probe\":");
+    try writeStepParitySegmentVJPProbeJson(&writer, segment_vjp_probe);
+    try writer.interface.writeAll(",\"layer_backward_decomp_probe\":");
+    try writeStepParityLayerBackwardDecompProbeJson(&writer, layer_backward_decomp_probe);
+    try writer.interface.writeAll(",\"softmax_vjp_probe\":");
+    try writeStepParitySoftmaxVJPProbeJson(&writer, softmax_vjp_probe);
+    try writer.interface.writeAll(",\"qkv_split_vjp_probe\":");
+    try writeStepParityQKVSplitVJPProbeJson(&writer, qkv_split_vjp_probe);
+    try writer.interface.writeAll(",\"update\":");
+    if (update_summary) |u| {
+        const boundary_grad_scale: f64 = @floatCast(u.grad_clip.clip_scale);
+        try writer.interface.print(
+            "{{\"grad_elems\":{d},\"lora_grad_norm_pre_clip\":{d:.9},\"lora_grad_norm_post_clip\":{d:.9},\"extra_grad_norm_pre_clip\":{d:.9},\"extra_grad_norm_post_clip\":{d:.9},\"boundary_dense1_weight_grad_norm_pre_clip\":{d:.9},\"boundary_dense1_weight_grad_norm_post_clip\":{d:.9},\"boundary_dense1_bias_grad_norm_pre_clip\":{d:.9},\"boundary_dense1_bias_grad_norm_post_clip\":{d:.9},\"boundary_dense2_weight_grad_norm_pre_clip\":{d:.9},\"boundary_dense2_weight_grad_norm_post_clip\":{d:.9},\"boundary_dense2_bias_grad_norm_pre_clip\":{d:.9},\"boundary_dense2_bias_grad_norm_post_clip\":{d:.9}",
+            .{
+                u.grad_clip.elems,
+                u.grad_clip.lora_norm_before_clip,
+                u.grad_clip.lora_norm_after_clip,
+                u.grad_clip.extra_norm_before_clip,
+                u.grad_clip.extra_norm_after_clip,
+                boundary_ctx.debug.grad_norm_w1,
+                @as(f64, boundary_ctx.debug.grad_norm_w1) * boundary_grad_scale,
+                boundary_ctx.debug.grad_norm_b1,
+                @as(f64, boundary_ctx.debug.grad_norm_b1) * boundary_grad_scale,
+                boundary_ctx.debug.grad_norm_w2,
+                @as(f64, boundary_ctx.debug.grad_norm_w2) * boundary_grad_scale,
+                boundary_ctx.debug.grad_norm_b2,
+                @as(f64, boundary_ctx.debug.grad_norm_b2) * boundary_grad_scale,
+            },
+        );
+        try writer.interface.print(
+            ",\"grad_norm_pre_clip\":{d:.9},\"grad_norm_post_clip\":{d:.9},\"grad_max_abs_pre_clip\":{d:.9},\"grad_max_abs_post_clip\":{d:.9},\"grad_clip_scale\":{d:.9},\"invalid_grad_repaired\":{d},\"max_grad_norm\":{d},\"active_adapters\":{d},\"active_matrices\":{d},\"base_lr\":{d},\"lora_plus_ratio\":{d},\"optimizer_step_count\":{d},\"param_elems\":{d},\"param_norm\":{d:.9},\"update_elems\":{d},\"update_norm\":{d:.9},\"update_max_abs\":{d:.9},\"update_mean_abs\":{d:.9},\"update_to_param\":{d:.9},\"adam_m_norm\":{d:.9},\"adam_v_norm\":{d:.9},\"repaired_after_update\":{d},\"lora_update_matrix_stats\":",
+            .{
+                u.grad_clip.norm_before_clip,
+                u.grad_clip.norm_after_clip,
+                u.grad_clip.max_abs_before_clip,
+                u.grad_clip.max_abs_after_clip,
+                u.grad_clip.clip_scale,
+                u.grad_clip.nonfinite_repaired,
+                opts.max_grad_norm,
+                u.active_adapters,
+                u.active_matrices,
+                u.base_lr,
+                u.lora_plus_ratio,
+                u.optimizer_step_count,
+                u.param_elems,
+                u.param_norm,
+                u.update_elems,
+                u.update_norm,
+                u.update_max_abs,
+                u.update_mean_abs,
+                u.update_to_param,
+                u.adam_m_norm,
+                u.adam_v_norm,
+                u.repaired_after_update,
+            },
+        );
+        try writeLoRAUpdateMatrixStatsJson(&writer, u.matrix_stats);
+        try writer.interface.writeByte('}');
+    } else {
+        try writer.interface.writeAll("null");
+    }
+    try writer.interface.writeAll(",\"lora_grad_matrix_stats\":");
+    try writeStepParityLoRAGradMatrixStatsJson(&writer, lora_grad_adapters, 1.0);
+    try writer.interface.writeAll(",\"lora_grad_matrix_stats_post_clip\":");
+    try writeStepParityLoRAGradMatrixStatsJson(&writer, lora_grad_adapters, 1.0);
+    try writer.interface.writeAll(",\"lora_grad_matrix_stats_pre_clip\":");
+    try writeStepParityLoRAGradMatrixStatsJson(&writer, lora_grad_adapters, pre_clip_lora_grad_scale);
+    try writer.interface.writeAll("}\n");
+    try writer.interface.flush();
+}
+
+fn computeStepParityContrastiveContext(
+    allocator: std.mem.Allocator,
+    loss_config: fused_chunker_loss.FusedLossConfig,
+    chunk_embeddings: []const f32,
+    chunk_mask: []const f32,
+    doc_ids: []const u32,
+    B: usize,
+    C: usize,
+    E: usize,
+) !StepParityContrastiveContext {
+    const n = B * C;
+    var ctx = StepParityContrastiveContext{};
+    ctx.embedding_stats.addSlice(chunk_embeddings);
+    const active_limit = @min(chunk_mask.len, n);
+    for (chunk_mask[0..active_limit], 0..) |m, chunk_idx| {
+        if (m <= 0.5) continue;
+        ctx.active_chunks += 1;
+        if (ctx.active_doc_id_sample_len < ctx.active_doc_id_sample.len and chunk_idx < doc_ids.len) {
+            ctx.active_doc_id_sample[ctx.active_doc_id_sample_len] = doc_ids[chunk_idx];
+            ctx.active_doc_id_sample_len += 1;
+        }
+        const base = chunk_idx * E;
+        if (base + E > chunk_embeddings.len) continue;
+        var norm_sq: f64 = 0;
+        for (chunk_embeddings[base .. base + E]) |value| {
+            norm_sq += @as(f64, value) * @as(f64, value);
+        }
+        if (ctx.active_embedding_norm_sample_len < ctx.active_embedding_norm_sample.len) {
+            ctx.active_embedding_norm_sample[ctx.active_embedding_norm_sample_len] = @as(f32, @floatCast(@sqrt(norm_sq)));
+            ctx.active_embedding_norm_sample_len += 1;
+        }
+        if (ctx.first_active_index == null) {
+            ctx.first_active_index = chunk_idx;
+            if (chunk_idx < doc_ids.len) ctx.first_active_doc_id = doc_ids[chunk_idx];
+            const sample_len = @min(E, ctx.first_active_embedding_sample.len);
+            @memcpy(ctx.first_active_embedding_sample[0..sample_len], chunk_embeddings[base .. base + sample_len]);
+            ctx.first_active_embedding_sample_len = sample_len;
+        }
+    }
+
+    var result = if (loss_config.use_mrl) mrl_blk: {
+        const mrl_config = infonce_cpu.MatryoshkaConfig{
+            .dims = loss_config.mrl_dims,
+            .weights = loss_config.mrl_weights,
+        };
+        var mrl = try infonce_cpu.computeMatryoshkaLossAndGrad(
+            allocator,
+            chunk_embeddings,
+            chunk_mask,
+            doc_ids,
+            n,
+            E,
+            mrl_config,
+            loss_config.temperature,
+            loss_config.contrastive_focal_gamma,
+            loss_config.contrastive_focal_alpha,
+        );
+        defer mrl.deinit(allocator);
+        const grad = try allocator.dupe(f32, mrl.grad);
+        errdefer allocator.free(grad);
+        for (grad) |*g| g.* *= loss_config.lambda_embed;
+        break :mrl_blk infonce_cpu.ContrastiveLossResult{
+            .contrastive_loss = mrl.total_loss,
+            .total_loss = mrl.total_loss * @as(f64, loss_config.lambda_embed),
+            .grad = grad,
+        };
+    } else try infonce_cpu.computeContrastiveLossOnCPU(
+        allocator,
+        chunk_embeddings,
+        chunk_mask,
+        doc_ids,
+        @as(f64, loss_config.temperature),
+        @as(f64, loss_config.lambda_embed),
+        B,
+        C,
+        E,
+        @as(f64, loss_config.contrastive_focal_gamma),
+        @as(f64, loss_config.contrastive_focal_alpha),
+    );
+    defer result.deinit(allocator);
+
+    ctx.contrastive_loss = result.contrastive_loss;
+    ctx.total_loss = result.total_loss;
+    ctx.grad_stats.addSlice(result.grad);
+    if (ctx.first_active_index) |chunk_idx| {
+        const base = chunk_idx * E;
+        if (base + E <= result.grad.len) {
+            const sample_len = @min(E, ctx.first_active_grad_sample.len);
+            @memcpy(ctx.first_active_grad_sample[0..sample_len], result.grad[base .. base + sample_len]);
+            ctx.first_active_grad_sample_len = sample_len;
+        }
+    }
+    for (chunk_mask[0..active_limit], 0..) |m, chunk_idx| {
+        if (m <= 0.5) continue;
+        const base = chunk_idx * E;
+        if (base + E > result.grad.len) continue;
+        var norm_sq: f64 = 0;
+        for (result.grad[base .. base + E]) |value| {
+            norm_sq += @as(f64, value) * @as(f64, value);
+        }
+        if (ctx.active_grad_norm_sample_len < ctx.active_grad_norm_sample.len) {
+            ctx.active_grad_norm_sample[ctx.active_grad_norm_sample_len] = @as(f32, @floatCast(@sqrt(norm_sq)));
+            ctx.active_grad_norm_sample_len += 1;
+        }
+    }
+    return ctx;
+}
+
+fn printLoRAUpdateDebugDetail(
+    step: u32,
+    layer_idx: u32,
+    module_name: []const u8,
+    matrix_name: []const u8,
+    lr: f32,
+    grad: []const f32,
+    before: []const f32,
+    after: []const f32,
+    maybe_state: ?optimizers.ParamState,
+) !void {
+    var grad_stats = FloatSliceStats{};
+    grad_stats.addSlice(grad);
+    var param_stats = FloatSliceStats{};
+    param_stats.addSlice(after);
+    var update_stats = FloatSliceStats{};
+    try update_stats.addDelta(before, after);
+    var m_stats = FloatSliceStats{};
+    var v_stats = FloatSliceStats{};
+    if (maybe_state) |state| {
+        m_stats.addSlice(state.m);
+        v_stats.addSlice(state.v);
+    }
+    print(
+        "lora_update_detail step={d} layer={d} module={s} matrix={s} lr={d} grad_norm={d:.9} grad_max_abs={d:.9} param_norm={d:.9} update_norm={d:.9} update_max_abs={d:.9} update_mean_abs={d:.9} adam_m_norm={d:.9} adam_v_norm={d:.9}\n",
+        .{
+            step,
+            layer_idx,
+            module_name,
+            matrix_name,
+            lr,
+            grad_stats.l2(),
+            grad_stats.max_abs,
+            param_stats.l2(),
+            update_stats.l2(),
+            update_stats.max_abs,
+            update_stats.meanAbs(),
+            m_stats.l2(),
+            v_stats.l2(),
+        },
+    );
+}
+
+fn captureStepParitySegmentVJPProbe(
+    allocator: std.mem.Allocator,
+    target_layer: u32,
+    segment_start: u32,
+    segment_end: u32,
+    include_hidden_grad: bool,
+    include_adapter_grads: bool,
+    upstream_grad: []const f32,
+    vjp_result: *const segmented_encoder.SegmentVJPResult,
+    lora_layers: []const fused_chunker_lora.LoRALayer,
+) !StepParitySegmentVJPProbe {
+    var probe = StepParitySegmentVJPProbe{
+        .target_layer = target_layer,
+        .segment_start = segment_start,
+        .segment_end = segment_end,
+        .include_hidden_grad = include_hidden_grad,
+        .include_adapter_grads = include_adapter_grads,
+        .runtime = segmentVJPProfileRuntimeName(vjp_result.profile),
+        .profile = vjp_result.profile,
+    };
+    errdefer probe.deinit(allocator);
+
+    probe.upstream.addSlice(upstream_grad);
+    if (vjp_result.hidden_grad) |hidden_grad| {
+        probe.hidden_grad.addSlice(hidden_grad);
+    }
+
+    var adapter_a_by_name: std.ArrayListUnmanaged(StepParityNamedTensorStats) = .empty;
+    defer adapter_a_by_name.deinit(allocator);
+    errdefer for (adapter_a_by_name.items) |*entry| entry.deinit(allocator);
+    var adapter_b_by_name: std.ArrayListUnmanaged(StepParityNamedTensorStats) = .empty;
+    defer adapter_b_by_name.deinit(allocator);
+    errdefer for (adapter_b_by_name.items) |*entry| entry.deinit(allocator);
+
+    for (lora_layers) |*layer| {
+        if (layer.layer_idx < segment_start or layer.layer_idx >= segment_end) continue;
+
+        var a_stats = StepParityTensorSliceStats{};
+        a_stats.addSlice(layer.grad_A);
+        probe.adapter_a.addStats(a_stats);
+        const a_name = try std.fmt.allocPrint(
+            allocator,
+            "layer_{d:0>2}_{s}_A",
+            .{ layer.layer_idx, layer.module_name },
+        );
+        adapter_a_by_name.append(allocator, .{ .name = a_name, .stats = a_stats }) catch |err| {
+            allocator.free(a_name);
+            return err;
+        };
+
+        var b_stats = StepParityTensorSliceStats{};
+        b_stats.addSlice(layer.grad_B);
+        probe.adapter_b.addStats(b_stats);
+        const b_name = try std.fmt.allocPrint(
+            allocator,
+            "layer_{d:0>2}_{s}_B",
+            .{ layer.layer_idx, layer.module_name },
+        );
+        adapter_b_by_name.append(allocator, .{ .name = b_name, .stats = b_stats }) catch |err| {
+            allocator.free(b_name);
+            return err;
+        };
+    }
+
+    probe.adapter_a_by_name = try adapter_a_by_name.toOwnedSlice(allocator);
+    adapter_a_by_name = .empty;
+    probe.adapter_b_by_name = try adapter_b_by_name.toOwnedSlice(allocator);
+    adapter_b_by_name = .empty;
+    return probe;
+}
+
+fn backwardDecompComponentName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "__substage_mlp_wo_input")) return "mlp_wo_input_grad";
+    if (std.mem.eql(u8, name, "__substage_gelu_input")) return "gelu_input_grad";
+    if (std.mem.eql(u8, name, "__substage_gate_value")) return "gate_value_grad";
+    if (std.mem.eql(u8, name, "__substage_gate_input")) return "gate_input_grad";
+    if (std.mem.eql(u8, name, "__substage_wi_output")) return "wi_output_grad";
+    if (std.mem.eql(u8, name, "__substage_mlp_norm_output")) return "mlp_norm_output_grad";
+    if (std.mem.eql(u8, name, "__substage_hidden_after_attn")) return "hidden_after_attn_grad";
+    if (std.mem.eql(u8, name, "__substage_attn_merged")) return "attn_merged_grad";
+    if (std.mem.eql(u8, name, "__substage_q_raw")) return "q_raw_grad";
+    if (std.mem.eql(u8, name, "__substage_k_raw")) return "k_raw_grad";
+    if (std.mem.eql(u8, name, "__substage_v_raw")) return "v_raw_grad";
+    if (std.mem.eql(u8, name, "__substage_q_rope")) return "q_rope_grad";
+    if (std.mem.eql(u8, name, "__substage_k_rope")) return "k_rope_grad";
+    if (std.mem.eql(u8, name, "__substage_v_attention_input")) return "v_attention_input_grad";
+    if (std.mem.eql(u8, name, "__substage_scores_raw")) return "scores_raw_grad";
+    if (std.mem.eql(u8, name, "__substage_scores_masked")) return "scores_masked_grad";
+    if (std.mem.eql(u8, name, "__substage_attention_probs")) return "probs_grad";
+    if (std.mem.eql(u8, name, "__substage_attn_normed")) return "attn_normed_grad";
+    if (std.mem.eql(u8, name, "__substage_q_attn_normed")) return "q_attn_normed_grad";
+    if (std.mem.eql(u8, name, "__substage_k_attn_normed")) return "k_attn_normed_grad";
+    if (std.mem.eql(u8, name, "__substage_v_attn_normed")) return "v_attn_normed_grad";
+    if (std.mem.eql(u8, name, "__substage_hidden_in")) return "hidden_in_grad";
+    return name;
+}
+
+fn missingBackwardDecompStage(reason: []const u8) StepParityBackwardDecompStage {
+    return .{
+        .status = "missing",
+        .reason = reason,
+    };
+}
+
+fn capturedBackwardDecompStatsStage(values: []const f32) StepParityBackwardDecompStage {
+    var stage = StepParityBackwardDecompStage{
+        .status = "captured",
+        .reason = "",
+    };
+    stage.stats.addSlice(values);
+    return stage;
+}
+
+fn cloneStepParityNamedStatsSlice(
+    allocator: std.mem.Allocator,
+    entries: []const StepParityNamedTensorStats,
+) ![]StepParityNamedTensorStats {
+    var out: std.ArrayListUnmanaged(StepParityNamedTensorStats) = .empty;
+    defer out.deinit(allocator);
+    errdefer for (out.items) |*entry| entry.deinit(allocator);
+    for (entries) |entry| {
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try out.append(allocator, .{
+            .name = name,
+            .stats = entry.stats,
+        });
+    }
+    const owned = try out.toOwnedSlice(allocator);
+    out = .empty;
+    return owned;
+}
+
+fn capturedBackwardDecompFullLayerStage(
+    allocator: std.mem.Allocator,
+    segment_probe: StepParitySegmentVJPProbe,
+) !StepParityBackwardDecompStage {
+    var stage = StepParityBackwardDecompStage{
+        .status = "captured",
+        .reason = "",
+        .stats = segment_probe.hidden_grad,
+        .adapter_a = segment_probe.adapter_a,
+        .adapter_b = segment_probe.adapter_b,
+    };
+    errdefer stage.deinit(allocator);
+    stage.adapter_a_by_name = try cloneStepParityNamedStatsSlice(allocator, segment_probe.adapter_a_by_name);
+    stage.adapter_b_by_name = try cloneStepParityNamedStatsSlice(allocator, segment_probe.adapter_b_by_name);
+    return stage;
+}
+
+fn addBackwardDecompAdapterGradientStats(
+    allocator: std.mem.Allocator,
+    stage: *StepParityBackwardDecompStage,
+    gradients: []const segmented_encoder.NamedGradient,
+) !void {
+    var adapter_a_by_name: std.ArrayListUnmanaged(StepParityNamedTensorStats) = .empty;
+    defer adapter_a_by_name.deinit(allocator);
+    errdefer for (adapter_a_by_name.items) |*entry| entry.deinit(allocator);
+    var adapter_b_by_name: std.ArrayListUnmanaged(StepParityNamedTensorStats) = .empty;
+    defer adapter_b_by_name.deinit(allocator);
+    errdefer for (adapter_b_by_name.items) |*entry| entry.deinit(allocator);
+
+    for (gradients) |grad| {
+        var stats = StepParityTensorSliceStats{};
+        stats.addSlice(grad.values);
+        const name = try allocator.dupe(u8, grad.name);
+        errdefer allocator.free(name);
+        if (std.mem.endsWith(u8, grad.name, "_A")) {
+            stage.adapter_a.addStats(stats);
+            try adapter_a_by_name.append(allocator, .{ .name = name, .stats = stats });
+        } else if (std.mem.endsWith(u8, grad.name, "_B")) {
+            stage.adapter_b.addStats(stats);
+            try adapter_b_by_name.append(allocator, .{ .name = name, .stats = stats });
+        } else {
+            allocator.free(name);
+        }
+    }
+
+    stage.adapter_a_by_name = try adapter_a_by_name.toOwnedSlice(allocator);
+    adapter_a_by_name = .empty;
+    stage.adapter_b_by_name = try adapter_b_by_name.toOwnedSlice(allocator);
+    adapter_b_by_name = .empty;
+}
+
+fn capturedBackwardDecompStageFromResult(
+    allocator: std.mem.Allocator,
+    result: *const segmented_encoder.LayerBackwardSubstageResult,
+) !StepParityBackwardDecompStage {
+    var stage = StepParityBackwardDecompStage{
+        .status = "captured",
+        .reason = "",
+    };
+    errdefer stage.deinit(allocator);
+
+    var components: std.ArrayListUnmanaged(StepParityBackwardDecompComponent) = .empty;
+    defer components.deinit(allocator);
+    errdefer for (components.items) |*entry| entry.deinit(allocator);
+
+    for (result.stage_grads) |grad| {
+        var stats = StepParityTensorSliceStats{};
+        stats.addSlice(grad.values);
+        stage.stats.addStats(stats);
+        const name = try allocator.dupe(u8, backwardDecompComponentName(grad.name));
+        errdefer allocator.free(name);
+        try components.append(allocator, .{
+            .name = name,
+            .stats = stats,
+        });
+    }
+
+    stage.components = try components.toOwnedSlice(allocator);
+    components = .empty;
+    try addBackwardDecompAdapterGradientStats(allocator, &stage, result.adapter_grads);
+    return stage;
+}
+
+fn captureLayerBackwardSubstage(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    graph_config: modern_bert_graph.Config,
+    actual_batch: usize,
+    max_seq: usize,
+    target_layer: u32,
+    stage: modern_bert_graph.LayerBackwardSubstage,
+    lora_rank: u32,
+    lora_alpha: f32,
+    upstream_grad: []const f32,
+    inputs: segmented_encoder.LayerBackwardSubstageInputs,
+    lora_layers: []fused_chunker_lora.LoRALayer,
+) !StepParityBackwardDecompStage {
+    var session = try segmented_encoder.ModernBertLayerBackwardSubstageSession.init(
+        allocator,
+        graph_config,
+        @intCast(actual_batch),
+        @intCast(max_seq),
+        target_layer,
+        stage,
+        lora_rank,
+        lora_alpha,
+        .mpsgraph_required,
+    );
+    defer session.deinit();
+
+    var result = try session.execute(cb, .{
+        .upstream_grad = upstream_grad,
+        .primary = inputs.primary,
+        .q_raw = inputs.q_raw,
+        .k_raw = inputs.k_raw,
+        .v_raw = inputs.v_raw,
+        .hidden_in_aux = inputs.hidden_in_aux,
+        .hidden_after_attn_aux = inputs.hidden_after_attn_aux,
+        .gate_input_aux = inputs.gate_input_aux,
+        .gate_value_aux = inputs.gate_value_aux,
+        .attention_mask = inputs.attention_mask,
+    }, lora_layers);
+    defer result.deinit();
+    return capturedBackwardDecompStageFromResult(allocator, &result);
+}
+
+fn decompStageCaptured(stage: StepParityBackwardDecompStage) bool {
+    return std.mem.eql(u8, stage.status, "captured");
+}
+
+fn captureStepParityLayerBackwardDecompProbe(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    graph_config: modern_bert_graph.Config,
+    actual_batch: usize,
+    max_seq: usize,
+    target_layer: u32,
+    segment_start: u32,
+    segment_end: u32,
+    lora_rank: u32,
+    lora_alpha: f32,
+    upstream_grad: []const f32,
+    attention_mask: []const f32,
+    act_buf: *const modern_bert.ActivationBuffer,
+    segment_probe: StepParitySegmentVJPProbe,
+    lora_layers: []fused_chunker_lora.LoRALayer,
+) !StepParityLayerBackwardDecompProbe {
+    var probe = StepParityLayerBackwardDecompProbe{
+        .target_layer = target_layer,
+        .segment_start = segment_start,
+        .segment_end = segment_end,
+        .runtime = segment_probe.runtime,
+        .incoming_upstream = capturedBackwardDecompStatsStage(upstream_grad),
+        .full_layer_hidden_grad = try capturedBackwardDecompFullLayerStage(allocator, segment_probe),
+    };
+    errdefer probe.deinit(allocator);
+
+    if (segment_start != target_layer or segment_end != target_layer + 1) {
+        const reason = "requires_single_layer_vjp_segment";
+        probe.status = "partial";
+        probe.mlp_wo = missingBackwardDecompStage(reason);
+        probe.mlp_gelu_input = missingBackwardDecompStage(reason);
+        probe.mlp_gate_value = missingBackwardDecompStage(reason);
+        probe.mlp_gate_input = missingBackwardDecompStage(reason);
+        probe.mlp_wi_output = missingBackwardDecompStage(reason);
+        probe.mlp_norm_output = missingBackwardDecompStage(reason);
+        probe.mlp_hidden_after_attn = missingBackwardDecompStage(reason);
+        probe.attn_out_proj = missingBackwardDecompStage(reason);
+        probe.attention_core = missingBackwardDecompStage(reason);
+        probe.attention_core_post_rope = missingBackwardDecompStage(reason);
+        probe.attention_scores_raw = missingBackwardDecompStage(reason);
+        probe.attention_scores_masked = missingBackwardDecompStage(reason);
+        probe.attention_probs = missingBackwardDecompStage(reason);
+        probe.qkv_proj = missingBackwardDecompStage(reason);
+        probe.qkv_proj_split = missingBackwardDecompStage(reason);
+        probe.attn_norm_hidden_in = missingBackwardDecompStage(reason);
+        return probe;
+    }
+
+    const hidden_in = if (act_buf.findLayerInput(target_layer)) |layer_input| layer_input.input else null;
+    const hidden_after_attn = act_buf.findLayerState(target_layer, "hidden_after_attn");
+    const mlp_norm_output = act_buf.findLayerState(target_layer, "mlp_norm_output");
+    const wi_output = act_buf.findLayerState(target_layer, "wi_output");
+    const gate_input = act_buf.findLayerState(target_layer, "gate_input");
+    const gate_value = act_buf.findLayerState(target_layer, "gate_value");
+    const gelu_input = act_buf.findLayerState(target_layer, "gelu_input");
+    const mlp_wo_input = findLayerActivationInput(act_buf, target_layer, "wo");
+    const attn_merged = findLayerActivationInput(act_buf, target_layer, "out_proj");
+    const attn_normed = findLayerActivationInput(act_buf, target_layer, "query_proj");
+    const q_raw = findLayerAttentionInternal(act_buf, target_layer, "q_raw");
+    const k_raw = findLayerAttentionInternal(act_buf, target_layer, "k_raw");
+    const v_raw = findLayerAttentionInternal(act_buf, target_layer, "v_raw");
+    const q_rope = findLayerAttentionInternal(act_buf, target_layer, "q_rope");
+    const k_rope = findLayerAttentionInternal(act_buf, target_layer, "k_rope");
+    var attention_core_tensors: ?StepParityAttentionCoreTensors = null;
+    defer if (attention_core_tensors) |*tensors| tensors.deinit(allocator);
+    if (q_rope != null and k_rope != null) {
+        attention_core_tensors = try computeStepParityAttentionCoreTensors(
+            allocator,
+            q_rope.?,
+            k_rope.?,
+            attention_mask,
+            actual_batch,
+            max_seq,
+            @intCast(graph_config.num_attention_heads),
+            @intCast(graph_config.head_dim),
+            !modern_bert_graph.isGlobalAttentionLayer(graph_config, target_layer),
+            graph_config.local_attention_window,
+        );
+    }
+
+    probe.mlp_wo = if (mlp_wo_input != null and hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_wo,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = mlp_wo_input.?,
+                .hidden_after_attn_aux = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_mlp_wo_or_hidden_after_attn_capture");
+
+    probe.mlp_gelu_input = if (gelu_input != null and gate_value != null and hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_gelu_input,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = gelu_input.?,
+                .gate_value_aux = gate_value.?,
+                .hidden_after_attn_aux = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_gelu_input_gate_value_or_hidden_after_attn_capture");
+
+    probe.mlp_gate_value = if (gate_value != null and gate_input != null and hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_gate_value,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = gate_value.?,
+                .gate_input_aux = gate_input.?,
+                .hidden_after_attn_aux = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_gate_value_gate_input_or_hidden_after_attn_capture");
+
+    probe.mlp_gate_input = if (gate_input != null and gate_value != null and hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_gate_input,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = gate_input.?,
+                .gate_value_aux = gate_value.?,
+                .hidden_after_attn_aux = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_gate_input_gate_value_or_hidden_after_attn_capture");
+
+    probe.mlp_wi_output = if (wi_output != null and hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_wi_output,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = wi_output.?,
+                .hidden_after_attn_aux = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_wi_output_or_hidden_after_attn_capture");
+
+    probe.mlp_norm_output = if (mlp_norm_output != null and hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_norm_output,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = mlp_norm_output.?,
+                .hidden_after_attn_aux = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_mlp_norm_output_or_hidden_after_attn_capture");
+
+    probe.mlp_hidden_after_attn = if (hidden_after_attn != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .mlp_hidden_after_attn,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = hidden_after_attn.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_hidden_after_attn_capture");
+
+    probe.attn_out_proj = if (attn_merged != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attn_out_proj,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = attn_merged.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attn_merged_or_hidden_in_capture");
+
+    probe.attention_core = if (q_raw != null and k_raw != null and v_raw != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attention_core,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .q_raw = q_raw.?,
+                .k_raw = k_raw.?,
+                .v_raw = v_raw.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attention_core_capture");
+
+    probe.attention_core_post_rope = if (q_rope != null and k_rope != null and v_raw != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attention_core_post_rope,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .q_raw = q_rope.?,
+                .k_raw = k_rope.?,
+                .v_raw = v_raw.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attention_core_post_rope_capture");
+
+    probe.attention_scores_raw = if (attention_core_tensors != null and v_raw != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attention_scores_raw,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = attention_core_tensors.?.scores_raw,
+                .v_raw = v_raw.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attention_scores_raw_capture");
+
+    probe.attention_scores_masked = if (attention_core_tensors != null and v_raw != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attention_scores_masked,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = attention_core_tensors.?.scores_masked,
+                .v_raw = v_raw.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attention_scores_masked_capture");
+
+    probe.attention_probs = if (attention_core_tensors != null and v_raw != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attention_probs,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = attention_core_tensors.?.probs,
+                .v_raw = v_raw.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attention_probs_capture");
+
+    probe.qkv_proj = if (attn_normed != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .qkv_proj,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = attn_normed.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attn_normed_or_hidden_in_capture");
+
+    probe.qkv_proj_split = if (attn_normed != null and hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .qkv_proj_split,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = attn_normed.?,
+                .hidden_in_aux = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_attn_normed_or_hidden_in_capture");
+
+    probe.attn_norm_hidden_in = if (hidden_in != null)
+        try captureLayerBackwardSubstage(
+            allocator,
+            cb,
+            graph_config,
+            actual_batch,
+            max_seq,
+            target_layer,
+            .attn_norm_hidden_in,
+            lora_rank,
+            lora_alpha,
+            upstream_grad,
+            .{
+                .upstream_grad = upstream_grad,
+                .primary = hidden_in.?,
+                .attention_mask = attention_mask,
+            },
+            lora_layers,
+        )
+    else
+        missingBackwardDecompStage("missing_hidden_in_capture");
+
+    if (!decompStageCaptured(probe.mlp_wo) or
+        !decompStageCaptured(probe.mlp_gelu_input) or
+        !decompStageCaptured(probe.mlp_gate_value) or
+        !decompStageCaptured(probe.mlp_gate_input) or
+        !decompStageCaptured(probe.mlp_wi_output) or
+        !decompStageCaptured(probe.mlp_norm_output) or
+        !decompStageCaptured(probe.mlp_hidden_after_attn) or
+        !decompStageCaptured(probe.attn_out_proj) or
+        !decompStageCaptured(probe.attention_core) or
+        !decompStageCaptured(probe.attention_core_post_rope) or
+        !decompStageCaptured(probe.attention_scores_raw) or
+        !decompStageCaptured(probe.attention_scores_masked) or
+        !decompStageCaptured(probe.attention_probs) or
+        !decompStageCaptured(probe.qkv_proj) or
+        !decompStageCaptured(probe.qkv_proj_split) or
+        !decompStageCaptured(probe.attn_norm_hidden_in))
+    {
+        probe.status = "partial";
+    }
+
+    return probe;
 }
 
 const SegmentVJPDiffStats = struct {
@@ -425,6 +2925,1575 @@ const SegmentVJPDiffStats = struct {
 
 fn absF32(value: f32) f32 {
     return if (value < 0.0) -value else value;
+}
+
+fn tokenMajorAttentionIndex(
+    b: usize,
+    token: usize,
+    head: usize,
+    dim: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) usize {
+    return ((b * seq_len + token) * num_heads + head) * head_dim + dim;
+}
+
+fn kernelMajorAttentionIndex(
+    b: usize,
+    token: usize,
+    head: usize,
+    dim: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) usize {
+    return (((b * num_heads + head) * seq_len + token) * head_dim) + dim;
+}
+
+const AttentionIndexMode = enum {
+    token_major,
+    kernel_major,
+};
+
+fn attentionIndex(
+    mode: AttentionIndexMode,
+    b: usize,
+    token: usize,
+    head: usize,
+    dim: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) usize {
+    return switch (mode) {
+        .token_major => tokenMajorAttentionIndex(b, token, head, dim, seq_len, num_heads, head_dim),
+        .kernel_major => kernelMajorAttentionIndex(b, token, head, dim, seq_len, num_heads, head_dim),
+    };
+}
+
+fn computeSdpaReference(
+    allocator: std.mem.Allocator,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    attention_mask: []const i32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    mode: AttentionIndexMode,
+    is_local_attention: bool,
+    local_attention_window: u32,
+) ![]f32 {
+    const total = batch * seq_len * num_heads * head_dim;
+    if (q.len != total or k.len != total or v.len != total) return error.StepParityAttentionReferenceShapeMismatch;
+    if (attention_mask.len < batch * seq_len) return error.StepParityAttentionReferenceShapeMismatch;
+
+    const out = try allocator.alloc(f32, total);
+    errdefer allocator.free(out);
+    @memset(out, 0.0);
+    const scores = try allocator.alloc(f32, seq_len);
+    defer allocator.free(scores);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const window_half: usize = @intCast(local_attention_window / 2);
+
+    for (0..batch) |b| {
+        for (0..num_heads) |head| {
+            for (0..seq_len) |qi| {
+                var best = -std.math.inf(f32);
+                for (0..seq_len) |ki| {
+                    const diff = if (qi >= ki) qi - ki else ki - qi;
+                    const outside_window = is_local_attention and diff > window_half;
+                    if (attention_mask[b * seq_len + ki] == 0 or outside_window) {
+                        scores[ki] = 0.0;
+                        continue;
+                    }
+                    var score: f32 = 0.0;
+                    for (0..head_dim) |dim| {
+                        const q_idx = attentionIndex(mode, b, qi, head, dim, seq_len, num_heads, head_dim);
+                        const k_idx = attentionIndex(mode, b, ki, head, dim, seq_len, num_heads, head_dim);
+                        score += q[q_idx] * k[k_idx];
+                    }
+                    score *= scale;
+                    scores[ki] = score;
+                    best = @max(best, score);
+                }
+
+                var sum: f32 = 0.0;
+                for (0..seq_len) |ki| {
+                    const diff = if (qi >= ki) qi - ki else ki - qi;
+                    const outside_window = is_local_attention and diff > window_half;
+                    if (attention_mask[b * seq_len + ki] == 0 or outside_window) {
+                        scores[ki] = 0.0;
+                        continue;
+                    }
+                    const weight = @exp(scores[ki] - best);
+                    scores[ki] = weight;
+                    sum += weight;
+                }
+                if (sum <= 0.0) continue;
+
+                for (0..head_dim) |dim| {
+                    var accum: f32 = 0.0;
+                    for (0..seq_len) |ki| {
+                        const diff = if (qi >= ki) qi - ki else ki - qi;
+                        const outside_window = is_local_attention and diff > window_half;
+                        if (outside_window) continue;
+                        if (scores[ki] == 0.0) continue;
+                        const v_idx = attentionIndex(mode, b, ki, head, dim, seq_len, num_heads, head_dim);
+                        accum += (scores[ki] / sum) * v[v_idx];
+                    }
+                    const out_idx = attentionIndex(mode, b, qi, head, dim, seq_len, num_heads, head_dim);
+                    out[out_idx] = accum;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+const StepParityAttentionCoreTensors = struct {
+    scores_raw: []f32,
+    scores_masked: []f32,
+    probs: []f32,
+
+    fn deinit(self: *StepParityAttentionCoreTensors, allocator: std.mem.Allocator) void {
+        allocator.free(self.scores_raw);
+        allocator.free(self.scores_masked);
+        allocator.free(self.probs);
+        self.* = undefined;
+    }
+};
+
+fn attentionScoreIndex(
+    b: usize,
+    head: usize,
+    query: usize,
+    key: usize,
+    seq_len: usize,
+    num_heads: usize,
+) usize {
+    return (((b * num_heads + head) * seq_len + query) * seq_len) + key;
+}
+
+fn computeStepParityAttentionCoreTensors(
+    allocator: std.mem.Allocator,
+    q: []const f32,
+    k: []const f32,
+    attention_mask: []const f32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    is_local_attention: bool,
+    local_attention_window: u32,
+) !StepParityAttentionCoreTensors {
+    const hidden_total = batch * seq_len * num_heads * head_dim;
+    if (q.len != hidden_total or k.len != hidden_total) return error.StepParityAttentionReferenceShapeMismatch;
+    if (attention_mask.len != batch * seq_len) return error.StepParityAttentionReferenceShapeMismatch;
+
+    const scores_total = batch * num_heads * seq_len * seq_len;
+    const scores_raw = try allocator.alloc(f32, scores_total);
+    errdefer allocator.free(scores_raw);
+    const scores_masked = try allocator.alloc(f32, scores_total);
+    errdefer allocator.free(scores_masked);
+    const probs = try allocator.alloc(f32, scores_total);
+    errdefer allocator.free(probs);
+    @memset(probs, 0.0);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const window_half: usize = @intCast(local_attention_window / 2);
+
+    for (0..batch) |b| {
+        for (0..num_heads) |head| {
+            for (0..seq_len) |query| {
+                var best = -std.math.inf(f32);
+                for (0..seq_len) |key| {
+                    var raw: f32 = 0.0;
+                    for (0..head_dim) |dim| {
+                        const q_idx = attentionIndex(.token_major, b, query, head, dim, seq_len, num_heads, head_dim);
+                        const k_idx = attentionIndex(.token_major, b, key, head, dim, seq_len, num_heads, head_dim);
+                        raw += q[q_idx] * k[k_idx];
+                    }
+
+                    const diff = if (query >= key) query - key else key - query;
+                    const outside_window = is_local_attention and diff > window_half;
+                    var masked_bias: f32 = 0.0;
+                    if (attention_mask[b * seq_len + key] < 0.5) masked_bias -= 10000.0;
+                    if (outside_window) masked_bias -= 10000.0;
+                    const score_idx = attentionScoreIndex(b, head, query, key, seq_len, num_heads);
+                    scores_raw[score_idx] = raw;
+                    scores_masked[score_idx] = raw * scale + masked_bias;
+                    best = @max(best, scores_masked[score_idx]);
+                }
+
+                var sum: f32 = 0.0;
+                for (0..seq_len) |key| {
+                    const score_idx = attentionScoreIndex(b, head, query, key, seq_len, num_heads);
+                    const weight = @exp(scores_masked[score_idx] - best);
+                    probs[score_idx] = weight;
+                    sum += weight;
+                }
+                if (sum <= 0.0) {
+                    for (0..seq_len) |key| {
+                        probs[attentionScoreIndex(b, head, query, key, seq_len, num_heads)] = 0.0;
+                    }
+                    continue;
+                }
+                const inv_sum = 1.0 / sum;
+                for (0..seq_len) |key| {
+                    const score_idx = attentionScoreIndex(b, head, query, key, seq_len, num_heads);
+                    probs[score_idx] *= inv_sum;
+                }
+            }
+        }
+    }
+
+    return .{
+        .scores_raw = scores_raw,
+        .scores_masked = scores_masked,
+        .probs = probs,
+    };
+}
+
+fn deterministicSoftmaxScore(outer: usize, query: usize, key: usize) f32 {
+    const mixed = (outer * 37 + query * 17 + key * 29 + 11) % 127;
+    const centered: i32 = @as(i32, @intCast(mixed)) - 63;
+    return @as(f32, @floatFromInt(centered)) * 0.03125 + @as(f32, @floatFromInt((query + key) % 7)) * 0.002;
+}
+
+fn deterministicSoftmaxUpstream(outer: usize, query: usize, key: usize) f32 {
+    const mixed = (outer * 19 + query * 23 + key * 13 + 5) % 89;
+    const centered: i32 = @as(i32, @intCast(mixed)) - 44;
+    return @as(f32, @floatFromInt(centered)) * 0.00025;
+}
+
+fn deterministicSoftmaxMaskedKey(
+    query: usize,
+    key: usize,
+    queries: usize,
+    keys: usize,
+    has_mask: bool,
+    local_attention_window: u32,
+) bool {
+    if (!has_mask) return false;
+    const tail_mask_start = keys - @max(@as(usize, 1), keys / 16);
+    if (key >= tail_mask_start) return true;
+    if (queries == keys and local_attention_window > 0) {
+        const window_half: usize = @intCast(local_attention_window / 2);
+        const diff = if (query >= key) query - key else key - query;
+        if (diff > window_half) return true;
+    }
+    return false;
+}
+
+fn fillDeterministicSoftmaxVJPTensors(
+    scores: []f32,
+    upstream: []f32,
+    outer: usize,
+    queries: usize,
+    keys: usize,
+    has_mask: bool,
+    mask_bias: f32,
+    local_attention_window: u32,
+) void {
+    var idx: usize = 0;
+    for (0..outer) |outer_idx| {
+        for (0..queries) |query| {
+            for (0..keys) |key| {
+                scores[idx] = deterministicSoftmaxScore(outer_idx, query, key);
+                if (deterministicSoftmaxMaskedKey(query, key, queries, keys, has_mask, local_attention_window)) {
+                    scores[idx] += mask_bias;
+                }
+                upstream[idx] = deterministicSoftmaxUpstream(outer_idx, query, key);
+                idx += 1;
+            }
+        }
+    }
+}
+
+fn buildSoftmaxVJPCPUReferenceStats(
+    allocator: std.mem.Allocator,
+    case: *StepParitySoftmaxVJPCase,
+    scores: []const f32,
+    upstream: []const f32,
+    mps_grad: []const f32,
+    local_attention_window: u32,
+) !void {
+    const total = case.outer * case.queries * case.keys;
+    if (scores.len != total or upstream.len != total or mps_grad.len != total) return error.InvalidSegmentTensorShape;
+    const probs = try allocator.alloc(f32, case.keys);
+    defer allocator.free(probs);
+
+    var row_start: usize = 0;
+    for (0..case.outer) |outer_idx| {
+        _ = outer_idx;
+        for (0..case.queries) |query| {
+            var best = -std.math.inf(f32);
+            for (0..case.keys) |key| {
+                best = @max(best, scores[row_start + key]);
+            }
+
+            var sum: f32 = 0.0;
+            for (0..case.keys) |key| {
+                const prob = @exp(scores[row_start + key] - best);
+                probs[key] = prob;
+                sum += prob;
+            }
+            if (sum <= 0.0) {
+                @memset(probs, 0.0);
+            } else {
+                const inv_sum = 1.0 / sum;
+                for (probs) |*prob| prob.* *= inv_sum;
+            }
+
+            var dot: f32 = 0.0;
+            for (0..case.keys) |key| {
+                const prob = probs[key];
+                case.probs.addValue(prob);
+                dot += upstream[row_start + key] * prob;
+            }
+
+            for (0..case.keys) |key| {
+                const idx = row_start + key;
+                const cpu_grad = probs[key] * (upstream[idx] - dot);
+                const err = absF32(mps_grad[idx] - cpu_grad);
+                case.cpu_scores_masked_grad.addValue(cpu_grad);
+                case.cpu_abs_error.addValue(err);
+                if (deterministicSoftmaxMaskedKey(query, key, case.queries, case.keys, case.has_mask, local_attention_window)) {
+                    case.masked_scores_masked_grad.addValue(mps_grad[idx]);
+                } else {
+                    case.valid_scores_masked_grad.addValue(mps_grad[idx]);
+                }
+            }
+            row_start += case.keys;
+        }
+    }
+}
+
+fn captureStepParitySoftmaxVJPCase(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    name: []const u8,
+    outer: usize,
+    queries: usize,
+    keys: usize,
+    has_mask: bool,
+    mask_bias: f32,
+    local_attention_window: u32,
+) !StepParitySoftmaxVJPCase {
+    const total = outer * queries * keys;
+    const scores = try allocator.alloc(f32, total);
+    defer allocator.free(scores);
+    const upstream = try allocator.alloc(f32, total);
+    defer allocator.free(upstream);
+    fillDeterministicSoftmaxVJPTensors(scores, upstream, outer, queries, keys, has_mask, mask_bias, local_attention_window);
+
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var bld = ml.graph.Builder.init(&graph);
+    const scores_node = try bld.parameter("scores_masked", ml.graph.Shape.init(.f32, &.{
+        @as(i64, @intCast(outer)),
+        @as(i64, @intCast(queries)),
+        @as(i64, @intCast(keys)),
+    }));
+    const upstream_node = try bld.parameter("upstream_probs_grad", ml.graph.Shape.init(.f32, &.{
+        @as(i64, @intCast(outer)),
+        @as(i64, @intCast(queries)),
+        @as(i64, @intCast(keys)),
+    }));
+    const probs_node = try bld.softmax(scores_node);
+    const weighted = try bld.mul(probs_node, upstream_node);
+    const loss = try bld.reduceSum(weighted, &.{ 0, 1, 2 });
+    try graph.markOutput(loss);
+
+    const trainable = [_][]const u8{"scores_masked"};
+    var session = try graph_training.CompiledTrainSession.init(
+        allocator,
+        &graph,
+        loss,
+        .{
+            .trainable_params = trainable[0..],
+            .execution_strategy = .mpsgraph_required,
+        },
+    );
+    defer session.deinit();
+
+    const dims = [_]i32{
+        @intCast(outer),
+        @intCast(queries),
+        @intCast(keys),
+    };
+    const scores_ct = try cb.fromFloat32Shape(scores, &dims);
+    defer cb.free(scores_ct);
+    const upstream_ct = try cb.fromFloat32Shape(upstream, &dims);
+    defer cb.free(upstream_ct);
+
+    var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+    defer runtime_inputs.deinit(allocator);
+    try runtime_inputs.put(allocator, scores_node, scores_ct);
+    try runtime_inputs.put(allocator, upstream_node, upstream_ct);
+
+    var result = try session.execute(cb, runtime_inputs);
+    defer result.deinit();
+    const grad = result.gradients.get("scores_masked") orelse return error.MissingSubstageGradient;
+    if (grad.len != total) return error.InvalidSegmentTensorShape;
+
+    var case = StepParitySoftmaxVJPCase{
+        .name = name,
+        .outer = outer,
+        .queries = queries,
+        .keys = keys,
+        .mask_bias = if (has_mask) mask_bias else 0.0,
+        .has_mask = has_mask,
+    };
+    case.scores_masked.addSlice(scores);
+    case.upstream_probs_grad.addSlice(upstream);
+    case.scores_masked_grad.addSlice(grad);
+    try buildSoftmaxVJPCPUReferenceStats(
+        allocator,
+        &case,
+        scores,
+        upstream,
+        grad,
+        local_attention_window,
+    );
+    return case;
+}
+
+fn captureStepParitySoftmaxVJPProbe(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    actual_batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    local_attention_window: u32,
+) !StepParitySoftmaxVJPProbe {
+    const CaseConfig = struct {
+        name: []const u8,
+        outer: usize,
+        queries: usize,
+        keys: usize,
+        has_mask: bool,
+        mask_bias: f32,
+    };
+    const layer_outer = actual_batch * num_heads;
+    const configs = [_]CaseConfig{
+        .{
+            .name = "synthetic_small_nomask",
+            .outer = 1,
+            .queries = 8,
+            .keys = 16,
+            .has_mask = false,
+            .mask_bias = 0.0,
+        },
+        .{
+            .name = "layer14_shape_mask_neg1e9",
+            .outer = layer_outer,
+            .queries = seq_len,
+            .keys = seq_len,
+            .has_mask = true,
+            .mask_bias = -1.0e9,
+        },
+        .{
+            .name = "layer14_shape_mask_neg10000",
+            .outer = layer_outer,
+            .queries = seq_len,
+            .keys = seq_len,
+            .has_mask = true,
+            .mask_bias = -10000.0,
+        },
+    };
+
+    var cases = try allocator.alloc(StepParitySoftmaxVJPCase, configs.len);
+    errdefer allocator.free(cases);
+    for (configs, 0..) |cfg, i| {
+        cases[i] = try captureStepParitySoftmaxVJPCase(
+            allocator,
+            cb,
+            cfg.name,
+            cfg.outer,
+            cfg.queries,
+            cfg.keys,
+            cfg.has_mask,
+            cfg.mask_bias,
+            local_attention_window,
+        );
+    }
+
+    return .{
+        .status = "captured",
+        .version = 1,
+        .runtime = "mpsgraph",
+        .cases = cases,
+    };
+}
+
+fn deterministicQKVSplitValue(tag: usize, a: usize, b: usize, c: usize) f32 {
+    const mixed = (tag * 1009 + a * 131 + b * 37 + c * 17) % 2003;
+    return (@as(f32, @floatFromInt(mixed)) - 1001.0) * 0.00025;
+}
+
+fn fillDeterministicFlatQKVTensor(values: []f32, rows: usize, cols: usize, tag: usize) void {
+    var idx: usize = 0;
+    for (0..rows) |row| {
+        for (0..cols) |col| {
+            values[idx] = deterministicQKVSplitValue(tag, row, col, 0);
+            idx += 1;
+        }
+    }
+}
+
+fn fillDeterministicBhsdTensor(values: []f32, outer: usize, seq_len: usize, head_dim: usize, tag: usize) void {
+    var idx: usize = 0;
+    for (0..outer) |outer_idx| {
+        for (0..seq_len) |pos| {
+            for (0..head_dim) |dim| {
+                values[idx] = deterministicQKVSplitValue(tag, outer_idx, pos, dim);
+                idx += 1;
+            }
+        }
+    }
+}
+
+fn fillDeterministicScoreTensor(values: []f32, outer: usize, seq_len: usize, tag: usize) void {
+    var idx: usize = 0;
+    for (0..outer) |outer_idx| {
+        for (0..seq_len) |query| {
+            for (0..seq_len) |key| {
+                values[idx] = deterministicQKVSplitValue(tag, outer_idx, query, key);
+                idx += 1;
+            }
+        }
+    }
+}
+
+fn fillDeterministicAttentionProbTensor(values: []f32, outer: usize, seq_len: usize, tag: usize) void {
+    var idx: usize = 0;
+    for (0..outer) |outer_idx| {
+        for (0..seq_len) |query| {
+            var row_sum: f32 = 0.0;
+            for (0..seq_len) |key| {
+                const raw = 0.1 + @abs(deterministicQKVSplitValue(tag, outer_idx, query, key));
+                values[idx + key] = raw;
+                row_sum += raw;
+            }
+            const inv_sum = if (row_sum > 0.0) 1.0 / row_sum else 0.0;
+            for (0..seq_len) |key| values[idx + key] *= inv_sum;
+            idx += seq_len;
+        }
+    }
+}
+
+fn stepParitySplitHeads(
+    bld: *ml.graph.Builder,
+    flat: ml.graph.NodeId,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !ml.graph.NodeId {
+    const bsnh = try bld.reshape(
+        flat,
+        ml.graph.Shape.init(.f32, &.{
+            @as(i64, @intCast(batch)),
+            @as(i64, @intCast(seq_len)),
+            @as(i64, @intCast(num_heads)),
+            @as(i64, @intCast(head_dim)),
+        }),
+    );
+    const bnsh = try bld.transpose(bsnh, &.{ 0, 2, 1, 3 });
+    return bld.reshape(
+        bnsh,
+        ml.graph.Shape.init(.f32, &.{
+            @as(i64, @intCast(batch * num_heads)),
+            @as(i64, @intCast(seq_len)),
+            @as(i64, @intCast(head_dim)),
+        }),
+    );
+}
+
+fn stepParityMergeHeads(
+    bld: *ml.graph.Builder,
+    bhsd: ml.graph.NodeId,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !ml.graph.NodeId {
+    const bnsh = try bld.reshape(
+        bhsd,
+        ml.graph.Shape.init(.f32, &.{
+            @as(i64, @intCast(batch)),
+            @as(i64, @intCast(num_heads)),
+            @as(i64, @intCast(seq_len)),
+            @as(i64, @intCast(head_dim)),
+        }),
+    );
+    const bsnh = try bld.transpose(bnsh, &.{ 0, 2, 1, 3 });
+    return bld.reshape(
+        bsnh,
+        ml.graph.Shape.init(.f32, &.{
+            @as(i64, @intCast(batch * seq_len)),
+            @as(i64, @intCast(num_heads * head_dim)),
+        }),
+    );
+}
+
+fn stepParityNamedStats(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    values: []const f32,
+) !StepParityNamedTensorStats {
+    var stats = StepParityTensorSliceStats{};
+    stats.addSlice(values);
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .stats = stats,
+    };
+}
+
+fn stepParityNamedStatsFromStats(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    stats: StepParityTensorSliceStats,
+) !StepParityNamedTensorStats {
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .stats = stats,
+    };
+}
+
+fn stepParityAbsErrorStats(lhs: []const f32, rhs: []const f32) !StepParityTensorSliceStats {
+    if (lhs.len != rhs.len) return error.StepParityAttentionReferenceShapeMismatch;
+    var stats = StepParityTensorSliceStats{};
+    for (lhs, rhs) |a, b| stats.addValue(absF32(a - b));
+    return stats;
+}
+
+fn captureQKVSplitHeadsVJPCase(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !StepParityQKVSplitVJPCase {
+    const hidden_size = num_heads * head_dim;
+    const total = batch * seq_len;
+    const flat_elems = total * hidden_size;
+    const bhsd_elems = batch * num_heads * seq_len * head_dim;
+    const flat = try allocator.alloc(f32, flat_elems);
+    defer allocator.free(flat);
+    const upstream = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(upstream);
+    const cpu_grad = try allocator.alloc(f32, flat_elems);
+    defer allocator.free(cpu_grad);
+    fillDeterministicFlatQKVTensor(flat, total, hidden_size, 1);
+    fillDeterministicBhsdTensor(upstream, batch * num_heads, seq_len, head_dim, 2);
+
+    @memset(cpu_grad, 0.0);
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            for (0..seq_len) |s| {
+                for (0..head_dim) |d| {
+                    const out_idx = (((b * num_heads + h) * seq_len + s) * head_dim) + d;
+                    const flat_idx = ((b * seq_len + s) * hidden_size) + h * head_dim + d;
+                    cpu_grad[flat_idx] += upstream[out_idx];
+                }
+            }
+        }
+    }
+
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var bld = ml.graph.Builder.init(&graph);
+    const flat_node = try bld.parameter("flat", ml.graph.Shape.init(.f32, &.{
+        @as(i64, @intCast(total)),
+        @as(i64, @intCast(hidden_size)),
+    }));
+    const upstream_node = try bld.parameter("upstream", ml.graph.Shape.init(.f32, &.{
+        @as(i64, @intCast(batch * num_heads)),
+        @as(i64, @intCast(seq_len)),
+        @as(i64, @intCast(head_dim)),
+    }));
+    const split = try stepParitySplitHeads(&bld, flat_node, batch, seq_len, num_heads, head_dim);
+    const weighted = try bld.mul(split, upstream_node);
+    const loss = try bld.reduceSum(weighted, &.{ 0, 1, 2 });
+    try graph.markOutput(loss);
+
+    const trainable = [_][]const u8{"flat"};
+    var session = try graph_training.CompiledTrainSession.init(
+        allocator,
+        &graph,
+        loss,
+        .{
+            .trainable_params = trainable[0..],
+            .execution_strategy = .mpsgraph_required,
+        },
+    );
+    defer session.deinit();
+
+    const flat_dims = [_]i32{ @intCast(total), @intCast(hidden_size) };
+    const upstream_dims = [_]i32{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim) };
+    const flat_ct = try cb.fromFloat32Shape(flat, &flat_dims);
+    defer cb.free(flat_ct);
+    const upstream_ct = try cb.fromFloat32Shape(upstream, &upstream_dims);
+    defer cb.free(upstream_ct);
+
+    var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+    defer runtime_inputs.deinit(allocator);
+    try runtime_inputs.put(allocator, flat_node, flat_ct);
+    try runtime_inputs.put(allocator, upstream_node, upstream_ct);
+
+    var result = try session.execute(cb, runtime_inputs);
+    defer result.deinit();
+    const grad = result.gradients.get("flat") orelse return error.MissingSubstageGradient;
+    if (grad.len != flat_elems) return error.InvalidSegmentTensorShape;
+    const err_stats = try stepParityAbsErrorStats(grad, cpu_grad);
+    var components = try allocator.alloc(StepParityNamedTensorStats, 4);
+    errdefer allocator.free(components);
+    components[0] = try stepParityNamedStats(allocator, "upstream", upstream);
+    components[1] = try stepParityNamedStats(allocator, "flat_grad", grad);
+    components[2] = try stepParityNamedStats(allocator, "cpu_flat_grad", cpu_grad);
+    components[3] = try stepParityNamedStatsFromStats(allocator, "flat_grad_cpu_abs_error", err_stats);
+    return .{
+        .name = "split_heads_vjp",
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .hidden_size = hidden_size,
+        .outer = batch * num_heads,
+        .components = components,
+    };
+}
+
+fn captureQKVScoreMatmulVJPCase(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !StepParityQKVSplitVJPCase {
+    const outer = batch * num_heads;
+    const bhsd_elems = outer * seq_len * head_dim;
+    const score_elems = outer * seq_len * seq_len;
+    const q = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(k);
+    const upstream = try allocator.alloc(f32, score_elems);
+    defer allocator.free(upstream);
+    const cpu_q_grad = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(cpu_q_grad);
+    const cpu_k_grad = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(cpu_k_grad);
+    fillDeterministicBhsdTensor(q, outer, seq_len, head_dim, 3);
+    fillDeterministicBhsdTensor(k, outer, seq_len, head_dim, 4);
+    fillDeterministicScoreTensor(upstream, outer, seq_len, 5);
+    @memset(cpu_q_grad, 0.0);
+    @memset(cpu_k_grad, 0.0);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    for (0..outer) |o| {
+        for (0..seq_len) |query| {
+            for (0..seq_len) |key| {
+                const upstream_idx = (o * seq_len + query) * seq_len + key;
+                const up = upstream[upstream_idx] * scale;
+                for (0..head_dim) |dim| {
+                    const q_idx = (o * seq_len + query) * head_dim + dim;
+                    const k_idx = (o * seq_len + key) * head_dim + dim;
+                    cpu_q_grad[q_idx] += up * k[k_idx];
+                    cpu_k_grad[k_idx] += up * q[q_idx];
+                }
+            }
+        }
+    }
+
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var bld = ml.graph.Builder.init(&graph);
+    const q_node = try bld.parameter("q", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(head_dim)) }));
+    const k_node = try bld.parameter("k", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(head_dim)) }));
+    const upstream_node = try bld.parameter("upstream", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(seq_len)) }));
+    const k_t = try bld.transpose(k_node, &.{ 0, 2, 1 });
+    const scores_raw = try bld.matmul3D(q_node, k_t);
+    const scale_node = try bld.scalarConst(.f32, scale);
+    const scores = try bld.mul(scores_raw, scale_node);
+    const weighted = try bld.mul(scores, upstream_node);
+    const loss = try bld.reduceSum(weighted, &.{ 0, 1, 2 });
+    try graph.markOutput(loss);
+
+    const trainable = [_][]const u8{ "q", "k" };
+    var session = try graph_training.CompiledTrainSession.init(allocator, &graph, loss, .{ .trainable_params = trainable[0..], .execution_strategy = .mpsgraph_required });
+    defer session.deinit();
+
+    const bhsd_dims = [_]i32{ @intCast(outer), @intCast(seq_len), @intCast(head_dim) };
+    const score_dims = [_]i32{ @intCast(outer), @intCast(seq_len), @intCast(seq_len) };
+    const q_ct = try cb.fromFloat32Shape(q, &bhsd_dims);
+    defer cb.free(q_ct);
+    const k_ct = try cb.fromFloat32Shape(k, &bhsd_dims);
+    defer cb.free(k_ct);
+    const upstream_ct = try cb.fromFloat32Shape(upstream, &score_dims);
+    defer cb.free(upstream_ct);
+
+    var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+    defer runtime_inputs.deinit(allocator);
+    try runtime_inputs.put(allocator, q_node, q_ct);
+    try runtime_inputs.put(allocator, k_node, k_ct);
+    try runtime_inputs.put(allocator, upstream_node, upstream_ct);
+
+    var result = try session.execute(cb, runtime_inputs);
+    defer result.deinit();
+    const q_grad = result.gradients.get("q") orelse return error.MissingSubstageGradient;
+    const k_grad = result.gradients.get("k") orelse return error.MissingSubstageGradient;
+    const q_err = try stepParityAbsErrorStats(q_grad, cpu_q_grad);
+    const k_err = try stepParityAbsErrorStats(k_grad, cpu_k_grad);
+    var components = try allocator.alloc(StepParityNamedTensorStats, 7);
+    errdefer allocator.free(components);
+    components[0] = try stepParityNamedStats(allocator, "upstream_scores_grad", upstream);
+    components[1] = try stepParityNamedStats(allocator, "q_grad", q_grad);
+    components[2] = try stepParityNamedStats(allocator, "k_grad", k_grad);
+    components[3] = try stepParityNamedStats(allocator, "cpu_q_grad", cpu_q_grad);
+    components[4] = try stepParityNamedStats(allocator, "cpu_k_grad", cpu_k_grad);
+    components[5] = try stepParityNamedStatsFromStats(allocator, "q_grad_cpu_abs_error", q_err);
+    components[6] = try stepParityNamedStatsFromStats(allocator, "k_grad_cpu_abs_error", k_err);
+    return .{
+        .name = "score_matmul_vjp",
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .hidden_size = num_heads * head_dim,
+        .outer = outer,
+        .components = components,
+    };
+}
+
+fn captureQKVValueContextVJPCase(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !StepParityQKVSplitVJPCase {
+    const outer = batch * num_heads;
+    const score_elems = outer * seq_len * seq_len;
+    const bhsd_elems = outer * seq_len * head_dim;
+    const probs = try allocator.alloc(f32, score_elems);
+    defer allocator.free(probs);
+    const v = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(v);
+    const upstream = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(upstream);
+    const cpu_probs_grad = try allocator.alloc(f32, score_elems);
+    defer allocator.free(cpu_probs_grad);
+    const cpu_v_grad = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(cpu_v_grad);
+    fillDeterministicAttentionProbTensor(probs, outer, seq_len, 6);
+    fillDeterministicBhsdTensor(v, outer, seq_len, head_dim, 7);
+    fillDeterministicBhsdTensor(upstream, outer, seq_len, head_dim, 8);
+    @memset(cpu_probs_grad, 0.0);
+    @memset(cpu_v_grad, 0.0);
+    for (0..outer) |o| {
+        for (0..seq_len) |query| {
+            for (0..seq_len) |key| {
+                var sum: f32 = 0.0;
+                for (0..head_dim) |dim| {
+                    const upstream_idx = (o * seq_len + query) * head_dim + dim;
+                    const v_idx = (o * seq_len + key) * head_dim + dim;
+                    sum += upstream[upstream_idx] * v[v_idx];
+                    cpu_v_grad[v_idx] += probs[(o * seq_len + query) * seq_len + key] * upstream[upstream_idx];
+                }
+                cpu_probs_grad[(o * seq_len + query) * seq_len + key] = sum;
+            }
+        }
+    }
+
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var bld = ml.graph.Builder.init(&graph);
+    const probs_node = try bld.parameter("probs", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(seq_len)) }));
+    const v_node = try bld.parameter("v", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(head_dim)) }));
+    const upstream_node = try bld.parameter("upstream", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(head_dim)) }));
+    const context = try bld.matmul3D(probs_node, v_node);
+    const weighted = try bld.mul(context, upstream_node);
+    const loss = try bld.reduceSum(weighted, &.{ 0, 1, 2 });
+    try graph.markOutput(loss);
+
+    const trainable = [_][]const u8{ "probs", "v" };
+    var session = try graph_training.CompiledTrainSession.init(allocator, &graph, loss, .{ .trainable_params = trainable[0..], .execution_strategy = .mpsgraph_required });
+    defer session.deinit();
+    const score_dims = [_]i32{ @intCast(outer), @intCast(seq_len), @intCast(seq_len) };
+    const bhsd_dims = [_]i32{ @intCast(outer), @intCast(seq_len), @intCast(head_dim) };
+    const probs_ct = try cb.fromFloat32Shape(probs, &score_dims);
+    defer cb.free(probs_ct);
+    const v_ct = try cb.fromFloat32Shape(v, &bhsd_dims);
+    defer cb.free(v_ct);
+    const upstream_ct = try cb.fromFloat32Shape(upstream, &bhsd_dims);
+    defer cb.free(upstream_ct);
+
+    var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+    defer runtime_inputs.deinit(allocator);
+    try runtime_inputs.put(allocator, probs_node, probs_ct);
+    try runtime_inputs.put(allocator, v_node, v_ct);
+    try runtime_inputs.put(allocator, upstream_node, upstream_ct);
+
+    var result = try session.execute(cb, runtime_inputs);
+    defer result.deinit();
+    const probs_grad = result.gradients.get("probs") orelse return error.MissingSubstageGradient;
+    const v_grad = result.gradients.get("v") orelse return error.MissingSubstageGradient;
+    const probs_err = try stepParityAbsErrorStats(probs_grad, cpu_probs_grad);
+    const v_err = try stepParityAbsErrorStats(v_grad, cpu_v_grad);
+    var components = try allocator.alloc(StepParityNamedTensorStats, 7);
+    errdefer allocator.free(components);
+    components[0] = try stepParityNamedStats(allocator, "upstream_context_grad", upstream);
+    components[1] = try stepParityNamedStats(allocator, "probs_grad", probs_grad);
+    components[2] = try stepParityNamedStats(allocator, "v_grad", v_grad);
+    components[3] = try stepParityNamedStats(allocator, "cpu_probs_grad", cpu_probs_grad);
+    components[4] = try stepParityNamedStats(allocator, "cpu_v_grad", cpu_v_grad);
+    components[5] = try stepParityNamedStatsFromStats(allocator, "probs_grad_cpu_abs_error", probs_err);
+    components[6] = try stepParityNamedStatsFromStats(allocator, "v_grad_cpu_abs_error", v_err);
+    return .{
+        .name = "value_context_vjp",
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .hidden_size = num_heads * head_dim,
+        .outer = outer,
+        .components = components,
+    };
+}
+
+fn captureQKVRopeVJPCase(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) !StepParityQKVSplitVJPCase {
+    const outer = batch * num_heads;
+    const bhsd_elems = outer * seq_len * head_dim;
+    const q = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(k);
+    const upstream_q = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(upstream_q);
+    const upstream_k = try allocator.alloc(f32, bhsd_elems);
+    defer allocator.free(upstream_k);
+    fillDeterministicBhsdTensor(q, outer, seq_len, head_dim, 11);
+    fillDeterministicBhsdTensor(k, outer, seq_len, head_dim, 12);
+    fillDeterministicBhsdTensor(upstream_q, outer, seq_len, head_dim, 13);
+    fillDeterministicBhsdTensor(upstream_k, outer, seq_len, head_dim, 14);
+
+    const rope = try graph_input_binder.QwenPlaceholderPrep.buildRopeCosSin(
+        allocator,
+        @intCast(seq_len),
+        @intCast(head_dim),
+        rope_theta,
+    );
+    defer {
+        allocator.free(rope.cos);
+        allocator.free(rope.sin);
+    }
+
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var bld = ml.graph.Builder.init(&graph);
+    const bhsd_shape = ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(outer)), @as(i64, @intCast(seq_len)), @as(i64, @intCast(head_dim)) });
+    const rope_shape = ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(seq_len)), @as(i64, @intCast(head_dim)) });
+    const q_node = try bld.parameter("q", bhsd_shape);
+    const k_node = try bld.parameter("k", bhsd_shape);
+    const upstream_q_node = try bld.parameter("upstream_q", bhsd_shape);
+    const upstream_k_node = try bld.parameter("upstream_k", bhsd_shape);
+    const rope_cos_node = try bld.parameter("rope_cos", rope_shape);
+    const rope_sin_node = try bld.parameter("rope_sin", rope_shape);
+    const q_roped = try bld.ropeWithOptions(
+        q_node,
+        rope_cos_node,
+        rope_sin_node,
+        @intCast(seq_len),
+        @intCast(head_dim),
+        @intCast(head_dim),
+        rope_theta,
+        true,
+    );
+    const k_roped = try bld.ropeWithOptions(
+        k_node,
+        rope_cos_node,
+        rope_sin_node,
+        @intCast(seq_len),
+        @intCast(head_dim),
+        @intCast(head_dim),
+        rope_theta,
+        true,
+    );
+    const q_weighted = try bld.mul(q_roped, upstream_q_node);
+    const k_weighted = try bld.mul(k_roped, upstream_k_node);
+    const weighted = try bld.add(q_weighted, k_weighted);
+    const loss = try bld.reduceSum(weighted, &.{ 0, 1, 2 });
+    try graph.markOutput(loss);
+
+    const trainable = [_][]const u8{ "q", "k" };
+    var session = try graph_training.CompiledTrainSession.init(allocator, &graph, loss, .{ .trainable_params = trainable[0..], .execution_strategy = .mpsgraph_required });
+    defer session.deinit();
+
+    const bhsd_dims = [_]i32{ @intCast(outer), @intCast(seq_len), @intCast(head_dim) };
+    const rope_dims = [_]i32{ @intCast(seq_len), @intCast(head_dim) };
+    const q_ct = try cb.fromFloat32Shape(q, &bhsd_dims);
+    defer cb.free(q_ct);
+    const k_ct = try cb.fromFloat32Shape(k, &bhsd_dims);
+    defer cb.free(k_ct);
+    const upstream_q_ct = try cb.fromFloat32Shape(upstream_q, &bhsd_dims);
+    defer cb.free(upstream_q_ct);
+    const upstream_k_ct = try cb.fromFloat32Shape(upstream_k, &bhsd_dims);
+    defer cb.free(upstream_k_ct);
+    const rope_cos_ct = try cb.fromFloat32Shape(rope.cos, &rope_dims);
+    defer cb.free(rope_cos_ct);
+    const rope_sin_ct = try cb.fromFloat32Shape(rope.sin, &rope_dims);
+    defer cb.free(rope_sin_ct);
+
+    var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+    defer runtime_inputs.deinit(allocator);
+    try runtime_inputs.put(allocator, q_node, q_ct);
+    try runtime_inputs.put(allocator, k_node, k_ct);
+    try runtime_inputs.put(allocator, upstream_q_node, upstream_q_ct);
+    try runtime_inputs.put(allocator, upstream_k_node, upstream_k_ct);
+    try runtime_inputs.put(allocator, rope_cos_node, rope_cos_ct);
+    try runtime_inputs.put(allocator, rope_sin_node, rope_sin_ct);
+
+    var result = try session.execute(cb, runtime_inputs);
+    defer result.deinit();
+    const q_grad = result.gradients.get("q") orelse return error.MissingSubstageGradient;
+    const k_grad = result.gradients.get("k") orelse return error.MissingSubstageGradient;
+    var components = try allocator.alloc(StepParityNamedTensorStats, 4);
+    errdefer allocator.free(components);
+    components[0] = try stepParityNamedStats(allocator, "upstream_q_grad", upstream_q);
+    components[1] = try stepParityNamedStats(allocator, "upstream_k_grad", upstream_k);
+    components[2] = try stepParityNamedStats(allocator, "q_grad", q_grad);
+    components[3] = try stepParityNamedStats(allocator, "k_grad", k_grad);
+    return .{
+        .name = "rope_qk_vjp",
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .hidden_size = num_heads * head_dim,
+        .outer = outer,
+        .components = components,
+    };
+}
+
+fn captureQKVSumConsistencyCase(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !StepParityQKVSplitVJPCase {
+    const hidden_size = num_heads * head_dim;
+    const total = batch * seq_len;
+    const flat_elems = total * hidden_size;
+    const x = try allocator.alloc(f32, flat_elems);
+    defer allocator.free(x);
+    const upstream = try allocator.alloc(f32, flat_elems);
+    defer allocator.free(upstream);
+    fillDeterministicFlatQKVTensor(x, total, hidden_size, 9);
+    fillDeterministicFlatQKVTensor(upstream, total, hidden_size, 10);
+
+    const shared_grad = blk: {
+        var graph = ml.graph.Graph.init(allocator);
+        defer graph.deinit();
+        var bld = ml.graph.Builder.init(&graph);
+        const x_node = try bld.parameter("x", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_size)) }));
+        const upstream_node = try bld.parameter("upstream", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_size)) }));
+        const q = try stepParitySplitHeads(&bld, x_node, batch, seq_len, num_heads, head_dim);
+        const k = try stepParitySplitHeads(&bld, x_node, batch, seq_len, num_heads, head_dim);
+        const v = try stepParitySplitHeads(&bld, x_node, batch, seq_len, num_heads, head_dim);
+        const k_t = try bld.transpose(k, &.{ 0, 2, 1 });
+        const scores = try bld.matmul3D(q, k_t);
+        const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))));
+        const scaled = try bld.mul(scores, scale);
+        const probs = try bld.softmax(scaled);
+        const context = try bld.matmul3D(probs, v);
+        const merged = try stepParityMergeHeads(&bld, context, batch, seq_len, num_heads, head_dim);
+        const weighted = try bld.mul(merged, upstream_node);
+        const loss = try bld.reduceSum(weighted, &.{ 0, 1 });
+        try graph.markOutput(loss);
+        const trainable = [_][]const u8{"x"};
+        var session = try graph_training.CompiledTrainSession.init(allocator, &graph, loss, .{ .trainable_params = trainable[0..], .execution_strategy = .mpsgraph_required });
+        defer session.deinit();
+        const flat_dims = [_]i32{ @intCast(total), @intCast(hidden_size) };
+        const x_ct = try cb.fromFloat32Shape(x, &flat_dims);
+        defer cb.free(x_ct);
+        const upstream_ct = try cb.fromFloat32Shape(upstream, &flat_dims);
+        defer cb.free(upstream_ct);
+        var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+        defer runtime_inputs.deinit(allocator);
+        try runtime_inputs.put(allocator, x_node, x_ct);
+        try runtime_inputs.put(allocator, upstream_node, upstream_ct);
+        var result = try session.execute(cb, runtime_inputs);
+        defer result.deinit();
+        const grad = result.gradients.get("x") orelse return error.MissingSubstageGradient;
+        break :blk try allocator.dupe(f32, grad);
+    };
+    defer allocator.free(shared_grad);
+
+    const separate = blk: {
+        var graph = ml.graph.Graph.init(allocator);
+        defer graph.deinit();
+        var bld = ml.graph.Builder.init(&graph);
+        const q_node = try bld.parameter("q", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_size)) }));
+        const k_node = try bld.parameter("k", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_size)) }));
+        const v_node = try bld.parameter("v", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_size)) }));
+        const upstream_node = try bld.parameter("upstream", ml.graph.Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_size)) }));
+        const q = try stepParitySplitHeads(&bld, q_node, batch, seq_len, num_heads, head_dim);
+        const k = try stepParitySplitHeads(&bld, k_node, batch, seq_len, num_heads, head_dim);
+        const v = try stepParitySplitHeads(&bld, v_node, batch, seq_len, num_heads, head_dim);
+        const k_t = try bld.transpose(k, &.{ 0, 2, 1 });
+        const scores = try bld.matmul3D(q, k_t);
+        const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))));
+        const scaled = try bld.mul(scores, scale);
+        const probs = try bld.softmax(scaled);
+        const context = try bld.matmul3D(probs, v);
+        const merged = try stepParityMergeHeads(&bld, context, batch, seq_len, num_heads, head_dim);
+        const weighted = try bld.mul(merged, upstream_node);
+        const loss = try bld.reduceSum(weighted, &.{ 0, 1 });
+        try graph.markOutput(loss);
+        const trainable = [_][]const u8{ "q", "k", "v" };
+        var session = try graph_training.CompiledTrainSession.init(allocator, &graph, loss, .{ .trainable_params = trainable[0..], .execution_strategy = .mpsgraph_required });
+        defer session.deinit();
+        const flat_dims = [_]i32{ @intCast(total), @intCast(hidden_size) };
+        const x_ct = try cb.fromFloat32Shape(x, &flat_dims);
+        defer cb.free(x_ct);
+        const upstream_ct = try cb.fromFloat32Shape(upstream, &flat_dims);
+        defer cb.free(upstream_ct);
+        var runtime_inputs = std.AutoHashMapUnmanaged(ml.graph.NodeId, ops_mod.CT){};
+        defer runtime_inputs.deinit(allocator);
+        try runtime_inputs.put(allocator, q_node, x_ct);
+        try runtime_inputs.put(allocator, k_node, x_ct);
+        try runtime_inputs.put(allocator, v_node, x_ct);
+        try runtime_inputs.put(allocator, upstream_node, upstream_ct);
+        var result = try session.execute(cb, runtime_inputs);
+        defer result.deinit();
+        const q_grad = result.gradients.get("q") orelse return error.MissingSubstageGradient;
+        const k_grad = result.gradients.get("k") orelse return error.MissingSubstageGradient;
+        const v_grad = result.gradients.get("v") orelse return error.MissingSubstageGradient;
+        const q_copy = try allocator.dupe(f32, q_grad);
+        errdefer allocator.free(q_copy);
+        const k_copy = try allocator.dupe(f32, k_grad);
+        errdefer allocator.free(k_copy);
+        const v_copy = try allocator.dupe(f32, v_grad);
+        errdefer allocator.free(v_copy);
+        break :blk .{ .q = q_copy, .k = k_copy, .v = v_copy };
+    };
+    defer allocator.free(separate.q);
+    defer allocator.free(separate.k);
+    defer allocator.free(separate.v);
+
+    const sum_grad = try allocator.alloc(f32, flat_elems);
+    defer allocator.free(sum_grad);
+    for (sum_grad, separate.q, separate.k, separate.v) |*dst, qv, kv, vv| dst.* = qv + kv + vv;
+    const delta = try computeSliceDelta(allocator, shared_grad, sum_grad);
+    defer allocator.free(delta);
+
+    var components = try allocator.alloc(StepParityNamedTensorStats, 6);
+    errdefer allocator.free(components);
+    components[0] = try stepParityNamedStats(allocator, "shared_grad", shared_grad);
+    components[1] = try stepParityNamedStats(allocator, "separate_q_grad", separate.q);
+    components[2] = try stepParityNamedStats(allocator, "separate_k_grad", separate.k);
+    components[3] = try stepParityNamedStats(allocator, "separate_v_grad", separate.v);
+    components[4] = try stepParityNamedStats(allocator, "sum_separate_grad", sum_grad);
+    components[5] = try stepParityNamedStats(allocator, "shared_minus_sum", delta);
+    return .{
+        .name = "qkv_sum_consistency",
+        .batch = batch,
+        .seq_len = seq_len,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .hidden_size = hidden_size,
+        .outer = batch * num_heads,
+        .components = components,
+    };
+}
+
+fn captureStepParityQKVSplitVJPProbe(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    actual_batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) !StepParityQKVSplitVJPProbe {
+    var cases = try allocator.alloc(StepParityQKVSplitVJPCase, 5);
+    errdefer allocator.free(cases);
+    cases[0] = try captureQKVSplitHeadsVJPCase(allocator, cb, actual_batch, seq_len, num_heads, head_dim);
+    cases[1] = try captureQKVScoreMatmulVJPCase(allocator, cb, actual_batch, seq_len, num_heads, head_dim);
+    cases[2] = try captureQKVValueContextVJPCase(allocator, cb, actual_batch, seq_len, num_heads, head_dim);
+    cases[3] = try captureQKVRopeVJPCase(allocator, cb, actual_batch, seq_len, num_heads, head_dim, rope_theta);
+    cases[4] = try captureQKVSumConsistencyCase(allocator, cb, actual_batch, seq_len, num_heads, head_dim);
+    return .{
+        .status = "captured",
+        .version = 1,
+        .runtime = "mpsgraph",
+        .cases = cases,
+    };
+}
+
+fn computeSliceDelta(
+    allocator: std.mem.Allocator,
+    lhs: []const f32,
+    rhs: []const f32,
+) ![]f32 {
+    if (lhs.len != rhs.len) return error.StepParityAttentionReferenceShapeMismatch;
+    const out = try allocator.alloc(f32, lhs.len);
+    errdefer allocator.free(out);
+    for (lhs, rhs, out) |a, b, *dst| dst.* = a - b;
+    return out;
+}
+
+fn computeAttentionRowProbe(
+    allocator: std.mem.Allocator,
+    layer_idx: u32,
+    name: []const u8,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    attention_mask: []const i32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    mode: AttentionIndexMode,
+    is_local_attention: bool,
+    local_attention_window: u32,
+    batch_idx: usize,
+    head_idx: usize,
+    query_idx: usize,
+) !EncoderAttentionRowProbe {
+    const total = batch * seq_len * num_heads * head_dim;
+    if (q.len != total or k.len != total or v.len != total) return error.StepParityAttentionReferenceShapeMismatch;
+    if (attention_mask.len < batch * seq_len) return error.StepParityAttentionReferenceShapeMismatch;
+    if (batch_idx >= batch or head_idx >= num_heads or query_idx >= seq_len) return error.StepParityAttentionReferenceShapeMismatch;
+
+    const scores = try allocator.alloc(f32, seq_len);
+    defer allocator.free(scores);
+    const probs = try allocator.alloc(f32, seq_len);
+    defer allocator.free(probs);
+    @memset(scores, 0.0);
+    @memset(probs, 0.0);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const window_half: usize = @intCast(local_attention_window / 2);
+    var out = EncoderAttentionRowProbe{
+        .layer_idx = layer_idx,
+        .name = name,
+        .batch_idx = batch_idx,
+        .head_idx = head_idx,
+        .query_idx = query_idx,
+        .valid_keys = 0,
+        .score_mean = 0.0,
+        .score_rms = 0.0,
+        .score_min = std.math.inf(f32),
+        .score_max = -std.math.inf(f32),
+        .score_argmax = 0,
+        .prob_entropy = 0.0,
+        .prob_max = 0.0,
+        .prob_argmax = 0,
+        .prob_top2_gap = 0.0,
+        .query_rms = 0.0,
+        .query_max_abs = 0.0,
+        .key_query_rms = 0.0,
+        .key_query_max_abs = 0.0,
+        .value_query_rms = 0.0,
+        .value_query_max_abs = 0.0,
+        .output_mean = 0.0,
+        .output_rms = 0.0,
+        .output_max_abs = 0.0,
+        .query_sample_len = 0,
+        .query_sample = [_]f32{0.0} ** attention_row_sample_max,
+        .key_query_sample_len = 0,
+        .key_query_sample = [_]f32{0.0} ** attention_row_sample_max,
+        .value_query_sample_len = 0,
+        .value_query_sample = [_]f32{0.0} ** attention_row_sample_max,
+        .score_sample_len = 0,
+        .score_sample = [_]f32{0.0} ** attention_row_sample_max,
+        .prob_sample_len = 0,
+        .prob_sample = [_]f32{0.0} ** attention_row_sample_max,
+        .output_sample_len = 0,
+        .output_sample = [_]f32{0.0} ** attention_row_sample_max,
+    };
+
+    var query_sum_sq: f64 = 0.0;
+    var key_query_sum_sq: f64 = 0.0;
+    var value_query_sum_sq: f64 = 0.0;
+    for (0..head_dim) |dim| {
+        const q_value = q[attentionIndex(mode, batch_idx, query_idx, head_idx, dim, seq_len, num_heads, head_dim)];
+        const k_value = k[attentionIndex(mode, batch_idx, query_idx, head_idx, dim, seq_len, num_heads, head_dim)];
+        const v_value = v[attentionIndex(mode, batch_idx, query_idx, head_idx, dim, seq_len, num_heads, head_dim)];
+        if (out.query_sample_len < attention_row_sample_max) {
+            out.query_sample[out.query_sample_len] = q_value;
+            out.query_sample_len += 1;
+        }
+        if (out.key_query_sample_len < attention_row_sample_max) {
+            out.key_query_sample[out.key_query_sample_len] = k_value;
+            out.key_query_sample_len += 1;
+        }
+        if (out.value_query_sample_len < attention_row_sample_max) {
+            out.value_query_sample[out.value_query_sample_len] = v_value;
+            out.value_query_sample_len += 1;
+        }
+        query_sum_sq += @as(f64, q_value) * @as(f64, q_value);
+        key_query_sum_sq += @as(f64, k_value) * @as(f64, k_value);
+        value_query_sum_sq += @as(f64, v_value) * @as(f64, v_value);
+        out.query_max_abs = @max(out.query_max_abs, absF32(q_value));
+        out.key_query_max_abs = @max(out.key_query_max_abs, absF32(k_value));
+        out.value_query_max_abs = @max(out.value_query_max_abs, absF32(v_value));
+    }
+    if (head_dim > 0) {
+        const head_denom = @as(f64, @floatFromInt(head_dim));
+        out.query_rms = @sqrt(query_sum_sq / head_denom);
+        out.key_query_rms = @sqrt(key_query_sum_sq / head_denom);
+        out.value_query_rms = @sqrt(value_query_sum_sq / head_denom);
+    }
+
+    var score_sum: f64 = 0.0;
+    var score_sum_sq: f64 = 0.0;
+    for (0..seq_len) |key_idx| {
+        const diff = if (query_idx >= key_idx) query_idx - key_idx else key_idx - query_idx;
+        const outside_window = is_local_attention and diff > window_half;
+        if (attention_mask[batch_idx * seq_len + key_idx] == 0 or outside_window) continue;
+        var score: f32 = 0.0;
+        for (0..head_dim) |dim| {
+            const q_idx = attentionIndex(mode, batch_idx, query_idx, head_idx, dim, seq_len, num_heads, head_dim);
+            const k_idx = attentionIndex(mode, batch_idx, key_idx, head_idx, dim, seq_len, num_heads, head_dim);
+            score += q[q_idx] * k[k_idx];
+        }
+        score *= scale;
+        scores[key_idx] = score;
+        if (out.score_sample_len < attention_row_sample_max) {
+            out.score_sample[out.score_sample_len] = score;
+            out.score_sample_len += 1;
+        }
+        out.valid_keys += 1;
+        score_sum += score;
+        score_sum_sq += @as(f64, score) * @as(f64, score);
+        if (score < out.score_min) out.score_min = score;
+        if (score > out.score_max) {
+            out.score_max = score;
+            out.score_argmax = key_idx;
+        }
+    }
+
+    if (out.valid_keys == 0) {
+        out.score_min = 0.0;
+        out.score_max = 0.0;
+        return out;
+    }
+
+    const valid_denom = @as(f64, @floatFromInt(out.valid_keys));
+    out.score_mean = score_sum / valid_denom;
+    out.score_rms = @sqrt(score_sum_sq / valid_denom);
+
+    var exp_sum: f32 = 0.0;
+    for (0..seq_len) |key_idx| {
+        const diff = if (query_idx >= key_idx) query_idx - key_idx else key_idx - query_idx;
+        const outside_window = is_local_attention and diff > window_half;
+        if (attention_mask[batch_idx * seq_len + key_idx] == 0 or outside_window) continue;
+        const weight = @exp(scores[key_idx] - out.score_max);
+        probs[key_idx] = weight;
+        exp_sum += weight;
+    }
+    if (exp_sum <= 0.0) return out;
+
+    var top1: f32 = -std.math.inf(f32);
+    var top2: f32 = -std.math.inf(f32);
+    for (0..seq_len) |key_idx| {
+        const diff = if (query_idx >= key_idx) query_idx - key_idx else key_idx - query_idx;
+        const outside_window = is_local_attention and diff > window_half;
+        if (attention_mask[batch_idx * seq_len + key_idx] == 0 or outside_window) continue;
+        const prob = probs[key_idx] / exp_sum;
+        probs[key_idx] = prob;
+        if (out.prob_sample_len < attention_row_sample_max) {
+            out.prob_sample[out.prob_sample_len] = prob;
+            out.prob_sample_len += 1;
+        }
+        if (prob > 0.0) out.prob_entropy -= @as(f64, prob) * @log(@as(f64, prob));
+        if (prob > out.prob_max) {
+            out.prob_max = prob;
+            out.prob_argmax = key_idx;
+        }
+        if (prob > top1) {
+            top2 = top1;
+            top1 = prob;
+        } else if (prob > top2) {
+            top2 = prob;
+        }
+    }
+    out.prob_top2_gap = if (top2 == -std.math.inf(f32)) top1 else top1 - top2;
+
+    var output_sum: f64 = 0.0;
+    var output_sum_sq: f64 = 0.0;
+    for (0..head_dim) |dim| {
+        var accum: f32 = 0.0;
+        for (0..seq_len) |key_idx| {
+            const prob = probs[key_idx];
+            if (prob == 0.0) continue;
+            const v_idx = attentionIndex(mode, batch_idx, key_idx, head_idx, dim, seq_len, num_heads, head_dim);
+            accum += prob * v[v_idx];
+        }
+        if (out.output_sample_len < attention_row_sample_max) {
+            out.output_sample[out.output_sample_len] = accum;
+            out.output_sample_len += 1;
+        }
+        output_sum += accum;
+        output_sum_sq += @as(f64, accum) * @as(f64, accum);
+        out.output_max_abs = @max(out.output_max_abs, absF32(accum));
+    }
+    if (head_dim > 0) {
+        const head_denom = @as(f64, @floatFromInt(head_dim));
+        out.output_mean = output_sum / head_denom;
+        out.output_rms = @sqrt(output_sum_sq / head_denom);
+    }
+    return out;
+}
+
+fn findLayerAttentionInternal(
+    act_buf: *const modern_bert.ActivationBuffer,
+    layer_idx: u32,
+    name: []const u8,
+) ?[]const f32 {
+    for (act_buf.attention_internals.items) |cap| {
+        if (cap.layer_idx == layer_idx and std.mem.eql(u8, cap.name, name)) return cap.values;
+    }
+    return null;
+}
+
+fn findLayerActivationInput(
+    act_buf: *const modern_bert.ActivationBuffer,
+    layer_idx: u32,
+    module_name: []const u8,
+) ?[]const f32 {
+    for (act_buf.items.items) |cap| {
+        if (cap.layer_idx == layer_idx and std.mem.eql(u8, cap.module_name, module_name)) return cap.input;
+    }
+    return null;
+}
+
+fn computeLayerSdpaReferenceProbeStats(
+    allocator: std.mem.Allocator,
+    act_buf: *const modern_bert.ActivationBuffer,
+    layer_idx: u32,
+    attention_mask: []const i32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    is_local_attention: bool,
+    local_attention_window: u32,
+) !?Layer0SdpaReferenceProbeStats {
+    const q = findLayerAttentionInternal(act_buf, layer_idx, "q_rope") orelse return null;
+    const k = findLayerAttentionInternal(act_buf, layer_idx, "k_rope") orelse return null;
+    const v = findLayerAttentionInternal(act_buf, layer_idx, "v_raw") orelse return null;
+    const attn_out = findLayerActivationInput(act_buf, layer_idx, "out_proj") orelse return null;
+    const total = batch * seq_len * num_heads * head_dim;
+    if (q.len != total or k.len != total or v.len != total or attn_out.len != total) return null;
+
+    const token_ref = try computeSdpaReference(allocator, q, k, v, attention_mask, batch, seq_len, num_heads, head_dim, .token_major, is_local_attention, local_attention_window);
+    defer allocator.free(token_ref);
+    const token_delta = try computeSliceDelta(allocator, attn_out, token_ref);
+    defer allocator.free(token_delta);
+    const kernel_ref = try computeSdpaReference(allocator, q, k, v, attention_mask, batch, seq_len, num_heads, head_dim, .kernel_major, is_local_attention, local_attention_window);
+    defer allocator.free(kernel_ref);
+    const kernel_delta = try computeSliceDelta(allocator, attn_out, kernel_ref);
+    defer allocator.free(kernel_delta);
+
+    return .{
+        .token_ref = fused_chunker_train.computeBoundaryProbeTensorStats(token_ref),
+        .token_delta = fused_chunker_train.computeBoundaryProbeTensorStats(token_delta),
+        .kernel_ref = fused_chunker_train.computeBoundaryProbeTensorStats(kernel_ref),
+        .kernel_delta = fused_chunker_train.computeBoundaryProbeTensorStats(kernel_delta),
+    };
+}
+
+fn computeLayerAttentionRowProbes(
+    allocator: std.mem.Allocator,
+    act_buf: *const modern_bert.ActivationBuffer,
+    layer_idx: u32,
+    attention_mask: []const i32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    is_local_attention: bool,
+    local_attention_window: u32,
+) ![]EncoderAttentionRowProbe {
+    const q = findLayerAttentionInternal(act_buf, layer_idx, "q_rope") orelse return try allocator.alloc(EncoderAttentionRowProbe, 0);
+    const k = findLayerAttentionInternal(act_buf, layer_idx, "k_rope") orelse return try allocator.alloc(EncoderAttentionRowProbe, 0);
+    const v = findLayerAttentionInternal(act_buf, layer_idx, "v_raw") orelse return try allocator.alloc(EncoderAttentionRowProbe, 0);
+    const total = batch * seq_len * num_heads * head_dim;
+    if (q.len != total or k.len != total or v.len != total or attention_mask.len < batch * seq_len or batch == 0) return try allocator.alloc(EncoderAttentionRowProbe, 0);
+
+    var valid_keys: usize = 0;
+    for (0..seq_len) |token_idx| {
+        if (attention_mask[token_idx] != 0) valid_keys += 1;
+    }
+    if (valid_keys == 0) return try allocator.alloc(EncoderAttentionRowProbe, 0);
+
+    var query_positions = [_]usize{ 0, 0, 0 };
+    const target_ranks = [_]usize{ 0, valid_keys / 2, valid_keys - 1 };
+    var valid_rank: usize = 0;
+    for (0..seq_len) |token_idx| {
+        if (attention_mask[token_idx] == 0) continue;
+        for (target_ranks, 0..) |target, slot| {
+            if (valid_rank == target) query_positions[slot] = token_idx;
+        }
+        valid_rank += 1;
+    }
+
+    const row_names = [2][3][]const u8{
+        .{ "attn_token_row_h00_first", "attn_token_row_h00_mid", "attn_token_row_h00_last" },
+        .{ "attn_token_row_h01_first", "attn_token_row_h01_mid", "attn_token_row_h01_last" },
+    };
+    const heads_to_probe = @min(num_heads, row_names.len);
+    const rows = try allocator.alloc(EncoderAttentionRowProbe, heads_to_probe * query_positions.len);
+    errdefer allocator.free(rows);
+
+    var row_idx: usize = 0;
+    for (0..heads_to_probe) |head_idx| {
+        for (query_positions, 0..) |query_idx, query_slot| {
+            rows[row_idx] = try computeAttentionRowProbe(
+                allocator,
+                layer_idx,
+                row_names[head_idx][query_slot],
+                q,
+                k,
+                v,
+                attention_mask,
+                batch,
+                seq_len,
+                num_heads,
+                head_dim,
+                .token_major,
+                is_local_attention,
+                local_attention_window,
+                0,
+                head_idx,
+                query_idx,
+            );
+            row_idx += 1;
+        }
+    }
+    return rows;
 }
 
 fn cloneLoRALayersForSegmentVJPParity(
@@ -509,7 +4578,8 @@ fn runSegmentVJPParityDiagnostic(
     );
     defer mps_session.deinit();
 
-    var partitioned_session = try segmented_encoder.ModernBertSegmentVJPSession.initWithGradientOptionsAndStrategy(
+    const reference_strategy = segmentVJPParityReferenceStrategy();
+    var reference_session = try segmented_encoder.ModernBertSegmentVJPSession.initWithGradientOptionsAndStrategy(
         allocator,
         graph_config,
         @intCast(actual_batch),
@@ -520,14 +4590,14 @@ fn runSegmentVJPParityDiagnostic(
         lora_alpha,
         include_hidden_grad,
         include_adapter_grads,
-        .partitioned_required,
+        reference_strategy,
     );
-    defer partitioned_session.deinit();
+    defer reference_session.deinit();
 
     const mps_layers = try cloneLoRALayersForSegmentVJPParity(allocator, lora_layers);
     defer deinitClonedLoRALayers(mps_layers, allocator);
-    const partitioned_layers = try cloneLoRALayersForSegmentVJPParity(allocator, lora_layers);
-    defer deinitClonedLoRALayers(partitioned_layers, allocator);
+    const reference_layers = try cloneLoRALayersForSegmentVJPParity(allocator, lora_layers);
+    defer deinitClonedLoRALayers(reference_layers, allocator);
 
     var mps_result = try mps_session.executeWithOptions(
         cb,
@@ -539,21 +4609,21 @@ fn runSegmentVJPParityDiagnostic(
     );
     defer mps_result.deinit();
 
-    var partitioned_result = try partitioned_session.executeWithOptions(
+    var reference_result = try reference_session.executeWithOptions(
         cb,
         segment_input,
         upstream_grad,
         attention_mask,
-        partitioned_layers,
+        reference_layers,
         include_adapter_grads,
     );
-    defer partitioned_result.deinit();
+    defer reference_result.deinit();
 
     var hidden_stats = SegmentVJPDiffStats{};
     if (include_hidden_grad) {
         const mps_hidden = mps_result.hidden_grad orelse return error.SegmentVJPParityMissingMpsHiddenGrad;
-        const partitioned_hidden = partitioned_result.hidden_grad orelse return error.SegmentVJPParityMissingPartitionedHiddenGrad;
-        try hidden_stats.add("hidden_grad", mps_hidden, partitioned_hidden);
+        const reference_hidden = reference_result.hidden_grad orelse return error.SegmentVJPParityMissingPartitionedHiddenGrad;
+        try hidden_stats.add("hidden_grad", mps_hidden, reference_hidden);
     }
 
     var adapter_a_stats = SegmentVJPDiffStats{};
@@ -561,18 +4631,32 @@ fn runSegmentVJPParityDiagnostic(
     if (include_adapter_grads) {
         for (mps_layers) |*mps_layer| {
             if (mps_layer.layer_idx < segment_start or mps_layer.layer_idx >= segment_end) continue;
-            const partitioned_layer = findLoRALayerForSegmentVJPParity(
-                partitioned_layers,
+            const reference_layer = findLoRALayerForSegmentVJPParity(
+                reference_layers,
                 mps_layer.layer_idx,
                 mps_layer.module_name,
             ) orelse return error.SegmentVJPParityMissingAdapterLayer;
-            try adapter_a_stats.add(mps_layer.module_name, mps_layer.grad_A, partitioned_layer.grad_A);
-            try adapter_b_stats.add(mps_layer.module_name, mps_layer.grad_B, partitioned_layer.grad_B);
+            try adapter_a_stats.add(mps_layer.module_name, mps_layer.grad_A, reference_layer.grad_A);
+            try adapter_b_stats.add(mps_layer.module_name, mps_layer.grad_B, reference_layer.grad_B);
         }
     }
 
     print(
-        "segment_vjp_parity segment={d}-{d} hidden_tensors={d} hidden_elems={d} hidden_max_abs={d:.9} hidden_mean_abs={d:.9} hidden_rel_l2={d:.9} hidden_cos={d:.9} hidden_sign_mismatch={d} hidden_max={s} adapter_a_tensors={d} adapter_a_elems={d} adapter_a_max_abs={d:.9} adapter_a_mean_abs={d:.9} adapter_a_rel_l2={d:.9} adapter_a_cos={d:.9} adapter_a_sign_mismatch={d} adapter_a_max={s} adapter_b_tensors={d} adapter_b_elems={d} adapter_b_max_abs={d:.9} adapter_b_mean_abs={d:.9} adapter_b_rel_l2={d:.9} adapter_b_cos={d:.9} adapter_b_sign_mismatch={d} adapter_b_max={s} mps_exec_ms={d:.2} partitioned_exec_ms={d:.2}\n",
+        "segment_vjp_parity_profile segment={d}-{d} reference={s} mps_runtime={s} reference_runtime={s} mps_exec_ms={d:.2} reference_exec_ms={d:.2} reference_interpreter_fallbacks={d} reference_graph_regions={d}\n",
+        .{
+            segment_start,
+            segment_end,
+            segmentVJPStrategyName(reference_strategy),
+            segmentVJPProfileRuntimeName(mps_result.profile),
+            segmentVJPProfileRuntimeName(reference_result.profile),
+            @as(f64, @floatFromInt(mps_result.profile.compiled_execute_ns)) / 1_000_000.0,
+            @as(f64, @floatFromInt(reference_result.profile.compiled_execute_ns)) / 1_000_000.0,
+            reference_result.profile.interpreter_fallbacks,
+            reference_result.profile.graph_region_dispatches,
+        },
+    );
+    print(
+        "segment_vjp_parity segment={d}-{d} hidden_tensors={d} hidden_elems={d} hidden_max_abs={d:.9} hidden_mean_abs={d:.9} hidden_rel_l2={d:.9} hidden_cos={d:.9} hidden_sign_mismatch={d} hidden_max={s} adapter_a_tensors={d} adapter_a_elems={d} adapter_a_max_abs={d:.9} adapter_a_mean_abs={d:.9} adapter_a_rel_l2={d:.9} adapter_a_cos={d:.9} adapter_a_sign_mismatch={d} adapter_a_max={s} adapter_b_tensors={d} adapter_b_elems={d} adapter_b_max_abs={d:.9} adapter_b_mean_abs={d:.9} adapter_b_rel_l2={d:.9} adapter_b_cos={d:.9} adapter_b_sign_mismatch={d} adapter_b_max={s}\n",
         .{
             segment_start,
             segment_end,
@@ -600,8 +4684,6 @@ fn runSegmentVJPParityDiagnostic(
             adapter_b_stats.cosine(),
             adapter_b_stats.sign_mismatches,
             adapter_b_stats.max_name,
-            @as(f64, @floatFromInt(mps_result.profile.compiled_execute_ns)) / 1_000_000.0,
-            @as(f64, @floatFromInt(partitioned_result.profile.compiled_execute_ns)) / 1_000_000.0,
         },
     );
 
@@ -823,17 +4905,28 @@ fn printPhase20ParityReport(opts: Options) void {
         opts.lora_rank,
         opts.lora_alpha,
     });
-    print("phase20_parity_loss lambda_chunk={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} boundary_dropout={d} neftune_alpha={d} mrl={s} mrl_dims={s} loss_type={s} pos_weight={d}\n", .{
+    const effective_boundary_dropout: f32 = if (opts.deterministic) 0.0 else opts.boundary_dropout;
+    const effective_neftune_alpha: f32 = if (opts.deterministic) 0.0 else opts.neftune_alpha;
+    const effective_encoder_neftune_alpha: f32 = if (opts.encoder_neftune) effective_neftune_alpha else 0.0;
+    print("phase20_parity_order deterministic={} go_epoch_shuffle={} shuffle_seed_rule=\"seed+epoch+1 when enabled\"\n", .{
+        opts.deterministic,
+        opts.go_epoch_shuffle,
+    });
+    print("phase20_parity_loss lambda_chunk={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} boundary_dropout={d} neftune_alpha={d} encoder_neftune_alpha={d} encoder_neftune={s} mrl={s} mrl_dims={s} loss_type={s} pos_weight={d} contrastive_focal_gamma={d} contrastive_focal_alpha={d}\n", .{
         opts.lambda_chunk,
         opts.lambda_embed,
         opts.boundary_focus_epochs,
         opts.boundary_focus_lambda_embed,
-        opts.boundary_dropout,
-        opts.neftune_alpha,
+        effective_boundary_dropout,
+        effective_neftune_alpha,
+        effective_encoder_neftune_alpha,
+        enabledName(effective_encoder_neftune_alpha > 0.0),
         enabledName(opts.mrl),
         opts.mrl_dims_str,
         @tagName(opts.boundary_loss_type),
         opts.boundary_pos_weight,
+        opts.contrastive_focal_gamma,
+        opts.contrastive_focal_alpha,
     });
     print("phase20_parity_note go_cli_default_pos_weight=5.0 phase20_best_pos_weight=1.0\n", .{});
     if (opts.model_dir) |mdir| {
@@ -853,6 +4946,335 @@ fn examplesPerSecond(examples: u64, ns: u64) f64 {
     return (@as(f64, @floatFromInt(examples)) * 1_000_000_000.0) / @as(f64, @floatFromInt(ns));
 }
 
+fn processMemorySnapshot() ProcessMemorySnapshot {
+    if (builtin.os.tag != .macos) return .{};
+    var info: darwin.rusage_info_current = std.mem.zeroes(darwin.rusage_info_current);
+    if (darwin.proc_pid_rusage(darwin.getpid(), darwin.RUSAGE_INFO_CURRENT, &info) != 0) return .{};
+    return .{
+        .available = true,
+        .resident_bytes = info.ri_resident_size,
+        .footprint_bytes = info.ri_phys_footprint,
+    };
+}
+
+const darwin = if (builtin.os.tag == .macos) struct {
+    pub const RUSAGE_INFO_CURRENT: i32 = 6;
+
+    pub const rusage_info_current = extern struct {
+        ri_uuid: [16]u8,
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+        ri_child_user_time: u64,
+        ri_child_system_time: u64,
+        ri_child_pkg_idle_wkups: u64,
+        ri_child_interrupt_wkups: u64,
+        ri_child_pageins: u64,
+        ri_child_elapsed_abstime: u64,
+        ri_diskio_bytesread: u64,
+        ri_diskio_byteswritten: u64,
+        ri_cpu_time_qos_default: u64,
+        ri_cpu_time_qos_maintenance: u64,
+        ri_cpu_time_qos_background: u64,
+        ri_cpu_time_qos_utility: u64,
+        ri_cpu_time_qos_legacy: u64,
+        ri_cpu_time_qos_user_initiated: u64,
+        ri_cpu_time_qos_user_interactive: u64,
+        ri_billed_system_time: u64,
+        ri_serviced_system_time: u64,
+        ri_logical_writes: u64,
+        ri_lifetime_max_phys_footprint: u64,
+        ri_instructions: u64,
+        ri_cycles: u64,
+        ri_billed_energy: u64,
+        ri_serviced_energy: u64,
+        ri_interval_max_phys_footprint: u64,
+        ri_runnable_time: u64,
+        ri_flags: u64,
+        ri_user_ptime: u64,
+        ri_system_ptime: u64,
+        ri_pinstructions: u64,
+        ri_pcycles: u64,
+        ri_energy_nj: u64,
+        ri_penergy_nj: u64,
+        ri_secure_time_in_system: u64,
+        ri_secure_ptime_in_system: u64,
+        ri_reserved: [12]u64,
+    };
+
+    extern "c" fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *rusage_info_current) i32;
+    extern "c" fn getpid() i32;
+} else struct {};
+
+fn parseMemoryGigabytesToBytes(raw: []const u8) !u64 {
+    const value = try std.fmt.parseFloat(f64, raw);
+    if (!std.math.isFinite(value) or value < 0) return error.InvalidMemoryThreshold;
+    return @intFromFloat(value * 1024.0 * 1024.0 * 1024.0);
+}
+
+fn computeSupervisionCounts(boundary_labels: []const f32, attention_mask: []const f32, total_tokens: usize) SupervisionCounts {
+    var counts = SupervisionCounts{};
+    const has_two_class_one_hot_labels = boundary_labels.len / 2 >= total_tokens;
+    for (0..total_tokens) |idx| {
+        if (idx >= attention_mask.len or attention_mask[idx] <= 0.5) continue;
+        counts.valid_tokens += 1;
+        const label_idx = if (has_two_class_one_hot_labels) idx * 2 + 1 else idx;
+        if (label_idx < boundary_labels.len and boundary_labels[label_idx] > 0.5) counts.boundary_positive_tokens += 1;
+    }
+    return counts;
+}
+
+test "computeSupervisionCounts handles scalar and one-hot boundary labels" {
+    const attention_mask = [_]f32{ 1, 1, 0, 1, 1 };
+    const scalar_labels = [_]f32{ 0, 1, 1, 0, 1 };
+    const one_hot_labels = [_]f32{
+        1, 0,
+        0, 1,
+        0, 1,
+        1, 0,
+        0, 1,
+    };
+
+    const scalar_counts = computeSupervisionCounts(scalar_labels[0..], attention_mask[0..], 5);
+    try std.testing.expectEqual(@as(u64, 4), scalar_counts.valid_tokens);
+    try std.testing.expectEqual(@as(u64, 2), scalar_counts.boundary_positive_tokens);
+    try std.testing.expectEqual(@as(u64, 1), scalar_counts.ignoredTokens(5));
+
+    const one_hot_counts = computeSupervisionCounts(one_hot_labels[0..], attention_mask[0..], 5);
+    try std.testing.expectEqual(@as(u64, 4), one_hot_counts.valid_tokens);
+    try std.testing.expectEqual(@as(u64, 2), one_hot_counts.boundary_positive_tokens);
+    try std.testing.expectEqual(@as(u64, 1), one_hot_counts.ignoredTokens(5));
+}
+
+fn writeStepMetric(
+    metrics_writer: anytype,
+    epoch: usize,
+    local_step: u32,
+    actual_batch: usize,
+    total_tokens: usize,
+    summary: TrainStepSummary,
+    timing: StepTiming,
+    supervision: SupervisionCounts,
+    use_metal: bool,
+    vjp_profile: ?segmented_encoder.SegmentVJPProfile,
+    memory: ProcessMemorySnapshot,
+    peak_resident_bytes: u64,
+) !void {
+    const runtime_name = if (vjp_profile) |profile|
+        if (profile.mpsgraph_runtime) "mpsgraph" else if (profile.partitioned_runtime) "partitioned" else "interpreter"
+    else
+        "none";
+    const profile = vjp_profile orelse segmented_encoder.SegmentVJPProfile{};
+    try std.json.Stringify.value(.{
+        .event = "step",
+        .schema_version = 1,
+        .epoch = epoch + 1,
+        .local_step = local_step,
+        .step = summary.step,
+        .examples = actual_batch,
+        .total_tokens = total_tokens,
+        .valid_tokens = supervision.valid_tokens,
+        .supervised_token_count = supervision.valid_tokens,
+        .entity_token_count = supervision.boundary_positive_tokens,
+        .ignored_token_count = supervision.ignoredTokens(total_tokens),
+        .loss = summary.total_loss,
+        .boundary_loss = summary.boundary_loss,
+        .contrastive_loss = summary.contrastive_loss,
+        .learning_rate = summary.learning_rate,
+        .backend = if (use_metal) "metal" else "native",
+        .step_wall_ms = nsToMs(timing.total_ns),
+        .batch_ms = nsToMs(timing.batch_ns),
+        .lora_refresh_ms = nsToMs(timing.lora_refresh_ns),
+        .encoder_ms = nsToMs(timing.encoder_ns),
+        .hard_negative_ms = nsToMs(timing.hard_neg_ns),
+        .train_step_ms = nsToMs(timing.train_ns),
+        .lora_update_ms = nsToMs(timing.lora_update_ns),
+        .splade_ms = nsToMs(timing.splade_ns),
+        .examples_per_second = examplesPerSecond(@intCast(actual_batch), timing.total_ns),
+        .vjp_runtime = runtime_name,
+        .vjp_runtime_input_ms = nsToMs(profile.runtime_input_ns),
+        .vjp_execute_ms = nsToMs(profile.compiled_execute_ns),
+        .vjp_extract_ms = nsToMs(profile.compiled_extract_ns),
+        .vjp_accumulate_ms = nsToMs(profile.accumulate_ns),
+        .vjp_total_ms = nsToMs(profile.total_ns),
+        .vjp_partitions_executed = profile.partitions_executed,
+        .vjp_backend_command_dispatches = profile.backend_command_dispatches,
+        .vjp_planned_operator_dispatches = profile.planned_operator_dispatches,
+        .vjp_graph_region_dispatches = profile.graph_region_dispatches,
+        .vjp_interpreter_fallbacks = profile.interpreter_fallbacks,
+        .memory_available = memory.available,
+        .resident_bytes = memory.resident_bytes,
+        .footprint_bytes = memory.footprint_bytes,
+        .peak_resident_bytes = peak_resident_bytes,
+    }, .{}, &metrics_writer.interface);
+    try metrics_writer.interface.writeByte('\n');
+    try metrics_writer.interface.flush();
+}
+
+fn writeValidationMetric(
+    metrics_writer: anytype,
+    event: []const u8,
+    epoch: usize,
+    step: u64,
+    samples: usize,
+    total_samples: usize,
+    eval_ms: f64,
+    summary: fused_chunker_train.EvalSummary,
+) !void {
+    try std.json.Stringify.value(.{
+        .event = event,
+        .schema_version = 1,
+        .epoch = epoch + 1,
+        .step = step,
+        .samples = samples,
+        .total_samples = total_samples,
+        .eval_ms = eval_ms,
+        .f1 = summary.boundary_f1,
+        .precision = summary.boundary_precision,
+        .recall = summary.boundary_recall,
+        .tp = summary.boundary_tp,
+        .fp = summary.boundary_fp,
+        .@"fn" = summary.boundary_fn,
+        .best_f1 = summary.best_boundary_f1,
+        .best_threshold = summary.best_boundary_threshold,
+        .best_tp = summary.best_boundary_tp,
+        .best_fp = summary.best_boundary_fp,
+        .best_fn = summary.best_boundary_fn,
+        .valid_tokens = summary.valid_tokens,
+        .gold_positives = summary.gold_positives,
+        .gold_positive_rate = summary.gold_positive_rate,
+        .predicted_positive_rate = summary.predicted_positive_rate,
+        .best_predicted_positive_rate = summary.best_predicted_positive_rate,
+        .mean_positive_probability_gold_positive = summary.mean_positive_probability_gold_positive,
+        .mean_positive_probability_gold_negative = summary.mean_positive_probability_gold_negative,
+        .mean_boundary_margin_gold_positive = summary.mean_boundary_margin_gold_positive,
+        .mean_boundary_margin_gold_negative = summary.mean_boundary_margin_gold_negative,
+        .mean_logit0_gold_positive = summary.mean_logit0_gold_positive,
+        .mean_logit1_gold_positive = summary.mean_logit1_gold_positive,
+        .mean_logit0_gold_negative = summary.mean_logit0_gold_negative,
+        .mean_logit1_gold_negative = summary.mean_logit1_gold_negative,
+    }, .{}, &metrics_writer.interface);
+    try metrics_writer.interface.writeByte('\n');
+    try metrics_writer.interface.flush();
+}
+
+fn writeEpochMetric(
+    metrics_writer: anytype,
+    epoch: usize,
+    total_epochs: u32,
+    steps: u64,
+    timing: TimingTotals,
+) !void {
+    try std.json.Stringify.value(.{
+        .event = "epoch",
+        .schema_version = 1,
+        .epoch = epoch + 1,
+        .epochs = total_epochs,
+        .steps = steps,
+        .avg_step_ms = avgMs(timing.total_ns, timing.steps),
+        .batch_ms = avgMs(timing.batch_ns, timing.steps),
+        .lora_refresh_ms = avgMs(timing.lora_refresh_ns, timing.steps),
+        .encoder_ms = avgMs(timing.encoder_ns, timing.steps),
+        .hard_negative_ms = avgMs(timing.hard_neg_ns, timing.steps),
+        .train_ms = avgMs(timing.train_ns, timing.steps),
+        .lora_update_ms = avgMs(timing.lora_update_ns, timing.steps),
+        .splade_ms = avgMs(timing.splade_ns, timing.steps),
+        .throughput_examples_per_second = examplesPerSecond(timing.examples, timing.total_ns),
+    }, .{}, &metrics_writer.interface);
+    try metrics_writer.interface.writeByte('\n');
+    try metrics_writer.interface.flush();
+}
+
+fn writeFusedTrainingManifest(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    opts: *const Options,
+    backend_name: []const u8,
+    metrics_path: []const u8,
+    train_stats: fused_chunker_data.FusedDatasetStats,
+    val_stats: ?fused_chunker_data.FusedDatasetStats,
+    status: []const u8,
+    total_steps: u64,
+    final_loss: ?f32,
+    final_checkpoint_path: ?[]const u8,
+    best_val_step: u64,
+    best_val_epoch: u32,
+    best_val_f1: f32,
+    peak_resident_bytes: u64,
+) !void {
+    _ = allocator;
+    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+    defer file.close(compat.io());
+    var buf: [8192]u8 = undefined;
+    var writer = file.writerStreaming(compat.io(), &buf);
+    try std.json.Stringify.value(.{
+        .schema_version = fused_manifest_schema_version,
+        .artifact_family_version = fused_artifact_family_version,
+        .status = status,
+        .metrics_file = fused_metrics_file_name,
+        .metrics_path = metrics_path,
+        .data_path = opts.data_path,
+        .val_data_path = opts.val_data_path,
+        .output_dir = opts.output_dir,
+        .model_dir = opts.model_dir,
+        .backend = backend_name,
+        .epochs = opts.epochs,
+        .batch_size = opts.batch_size,
+        .learning_rate = opts.learning_rate,
+        .warmup_steps = opts.warmup_steps,
+        .lr_total_steps = opts.lr_total_steps,
+        .weight_decay = opts.weight_decay,
+        .max_grad_norm = opts.max_grad_norm,
+        .hidden_size = opts.hidden_size,
+        .num_layers = opts.num_layers,
+        .max_seq_len = opts.max_seq_len,
+        .max_chunks = opts.max_chunks,
+        .lora_rank = opts.lora_rank,
+        .lora_alpha = opts.lora_alpha,
+        .encoder_vjp = encoderVJPModeName(opts.encoder_vjp),
+        .layers_per_segment = opts.layers_per_segment,
+        .deterministic = opts.deterministic,
+        .go_epoch_shuffle = opts.go_epoch_shuffle,
+        .splade = opts.splade,
+        .mrl = opts.mrl,
+        .mrl_dims = opts.mrl_dims_str,
+        .boundary_loss_type = @tagName(opts.boundary_loss_type),
+        .boundary_pos_weight = opts.boundary_pos_weight,
+        .boundary_dropout = if (opts.deterministic) 0.0 else opts.boundary_dropout,
+        .configured_neftune_alpha = if (opts.deterministic) 0.0 else opts.neftune_alpha,
+        .encoder_neftune = opts.encoder_neftune and !opts.deterministic,
+        .encoder_neftune_alpha = if (opts.encoder_neftune and !opts.deterministic) opts.neftune_alpha else 0.0,
+        .boundary_focal_gamma = opts.boundary_focal_gamma,
+        .boundary_focal_alpha = opts.boundary_focal_alpha,
+        .contrastive_focal_gamma = opts.contrastive_focal_gamma,
+        .contrastive_focal_alpha = opts.contrastive_focal_alpha,
+        .lambda_chunk = opts.lambda_chunk,
+        .lambda_embed = opts.lambda_embed,
+        .boundary_focus_epochs = opts.boundary_focus_epochs,
+        .boundary_focus_lambda_embed = opts.boundary_focus_lambda_embed,
+        .train_dataset = train_stats,
+        .validation_dataset = val_stats,
+        .total_steps = total_steps,
+        .final_loss = final_loss,
+        .final_checkpoint_path = final_checkpoint_path,
+        .best_val_step = best_val_step,
+        .best_val_epoch = best_val_epoch,
+        .best_val_f1 = best_val_f1,
+        .peak_resident_bytes = peak_resident_bytes,
+        .go_phase20_reference_f1 = 0.786,
+        .go_phase20_parity_floor_f1 = 0.766,
+    }, .{ .whitespace = .indent_2 }, &writer.interface);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+}
+
 const BoundaryBatchDebugStats = struct {
     valid_tokens: u64 = 0,
     gold_positives: u64 = 0,
@@ -860,6 +5282,168 @@ const BoundaryBatchDebugStats = struct {
     feature_rms: f32 = 0,
     feature_max_abs: f32 = 0,
 };
+
+const FinalNormCheckpointStats = struct {
+    weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    bias: fused_chunker_train.BoundaryProbeTensorStats = .{},
+};
+
+const EmbeddingCheckpointStats = struct {
+    word_embedding_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    layer_norm_weight: fused_chunker_train.BoundaryProbeTensorStats = .{},
+    layer_norm_bias: fused_chunker_train.BoundaryProbeTensorStats = .{},
+};
+
+fn loadedWeightFloatSlice(loaded: *const LoadedWeight) ?[]const f32 {
+    if (loaded.tensor.dtype != .f32) return null;
+    const aligned: []align(@alignOf(f32)) const u8 = @alignCast(loaded.tensor.data);
+    return std.mem.bytesAsSlice(f32, aligned);
+}
+
+fn loadedWeightProbeStats(loaded: *const LoadedWeight) fused_chunker_train.BoundaryProbeTensorStats {
+    const values = loadedWeightFloatSlice(loaded) orelse return .{};
+    return fused_chunker_train.computeBoundaryProbeTensorStats(values);
+}
+
+fn nativeWeightProbeStats(
+    weight_store: *native_compute.WeightStore,
+    key: []const u8,
+) fused_chunker_train.BoundaryProbeTensorStats {
+    const loaded = weight_store.resident_weights.getPtr(key) orelse return .{};
+    return loadedWeightProbeStats(loaded);
+}
+
+fn metalWeightProbeStats(
+    weight_store: *MetalWeightStore,
+    key: []const u8,
+) fused_chunker_train.BoundaryProbeTensorStats {
+    if (comptime !build_options.enable_metal) return .{};
+    const entry = weight_store.lazy_weights.getPtr(key) orelse return .{};
+    const loaded = entry.host_loaded orelse return .{};
+    return loadedWeightProbeStats(&loaded);
+}
+
+fn nativeWeightFloatSlice(
+    weight_store: *native_compute.WeightStore,
+    key: []const u8,
+) ?[]const f32 {
+    const loaded = weight_store.resident_weights.getPtr(key) orelse return null;
+    return loadedWeightFloatSlice(loaded);
+}
+
+fn metalWeightFloatSlice(
+    weight_store: *MetalWeightStore,
+    key: []const u8,
+) ?[]const f32 {
+    if (comptime !build_options.enable_metal) return null;
+    const entry = weight_store.lazy_weights.getPtr(key) orelse return null;
+    const loaded = entry.host_loaded orelse return null;
+    return loadedWeightFloatSlice(&loaded);
+}
+
+fn allocEmbeddingTableRowProbes(
+    allocator: std.mem.Allocator,
+    input_ids: []const i32,
+    total_tokens: usize,
+    hidden_size: usize,
+    values: ?[]const f32,
+) ![]EmbeddingRowProbe {
+    const count = @min(@min(input_ids.len, total_tokens), embedding_row_probe_max);
+    const probes = try allocator.alloc(EmbeddingRowProbe, count);
+    for (probes, 0..) |*probe, i| {
+        const token_id = input_ids[i];
+        probe.* = .{ .position = i, .token_id = token_id };
+        if (values) |weight_values| {
+            if (token_id >= 0) {
+                const row_idx: usize = @intCast(token_id);
+                const start = row_idx * hidden_size;
+                const end = start + hidden_size;
+                if (end <= weight_values.len) {
+                    probe.stats = fused_chunker_train.computeBoundaryProbeTensorStats(weight_values[start..end]);
+                }
+            }
+        }
+    }
+    return probes;
+}
+
+fn allocEmbeddingLookupRowProbes(
+    allocator: std.mem.Allocator,
+    input_ids: []const i32,
+    total_tokens: usize,
+    hidden_size: usize,
+    lookup_values: ?[]const f32,
+) ![]EmbeddingRowProbe {
+    const count = @min(@min(input_ids.len, total_tokens), embedding_row_probe_max);
+    const probes = try allocator.alloc(EmbeddingRowProbe, count);
+    for (probes, 0..) |*probe, i| {
+        const token_id = input_ids[i];
+        probe.* = .{ .position = i, .token_id = token_id };
+        if (lookup_values) |values| {
+            const start = i * hidden_size;
+            const end = start + hidden_size;
+            if (end <= values.len) {
+                probe.stats = fused_chunker_train.computeBoundaryProbeTensorStats(values[start..end]);
+            }
+        }
+    }
+    return probes;
+}
+
+fn activeEmbeddingWeightValues(
+    use_metal: bool,
+    weight_store: *native_compute.WeightStore,
+    metal_weight_store: *MetalWeightStore,
+) ?[]const f32 {
+    if (use_metal) {
+        return metalWeightFloatSlice(metal_weight_store, "model.embeddings.tok_embeddings.weight");
+    }
+    return nativeWeightFloatSlice(weight_store, "model.embeddings.tok_embeddings.weight");
+}
+
+fn computeFinalNormCheckpointStats(
+    use_metal: bool,
+    weight_store: *native_compute.WeightStore,
+    metal_weight_store: *MetalWeightStore,
+) FinalNormCheckpointStats {
+    var out: FinalNormCheckpointStats = if (use_metal)
+        .{
+            .weight = metalWeightProbeStats(metal_weight_store, "model.final_norm.weight"),
+            .bias = metalWeightProbeStats(metal_weight_store, "model.final_norm.bias"),
+        }
+    else
+        .{
+            .weight = nativeWeightProbeStats(weight_store, "model.final_norm.weight"),
+            .bias = nativeWeightProbeStats(weight_store, "model.final_norm.bias"),
+        };
+    if (out.bias.elems == 0 and out.weight.elems > 0) {
+        out.bias = fused_chunker_train.computeZeroBoundaryProbeTensorStats(@intCast(out.weight.elems));
+    }
+    return out;
+}
+
+fn computeEmbeddingCheckpointStats(
+    use_metal: bool,
+    weight_store: *native_compute.WeightStore,
+    metal_weight_store: *MetalWeightStore,
+) EmbeddingCheckpointStats {
+    var out: EmbeddingCheckpointStats = if (use_metal)
+        .{
+            .word_embedding_weight = metalWeightProbeStats(metal_weight_store, "model.embeddings.tok_embeddings.weight"),
+            .layer_norm_weight = metalWeightProbeStats(metal_weight_store, "model.embeddings.norm.weight"),
+            .layer_norm_bias = metalWeightProbeStats(metal_weight_store, "model.embeddings.norm.bias"),
+        }
+    else
+        .{
+            .word_embedding_weight = nativeWeightProbeStats(weight_store, "model.embeddings.tok_embeddings.weight"),
+            .layer_norm_weight = nativeWeightProbeStats(weight_store, "model.embeddings.norm.weight"),
+            .layer_norm_bias = nativeWeightProbeStats(weight_store, "model.embeddings.norm.bias"),
+        };
+    if (out.layer_norm_bias.elems == 0 and out.layer_norm_weight.elems > 0) {
+        out.layer_norm_bias = fused_chunker_train.computeZeroBoundaryProbeTensorStats(@intCast(out.layer_norm_weight.elems));
+    }
+    return out;
+}
 
 fn computeBoundaryBatchDebugStats(
     features: []const f32,
@@ -903,6 +5487,21 @@ fn printIndexSlice(label: []const u8, values: []const usize) void {
         print("{d}", .{value});
     }
     print("]\n", .{});
+}
+
+fn resetIdentityIndices(indices: []usize) void {
+    for (indices, 0..) |*idx, i| idx.* = i;
+}
+
+fn shuffleIndicesFisherYates(indices: []usize, rng: std.Random) void {
+    var i: usize = indices.len;
+    while (i > 1) {
+        i -= 1;
+        const j = rng.uintLessThan(usize, i + 1);
+        const tmp = indices[i];
+        indices[i] = indices[j];
+        indices[j] = tmp;
+    }
 }
 
 fn printPerSampleBoundaryDebug(
@@ -971,6 +5570,8 @@ pub fn main(init: std.process.Init) !void {
     var boundary_focus_lambda_embed: f32 = 0.1;
     var boundary_focal_gamma: f32 = 2.0;
     var boundary_focal_alpha: f32 = 0.75;
+    var contrastive_focal_gamma: f32 = 0.0;
+    var contrastive_focal_alpha: f32 = 0.75;
     var boundary_pos_weight: f32 = 5.0;
     var boundary_dropout: f32 = 0.1;
     var boundary_loss_type: BoundaryLossType = .ce;
@@ -999,6 +5600,7 @@ pub fn main(init: std.process.Init) !void {
     var grad_accum: u32 = 1;
     var schedule_free: bool = false;
     var neftune_alpha: f32 = 0.0;
+    var encoder_neftune: bool = true;
     var xbm_capacity: usize = 0;
     var llrd_decay: f32 = 1.0;
     var lisa_sample_layers: u32 = 0;
@@ -1018,10 +5620,27 @@ pub fn main(init: std.process.Init) !void {
     var mrl_dims_str: []const u8 = "768,256,128";
     var resume_from: []const u8 = "";
     var save_optimizer_state: bool = false;
+    var deterministic: bool = false;
+    var go_epoch_shuffle: bool = false;
+    var report_to: ?[]const u8 = null;
+    var manifest_path: ?[]const u8 = null;
+    var memory_sample_every: u32 = 1;
+    var memory_warn_rss_bytes: u64 = 0;
+    var memory_abort_rss_bytes: u64 = 0;
     var debug_first_boundary_step: bool = false;
     var debug_first_boundary_step_exit: bool = false;
     var debug_boundary_step: u32 = 0;
     var debug_boundary_step_exit: bool = false;
+    var debug_update_step: u32 = 0;
+    var debug_update_step_exit: bool = false;
+    var debug_step_json_path: ?[]const u8 = null;
+    var debug_batch_offset: ?usize = null;
+    var debug_encoder_probe_layer: u32 = 0;
+    var debug_encoder_layer_inputs_only: bool = false;
+    var debug_encoder_replay_input_path: ?[]const u8 = null;
+    var debug_encoder_replay_upstream_path: ?[]const u8 = null;
+    var debug_layer_backward_decomp: bool = false;
+    var debug_qkv_split_vjp: bool = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--data")) {
@@ -1080,6 +5699,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--boundary-focal-alpha") or std.mem.eql(u8, arg, "--focal-alpha")) {
             const val = args.next() orelse return error.MissingBoundaryFocalAlpha;
             boundary_focal_alpha = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--contrastive-focal-gamma")) {
+            const val = args.next() orelse return error.MissingContrastiveFocalGamma;
+            contrastive_focal_gamma = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--contrastive-focal-alpha")) {
+            const val = args.next() orelse return error.MissingContrastiveFocalAlpha;
+            contrastive_focal_alpha = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--boundary-pos-weight") or std.mem.eql(u8, arg, "--pos-weight")) {
             const val = args.next() orelse return error.MissingBoundaryPosWeight;
             boundary_pos_weight = try std.fmt.parseFloat(f32, val);
@@ -1149,7 +5774,7 @@ pub fn main(init: std.process.Init) !void {
             intermediate_size = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--backend")) {
             const val = args.next() orelse return error.MissingBackend;
-            if (std.mem.eql(u8, val, "native") or std.mem.eql(u8, val, "blas")) {
+            if (std.mem.eql(u8, val, "native")) {
                 backend = .native;
             } else if (std.mem.eql(u8, val, "metal")) {
                 backend = .metal;
@@ -1176,6 +5801,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--neftune-alpha")) {
             const val = args.next() orelse return error.MissingNeftuneAlpha;
             neftune_alpha = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--encoder-neftune")) {
+            encoder_neftune = true;
+        } else if (std.mem.eql(u8, arg, "--disable-encoder-neftune")) {
+            encoder_neftune = false;
         } else if (std.mem.eql(u8, arg, "--xbm-capacity")) {
             const val = args.next() orelse return error.MissingXbmCapacity;
             xbm_capacity = try std.fmt.parseUnsigned(usize, val, 10);
@@ -1237,6 +5866,22 @@ pub fn main(init: std.process.Init) !void {
             resume_from = args.next() orelse return error.MissingResumeFrom;
         } else if (std.mem.eql(u8, arg, "--save-optimizer-state")) {
             save_optimizer_state = true;
+        } else if (std.mem.eql(u8, arg, "--deterministic")) {
+            deterministic = true;
+        } else if (std.mem.eql(u8, arg, "--go-epoch-shuffle")) {
+            go_epoch_shuffle = true;
+        } else if (std.mem.eql(u8, arg, "--report-to")) {
+            report_to = args.next() orelse return error.MissingReportTo;
+        } else if (std.mem.eql(u8, arg, "--manifest")) {
+            manifest_path = args.next() orelse return error.MissingManifestPath;
+        } else if (std.mem.eql(u8, arg, "--memory-sample-every")) {
+            const val = args.next() orelse return error.MissingMemorySampleEvery;
+            memory_sample_every = try std.fmt.parseUnsigned(u32, val, 10);
+            if (memory_sample_every == 0) return error.InvalidMemorySampleEvery;
+        } else if (std.mem.eql(u8, arg, "--memory-warn-rss-gb")) {
+            memory_warn_rss_bytes = try parseMemoryGigabytesToBytes(args.next() orelse return error.MissingMemoryWarnRssGb);
+        } else if (std.mem.eql(u8, arg, "--memory-abort-rss-gb")) {
+            memory_abort_rss_bytes = try parseMemoryGigabytesToBytes(args.next() orelse return error.MissingMemoryAbortRssGb);
         } else if (std.mem.eql(u8, arg, "--debug-first-boundary-step")) {
             debug_first_boundary_step = true;
         } else if (std.mem.eql(u8, arg, "--debug-first-boundary-step-exit")) {
@@ -1247,6 +5892,29 @@ pub fn main(init: std.process.Init) !void {
             debug_boundary_step = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--debug-boundary-step-exit")) {
             debug_boundary_step_exit = true;
+        } else if (std.mem.eql(u8, arg, "--debug-update-step")) {
+            const val = args.next() orelse return error.MissingDebugUpdateStep;
+            debug_update_step = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-update-step-exit")) {
+            debug_update_step_exit = true;
+        } else if (std.mem.eql(u8, arg, "--debug-step-json")) {
+            debug_step_json_path = args.next() orelse return error.MissingDebugStepJson;
+        } else if (std.mem.eql(u8, arg, "--debug-batch-offset")) {
+            const val = args.next() orelse return error.MissingDebugBatchOffset;
+            debug_batch_offset = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-encoder-probe-layer")) {
+            const val = args.next() orelse return error.MissingDebugEncoderProbeLayer;
+            debug_encoder_probe_layer = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-encoder-layer-inputs-only")) {
+            debug_encoder_layer_inputs_only = true;
+        } else if (std.mem.eql(u8, arg, "--debug-encoder-replay-input")) {
+            debug_encoder_replay_input_path = args.next() orelse return error.MissingDebugEncoderReplayInput;
+        } else if (std.mem.eql(u8, arg, "--debug-encoder-replay-upstream")) {
+            debug_encoder_replay_upstream_path = args.next() orelse return error.MissingDebugEncoderReplayUpstream;
+        } else if (std.mem.eql(u8, arg, "--debug-layer-backward-decomp")) {
+            debug_layer_backward_decomp = true;
+        } else if (std.mem.eql(u8, arg, "--debug-qkv-split-vjp")) {
+            debug_qkv_split_vjp = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -1256,6 +5924,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    if (debug_encoder_probe_layer >= num_layers) return error.InvalidDebugEncoderProbeLayer;
 
     const opts = Options{
         .data_path = data_path orelse {
@@ -1286,6 +5955,8 @@ pub fn main(init: std.process.Init) !void {
         .boundary_focus_lambda_embed = boundary_focus_lambda_embed,
         .boundary_focal_gamma = boundary_focal_gamma,
         .boundary_focal_alpha = boundary_focal_alpha,
+        .contrastive_focal_gamma = contrastive_focal_gamma,
+        .contrastive_focal_alpha = contrastive_focal_alpha,
         .boundary_pos_weight = boundary_pos_weight,
         .boundary_dropout = boundary_dropout,
         .boundary_loss_type = boundary_loss_type,
@@ -1311,6 +5982,7 @@ pub fn main(init: std.process.Init) !void {
         .grad_accum = grad_accum,
         .schedule_free = schedule_free,
         .neftune_alpha = neftune_alpha,
+        .encoder_neftune = encoder_neftune,
         .xbm_capacity = xbm_capacity,
         .llrd_decay = llrd_decay,
         .lisa_sample_layers = lisa_sample_layers,
@@ -1330,10 +6002,27 @@ pub fn main(init: std.process.Init) !void {
         .mrl_dims_str = mrl_dims_str,
         .resume_from = resume_from,
         .save_optimizer_state = save_optimizer_state,
+        .deterministic = deterministic,
+        .go_epoch_shuffle = go_epoch_shuffle,
+        .report_to = report_to,
+        .manifest_path = manifest_path,
+        .memory_sample_every = memory_sample_every,
+        .memory_warn_rss_bytes = memory_warn_rss_bytes,
+        .memory_abort_rss_bytes = memory_abort_rss_bytes,
         .debug_first_boundary_step = debug_first_boundary_step,
         .debug_first_boundary_step_exit = debug_first_boundary_step_exit,
         .debug_boundary_step = debug_boundary_step,
         .debug_boundary_step_exit = debug_boundary_step_exit,
+        .debug_update_step = debug_update_step,
+        .debug_update_step_exit = debug_update_step_exit,
+        .debug_step_json_path = debug_step_json_path,
+        .debug_batch_offset = debug_batch_offset,
+        .debug_encoder_probe_layer = debug_encoder_probe_layer,
+        .debug_encoder_layer_inputs_only = debug_encoder_layer_inputs_only,
+        .debug_encoder_replay_input_path = debug_encoder_replay_input_path,
+        .debug_encoder_replay_upstream_path = debug_encoder_replay_upstream_path,
+        .debug_layer_backward_decomp = debug_layer_backward_decomp,
+        .debug_qkv_split_vjp = debug_qkv_split_vjp,
     };
 
     try run(allocator, opts);
@@ -1515,11 +6204,11 @@ fn restoreMetalLoRAWeights(
     originals.deinit(allocator);
 }
 
-/// Insert (or update) a LoRA matrix in the BLAS WeightStore under `key`.
+/// Insert or update a LoRA matrix in the native WeightStore under `key`.
 /// The tensor is a 2-D f32 matrix of shape [rows, cols].
 /// If a weight already exists under `key` its data is replaced with a fresh
 /// copy of `data` so that optimizer updates are visible each step.
-fn insertLoRAIntoBlasStore(
+fn insertLoRAIntoNativeStore(
     allocator: std.mem.Allocator,
     weight_store: *native_compute.WeightStore,
     key: []const u8,
@@ -1644,11 +6333,225 @@ fn saveFusedCheckpoint(
     try safetensors_checkpoint.save(allocator, path, tensor_list.items);
 }
 
+fn appendOptimizerStateTensor(
+    allocator: std.mem.Allocator,
+    tensor_list: *std.ArrayListUnmanaged(safetensors_checkpoint.NamedTensor),
+    name_storage: *std.ArrayListUnmanaged([]u8),
+    shape_storage: *std.ArrayListUnmanaged([]usize),
+    name: []const u8,
+    data: []const f32,
+    shape: []const usize,
+) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try name_storage.append(allocator, owned_name);
+    try appendCheckpointTensor(allocator, tensor_list, shape_storage, owned_name, data, shape);
+}
+
+fn appendLoRAOptimizerStateTensor(
+    allocator: std.mem.Allocator,
+    tensor_list: *std.ArrayListUnmanaged(safetensors_checkpoint.NamedTensor),
+    name_storage: *std.ArrayListUnmanaged([]u8),
+    shape_storage: *std.ArrayListUnmanaged([]usize),
+    prefix: []const u8,
+    layer_idx: u32,
+    module_name: []const u8,
+    matrix_name: []const u8,
+    data: []const f32,
+    shape: []const usize,
+) !void {
+    const name = try std.fmt.allocPrint(
+        allocator,
+        "{s}_lora.{d}.{s}.{s}",
+        .{ prefix, layer_idx, module_name, matrix_name },
+    );
+    errdefer allocator.free(name);
+    try name_storage.append(allocator, name);
+    try appendCheckpointTensor(allocator, tensor_list, shape_storage, name, data, shape);
+}
+
+fn saveFusedOptimizerState(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    trainer: *const FusedTrainer,
+    lora_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    lora_optimizer_state: ?*const optimizers.OptimizerState,
+) !void {
+    var tensor_list = std.ArrayListUnmanaged(safetensors_checkpoint.NamedTensor).empty;
+    defer tensor_list.deinit(allocator);
+
+    var name_storage = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (name_storage.items) |name| allocator.free(name);
+        name_storage.deinit(allocator);
+    }
+
+    var shape_storage = std.ArrayListUnmanaged([]usize).empty;
+    defer {
+        for (shape_storage.items) |shape| allocator.free(shape);
+        shape_storage.deinit(allocator);
+    }
+
+    const step_val = [1]f32{@as(f32, @floatFromInt(trainer.optimizer_state.step_count))};
+    try appendCheckpointTensor(allocator, &tensor_list, &shape_storage, "adam_step", &step_val, &.{1});
+
+    const head_params = [_]struct {
+        name: []const u8,
+        values: []const f32,
+    }{
+        .{ .name = "w1", .values = trainer.boundary_head.w1 },
+        .{ .name = "b1", .values = trainer.boundary_head.b1 },
+        .{ .name = "w2", .values = trainer.boundary_head.w2 },
+        .{ .name = "b2", .values = trainer.boundary_head.b2 },
+    };
+    for (head_params) |param| {
+        if (trainer.optimizer_state.param_states.get(param.name)) |state| {
+            const m_name = try std.fmt.allocPrint(allocator, "adam_m_{s}", .{param.name});
+            defer allocator.free(m_name);
+            try appendOptimizerStateTensor(allocator, &tensor_list, &name_storage, &shape_storage, m_name, state.m, &.{state.m.len});
+            if (state.v.len > 0) {
+                const v_name = try std.fmt.allocPrint(allocator, "adam_v_{s}", .{param.name});
+                defer allocator.free(v_name);
+                try appendOptimizerStateTensor(allocator, &tensor_list, &name_storage, &shape_storage, v_name, state.v, &.{state.v.len});
+            }
+        }
+    }
+
+    if (lora_adapters) |la| {
+        if (lora_optimizer_state) |state| {
+            const lora_step_val = [1]f32{@as(f32, @floatFromInt(state.step_count))};
+            try appendCheckpointTensor(allocator, &tensor_list, &shape_storage, "lora_adam_step", &lora_step_val, &.{1});
+            for (la.layers) |*ll| {
+                const rank = ll.A.len / ll.in_features;
+                if (rank == 0) continue;
+
+                const shape_a = [_]usize{ rank, ll.in_features };
+                const shape_b = [_]usize{ ll.out_features, rank };
+
+                const a_key = try std.fmt.allocPrint(allocator, "lora.{d}.{s}.A", .{ ll.layer_idx, ll.module_name });
+                defer allocator.free(a_key);
+                if (state.param_states.get(a_key)) |param_state| {
+                    try appendLoRAOptimizerStateTensor(allocator, &tensor_list, &name_storage, &shape_storage, "adam_m", ll.layer_idx, ll.module_name, "A", param_state.m, &shape_a);
+                    if (param_state.v.len > 0) {
+                        try appendLoRAOptimizerStateTensor(allocator, &tensor_list, &name_storage, &shape_storage, "adam_v", ll.layer_idx, ll.module_name, "A", param_state.v, &shape_a);
+                    }
+                }
+
+                const b_key = try std.fmt.allocPrint(allocator, "lora.{d}.{s}.B", .{ ll.layer_idx, ll.module_name });
+                defer allocator.free(b_key);
+                if (state.param_states.get(b_key)) |param_state| {
+                    try appendLoRAOptimizerStateTensor(allocator, &tensor_list, &name_storage, &shape_storage, "adam_m", ll.layer_idx, ll.module_name, "B", param_state.m, &shape_b);
+                    if (param_state.v.len > 0) {
+                        try appendLoRAOptimizerStateTensor(allocator, &tensor_list, &name_storage, &shape_storage, "adam_v", ll.layer_idx, ll.module_name, "B", param_state.v, &shape_b);
+                    }
+                }
+            }
+        }
+    }
+
+    try safetensors_checkpoint.save(allocator, path, tensor_list.items);
+}
+
+fn copyOptimizerTensorIfPresent(
+    reader: *const safetensors.MMapReader,
+    name: []const u8,
+    dest: []f32,
+) !bool {
+    if (reader.header.tensors.get(name) == null) return false;
+    var tensor = try reader.readTensor(name);
+    defer tensor.deinit();
+    if (tensor.dtype != .f32) return error.InvalidTensorDType;
+    const src = tensor.asFloat32();
+    if (src.len != dest.len) return error.OptimizerStateShapeMismatch;
+    @memcpy(dest, src);
+    return true;
+}
+
+fn loadFusedLoRAOptimizerState(
+    allocator: std.mem.Allocator,
+    reader: *const safetensors.MMapReader,
+    lora_adapters: *const fused_chunker_lora.LoRAAdapterSet,
+    lora_optimizer_state: *optimizers.OptimizerState,
+) !usize {
+    var restored: usize = 0;
+    if (reader.header.tensors.get("lora_adam_step")) |_| {
+        var step_tensor = try reader.readTensor("lora_adam_step");
+        defer step_tensor.deinit();
+        const values = step_tensor.asFloat32();
+        if (values.len > 0) lora_optimizer_state.step_count = @intFromFloat(values[0]);
+    } else if (reader.header.tensors.get("adam_step")) |_| {
+        var step_tensor = try reader.readTensor("adam_step");
+        defer step_tensor.deinit();
+        const values = step_tensor.asFloat32();
+        if (values.len > 0) lora_optimizer_state.step_count = @intFromFloat(values[0]);
+    }
+
+    for (lora_adapters.layers) |*ll| {
+        const rank = ll.A.len / ll.in_features;
+        if (rank == 0) continue;
+
+        const a_key = try std.fmt.allocPrint(allocator, "lora.{d}.{s}.A", .{ ll.layer_idx, ll.module_name });
+        defer allocator.free(a_key);
+        const a_m_name = try std.fmt.allocPrint(allocator, "adam_m_{s}", .{a_key});
+        defer allocator.free(a_m_name);
+        const a_v_name = try std.fmt.allocPrint(allocator, "adam_v_{s}", .{a_key});
+        defer allocator.free(a_v_name);
+        const a_has_m = reader.header.tensors.get(a_m_name) != null;
+        const a_has_v = reader.header.tensors.get(a_v_name) != null;
+        if (a_has_m) {
+            const state = try lora_optimizer_state.getOrCreate(a_key, ll.A.len, a_has_v);
+            _ = try copyOptimizerTensorIfPresent(reader, a_m_name, state.m);
+            restored += 1;
+            if (a_has_v) {
+                _ = try copyOptimizerTensorIfPresent(reader, a_v_name, state.v);
+                restored += 1;
+            }
+        }
+
+        const b_key = try std.fmt.allocPrint(allocator, "lora.{d}.{s}.B", .{ ll.layer_idx, ll.module_name });
+        defer allocator.free(b_key);
+        const b_m_name = try std.fmt.allocPrint(allocator, "adam_m_{s}", .{b_key});
+        defer allocator.free(b_m_name);
+        const b_v_name = try std.fmt.allocPrint(allocator, "adam_v_{s}", .{b_key});
+        defer allocator.free(b_v_name);
+        const b_has_m = reader.header.tensors.get(b_m_name) != null;
+        const b_has_v = reader.header.tensors.get(b_v_name) != null;
+        if (b_has_m) {
+            const state = try lora_optimizer_state.getOrCreate(b_key, ll.B.len, b_has_v);
+            _ = try copyOptimizerTensorIfPresent(reader, b_m_name, state.m);
+            restored += 1;
+            if (b_has_v) {
+                _ = try copyOptimizerTensorIfPresent(reader, b_v_name, state.v);
+                restored += 1;
+            }
+        }
+    }
+    return restored;
+}
+
+fn loadFusedOptimizerState(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    trainer: *FusedTrainer,
+    lora_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    lora_optimizer_state: *optimizers.OptimizerState,
+) !void {
+    try trainer.loadOptimizerState(allocator, path);
+    const la = lora_adapters orelse return;
+
+    const file_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .unlimited);
+    var reader = try safetensors.MMapReader.fromBytes(allocator, file_bytes);
+    defer reader.deinit();
+    const restored = try loadFusedLoRAOptimizerState(allocator, &reader, la, lora_optimizer_state);
+    print("restored {d} LoRA optimizer tensors from {s}\n", .{ restored, path });
+}
+
 fn savePeriodicTrainingCheckpoint(
     allocator: std.mem.Allocator,
     opts: *const Options,
     trainer: *FusedTrainer,
     lora_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    lora_optimizer_state: ?*const optimizers.OptimizerState,
     splade_w: ?[]const f32,
     splade_vocab_size: usize,
     label: []const u8,
@@ -1670,7 +6573,7 @@ fn savePeriodicTrainingCheckpoint(
             label,
             value,
         });
-        try trainer.saveOptimizerState(allocator, opt_path);
+        try saveFusedOptimizerState(allocator, opt_path, trainer, lora_adapters, lora_optimizer_state);
         print("optimizer state saved to {s}\n", .{opt_path});
     }
 
@@ -1704,6 +6607,34 @@ fn normalizeModernBertWeightName(allocator: std.mem.Allocator, name: []const u8)
         return std.fmt.allocPrint(allocator, "model.{s}", .{stripped});
     }
     return allocator.dupe(u8, stripped);
+}
+
+fn isGoFusedEmbeddingWeightName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "model.embeddings.tok_embeddings.weight");
+}
+
+fn transposeLoadedEmbeddingWeightLikeGoFused(allocator: std.mem.Allocator, loaded: *LoadedWeight) !void {
+    if (loaded.tensor.dtype != .f32) return error.UnsupportedGoFusedEmbeddingTensor;
+    if (loaded.tensor.shape.len != 2) return error.InvalidGoFusedEmbeddingTensor;
+    if (loaded.tensor.shape[0] < 0 or loaded.tensor.shape[1] < 0) return error.InvalidGoFusedEmbeddingTensor;
+
+    const rows: usize = @intCast(loaded.tensor.shape[0]);
+    const cols: usize = @intCast(loaded.tensor.shape[1]);
+    const values = loaded.tensor.asFloat32();
+    if (values.len != rows * cols) return error.InvalidGoFusedEmbeddingTensor;
+
+    const transposed = try allocator.alloc(f32, values.len);
+    defer allocator.free(transposed);
+    for (0..cols) |r| {
+        for (0..rows) |c| {
+            transposed[c * cols + r] = values[r * rows + c];
+        }
+    }
+
+    var tensor = try tensor_mod.Tensor.initFloat32(allocator, loaded.tensor.name, loaded.tensor.shape, transposed);
+    errdefer tensor.deinit();
+    loaded.tensor.deinit();
+    loaded.tensor = tensor;
 }
 
 fn cloneLoadedWeight(allocator: std.mem.Allocator, loaded: LoadedWeight) !LoadedWeight {
@@ -1830,6 +6761,9 @@ fn loadSafetensorsIntoMetalStore(
         errdefer owned_loaded.deinit();
         const owned_name = try normalizeModernBertWeightName(allocator, name);
         errdefer allocator.free(owned_name);
+        if (isGoFusedEmbeddingWeightName(owned_name)) {
+            try transposeLoadedEmbeddingWeightLikeGoFused(allocator, &owned_loaded);
+        }
         try weight_store.lazy_weights.put(allocator, owned_name, .{
             .tensor_ref = undefined,
             .host_loaded = owned_loaded,
@@ -1923,10 +6857,106 @@ fn refreshLoRAWeightsForForward(
                 try insertLoRAIntoMetalStore(allocator, metal_weight_store, key_b, ll.B, ll.out_features, rank);
             }
         } else {
-            try insertLoRAIntoBlasStore(allocator, native_weight_store, key_a, ll.A, rank, ll.in_features);
-            try insertLoRAIntoBlasStore(allocator, native_weight_store, key_b, ll.B, ll.out_features, rank);
+            try insertLoRAIntoNativeStore(allocator, native_weight_store, key_a, ll.A, rank, ll.in_features);
+            try insertLoRAIntoNativeStore(allocator, native_weight_store, key_b, ll.B, ll.out_features, rank);
         }
     }
+}
+
+fn loadLoRAAdaptersFromCheckpoint(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+    la: *fused_chunker_lora.LoRAAdapterSet,
+) !usize {
+    const file_bytes = try compat.cwd().readFileAlloc(compat.io(), checkpoint_path, allocator, .unlimited);
+    var reader = safetensors.MMapReader.fromBytes(allocator, file_bytes) catch |err| {
+        allocator.free(file_bytes);
+        return err;
+    };
+    defer reader.deinit();
+
+    var loaded: usize = 0;
+    for (la.layers) |*ll| {
+        const target = loraRuntimeTarget(ll.module_name) orelse continue;
+        const rank = ll.A.len / ll.in_features;
+        if (rank == 0) continue;
+
+        var zig_a_buf: [128]u8 = undefined;
+        var zig_b_buf: [128]u8 = undefined;
+        var go_a_buf: [160]u8 = undefined;
+        var go_b_buf: [160]u8 = undefined;
+        const zig_a = try std.fmt.bufPrint(
+            &zig_a_buf,
+            "model.layers.{d}.{s}.{s}.lora_a",
+            .{ ll.layer_idx, target.scope, target.projection },
+        );
+        const zig_b = try std.fmt.bufPrint(
+            &zig_b_buf,
+            "model.layers.{d}.{s}.{s}.lora_b",
+            .{ ll.layer_idx, target.scope, target.projection },
+        );
+        const go_a = try std.fmt.bufPrint(
+            &go_a_buf,
+            "var:/fused_chunker_embedder/encoder/layer/{d}/{s}/{s}/lora_A",
+            .{ ll.layer_idx, target.scope, target.projection },
+        );
+        const go_b = try std.fmt.bufPrint(
+            &go_b_buf,
+            "var:/fused_chunker_embedder/encoder/layer/{d}/{s}/{s}/lora_B",
+            .{ ll.layer_idx, target.scope, target.projection },
+        );
+
+        if (try loadLoRATensorFromCheckpoint(&reader, zig_a, go_a, ll.A, rank, ll.in_features)) loaded += 1;
+        if (try loadLoRATensorFromCheckpoint(&reader, zig_b, go_b, ll.B, ll.out_features, rank)) loaded += 1;
+    }
+    return loaded;
+}
+
+fn loadLoRATensorFromCheckpoint(
+    reader: anytype,
+    zig_name: []const u8,
+    go_name: []const u8,
+    dest: []f32,
+    rows: usize,
+    cols: usize,
+) !bool {
+    if (reader.header.tensors.contains(zig_name)) {
+        var tensor = try reader.readTensor(zig_name);
+        defer tensor.deinit();
+        if (tensor.dtype != .f32) return error.InvalidCheckpoint;
+        if (tensor.shape.len != 2 or
+            tensor.shape[0] != @as(i64, @intCast(rows)) or
+            tensor.shape[1] != @as(i64, @intCast(cols)))
+        {
+            return error.CheckpointSizeMismatch;
+        }
+        const src = tensor.asFloat32();
+        if (src.len != dest.len) return error.CheckpointSizeMismatch;
+        @memcpy(dest, src);
+        return true;
+    }
+
+    if (reader.header.tensors.contains(go_name)) {
+        var tensor = try reader.readTensor(go_name);
+        defer tensor.deinit();
+        if (tensor.dtype != .f32) return error.InvalidCheckpoint;
+        if (tensor.shape.len != 2 or
+            tensor.shape[0] != @as(i64, @intCast(cols)) or
+            tensor.shape[1] != @as(i64, @intCast(rows)))
+        {
+            return error.CheckpointSizeMismatch;
+        }
+        const src = tensor.asFloat32();
+        if (src.len != dest.len) return error.CheckpointSizeMismatch;
+        for (0..cols) |c| {
+            for (0..rows) |r| {
+                dest[r * cols + c] = src[c * rows + r];
+            }
+        }
+        return true;
+    }
+
+    return false;
 }
 
 fn deinitMetalWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeightStore) void {
@@ -1939,9 +6969,6 @@ fn deinitMetalWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeig
         if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
     }
     weight_store.lazy_weights.deinit(allocator);
-    if (comptime build_options.enable_mlx) {
-        _ = mlx_mod.c.mlx_map_string_to_array_free(weight_store.resident_weights);
-    }
 }
 
 fn evaluateBoundarySamplesStreaming(
@@ -2081,6 +7108,22 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     try compat.cwd().createDirPath(compat.io(), opts.output_dir);
 
+    const default_metrics_path = try std.fs.path.join(allocator, &.{ opts.output_dir, fused_metrics_file_name });
+    defer allocator.free(default_metrics_path);
+    const default_manifest_path = try std.fs.path.join(allocator, &.{ opts.output_dir, fused_manifest_file_name });
+    defer allocator.free(default_manifest_path);
+    const metrics_path = opts.report_to orelse default_metrics_path;
+    const manifest_path = opts.manifest_path orelse default_manifest_path;
+
+    var metrics_file = try compat.cwd().createFile(compat.io(), metrics_path, .{ .truncate = true });
+    defer metrics_file.close(compat.io());
+    var metrics_buf: [8192]u8 = undefined;
+    var metrics_writer = metrics_file.writerStreaming(compat.io(), &metrics_buf);
+
+    const effective_boundary_dropout: f32 = if (opts.deterministic) 0.0 else opts.boundary_dropout;
+    const effective_neftune_alpha: f32 = if (opts.deterministic) 0.0 else opts.neftune_alpha;
+    const effective_encoder_neftune_alpha: f32 = if (opts.encoder_neftune) effective_neftune_alpha else 0.0;
+
     print("train-fused-chunker data={s} output={s} epochs={d} batch_size={d} lr={d} warmup_steps={d} lr_total_steps={d} weight_decay={d} beta1={d} beta2={d} adam_epsilon={d} hidden={d} layers={d} max_seq_len={d} max_chunks={d} loss_type={s} pos_weight={d} boundary_dropout={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} optimizer={s} log_every={d} checkpoint_every_steps={d} eval_every_steps={d} seed={d} lisa_sample={d} lisa_top_k={d} lora_train_top_k={d} lora_start_epoch={d} encoder_vjp={s} layers_per_segment={d}\n", .{
         opts.data_path,
         opts.output_dir,
@@ -2099,7 +7142,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_chunks,
         @tagName(opts.boundary_loss_type),
         opts.boundary_pos_weight,
-        opts.boundary_dropout,
+        effective_boundary_dropout,
         opts.lambda_embed,
         opts.boundary_focus_epochs,
         opts.boundary_focus_lambda_embed,
@@ -2115,9 +7158,26 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         encoderVJPModeName(opts.encoder_vjp),
         opts.layers_per_segment,
     });
+    print("encoder_neftune={s} configured_neftune_alpha={d} applied_encoder_neftune_alpha={d}\n", .{
+        enabledName(effective_encoder_neftune_alpha > 0.0),
+        effective_neftune_alpha,
+        effective_encoder_neftune_alpha,
+    });
+    print("train-fused-chunker dense_contrastive_focal gamma={d} alpha={d}\n", .{
+        opts.contrastive_focal_gamma,
+        opts.contrastive_focal_alpha,
+    });
     print("contrastive_grad_path={s}\n", .{fused_chunker_train.contrastive_gradient_path});
     print("step_eval_max_examples={d}\n", .{opts.step_eval_max_examples});
     print("max_steps={d}\n", .{opts.max_steps});
+    print("telemetry manifest={s} metrics={s} deterministic={} memory_sample_every={d} memory_warn_rss_bytes={d} memory_abort_rss_bytes={d}\n", .{
+        manifest_path,
+        metrics_path,
+        opts.deterministic,
+        opts.memory_sample_every,
+        opts.memory_warn_rss_bytes,
+        opts.memory_abort_rss_bytes,
+    });
     printPhase20ParityReport(opts);
 
     if (opts.model_dir) |mdir| {
@@ -2136,6 +7196,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         .lazy_weights = .{},
     };
     defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
         var it = weight_store.resident_weights.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -2177,7 +7238,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
 
     // Declare both backends at outer scope so their addresses are stable for
     // the ComputeBackend vtable pointer that FusedTrainer holds.
-    var blas_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
 
     var metal_weight_store: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
@@ -2186,8 +7247,6 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         if (comptime build_options.enable_metal) {
             metal_weight_store = MetalWeightStore{
                 .allocator = allocator,
-                .resident_weights = if (comptime build_options.enable_mlx) mlx_mod.c.mlx_map_string_to_array_new() else {},
-                .stream = if (comptime build_options.enable_mlx) mlx_mod.openDefaultStream().stream else {},
                 .prefix = "",
                 .lazy_weights = .{},
             };
@@ -2195,7 +7254,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_weight_store, null);
             break :blk metal_backend.computeBackend();
         } else unreachable;
-    } else blas_backend.computeBackend();
+    } else native_backend.computeBackend();
     defer if (use_metal) {
         if (comptime build_options.enable_metal) deinitMetalWeightStore(allocator, &metal_weight_store);
     };
@@ -2254,7 +7313,24 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                     load_ok = false;
                                     break;
                                 };
-                                weight_store.resident_weights.put(allocator, owned_name, lw) catch {
+                                var store_loaded = lw;
+                                var owns_store_loaded = false;
+                                if (isGoFusedEmbeddingWeightName(owned_name)) {
+                                    store_loaded = cloneLoadedWeight(allocator, lw) catch {
+                                        allocator.free(owned_name);
+                                        load_ok = false;
+                                        break;
+                                    };
+                                    owns_store_loaded = true;
+                                    transposeLoadedEmbeddingWeightLikeGoFused(allocator, &store_loaded) catch {
+                                        store_loaded.deinit();
+                                        allocator.free(owned_name);
+                                        load_ok = false;
+                                        break;
+                                    };
+                                }
+                                weight_store.resident_weights.put(allocator, owned_name, store_loaded) catch {
+                                    if (owns_store_loaded) store_loaded.deinit();
                                     allocator.free(owned_name);
                                     load_ok = false;
                                     break;
@@ -2331,6 +7407,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         allocator.free(sessions);
     };
     var segment_vjp_parity_pending = platform.env.getenvBoolDefault("TERMITE_SEGMENT_VJP_PARITY", false);
+    const segment_vjp_parity_layer = getenvU32OrNull("TERMITE_SEGMENT_VJP_PARITY_LAYER");
     if (usesFullEncoderVJP(opts.encoder_vjp) and opts.lora_rank > 0) {
         const sessions = try allocator.alloc(?segmented_encoder.ModernBertSegmentVJPSession, opts.num_layers);
         errdefer allocator.free(sessions);
@@ -2394,21 +7471,22 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         std.process.exit(1);
     }
 
-    const stats = fused_chunker_data.computeStats(samples);
+    const train_stats = fused_chunker_data.computeStats(samples);
     print("loaded {d} samples  avg_chars={d:.0}  avg_chunks={d:.1}  min_chunks={d}  max_chunks={d}  contrastive_pos_samples={d}  boundary_target_samples={d}  boundary_targets={d}\n", .{
-        stats.num_samples,
-        stats.avg_text_chars,
-        stats.avg_chunks_per_sample,
-        stats.min_chunks,
-        stats.max_chunks,
-        stats.samples_with_contrastive_positives,
-        stats.samples_with_boundary_targets,
-        stats.total_boundary_targets,
+        train_stats.num_samples,
+        train_stats.avg_text_chars,
+        train_stats.avg_chunks_per_sample,
+        train_stats.min_chunks,
+        train_stats.max_chunks,
+        train_stats.samples_with_contrastive_positives,
+        train_stats.samples_with_boundary_targets,
+        train_stats.total_boundary_targets,
     });
 
     var val_loaded_opt: ?fused_chunker_data.LoadedSamples = null;
     defer if (val_loaded_opt) |*val_loaded| val_loaded.deinit();
     var val_samples: []const fused_chunker_data.FusedSample = &.{};
+    var validation_stats: ?fused_chunker_data.FusedDatasetStats = null;
     if (opts.val_data_path) |val_path| {
         print("loading validation samples from {s} (split={s})...\n", .{ val_path, opts.val_split });
         val_loaded_opt = try fused_chunker_data.loadSamples(allocator, val_path, opts.val_split);
@@ -2420,6 +7498,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             val_samples = &.{};
         } else {
             const val_stats = fused_chunker_data.computeStats(val_samples);
+            validation_stats = val_stats;
             print("loaded {d} validation samples  avg_chars={d:.0}  avg_chunks={d:.1}  min_chunks={d}  max_chunks={d}  contrastive_pos_samples={d}  boundary_target_samples={d}  boundary_targets={d}\n", .{
                 val_stats.num_samples,
                 val_stats.avg_text_chars,
@@ -2474,6 +7553,8 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     loss_config.lambda_splade = opts.lambda_splade;
     loss_config.lambda_flops = opts.lambda_flops;
     loss_config.splade_focus_epoch = opts.splade_focus_epoch;
+    loss_config.contrastive_focal_gamma = opts.contrastive_focal_gamma;
+    loss_config.contrastive_focal_alpha = opts.contrastive_focal_alpha;
     loss_config.use_mrl = opts.mrl;
     if (opts.mrl and mrl_dims_count > 0) {
         loss_config.mrl_dims = mrl_dims_buf[0..mrl_dims_count];
@@ -2499,8 +7580,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         .use_boundary_focal = opts.boundary_loss_type == .focal,
         .focal_gamma = opts.boundary_focal_gamma,
         .focal_alpha = opts.boundary_focal_alpha,
+        .contrastive_focal_gamma = opts.contrastive_focal_gamma,
+        .contrastive_focal_alpha = opts.contrastive_focal_alpha,
         .pos_weight = opts.boundary_pos_weight,
-        .boundary_dropout = opts.boundary_dropout,
+        .boundary_dropout = effective_boundary_dropout,
         .warmup_steps = warmup_steps,
         .total_steps = @max(1, total_steps),
         .seed = opts.seed,
@@ -2514,13 +7597,12 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         // Feature 1: XBM
         .xbm_capacity = opts.xbm_capacity,
         // Feature 5: NEFTune
-        .neftune_alpha = opts.neftune_alpha,
+        .neftune_alpha = effective_encoder_neftune_alpha,
         // Feature 6: LLRD
         .llrd_decay = opts.llrd_decay,
         // Feature 8: length bucketing
         .length_bucketing = opts.length_bucketing,
         .bucket_size = opts.bucket_size,
-        // mixed precision
         .mixed_precision = opts.mixed_precision,
         // SPLADE
         .enable_splade = loss_config.enable_splade,
@@ -2547,6 +7629,12 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     if (opts.resume_from.len > 0) {
         print("resuming weights from {s}\n", .{opts.resume_from});
         try trainer.loadCheckpoint(allocator, opts.resume_from);
+        if (lora_adapters_opt) |*la| {
+            const loaded_lora_tensors = try loadLoRAAdaptersFromCheckpoint(allocator, opts.resume_from, la);
+            if (loaded_lora_tensors > 0) {
+                print("restored {d} LoRA tensors from {s}\n", .{ loaded_lora_tensors, opts.resume_from });
+            }
+        }
 
         // Look for a companion optimizer-state file next to the checkpoint.
         // Convention: replace the extension of the checkpoint path with
@@ -2568,7 +7656,13 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             const exists = compat.cwd().statFile(compat.io(), p, .{}) catch null;
             if (exists != null) {
                 print("restoring optimizer state from {s}\n", .{p});
-                trainer.loadOptimizerState(allocator, p) catch |err| {
+                loadFusedOptimizerState(
+                    allocator,
+                    p,
+                    &trainer,
+                    if (lora_adapters_opt) |*la| la else null,
+                    &lora_opt_state,
+                ) catch |err| {
                     print("warning: could not load optimizer state from {s}: {}\n", .{ p, err });
                 };
             }
@@ -2582,7 +7676,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     // Build a mutable index array for shuffling
     var indices = try allocator.alloc(usize, samples.len);
     defer allocator.free(indices);
-    for (indices, 0..) |*idx, i| idx.* = i;
+    resetIdentityIndices(indices);
 
     var prng = std.Random.DefaultPrng.init(opts.seed);
     const rng = prng.random();
@@ -2598,9 +7692,30 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     const max_chunks: usize = @intCast(opts.max_chunks);
     const batch_sz: usize = @intCast(opts.batch_size);
     const max_seq: usize = @intCast(opts.max_seq_len);
-    var best_val_f1: f32 = -std.math.inf(f32);
+    var best_val_f1: f32 = 0.0;
     var best_val_epoch: u32 = 0;
     var best_val_step: u32 = 0;
+    var last_step_loss: ?f32 = null;
+    var memory_tracker = MemoryTracker{};
+    _ = memory_tracker.observe();
+
+    try writeFusedTrainingManifest(
+        allocator,
+        manifest_path,
+        &opts,
+        if (use_metal) "metal" else "native",
+        metrics_path,
+        train_stats,
+        validation_stats,
+        "running",
+        trainer.step_count,
+        null,
+        null,
+        @intCast(best_val_step),
+        best_val_epoch,
+        best_val_f1,
+        memory_tracker.peak_resident_bytes,
+    );
 
     const resume_step_count: u32 = trainer.step_count;
     const resume_epoch: usize = if (steps_per_epoch == 0)
@@ -2612,6 +7727,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     else
         resume_step_count % steps_per_epoch;
     const resume_batch_offset: usize = @min(@as(usize, @intCast(resume_step_in_epoch)) * batch_sz, samples.len);
+    if (opts.debug_batch_offset) |requested_offset| {
+        if (requested_offset > samples.len) return error.InvalidDebugBatchOffset;
+    }
+    const effective_resume_batch_offset: usize = opts.debug_batch_offset orelse resume_batch_offset;
     if (resume_step_count > 0) {
         print(
             "resume_position global_step={d} steps_per_epoch={d} resume_epoch={d} resume_step_in_epoch={d} resume_batch_offset={d}\n",
@@ -2622,6 +7741,12 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 resume_step_in_epoch,
                 resume_batch_offset,
             },
+        );
+    }
+    if (opts.debug_batch_offset) |requested_offset| {
+        print(
+            "debug_batch_offset_override requested={d} effective_batch_offset={d} resume_batch_offset={d}\n",
+            .{ requested_offset, effective_resume_batch_offset, resume_batch_offset },
         );
     }
 
@@ -2639,14 +7764,35 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             trainer.loss_config.lambda_embed,
         });
 
-        // Shuffle indices using Fisher-Yates
-        var i: usize = indices.len;
-        while (i > 1) {
-            i -= 1;
-            const j = rng.uintLessThan(usize, i + 1);
-            const tmp = indices[i];
-            indices[i] = indices[j];
-            indices[j] = tmp;
+        const order_preview_len = @min(indices.len, 16);
+        if (opts.deterministic) {
+            resetIdentityIndices(indices);
+            print("epoch_order epoch={d}/{d} shuffle_mode=deterministic shuffle_seed=none reset_indices=true preview_len={d} ", .{
+                epoch + 1,
+                opts.epochs,
+                order_preview_len,
+            });
+            printIndexSlice("first_indices", indices[0..order_preview_len]);
+        } else if (opts.go_epoch_shuffle) {
+            resetIdentityIndices(indices);
+            const epoch_shuffle_seed = opts.seed + @as(u64, @intCast(epoch)) + 1;
+            var epoch_prng = std.Random.DefaultPrng.init(epoch_shuffle_seed);
+            shuffleIndicesFisherYates(indices, epoch_prng.random());
+            print("epoch_order epoch={d}/{d} shuffle_mode=go_epoch_reset shuffle_seed={d} reset_indices=true preview_len={d} ", .{
+                epoch + 1,
+                opts.epochs,
+                epoch_shuffle_seed,
+                order_preview_len,
+            });
+            printIndexSlice("first_indices", indices[0..order_preview_len]);
+        } else {
+            shuffleIndicesFisherYates(indices, rng);
+            print("epoch_order epoch={d}/{d} shuffle_mode=legacy_stream shuffle_seed=stream reset_indices=false preview_len={d} ", .{
+                epoch + 1,
+                opts.epochs,
+                order_preview_len,
+            });
+            printIndexSlice("first_indices", indices[0..order_preview_len]);
         }
 
         // Feature 8: Length bucketing — sort within windows after shuffle
@@ -2671,7 +7817,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         }
 
         var step: u32 = if (epoch == resume_epoch) resume_step_in_epoch else 0;
-        var batch_start: usize = if (epoch == resume_epoch) resume_batch_offset else 0;
+        var batch_start: usize = if (epoch == resume_epoch) effective_resume_batch_offset else 0;
         if (resume_step_count > 0 and epoch == resume_epoch and batch_start > 0) {
             print(
                 "resume_epoch_start epoch={d}/{d} local_step={d} batch_start={d}/{d}\n",
@@ -2786,6 +7932,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             // ------------------------------------------------------------------
             // Encoder forward pass (or zero-fill fallback)
             // ------------------------------------------------------------------
+            const debug_encoder_timing_step = getenvU32OrNull("ANTFLY_FUSED_CHUNKER_DEBUG_ENCODER_TIMING_STEP");
+            const debug_encoder_timing = debug_encoder_timing_step != null and
+                trainer.step_count + 1 == debug_encoder_timing_step.?;
+            if (debug_encoder_timing) cb.resetDebugTimingStats();
             const encoder_start_ns = nowNs();
             var features_owned: ?[]f32 = null;
             defer if (features_owned) |f| allocator.free(f);
@@ -2804,7 +7954,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 for (batch.attention_mask[0..total_tokens], mask_i64) |m32, *m64| m64.* = @intCast(m32);
 
                 const lora_alpha_for_config: f32 = if (lora_adapters_opt) |la| la.config.alpha else 0.0;
-                const neftune_seed = if (opts.neftune_alpha > 0.0) blk: {
+                const neftune_seed = if (effective_encoder_neftune_alpha > 0.0) blk: {
                     const seed = opts.seed ^ global_neft_step;
                     global_neft_step += 1;
                     break :blk seed;
@@ -2815,12 +7965,20 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     .intermediate_size = opts.intermediate_size,
                     .lora_rank = if (lora_adapters_opt != null) opts.lora_rank else 0,
                     .lora_alpha = lora_alpha_for_config,
-                    .neftune_alpha = opts.neftune_alpha,
+                    .neftune_alpha = effective_encoder_neftune_alpha,
                     .neftune_seed = neftune_seed,
                 };
 
                 if (lora_training_active) {
                     var act_buf = modern_bert.ActivationBuffer.init(allocator);
+                    if (!opts.debug_encoder_layer_inputs_only and
+                        ((opts.debug_first_boundary_step and epoch == 0 and step == 0) or
+                            (opts.debug_boundary_step > 0 and trainer.step_count + 1 == opts.debug_boundary_step)))
+                    {
+                        act_buf.capture_attention_internal_layer = opts.debug_encoder_probe_layer;
+                        act_buf.capture_projection_decomposition_layer = opts.debug_encoder_probe_layer;
+                        act_buf.capture_layer_state_layer = opts.debug_encoder_probe_layer;
+                    }
                     const fwd = try modern_bert.forwardCapturingActivations(
                         &cb,
                         allocator,
@@ -2860,6 +8018,23 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 break :blk zeros;
             };
             step_timing.encoder_ns = elapsedNs(encoder_start_ns);
+            if (debug_encoder_timing) {
+                print(
+                    "encoder_timing_probe step={d} encoder_ms={d:.3} backend={s} decoder_runtime_ready={}\n",
+                    .{
+                        trainer.step_count + 1,
+                        nsToMs(step_timing.encoder_ns),
+                        if (use_metal) "metal" else "native",
+                        cb.decoderRuntimeReady(),
+                    },
+                );
+                debug_timing.printBackendTimingDetails(
+                    cb.kind(),
+                    cb.debugTimingSnapshot(),
+                    cb.decoderRuntimeReady(),
+                    false,
+                );
+            }
 
             // Attention mask: convert i32 -> f32
             const attn_mask_f32 = try allocator.alloc(f32, total_tokens);
@@ -2883,6 +8058,39 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             const next_train_step = trainer.step_count + 1;
             const debug_first_boundary_step_now = opts.debug_first_boundary_step and epoch == 0 and step == 0;
             const debug_selected_boundary_step_now = opts.debug_boundary_step > 0 and next_train_step == opts.debug_boundary_step;
+            var embedding_probe = EmbeddingProbe{};
+            var embedding_lookup_values: ?[]const f32 = null;
+            var embedding_table_row_probes: []EmbeddingRowProbe = &.{};
+            defer if (embedding_table_row_probes.len > 0) allocator.free(embedding_table_row_probes);
+            var embedding_lookup_row_probes: []EmbeddingRowProbe = &.{};
+            defer if (embedding_lookup_row_probes.len > 0) allocator.free(embedding_lookup_row_probes);
+            var encoder_activation_input_probes: []EncoderActivationInputProbe = &.{};
+            defer if (encoder_activation_input_probes.len > 0) allocator.free(encoder_activation_input_probes);
+            var encoder_projection_decomposition_probes: []EncoderProjectionDecompositionProbe = &.{};
+            defer if (encoder_projection_decomposition_probes.len > 0) allocator.free(encoder_projection_decomposition_probes);
+            var encoder_attention_internal_probes: []EncoderAttentionInternalProbe = &.{};
+            defer if (encoder_attention_internal_probes.len > 0) allocator.free(encoder_attention_internal_probes);
+            var encoder_attention_row_probes: []EncoderAttentionRowProbe = &.{};
+            defer if (encoder_attention_row_probes.len > 0) allocator.free(encoder_attention_row_probes);
+            var encoder_layer_input_probes: []EncoderLayerInputProbe = &.{};
+            defer if (encoder_layer_input_probes.len > 0) allocator.free(encoder_layer_input_probes);
+            var encoder_layer_state_probes: []EncoderLayerStateProbe = &.{};
+            defer if (encoder_layer_state_probes.len > 0) allocator.free(encoder_layer_state_probes);
+            var encoder_replay_input_probe: ?EncoderReplayInputProbe = null;
+            var encoder_replay_upstream_probe: ?EncoderReplayUpstreamProbe = null;
+            var step_parity_upstream_grad_probe: ?StepParityUpstreamGradProbe = null;
+            defer if (step_parity_upstream_grad_probe) |*probe| probe.deinit(allocator);
+            var step_parity_boundary: ?StepParityBoundaryContext = null;
+            var step_parity_contrastive: ?StepParityContrastiveContext = null;
+            var step_parity_segment_vjp: ?StepParitySegmentVJPProbe = null;
+            defer if (step_parity_segment_vjp) |*probe| probe.deinit(allocator);
+            var step_parity_layer_backward_decomp: ?StepParityLayerBackwardDecompProbe = null;
+            defer if (step_parity_layer_backward_decomp) |*probe| probe.deinit(allocator);
+            var step_parity_softmax_vjp: ?StepParitySoftmaxVJPProbe = null;
+            defer if (step_parity_softmax_vjp) |*probe| probe.deinit(allocator);
+            var step_parity_qkv_split_vjp: ?StepParityQKVSplitVJPProbe = null;
+            defer if (step_parity_qkv_split_vjp) |*probe| probe.deinit(allocator);
+            var exit_after_step_parity_contrastive = false;
             if (epoch == 0 and step == 0 and !debug_first_boundary_step_now) {
                 const first_batch_stats = computeBoundaryBatchDebugStats(
                     features,
@@ -2904,7 +8112,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         first_batch_stats.gold_positives,
                         gold_rate,
                         opts.boundary_pos_weight,
-                        opts.boundary_dropout,
+                        config.boundary_dropout,
                         encoder_loaded,
                         use_metal,
                     },
@@ -2919,7 +8127,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     total_tokens,
                     E,
                 );
-                const debug = try trainer.debugBoundaryStep(
+                var debug = try trainer.debugBoundaryStep(
                     allocator,
                     features,
                     boundary_labels_2,
@@ -2927,6 +8135,268 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     total_tokens,
                     true,
                 );
+                if (activations_opt) |*act_buf| {
+                    if (act_buf.embedding_lookup) |embedding_lookup| {
+                        if (embedding_lookup.len == total_tokens * E) {
+                            embedding_lookup_values = embedding_lookup;
+                            embedding_probe.token_lookup =
+                                fused_chunker_train.computeBoundaryProbeTensorStats(embedding_lookup);
+                        }
+                    }
+                    if (act_buf.embedding_output) |embedding_output| {
+                        if (embedding_output.len == total_tokens * E) {
+                            embedding_probe.layer_norm_output =
+                                fused_chunker_train.computeBoundaryProbeTensorStats(embedding_output);
+                        }
+                    }
+                    if (act_buf.final_norm_input) |final_norm_input| {
+                        if (final_norm_input.len == total_tokens * E) {
+                            debug.boundary_forward_probe.final_norm_input =
+                                fused_chunker_train.computeBoundaryProbeTensorStats(final_norm_input);
+                        }
+                    }
+                    const has_final_norm_input_probe = if (act_buf.final_norm_input) |final_norm_input|
+                        final_norm_input.len == total_tokens * E
+                    else
+                        false;
+                    const final_probe_count: usize = if (has_final_norm_input_probe) 1 else 0;
+                    encoder_layer_input_probes = try allocator.alloc(EncoderLayerInputProbe, act_buf.layer_inputs.items.len + final_probe_count);
+                    var probe_idx: usize = 0;
+                    for (act_buf.layer_inputs.items) |layer_input| {
+                        encoder_layer_input_probes[probe_idx] = .{
+                            .layer_idx = layer_input.layer_idx,
+                            .stats = fused_chunker_train.computeBoundaryProbeTensorStats(layer_input.input),
+                        };
+                        probe_idx += 1;
+                    }
+                    if (has_final_norm_input_probe) {
+                        const final_norm_input = act_buf.final_norm_input.?;
+                        encoder_layer_input_probes[probe_idx] = .{
+                            .layer_idx = opts.num_layers,
+                            .stats = fused_chunker_train.computeBoundaryProbeTensorStats(final_norm_input),
+                        };
+                    }
+                    if (opts.debug_encoder_replay_input_path) |replay_path| {
+                        const layer_input = act_buf.findLayerInput(opts.debug_encoder_probe_layer) orelse return error.MissingEncoderReplayInputCapture;
+                        if (layer_input.input.len != total_tokens * E) return error.InvalidEncoderReplayInputShape;
+                        try writeF32LittleEndianFile(allocator, replay_path, layer_input.input);
+                        encoder_replay_input_probe = .{
+                            .path = replay_path,
+                            .layer_idx = layer_input.layer_idx,
+                            .batch_size = actual_batch,
+                            .seq_len = max_seq,
+                            .hidden_size = E,
+                            .elems = layer_input.input.len,
+                            .stats = fused_chunker_train.computeBoundaryProbeTensorStats(layer_input.input),
+                        };
+                    }
+                    var layer_state_probe_count: usize = 0;
+                    for (act_buf.layer_states.items) |cap| {
+                        if (cap.layer_idx == opts.debug_encoder_probe_layer) layer_state_probe_count += 1;
+                    }
+                    if (layer_state_probe_count > 0) {
+                        encoder_layer_state_probes = try allocator.alloc(EncoderLayerStateProbe, layer_state_probe_count);
+                        var layer_state_probe_idx: usize = 0;
+                        for (act_buf.layer_states.items) |cap| {
+                            if (cap.layer_idx != opts.debug_encoder_probe_layer) continue;
+                            encoder_layer_state_probes[layer_state_probe_idx] = .{
+                                .layer_idx = cap.layer_idx,
+                                .name = cap.name,
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(cap.values),
+                            };
+                            layer_state_probe_idx += 1;
+                        }
+                    }
+                    var activation_probe_count: usize = 0;
+                    for (act_buf.items.items) |cap| {
+                        if (cap.layer_idx == opts.debug_encoder_probe_layer) activation_probe_count += 1;
+                    }
+                    if (activation_probe_count > 0) {
+                        encoder_activation_input_probes = try allocator.alloc(EncoderActivationInputProbe, activation_probe_count);
+                        var activation_probe_idx: usize = 0;
+                        for (act_buf.items.items) |cap| {
+                            if (cap.layer_idx != opts.debug_encoder_probe_layer) continue;
+                            encoder_activation_input_probes[activation_probe_idx] = .{
+                                .layer_idx = cap.layer_idx,
+                                .module_name = cap.module_name,
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(cap.input),
+                            };
+                            activation_probe_idx += 1;
+                        }
+                    }
+                    var projection_probe_count: usize = 0;
+                    for (act_buf.projection_decompositions.items) |cap| {
+                        if (cap.layer_idx == opts.debug_encoder_probe_layer) projection_probe_count += 1;
+                    }
+                    if (projection_probe_count > 0) {
+                        encoder_projection_decomposition_probes = try allocator.alloc(EncoderProjectionDecompositionProbe, projection_probe_count);
+                        var projection_probe_idx: usize = 0;
+                        for (act_buf.projection_decompositions.items) |cap| {
+                            if (cap.layer_idx != opts.debug_encoder_probe_layer) continue;
+                            encoder_projection_decomposition_probes[projection_probe_idx] = .{
+                                .layer_idx = cap.layer_idx,
+                                .name = cap.name,
+                                .input = fusedProbeStatsFromModernBert(cap.input),
+                                .base = fusedProbeStatsFromModernBert(cap.base),
+                                .lora_a = fusedProbeStatsFromModernBert(cap.lora_a),
+                                .lora_b = fusedProbeStatsFromModernBert(cap.lora_b),
+                                .delta = fusedProbeStatsFromModernBert(cap.delta),
+                                .output = fusedProbeStatsFromModernBert(cap.output),
+                                .weight = fusedProbeStatsFromModernBert(cap.weight),
+                                .bias = fusedProbeStatsFromModernBert(cap.bias),
+                                .lora_a_weight = fusedProbeStatsFromModernBert(cap.lora_a_weight),
+                                .lora_b_weight = fusedProbeStatsFromModernBert(cap.lora_b_weight),
+                                .base_reference_error = fusedProbeStatsFromModernBert(cap.base_reference_error),
+                                .lora_a_reference_error = fusedProbeStatsFromModernBert(cap.lora_a_reference_error),
+                                .lora_b_reference_error = fusedProbeStatsFromModernBert(cap.lora_b_reference_error),
+                                .delta_reference_error = fusedProbeStatsFromModernBert(cap.delta_reference_error),
+                                .output_reference_error = fusedProbeStatsFromModernBert(cap.output_reference_error),
+                                .scale = cap.scale,
+                                .rank = cap.rank,
+                                .rows = cap.rows,
+                                .in_dim = cap.in_dim,
+                                .out_dim = cap.out_dim,
+                                .has_bias = cap.has_bias,
+                            };
+                            projection_probe_idx += 1;
+                        }
+                    }
+                    var attention_internal_probe_count: usize = 0;
+                    for (act_buf.attention_internals.items) |cap| {
+                        if (cap.layer_idx == opts.debug_encoder_probe_layer) attention_internal_probe_count += 1;
+                    }
+                    var sdpa_reference_stats: ?Layer0SdpaReferenceProbeStats = null;
+                    var attention_core_tensors: ?StepParityAttentionCoreTensors = null;
+                    defer if (attention_core_tensors) |*tensors| tensors.deinit(allocator);
+                    const attention_defaults = modern_bert.Config{};
+                    const is_local_attention_probe = attention_defaults.global_attn_every_n_layers > 0 and
+                        opts.debug_encoder_probe_layer % attention_defaults.global_attn_every_n_layers != 0;
+                    const attention_output_probe = findLayerActivationInput(act_buf, opts.debug_encoder_probe_layer, "out_proj");
+                    const sdpa_num_heads: usize = 12;
+                    if (E % sdpa_num_heads == 0) {
+                        if (findLayerAttentionInternal(act_buf, opts.debug_encoder_probe_layer, "q_rope")) |q_rope| {
+                            if (findLayerAttentionInternal(act_buf, opts.debug_encoder_probe_layer, "k_rope")) |k_rope| {
+                                attention_core_tensors = try computeStepParityAttentionCoreTensors(
+                                    allocator,
+                                    q_rope,
+                                    k_rope,
+                                    attn_mask_f32,
+                                    actual_batch,
+                                    max_seq,
+                                    sdpa_num_heads,
+                                    E / sdpa_num_heads,
+                                    is_local_attention_probe,
+                                    attention_defaults.local_attention_window,
+                                );
+                            }
+                        }
+                        sdpa_reference_stats = try computeLayerSdpaReferenceProbeStats(
+                            allocator,
+                            act_buf,
+                            opts.debug_encoder_probe_layer,
+                            batch.attention_mask[0..total_tokens],
+                            actual_batch,
+                            max_seq,
+                            sdpa_num_heads,
+                            E / sdpa_num_heads,
+                            is_local_attention_probe,
+                            attention_defaults.local_attention_window,
+                        );
+                        encoder_attention_row_probes = try computeLayerAttentionRowProbes(
+                            allocator,
+                            act_buf,
+                            opts.debug_encoder_probe_layer,
+                            batch.attention_mask[0..total_tokens],
+                            actual_batch,
+                            max_seq,
+                            sdpa_num_heads,
+                            E / sdpa_num_heads,
+                            is_local_attention_probe,
+                            attention_defaults.local_attention_window,
+                        );
+                    }
+                    const sdpa_reference_probe_count: usize = if (sdpa_reference_stats != null) 6 else 0;
+                    const attention_core_probe_count: usize = if (attention_core_tensors != null) 3 else 0;
+                    const attention_output_probe_count: usize = if (attention_output_probe != null) 1 else 0;
+                    if (attention_internal_probe_count + attention_core_probe_count + attention_output_probe_count + sdpa_reference_probe_count > 0) {
+                        encoder_attention_internal_probes = try allocator.alloc(EncoderAttentionInternalProbe, attention_internal_probe_count + attention_core_probe_count + attention_output_probe_count + sdpa_reference_probe_count);
+                        var attention_internal_probe_idx: usize = 0;
+                        for (act_buf.attention_internals.items) |cap| {
+                            if (cap.layer_idx != opts.debug_encoder_probe_layer) continue;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = cap.layer_idx,
+                                .name = cap.name,
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(cap.values),
+                            };
+                            attention_internal_probe_idx += 1;
+                        }
+                        if (attention_core_tensors) |core| {
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_scores_raw",
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(core.scores_raw),
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_scores_masked",
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(core.scores_masked),
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_probs",
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(core.probs),
+                            };
+                            attention_internal_probe_idx += 1;
+                        }
+                        if (attention_output_probe) |attn_output| {
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_output",
+                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(attn_output),
+                            };
+                            attention_internal_probe_idx += 1;
+                        }
+                        if (sdpa_reference_stats) |stats| {
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_context_ref",
+                                .stats = stats.token_ref,
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_context_delta",
+                                .stats = stats.token_delta,
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_token_ref",
+                                .stats = stats.token_ref,
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_token_delta",
+                                .stats = stats.token_delta,
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_kernel_ref",
+                                .stats = stats.kernel_ref,
+                            };
+                            attention_internal_probe_idx += 1;
+                            encoder_attention_internal_probes[attention_internal_probe_idx] = .{
+                                .layer_idx = opts.debug_encoder_probe_layer,
+                                .name = "attn_kernel_delta",
+                                .stats = stats.kernel_delta,
+                            };
+                        }
+                    }
+                }
                 const gold_rate = if (debug_batch_stats.valid_tokens > 0)
                     @as(f32, @floatFromInt(debug_batch_stats.gold_positives)) / @as(f32, @floatFromInt(debug_batch_stats.valid_tokens))
                 else
@@ -2945,7 +8415,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         debug_batch_stats.gold_positives,
                         gold_rate,
                         opts.boundary_pos_weight,
-                        opts.boundary_dropout,
+                        config.boundary_dropout,
                         encoder_loaded,
                         use_metal,
                     },
@@ -2994,11 +8464,50 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         debug.features_grad_max_abs,
                     },
                 );
+                const final_norm_checkpoint = computeFinalNormCheckpointStats(use_metal, &weight_store, &metal_weight_store);
+                const embedding_checkpoint = computeEmbeddingCheckpointStats(use_metal, &weight_store, &metal_weight_store);
+                embedding_probe.word_embedding_weight = embedding_checkpoint.word_embedding_weight;
+                embedding_probe.layer_norm_weight = embedding_checkpoint.layer_norm_weight;
+                embedding_probe.layer_norm_bias = embedding_checkpoint.layer_norm_bias;
+                embedding_table_row_probes = try allocEmbeddingTableRowProbes(
+                    allocator,
+                    batch.input_ids,
+                    total_tokens,
+                    E,
+                    activeEmbeddingWeightValues(use_metal, &weight_store, &metal_weight_store),
+                );
+                embedding_lookup_row_probes = try allocEmbeddingLookupRowProbes(
+                    allocator,
+                    batch.input_ids,
+                    total_tokens,
+                    E,
+                    embedding_lookup_values,
+                );
+                step_parity_boundary = .{
+                    .batch_stats = debug_batch_stats,
+                    .debug = debug,
+                    .embedding_probe = embedding_probe,
+                    .embedding_table_rows = embedding_table_row_probes,
+                    .embedding_lookup_rows = embedding_lookup_row_probes,
+                    .final_norm_weight = final_norm_checkpoint.weight,
+                    .final_norm_bias = final_norm_checkpoint.bias,
+                    .encoder_activation_inputs = encoder_activation_input_probes,
+                    .encoder_projection_decompositions = encoder_projection_decomposition_probes,
+                    .encoder_attention_internals = encoder_attention_internal_probes,
+                    .encoder_attention_rows = encoder_attention_row_probes,
+                    .encoder_layer_inputs = encoder_layer_input_probes,
+                    .encoder_layer_states = encoder_layer_state_probes,
+                    .encoder_replay_input = encoder_replay_input_probe,
+                };
                 if ((debug_first_boundary_step_now and opts.debug_first_boundary_step_exit) or
                     (debug_selected_boundary_step_now and opts.debug_boundary_step_exit))
                 {
-                    print("{s} exiting before optimizer update\n", .{debug_prefix});
-                    return;
+                    if (opts.debug_step_json_path != null) {
+                        exit_after_step_parity_contrastive = true;
+                    } else {
+                        print("{s} exiting before optimizer update\n", .{debug_prefix});
+                        return;
+                    }
                 }
             }
 
@@ -3103,7 +8612,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     }
 
                     const lora_alpha_for_config: f32 = if (lora_adapters_opt) |la| la.config.alpha else 0.0;
-                    const hard_neg_neftune_seed = if (opts.neftune_alpha > 0.0) blk: {
+                    const hard_neg_neftune_seed = if (effective_encoder_neftune_alpha > 0.0) blk: {
                         const seed = opts.seed ^ global_neft_step;
                         global_neft_step += 1;
                         break :blk seed;
@@ -3114,7 +8623,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         .intermediate_size = opts.intermediate_size,
                         .lora_rank = if (lora_adapters_opt != null) opts.lora_rank else 0,
                         .lora_alpha = lora_alpha_for_config,
-                        .neftune_alpha = opts.neftune_alpha,
+                        .neftune_alpha = effective_encoder_neftune_alpha,
                         .neftune_seed = hard_neg_neftune_seed,
                     };
                     hard_neg_features = modern_bert.forward(
@@ -3168,6 +8677,49 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             }
             step_timing.hard_neg_ns = elapsedNs(hard_neg_start_ns);
 
+            if (opts.debug_step_json_path != null and step_parity_boundary != null) {
+                step_parity_contrastive = try computeStepParityContrastiveContext(
+                    allocator,
+                    trainer.loss_config,
+                    contrastive_embeddings,
+                    contrastive_mask,
+                    contrastive_doc_ids,
+                    contrastive_B,
+                    contrastive_C,
+                    E,
+                );
+            }
+
+            if (exit_after_step_parity_contrastive) {
+                const json_path = opts.debug_step_json_path orelse return error.MissingDebugStepJson;
+                const boundary_ctx = step_parity_boundary orelse return error.MissingDebugBoundaryStepForParityJson;
+                try writeStepParityJson(
+                    json_path,
+                    "no_update",
+                    &opts,
+                    trainer.loss_config.lambda_embed,
+                    epoch,
+                    step,
+                    next_train_step,
+                    trainer.step_count,
+                    batch_indices,
+                    &batch,
+                    total_tokens,
+                    boundary_ctx,
+                    step_parity_contrastive,
+                    step_parity_upstream_grad_probe,
+                    encoder_replay_upstream_probe,
+                    step_parity_segment_vjp,
+                    step_parity_layer_backward_decomp,
+                    step_parity_softmax_vjp,
+                    step_parity_qkv_split_vjp,
+                    null,
+                    null,
+                );
+                print("debug_boundary_step exiting before optimizer update after contrastive diagnostics\n", .{});
+                return;
+            }
+
             // ------------------------------------------------------------------
             // Training step + optional LoRA backprop
             // ------------------------------------------------------------------
@@ -3195,6 +8747,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         actual_batch,
                         max_seq,
                         C,
+                        opts.debug_step_json_path != null,
                     );
                     step_timing.train_ns = elapsedNs(train_step_start_ns);
                     defer result_with_grad.deinit(allocator);
@@ -3237,6 +8790,23 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                             break :blk_grad final_norm_grad.?;
                         } else d_features;
 
+                        if (opts.debug_step_json_path != null) {
+                            var upstream_probe = StepParityUpstreamGradProbe{
+                                .target_layer = opts.debug_encoder_probe_layer,
+                                .boundary_features_grad = result_with_grad.boundary_features_grad_stats,
+                                .contrastive_features_grad = result_with_grad.contrastive_features_grad_stats,
+                                .combined_features_grad = result_with_grad.combined_features_grad_stats,
+                                .lora_output_grad = fused_chunker_train.computeBoundaryProbeTensorStats(lora_output_grad),
+                            };
+                            if (act_buf.final_norm_input) |final_norm_input| {
+                                upstream_probe.final_norm_input = fused_chunker_train.computeBoundaryProbeTensorStats(final_norm_input);
+                            }
+                            if (act_buf.final_norm_weight) |final_norm_weight| {
+                                upstream_probe.final_norm_weight = fused_chunker_train.computeBoundaryProbeTensorStats(final_norm_weight);
+                            }
+                            step_parity_upstream_grad_probe = upstream_probe;
+                        }
+
                         const active_layers = active_lora_layers orelse return error.MissingActiveLoRALayers;
 
                         var direct_skip_layer: ?u32 = null;
@@ -3263,6 +8833,28 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 break :blk la.config.num_layers - top_k;
                             } else null;
 
+                            if (opts.debug_step_json_path != null and opts.debug_encoder_probe_layer < la.config.num_layers) {
+                                if (step_parity_upstream_grad_probe) |*probe| {
+                                    const ladder_count: usize = @intCast(la.config.num_layers - opts.debug_encoder_probe_layer);
+                                    if (probe.upper_encoder_ladder.len == 0 and ladder_count > 0) {
+                                        var ladder = try allocator.alloc(StepParityNamedProbeTensorStats, ladder_count);
+                                        var filled: usize = 0;
+                                        errdefer {
+                                            for (ladder[0..filled]) |*entry| entry.deinit(allocator);
+                                            allocator.free(ladder);
+                                        }
+                                        for (0..ladder_count) |i| {
+                                            const layer_idx = la.config.num_layers - 1 - @as(u32, @intCast(i));
+                                            ladder[i] = .{
+                                                .name = try std.fmt.allocPrint(allocator, "after_layer_{d}", .{layer_idx}),
+                                            };
+                                            filled += 1;
+                                        }
+                                        probe.upper_encoder_ladder = ladder;
+                                    }
+                                }
+                            }
+
                             var layer_cursor: u32 = la.config.num_layers;
                             while (layer_cursor > 0) {
                                 const segment_end = layer_cursor;
@@ -3278,6 +8870,18 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 const segment_input = act_buf.findLayerInput(segment_start) orelse return error.MissingSegmentLayerInputCapture;
                                 if (segment_input.input.len != total_hidden or upstream_grad.len != total_hidden) {
                                     return error.InvalidSegmentVJPShape;
+                                }
+                                if (step_parity_upstream_grad_probe) |*probe| {
+                                    if (probe.upper_encoder_ladder.len > 0 and
+                                        segment_end > opts.debug_encoder_probe_layer and
+                                        segment_end <= la.config.num_layers)
+                                    {
+                                        const ladder_index: usize = @intCast(la.config.num_layers - segment_end);
+                                        if (ladder_index < probe.upper_encoder_ladder.len) {
+                                            probe.upper_encoder_ladder[ladder_index].stats =
+                                                fused_chunker_train.computeBoundaryProbeTensorStats(upstream_grad);
+                                        }
+                                    }
                                 }
                                 var segment_has_active_lora = false;
                                 var active_layer_idx = segment_start;
@@ -3351,7 +8955,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                         );
                                     }
                                     const session = &(session_slot.* orelse return error.MissingFullVJPSessions);
-                                    if (segment_vjp_parity_pending) {
+                                    const run_segment_vjp_parity = segment_vjp_parity_pending and
+                                        (segment_vjp_parity_layer == null or
+                                            (segment_vjp_parity_layer.? >= segment_start and segment_vjp_parity_layer.? < segment_end));
+                                    if (run_segment_vjp_parity) {
                                         segment_vjp_parity_pending = false;
                                         try runSegmentVJPParityDiagnostic(
                                             allocator,
@@ -3380,6 +8987,91 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                         include_adapter_grads,
                                     );
                                     aggregate_profile.add(vjp_result.profile);
+                                    if (opts.debug_step_json_path != null and
+                                        step_parity_segment_vjp == null and
+                                        opts.debug_encoder_probe_layer >= segment_start and
+                                        opts.debug_encoder_probe_layer < segment_end)
+                                    {
+                                        if (step_parity_upstream_grad_probe) |*probe| {
+                                            probe.target_segment_upstream = fused_chunker_train.computeBoundaryProbeTensorStats(upstream_grad);
+                                        }
+                                        var captured_segment_probe = try captureStepParitySegmentVJPProbe(
+                                            allocator,
+                                            opts.debug_encoder_probe_layer,
+                                            segment_start,
+                                            segment_end,
+                                            include_hidden_grad,
+                                            include_adapter_grads,
+                                            upstream_grad,
+                                            &vjp_result,
+                                            la.layers,
+                                        );
+                                        var captured_segment_probe_owned = true;
+                                        errdefer if (captured_segment_probe_owned) captured_segment_probe.deinit(allocator);
+
+                                        if (opts.debug_encoder_replay_upstream_path) |replay_path| {
+                                            if (upstream_grad.len != total_hidden) return error.InvalidEncoderReplayUpstreamShape;
+                                            try writeF32LittleEndianFile(allocator, replay_path, upstream_grad);
+                                            encoder_replay_upstream_probe = .{
+                                                .path = replay_path,
+                                                .target_layer = opts.debug_encoder_probe_layer,
+                                                .segment_start = segment_start,
+                                                .segment_end = segment_end,
+                                                .batch_size = actual_batch,
+                                                .seq_len = max_seq,
+                                                .hidden_size = E,
+                                                .elems = upstream_grad.len,
+                                                .stats = fused_chunker_train.computeBoundaryProbeTensorStats(upstream_grad),
+                                            };
+                                        }
+
+                                        if (opts.debug_layer_backward_decomp and step_parity_layer_backward_decomp == null) {
+                                            step_parity_layer_backward_decomp = try captureStepParityLayerBackwardDecompProbe(
+                                                allocator,
+                                                &cb,
+                                                graph_config,
+                                                actual_batch,
+                                                max_seq,
+                                                opts.debug_encoder_probe_layer,
+                                                segment_start,
+                                                segment_end,
+                                                opts.lora_rank,
+                                                la.config.alpha,
+                                                upstream_grad,
+                                                attn_mask_f32,
+                                                act_buf,
+                                                captured_segment_probe,
+                                                la.layers,
+                                            );
+                                        }
+                                        if (opts.debug_layer_backward_decomp and step_parity_softmax_vjp == null) {
+                                            step_parity_softmax_vjp = try captureStepParitySoftmaxVJPProbe(
+                                                allocator,
+                                                &cb,
+                                                actual_batch,
+                                                max_seq,
+                                                @intCast(graph_config.num_attention_heads),
+                                                graph_config.local_attention_window,
+                                            );
+                                        }
+                                        if (opts.debug_qkv_split_vjp and step_parity_qkv_split_vjp == null) {
+                                            step_parity_qkv_split_vjp = try captureStepParityQKVSplitVJPProbe(
+                                                allocator,
+                                                &cb,
+                                                actual_batch,
+                                                max_seq,
+                                                @intCast(graph_config.num_attention_heads),
+                                                @intCast(graph_config.hidden_size / graph_config.num_attention_heads),
+                                                modern_bert_graph.ropeThetaForLayer(
+                                                    graph_config,
+                                                    opts.debug_encoder_probe_layer,
+                                                ),
+                                            );
+                                        }
+
+                                        step_parity_segment_vjp = captured_segment_probe;
+                                        captured_segment_probe_owned = false;
+                                    }
                                     const next_upstream = if (include_hidden_grad) blk: {
                                         const hidden_grad = vjp_result.hidden_grad orelse return error.MissingHiddenGradient;
                                         vjp_result.hidden_grad = null;
@@ -3513,7 +9205,30 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 la.config.alpha,
                             );
                         }
-                        sanitizeAndClipLoRAGrads(la.layers, opts.max_grad_norm);
+                        const debug_update_step_now = opts.debug_update_step > 0 and summary.step == opts.debug_update_step;
+                        const lora_grad_clip = sanitizeAndClipLoRAGrads(la.layers, opts.max_grad_norm, summary.boundary_grad_norm);
+                        var update_debug = LoRAUpdateDebugAggregate{};
+                        defer update_debug.deinit(allocator);
+                        if (debug_update_step_now) {
+                            print(
+                                "lora_update_diagnostic_pre step={d} grad_elems={d} lora_grad_norm_pre_clip={d:.9} lora_grad_norm_post_clip={d:.9} extra_grad_norm_pre_clip={d:.9} extra_grad_norm_post_clip={d:.9} grad_norm_pre_clip={d:.9} grad_norm_post_clip={d:.9} grad_max_abs_pre_clip={d:.9} grad_max_abs_post_clip={d:.9} grad_clip_scale={d:.9} invalid_grad_repaired={d} max_grad_norm={d}\n",
+                                .{
+                                    summary.step,
+                                    lora_grad_clip.elems,
+                                    lora_grad_clip.lora_norm_before_clip,
+                                    lora_grad_clip.lora_norm_after_clip,
+                                    lora_grad_clip.extra_norm_before_clip,
+                                    lora_grad_clip.extra_norm_after_clip,
+                                    lora_grad_clip.norm_before_clip,
+                                    lora_grad_clip.norm_after_clip,
+                                    lora_grad_clip.max_abs_before_clip,
+                                    lora_grad_clip.max_abs_after_clip,
+                                    lora_grad_clip.clip_scale,
+                                    lora_grad_clip.nonfinite_repaired,
+                                    opts.max_grad_norm,
+                                },
+                            );
+                        }
 
                         // Apply optimizer steps for all LoRA parameters.
                         // Feature 4 (LoRA+): use lr * lora_plus_ratio for lora_B.
@@ -3523,6 +9238,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         const num_layers_f: f32 = @floatFromInt(la.config.num_layers);
                         for (la.layers) |*ll| {
                             if (!fused_chunker_train.isLoRALayerActive(active_layers, ll.layer_idx)) continue;
+                            update_debug.active_layers += 1;
                             // LLRD: layer 0 = first encoder layer (shallowest, closest to embeddings) → lowest LR
                             // layer N-1 = last encoder layer (deepest, closest to task head) → highest LR (= base_lr)
                             // Formula: lr[i] = base_lr * decay^(num_layers - 1 - i)
@@ -3543,8 +9259,61 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 .{ ll.layer_idx, ll.module_name },
                             );
                             defer allocator.free(b_key);
+                            var before_a: ?[]f32 = null;
+                            var before_b: ?[]f32 = null;
+                            defer if (before_a) |buf| allocator.free(buf);
+                            defer if (before_b) |buf| allocator.free(buf);
+                            if (debug_update_step_now) {
+                                before_a = try allocator.dupe(f32, ll.A);
+                                before_b = try allocator.dupe(f32, ll.B);
+                            }
                             try optimizers.step(trainer.optimizer, &lora_opt_state, layer_lr, a_key, ll.A, ll.grad_A);
                             try optimizers.step(trainer.optimizer, &lora_opt_state, b_lr, b_key, ll.B, ll.grad_B);
+                            if (debug_update_step_now) {
+                                update_debug.active_matrices += 2;
+                                update_debug.param_stats.addSlice(ll.A);
+                                update_debug.param_stats.addSlice(ll.B);
+                                try update_debug.update_stats.addDelta(before_a.?, ll.A);
+                                try update_debug.update_stats.addDelta(before_b.?, ll.B);
+                                const a_state = lora_opt_state.param_states.get(a_key);
+                                const b_state = lora_opt_state.param_states.get(b_key);
+                                if (a_state) |state| {
+                                    update_debug.adam_m_stats.addSlice(state.m);
+                                    update_debug.adam_v_stats.addSlice(state.v);
+                                }
+                                if (b_state) |state| {
+                                    update_debug.adam_m_stats.addSlice(state.m);
+                                    update_debug.adam_v_stats.addSlice(state.v);
+                                }
+                                try appendLoRAUpdateMatrixDebug(
+                                    allocator,
+                                    &update_debug,
+                                    ll.layer_idx,
+                                    ll.module_name,
+                                    "A",
+                                    before_a.?,
+                                    ll.A,
+                                    a_state,
+                                );
+                                try appendLoRAUpdateMatrixDebug(
+                                    allocator,
+                                    &update_debug,
+                                    ll.layer_idx,
+                                    ll.module_name,
+                                    "B",
+                                    before_b.?,
+                                    ll.B,
+                                    b_state,
+                                );
+                                if (update_debug.detail_printed < 12) {
+                                    try printLoRAUpdateDebugDetail(summary.step, ll.layer_idx, ll.module_name, "A", layer_lr, ll.grad_A, before_a.?, ll.A, a_state);
+                                    update_debug.detail_printed += 1;
+                                }
+                                if (update_debug.detail_printed < 12) {
+                                    try printLoRAUpdateDebugDetail(summary.step, ll.layer_idx, ll.module_name, "B", b_lr, ll.grad_B, before_b.?, ll.B, b_state);
+                                    update_debug.detail_printed += 1;
+                                }
+                            }
                         }
                         const repaired = sanitizeLoRAAdapterSet(la) + optimizers.sanitizeState(&lora_opt_state);
                         if (repaired > 0) {
@@ -3552,6 +9321,81 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 repaired,
                                 summary.step,
                             });
+                        }
+                        if (debug_update_step_now) {
+                            const update_to_param = if (update_debug.param_stats.l2() > 0.0)
+                                update_debug.update_stats.l2() / update_debug.param_stats.l2()
+                            else
+                                0.0;
+                            print(
+                                "lora_update_diagnostic step={d} active_adapters={d} active_matrices={d} base_lr={d} lora_plus_ratio={d} optimizer_step_count={d} param_elems={d} param_norm={d:.9} update_elems={d} update_norm={d:.9} update_max_abs={d:.9} update_mean_abs={d:.9} update_to_param={d:.9} adam_m_norm={d:.9} adam_v_norm={d:.9} repaired_after_update={d}\n",
+                                .{
+                                    summary.step,
+                                    update_debug.active_layers,
+                                    update_debug.active_matrices,
+                                    base_lr,
+                                    la.config.lora_plus_ratio,
+                                    lora_opt_state.step_count,
+                                    update_debug.param_stats.elems,
+                                    update_debug.param_stats.l2(),
+                                    update_debug.update_stats.elems,
+                                    update_debug.update_stats.l2(),
+                                    update_debug.update_stats.max_abs,
+                                    update_debug.update_stats.meanAbs(),
+                                    update_to_param,
+                                    update_debug.adam_m_stats.l2(),
+                                    update_debug.adam_v_stats.l2(),
+                                    repaired,
+                                },
+                            );
+                            if (opts.debug_step_json_path) |json_path| {
+                                const boundary_ctx = step_parity_boundary orelse return error.MissingDebugBoundaryStepForParityJson;
+                                try writeStepParityJson(
+                                    json_path,
+                                    "apply_update",
+                                    &opts,
+                                    trainer.loss_config.lambda_embed,
+                                    epoch,
+                                    step,
+                                    summary.step,
+                                    trainer.step_count,
+                                    batch_indices,
+                                    &batch,
+                                    total_tokens,
+                                    boundary_ctx,
+                                    step_parity_contrastive,
+                                    step_parity_upstream_grad_probe,
+                                    encoder_replay_upstream_probe,
+                                    step_parity_segment_vjp,
+                                    step_parity_layer_backward_decomp,
+                                    step_parity_softmax_vjp,
+                                    step_parity_qkv_split_vjp,
+                                    .{
+                                        .grad_clip = lora_grad_clip,
+                                        .active_adapters = update_debug.active_layers,
+                                        .active_matrices = update_debug.active_matrices,
+                                        .base_lr = base_lr,
+                                        .lora_plus_ratio = la.config.lora_plus_ratio,
+                                        .optimizer_step_count = lora_opt_state.step_count,
+                                        .param_elems = update_debug.param_stats.elems,
+                                        .param_norm = update_debug.param_stats.l2(),
+                                        .update_elems = update_debug.update_stats.elems,
+                                        .update_norm = update_debug.update_stats.l2(),
+                                        .update_max_abs = update_debug.update_stats.max_abs,
+                                        .update_mean_abs = update_debug.update_stats.meanAbs(),
+                                        .update_to_param = update_to_param,
+                                        .adam_m_norm = update_debug.adam_m_stats.l2(),
+                                        .adam_v_norm = update_debug.adam_v_stats.l2(),
+                                        .repaired_after_update = repaired,
+                                        .matrix_stats = update_debug.matrix_stats.items,
+                                    },
+                                    la,
+                                );
+                            }
+                            if (opts.debug_update_step_exit) {
+                                print("debug_update_step exiting after optimizer update\n", .{});
+                                return;
+                            }
                         }
                         la.zeroGrads();
                         step_timing.lora_update_ns = elapsedNs(lora_update_start_ns);
@@ -3755,6 +9599,95 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             step_timing.total_ns = elapsedNs(step_start_ns);
             epoch_timing.add(step_timing, actual_batch);
             step += 1;
+            last_step_loss = summary.total_loss;
+
+            const supervision_counts = computeSupervisionCounts(
+                boundary_labels_2,
+                attn_mask_f32,
+                total_tokens,
+            );
+            const sample_memory_now = opts.memory_sample_every <= 1 or
+                summary.step == 1 or
+                summary.step % opts.memory_sample_every == 0;
+            const memory_snapshot = if (sample_memory_now)
+                memory_tracker.observe()
+            else
+                ProcessMemorySnapshot{
+                    .available = memory_tracker.last_resident_bytes > 0,
+                    .resident_bytes = memory_tracker.last_resident_bytes,
+                    .footprint_bytes = 0,
+                };
+            try writeStepMetric(
+                &metrics_writer,
+                epoch,
+                step,
+                actual_batch,
+                total_tokens,
+                summary,
+                step_timing,
+                supervision_counts,
+                use_metal,
+                last_vjp_profile,
+                memory_snapshot,
+                memory_tracker.peak_resident_bytes,
+            );
+            if (memory_snapshot.available and opts.memory_warn_rss_bytes > 0 and
+                !memory_tracker.warning_emitted and
+                memory_snapshot.resident_bytes >= opts.memory_warn_rss_bytes)
+            {
+                memory_tracker.warning_emitted = true;
+                print("memory_watchdog warning resident_bytes={d} warn_threshold={d} peak_resident_bytes={d} global_step={d}\n", .{
+                    memory_snapshot.resident_bytes,
+                    opts.memory_warn_rss_bytes,
+                    memory_tracker.peak_resident_bytes,
+                    summary.step,
+                });
+            }
+            if (memory_snapshot.available and opts.memory_abort_rss_bytes > 0 and
+                memory_snapshot.resident_bytes >= opts.memory_abort_rss_bytes)
+            {
+                const abort_ckpt_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/checkpoint_memory_abort_{d}.safetensors",
+                    .{ opts.output_dir, summary.step },
+                );
+                defer allocator.free(abort_ckpt_path);
+                try savePeriodicTrainingCheckpoint(
+                    allocator,
+                    &opts,
+                    &trainer,
+                    if (lora_adapters_opt) |*la| la else null,
+                    &lora_opt_state,
+                    splade_w,
+                    splade_vocab_size,
+                    "memory_abort",
+                    summary.step,
+                );
+                try writeFusedTrainingManifest(
+                    allocator,
+                    manifest_path,
+                    &opts,
+                    if (use_metal) "metal" else "native",
+                    metrics_path,
+                    train_stats,
+                    validation_stats,
+                    "memory_abort",
+                    trainer.step_count,
+                    summary.total_loss,
+                    abort_ckpt_path,
+                    @intCast(best_val_step),
+                    best_val_epoch,
+                    best_val_f1,
+                    memory_tracker.peak_resident_bytes,
+                );
+                print("memory_watchdog abort resident_bytes={d} abort_threshold={d} peak_resident_bytes={d} checkpoint={s}\n", .{
+                    memory_snapshot.resident_bytes,
+                    opts.memory_abort_rss_bytes,
+                    memory_tracker.peak_resident_bytes,
+                    abort_ckpt_path,
+                });
+                return error.MemoryAbortThresholdExceeded;
+            }
 
             if (opts.log_every > 0 and (step == 1 or step % opts.log_every == 0)) {
                 print(
@@ -3805,6 +9738,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     &opts,
                     &trainer,
                     if (lora_adapters_opt) |*la| la else null,
+                    &lora_opt_state,
                     splade_w,
                     splade_vocab_size,
                     "step",
@@ -3832,8 +9766,9 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     use_metal,
                     if (lora_adapters_opt) |*la| la else null,
                 );
+                const eval_ms = nsToMs(elapsedNs(val_eval_start_ns));
                 print(
-                    "validation step {d} epoch {d}/{d} samples={d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} | eval_ms {d:.2}\n",
+                    "validation step {d} epoch {d}/{d} samples={d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
                     .{
                         summary.step,
                         epoch + 1,
@@ -3858,8 +9793,20 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         val_summary.best_predicted_positive_rate,
                         val_summary.mean_positive_probability_gold_positive,
                         val_summary.mean_positive_probability_gold_negative,
-                        nsToMs(elapsedNs(val_eval_start_ns)),
+                        val_summary.mean_boundary_margin_gold_positive,
+                        val_summary.mean_boundary_margin_gold_negative,
+                        eval_ms,
                     },
+                );
+                try writeValidationMetric(
+                    &metrics_writer,
+                    "validation_step",
+                    epoch,
+                    summary.step,
+                    step_eval_samples.len,
+                    val_samples.len,
+                    eval_ms,
+                    val_summary,
                 );
                 fused_chunker_train.printBoundaryQualityDiagnostics("validation_step_quality", val_summary);
 
@@ -3903,6 +9850,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 examplesPerSecond(epoch_timing.examples, epoch_timing.total_ns),
             },
         );
+        try writeEpochMetric(&metrics_writer, epoch, opts.epochs, step, epoch_timing);
 
         // Flush any partial gradient accumulation window left at epoch end.
         try trainer.flushEpochEnd(allocator);
@@ -3918,6 +9866,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 &opts,
                 &trainer,
                 if (lora_adapters_opt) |*la| la else null,
+                &lora_opt_state,
                 splade_w,
                 splade_vocab_size,
                 "epoch",
@@ -3940,8 +9889,9 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 use_metal,
                 if (lora_adapters_opt) |*la| la else null,
             );
+            const eval_ms = nsToMs(elapsedNs(val_eval_start_ns));
             print(
-                "validation epoch {d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} | eval_ms {d:.2}\n",
+                "validation epoch {d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
                 .{
                     epoch + 1,
                     opts.epochs,
@@ -3963,8 +9913,20 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     val_summary.best_predicted_positive_rate,
                     val_summary.mean_positive_probability_gold_positive,
                     val_summary.mean_positive_probability_gold_negative,
-                    nsToMs(elapsedNs(val_eval_start_ns)),
+                    val_summary.mean_boundary_margin_gold_positive,
+                    val_summary.mean_boundary_margin_gold_negative,
+                    eval_ms,
                 },
+            );
+            try writeValidationMetric(
+                &metrics_writer,
+                "validation_epoch",
+                epoch,
+                trainer.step_count,
+                val_samples.len,
+                val_samples.len,
+                eval_ms,
+                val_summary,
             );
             fused_chunker_train.printBoundaryQualityDiagnostics("validation_epoch_quality", val_summary);
 
@@ -3996,7 +9958,13 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     if (opts.save_optimizer_state) {
         var opt_final_buf: [512]u8 = undefined;
         const opt_final_path = try std.fmt.bufPrint(&opt_final_buf, "{s}/checkpoint_final_optimizer.safetensors", .{opts.output_dir});
-        try trainer.saveOptimizerState(allocator, opt_final_path);
+        try saveFusedOptimizerState(
+            allocator,
+            opt_final_path,
+            &trainer,
+            if (lora_adapters_opt) |*la| la else null,
+            &lora_opt_state,
+        );
         print("optimizer state saved to {s}\n", .{opt_final_path});
     }
 
@@ -4019,6 +9987,24 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             opts.output_dir,
         });
     }
+
+    try writeFusedTrainingManifest(
+        allocator,
+        manifest_path,
+        &opts,
+        if (use_metal) "metal" else "native",
+        metrics_path,
+        train_stats,
+        validation_stats,
+        "complete",
+        trainer.step_count,
+        last_step_loss,
+        final_path,
+        @intCast(best_val_step),
+        best_val_epoch,
+        best_val_f1,
+        memory_tracker.peak_resident_bytes,
+    );
 
     print("training complete\n", .{});
 }
@@ -4056,6 +10042,8 @@ fn printUsage() void {
         \\  --focal-gamma <f>         Alias for --boundary-focal-gamma
         \\  --boundary-focal-alpha <f> Boundary focal positive alpha when loss type is focal (default: 0.75)
         \\  --focal-alpha <f>         Alias for --boundary-focal-alpha
+        \\  --contrastive-focal-gamma <f> Dense contrastive focal gamma (default: 0.0, disabled)
+        \\  --contrastive-focal-alpha <f> Dense contrastive focal alpha (default: 0.75)
         \\  --boundary-pos-weight <f> Positive class weight for CE loss (default: 5.0)
         \\  --pos-weight <f>          Alias for --boundary-pos-weight
         \\  --boundary-dropout <f>    Boundary head dropout rate (default: 0.1)
@@ -4083,6 +10071,8 @@ fn printUsage() void {
         \\  --optimizer adamw|schedule-free Optimizer selection (default: adamw)
         \\  --schedule-free           Use Schedule-Free AdamW
         \\  --neftune-alpha <f>       NEFTune noise magnitude (default: 0.0=disabled)
+        \\  --encoder-neftune         Apply NEFTune to encoder forwards when alpha > 0 (default)
+        \\  --disable-encoder-neftune Keep configured NEFTune alpha but disable encoder noise
         \\  --xbm-capacity <n>        Cross-Batch Memory capacity (default: 0=disabled)
         \\  --llrd-decay <f>          Layer-wise LR decay (default: 1.0=disabled)
         \\  --lisa-sample <n>         LISA random layers per step (default: 0=disabled)
@@ -4102,10 +10092,27 @@ fn printUsage() void {
         \\  --mrl-dims <s>            Comma-separated MRL dims (default: "768,256,128")
         \\  --resume-from <path>      Resume training from a checkpoint file
         \\  --save-optimizer-state    Save Adam optimizer state alongside each checkpoint
+        \\  --deterministic           Disable shuffle, boundary dropout, and NEFTune for parity probes
+        \\  --go-epoch-shuffle        Reset to identity and reseed shuffle as seed+epoch+1 to match Go training epoch order
+        \\  --report-to <path>        Write fused training metrics JSONL (default: <output>/fused_training_metrics.jsonl)
+        \\  --manifest <path>         Write fused training manifest JSON (default: <output>/fused_training_manifest.json)
+        \\  --memory-sample-every <n> Sample process RSS every N steps (default: 1)
+        \\  --memory-warn-rss-gb <f>  Print a memory watchdog warning above this RSS in GiB
+        \\  --memory-abort-rss-gb <f> Save checkpoint and abort above this RSS in GiB
         \\  --debug-first-boundary-step Print first-batch boundary diagnostics before the first update
         \\  --debug-first-boundary-step-exit Print first-batch diagnostics and exit before the first update
         \\  --debug-boundary-step <n> Print boundary diagnostics before global training step N
         \\  --debug-boundary-step-exit Exit after --debug-boundary-step diagnostics
+        \\  --debug-update-step <n>   Print LoRA gradient clip, AdamW moment, and update-delta diagnostics after global training step N
+        \\  --debug-update-step-exit  Exit after --debug-update-step diagnostics
+        \\  --debug-step-json <path>  Write machine-readable frozen-step parity diagnostics for the selected debug step
+        \\  --debug-batch-offset <n>  Override resumed batch offset for frozen-step parity diagnostics
+        \\  --debug-encoder-probe-layer <n> Capture target encoder layer internals in frozen-step parity JSON (default: 0)
+        \\  --debug-encoder-layer-inputs-only Capture the encoder layer-input ladder without target-layer internals
+        \\  --debug-encoder-replay-input <path> Write target encoder layer input as little-endian f32 for same-input replay
+        \\  --debug-encoder-replay-upstream <path> Write target encoder upstream gradient as little-endian f32 for same-upstream replay
+        \\  --debug-layer-backward-decomp Emit opt-in layer backward decomposition probe in frozen-step parity JSON
+        \\  --debug-qkv-split-vjp     Emit opt-in QKV split VJP primitive probe in frozen-step parity JSON
         \\
     , .{});
 }

@@ -33,6 +33,9 @@ const ComputeBackend = ops_mod.ComputeBackend;
 const CT = ops_mod.CT;
 
 pub const contrastive_gradient_path = "direct_mean_pool_scatter";
+const tensor_probe_hash_offset: u64 = 14695981039346656037;
+const tensor_probe_hash_prime: u64 = 1099511628211;
+const tensor_probe_top_abs_count: usize = 8;
 const training = @import("../graph/training.zig");
 const compat = @import("../io/compat.zig");
 const native_compute = @import("../ops/native_compute.zig");
@@ -78,6 +81,8 @@ pub const FusedTrainingConfig = struct {
     use_boundary_focal: bool = false,
     focal_gamma: f32 = 2.0,
     focal_alpha: f32 = 0.75,
+    contrastive_focal_gamma: f32 = 0.0,
+    contrastive_focal_alpha: f32 = 0.75,
     pos_weight: f32 = 5.0,
     boundary_dropout: f32 = 0.1,
 
@@ -420,6 +425,7 @@ pub const TrainStepSummary = struct {
     boundary_loss: f32 = 0,
     contrastive_loss: f64 = 0,
     total_loss: f32 = 0,
+    boundary_grad_norm: f64 = 0,
     boundary_tp: u64 = 0,
     boundary_fp: u64 = 0,
     boundary_fn: u64 = 0,
@@ -432,6 +438,9 @@ pub const TrainStepWithGradSummary = struct {
     /// dL/d(features): [total_tokens * hidden_size] — owned, caller must free.
     /// null if no gradient was available.
     features_grad: ?[]f32,
+    boundary_features_grad_stats: BoundaryProbeTensorStats = .{},
+    contrastive_features_grad_stats: BoundaryProbeTensorStats = .{},
+    combined_features_grad_stats: BoundaryProbeTensorStats = .{},
 
     pub fn deinit(self: *TrainStepWithGradSummary, allocator: std.mem.Allocator) void {
         if (self.features_grad) |g| allocator.free(g);
@@ -459,6 +468,38 @@ pub const BoundaryStepDebugSummary = struct {
     eval_f1: f32 = 0,
     eval_mean_prob_gold_positive: f32 = 0,
     eval_mean_prob_gold_negative: f32 = 0,
+    boundary_forward_probe: BoundaryForwardProbe = .{},
+    boundary_checkpoint_probe: BoundaryCheckpointProbe = .{},
+};
+
+pub const BoundaryProbeTensorStats = struct {
+    elems: u64 = 0,
+    mean: f32 = 0,
+    rms: f32 = 0,
+    max_abs: f32 = 0,
+    max_abs_index: u64 = 0,
+    max_abs_value: f32 = 0,
+    hash: u64 = tensor_probe_hash_offset,
+    sample_len: u8 = 0,
+    sample: [16]f32 = [_]f32{0} ** 16,
+    top_abs_len: u8 = 0,
+    top_abs_indices: [tensor_probe_top_abs_count]u64 = [_]u64{0} ** tensor_probe_top_abs_count,
+    top_abs_values: [tensor_probe_top_abs_count]f32 = [_]f32{0} ** tensor_probe_top_abs_count,
+};
+
+pub const BoundaryForwardProbe = struct {
+    final_norm_input: BoundaryProbeTensorStats = .{},
+    boundary_head_input: BoundaryProbeTensorStats = .{},
+    dense1_pre_activation: BoundaryProbeTensorStats = .{},
+    dense1_post_activation: BoundaryProbeTensorStats = .{},
+    logits: BoundaryProbeTensorStats = .{},
+};
+
+pub const BoundaryCheckpointProbe = struct {
+    w1: BoundaryProbeTensorStats = .{},
+    b1: BoundaryProbeTensorStats = .{},
+    w2: BoundaryProbeTensorStats = .{},
+    b2: BoundaryProbeTensorStats = .{},
 };
 
 // ----------------------------------------------------------------------------
@@ -502,6 +543,12 @@ pub const EvalSummary = struct {
     best_predicted_positive_rate: f32 = 0,
     mean_positive_probability_gold_positive: f32 = 0,
     mean_positive_probability_gold_negative: f32 = 0,
+    mean_boundary_margin_gold_positive: f32 = 0,
+    mean_boundary_margin_gold_negative: f32 = 0,
+    mean_logit0_gold_positive: f32 = 0,
+    mean_logit1_gold_positive: f32 = 0,
+    mean_logit0_gold_negative: f32 = 0,
+    mean_logit1_gold_negative: f32 = 0,
     num_batches: u32 = 0,
     threshold_points: [diagnostic_threshold_count]ThresholdPoint = [_]ThresholdPoint{.{}} ** diagnostic_threshold_count,
     probability_histogram_gold_positive: [histogram_bucket_count]u64 = [_]u64{0} ** histogram_bucket_count,
@@ -518,6 +565,12 @@ pub const BoundaryEvalAccumulator = struct {
     gold_positives: u64 = 0,
     prob_sum_gold_positive: f64 = 0,
     prob_sum_gold_negative: f64 = 0,
+    margin_sum_gold_positive: f64 = 0,
+    margin_sum_gold_negative: f64 = 0,
+    logit0_sum_gold_positive: f64 = 0,
+    logit1_sum_gold_positive: f64 = 0,
+    logit0_sum_gold_negative: f64 = 0,
+    logit1_sum_gold_negative: f64 = 0,
     probability_histogram_gold_positive: [EvalSummary.histogram_bucket_count]u64 = [_]u64{0} ** EvalSummary.histogram_bucket_count,
     probability_histogram_gold_negative: [EvalSummary.histogram_bucket_count]u64 = [_]u64{0} ** EvalSummary.histogram_bucket_count,
     num_batches: u32 = 0,
@@ -548,14 +601,23 @@ pub const BoundaryEvalAccumulator = struct {
                 if (m[i] <= 0.5) continue;
             }
             self.valid_tokens += 1;
-            const prob = fused_chunker_loss.positiveBoundaryProbability(logits[i * 2], logits[i * 2 + 1]);
+            const logit0 = logits[i * 2];
+            const logit1 = logits[i * 2 + 1];
+            const margin = logit1 - logit0;
+            const prob = fused_chunker_loss.positiveBoundaryProbability(logit0, logit1);
             const bucket = probabilityBucket(prob);
             if (scalar_labels[i] > 0.5) {
                 self.gold_positives += 1;
                 self.prob_sum_gold_positive += prob;
+                self.margin_sum_gold_positive += margin;
+                self.logit0_sum_gold_positive += logit0;
+                self.logit1_sum_gold_positive += logit1;
                 self.probability_histogram_gold_positive[bucket] += 1;
             } else {
                 self.prob_sum_gold_negative += prob;
+                self.margin_sum_gold_negative += margin;
+                self.logit0_sum_gold_negative += logit0;
+                self.logit1_sum_gold_negative += logit1;
                 self.probability_histogram_gold_negative[bucket] += 1;
             }
         }
@@ -612,6 +674,30 @@ pub const BoundaryEvalAccumulator = struct {
             0.0
         else
             @as(f32, @floatCast(self.prob_sum_gold_negative / @as(f64, @floatFromInt(gold_negatives))));
+        const mean_margin_gold_positive = if (self.gold_positives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.margin_sum_gold_positive / @as(f64, @floatFromInt(self.gold_positives))));
+        const mean_margin_gold_negative = if (gold_negatives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.margin_sum_gold_negative / @as(f64, @floatFromInt(gold_negatives))));
+        const mean_logit0_gold_positive = if (self.gold_positives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.logit0_sum_gold_positive / @as(f64, @floatFromInt(self.gold_positives))));
+        const mean_logit1_gold_positive = if (self.gold_positives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.logit1_sum_gold_positive / @as(f64, @floatFromInt(self.gold_positives))));
+        const mean_logit0_gold_negative = if (gold_negatives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.logit0_sum_gold_negative / @as(f64, @floatFromInt(gold_negatives))));
+        const mean_logit1_gold_negative = if (gold_negatives == 0)
+            0.0
+        else
+            @as(f32, @floatCast(self.logit1_sum_gold_negative / @as(f64, @floatFromInt(gold_negatives))));
         var threshold_points: [EvalSummary.diagnostic_threshold_count]EvalSummary.ThresholdPoint = [_]EvalSummary.ThresholdPoint{.{}} ** EvalSummary.diagnostic_threshold_count;
         for (diagnostic_thresholds, 0..) |threshold, i| {
             const sweep_idx = @min(@as(usize, @intFromFloat(@round(threshold * @as(f32, @floatFromInt(sweep_count - 1))))), sweep_count - 1);
@@ -652,6 +738,12 @@ pub const BoundaryEvalAccumulator = struct {
             .best_predicted_positive_rate = best_predicted_positive_rate,
             .mean_positive_probability_gold_positive = mean_pos_prob_gold_positive,
             .mean_positive_probability_gold_negative = mean_pos_prob_gold_negative,
+            .mean_boundary_margin_gold_positive = mean_margin_gold_positive,
+            .mean_boundary_margin_gold_negative = mean_margin_gold_negative,
+            .mean_logit0_gold_positive = mean_logit0_gold_positive,
+            .mean_logit1_gold_positive = mean_logit1_gold_positive,
+            .mean_logit0_gold_negative = mean_logit0_gold_negative,
+            .mean_logit1_gold_negative = mean_logit1_gold_negative,
             .num_batches = self.num_batches,
             .threshold_points = threshold_points,
             .probability_histogram_gold_positive = self.probability_histogram_gold_positive,
@@ -661,6 +753,16 @@ pub const BoundaryEvalAccumulator = struct {
 };
 
 pub fn printBoundaryQualityDiagnostics(label: []const u8, summary: EvalSummary) void {
+    std.debug.print("{s} margin_means gold_pos={d:.6} gold_neg={d:.6} logit0_pos={d:.6} logit1_pos={d:.6} logit0_neg={d:.6} logit1_neg={d:.6}\n", .{
+        label,
+        summary.mean_boundary_margin_gold_positive,
+        summary.mean_boundary_margin_gold_negative,
+        summary.mean_logit0_gold_positive,
+        summary.mean_logit1_gold_positive,
+        summary.mean_logit0_gold_negative,
+        summary.mean_logit1_gold_negative,
+    });
+
     std.debug.print("{s} threshold_sweep", .{label});
     for (summary.threshold_points) |point| {
         std.debug.print(" t={d:.2}:f1={d:.4},p={d:.4},r={d:.4},pred={d:.6}", .{
@@ -767,6 +869,8 @@ pub const FusedTrainer = struct {
             .use_focal = config.use_boundary_focal,
             .focal_gamma = config.focal_gamma,
             .focal_alpha = config.focal_alpha,
+            .contrastive_focal_gamma = config.contrastive_focal_gamma,
+            .contrastive_focal_alpha = config.contrastive_focal_alpha,
             .temperature = config.temperature,
             .pos_weight = config.pos_weight,
             .enable_splade = config.enable_splade,
@@ -1049,6 +1153,15 @@ pub const FusedTrainer = struct {
             const grad = self.features_grad;
             self.features_grad = null;
             return grad;
+        }
+
+        fn gradNorm(self: *const BoundaryTrainStepResult) f64 {
+            var total_sq: f64 = 0;
+            addGradientNormSq(&total_sq, self.w1_grad);
+            addGradientNormSq(&total_sq, self.b1_grad);
+            addGradientNormSq(&total_sq, self.w2_grad);
+            addGradientNormSq(&total_sq, self.b2_grad);
+            return @sqrt(total_sq);
         }
     };
 
@@ -1459,8 +1572,8 @@ pub const FusedTrainer = struct {
                         E,
                         mrl_config,
                         self.loss_config.temperature,
-                        self.loss_config.focal_gamma,
-                        self.loss_config.focal_alpha,
+                        self.loss_config.contrastive_focal_gamma,
+                        self.loss_config.contrastive_focal_alpha,
                     );
                     break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
                 } else try infonce_cpu.computeContrastiveLossOnCPU(
@@ -1473,8 +1586,8 @@ pub const FusedTrainer = struct {
                     1,
                     n_total,
                     E,
-                    @as(f64, self.loss_config.focal_gamma),
-                    @as(f64, self.loss_config.focal_alpha),
+                    @as(f64, self.loss_config.contrastive_focal_gamma),
+                    @as(f64, self.loss_config.contrastive_focal_alpha),
                 );
                 result_ready = true;
                 return out;
@@ -1495,8 +1608,8 @@ pub const FusedTrainer = struct {
                 E,
                 mrl_config,
                 self.loss_config.temperature,
-                self.loss_config.focal_gamma,
-                self.loss_config.focal_alpha,
+                self.loss_config.contrastive_focal_gamma,
+                self.loss_config.contrastive_focal_alpha,
             );
             break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
         } else try infonce_cpu.computeContrastiveLossOnCPU(
@@ -1509,8 +1622,8 @@ pub const FusedTrainer = struct {
             B,
             C,
             E,
-            @as(f64, self.loss_config.focal_gamma),
-            @as(f64, self.loss_config.focal_alpha),
+            @as(f64, self.loss_config.contrastive_focal_gamma),
+            @as(f64, self.loss_config.contrastive_focal_alpha),
         );
         result_ready = true;
         return out;
@@ -1552,6 +1665,7 @@ pub const FusedTrainer = struct {
         sanitizeBoundaryStepGradients(&boundary_step);
 
         const boundary_loss = boundary_step.boundary_loss;
+        const boundary_grad_norm = boundary_step.gradNorm();
 
         // 4. Get current learning rate
         const lr = self.lr_schedule.lr(self.step_count);
@@ -1619,8 +1733,8 @@ pub const FusedTrainer = struct {
                             E,
                             mrl_config,
                             self.loss_config.temperature,
-                            self.loss_config.focal_gamma,
-                            self.loss_config.focal_alpha,
+                            self.loss_config.contrastive_focal_gamma,
+                            self.loss_config.contrastive_focal_alpha,
                         );
                         break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
                     } else try infonce_cpu.computeContrastiveLossOnCPU(
@@ -1633,8 +1747,8 @@ pub const FusedTrainer = struct {
                         1,
                         n_total,
                         E,
-                        @as(f64, self.loss_config.focal_gamma),
-                        @as(f64, self.loss_config.focal_alpha),
+                        @as(f64, self.loss_config.contrastive_focal_gamma),
+                        @as(f64, self.loss_config.contrastive_focal_alpha),
                     );
                     break :blk expanded;
                 }
@@ -1653,8 +1767,8 @@ pub const FusedTrainer = struct {
                     E,
                     mrl_config,
                     self.loss_config.temperature,
-                    self.loss_config.focal_gamma,
-                    self.loss_config.focal_alpha,
+                    self.loss_config.contrastive_focal_gamma,
+                    self.loss_config.contrastive_focal_alpha,
                 );
                 break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
             } else try infonce_cpu.computeContrastiveLossOnCPU(
@@ -1667,8 +1781,8 @@ pub const FusedTrainer = struct {
                 B,
                 C,
                 E,
-                @as(f64, self.loss_config.focal_gamma),
-                @as(f64, self.loss_config.focal_alpha),
+                @as(f64, self.loss_config.contrastive_focal_gamma),
+                @as(f64, self.loss_config.contrastive_focal_alpha),
             );
             break :blk chunk_embeddings;
         };
@@ -1699,6 +1813,7 @@ pub const FusedTrainer = struct {
             .boundary_loss = boundary_loss,
             .contrastive_loss = contrastive_result.contrastive_loss,
             .total_loss = total_loss,
+            .boundary_grad_norm = boundary_grad_norm,
             .boundary_tp = 0,
             .boundary_fp = 0,
             .boundary_fn = 0,
@@ -1736,6 +1851,7 @@ pub const FusedTrainer = struct {
         pooled_batch_size: usize,
         pooled_max_seq_len: usize,
         pooled_max_chunks: usize,
+        want_upstream_grad_probe: bool,
     ) !TrainStepWithGradSummary {
         self.optimizer_state.step_count = self.step_count + 1;
         self.sanitizeBoundaryHeadParameters();
@@ -1751,6 +1867,7 @@ pub const FusedTrainer = struct {
         sanitizeBoundaryStepGradients(&boundary_step);
 
         const boundary_loss = boundary_step.boundary_loss;
+        const boundary_grad_norm = boundary_step.gradNorm();
 
         // 4. Get current learning rate
         const lr = self.lr_schedule.lr(self.step_count);
@@ -1759,6 +1876,12 @@ pub const FusedTrainer = struct {
         //    scatter/accumulation path can consume it.
         var features_grad_owned: ?[]f32 = boundary_step.takeFeaturesGrad();
         errdefer if (features_grad_owned) |g| allocator.free(g);
+        const boundary_features_grad_stats = if (features_grad_owned) |grad|
+            computeBoundaryProbeTensorStats(grad)
+        else
+            BoundaryProbeTensorStats{};
+        var contrastive_features_grad_stats = BoundaryProbeTensorStats{};
+        var combined_features_grad_stats = BoundaryProbeTensorStats{};
 
         // 6. Accumulate gradients — scale by 1/accum_steps before adding
         const w1_grad = boundary_step.w1_grad;
@@ -1820,8 +1943,8 @@ pub const FusedTrainer = struct {
                             E,
                             mrl_config,
                             self.loss_config.temperature,
-                            self.loss_config.focal_gamma,
-                            self.loss_config.focal_alpha,
+                            self.loss_config.contrastive_focal_gamma,
+                            self.loss_config.contrastive_focal_alpha,
                         );
                         break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
                     } else try infonce_cpu.computeContrastiveLossOnCPU(
@@ -1834,8 +1957,8 @@ pub const FusedTrainer = struct {
                         1,
                         n_total,
                         E,
-                        @as(f64, self.loss_config.focal_gamma),
-                        @as(f64, self.loss_config.focal_alpha),
+                        @as(f64, self.loss_config.contrastive_focal_gamma),
+                        @as(f64, self.loss_config.contrastive_focal_alpha),
                     );
                     break :blk expanded;
                 }
@@ -1854,8 +1977,8 @@ pub const FusedTrainer = struct {
                     E,
                     mrl_config,
                     self.loss_config.temperature,
-                    self.loss_config.focal_gamma,
-                    self.loss_config.focal_alpha,
+                    self.loss_config.contrastive_focal_gamma,
+                    self.loss_config.contrastive_focal_alpha,
                 );
                 break :mrl_blk self.mrlContrastiveResult(allocator, &mrl);
             } else try infonce_cpu.computeContrastiveLossOnCPU(
@@ -1868,8 +1991,8 @@ pub const FusedTrainer = struct {
                 B,
                 C,
                 E,
-                @as(f64, self.loss_config.focal_gamma),
-                @as(f64, self.loss_config.focal_alpha),
+                @as(f64, self.loss_config.contrastive_focal_gamma),
+                @as(f64, self.loss_config.contrastive_focal_alpha),
             );
             break :blk chunk_embeddings;
         };
@@ -1889,26 +2012,58 @@ pub const FusedTrainer = struct {
         // backward graph lowering once that graph surface is ready.
         const pooled_chunk_count = pooled_batch_size * pooled_max_chunks;
         if (pooled_chunk_count > 0 and E > 0 and contrastive_result.grad.len >= pooled_chunk_count * E) {
-            if (features_grad_owned == null) {
-                features_grad_owned = try allocator.alloc(f32, total_tokens * self.config.hidden_size);
-                @memset(features_grad_owned.?, 0);
+            if (want_upstream_grad_probe) {
+                var contrastive_features_grad: ?[]f32 = try allocator.alloc(f32, total_tokens * self.config.hidden_size);
+                errdefer if (contrastive_features_grad) |grad| allocator.free(grad);
+                @memset(contrastive_features_grad.?, 0);
+                try fused_chunker_data.addMeanPoolChunkEmbeddingGradToFeatures(
+                    allocator,
+                    contrastive_features_grad.?,
+                    features,
+                    contrastive_result.grad[0 .. pooled_chunk_count * E],
+                    pooled_chunk_starts,
+                    pooled_chunk_ends,
+                    chunk_mask[0..pooled_chunk_count],
+                    attention_mask,
+                    pooled_batch_size,
+                    pooled_max_seq_len,
+                    pooled_max_chunks,
+                    E,
+                );
+                contrastive_features_grad_stats = computeBoundaryProbeTensorStats(contrastive_features_grad.?);
+                if (features_grad_owned) |grad| {
+                    for (grad, contrastive_features_grad.?) |*dst, src| dst.* += src;
+                    allocator.free(contrastive_features_grad.?);
+                    contrastive_features_grad = null;
+                } else {
+                    features_grad_owned = contrastive_features_grad.?;
+                    contrastive_features_grad = null;
+                }
+            } else {
+                if (features_grad_owned == null) {
+                    features_grad_owned = try allocator.alloc(f32, total_tokens * self.config.hidden_size);
+                    @memset(features_grad_owned.?, 0);
+                }
+                try fused_chunker_data.addMeanPoolChunkEmbeddingGradToFeatures(
+                    allocator,
+                    features_grad_owned.?,
+                    features,
+                    contrastive_result.grad[0 .. pooled_chunk_count * E],
+                    pooled_chunk_starts,
+                    pooled_chunk_ends,
+                    chunk_mask[0..pooled_chunk_count],
+                    attention_mask,
+                    pooled_batch_size,
+                    pooled_max_seq_len,
+                    pooled_max_chunks,
+                    E,
+                );
             }
-            try fused_chunker_data.addMeanPoolChunkEmbeddingGradToFeatures(
-                allocator,
-                features_grad_owned.?,
-                features,
-                contrastive_result.grad[0 .. pooled_chunk_count * E],
-                pooled_chunk_starts,
-                pooled_chunk_ends,
-                chunk_mask[0..pooled_chunk_count],
-                attention_mask,
-                pooled_batch_size,
-                pooled_max_seq_len,
-                pooled_max_chunks,
-                E,
-            );
         }
-        if (features_grad_owned) |grad| sanitizeGradientBufferInPlace(grad);
+        if (features_grad_owned) |grad| {
+            sanitizeGradientBufferInPlace(grad);
+            combined_features_grad_stats = computeBoundaryProbeTensorStats(grad);
+        }
 
         // Accumulate features_grad across microbatches for LoRA (Fix 4).
         // We null features_grad_owned after consuming it so the errdefer above
@@ -1961,6 +2116,7 @@ pub const FusedTrainer = struct {
             .boundary_loss = boundary_loss,
             .contrastive_loss = contrastive_result.contrastive_loss,
             .total_loss = total_loss,
+            .boundary_grad_norm = boundary_grad_norm,
             .boundary_tp = 0,
             .boundary_fp = 0,
             .boundary_fn = 0,
@@ -1971,6 +2127,9 @@ pub const FusedTrainer = struct {
         return TrainStepWithGradSummary{
             .summary = summary,
             .features_grad = final_features_grad,
+            .boundary_features_grad_stats = boundary_features_grad_stats,
+            .contrastive_features_grad_stats = contrastive_features_grad_stats,
+            .combined_features_grad_stats = combined_features_grad_stats,
         };
     }
 
@@ -2043,10 +2202,17 @@ pub const FusedTrainer = struct {
         defer boundary_step.deinit(allocator);
         sanitizeBoundaryStepGradients(&boundary_step);
 
-        const logits = if (self.legacy_dense_boundary_head) |*legacy_head|
-            try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, features, total_tokens)
-        else
-            try evaluateBoundaryLogitsSimple(allocator, &self.boundary_head, features, total_tokens);
+        var forward_probe = BoundaryForwardProbe{};
+        const logits = if (self.legacy_dense_boundary_head) |*legacy_head| blk: {
+            const legacy_logits = try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, features, total_tokens);
+            forward_probe.boundary_head_input = computeBoundaryProbeTensorStats(features);
+            forward_probe.logits = computeBoundaryProbeTensorStats(legacy_logits);
+            break :blk legacy_logits;
+        } else blk: {
+            const forward = try evaluateBoundaryForwardProbeSimple(allocator, &self.boundary_head, features, total_tokens);
+            forward_probe = forward.probe;
+            break :blk forward.logits;
+        };
         defer allocator.free(logits);
 
         var predicted_positives: u64 = 0;
@@ -2099,6 +2265,8 @@ pub const FusedTrainer = struct {
             .eval_f1 = (fused_chunker_loss.BoundaryMetrics{ .tp = tp, .fp = fp, .fn_ = fn_ }).f1(),
             .eval_mean_prob_gold_positive = if (count_pos > 0) @as(f32, @floatCast(prob_sum_pos / @as(f64, @floatFromInt(count_pos)))) else 0,
             .eval_mean_prob_gold_negative = if (count_neg > 0) @as(f32, @floatCast(prob_sum_neg / @as(f64, @floatFromInt(count_neg)))) else 0,
+            .boundary_forward_probe = forward_probe,
+            .boundary_checkpoint_probe = computeBoundaryCheckpointProbe(&self.boundary_head),
         };
     }
 
@@ -2370,12 +2538,20 @@ pub const FusedTrainer = struct {
             name_storage.deinit(allocator);
         }
 
+        var shape_storage = std.ArrayListUnmanaged([]usize).empty;
+        defer {
+            for (shape_storage.items) |shape| allocator.free(shape);
+            shape_storage.deinit(allocator);
+        }
+
         // adam_step as a 1-element f32 scalar.
         const step_val = [1]f32{@as(f32, @floatFromInt(self.optimizer_state.step_count))};
+        const step_shape = try allocator.dupe(usize, &.{1});
+        try shape_storage.append(allocator, step_shape);
         try tensor_list.append(allocator, .{
             .name = "adam_step",
             .data = &step_val,
-            .shape = &.{1},
+            .shape = step_shape,
         });
 
         // AdamW moment buffers for each head parameter.
@@ -2384,18 +2560,22 @@ pub const FusedTrainer = struct {
             if (self.optimizer_state.param_states.get(pname)) |ps| {
                 const m_name = try std.fmt.allocPrint(allocator, "adam_m_{s}", .{pname});
                 try name_storage.append(allocator, m_name);
+                const m_shape = try allocator.dupe(usize, &.{ps.m.len});
+                try shape_storage.append(allocator, m_shape);
                 try tensor_list.append(allocator, .{
                     .name = m_name,
                     .data = ps.m,
-                    .shape = &.{ps.m.len},
+                    .shape = m_shape,
                 });
                 if (ps.v.len > 0) {
                     const v_name = try std.fmt.allocPrint(allocator, "adam_v_{s}", .{pname});
                     try name_storage.append(allocator, v_name);
+                    const v_shape = try allocator.dupe(usize, &.{ps.v.len});
+                    try shape_storage.append(allocator, v_shape);
                     try tensor_list.append(allocator, .{
                         .name = v_name,
                         .data = ps.v,
-                        .shape = &.{ps.v.len},
+                        .shape = v_shape,
                     });
                 }
             }
@@ -2417,15 +2597,19 @@ pub const FusedTrainer = struct {
                 try name_storage.append(allocator, z_name);
                 const v_name = try std.fmt.allocPrint(allocator, "sf_v_{s}", .{pair.pname});
                 try name_storage.append(allocator, v_name);
+                const z_shape = try allocator.dupe(usize, &.{sf.z.len});
+                try shape_storage.append(allocator, z_shape);
+                const v_shape = try allocator.dupe(usize, &.{sf.v.len});
+                try shape_storage.append(allocator, v_shape);
                 try tensor_list.append(allocator, .{
                     .name = z_name,
                     .data = sf.z,
-                    .shape = &.{sf.z.len},
+                    .shape = z_shape,
                 });
                 try tensor_list.append(allocator, .{
                     .name = v_name,
                     .data = sf.v,
-                    .shape = &.{sf.v.len},
+                    .shape = v_shape,
                 });
             }
         }
@@ -2581,6 +2765,103 @@ fn maxAbsF32(values: []const f32) f32 {
         out = @max(out, @abs(value));
     }
     return out;
+}
+
+fn hashProbeF32(hash: *u64, value: f32) void {
+    var bits: u32 = @bitCast(value);
+    for (0..4) |_| {
+        hash.* ^= bits & 0xff;
+        hash.* *%= tensor_probe_hash_prime;
+        bits >>= 8;
+    }
+}
+
+fn addBoundaryProbeTopAbs(stats: *BoundaryProbeTensorStats, index: usize, value: f32) void {
+    const ax = @abs(value);
+    if (ax > stats.max_abs) {
+        stats.max_abs = ax;
+        stats.max_abs_index = @intCast(index);
+        stats.max_abs_value = value;
+    }
+
+    var insert_at: usize = undefined;
+    if (stats.top_abs_len < stats.top_abs_values.len) {
+        insert_at = stats.top_abs_len;
+        stats.top_abs_len += 1;
+    } else if (ax > @abs(stats.top_abs_values[stats.top_abs_values.len - 1])) {
+        insert_at = stats.top_abs_values.len - 1;
+    } else {
+        return;
+    }
+
+    while (insert_at > 0 and ax > @abs(stats.top_abs_values[insert_at - 1])) : (insert_at -= 1) {
+        stats.top_abs_values[insert_at] = stats.top_abs_values[insert_at - 1];
+        stats.top_abs_indices[insert_at] = stats.top_abs_indices[insert_at - 1];
+    }
+    stats.top_abs_values[insert_at] = value;
+    stats.top_abs_indices[insert_at] = @intCast(index);
+}
+
+pub fn computeBoundaryProbeTensorStats(values: []const f32) BoundaryProbeTensorStats {
+    var out = BoundaryProbeTensorStats{
+        .elems = @intCast(values.len),
+    };
+    var sum: f64 = 0;
+    var sum_sq: f64 = 0;
+    var finite_count: u64 = 0;
+    for (values, 0..) |value, i| {
+        if (i < out.sample.len) {
+            out.sample[i] = value;
+            out.sample_len = @intCast(i + 1);
+        }
+        hashProbeF32(&out.hash, value);
+        if (!std.math.isFinite(value)) continue;
+        const v: f64 = @floatCast(value);
+        sum += v;
+        sum_sq += v * v;
+        addBoundaryProbeTopAbs(&out, i, value);
+        finite_count += 1;
+    }
+    if (finite_count > 0) {
+        const denom = @as(f64, @floatFromInt(finite_count));
+        out.mean = @floatCast(sum / denom);
+        out.rms = @floatCast(@sqrt(sum_sq / denom));
+    }
+    return out;
+}
+
+pub fn computeZeroBoundaryProbeTensorStats(elems: usize) BoundaryProbeTensorStats {
+    var out = BoundaryProbeTensorStats{
+        .elems = @intCast(elems),
+        .sample_len = @intCast(@min(elems, 16)),
+    };
+    for (0..elems) |_| hashProbeF32(&out.hash, 0);
+    return out;
+}
+
+fn computeTransposedBoundaryProbeTensorStats(
+    values: []const f32,
+    rows: usize,
+    cols: usize,
+) BoundaryProbeTensorStats {
+    var out = computeBoundaryProbeTensorStats(values);
+    const sample_len = @min(values.len, out.sample.len);
+    out.sample_len = @intCast(sample_len);
+    for (0..sample_len) |i| {
+        const src_col = i / rows;
+        const src_row = i % rows;
+        out.sample[i] = values[src_row * cols + src_col];
+    }
+    return out;
+}
+
+fn computeBoundaryCheckpointProbe(head: *const BoundaryHead) BoundaryCheckpointProbe {
+    return .{
+        .w1 = computeTransposedBoundaryProbeTensorStats(head.w1, head.mlp_dim, head.hidden_dim),
+        .b1 = computeBoundaryProbeTensorStats(head.b1),
+        .w2 = computeTransposedBoundaryProbeTensorStats(head.w2, 2, head.mlp_dim),
+        .b2 = computeBoundaryProbeTensorStats(head.b2),
+    };
 }
 
 const BoundaryCeGradResult = struct {
@@ -2745,6 +3026,68 @@ fn evaluateBoundaryLogitsSimple(
     }
 
     return logits;
+}
+
+const BoundaryForwardProbeResult = struct {
+    logits: []f32,
+    probe: BoundaryForwardProbe,
+
+    fn deinit(self: *BoundaryForwardProbeResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.logits);
+        self.* = undefined;
+    }
+};
+
+fn evaluateBoundaryForwardProbeSimple(
+    allocator: std.mem.Allocator,
+    head: *const BoundaryHead,
+    features: []const f32,
+    total: usize,
+) !BoundaryForwardProbeResult {
+    const hidden_dim = head.hidden_dim;
+    const mlp_dim = head.mlp_dim;
+
+    const dense1 = try allocator.alloc(f32, total * mlp_dim);
+    defer allocator.free(dense1);
+
+    for (0..total) |i| {
+        for (0..mlp_dim) |j| {
+            var acc: f32 = head.b1[j];
+            for (0..hidden_dim) |k| {
+                acc += features[i * hidden_dim + k] * head.w1[j * hidden_dim + k];
+            }
+            dense1[i * mlp_dim + j] = acc;
+        }
+    }
+
+    const hidden = try allocator.alloc(f32, total * mlp_dim);
+    defer allocator.free(hidden);
+
+    for (dense1, hidden) |x, *h| {
+        h.* = geluF32(x);
+    }
+
+    const logits = try allocator.alloc(f32, total * 2);
+    errdefer allocator.free(logits);
+    for (0..total) |i| {
+        for (0..2) |j| {
+            var acc: f32 = head.b2[j];
+            for (0..mlp_dim) |k| {
+                acc += hidden[i * mlp_dim + k] * head.w2[j * mlp_dim + k];
+            }
+            logits[i * 2 + j] = acc;
+        }
+    }
+
+    return .{
+        .logits = logits,
+        .probe = .{
+            .boundary_head_input = computeBoundaryProbeTensorStats(features),
+            .dense1_pre_activation = computeBoundaryProbeTensorStats(dense1),
+            .dense1_post_activation = computeBoundaryProbeTensorStats(hidden),
+            .logits = computeBoundaryProbeTensorStats(logits),
+        },
+    };
 }
 
 fn evaluateLegacyDenseBoundaryLogits(
@@ -2942,6 +3285,12 @@ test "BoundaryEvalAccumulator reports boundary rate and probability diagnostics"
     const p2 = fused_chunker_loss.positiveBoundaryProbability(0.0, 0.0);
     try std.testing.expectApproxEqAbs((p0 + p2) * 0.5, summary.mean_positive_probability_gold_positive, 1e-6);
     try std.testing.expectApproxEqAbs(p1, summary.mean_positive_probability_gold_negative, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), summary.mean_boundary_margin_gold_positive, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), summary.mean_boundary_margin_gold_negative, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), summary.mean_logit0_gold_positive, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), summary.mean_logit1_gold_positive, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.mean_logit0_gold_negative, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), summary.mean_logit1_gold_negative, 1e-6);
     try std.testing.expectEqual(@as(f32, 0.01), summary.threshold_points[0].threshold);
     try std.testing.expectEqual(@as(f32, 0.5), summary.threshold_points[summary.threshold_points.len - 1].threshold);
     try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_positive[5]);
@@ -3217,6 +3566,7 @@ test "trainStepWithEncoderGrad scatters contrastive gradients into features" {
         1,
         3,
         3,
+        false,
     );
     defer result.deinit(allocator);
 

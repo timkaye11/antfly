@@ -578,6 +578,23 @@ alpha `32`, boundary focus for `3` epochs with embed lambda `0.1`, boundary
 dropout `0.1`, NEFTune alpha `5.0`, and MRL dims `768,256,128`. The Phase-20
 runner prints these values as a compact parity contract, along with the model
 directory, tokenizer path, and artifact hashes when hashing is enabled.
+Because the Go MPSGraph segmented trainer builds encoder forward execs with
+training disabled, the Phase-20 parity runner defaults the applied encoder
+NEFTune state to `false` while still recording the configured NEFTune alpha.
+Readiness validation enforces this manifest field by default; set
+`ANTFLY_FUSED_CHUNKER_REQUIRE_ENCODER_NEFTUNE=1` only for explicit NEFTune
+quality ablations, not Go-parity gates.
+
+For Phase-20 fused-chunker training, the runner defaults
+`TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD=1`. The current Metal
+device-dense forward path is mechanically stable, but frozen-step parity showed
+it moves ModernBERT projection samples and boundary probabilities away from the
+Go MPSGraph reference. The host/reference dense path restores projection
+reference errors to the `1e-6` range and aligns Go/Zig boundary probabilities;
+set `TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD=0` only for targeted
+device-dense diagnostics. This parity-safe path is slower on the M4 Pro smoke
+host, around `8.7s` per step for the deterministic 10-step probe, so the
+readiness wrapper's default average-step gate is `12000ms`.
 
 Current quality debugging should start with deterministic supervision parity
 before longer runs. Use `zig build count-fused-tokenization -- --data <jsonl>
@@ -589,6 +606,17 @@ summary. Short Metal/MPSGraph probes can be gated with
 `scripts/verify_fused_chunker_probe_log.sh <log>`; controlled quality sweeps
 from a stable checkpoint are launched by
 `scripts/run_fused_chunker_quality_ablations.sh`.
+
+The readiness wrapper `scripts/run_fused_chunker_production_readiness.sh`
+chains the required preflight path: Go/Zig batch parity, Phase-20 Metal
+training, log verification, and `validate-fused-chunker-run` over the emitted
+`fused_training_manifest.json` and `fused_training_metrics.jsonl`. Its default
+`probe` mode caps training at a short memory-safe run; set
+`ANTFLY_FUSED_CHUNKER_READINESS_MODE=full` for the Go-parity F1 gate. The
+Phase-20 runner forwards memory watchdog settings with
+`ANTFLY_FUSED_CHUNKER_MEMORY_WARN_RSS_GB` and
+`ANTFLY_FUSED_CHUNKER_MEMORY_ABORT_RSS_GB`; aborts save a
+`checkpoint_memory_abort_<step>.safetensors` checkpoint before failing.
 
 | Feature | Fused Chunker | LayoutLMv3 Seq | LayoutLMv3 Token | Reranker LoRA | ColQwen2 | GLiNER2 LoRA | Gemma4 LoRA |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|

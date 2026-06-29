@@ -128,6 +128,7 @@ const tests = [_]common.TestSpec{
         .root_source_file = "src/finetune/test/test_fused_chunker_train.zig",
         .description = "Run fused chunker trainer tests",
         .imports = &.{ .ml, .inference_internal },
+        .native_link = .default,
     },
     .{
         .step_name = "test-fused-chunker-lora",

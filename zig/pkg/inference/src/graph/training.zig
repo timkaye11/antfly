@@ -1354,6 +1354,50 @@ test "CompiledTrainSession can retain gradient tensors without host extraction" 
     try std.testing.expect(result.device_gradients.get("bias") != null);
 }
 
+test "CompiledTrainSession preserves LoRA preprojection input gradient" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const wi = try bld.parameter("mlp.Wi.weight", Shape.init(.f32, &.{ 6, 4 }));
+    const wo = try bld.parameter("mlp.Wo.weight", Shape.init(.f32, &.{ 4, 3 }));
+
+    const wi_out = try bld.linearNoBias(x, wi, 2, 4, 6);
+    const gate = try bld.sliceLastDim(wi_out, 0, 3);
+    const value = try bld.sliceLastDim(wi_out, 3, 6);
+    const gated = try bld.mul(try bld.geluExact(gate), value);
+    const projected = try bld.linearNoBias(gated, wo, 2, 3, 4);
+    const loss = try bld.reduceSum(projected, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var injected = try ml.graph.lora.injectLoRA(allocator, &g, .{
+        .rank = 2,
+        .alpha = 2.0,
+        .target_patterns = &.{"mlp.Wo.weight"},
+    });
+    defer injected.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), injected.adapter.adapters.items.len);
+    const adapter = injected.adapter.adapters.items[0];
+    const trainable = [_][]const u8{
+        "x",
+        adapter.lora_a_name,
+        adapter.lora_b_name,
+    };
+    var session = try CompiledTrainSession.init(allocator, &injected.graph, injected.graph.outputs.items[0], .{
+        .trainable_params = &trainable,
+    });
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), session.param_grads.len);
+    try std.testing.expect(session.param_grads[0] != null_node);
+    try std.testing.expect(session.param_grads[1] != null_node);
+    try std.testing.expect(session.param_grads[2] != null_node);
+}
+
 test "trainStep on linear-gelu chain" {
     // Build: y = gelu(linear(x, w, b)), loss = reduceSum(y)
     const allocator = std.testing.allocator;

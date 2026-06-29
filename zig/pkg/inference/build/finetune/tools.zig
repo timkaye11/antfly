@@ -176,6 +176,18 @@ const commands = [_]common.CommandSpec{
         .native_link = .default,
     },
     .{
+        .name = "validate-fused-chunker-run",
+        .root_source_file = "src/finetune/tools/validate_fused_chunker_run.zig",
+        .description = "Validate fused-chunker training manifest, metrics, backend, memory, performance, and F1 gates",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "convert-fused-chunker-checkpoint-for-go",
+        .root_source_file = "src/finetune/tools/convert_fused_chunker_checkpoint_for_go.zig",
+        .description = "Convert a Zig fused-chunker checkpoint to Go fused trainer SafeTensors names",
+        .imports = &.{.inference_internal},
+    },
+    .{
         .name = "train-eval-reranker-head",
         .root_source_file = "src/finetune/train/train_eval_reranker_head.zig",
         .description = "Train and evaluate a bounded termite-owned reranker head",

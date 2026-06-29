@@ -36,6 +36,8 @@ pub const FusedLossConfig = struct {
     coherence_margin: f32 = 0.2,
     pos_weight: f32 = 5.0,
     use_focal: bool = false,
+    contrastive_focal_gamma: f32 = 0.0,
+    contrastive_focal_alpha: f32 = 0.75,
 
     // MRL (Matryoshka Representation Learning)
     use_mrl: bool = false,

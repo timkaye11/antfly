@@ -22,6 +22,7 @@
 //   --checkpoint <file>  Checkpoint file written by train_fused_chunker
 //   --split <name>       Dataset split filter (default: "val")
 //   --batch-size <n>     Batch size (default: 32)
+//   --max-examples <n>   Maximum eval examples (default: 0 = all)
 //   --hidden-size <n>    Hidden size (default: 768)
 //   --max-seq-len <n>    Max seq len (default: 384)
 //   --max-chunks <n>     Max chunks per sample (default: 32)
@@ -29,21 +30,12 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const blas_compute = @import("../../ops/blas_compute.zig");
+const native_compute = @import("../../ops/native_compute.zig");
 const metal_compute = if (build_options.enable_metal) @import("../../ops/metal_compute.zig") else struct {};
 const gpu_hosted_store = @import("../../ops/gpu_hosted_store.zig");
 const metal_runtime = if (build_options.enable_metal) @import("../../backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
-    }
-};
-const mlx_mod = if (build_options.enable_mlx) @import("../../backends/mlx.zig") else struct {
-    pub const c = struct {
-        pub fn mlx_map_string_to_array_new() void {}
-        pub fn mlx_map_string_to_array_free(_: void) void {}
-    };
-    pub fn openDefaultStream() struct { stream: void } {
-        return .{ .stream = {} };
     }
 };
 const ops_mod = @import("../../ops/ops.zig");
@@ -257,6 +249,7 @@ const Options = struct {
     model_dir: ?[]const u8 = null,
     split: []const u8 = "val",
     batch_size: u32 = 32,
+    max_examples: usize = 0,
     hidden_size: u32 = 768,
     num_layers: u32 = 22,
     max_seq_len: u32 = 384,
@@ -275,6 +268,7 @@ fn printUsage() void {
         \\  --model-dir <dir>        Model directory (tokenizer + encoder weights)
         \\  --split <name>           Dataset split filter (default: "val")
         \\  --batch-size <n>         Batch size (default: 32)
+        \\  --max-examples <n>       Maximum eval examples (default: 0 = all)
         \\  --hidden-size <n>        Hidden size (default: 768)
         \\  --num-layers <n>         ModernBERT layer count (default: 22)
         \\  --max-layers <n>         Alias for --num-layers
@@ -296,12 +290,10 @@ fn deinitMetalWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeig
         if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
     }
     weight_store.lazy_weights.deinit(allocator);
-    if (comptime build_options.enable_mlx) {
-        _ = mlx_mod.c.mlx_map_string_to_array_free(weight_store.resident_weights);
-    }
 }
 
-fn deinitNativeWeightStore(allocator: std.mem.Allocator, weight_store: *blas_compute.WeightStore) void {
+fn deinitNativeWeightStore(allocator: std.mem.Allocator, weight_store: *native_compute.WeightStore) void {
+    native_compute.deinitPrefetchQueue(weight_store);
     var it = weight_store.resident_weights.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
@@ -382,7 +374,7 @@ fn copyModernBertQkvPart(
 
 fn insertModernBertQkvSplitsIntoNativeStore(
     allocator: std.mem.Allocator,
-    weight_store: *blas_compute.WeightStore,
+    weight_store: *native_compute.WeightStore,
     normalized_name: []const u8,
     loaded: LoadedWeight,
 ) !usize {
@@ -636,7 +628,7 @@ test "eval fused LoRA normalization accepts Go checkpoint tensors" {
 
 fn insertLoRATensorIntoNativeStore(
     allocator: std.mem.Allocator,
-    weight_store: *blas_compute.WeightStore,
+    weight_store: *native_compute.WeightStore,
     key: []const u8,
     values: []const f32,
     shape: []const i64,
@@ -676,7 +668,7 @@ fn loadFusedLoRAFromCheckpoint(
     allocator: std.mem.Allocator,
     checkpoint_path: []const u8,
     use_metal: bool,
-    native_weight_store: *blas_compute.WeightStore,
+    native_weight_store: *native_compute.WeightStore,
     metal_weight_store: *MetalWeightStore,
 ) !FusedLoRALoadResult {
     const file_bytes = try compat.cwd().readFileAlloc(compat.io(), checkpoint_path, allocator, .unlimited);
@@ -754,7 +746,7 @@ fn loadFusedLoRAFromCheckpoint(
 
 fn loadSafetensorsIntoNativeStore(
     allocator: std.mem.Allocator,
-    weight_store: *blas_compute.WeightStore,
+    weight_store: *native_compute.WeightStore,
     st_path: []const u8,
 ) !usize {
     var source = try SafetensorsSource.initAbsolute(allocator, st_path);
@@ -823,6 +815,7 @@ pub fn main(init: std.process.Init) !void {
     var model_dir: ?[]const u8 = null;
     var split: []const u8 = "val";
     var batch_size: u32 = 32;
+    var max_examples: usize = 0;
     var hidden_size: u32 = 768;
     var num_layers: u32 = 22;
     var max_seq_len: u32 = 384;
@@ -861,6 +854,15 @@ pub fn main(init: std.process.Init) !void {
             };
             batch_size = std.fmt.parseUnsigned(u32, value, 10) catch {
                 print("error: invalid --batch-size value: {s}\n", .{value});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--max-examples")) {
+            const value = args.next() orelse {
+                print("error: --max-examples requires a value\n", .{});
+                std.process.exit(1);
+            };
+            max_examples = std.fmt.parseUnsigned(usize, value, 10) catch {
+                print("error: invalid --max-examples value: {s}\n", .{value});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, arg, "--hidden-size")) {
@@ -913,7 +915,7 @@ pub fn main(init: std.process.Init) !void {
                 print("error: --backend requires a value\n", .{});
                 std.process.exit(1);
             };
-            if (std.mem.eql(u8, value, "native") or std.mem.eql(u8, value, "blas")) {
+            if (std.mem.eql(u8, value, "native")) {
                 backend = .native;
             } else if (std.mem.eql(u8, value, "metal")) {
                 backend = .metal;
@@ -947,6 +949,7 @@ pub fn main(init: std.process.Init) !void {
         .model_dir = model_dir,
         .split = split,
         .batch_size = batch_size,
+        .max_examples = max_examples,
         .hidden_size = hidden_size,
         .num_layers = num_layers,
         .max_seq_len = max_seq_len,
@@ -970,14 +973,14 @@ pub fn main(init: std.process.Init) !void {
     const use_metal = selected_backend == .metal;
 
     // Set up compute backend for optional encoder forward and boundary-head eval.
-    var weight_store = blas_compute.WeightStore{
+    var weight_store = native_compute.WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
         .lazy_weights = .{},
     };
     defer deinitNativeWeightStore(allocator, &weight_store);
 
-    var blas_backend = blas_compute.BlasCompute.init(allocator, &weight_store, null);
+    var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
 
     var metal_weight_store: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
@@ -986,8 +989,6 @@ pub fn main(init: std.process.Init) !void {
         if (comptime build_options.enable_metal) {
             metal_weight_store = MetalWeightStore{
                 .allocator = allocator,
-                .resident_weights = if (comptime build_options.enable_mlx) mlx_mod.c.mlx_map_string_to_array_new() else {},
-                .stream = if (comptime build_options.enable_mlx) mlx_mod.openDefaultStream().stream else {},
                 .prefix = "",
                 .lazy_weights = .{},
             };
@@ -995,7 +996,7 @@ pub fn main(init: std.process.Init) !void {
             metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_weight_store, null);
             break :blk metal_backend.computeBackend();
         } else unreachable;
-    } else blas_backend.computeBackend();
+    } else native_backend.computeBackend();
     defer if (use_metal) {
         if (comptime build_options.enable_metal) deinitMetalWeightStore(allocator, &metal_weight_store);
     };
@@ -1086,13 +1087,21 @@ pub fn main(init: std.process.Init) !void {
     };
     defer loaded.deinit();
 
-    const samples = loaded.samples;
+    const samples = if (opts.max_examples > 0 and opts.max_examples < loaded.samples.len)
+        loaded.samples[0..opts.max_examples]
+    else
+        loaded.samples;
     if (samples.len == 0) {
         print("error: no samples found in '{s}' for split '{s}'\n", .{ opts.data_path, opts.split });
         std.process.exit(1);
     }
 
-    print("Loaded {d} eval samples from '{s}' (split='{s}')\n", .{ samples.len, opts.data_path, opts.split });
+    print("Loaded {d}/{d} eval samples from '{s}' (split='{s}')\n", .{
+        samples.len,
+        loaded.samples.len,
+        opts.data_path,
+        opts.split,
+    });
 
     var boundary_acc = fused_chunker_train.BoundaryEvalAccumulator{};
 
@@ -1264,6 +1273,16 @@ pub fn main(init: std.process.Init) !void {
     print("Mean P(+):   gold_pos={d:.4} gold_neg={d:.4}\n", .{
         summary.mean_positive_probability_gold_positive,
         summary.mean_positive_probability_gold_negative,
+    });
+    print("Mean Margin: gold_pos={d:.4} gold_neg={d:.4}\n", .{
+        summary.mean_boundary_margin_gold_positive,
+        summary.mean_boundary_margin_gold_negative,
+    });
+    print("Mean Logits: gold_pos=({d:.4},{d:.4}) gold_neg=({d:.4},{d:.4})\n", .{
+        summary.mean_logit0_gold_positive,
+        summary.mean_logit1_gold_positive,
+        summary.mean_logit0_gold_negative,
+        summary.mean_logit1_gold_negative,
     });
     fused_chunker_train.printBoundaryQualityDiagnostics("eval_quality", summary);
 

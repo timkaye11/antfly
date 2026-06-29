@@ -74,9 +74,7 @@ export default function SearchBoxBuilder({
   const [displayTextField, setDisplayTextField] = useState<string>("");
 
   // Get baseUrl from environment
-  const baseUrl =
-    getAntfarmRuntimeConfig().apiUrl ??
-    (import.meta.env.MODE === "development" ? "http://localhost:8080/db/v1" : "/db/v1");
+  const baseUrl = getAntfarmRuntimeConfig().apiUrl ?? "/db/v1";
   const antflyUrl = `${baseUrl}/tables/${tableName}`;
 
   // Derive effective pagination: pagination is disabled when semantic search is enabled
@@ -728,7 +726,6 @@ ${facetsCode}${resultsCode}
                           return (
                             <Badge
                               key={searchField}
-                              variant="secondary"
                               className="cursor-pointer"
                               onClick={() => handleRemoveSearchField(searchField)}
                               title={`Search field: ${searchField}\nSchema types: ${fieldInfo?.schemaTypes.join(", ") || "unknown"}\nAntfly types: ${fieldInfo?.antflyTypes.join(", ") || "unknown"}`}
@@ -775,7 +772,6 @@ ${facetsCode}${resultsCode}
                           .map((fieldInfo) => (
                             <Badge
                               key={fieldInfo.searchField}
-                              variant="outline"
                               className="cursor-pointer hover:bg-muted"
                               onClick={() => handleAddSearchField(fieldInfo.searchField)}
                               title={`Search field: ${fieldInfo.searchField}\nSchema types: ${fieldInfo.schemaTypes.join(", ")}\nAntfly types: ${fieldInfo.antflyTypes.join(", ")}`}
@@ -810,7 +806,7 @@ ${facetsCode}${resultsCode}
                               return (
                                 <Badge
                                   key={index}
-                                  variant={isSelected ? "default" : "outline"}
+                                  variant={isSelected ? "default" : "default"}
                                   className="cursor-pointer hover:bg-muted"
                                   onClick={() =>
                                     isSelected
@@ -910,7 +906,6 @@ ${facetsCode}${resultsCode}
                                 return (
                                   <Badge
                                     key={field}
-                                    variant="secondary"
                                     className="cursor-pointer"
                                     onClick={() => handleRemoveAutosuggestField(field)}
                                     title={`Search field: ${field}\\nSchema types: ${fieldInfo?.schemaTypes.join(", ") || "unknown"}\\nAntfly types: ${fieldInfo?.antflyTypes.join(", ") || "unknown"}`}
@@ -932,7 +927,6 @@ ${facetsCode}${resultsCode}
                                 .map((fieldInfo) => (
                                   <Badge
                                     key={fieldInfo.searchField}
-                                    variant="outline"
                                     className="cursor-pointer hover:bg-muted"
                                     onClick={() => handleAddAutosuggestField(fieldInfo.searchField)}
                                     title={`Search field: ${fieldInfo.searchField}\\nSchema types: ${fieldInfo.schemaTypes.join(", ")}\\nAntfly types: ${fieldInfo.antflyTypes.join(", ")}`}
@@ -963,7 +957,7 @@ ${facetsCode}${resultsCode}
                                   return (
                                     <Badge
                                       key={index}
-                                      variant={isSelected ? "default" : "outline"}
+                                      variant={isSelected ? "default" : "default"}
                                       className="cursor-pointer hover:bg-muted"
                                       onClick={() =>
                                         isSelected
@@ -1108,7 +1102,6 @@ ${facetsCode}${resultsCode}
                               return (
                                 <Badge
                                   key={field}
-                                  variant="secondary"
                                   className="cursor-pointer"
                                   onClick={() => handleRemoveResultField(field)}
                                   title={`Field: ${field}\\nSchema type: ${fieldInfo?.schemaType || "unknown"}`}
@@ -1128,7 +1121,6 @@ ${facetsCode}${resultsCode}
                               .map((fieldInfo) => (
                                 <Badge
                                   key={fieldInfo.fieldName}
-                                  variant="outline"
                                   className="cursor-pointer hover:bg-muted"
                                   onClick={() => handleAddResultField(fieldInfo.fieldName)}
                                   title={`Field: ${fieldInfo.fieldName}\\nSchema type: ${fieldInfo.schemaType}`}
@@ -1175,7 +1167,6 @@ ${facetsCode}${resultsCode}
                                 {thumbnailField ? (
                                   <div className="mb-3">
                                     <Badge
-                                      variant="secondary"
                                       className="cursor-pointer"
                                       onClick={handleClearThumbnailField}
                                     >
@@ -1195,7 +1186,7 @@ ${facetsCode}${resultsCode}
                                       variant={
                                         thumbnailField === fieldInfo.fieldName
                                           ? "default"
-                                          : "outline"
+                                          : "default"
                                       }
                                       className="cursor-pointer hover:bg-muted"
                                       onClick={() => handleSetThumbnailField(fieldInfo.fieldName)}
@@ -1215,7 +1206,7 @@ ${facetsCode}${resultsCode}
                                   {(["small", "medium", "large"] as const).map((size) => (
                                     <Badge
                                       key={size}
-                                      variant={thumbnailSize === size ? "default" : "outline"}
+                                      variant={thumbnailSize === size ? "default" : "default"}
                                       className="cursor-pointer hover:bg-muted capitalize"
                                       onClick={() => setThumbnailSize(size)}
                                     >
@@ -1262,7 +1253,6 @@ ${facetsCode}${resultsCode}
                             {displayTextField ? (
                               <div className="mb-3">
                                 <Badge
-                                  variant="secondary"
                                   className="cursor-pointer"
                                   onClick={handleClearDisplayTextField}
                                 >
@@ -1280,7 +1270,7 @@ ${facetsCode}${resultsCode}
                                 <Badge
                                   key={fieldInfo.fieldName}
                                   variant={
-                                    displayTextField === fieldInfo.fieldName ? "default" : "outline"
+                                    displayTextField === fieldInfo.fieldName ? "default" : "default"
                                   }
                                   className="cursor-pointer hover:bg-muted"
                                   onClick={() => handleSetDisplayTextField(fieldInfo.fieldName)}
@@ -1373,7 +1363,6 @@ ${facetsCode}${resultsCode}
                             {availableFields.map((fieldInfo) => (
                               <Badge
                                 key={fieldInfo.searchField}
-                                variant="outline"
                                 className="cursor-pointer hover:bg-muted"
                                 onClick={() => setNewFacetField(fieldInfo.searchField)}
                                 title={`Search field: ${fieldInfo.searchField}\nSchema types: ${fieldInfo.schemaTypes.join(", ")}\nAntfly types: ${fieldInfo.antflyTypes.join(", ")}`}

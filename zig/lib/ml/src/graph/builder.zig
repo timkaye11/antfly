@@ -803,6 +803,20 @@ pub const Builder = struct {
         rope_dim: u32,
         theta: f32,
     ) !NodeId {
+        return self.ropeWithOptions(input, cos, sin, seq_len, head_dim, rope_dim, theta, false);
+    }
+
+    pub fn ropeWithOptions(
+        self: *Builder,
+        input: NodeId,
+        cos: NodeId,
+        sin: NodeId,
+        seq_len: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        consecutive_pairs: bool,
+    ) !NodeId {
         // RoPE is a per-pair rotation in the (x0, x1) plane. Because the
         // half-swap permutation cannot be expressed with the current set of
         // primitive builder wrappers (no slice/concat helper), we do NOT
@@ -824,7 +838,7 @@ pub const Builder = struct {
                 .theta = theta,
                 .freq_scale = 1.0,
                 .position_offset = 0,
-                .consecutive_pairs = false,
+                .consecutive_pairs = consecutive_pairs,
             } },
             .output_shape = out_shape,
             .inputs = .{ input, cos, sin, null_node },

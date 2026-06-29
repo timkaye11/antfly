@@ -2448,7 +2448,7 @@ typedef struct termite_metal_sdpa_f32_params {
     uint32_t bias_mode;
     uint32_t has_mask;
     uint32_t local_window_half;
-    uint32_t reserved1;
+    uint32_t layout;
 } termite_metal_sdpa_f32_params;
 
 typedef struct termite_metal_disentangled_relative_attention_f32_params {
@@ -2589,7 +2589,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_gliner_gru_combine_f32_params { uint rows; uint dim; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_argmax_axis_f32_params { uint outer; uint axis_dim; uint inner; uint reserved; };\n"
            "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint local_window_half; uint reserved1; };\n"
+           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint local_window_half; uint layout; };\n"
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
@@ -2597,28 +2597,6 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_dot_general_batched_f32_params { uint batch_count; uint m; uint n; uint k; uint rhs_contract_axis; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_conv1d_f32_params { uint batch; uint in_channels; uint out_channels; uint time_steps; uint kernel_size; uint stride; uint padding; uint out_time; uint has_bias; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_conv2d_f32_params { uint batch; uint in_channels; uint out_channels; uint height; uint width; uint kernel_h; uint kernel_w; uint stride_h; uint stride_w; uint padding_h; uint padding_w; uint groups; uint out_h; uint out_w; uint has_bias; uint reserved0; };\n"
-           "inline float termite_erf_approx(float x) {\n"
-           "    float sign = x < 0.0f ? -1.0f : 1.0f;\n"
-           "    float ax = fabs(x);\n"
-           "    float t = 1.0f / (1.0f + 0.3275911f * ax);\n"
-           "    float poly = (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;\n"
-           "    return sign * (1.0f - poly * exp(-(ax * ax)));\n"
-           "}\n"
-           "inline float termite_gelu_tanh(float x) {\n"
-           "    if (!isfinite(x)) return 0.0f;\n"
-           "    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);\n"
-           "    if (inner > 10.0f) return x;\n"
-           "    if (inner < -10.0f) return 0.0f;\n"
-           "    float y = 0.5f * x * (1.0f + tanh(inner));\n"
-           "    return isfinite(y) ? y : 0.0f;\n"
-           "}\n"
-           "inline float termite_silu(float x) {\n"
-           "    if (!isfinite(x)) return 0.0f;\n"
-           "    if (x > 20.0f) return x;\n"
-           "    if (x < -20.0f) return 0.0f;\n"
-           "    float y = x / (1.0f + exp(-x));\n"
-           "    return isfinite(y) ? y : 0.0f;\n"
-           "}\n"
            "inline float termite_exp_approx(float x_in) {\n"
            "    if (isnan(x_in)) return NAN;\n"
            "    if (x_in > 88.7228f) return INFINITY;\n"
@@ -2637,6 +2615,53 @@ static NSString *termite_metal_shader_source(void) {
            "    uint pow2_bits = uint((k + 127) << 23);\n"
            "    return p * as_type<float>(pow2_bits);\n"
            "}\n"
+           "inline float termite_erf_approx(float x) {\n"
+           "    float sign = x < 0.0f ? -1.0f : 1.0f;\n"
+           "    float ax = fabs(x);\n"
+           "    float t = 1.0f / (1.0f + 0.3275911f * ax);\n"
+           "    float poly = (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;\n"
+           "    return sign * (1.0f - poly * exp(-(ax * ax)));\n"
+           "}\n"
+           "inline float termite_gelu_tanh(float x) {\n"
+           "    if (!isfinite(x)) return 0.0f;\n"
+           "    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);\n"
+           "    if (inner > 10.0f) return x;\n"
+           "    if (inner < -10.0f) return 0.0f;\n"
+           "    float y = 0.5f * x * (1.0f + tanh(inner));\n"
+           "    return isfinite(y) ? y : 0.0f;\n"
+           "}\n"
+           "inline float termite_gelu_exact(float x) {\n"
+           "    if (!isfinite(x)) return 0.0f;\n"
+           "    float ax = fabs(x);\n"
+           "    float y = ax >= 5.0f ? ax : (0.4f * ax - 1.0f);\n"
+           "    if (ax < 5.0f) {\n"
+           "        float b1 = 0.0f;\n"
+           "        float b2 = 0.0f;\n"
+           "        float b0 = 2.0f * y * b1 - b2 + 0.000006588109088f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 - 0.000003724559810f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 - 0.00004772058428f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 0.0001383309782f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 0.00005299278172f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 - 0.001123589958f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 0.002340168989f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 0.001112271688f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 - 0.01604523368f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 0.03860477144f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 - 0.04396306666f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 0.006512240886f; b2 = b1; b1 = b0;\n"
+           "        b0 = 2.0f * y * b1 - b2 + 2.557656309f; b2 = b1; b1 = b0;\n"
+           "        y = y * b1 - b2 + 2.454759727f;\n"
+           "    }\n"
+           "    float out = x < 0.0f ? y - ax : y;\n"
+           "    return isfinite(out) ? out : 0.0f;\n"
+           "}\n"
+           "inline float termite_silu(float x) {\n"
+           "    if (!isfinite(x)) return 0.0f;\n"
+           "    if (x > 20.0f) return x;\n"
+           "    if (x < -20.0f) return 0.0f;\n"
+           "    float y = x / (1.0f + exp(-x));\n"
+           "    return isfinite(y) ? y : 0.0f;\n"
+           "}\n"
            "inline float termite_quick_gelu(float x) {\n"
            "    if (!isfinite(x)) return 0.0f;\n"
            "    float y = x / (1.0f + termite_exp_approx(-1.702f * x));\n"
@@ -2644,7 +2669,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "inline float termite_apply_activation_scalar(float x, uint activation_kind) {\n"
            "    switch (activation_kind) {\n"
-           "        case 0u: return termite_gelu_tanh(x);\n"
+           "        case 0u: return termite_gelu_exact(x);\n"
            "        case 1u: return termite_gelu_tanh(x);\n"
            "        case 2u: return termite_silu(x);\n"
            "        case 3u: return max(x, 0.0f);\n"
@@ -4365,14 +4390,14 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "kernel void termite_sdpa_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.batch * p.num_heads * p.seq_len * p.head_dim; if (gid >= total || p.seq_len == 0u || p.head_dim == 0u) return;\n"
-           "    uint d = gid % p.head_dim; uint tmp = gid / p.head_dim; uint qi = tmp % p.seq_len; uint bh = tmp / p.seq_len; uint b = bh / p.num_heads; uint h = bh - b * p.num_heads;\n"
-           "    uint q_base = (bh * p.seq_len + qi) * p.head_dim;\n"
+           "    uint d = gid % p.head_dim; uint tmp = gid / p.head_dim; uint qi = tmp % p.seq_len; uint bh = tmp / p.seq_len; uint b = bh / p.num_heads; uint h = bh - b * p.num_heads; uint hidden = p.num_heads * p.head_dim;\n"
+           "    uint q_base = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim : (bh * p.seq_len + qi) * p.head_dim;\n"
            "    uint ki_begin = 0u; uint ki_end = p.seq_len;\n"
            "    if (p.local_window_half != 0u) { ki_begin = qi > p.local_window_half ? qi - p.local_window_half : 0u; uint tail = p.seq_len - qi; uint span = p.local_window_half + 1u; ki_end = span < tail ? qi + span : p.seq_len; }\n"
            "    float scale = rsqrt(float(p.head_dim)); float best = -3.402823466e+38f;\n"
            "    for (uint ki = ki_begin; ki < ki_end; ++ki) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
-           "        uint k_base = (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
+           "        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
            "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
            "        score *= scale;\n"
            "        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
@@ -4383,27 +4408,27 @@ static NSString *termite_metal_shader_source(void) {
            "    float sum = 0.0f; float accum = 0.0f;\n"
            "    for (uint ki = ki_begin; ki < ki_end; ++ki) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
-           "        uint k_base = (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
+           "        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
            "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
            "        score *= scale;\n"
            "        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
            "        else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];\n"
            "        else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        float w = exp(score - best); sum += w; accum += w * v[(bh * p.seq_len + ki) * p.head_dim + d];\n"
+           "        uint v_idx = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim + d : (bh * p.seq_len + ki) * p.head_dim + d; float w = exp(score - best); sum += w; accum += w * v[v_idx];\n"
            "    }\n"
-           "    output[gid] = sum > 0.0f ? accum / sum : 0.0f;\n"
+           "    uint out_idx = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim + d : gid; output[out_idx] = sum > 0.0f ? accum / sum : 0.0f;\n"
            "}\n"
            "kernel void termite_sdpa_f32_tg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u) return;\n"
            "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
-           "    uint lid = uint(tid); uint width = uint(tpg.x); uint bh = b * p.num_heads + h; uint q_base = (bh * p.seq_len + qi) * p.head_dim; float scale = rsqrt(float(p.head_dim));\n"
+           "    uint lid = uint(tid); uint width = uint(tpg.x); uint bh = b * p.num_heads + h; uint hidden = p.num_heads * p.head_dim; uint q_base = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim : (bh * p.seq_len + qi) * p.head_dim; float scale = rsqrt(float(p.head_dim));\n"
            "    uint ki_begin = 0u; uint ki_end = p.seq_len;\n"
            "    if (p.local_window_half != 0u) { ki_begin = qi > p.local_window_half ? qi - p.local_window_half : 0u; uint tail = p.seq_len - qi; uint span = p.local_window_half + 1u; ki_end = span < tail ? qi + span : p.seq_len; }\n"
            "    threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
            "    float local_best = -3.402823466e+38f;\n"
            "    for (uint ki = ki_begin + lid; ki < ki_end; ki += width) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; float score = -3.402823466e+38f;\n"
-           "        if (allowed) { uint k_base = (bh * p.seq_len + ki) * p.head_dim; float acc = 0.0f;\n"
+           "        if (allowed) { uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float acc = 0.0f;\n"
            "            if (p.head_dim == 64u) { const device float4 *q4 = reinterpret_cast<const device float4 *>(q + q_base); const device float4 *k4 = reinterpret_cast<const device float4 *>(k + k_base); for (uint x4 = 0u; x4 < 16u; ++x4) acc += dot(q4[x4], k4[x4]); }\n"
            "            else { for (uint x = 0u; x < p.head_dim; ++x) acc += q[q_base + x] * k[k_base + x]; }\n"
            "            score = acc * scale; if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki]; else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki]; else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki]; }\n"
@@ -4417,7 +4442,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
            "    for (uint ki = ki_begin + lid; ki < ki_end; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = ki_begin; ki < ki_end; ++ki) accum += scores[ki] * v[(bh * p.seq_len + ki) * p.head_dim + d]; output[(bh * p.seq_len + qi) * p.head_dim + d] = accum; }\n"
+           "    for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = ki_begin; ki < ki_end; ++ki) { uint v_idx = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim + d : (bh * p.seq_len + ki) * p.head_dim + d; accum += scores[ki] * v[v_idx]; } uint out_idx = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim + d : (bh * p.seq_len + qi) * p.head_dim + d; output[out_idx] = accum; }\n"
            "}\n"
            "kernel void termite_disentangled_relative_attention_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *q_r [[buffer(3)]], device const float *k_r [[buffer(4)]], device const float *mask [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_disentangled_relative_attention_f32_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint hidden = p.num_heads * p.head_dim; uint total = p.batch * p.seq_len * hidden; if (gid >= total || p.seq_len == 0u || p.head_dim == 0u || hidden == 0u) return;\n"
@@ -22574,12 +22599,13 @@ int termite_metal_decode_runtime_sdpa_f32_device(
     uint32_t bias_mode,
     uint32_t has_mask,
     uint32_t local_window_half,
+    uint32_t layout,
     void *output_handle,
     size_t output_offset
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->sdpa_f32_pipeline == nil) return -2;
-    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u) return -3;
+    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u || layout > 1u) return -3;
     if (bias_mode != 0u && bias_handle == NULL) return -4;
     if (has_mask != 0u && mask_handle == NULL) return -5;
     if (batch > UINT32_MAX || seq_len > UINT32_MAX || num_heads > UINT32_MAX || head_dim > UINT32_MAX) return -6;
@@ -22617,7 +22643,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             .bias_mode = bias_mode,
             .has_mask = has_mask,
             .local_window_half = local_window_half,
-            .reserved1 = 0,
+            .layout = layout,
         };
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -22637,8 +22663,11 @@ int termite_metal_decode_runtime_sdpa_f32_device(
         {
             return -15;
         }
+        const bool allow_token_major_tg = getenv("TERMITE_METAL_ENABLE_SDPA_TG_TOKEN_MAJOR") != NULL;
+        const bool allow_tg_layout = layout == 0u || (layout == 1u && allow_token_major_tg);
         if (getenv("TERMITE_METAL_DISABLE_SDPA_TG") == NULL &&
             runtime->sdpa_f32_tg_pipeline != nil &&
+            allow_tg_layout &&
             seq_len <= 1024 &&
             head_dim <= 256)
         {

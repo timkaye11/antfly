@@ -21,6 +21,7 @@ const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
 const common_secrets = @import("../common/secrets.zig");
+const extension_domain = @import("../extensions/mod.zig");
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -349,6 +350,9 @@ pub const ClusterBackupManifest = struct {
     location: []const u8,
     antfly_version: []const u8,
     tables: []const ClusterTableBackupEntry,
+    installed_extensions: []extension_domain.InstalledExtension = &.{},
+    extension_members: []extension_domain.ExtensionMember = &.{},
+    extension_dependencies: []extension_domain.ExtensionDependency = &.{},
 
     pub fn deinit(self: *ClusterBackupManifest, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.backup_id));
@@ -360,6 +364,21 @@ pub const ClusterBackupManifest = struct {
             owned.deinit(alloc);
         }
         alloc.free(@constCast(self.tables));
+        for (self.installed_extensions) |extension| {
+            var owned = extension;
+            owned.deinitOwned(alloc);
+        }
+        if (self.installed_extensions.len > 0) alloc.free(@constCast(self.installed_extensions));
+        for (self.extension_members) |member| {
+            var owned = member;
+            owned.deinitOwned(alloc);
+        }
+        if (self.extension_members.len > 0) alloc.free(@constCast(self.extension_members));
+        for (self.extension_dependencies) |dependency| {
+            var owned = dependency;
+            owned.deinitOwned(alloc);
+        }
+        if (self.extension_dependencies.len > 0) alloc.free(@constCast(self.extension_dependencies));
         self.* = undefined;
     }
 };
@@ -510,10 +529,7 @@ pub fn readManifest(
     const body = try readFileAbsoluteAlloc(alloc, path, 16 * 1024 * 1024);
     defer alloc.free(body);
 
-    var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
-    return try cloneTableBackupManifest(alloc, parsed.value);
+    return parseTableBackupManifestOrPortable(alloc, body, backup_id);
 }
 
 pub fn writeManifestToLocation(
@@ -545,12 +561,261 @@ pub fn readManifestFromLocation(
             defer alloc.free(suffix);
             const body = try store.readBytesAlloc(alloc, trimLeftSlash(suffix));
             defer alloc.free(body);
-            var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-            defer parsed.deinit();
-            if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
-            return try cloneTableBackupManifest(alloc, parsed.value);
+            return parseTableBackupManifestOrPortable(alloc, body, backup_id);
         },
     }
+}
+
+fn parseTableBackupManifestOrPortable(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+) !TableBackupManifest {
+    if (std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always })) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.format_version != format_version) return error.UnsupportedBackupFormat;
+        return try cloneTableBackupManifest(alloc, parsed.value);
+    } else |_| {
+        return try parseGoPortableTableManifest(alloc, body, backup_id);
+    }
+}
+
+const PortableShard = struct {
+    group_id: u64,
+    shard_id: []u8,
+    start_key: []u8,
+    end_key: ?[]u8,
+    snapshot_path: []u8,
+
+    fn deinit(self: PortableShard, alloc: std.mem.Allocator) void {
+        alloc.free(self.shard_id);
+        alloc.free(self.start_key);
+        if (self.end_key) |end| alloc.free(end);
+        alloc.free(self.snapshot_path);
+    }
+};
+
+fn parseGoPortableTableManifest(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+) !TableBackupManifest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+    const table_name = switch (root.get("name") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    const schema_value = root.get("schema") orelse return error.InvalidBackupRequest;
+    const indexes_json = try normalizeGoPortableIndexesJson(alloc, root.get("indexes"));
+    errdefer alloc.free(indexes_json);
+    const shards_value = switch (root.get("shards") orelse return error.InvalidBackupRequest) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var shards_list = std.ArrayListUnmanaged(PortableShard).empty;
+    defer {
+        for (shards_list.items) |shard| shard.deinit(alloc);
+        shards_list.deinit(alloc);
+    }
+
+    var it = shards_value.iterator();
+    while (it.next()) |entry| {
+        const shard_object = switch (entry.value_ptr.*) {
+            .object => |object| object,
+            else => return error.InvalidBackupRequest,
+        };
+        const raw_group_id = try std.fmt.parseInt(u64, entry.key_ptr.*, 16);
+        const byte_range = switch (shard_object.get("byte_range") orelse return error.InvalidBackupRequest) {
+            .array => |array| array,
+            else => return error.InvalidBackupRequest,
+        };
+        if (byte_range.items.len != 2) return error.InvalidBackupRequest;
+        const start_encoded = switch (byte_range.items[0]) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const end_encoded = switch (byte_range.items[1]) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const start_key = try decodePortableByteRangeBoundary(alloc, start_encoded);
+        errdefer alloc.free(start_key);
+        const end_key = if (end_encoded.len > 0) try decodePortableByteRangeBoundary(alloc, end_encoded) else null;
+        errdefer if (end_key) |value| alloc.free(value);
+        const snapshot_path = try std.fmt.allocPrint(alloc, "{s}-{s}.afb", .{ backup_id, entry.key_ptr.* });
+        errdefer alloc.free(snapshot_path);
+        try shards_list.append(alloc, .{
+            .group_id = group_ids.dataGroupIdFromHash(raw_group_id),
+            .shard_id = try alloc.dupe(u8, entry.key_ptr.*),
+            .start_key = start_key,
+            .end_key = end_key,
+            .snapshot_path = snapshot_path,
+        });
+    }
+    std.mem.sort(PortableShard, shards_list.items, {}, portableShardLessThan);
+
+    const shards = try alloc.alloc(ShardSnapshot, shards_list.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (shards[0..initialized]) |shard| shard.deinit(alloc);
+        alloc.free(shards);
+    }
+    for (shards_list.items, 0..) |portable_shard, i| {
+        shards[i] = .{
+            .group_id = portable_shard.group_id,
+            .start_key = try alloc.dupe(u8, portable_shard.start_key),
+            .end_key = if (portable_shard.end_key) |value| try alloc.dupe(u8, value) else null,
+            .snapshot_path = try alloc.dupe(u8, portable_shard.snapshot_path),
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .backup_id = try alloc.dupe(u8, backup_id),
+        .table_name = try alloc.dupe(u8, table_name),
+        .description = try alloc.dupe(u8, ""),
+        .schema_json = try stringifyJsonAlloc(alloc, schema_value),
+        .read_schema_json = try alloc.dupe(u8, ""),
+        .indexes_json = indexes_json,
+        .replication_sources_json = try alloc.dupe(u8, "[]"),
+        .shards = shards,
+    };
+}
+
+fn normalizeGoPortableIndexesJson(alloc: std.mem.Allocator, maybe_indexes: ?std.json.Value) ![]u8 {
+    const indexes = maybe_indexes orelse return try alloc.dupe(u8, "{}");
+    const object = switch (indexes) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidBackupRequest;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendGoPortableIndexConfigJson(alloc, &out, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendGoPortableIndexConfigJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_name: []const u8,
+    value: std.json.Value,
+) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var has_non_empty_name = false;
+    if (object.get("name")) |name_value| {
+        has_non_empty_name = switch (name_value) {
+            .string => |name| name.len > 0,
+            else => false,
+        };
+    }
+
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "name") and !has_non_empty_name) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendGoPortableJsonValue(alloc, out, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    if (!has_non_empty_name) {
+        if (!first) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, index_name);
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendGoPortableJsonValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    field_name: []const u8,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .object => |object| {
+            try out.append(alloc, '{');
+            var first = true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendJsonString(alloc, out, entry.key_ptr.*);
+                try out.append(alloc, ':');
+                try appendGoPortableJsonValue(alloc, out, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendGoPortableJsonValue(alloc, out, field_name, item);
+            }
+            try out.append(alloc, ']');
+        },
+        .string => |text| {
+            // Antfly Go 0.1.x portable metadata used the old local inference
+            // provider name "termite"; Zig's public index API calls the same
+            // local inference provider "antfly".
+            if (std.mem.eql(u8, field_name, "provider") and std.mem.eql(u8, text, "termite")) {
+                try appendJsonString(alloc, out, "antfly");
+            } else {
+                try appendJsonString(alloc, out, text);
+            }
+        },
+        else => {
+            const encoded = try stringifyJsonAlloc(alloc, value);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try stringifyJsonAlloc(alloc, value);
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn portableShardLessThan(_: void, a: PortableShard, b: PortableShard) bool {
+    const start_order = std.mem.order(u8, a.start_key, b.start_key);
+    if (start_order != .eq) return start_order == .lt;
+    return a.group_id < b.group_id;
+}
+
+fn decodePortableByteRangeBoundary(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len == 0) return try alloc.dupe(u8, "");
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    try std.base64.standard.Decoder.decode(out, encoded);
+    return out;
 }
 
 pub fn metadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
@@ -587,6 +852,18 @@ pub fn createClusterManifest(
     location: []const u8,
     table_entries: []const ClusterTableBackupEntry,
 ) !ClusterBackupManifest {
+    return try createClusterManifestWithExtensions(alloc, backup_id, location, table_entries, &.{}, &.{}, &.{});
+}
+
+pub fn createClusterManifestWithExtensions(
+    alloc: std.mem.Allocator,
+    backup_id: []const u8,
+    location: []const u8,
+    table_entries: []const ClusterTableBackupEntry,
+    installed_extensions: []const extension_domain.InstalledExtension,
+    extension_members: []const extension_domain.ExtensionMember,
+    extension_dependencies: []const extension_domain.ExtensionDependency,
+) !ClusterBackupManifest {
     const owned_entries = try alloc.alloc(ClusterTableBackupEntry, table_entries.len);
     var initialized: usize = 0;
     errdefer {
@@ -600,6 +877,12 @@ pub fn createClusterManifest(
         };
         initialized += 1;
     }
+    const owned_installed = try cloneInstalledExtensions(alloc, installed_extensions);
+    errdefer freeInstalledExtensions(alloc, owned_installed);
+    const owned_members = try cloneExtensionMembers(alloc, extension_members);
+    errdefer freeExtensionMembers(alloc, owned_members);
+    const owned_dependencies = try cloneExtensionDependencies(alloc, extension_dependencies);
+    errdefer freeExtensionDependencies(alloc, owned_dependencies);
 
     return .{
         .backup_id = try alloc.dupe(u8, backup_id),
@@ -607,6 +890,9 @@ pub fn createClusterManifest(
         .location = try alloc.dupe(u8, location),
         .antfly_version = try alloc.dupe(u8, antfly_version),
         .tables = owned_entries,
+        .installed_extensions = owned_installed,
+        .extension_members = owned_members,
+        .extension_dependencies = owned_dependencies,
     };
 }
 
@@ -906,6 +1192,26 @@ pub fn copyDirectoryFromLocation(
     }
 }
 
+pub fn copyFileFromLocation(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    dest_path: []const u8,
+) !void {
+    switch (location.*) {
+        .file => |backup_root| {
+            const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
+            defer alloc.free(src_path);
+            try copyFileAbsolute(src_path, dest_path);
+        },
+        .remote => |*store| {
+            const body = try store.readBytesAlloc(alloc, trimLeftSlash(snapshot_path));
+            defer alloc.free(body);
+            try writeFileAbsolute(dest_path, body);
+        },
+    }
+}
+
 fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManifest) !TableBackupManifest {
     const shards = try alloc.alloc(ShardSnapshot, manifest.shards.len);
     var initialized_shards: usize = 0;
@@ -950,6 +1256,12 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
         };
         initialized_tables += 1;
     }
+    const installed_extensions = try cloneInstalledExtensions(alloc, manifest.installed_extensions);
+    errdefer freeInstalledExtensions(alloc, installed_extensions);
+    const extension_members = try cloneExtensionMembers(alloc, manifest.extension_members);
+    errdefer freeExtensionMembers(alloc, extension_members);
+    const extension_dependencies = try cloneExtensionDependencies(alloc, manifest.extension_dependencies);
+    errdefer freeExtensionDependencies(alloc, extension_dependencies);
 
     return .{
         .format_version = manifest.format_version,
@@ -958,7 +1270,113 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
         .location = try alloc.dupe(u8, manifest.location),
         .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
         .tables = tables,
+        .installed_extensions = installed_extensions,
+        .extension_members = extension_members,
+        .extension_dependencies = extension_dependencies,
     };
+}
+
+fn cloneInstalledExtensions(alloc: std.mem.Allocator, extensions: []const extension_domain.InstalledExtension) ![]extension_domain.InstalledExtension {
+    const out = try alloc.alloc(extension_domain.InstalledExtension, extensions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*extension| extension.deinitOwned(alloc);
+        alloc.free(out);
+    }
+    for (extensions, 0..) |extension, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, extension.name),
+            .package_name = try alloc.dupe(u8, extension.package_name),
+            .package_version = try alloc.dupe(u8, extension.package_version),
+            .package_digest = try alloc.dupe(u8, extension.package_digest),
+            .scope = .{
+                .kind = extension.scope.kind,
+                .table_name = if (extension.scope.table_name.len > 0) try alloc.dupe(u8, extension.scope.table_name) else "",
+            },
+            .config_json = try alloc.dupe(u8, extension.config_json),
+            .granted_capabilities = try cloneExtensionCapabilities(alloc, extension.granted_capabilities),
+            .installed_at_epoch_ms = extension.installed_at_epoch_ms,
+            .status = extension.status,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeInstalledExtensions(alloc: std.mem.Allocator, extensions: []extension_domain.InstalledExtension) void {
+    for (extensions) |*extension| extension.deinitOwned(alloc);
+    if (extensions.len > 0) alloc.free(extensions);
+}
+
+fn cloneExtensionMembers(alloc: std.mem.Allocator, members: []const extension_domain.ExtensionMember) ![]extension_domain.ExtensionMember {
+    const out = try alloc.alloc(extension_domain.ExtensionMember, members.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*member| member.deinitOwned(alloc);
+        alloc.free(out);
+    }
+    for (members, 0..) |member, i| {
+        out[i] = .{
+            .extension_name = try alloc.dupe(u8, member.extension_name),
+            .scope = .{
+                .kind = member.scope.kind,
+                .table_name = if (member.scope.table_name.len > 0) try alloc.dupe(u8, member.scope.table_name) else "",
+            },
+            .object_kind = member.object_kind,
+            .object_name = try alloc.dupe(u8, member.object_name),
+            .table_name = if (member.table_name.len > 0) try alloc.dupe(u8, member.table_name) else "",
+            .shape_kind = member.shape_kind,
+            .shape_name = if (member.shape_name.len > 0) try alloc.dupe(u8, member.shape_name) else "",
+            .shape_version = if (member.shape_version.len > 0) try alloc.dupe(u8, member.shape_version) else "",
+            .owner_metadata_json = try alloc.dupe(u8, member.owner_metadata_json),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeExtensionMembers(alloc: std.mem.Allocator, members: []extension_domain.ExtensionMember) void {
+    for (members) |*member| member.deinitOwned(alloc);
+    if (members.len > 0) alloc.free(members);
+}
+
+fn cloneExtensionDependencies(alloc: std.mem.Allocator, dependencies: []const extension_domain.ExtensionDependency) ![]extension_domain.ExtensionDependency {
+    const out = try alloc.alloc(extension_domain.ExtensionDependency, dependencies.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*dependency| dependency.deinitOwned(alloc);
+        alloc.free(out);
+    }
+    for (dependencies, 0..) |dependency, i| {
+        out[i] = try extension_domain.cloneExtensionDependencyAlloc(alloc, dependency);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeExtensionDependencies(alloc: std.mem.Allocator, dependencies: []extension_domain.ExtensionDependency) void {
+    for (dependencies) |*dependency| dependency.deinitOwned(alloc);
+    if (dependencies.len > 0) alloc.free(dependencies);
+}
+
+fn cloneExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) ![]extension_domain.Capability {
+    const out = try alloc.alloc(extension_domain.Capability, capabilities.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |capability| {
+            alloc.free(capability.name);
+            if (capability.scope.len > 0) alloc.free(capability.scope);
+        }
+        alloc.free(out);
+    }
+    for (capabilities, 0..) |capability, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, capability.name),
+            .scope = if (capability.scope.len > 0) try alloc.dupe(u8, capability.scope) else "",
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn backupIdFromClusterMetadataKey(key: []const u8) []const u8 {
@@ -1213,6 +1631,84 @@ test "backup manifest round trips through metadata path" {
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
 }
 
+test "cluster backup manifest round trips extension metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/cluster-backup-manifest", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const tables = [_]ClusterTableBackupEntry{.{
+        .name = "memories",
+        .table_backup_id = "memories-snap",
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:abc",
+        .scope = .{ .kind = .table, .table_name = "memories" },
+        .granted_capabilities = &.{.{ .name = "read:table", .scope = "memories" }},
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .data_shape,
+            .object_name = "memory_record",
+            .shape_kind = .document,
+            .shape_version = "1",
+            .owner_metadata_json = "{\"type\":\"object\"}",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .generated_artifact,
+            .object_name = "memory_embedding",
+            .shape_name = "memory_embedding_shape",
+            .shape_version = "2",
+            .owner_metadata_json = "{\"kind\":\"embedding\"}",
+        },
+    };
+
+    var manifest = try createClusterManifestWithExtensions(
+        std.testing.allocator,
+        "snap",
+        "file:///tmp/backups",
+        &tables,
+        &installed,
+        &members,
+        &.{.{
+            .extension_name = "memoryaf",
+            .required_extension_name = "antfly_core",
+            .package_name = "antfly_core",
+            .version_requirement = ">=1.0.0",
+        }},
+    );
+    defer manifest.deinit(std.testing.allocator);
+
+    try writeClusterManifest(std.testing.allocator, root, &manifest);
+
+    var loaded = try readClusterManifest(std.testing.allocator, root, "snap");
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded.installed_extensions.len);
+    try std.testing.expectEqualStrings("memoryaf", loaded.installed_extensions[0].name);
+    try std.testing.expectEqualStrings("sha256:abc", loaded.installed_extensions[0].package_digest);
+    try std.testing.expectEqualStrings("memories", loaded.installed_extensions[0].scope.table_name);
+    try std.testing.expectEqual(@as(usize, 1), loaded.installed_extensions[0].granted_capabilities.len);
+    try std.testing.expectEqualStrings("read:table", loaded.installed_extensions[0].granted_capabilities[0].name);
+    try std.testing.expectEqual(@as(usize, 2), loaded.extension_members.len);
+    try std.testing.expectEqual(.data_shape, loaded.extension_members[0].object_kind);
+    try std.testing.expectEqual(extension_domain.DataShapeKind.document, loaded.extension_members[0].shape_kind.?);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", loaded.extension_members[0].owner_metadata_json);
+    try std.testing.expectEqual(.generated_artifact, loaded.extension_members[1].object_kind);
+    try std.testing.expectEqualStrings("memory_embedding_shape", loaded.extension_members[1].shape_name);
+    try std.testing.expectEqualStrings("2", loaded.extension_members[1].shape_version);
+    try std.testing.expectEqual(@as(usize, 1), loaded.extension_dependencies.len);
+    try std.testing.expectEqualStrings("antfly_core", loaded.extension_dependencies[0].package_name);
+}
+
 test "backup location parsing requires absolute file uri" {
     try std.testing.expectEqualStrings("/tmp/antfly-backup", try parseFileLocation("file:///tmp/antfly-backup"));
     try std.testing.expectError(error.UnsupportedBackupLocation, parseFileLocation("s3://bucket/path"));
@@ -1260,6 +1756,41 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqualStrings("docs", loaded.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.shards.len);
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
+}
+
+test "go portable metadata parses as table backup manifest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/go-portable-manifest", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    try ensureDirPath(root);
+
+    const backup_id = "portable-snap";
+    const path = try metadataPath(std.testing.allocator, root, backup_id);
+    defer std.testing.allocator.free(path);
+    try writeFileAbsolute(path,
+        \\{
+        \\  "name": "docs",
+        \\  "schema": {"default_type":"doc"},
+        \\  "indexes": {"legacy_vec":{"type":"embeddings","embedder":{"provider":"termite"}}},
+        \\  "shards": {
+        \\    "0000000000000001": {"byte_range":["","Qw=="]}
+        \\  }
+        \\}
+    );
+
+    var manifest = try readManifest(std.testing.allocator, root, backup_id);
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(backup_id, manifest.backup_id);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings("{\"default_type\":\"doc\"}", manifest.schema_json);
+    try std.testing.expectEqualStrings("{\"legacy_vec\":{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\"},\"name\":\"legacy_vec\"}}", manifest.indexes_json);
+    try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
+    try std.testing.expectEqual(group_ids.dataGroupIdFromHash(1), manifest.shards[0].group_id);
+    try std.testing.expectEqualStrings("", manifest.shards[0].start_key);
+    try std.testing.expectEqualStrings("C", manifest.shards[0].end_key.?);
+    try std.testing.expectEqualStrings("portable-snap-0000000000000001.afb", manifest.shards[0].snapshot_path);
 }
 
 test "backup remote location normalizes gcs alias" {

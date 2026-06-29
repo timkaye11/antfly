@@ -20,11 +20,6 @@ pub const metal_runtime = if (build_options.enable_metal) @import("backends/meta
         return false;
     }
 };
-pub const mlx_backend = if (build_options.enable_mlx) @import("backends/mlx.zig") else struct {
-    pub fn metalDeviceAvailable() bool {
-        return false;
-    }
-};
 pub const graph = @import("graph/root.zig");
 pub const io = @import("io/io.zig");
 pub const ops = @import("ops/ops.zig");
@@ -69,8 +64,10 @@ pub const finetune = struct {
     pub const infonce_cpu = @import("finetune/infonce_cpu.zig");
     pub const fused_chunker_splade = @import("finetune/fused_chunker_splade.zig");
     pub const fused_chunker_train = @import("finetune/fused_chunker_train.zig");
+    pub const fused_chunker_train_cli = @import("finetune_train_fused_chunker_root.zig");
     pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
     pub const peft = @import("finetune/peft.zig");
+    pub const safetensors_checkpoint = @import("finetune/safetensors_checkpoint.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
 pub const architectures = struct {
@@ -97,8 +94,6 @@ pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
     pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
     pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
-    pub const blas = @import("ops/blas_compute.zig");
-    pub const mlx = if (build_options.enable_mlx) @import("ops/mlx_compute.zig") else struct {};
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
     pub const wasm = if (build_options.enable_wasm) @import("ops/wasm_compute.zig") else struct {};
 };

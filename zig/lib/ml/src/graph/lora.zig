@@ -31,6 +31,7 @@ const graph_mod = @import("graph.zig");
 const node_mod = @import("node.zig");
 const builder_mod = @import("builder.zig");
 const shape_mod = @import("shape.zig");
+const autodiff = @import("autodiff.zig");
 
 const Graph = graph_mod.Graph;
 const Node = node_mod.Node;
@@ -307,6 +308,47 @@ test "injectLoRA by_weight keeps one adapter for shared weight uses" {
 
     try std.testing.expectEqual(@as(usize, 1), result.adapter.adapters.items.len);
     try std.testing.expectEqualStrings("shared.q_proj.weight.lora_A", result.adapter.adapters.items[0].lora_a_name);
+}
+
+test "injectLoRA preserves upstream gradient through untargeted preprojection" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const wi = try bld.parameter("mlp.Wi.weight", Shape.init(.f32, &.{ 6, 4 }));
+    const wo = try bld.parameter("mlp.Wo.weight", Shape.init(.f32, &.{ 4, 3 }));
+
+    const wi_out = try bld.linearNoBias(x, wi, 2, 4, 6);
+    const gate = try bld.sliceLastDim(wi_out, 0, 3);
+    const value = try bld.sliceLastDim(wi_out, 3, 6);
+    const gated = try bld.mul(try bld.geluExact(gate), value);
+    const projected = try bld.linearNoBias(gated, wo, 2, 3, 4);
+    const loss = try bld.reduceSum(projected, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var injected = try injectLoRA(allocator, &g, .{
+        .rank = 2,
+        .alpha = 2.0,
+        .target_patterns = &.{"mlp.Wo.weight"},
+    });
+    defer injected.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), injected.adapter.adapters.items.len);
+    const adapter = injected.adapter.adapters.items[0];
+    var grad_result = try autodiff.gradient(
+        allocator,
+        &injected.graph,
+        injected.graph.outputs.items[0],
+        &.{ x, adapter.lora_a_id, adapter.lora_b_id },
+    );
+    defer grad_result.deinit();
+
+    try std.testing.expect(grad_result.param_grads[0] != null_node);
+    try std.testing.expect(grad_result.param_grads[1] != null_node);
+    try std.testing.expect(grad_result.param_grads[2] != null_node);
 }
 
 /// Merge LoRA weights back into base weights: W' = W + scale * B @ A.

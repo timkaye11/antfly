@@ -799,6 +799,17 @@ const Buf = struct {
     reservation: ?run_memory.Reservation = null,
 };
 
+fn ropeHeadsPerTokenRow(logical_shape: ?[]const i64, head_dim: usize) usize {
+    if (head_dim == 0) return 1;
+    if (logical_shape) |shape| {
+        if (shape.len >= 2 and shape[shape.len - 1] > 0) {
+            const row_dim: usize = @intCast(shape[shape.len - 1]);
+            if (row_dim >= head_dim and row_dim % head_dim == 0) return row_dim / head_dim;
+        }
+    }
+    return 1;
+}
+
 fn toBuf(ct: CT) *Buf {
     return @ptrCast(@alignCast(ct));
 }
@@ -5574,7 +5585,12 @@ fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
 }
 
 fn geluNewOp(ctx: *anyopaque, input: CT) anyerror!CT {
-    return geluOp(ctx, input);
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const output = try self.allocator.dupe(f32, getData(input));
+    activations_mod.geluTanh(output);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
 }
 
 fn applyUnaryConsume(op: ops.UnaryConsumeOp, data: []f32) void {
@@ -9687,6 +9703,33 @@ fn chunkColsForWorkers(
         const end = @min(out_dim, start + cols_per_worker);
         out[count] = .{ .start = start, .end = end };
         count += 1;
+    }
+    return count;
+}
+
+fn chunkColsForWorkersAligned(
+    out_dim: usize,
+    plan: QuantLinearParallelPlan,
+    comptime align_cols: usize,
+    out: *[max_q4_k_parallel_workers]QuantColChunk,
+) usize {
+    if (align_cols <= 1 or plan.worker_count <= 1) return chunkColsForWorkers(out_dim, plan, out);
+    if (out_dim <= align_cols) return chunkColsForWorkers(out_dim, plan, out);
+
+    const cols_per_worker = std.math.divCeil(usize, out_dim, plan.worker_count) catch unreachable;
+    const aligned_cols_per_worker = std.mem.alignForward(usize, @max(cols_per_worker, align_cols), align_cols);
+
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < out_dim and count < plan.worker_count) {
+        const remaining = out_dim - start;
+        const end = if (count + 1 == plan.worker_count or remaining <= aligned_cols_per_worker + align_cols)
+            out_dim
+        else
+            start + aligned_cols_per_worker;
+        out[count] = .{ .start = start, .end = end };
+        count += 1;
+        start = end;
     }
     return count;
 }
@@ -22815,7 +22858,10 @@ fn linearKPreparedQ8KActivationTripleParallel(
             std.debug.print("k_prepared_q8_k_activation_triple_parallel_cols q6={} workers={d} rows={d} out={d} row_blocks={d}\n", .{ q6, col_plan.worker_count, rows, out_dim, row_blocks });
         }
         var chunks: [max_q4_k_parallel_workers]QuantColChunk = undefined;
-        const num_chunks = chunkColsForWorkers(out_dim, col_plan, &chunks);
+        const num_chunks = if (use_panel16_direct)
+            chunkColsForWorkersAligned(out_dim, col_plan, prepared_k_panel16_nr, &chunks)
+        else
+            chunkColsForWorkers(out_dim, col_plan, &chunks);
         var contexts: [max_q4_k_parallel_workers]KPreparedQ8KActivationTripleWorkerCtx = undefined;
         var jobs: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
         for (chunks[0..num_chunks], 0..) |chunk, i| {
@@ -34707,22 +34753,25 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
 
 fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const input_buf = toBuf(input);
     const data = getData(input);
     const total_chunks = data.len / head_dim;
     if (seq_len == 0) return error.InvalidRoPEInput;
     if (total_chunks % seq_len != 0) return error.InvalidRoPEInput;
-    const chunks_per_position = total_chunks / seq_len;
-    if (chunks_per_position == 0) return error.InvalidRoPEInput;
+    const heads_per_row = ropeHeadsPerTokenRow(input_buf.logical_shape, head_dim);
+    if (heads_per_row == 0 or total_chunks % heads_per_row != 0) return error.InvalidRoPEInput;
     const output = try self.allocator.dupe(f32, data);
     errdefer self.allocator.free(output);
 
     // Build flat position array: one position per head-sized chunk.
-    // Layout is [batch * seq_len, num_heads], flattened by rows, so each token
-    // position must repeat for all heads in that row.
+    // Token-major layouts are [batch * seq_len, num_heads * head_dim],
+    // flattened by rows, so each token position repeats for every head in
+    // that row.  A [batch, heads, seq_len, head_dim] layout has
+    // heads_per_row=1 and naturally falls back to chunk % seq_len.
     const positions = try self.allocator.alloc(usize, total_chunks);
     defer self.allocator.free(positions);
     for (0..total_chunks) |tok| {
-        positions[tok] = position_offset + ((tok / chunks_per_position) % seq_len);
+        positions[tok] = position_offset + ((tok / heads_per_row) % seq_len);
     }
 
     ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
@@ -36281,6 +36330,34 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
         )) |resolved| {
             rhs_resolved_shape_buf = resolved;
             rhs_effective_shape = rhs_resolved_shape_buf[0..rhs_shape.len];
+        }
+    }
+
+    if (lhs_batch.len == 0 and rhs_batch.len == 0 and lhs_contracting.len == 0 and rhs_contracting.len == 0) {
+        if (lhs_effective_shape.len == 1 and rhs_effective_shape.len == 1) {
+            const lhs_view = try denseWeightView(self, lhs);
+            defer if (lhs_view.owned) |owned| self.allocator.free(owned);
+            const rhs_view = try denseWeightView(self, rhs);
+            defer if (rhs_view.owned) |owned| self.allocator.free(owned);
+
+            const m = positiveShapeDim(lhs_effective_shape, 0) catch lhs_view.data.len;
+            const n = positiveShapeDim(rhs_effective_shape, 0) catch rhs_view.data.len;
+            if (m != lhs_view.data.len or n != rhs_view.data.len) return error.ShapeMismatch;
+
+            const output = try self.allocator.alloc(f32, m * n);
+            var raw_output: ?[]f32 = output;
+            errdefer if (raw_output) |raw| self.allocator.free(raw);
+            for (0..m) |i| {
+                for (0..n) |j| {
+                    output[i * n + j] = lhs_view.data[i] * rhs_view.data[j];
+                }
+            }
+
+            const result = try self.makeBuf(output, true);
+            raw_output = null;
+            errdefer freeTensor(self, result);
+            const out_shape = [_]i64{ @intCast(m), @intCast(n) };
+            return self.withLogicalShape(result, &out_shape);
         }
     }
 
@@ -41028,6 +41105,22 @@ test "small-row quant column planner chunks output columns" {
         try std.testing.expect(chunk.start < chunk.end);
         try std.testing.expectEqual(chunk.end, chunks[idx + 1].start);
     }
+}
+
+test "aligned quant column chunks preserve panel16 groups" {
+    var chunks: [max_q4_k_parallel_workers]QuantColChunk = undefined;
+    const count = chunkColsForWorkersAligned(768, .{ .worker_count = 5 }, prepared_k_panel16_nr, &chunks);
+    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(QuantColChunk{ .start = 0, .end = 160 }, chunks[0]);
+    try std.testing.expectEqual(QuantColChunk{ .start = 160, .end = 320 }, chunks[1]);
+    try std.testing.expectEqual(QuantColChunk{ .start = 640, .end = 768 }, chunks[4]);
+    for (chunks[0 .. count - 1], 0..) |chunk, idx| {
+        try std.testing.expectEqual(@as(usize, 0), chunk.start % prepared_k_panel16_nr);
+        try std.testing.expectEqual(@as(usize, 0), chunk.end % prepared_k_panel16_nr);
+        try std.testing.expectEqual(chunk.end, chunks[idx + 1].start);
+    }
+    try std.testing.expectEqual(@as(usize, 0), chunks[count - 1].start % prepared_k_panel16_nr);
+    try std.testing.expectEqual(@as(usize, 0), chunks[count - 1].end % prepared_k_panel16_nr);
 }
 
 test "quantized storage budget bytes include prepared q4_k cache" {
@@ -46231,6 +46324,33 @@ test "dot_general flattens lhs suffix for shared rhs source tensor" {
     for (out, expected) |actual, want| {
         try std.testing.expectApproxEqAbs(want, actual, 1e-4);
     }
+}
+
+test "dot_general handles rank1 outer product without contracting axes" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    var lhs_data = [_]f32{ 1, 2, 3 };
+    var rhs_data = [_]f32{ 10, 20, 30, 40 };
+
+    const lhs_ct = try compute.makeBuf(lhs_data[0..], false);
+    defer freeTensor(&compute, lhs_ct);
+    const lhs_shaped = try compute.withLogicalShape(lhs_ct, &.{3});
+
+    const rhs_ct = try compute.makeBuf(rhs_data[0..], false);
+    defer freeTensor(&compute, rhs_ct);
+    const rhs_shaped = try compute.withLogicalShape(rhs_ct, &.{4});
+
+    const out_ct = try primDotGeneralOp(&compute, lhs_shaped, rhs_shaped, &.{3}, &.{4}, &.{}, &.{}, &.{}, &.{});
+    defer freeTensor(&compute, out_ct);
+
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, tensorStoredShape(out_ct).?);
+    try std.testing.expectEqualSlices(f32, &.{
+        10, 20, 30, 40,
+        20, 40, 60, 80,
+        30, 60, 90, 120,
+    }, getData(out_ct));
 }
 
 test "dot_general handles rank2 lhs transpose view without materializing input first" {

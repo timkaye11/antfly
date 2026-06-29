@@ -70,6 +70,7 @@ const Graph = ml.graph.Graph;
 const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
+const null_node = ml.graph.null_node;
 
 // ── Public Config ───────────────────────────────────────────────────────────
 
@@ -130,6 +131,43 @@ pub const SegmentLayerInputs = struct {
     attn_bias_node: NodeId,
     rope_cos_node: NodeId,
     rope_sin_node: NodeId,
+};
+
+pub const LayerBackwardSubstage = enum {
+    mlp_wo,
+    mlp_gelu_input,
+    mlp_gate_value,
+    mlp_gate_input,
+    mlp_wi_output,
+    mlp_norm_output,
+    mlp_hidden_after_attn,
+    attn_out_proj,
+    attention_core,
+    attention_core_post_rope,
+    attention_scores_raw,
+    attention_scores_masked,
+    attention_probs,
+    qkv_proj,
+    qkv_proj_split,
+    attn_norm_hidden_in,
+};
+
+pub const ModernBertLayerBackwardSubstageGraph = struct {
+    stage: LayerBackwardSubstage,
+    primary_input_node: NodeId = null_node,
+    q_raw_node: NodeId = null_node,
+    k_raw_node: NodeId = null_node,
+    v_raw_node: NodeId = null_node,
+    hidden_in_aux_node: NodeId = null_node,
+    hidden_after_attn_aux_node: NodeId = null_node,
+    gate_input_aux_node: NodeId = null_node,
+    gate_value_aux_node: NodeId = null_node,
+    upstream_grad_node: NodeId,
+    attn_bias_node: NodeId = null_node,
+    rope_cos_node: NodeId = null_node,
+    rope_sin_node: NodeId = null_node,
+    output_node: NodeId,
+    loss_node: NodeId,
 };
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -348,6 +386,543 @@ pub fn ropeThetaForLayer(config: Config, layer: u32) f32 {
     return if (isGlobalAttentionLayer(config, layer)) config.rope_theta else config.local_rope_theta;
 }
 
+pub fn buildEncoderLayerBackwardSubstageGraph(
+    bld: *Builder,
+    config: Config,
+    stage: LayerBackwardSubstage,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+) !ModernBertLayerBackwardSubstageGraph {
+    if (layer >= config.num_hidden_layers) return error.InvalidLayerRange;
+    const H: u32 = config.hidden_size;
+    const I: u32 = config.intermediate_size;
+    const total: u32 = batch * seq_len;
+    const total_i: i64 = @intCast(total);
+    const hidden_i: i64 = @intCast(H);
+    const intermediate_i: i64 = @intCast(I);
+    const doubled_intermediate_i: i64 = @intCast(2 * I);
+    const head_dim_i: i64 = @intCast(config.head_dim);
+    const bh_i: i64 = @intCast(batch * config.num_attention_heads);
+    const seq_i: i64 = @intCast(seq_len);
+    const num_heads = config.num_attention_heads;
+    const head_dim = config.head_dim;
+    if (num_heads * head_dim != H) return error.InvalidHeadDim;
+
+    const upstream_grad = try bld.parameter(
+        "__substage_upstream_grad",
+        Shape.init(.f32, &.{ total_i, hidden_i }),
+    );
+
+    var out = ModernBertLayerBackwardSubstageGraph{
+        .stage = stage,
+        .upstream_grad_node = upstream_grad,
+        .output_node = null_node,
+        .loss_node = null_node,
+    };
+
+    const output = switch (stage) {
+        .mlp_wo => blk: {
+            const activated = try bld.parameter(
+                "__substage_mlp_wo_input",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = activated;
+            out.hidden_after_attn_aux_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromMlpActivated(
+                bld,
+                config,
+                activated,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .mlp_gelu_input => blk: {
+            const gate_gelu = try bld.parameter(
+                "__substage_gelu_input",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const gate_value = try bld.parameter(
+                "__substage_gate_value_aux",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = gate_gelu;
+            out.gate_value_aux_node = gate_value;
+            out.hidden_after_attn_aux_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromGeluOutput(
+                bld,
+                config,
+                gate_gelu,
+                gate_value,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .mlp_gate_value => blk: {
+            const gate_value = try bld.parameter(
+                "__substage_gate_value",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const gate_input = try bld.parameter(
+                "__substage_gate_input_aux",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = gate_value;
+            out.gate_input_aux_node = gate_input;
+            out.hidden_after_attn_aux_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromGateInputs(
+                bld,
+                config,
+                gate_input,
+                gate_value,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .mlp_gate_input => blk: {
+            const gate_input = try bld.parameter(
+                "__substage_gate_input",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const gate_value = try bld.parameter(
+                "__substage_gate_value_aux",
+                Shape.init(.f32, &.{ total_i, intermediate_i }),
+            );
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = gate_input;
+            out.gate_value_aux_node = gate_value;
+            out.hidden_after_attn_aux_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromGateInputs(
+                bld,
+                config,
+                gate_input,
+                gate_value,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .mlp_wi_output => blk: {
+            const gated = try bld.parameter(
+                "__substage_wi_output",
+                Shape.init(.f32, &.{ total_i, doubled_intermediate_i }),
+            );
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = gated;
+            out.hidden_after_attn_aux_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromWiOutput(
+                bld,
+                config,
+                gated,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .mlp_norm_output => blk: {
+            const mlp_normed = try bld.parameter(
+                "__substage_mlp_norm_output",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = mlp_normed;
+            out.hidden_after_attn_aux_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromMlpNormed(
+                bld,
+                config,
+                mlp_normed,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .mlp_hidden_after_attn => blk: {
+            const hidden_after_attn = try bld.parameter(
+                "__substage_hidden_after_attn",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = hidden_after_attn;
+            break :blk try encoderLayerTailFromHiddenAfterAttn(
+                bld,
+                config,
+                hidden_after_attn,
+                total,
+                layer,
+            );
+        },
+        .attn_out_proj => blk: {
+            const attn_merged = try bld.parameter(
+                "__substage_attn_merged",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = attn_merged;
+            out.hidden_in_aux_node = hidden_in_aux;
+            break :blk try encoderLayerTailFromAttnMerged(
+                bld,
+                config,
+                attn_merged,
+                hidden_in_aux,
+                total,
+                layer,
+            );
+        },
+        .attention_core => blk: {
+            const q_raw = try bld.parameter(
+                "__substage_q_raw",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const k_raw = try bld.parameter(
+                "__substage_k_raw",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const v_raw = try bld.parameter(
+                "__substage_v_raw",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const attn_bias = try bld.parameter(
+                "__substage_attn_bias",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const rope_cos = try bld.parameter(
+                "__substage_rope_cos",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            const rope_sin = try bld.parameter(
+                "__substage_rope_sin",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            out.q_raw_node = q_raw;
+            out.k_raw_node = k_raw;
+            out.v_raw_node = v_raw;
+            out.hidden_in_aux_node = hidden_in_aux;
+            out.attn_bias_node = attn_bias;
+            out.rope_cos_node = rope_cos;
+            out.rope_sin_node = rope_sin;
+            break :blk try encoderLayerTailFromQKVRaw(
+                bld,
+                config,
+                q_raw,
+                k_raw,
+                v_raw,
+                hidden_in_aux,
+                attn_bias,
+                rope_cos,
+                rope_sin,
+                ropeThetaForLayer(config, layer),
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .attention_core_post_rope => blk: {
+            const q_rope = try bld.parameter(
+                "__substage_q_rope",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const k_rope = try bld.parameter(
+                "__substage_k_rope",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const v_raw = try bld.parameter(
+                "__substage_v_attention_input",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const attn_bias = try bld.parameter(
+                "__substage_attn_bias",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            out.q_raw_node = q_rope;
+            out.k_raw_node = k_rope;
+            out.v_raw_node = v_raw;
+            out.hidden_in_aux_node = hidden_in_aux;
+            out.attn_bias_node = attn_bias;
+            break :blk try encoderLayerTailFromQKVRopedFlat(
+                bld,
+                config,
+                q_rope,
+                k_rope,
+                v_raw,
+                hidden_in_aux,
+                attn_bias,
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .attention_scores_raw => blk: {
+            const scores_raw = try bld.parameter(
+                "__substage_scores_raw",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const v_raw = try bld.parameter(
+                "__substage_v_attention_input",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const attn_bias = try bld.parameter(
+                "__substage_attn_bias",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            out.primary_input_node = scores_raw;
+            out.v_raw_node = v_raw;
+            out.hidden_in_aux_node = hidden_in_aux;
+            out.attn_bias_node = attn_bias;
+            break :blk try encoderLayerTailFromAttentionScoresRaw(
+                bld,
+                config,
+                scores_raw,
+                v_raw,
+                hidden_in_aux,
+                attn_bias,
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .attention_scores_masked => blk: {
+            const scores_masked = try bld.parameter(
+                "__substage_scores_masked",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const v_raw = try bld.parameter(
+                "__substage_v_attention_input",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = scores_masked;
+            out.v_raw_node = v_raw;
+            out.hidden_in_aux_node = hidden_in_aux;
+            break :blk try encoderLayerTailFromAttentionScoresMasked(
+                bld,
+                config,
+                scores_masked,
+                v_raw,
+                hidden_in_aux,
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .attention_probs => blk: {
+            const probs = try bld.parameter(
+                "__substage_attention_probs",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const v_raw = try bld.parameter(
+                "__substage_v_attention_input",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            out.primary_input_node = probs;
+            out.v_raw_node = v_raw;
+            out.hidden_in_aux_node = hidden_in_aux;
+            break :blk try encoderLayerTailFromAttentionProbs(
+                bld,
+                config,
+                probs,
+                v_raw,
+                hidden_in_aux,
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .qkv_proj => blk: {
+            const attn_normed = try bld.parameter(
+                "__substage_attn_normed",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const attn_bias = try bld.parameter(
+                "__substage_attn_bias",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const rope_cos = try bld.parameter(
+                "__substage_rope_cos",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            const rope_sin = try bld.parameter(
+                "__substage_rope_sin",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            out.primary_input_node = attn_normed;
+            out.hidden_in_aux_node = hidden_in_aux;
+            out.attn_bias_node = attn_bias;
+            out.rope_cos_node = rope_cos;
+            out.rope_sin_node = rope_sin;
+            break :blk try encoderLayerTailFromAttnNormed(
+                bld,
+                config,
+                attn_normed,
+                hidden_in_aux,
+                attn_bias,
+                rope_cos,
+                rope_sin,
+                ropeThetaForLayer(config, layer),
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .qkv_proj_split => blk: {
+            const q_attn_normed = try bld.parameter(
+                "__substage_q_attn_normed",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const k_attn_normed = try bld.parameter(
+                "__substage_k_attn_normed",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const v_attn_normed = try bld.parameter(
+                "__substage_v_attn_normed",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const hidden_in_aux = try bld.parameter(
+                "__substage_hidden_in_aux",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const attn_bias = try bld.parameter(
+                "__substage_attn_bias",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const rope_cos = try bld.parameter(
+                "__substage_rope_cos",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            const rope_sin = try bld.parameter(
+                "__substage_rope_sin",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            out.q_raw_node = q_attn_normed;
+            out.k_raw_node = k_attn_normed;
+            out.v_raw_node = v_attn_normed;
+            out.hidden_in_aux_node = hidden_in_aux;
+            out.attn_bias_node = attn_bias;
+            out.rope_cos_node = rope_cos;
+            out.rope_sin_node = rope_sin;
+            break :blk try encoderLayerTailFromAttnNormedSplit(
+                bld,
+                config,
+                q_attn_normed,
+                k_attn_normed,
+                v_attn_normed,
+                hidden_in_aux,
+                attn_bias,
+                rope_cos,
+                rope_sin,
+                ropeThetaForLayer(config, layer),
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+        .attn_norm_hidden_in => blk: {
+            const hidden_in = try bld.parameter(
+                "__substage_hidden_in",
+                Shape.init(.f32, &.{ total_i, hidden_i }),
+            );
+            const attn_bias = try bld.parameter(
+                "__substage_attn_bias",
+                Shape.init(.f32, &.{ bh_i, seq_i, seq_i }),
+            );
+            const rope_cos = try bld.parameter(
+                "__substage_rope_cos",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            const rope_sin = try bld.parameter(
+                "__substage_rope_sin",
+                Shape.init(.f32, &.{ seq_i, head_dim_i }),
+            );
+            out.primary_input_node = hidden_in;
+            out.attn_bias_node = attn_bias;
+            out.rope_cos_node = rope_cos;
+            out.rope_sin_node = rope_sin;
+            break :blk try encoderLayer(
+                bld,
+                config,
+                hidden_in,
+                attn_bias,
+                rope_cos,
+                rope_sin,
+                ropeThetaForLayer(config, layer),
+                batch,
+                seq_len,
+                layer,
+                num_heads,
+                head_dim,
+            );
+        },
+    };
+
+    const loss = try syntheticUpstreamLoss(bld, output, upstream_grad);
+    try bld.graph.markOutput(loss);
+    out.output_node = output;
+    out.loss_node = loss;
+    return out;
+}
+
 // ── Embeddings block ────────────────────────────────────────────────────────
 
 fn embeddings(
@@ -407,9 +982,14 @@ fn encoderLayer(
     const total: u32 = batch * seq_len;
 
     // ── Pre-attention LayerNorm ────────────────────────────────────────
-    // ModernBERT skips this norm in layer 0; the checkpoint does not contain
-    // model.layers.0.attn_norm.* tensors, and the eager path mirrors that.
-    const attn_normed = if (layer == 0) hidden_in else blk: {
+    // Layer 0 has no checkpoint attn_norm tensors; the eager path still
+    // applies layer norm with gamma=1 and beta=0, so the graph VJP must do the
+    // same to keep segment-local gradients isomorphic to the forward path.
+    const attn_normed = if (layer == 0) blk: {
+        const attn_ln_w = try constantVector(bld, H, 1.0);
+        const attn_ln_b = try constantVector(bld, H, 0.0);
+        break :blk try bld.layerNorm(hidden_in, attn_ln_w, attn_ln_b, H, config.layer_norm_eps);
+    } else blk: {
         const attn_ln_w = try layerParam(bld, layer, "attn_norm.weight", .{H});
         const attn_ln_b = try layerParam(bld, layer, "attn_norm.bias", .{H});
         break :blk try bld.layerNorm(hidden_in, attn_ln_w, attn_ln_b, H, config.layer_norm_eps);
@@ -446,7 +1026,7 @@ fn encoderLayer(
     // RoPE does not depend on attention direction, so the same `rope_cos`
     // / `rope_sin` tables that would be used by a causal decoder apply
     // here. V is not rotated.
-    const q_roped = try bld.rope(
+    const q_roped = try bld.ropeWithOptions(
         q_bhsd,
         rope_cos,
         rope_sin,
@@ -454,8 +1034,9 @@ fn encoderLayer(
         head_dim,
         head_dim,
         rope_theta,
+        true,
     );
-    const k_roped = try bld.rope(
+    const k_roped = try bld.ropeWithOptions(
         k_bhsd,
         rope_cos,
         rope_sin,
@@ -463,6 +1044,7 @@ fn encoderLayer(
         head_dim,
         head_dim,
         rope_theta,
+        true,
     );
 
     // ── Manual masked scaled dot-product attention ─────────────────────
@@ -542,6 +1124,384 @@ fn encoderLayer(
 
     // Pre-norm residual on the post-attention stream.
     return bld.add(mlp_out, hidden_after_attn);
+}
+
+fn encoderLayerTailFromMlpActivated(
+    bld: *Builder,
+    config: Config,
+    activated: NodeId,
+    hidden_after_attn: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const H: u32 = config.hidden_size;
+    const I: u32 = config.intermediate_size;
+    const down_w = try layerParam(bld, layer, "mlp.Wo.weight", .{ H, I });
+    const mlp_out = try bld.linearNoBias(activated, down_w, total, I, H);
+    return bld.add(mlp_out, hidden_after_attn);
+}
+
+fn encoderLayerTailFromGeluOutput(
+    bld: *Builder,
+    config: Config,
+    gate_gelu: NodeId,
+    gate_value: NodeId,
+    hidden_after_attn: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const activated = try bld.elemMultiply(gate_gelu, gate_value);
+    return encoderLayerTailFromMlpActivated(bld, config, activated, hidden_after_attn, total, layer);
+}
+
+fn encoderLayerTailFromGateInputs(
+    bld: *Builder,
+    config: Config,
+    gate_input: NodeId,
+    gate_value: NodeId,
+    hidden_after_attn: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const gate_gelu = try bld.geluExact(gate_input);
+    return encoderLayerTailFromGeluOutput(bld, config, gate_gelu, gate_value, hidden_after_attn, total, layer);
+}
+
+fn encoderLayerTailFromWiOutput(
+    bld: *Builder,
+    config: Config,
+    gated: NodeId,
+    hidden_after_attn: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const I: u32 = config.intermediate_size;
+    const gate_linear = try bld.sliceLastDim(gated, 0, @intCast(I));
+    const up_linear = try bld.sliceLastDim(gated, @intCast(I), @intCast(2 * I));
+    return encoderLayerTailFromGateInputs(bld, config, gate_linear, up_linear, hidden_after_attn, total, layer);
+}
+
+fn encoderLayerTailFromMlpNormed(
+    bld: *Builder,
+    config: Config,
+    mlp_normed: NodeId,
+    hidden_after_attn: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const H: u32 = config.hidden_size;
+    const I: u32 = config.intermediate_size;
+    const wi_w = try layerParam(bld, layer, "mlp.Wi.weight", .{ 2 * I, H });
+    const gated = try bld.linearNoBias(mlp_normed, wi_w, total, H, 2 * I);
+    return encoderLayerTailFromWiOutput(bld, config, gated, hidden_after_attn, total, layer);
+}
+
+fn encoderLayerTailFromHiddenAfterAttn(
+    bld: *Builder,
+    config: Config,
+    hidden_after_attn: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const H: u32 = config.hidden_size;
+    const mlp_ln_w = try layerParam(bld, layer, "mlp_norm.weight", .{H});
+    const mlp_ln_b = try layerParam(bld, layer, "mlp_norm.bias", .{H});
+    const mlp_normed = try bld.layerNorm(
+        hidden_after_attn,
+        mlp_ln_w,
+        mlp_ln_b,
+        H,
+        config.layer_norm_eps,
+    );
+    return encoderLayerTailFromMlpNormed(bld, config, mlp_normed, hidden_after_attn, total, layer);
+}
+
+fn encoderLayerTailFromAttnMerged(
+    bld: *Builder,
+    config: Config,
+    attn_merged: NodeId,
+    hidden_in: NodeId,
+    total: u32,
+    layer: u32,
+) !NodeId {
+    const H: u32 = config.hidden_size;
+    const o_w = try layerParam(bld, layer, "attn.Wo.weight", .{ H, H });
+    const o_b = try layerParam(bld, layer, "attn.Wo.bias", .{H});
+    const attn_proj = try bld.linear(attn_merged, o_w, o_b, total, H, H);
+    const hidden_after_attn = try bld.add(attn_proj, hidden_in);
+    return encoderLayerTailFromHiddenAfterAttn(bld, config, hidden_after_attn, total, layer);
+}
+
+fn encoderLayerTailFromQKVRaw(
+    bld: *Builder,
+    config: Config,
+    q_raw: NodeId,
+    k_raw: NodeId,
+    v_raw: NodeId,
+    hidden_in: NodeId,
+    attn_bias: NodeId,
+    rope_cos: NodeId,
+    rope_sin: NodeId,
+    rope_theta: f32,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const q_bhsd = try splitHeads(bld, q_raw, batch, seq_len, num_heads, head_dim);
+    const k_bhsd = try splitHeads(bld, k_raw, batch, seq_len, num_heads, head_dim);
+    const v_bhsd = try splitHeads(bld, v_raw, batch, seq_len, num_heads, head_dim);
+    const q_roped = try bld.ropeWithOptions(
+        q_bhsd,
+        rope_cos,
+        rope_sin,
+        seq_len,
+        head_dim,
+        head_dim,
+        rope_theta,
+        true,
+    );
+    const k_roped = try bld.ropeWithOptions(
+        k_bhsd,
+        rope_cos,
+        rope_sin,
+        seq_len,
+        head_dim,
+        head_dim,
+        rope_theta,
+        true,
+    );
+    return encoderLayerTailFromPostRopeAttention(
+        bld,
+        config,
+        q_roped,
+        k_roped,
+        v_bhsd,
+        hidden_in,
+        attn_bias,
+        batch,
+        seq_len,
+        layer,
+        num_heads,
+        head_dim,
+    );
+}
+
+fn encoderLayerTailFromQKVRopedFlat(
+    bld: *Builder,
+    config: Config,
+    q_rope: NodeId,
+    k_rope: NodeId,
+    v_raw: NodeId,
+    hidden_in: NodeId,
+    attn_bias: NodeId,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const q_bhsd = try splitHeads(bld, q_rope, batch, seq_len, num_heads, head_dim);
+    const k_bhsd = try splitHeads(bld, k_rope, batch, seq_len, num_heads, head_dim);
+    const v_bhsd = try splitHeads(bld, v_raw, batch, seq_len, num_heads, head_dim);
+    return encoderLayerTailFromPostRopeAttention(
+        bld,
+        config,
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        hidden_in,
+        attn_bias,
+        batch,
+        seq_len,
+        layer,
+        num_heads,
+        head_dim,
+    );
+}
+
+fn encoderLayerTailFromPostRopeAttention(
+    bld: *Builder,
+    config: Config,
+    q_roped: NodeId,
+    k_roped: NodeId,
+    v_bhsd: NodeId,
+    hidden_in: NodeId,
+    attn_bias: NodeId,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const k_t = try bld.transpose(k_roped, &.{ 0, 2, 1 });
+    const scores_raw = try bld.matmul3D(q_roped, k_t);
+    const inv_sqrt_d = try bld.scalarConst(
+        .f32,
+        1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+    );
+    const scores_scaled = try bld.mul(scores_raw, inv_sqrt_d);
+    const scores_masked = try bld.add(scores_scaled, attn_bias);
+    const probs = try bld.softmax(scores_masked);
+    return encoderLayerTailFromAttentionProbsBhsd(bld, config, probs, v_bhsd, hidden_in, batch, seq_len, layer, num_heads, head_dim);
+}
+
+fn encoderLayerTailFromAttentionScoresRaw(
+    bld: *Builder,
+    config: Config,
+    scores_raw: NodeId,
+    v_raw: NodeId,
+    hidden_in: NodeId,
+    attn_bias: NodeId,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const inv_sqrt_d = try bld.scalarConst(
+        .f32,
+        1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+    );
+    const scores_scaled = try bld.mul(scores_raw, inv_sqrt_d);
+    const scores_masked = try bld.add(scores_scaled, attn_bias);
+    return encoderLayerTailFromAttentionScoresMasked(bld, config, scores_masked, v_raw, hidden_in, batch, seq_len, layer, num_heads, head_dim);
+}
+
+fn encoderLayerTailFromAttentionScoresMasked(
+    bld: *Builder,
+    config: Config,
+    scores_masked: NodeId,
+    v_raw: NodeId,
+    hidden_in: NodeId,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const probs = try bld.softmax(scores_masked);
+    return encoderLayerTailFromAttentionProbs(bld, config, probs, v_raw, hidden_in, batch, seq_len, layer, num_heads, head_dim);
+}
+
+fn encoderLayerTailFromAttentionProbs(
+    bld: *Builder,
+    config: Config,
+    probs: NodeId,
+    v_raw: NodeId,
+    hidden_in: NodeId,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const v_bhsd = try splitHeads(bld, v_raw, batch, seq_len, num_heads, head_dim);
+    return encoderLayerTailFromAttentionProbsBhsd(bld, config, probs, v_bhsd, hidden_in, batch, seq_len, layer, num_heads, head_dim);
+}
+
+fn encoderLayerTailFromAttentionProbsBhsd(
+    bld: *Builder,
+    config: Config,
+    probs: NodeId,
+    v_bhsd: NodeId,
+    hidden_in: NodeId,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const attn_bhsd = try bld.matmul3D(probs, v_bhsd);
+    const attn_merged = try mergeHeads(bld, attn_bhsd, batch, seq_len, num_heads, head_dim);
+    return encoderLayerTailFromAttnMerged(bld, config, attn_merged, hidden_in, batch * seq_len, layer);
+}
+
+fn encoderLayerTailFromAttnNormed(
+    bld: *Builder,
+    config: Config,
+    attn_normed: NodeId,
+    hidden_in: NodeId,
+    attn_bias: NodeId,
+    rope_cos: NodeId,
+    rope_sin: NodeId,
+    rope_theta: f32,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    return encoderLayerTailFromAttnNormedSplit(
+        bld,
+        config,
+        attn_normed,
+        attn_normed,
+        attn_normed,
+        hidden_in,
+        attn_bias,
+        rope_cos,
+        rope_sin,
+        rope_theta,
+        batch,
+        seq_len,
+        layer,
+        num_heads,
+        head_dim,
+    );
+}
+
+fn encoderLayerTailFromAttnNormedSplit(
+    bld: *Builder,
+    config: Config,
+    q_attn_normed: NodeId,
+    k_attn_normed: NodeId,
+    v_attn_normed: NodeId,
+    hidden_in: NodeId,
+    attn_bias: NodeId,
+    rope_cos: NodeId,
+    rope_sin: NodeId,
+    rope_theta: f32,
+    batch: u32,
+    seq_len: u32,
+    layer: u32,
+    num_heads: u32,
+    head_dim: u32,
+) !NodeId {
+    const H: u32 = config.hidden_size;
+    const total = batch * seq_len;
+    const q_w = try layerParam(bld, layer, "attn.query_proj.weight", .{ H, H });
+    const q_b = try layerParam(bld, layer, "attn.query_proj.bias", .{H});
+    const q_raw = try bld.linear(q_attn_normed, q_w, q_b, total, H, H);
+    const k_w = try layerParam(bld, layer, "attn.key_proj.weight", .{ H, H });
+    const k_b = try layerParam(bld, layer, "attn.key_proj.bias", .{H});
+    const k_raw = try bld.linear(k_attn_normed, k_w, k_b, total, H, H);
+    const v_w = try layerParam(bld, layer, "attn.value_proj.weight", .{ H, H });
+    const v_b = try layerParam(bld, layer, "attn.value_proj.bias", .{H});
+    const v_raw = try bld.linear(v_attn_normed, v_w, v_b, total, H, H);
+    return encoderLayerTailFromQKVRaw(
+        bld,
+        config,
+        q_raw,
+        k_raw,
+        v_raw,
+        hidden_in,
+        attn_bias,
+        rope_cos,
+        rope_sin,
+        rope_theta,
+        batch,
+        seq_len,
+        layer,
+        num_heads,
+        head_dim,
+    );
+}
+
+fn syntheticUpstreamLoss(bld: *Builder, output: NodeId, upstream_grad: NodeId) !NodeId {
+    const weighted = try bld.elemMultiply(output, upstream_grad);
+    return bld.reduceSum(weighted, &.{ 0, 1 });
 }
 
 // ── Head-split / merge helpers ──────────────────────────────────────────────
@@ -625,6 +1585,14 @@ fn layerParam(bld: *Builder, layer: u32, suffix: []const u8, dims: anytype) !Nod
         else => @compileError("layerParam: only 1-D or 2-D dims supported"),
     };
     return bld.parameter(name, shape);
+}
+
+fn constantVector(bld: *Builder, len: u32, value: f32) !NodeId {
+    const allocator = bld.graph.allocator;
+    const data = try allocator.alloc(f32, len);
+    defer allocator.free(data);
+    @memset(data, value);
+    return bld.tensorConst(data, Shape.init(.f32, &.{@intCast(len)}));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ split="${ANTFLY_FUSED_CHUNKER_PARITY_SPLIT:-train}"
 max_seq_len="${ANTFLY_FUSED_CHUNKER_MAX_SEQ_LEN:-384}"
 max_chunks="${ANTFLY_FUSED_CHUNKER_MAX_CHUNKS:-32}"
 batch_size="${ANTFLY_FUSED_CHUNKER_BATCH_SIZE:-8}"
+offset="${ANTFLY_FUSED_CHUNKER_PARITY_OFFSET:-0}"
 limit="${ANTFLY_FUSED_CHUNKER_PARITY_LIMIT:-8}"
 out_dir="${ANTFLY_FUSED_CHUNKER_PARITY_OUT:-/tmp/fused_chunker_go_zig_parity}"
 
@@ -139,6 +140,7 @@ type FirstBatch struct {
 type Output struct {
 	Tool                            string      `json:"tool"`
 	SchemaVersion                   int         `json:"schema_version"`
+	Offset                          int         `json:"offset"`
 	Samples                         int         `json:"samples"`
 	Batches                         int         `json:"batches"`
 	MaxSeqLen                       int         `json:"max_seq_len"`
@@ -276,6 +278,7 @@ func main() {
 	maxSeqLen := flag.Int("max-seq-len", 384, "max sequence length")
 	maxChunks := flag.Int("max-chunks", 32, "max chunks")
 	batchSize := flag.Int("batch-size", 8, "batch size")
+	offset := flag.Int("offset", 0, "sample offset")
 	limit := flag.Int("limit", 8, "sample limit")
 	dumpBatch := flag.Bool("dump-batch", false, "dump first batch arrays")
 	flag.Parse()
@@ -290,9 +293,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load samples: %v\n", err)
 		os.Exit(1)
 	}
-	if *limit > 0 && *limit < len(samples) {
-		samples = samples[:*limit]
+	if *offset < 0 || *offset > len(samples) {
+		fmt.Fprintf(os.Stderr, "invalid offset %d for %d samples\n", *offset, len(samples))
+		os.Exit(1)
 	}
+	end := len(samples)
+	if *limit > 0 && *offset+*limit < end {
+		end = *offset + *limit
+	}
+	sourceOffset := *offset
+	samples = samples[*offset:end]
 
 	tokenizer, err := finetune.NewFusedHFTokenizer(filepath.Join(*modelDir, "tokenizer.json"), 50368)
 	if err != nil {
@@ -335,7 +345,7 @@ func main() {
 		chunkMask := tensorF32(batch.ChunkMask)
 
 		for _, idx := range batch.SampleIndices {
-			hashU64(&sampleIndicesHash, uint64(idx))
+			hashU64(&sampleIndicesHash, uint64(sourceOffset+idx))
 		}
 		batchGoldBySample := make([]uint64, len(batch.SampleIndices))
 		total := len(batch.SampleIndices) * *maxSeqLen
@@ -371,8 +381,12 @@ func main() {
 		}
 
 		if *dumpBatch && firstBatch == nil {
+			absoluteSampleIndices := make([]int, len(batch.SampleIndices))
+			for i, idx := range batch.SampleIndices {
+				absoluteSampleIndices[i] = sourceOffset + idx
+			}
 			fb := &FirstBatch{
-				SampleIndices: append([]int(nil), batch.SampleIndices...),
+				SampleIndices: absoluteSampleIndices,
 				Samples:       make([]BatchSample, 0, len(batch.SampleIndices)),
 			}
 			debugSourceTokenMappings = make([]DebugSourceTokenMappings, 0, len(batch.SampleIndices))
@@ -405,7 +419,7 @@ func main() {
 					})
 				}
 				fb.Samples = append(fb.Samples, BatchSample{
-					SampleIndex:           sampleIndex,
+					SampleIndex:           sourceOffset + sampleIndex,
 					ValidTokens:           validCount(attentionMask[seqStart:seqEnd]),
 					InputIDs:              append([]int32(nil), inputIDs[seqStart:seqEnd]...),
 					AttentionMask:         append([]int32(nil), attentionMask[seqStart:seqEnd]...),
@@ -415,7 +429,7 @@ func main() {
 				})
 				_, _, offsets := tokenizer.Encode(samples[sampleIndex].Text, *maxSeqLen)
 				debugSourceTokenMappings = append(debugSourceTokenMappings, DebugSourceTokenMappings{
-					SampleIndex: sampleIndex,
+					SampleIndex: sourceOffset + sampleIndex,
 					Mappings:    sourceTokenMappings(samples[sampleIndex], offsets),
 				})
 			}
@@ -438,6 +452,7 @@ func main() {
 	out := Output{
 		Tool:                            "go_fused_tokenization_parity",
 		SchemaVersion:                   2,
+		Offset:                          sourceOffset,
 		Samples:                         len(samples),
 		Batches:                         int(batches),
 		MaxSeqLen:                       *maxSeqLen,
@@ -482,6 +497,7 @@ with open(go_path, "r", encoding="utf-8") as f:
 
 fields = [
     "schema_version",
+    "offset",
     "samples",
     "batches",
     "max_seq_len",
@@ -529,13 +545,14 @@ chmod +x "$compare_py"
 echo "running Zig fused batch parity dump"
 (
   cd "$pkg_root"
-  "$zig_bin" build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false count-fused-tokenization -- \
+  "$zig_bin" build -Doptimize=ReleaseFast -Dmetal=true count-fused-tokenization -- \
     --data "$data_path" \
     --model-dir "$model_dir" \
     --split "$split" \
     --max-seq-len "$max_seq_len" \
     --max-chunks "$max_chunks" \
     --batch-size "$batch_size" \
+    --offset "$offset" \
     --limit "$limit" \
     --json \
     --dump-first \
@@ -557,6 +574,7 @@ echo "running Go fused batch parity dump"
     --max-seq-len "$max_seq_len" \
     --max-chunks "$max_chunks" \
     --batch-size "$batch_size" \
+    --offset "$offset" \
     --limit "$limit" \
     --dump-batch
 ) > "$go_json" 2>"$out_dir/go_stderr.log"

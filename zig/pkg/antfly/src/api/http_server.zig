@@ -28,6 +28,7 @@ const table_contract = @import("table_contract.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/mod.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -53,6 +54,7 @@ const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -70,6 +72,8 @@ const schema_openapi = @import("antfly_schema_openapi");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const connections_api = @import("connections.zig");
+const common_config = @import("../common/config.zig");
 const generating_runtime = @import("../generating/mod.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -247,6 +251,9 @@ pub const ApiHttpServerConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
+    /// Loaded node config, used by /connections to enumerate configured
+    /// providers and object stores. Must outlive the server.
+    node_config: ?*const common_config.Config = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
@@ -255,6 +262,8 @@ pub const ApiHttpServerConfig = struct {
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
+    artifact_reprocess_job_store_path: ?[]const u8 = null,
+    artifact_reprocess_job_retention_ms: ?u64 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -351,6 +360,13 @@ pub const StatusSource = struct {
         get_join_shuffle_lease: ?*const fn (ptr: *anyopaque, job_id: u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (ptr: *anyopaque, job_id: u64) anyerror!void = null,
+        install_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        update_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        drop_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) anyerror!void = null,
+        enable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
+        disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
+        configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
     };
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
@@ -438,6 +454,47 @@ pub const StatusSource = struct {
         return true;
     }
 
+    pub fn installExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.install_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn updateExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.update_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn dropExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
+        const fn_ptr = self.vtable.drop_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn enableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.enable_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name);
+    }
+
+    pub fn disableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.disable_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name);
+    }
+
+    pub fn configureExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.configure_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn restoreExtensions(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        installed: []const extension_domain.InstalledExtension,
+        members: []const extension_domain.ExtensionMember,
+        dependencies: []const extension_domain.ExtensionDependency,
+    ) !void {
+        const fn_ptr = self.vtable.restore_extensions orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, installed, members, dependencies);
+    }
+
     fn makeServiceVTable(comptime T: type) VTable {
         const Gen = struct {
             fn cast(ptr: *anyopaque) *T {
@@ -513,6 +570,40 @@ pub const StatusSource = struct {
             fn removeJoinShuffleLease(ptr: *anyopaque, job_id: u64) anyerror!void {
                 try cast(ptr).removeShuffleJoinLease(job_id);
             }
+
+            fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) anyerror!extension_domain.InstalledExtension {
+                return try installExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) anyerror!extension_domain.InstalledExtension {
+                return try updateExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn dropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) anyerror!void {
+                return try dropExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension {
+                return try enableExtensionOnService(cast(ptr), alloc, name);
+            }
+
+            fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension {
+                return try disableExtensionOnService(cast(ptr), alloc, name);
+            }
+
+            fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension {
+                return try configureExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn restoreExtensions(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                installed: []const extension_domain.InstalledExtension,
+                members: []const extension_domain.ExtensionMember,
+                dependencies: []const extension_domain.ExtensionDependency,
+            ) anyerror!void {
+                return try restoreExtensionsOnService(cast(ptr), alloc, installed, members, dependencies);
+            }
         };
 
         return .{
@@ -532,6 +623,13 @@ pub const StatusSource = struct {
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
             .upsert_join_shuffle_lease = Gen.upsertJoinShuffleLease,
             .remove_join_shuffle_lease = Gen.removeJoinShuffleLease,
+            .install_extension = Gen.installExtension,
+            .update_extension = Gen.updateExtension,
+            .drop_extension = Gen.dropExtension,
+            .enable_extension = Gen.enableExtension,
+            .disable_extension = Gen.disableExtension,
+            .configure_extension = Gen.configureExtension,
+            .restore_extensions = Gen.restoreExtensions,
         };
     }
 
@@ -614,6 +712,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
@@ -625,6 +724,7 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
@@ -636,6 +736,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
     const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, table.schema_json);
     defer alloc.free(expanded_index_json);
 
@@ -650,6 +751,7 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
     const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(indexes_json);
@@ -867,8 +969,10 @@ pub const ApiHttpServer = struct {
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
+    artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    connections_cache: connections_api.Cache = .{ .alloc = undefined },
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
@@ -905,6 +1009,11 @@ pub const ApiHttpServer = struct {
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
             }),
+            .artifact_reprocess_job_store = artifact_reprocess_jobs.Store.init(alloc, .{
+                .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
+                .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
+            }),
+            .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
         };
@@ -958,6 +1067,18 @@ pub const ApiHttpServer = struct {
             opened.* = try distributed_join.OpenedJoinJobStore.open(alloc, join_job_path);
             server.join_job_store.opened_join_job_store = opened;
         }
+        if (cfg.artifact_reprocess_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.artifact_reprocess_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.artifact_reprocess_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(artifact_reprocess_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try artifact_reprocess_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.artifact_reprocess_job_store.attachOpenedStore(opened);
+        }
         return server;
     }
 
@@ -988,11 +1109,46 @@ pub const ApiHttpServer = struct {
             self.alloc.destroy(opened);
         }
         self.join_job_store.deinit();
+        self.artifact_reprocess_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
         }
+        self.connections_cache.deinit();
         self.* = undefined;
+    }
+
+    /// Build the GET /connections response body. Shared by the legacy
+    /// dispatcher and the generated httpx handler so both paths use the same
+    /// per-connection result cache. The caller owns the returned JSON.
+    pub fn listConnectionsJsonAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        types_param: ?[]const u8,
+        include_param: ?[]const u8,
+        refresh_param: ?[]const u8,
+    ) ![]u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
+        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+
+        const node_config = self.cfg.node_config;
+        const response = try connections_api.buildConnectionsResponse(arena, .{
+            .node_config = node_config,
+            .snapshot = if (snapshot_opt) |*snapshot| snapshot else null,
+            .antfly_provider = self.antfly_provider,
+            .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
+            .inference_api_key = self.cfg.inference_api_key,
+        }, &self.connections_cache, .{
+            .include_models = connections_api.includeHasModels(include_param),
+            .refresh = if (refresh_param) |value| std.mem.eql(u8, value, "true") else false,
+            .types_filter = types_param,
+        });
+        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(response, .{})});
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -1081,6 +1237,7 @@ pub const ApiHttpServer = struct {
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
+        self.artifact_reprocess_job_store.cleanupExpiredJobs();
     }
 
     fn localTableRuntimeStatuses(
@@ -1755,7 +1912,21 @@ pub const ApiHttpServer = struct {
             defer topology_status.deinit(self.alloc);
             return try jsonResponse(self.alloc, topology_status);
         }
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.connections)) {
+            const body = try self.listConnectionsJsonAlloc(
+                self.alloc,
+                parseSimpleQueryParam(uri_parts.query, "types"),
+                parseSimpleQueryParam(uri_parts.query, "include"),
+                parseSimpleQueryParam(uri_parts.query, "refresh"),
+            );
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = body,
+            };
+        }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
+        if (try self.dispatchExtensionRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         try self.runSessionMaintenanceOnce();
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
@@ -1766,6 +1937,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        if (req.method == .GET or req.method == .POST or req.method == .DELETE) {
+            if (routes.Routes.matchMcpExtension(uri_parts.path)) |mcp_extension| {
+                return try protocol_adapters.handleExtensionMcpRequest(self, req, authenticated_identity, mcp_extension.name);
+            }
+        }
         if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
             return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
@@ -1774,6 +1950,141 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
             return try protocol_adapters.handleA2aCard(self);
+        }
+        return null;
+    }
+
+    fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        if (!isExtensionPath(uri_parts.path)) return null;
+
+        if (req.method != .GET) {
+            if (req.method == .POST) {
+                if (routes.Routes.matchInstalledExtensionUpdate(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension update request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.updateExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
+                    return try jsonResponse(self.alloc, installed);
+                }
+                if (routes.Routes.matchInstalledExtensionDrop(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension drop request");
+                    };
+                    defer parsed.deinit();
+                    self.source.dropExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    return try jsonResponse(self.alloc, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
+                }
+                if (routes.Routes.matchInstalledExtensionEnable(uri_parts.path)) |installed_route| {
+                    var installed = self.source.enableExtension(self.alloc, installed_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
+                    return try jsonResponse(self.alloc, installed);
+                }
+                if (routes.Routes.matchInstalledExtensionDisable(uri_parts.path)) |installed_route| {
+                    var installed = self.source.disableExtension(self.alloc, installed_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
+                    return try jsonResponse(self.alloc, installed);
+                }
+                if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension install request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.installExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    if (!parsed.value.dry_run) {
+                        self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                            error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                            else => return err,
+                        };
+                    }
+                    return try jsonResponse(self.alloc, installed);
+                }
+            }
+            if (req.method == .PUT) {
+                if (routes.Routes.matchInstalledExtensionConfig(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension config request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.configureExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
+                    return try jsonResponse(self.alloc, installed);
+                }
+            }
+            return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        }
+
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1)) {
+            return try jsonResponse(self.alloc, .{
+                .packages = routes.Routes.extensions_v1_packages,
+                .installed = routes.Routes.extensions_v1_installed,
+            });
+        }
+
+        var snapshot = (try self.source.adminSnapshot()) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_packages)) {
+            return try jsonResponse(self.alloc, snapshot.extension_packages);
+        }
+        if (routes.Routes.matchExtensionPackageVersion(uri_parts.path)) |package_version| {
+            const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try jsonResponse(self.alloc, package.*);
+        }
+        if (routes.Routes.matchExtensionPackage(uri_parts.path)) |package_route| {
+            const package = findLatestExtensionPackage(&snapshot, package_route.name) orelse {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try jsonResponse(self.alloc, package.*);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_installed)) {
+            return try jsonResponse(self.alloc, snapshot.installed_extensions);
+        }
+        if (routes.Routes.matchInstalledExtensionObjects(uri_parts.path)) |installed_route| {
+            const members = try extensionMembersForName(self.alloc, snapshot.extension_members, installed_route.name);
+            defer if (members.len > 0) self.alloc.free(members);
+            if (members.len == 0 and findInstalledExtension(&snapshot, installed_route.name) == null) {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            }
+            return try jsonResponse(self.alloc, members);
+        }
+        if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
+            const installed = findInstalledExtension(&snapshot, installed_route.name) orelse {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try jsonResponse(self.alloc, installed.*);
         }
         return null;
     }
@@ -3166,6 +3477,23 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
+                return try self.handlePublicStartDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
+                return try self.handlePublicAdvanceDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
+                return try self.handlePublicCancelDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicReprocessDocumentArtifactRange(artifact_route.table_name, artifact_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicReprocessDocumentArtifact(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableCreateIndex(table_index.table_name, table_index.index_name, req.body);
             }
@@ -3297,6 +3625,7 @@ pub const ApiHttpServer = struct {
                     self.source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                             _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
@@ -3317,6 +3646,7 @@ pub const ApiHttpServer = struct {
                 self.source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |err| switch (err) {
                     error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
                         _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
@@ -3384,6 +3714,21 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
+                return try self.handlePublicDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
             if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
                 if (runtimeSchemaDebugRequested(uri_parts.query) and !self.runtimeSchemaDebugAllowed(authenticated_identity)) {
                     return try textResponse(self.alloc, 403, "forbidden");
@@ -3418,6 +3763,7 @@ pub const ApiHttpServer = struct {
                 }
                 self.source.dropTable(self.alloc, table_path.table_name) catch |err| switch (err) {
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     else => {
                         std.log.err("public drop table metadata remove failed table={s} err={s}", .{
@@ -3568,11 +3914,13 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (table.schema_json.len == 0) return;
 
-        var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
-        defer parsed_schema.deinit(self.alloc);
-        try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
+        if (table.schema_json.len != 0) {
+            var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
+            defer parsed_schema.deinit(self.alloc);
+            try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
+        }
+        try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
     }
 
     pub fn validateCommitTablesAgainstSchema(self: *ApiHttpServer, tables: []const distributed_txn.TableCommitRequest) !void {
@@ -3665,6 +4013,37 @@ pub const ApiHttpServer = struct {
         return group_ids;
     }
 
+    fn restoreManifestGroupIdsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        backup_location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+    ) ![]u64 {
+        _ = self;
+        var manifest = try backups_api.readManifestFromLocation(alloc, backup_location, backup_id);
+        defer manifest.deinit(alloc);
+        const group_ids = try alloc.alloc(u64, manifest.shards.len);
+        for (manifest.shards, 0..) |shard, i| group_ids[i] = shard.group_id;
+        return group_ids;
+    }
+
+    fn overwriteRestoreDropGroupIdsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        backup_location: *backups_api.BackupLocation,
+        table_name: []const u8,
+        backup_id: []const u8,
+    ) ![]u64 {
+        if ((self.source.adminSnapshot() catch return error.InternalFailure)) |snapshot_value| {
+            var snapshot = snapshot_value;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            const group_ids = try tableGroupIdsFromSnapshot(alloc, &snapshot, table_name);
+            if (group_ids.len > 0) return group_ids;
+            alloc.free(group_ids);
+        }
+        return try self.restoreManifestGroupIdsAlloc(alloc, backup_location, backup_id);
+    }
+
     pub fn loadOwnedTableRecord(self: *ApiHttpServer, table_name: []const u8) !?metadata_table_manager.TableRecord {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -3691,6 +4070,19 @@ pub const ApiHttpServer = struct {
         row_filter_json: []const u8,
     ) !bool {
         return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
+    }
+
+    pub fn sourceDocumentVisibleToIdentity(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        key: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !bool {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return true;
+        const source = self.table_reads orelse return false;
+        return try self.docMatchesRowFilter(source, table_name, key, filter);
     }
 
     pub fn filterScanResultByRowFilter(
@@ -3988,6 +4380,25 @@ pub const ApiHttpServer = struct {
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
     }
 
+    pub fn documentArtifactManifestOptionsForRequest(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !public_table_http.DocumentArtifactManifestOptions {
+        var opts = public_table_http.parseDocumentArtifactManifestOptions(query) catch return error.InvalidDetail;
+        if (self.cfg.auth_enabled and parseSimpleQueryParam(query, "detail") == null) opts.detail = .summary;
+        if (opts.detail == .raw and self.cfg.auth_enabled) {
+            const identity = authenticated_identity orelse return error.Forbidden;
+            if (!permissionsAllow(identity.permissions, .table, table_name, .admin) and
+                !permissionsAllow(identity.permissions, .@"*", "*", .admin))
+            {
+                return error.Forbidden;
+            }
+        }
+        return opts;
+    }
+
     pub fn waitForTableVisibility(self: *ApiHttpServer, table_name: []const u8, expected: TableVisibility) !void {
         const handled = try self.source.waitTableLifecycle(table_name, expected);
         if (handled) return;
@@ -4044,6 +4455,23 @@ pub const ApiHttpServer = struct {
                 return;
             }
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_interval_ns);
+        }
+    }
+
+    pub fn waitForProjectedExtensionLifecycle(self: *ApiHttpServer, expected: extension_domain.InstalledExtension) !void {
+        const timeout_ns = 10 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            var maybe_snapshot = try self.source.adminSnapshot();
+            if (maybe_snapshot) |*snapshot| {
+                defer self.source.freeAdminSnapshot(snapshot);
+                if (projectedExtensionLifecycleReady(snapshot, expected)) return;
+            } else {
+                return;
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.ExtensionVisibilityTimeout;
             sleepNs(poll_interval_ns);
         }
     }
@@ -4278,9 +4706,101 @@ pub const ApiHttpServer = struct {
             for (manifest.shards) |shard| {
                 const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(dest_root);
-                try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
             }
         }
+
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        var portable_restore = false;
+        for (manifest.shards) |shard| {
+            if (std.mem.endsWith(u8, shard.snapshot_path, ".afb")) {
+                portable_restore = true;
+                break;
+            }
+        }
+        var restore_attempt: usize = 0;
+        while (restore_attempt < 3) : (restore_attempt += 1) {
+            const start_ns = platform_time.monotonicNs();
+            while (true) {
+                if ((table_writes_source.restoreTable(self.alloc, table_name, .{
+                    .backup_root = local_backup_root,
+                    .manifest = &manifest,
+                }) catch |err| switch (err) {
+                    error.UnsupportedOperation => return error.UnsupportedOperation,
+                    error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
+                    else => {
+                        std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                        return err;
+                    },
+                }) != null) break;
+
+                if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+                sleepNs(poll_interval_ns);
+            }
+
+            if (portable_restore) return;
+
+            // Wait until the read path can see the restored data. A null probe
+            // means the catalog hasn't propagated the table yet; keep polling
+            // rather than optimistically assuming success.
+            const verify_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+            while (true) {
+                const storage_status = self.probeTableStorageStatus(table_name) catch null;
+                if (storage_status) |status| {
+                    if (!status.empty) break;
+                }
+                if (platform_time.monotonicNs() >= verify_deadline_ns) break;
+                sleepNs(poll_interval_ns);
+            }
+
+            const storage_status = self.probeTableStorageStatus(table_name) catch null;
+            if (storage_status != null and !storage_status.?.empty) return;
+            std.log.info("restoreOwnedTable data not visible via read path table={s} backup_id={s} attempt={d}", .{
+                table_name,
+                backup_id,
+                restore_attempt + 1,
+            });
+            if (restore_attempt + 1 >= 3) return error.TableVisibilityTimeout;
+            sleepNs(500 * std.time.ns_per_ms);
+        }
+    }
+
+    fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        defer manifest.deinit(self.alloc);
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+
+        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const local_backup_root = switch (backup_location.*) {
+            .file => |value| value,
+            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+        };
+        defer switch (backup_location.*) {
+            .file => {},
+            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+        };
+        if (switch (backup_location.*) {
+            .remote => true,
+            .file => false,
+        }) {
+            for (manifest.shards) |shard| {
+                const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
+                defer self.alloc.free(dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+            }
+        }
+
+        self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
+            else => return err,
+        };
 
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ns = 50 * std.time.ns_per_ms;
@@ -4293,20 +4813,13 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedOperation => return error.UnsupportedOperation,
                 error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
                 else => {
-                    std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                    std.log.err("restoreLocalTableDataFromManifest restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
                     return err;
                 },
-            }) != null) break;
+            }) != null) return;
 
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             sleepNs(poll_interval_ns);
-        }
-
-        // The public restore contract is "triggered": index/read-path repair can
-        // lag behind the local restore call and callers already poll visibility.
-        const storage_status = self.probeTableStorageStatus(table_name) catch null;
-        if (storage_status == null or storage_status.?.empty) {
-            std.log.info("restoreOwnedTable data not yet visible via read path table={s} backup_id={s}", .{ table_name, backup_id });
         }
     }
 
@@ -4505,6 +5018,10 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
+                .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
+                .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
+                .execute_reprocess_document_artifact_range = executePublicReprocessDocumentArtifactRange,
             },
         };
     }
@@ -4528,6 +5045,14 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_writes orelse return error.NotFound;
+        self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidBatchRequest,
+            error.TableNotFound => return error.NotFound,
+            else => {
+                std.log.err("public table batch schema validation failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
         _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
@@ -5046,7 +5571,12 @@ pub const ApiHttpServer = struct {
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
-                error.EndOfStream => {
+                // FileNotFound surfaces when a read-only replica open races
+                // with the writer reclaiming obsolete LSM runs; reopening
+                // picks up a fresh manifest. TableReadChurn: the read cache
+                // gave up opening a table that was being invalidated faster
+                // than an open completes.
+                error.EndOfStream, error.FileNotFound, error.TableReadChurn => {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
                     sleepNs(retry_poll_ns);
@@ -5140,7 +5670,15 @@ pub const ApiHttpServer = struct {
                 return error.InvalidBackupRequest;
             },
             else => return mapExecuteRestoreError(err),
-        }) return;
+        }) {
+            if (self.cfg.swarm_mode) {
+                self.restoreLocalTableDataFromManifest(table_name, location, backup_id) catch |err| {
+                    std.log.err("swarm local restore data apply failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                    return mapExecuteRestoreError(err);
+                };
+            }
+            return;
+        }
 
         self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -5254,6 +5792,7 @@ pub const ApiHttpServer = struct {
 
         self.source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => {
@@ -5292,6 +5831,7 @@ pub const ApiHttpServer = struct {
         defer metadata_table_manager.freeTable(alloc, table_before);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return error.InternalFailure,
         };
@@ -5308,6 +5848,84 @@ pub const ApiHttpServer = struct {
                 else => return error.InternalFailure,
             };
         }
+    }
+
+    fn executePublicDocumentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_reads orelse return error.NotFound;
+        return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.NotFound;
+    }
+
+    fn executePublicDocumentArtifactManifests(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) public_table_http.TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_reads orelse return error.NotFound;
+        return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.NotFound;
+    }
+
+    fn executePublicReprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.NotFound;
+        const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact reprocess failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
+                return error.InternalFailure;
+            },
+        };
+        if (handled == null) return error.MethodNotAllowed;
+        if (!handled.?) return error.NotFound;
+    }
+
+    fn executePublicReprocessDocumentArtifactRange(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.NotFound;
+        return (source.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.InvalidRequest,
+            error.NotFound => return error.NotFound,
+            else => {
+                std.log.err("public document artifact range reprocess failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.MethodNotAllowed;
     }
 
     fn executePublicClusterBackupList(
@@ -5346,6 +5964,8 @@ pub const ApiHttpServer = struct {
             for (cluster_tables.items) |*entry| entry.deinit(alloc);
             cluster_tables.deinit(alloc);
         }
+        var extension_snapshot_opt = self.source.adminSnapshot() catch null;
+        defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
 
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
@@ -5373,7 +5993,10 @@ pub const ApiHttpServer = struct {
             }) catch return error.InternalFailure;
         }
 
-        var manifest = backups_api.createClusterManifest(alloc, req.backup_id, req.location, cluster_tables.items) catch return error.InternalFailure;
+        const installed_extensions = if (extension_snapshot_opt) |*snapshot| snapshot.installed_extensions else &.{};
+        const extension_members = if (extension_snapshot_opt) |*snapshot| snapshot.extension_members else &.{};
+        const extension_dependencies = if (extension_snapshot_opt) |*snapshot| snapshot.extension_dependencies else &.{};
+        var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
         defer manifest.deinit(alloc);
         backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch return error.InternalFailure;
 
@@ -5391,6 +6014,8 @@ pub const ApiHttpServer = struct {
 
         var manifest = backups_api.readClusterManifestFromLocation(alloc, location, req.backup_id) catch return error.InvalidRequest;
         defer manifest.deinit(alloc);
+
+        preflightClusterRestoreExtensions(self, &manifest) catch return error.InvalidRequest;
 
         const owns_table_names = req.table_names == null;
         const table_names = if (req.table_names) |values|
@@ -5431,22 +6056,21 @@ pub const ApiHttpServer = struct {
                 const exists = self.tableExists(table_name) catch return error.InternalFailure;
                 if (!exists) continue;
 
+                const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
                 var local_drop_group_ids: ?[]u64 = null;
                 defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
                 if (self.table_writes != null) {
-                    if ((self.source.adminSnapshot() catch return error.InternalFailure)) |snapshot_value| {
-                        var snapshot = snapshot_value;
-                        defer self.source.freeAdminSnapshot(&snapshot);
-                        local_drop_group_ids = tableGroupIdsFromSnapshot(alloc, &snapshot, table_name) catch return error.InternalFailure;
-                    }
+                    local_drop_group_ids = self.overwriteRestoreDropGroupIdsAlloc(alloc, location, table_name, table_backup_id) catch return error.InternalFailure;
                 }
 
                 self.source.dropTable(alloc, table_name) catch |err| {
                     statuses[i].@"error" = switch (err) {
+                        error.TableNotFound => null,
+                        error.ExtensionOwnedObject => "method not allowed",
                         error.UnsupportedOperation => "method not allowed",
                         else => "failed to remove existing table",
                     };
-                    continue;
+                    if (statuses[i].@"error" != null) continue;
                 };
                 if (self.table_writes) |write_source| {
                     const group_ids = local_drop_group_ids orelse &.{};
@@ -5494,6 +6118,25 @@ pub const ApiHttpServer = struct {
                     },
                 };
                 if (restored_via_metadata) {
+                    if (self.cfg.swarm_mode) {
+                        self.restoreLocalTableDataFromManifest(table_name, location, table_backup_id) catch |err| {
+                            std.log.err("cluster restore local data apply failed table={s} backup_id={s} err={}", .{
+                                table_name,
+                                table_backup_id,
+                                err,
+                            });
+                            statuses[i].@"error" = switch (err) {
+                                error.UnsupportedOperation => "method not allowed",
+                                error.UnsupportedBackupFormat => "restore does not support this backup layout",
+                                error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
+                                error.TableAlreadyExists => "table already exists",
+                                error.TableNotFound => "not found",
+                                error.InvalidBackupRequest => "invalid restore request",
+                                else => "restore failed",
+                            };
+                            continue;
+                        };
+                    }
                     statuses[i].status = "triggered";
                     continue;
                 }
@@ -5517,6 +6160,21 @@ pub const ApiHttpServer = struct {
                 continue;
             };
             statuses[i].status = "triggered";
+        }
+
+        if (owns_table_names and clusterRestoreStatusesHaveNoErrors(statuses)) {
+            self.source.restoreExtensions(
+                alloc,
+                manifest.installed_extensions,
+                manifest.extension_members,
+                manifest.extension_dependencies,
+            ) catch |err| switch (err) {
+                error.UnsupportedOperation => {},
+                else => {
+                    std.log.err("cluster restore extension metadata restore failed err={}", .{err});
+                    return error.InternalFailure;
+                },
+            };
         }
 
         return backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
@@ -5704,6 +6362,223 @@ pub const ApiHttpServer = struct {
             },
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
+    }
+
+    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
+            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
+        };
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, opts, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
+            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
+        };
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, opts, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifactRange(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, body, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
+            return try textResponse(self.alloc, 400, "invalid request");
+        };
+        defer parsed.deinit();
+
+        const encoded = try self.artifact_reprocess_job_store.startJob(self.alloc, table_name, artifact_name, parsed.value);
+        defer self.alloc.free(encoded);
+        if (parsed.value.advance) {
+            var parsed_state = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            };
+            defer parsed_state.deinit();
+            return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed_state.value);
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+    }
+
+    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+    }
+
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed.value);
+    }
+
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        defer self.alloc.free(cancelled);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+    }
+
+    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
+        if (artifact_reprocess_jobs.isTerminalPhase(state.phase)) {
+            const encoded = try artifact_reprocess_jobs.encodeState(self.alloc, state);
+            defer self.alloc.free(encoded);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+
+        const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, state);
+        defer self.alloc.free(begin.encoded);
+        var parsed_running = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid job state");
+        };
+        defer parsed_running.deinit();
+        const running_state = parsed_running.value;
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+        }
+
+        const source = self.table_writes orelse {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        };
+
+        const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, running_state.shard_cursors.len);
+        defer self.alloc.free(shard_resumes);
+        for (running_state.shard_cursors, shard_resumes) |cursor, *out_resume| {
+            out_resume.* = .{
+                .group_id = cursor.group_id,
+                .next_key = cursor.next_key,
+                .limit = cursor.limit,
+            };
+        }
+        const req = db_mod.types.DocumentArtifactTableReprocessRequest{
+            .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
+            .to_key = running_state.to_key,
+            .limit = running_state.limit,
+            .shard_cursors = shard_resumes,
+        };
+        const result = source.reprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 503, "doc identity unavailable");
+            },
+            error.InvalidArgument => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 400, "invalid request");
+            },
+            error.NotFound => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            else => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, running_state.job_id, err });
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            },
+        };
+        if (result == null) {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        }
+        var pass = result.?;
+        defer pass.deinit(self.alloc);
+        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, running_state, pass);
+        defer self.alloc.free(updated);
+        return try jsonBodyResponseWithStatus(self.alloc, 202, updated);
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -6030,7 +6905,520 @@ fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     };
 }
 
+fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
+    return if (body.len == 0) "{}" else body;
+}
+
+fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    return switch (err) {
+        error.UnsupportedOperation => try jsonErrorResponse(alloc, 405, "method not allowed"),
+        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try jsonErrorResponse(alloc, 404, "not found"),
+        error.ExtensionAlreadyInstalled => try jsonErrorResponse(alloc, 409, "extension already installed"),
+        error.DependentExtensionExists => try jsonErrorResponse(alloc, 409, "dependent extension exists"),
+        error.RequiredExtensionNotInstalled => try jsonErrorResponse(alloc, 409, "required extension not installed"),
+        error.UnsupportedManifestApiVersion,
+        error.UnsupportedPackageKind,
+        error.UnsupportedExtensionScope,
+        error.UnsupportedObjectKindForV1,
+        error.PackageVersionMismatch,
+        error.UpdatePathNotFound,
+        error.ExtensionDisabled,
+        error.ExtensionLifecycleBusy,
+        error.InvalidCreateTableRequest,
+        error.InvalidCreateIndexRequest,
+        error.InvalidTableIndexMetadata,
+        error.InvalidExtensionEnrichment,
+        error.InvalidExtensionLifecycleRequest,
+        error.UnrequestedCapabilityGrant,
+        error.InvalidJsonObject,
+        error.EmptyName,
+        error.InvalidIdentifier,
+        error.MemberTableOutsideScope,
+        => try jsonErrorResponse(alloc, 400, "invalid extension lifecycle request"),
+        else => err,
+    };
+}
+
+fn installExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.InstallExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.installOnService(service, alloc, extension_name, request);
+}
+
+fn updateExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.UpdateExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.updateOnService(service, alloc, extension_name, request);
+}
+
+fn dropExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.DropExtensionRequest,
+) !void {
+    return try extension_domain.lifecycle.dropOnService(service, alloc, extension_name, request);
+}
+
+fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.enableOnService(service, alloc, extension_name);
+}
+
+fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.disableOnService(service, alloc, extension_name);
+}
+
+fn configureExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.ConfigureExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.configureOnService(service, alloc, extension_name, request);
+}
+
+fn restoreExtensionsOnService(
+    service: anytype,
+    _: std.mem.Allocator,
+    installed: []const extension_domain.InstalledExtension,
+    members: []const extension_domain.ExtensionMember,
+    dependencies: []const extension_domain.ExtensionDependency,
+) !void {
+    if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
+    try extension_domain.lifecycle.restoreOnService(service, installed, members, dependencies);
+}
+
+fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const extension_domain.PackageManifest {
+    for (snapshot.extension_packages) |*package| {
+        if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
+    }
+    return null;
+}
+
+fn extensionPackageAvailableForRestore(snapshot: *const metadata_api.AdminSnapshot, installed: extension_domain.InstalledExtension) bool {
+    const package = findExtensionPackageVersion(snapshot, installed.package_name, installed.package_version) orelse return false;
+    return std.mem.eql(u8, package.digest, installed.package_digest);
+}
+
+fn preflightClusterRestoreExtensions(self: *ApiHttpServer, manifest: *const backups_api.ClusterBackupManifest) !void {
+    if (manifest.installed_extensions.len == 0) return;
+    var snapshot = (try self.source.adminSnapshot()) orelse return error.MissingExtensionPackage;
+    defer self.source.freeAdminSnapshot(&snapshot);
+
+    for (manifest.installed_extensions) |installed| {
+        if (!extensionPackageAvailableForRestore(&snapshot, installed)) return error.MissingExtensionPackage;
+    }
+}
+
+fn clusterRestoreStatusesHaveNoErrors(statuses: []const backups_api.ClusterTableRestoreStatus) bool {
+    for (statuses) |status| {
+        if (status.@"error" != null) return false;
+    }
+    return true;
+}
+
+fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.PackageManifest {
+    var found: ?*const extension_domain.PackageManifest = null;
+    for (snapshot.extension_packages) |*package| {
+        if (!std.mem.eql(u8, package.name, name)) continue;
+        if (found == null or extension_domain.packageVersionLess(found.?.version, package.version)) found = package;
+    }
+    return found;
+}
+
+fn installedExtensionExists(installed_extensions: []const extension_domain.InstalledExtension, name: []const u8) bool {
+    for (installed_extensions) |installed| {
+        if (std.mem.eql(u8, installed.name, name)) return true;
+    }
+    return false;
+}
+
+fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.InstalledExtension {
+    for (snapshot.installed_extensions) |*extension| {
+        if (std.mem.eql(u8, extension.name, name)) return extension;
+    }
+    return null;
+}
+
+fn projectedExtensionLifecycleReady(snapshot: *const metadata_api.AdminSnapshot, expected: extension_domain.InstalledExtension) bool {
+    const installed = findInstalledExtension(snapshot, expected.name) orelse return false;
+    if (!installedExtensionMatchesProjected(expected, installed.*)) return false;
+    const package = findExtensionPackageVersion(snapshot, expected.package_name, expected.package_version) orelse return true;
+    const expected_members = package.install.shapes.len + package.install.objects.len;
+    if (expected_members == 0) return true;
+    var projected_members: usize = 0;
+    for (snapshot.extension_members) |member| {
+        if (std.mem.eql(u8, member.extension_name, expected.name)) projected_members += 1;
+    }
+    return projected_members >= expected_members;
+}
+
+fn installedExtensionMatchesProjected(expected: extension_domain.InstalledExtension, actual: extension_domain.InstalledExtension) bool {
+    return std.mem.eql(u8, actual.name, expected.name) and
+        std.mem.eql(u8, actual.package_name, expected.package_name) and
+        std.mem.eql(u8, actual.package_version, expected.package_version) and
+        std.mem.eql(u8, actual.package_digest, expected.package_digest) and
+        std.mem.eql(u8, actual.config_json, expected.config_json) and
+        actual.status == expected.status and
+        actual.scope.kind == expected.scope.kind and
+        std.mem.eql(u8, actual.scope.table_name, expected.scope.table_name);
+}
+
+fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
+    if (member.table_name.len != 0) return member.table_name;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    return null;
+}
+
+fn extensionIndexMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .index) return null;
+    return extensionMemberTableName(member);
+}
+
+fn extensionEnrichmentMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .enrichment) return null;
+    return extensionMemberTableName(member);
+}
+
+fn extensionDataShapeMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .data_shape) return null;
+    const shape_kind = member.shape_kind orelse return null;
+    if (shape_kind != .document and shape_kind != .row) return null;
+    return extensionMemberTableName(member);
+}
+
+fn validateWritesAgainstExtensionDataShapes(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    writes: anytype,
+) !void {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionDataShapeMemberTableName(member) orelse continue;
+        if (!std.mem.eql(u8, member_table, table_name)) continue;
+
+        try validateExtensionDataShapeSchema(alloc, member.owner_metadata_json);
+        var parsed_shape = tables_api.parseValidatedTableSchema(alloc, member.owner_metadata_json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidExtensionShape,
+        };
+        defer parsed_shape.deinit(alloc);
+        try tables_api.validateWritesAgainstTableSchema(alloc, parsed_shape, writes);
+    }
+}
+
+fn validateExtensionDataShapeSchema(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExtensionShape,
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidExtensionShape,
+    };
+    const document_schemas = root.get("document_schemas") orelse return error.InvalidExtensionShape;
+    if (document_schemas != .object or document_schemas.object.count() == 0) return error.InvalidExtensionShape;
+}
+
+fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionIndexMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, index_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .table_schema) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableShape(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    if (extensionOwnsTableSchema(snapshot, table_name)) return true;
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionDataShapeMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn validateNewExtensionStorageMembers(snapshot: *const metadata_api.AdminSnapshot, new_members: []const extension_domain.ExtensionMember) !void {
+    for (new_members) |member| {
+        if (member.object_kind != .index and member.object_kind != .enrichment) continue;
+        const table_name = extensionMemberTableName(member) orelse return error.UnsupportedExtensionScope;
+        if (tables_api.findTableByName(snapshot, table_name) == null) return error.TableNotFound;
+    }
+}
+
+fn planExtensionStorageMemberDeltaAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    old_members: []const extension_domain.ExtensionMember,
+    new_members: []const extension_domain.ExtensionMember,
+) ![]metadata_table_manager.TableRecord {
+    try validateNewExtensionStorageMembers(snapshot, new_members);
+
+    var out = std.ArrayListUnmanaged(metadata_table_manager.TableRecord).empty;
+    errdefer {
+        for (out.items) |record| metadata_table_manager.freeTable(alloc, record);
+        out.deinit(alloc);
+    }
+
+    for (snapshot.tables) |table| {
+        var owned_indexes_json: ?[]u8 = null;
+        defer if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+        var changed = false;
+
+        for (old_members) |member| {
+            const table_name = extensionIndexMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = (try indexes_api.removeIndexFromTableIndexesJson(alloc, current, member.object_name)) orelse continue;
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+        for (old_members) |member| {
+            const table_name = extensionEnrichmentMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, current, member.object_name)) orelse continue;
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+
+        for (new_members) |member| {
+            const table_name = extensionIndexMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, member.owner_metadata_json, table.schema_json);
+            defer alloc.free(expanded_index_json);
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = try indexes_api.addIndexToTableIndexesJson(alloc, current, member.object_name, expanded_index_json);
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+        for (new_members) |member| {
+            const table_name = extensionEnrichmentMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = try indexes_api.addEnrichmentToTableIndexesJson(alloc, current, member.object_name, member.owner_metadata_json);
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+
+        if (!changed) continue;
+        var updated_record = try metadata_table_manager.cloneTable(alloc, table);
+        errdefer metadata_table_manager.freeTable(alloc, updated_record);
+        alloc.free(@constCast(updated_record.indexes_json));
+        updated_record.indexes_json = owned_indexes_json.?;
+        owned_indexes_json = null;
+        try out.append(alloc, updated_record);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn planRemovedExtensionStorageMembersAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    remaining_members: []const extension_domain.ExtensionMember,
+) ![]metadata_table_manager.TableRecord {
+    var removed = std.ArrayListUnmanaged(extension_domain.ExtensionMember).empty;
+    defer removed.deinit(alloc);
+    for (snapshot.extension_members) |member| {
+        if (extensionMemberExists(remaining_members, member)) continue;
+        try removed.append(alloc, member);
+    }
+    return try planExtensionStorageMemberDeltaAlloc(alloc, snapshot, removed.items, &.{});
+}
+
+fn freeExtensionLifecycleTables(alloc: std.mem.Allocator, tables: []metadata_table_manager.TableRecord) void {
+    for (tables) |record| metadata_table_manager.freeTable(alloc, record);
+    if (tables.len > 0) alloc.free(tables);
+}
+
+fn extensionMemberRemoveKeysAlloc(
+    alloc: std.mem.Allocator,
+    members: []const extension_domain.ExtensionMember,
+) ![]metadata_mod.storage.ExtensionMemberKey {
+    const out = try alloc.alloc(metadata_mod.storage.ExtensionMemberKey, members.len);
+    errdefer alloc.free(out);
+    for (members, 0..) |member, i| {
+        out[i] = .{
+            .extension_name = member.extension_name,
+            .object_kind = member.object_kind,
+            .object_name = member.object_name,
+        };
+    }
+    return out;
+}
+
+fn missingExtensionMemberKeysAlloc(
+    alloc: std.mem.Allocator,
+    members: []const extension_domain.ExtensionMember,
+    remaining_members: []const extension_domain.ExtensionMember,
+) ![]metadata_mod.storage.ExtensionMemberKey {
+    var out = std.ArrayListUnmanaged(metadata_mod.storage.ExtensionMemberKey).empty;
+    errdefer out.deinit(alloc);
+    for (members) |member| {
+        if (extensionMemberExists(remaining_members, member)) continue;
+        try out.append(alloc, .{
+            .extension_name = member.extension_name,
+            .object_kind = member.object_kind,
+            .object_name = member.object_name,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionMemberRemoveKeys(alloc: std.mem.Allocator, keys: []metadata_mod.storage.ExtensionMemberKey) void {
+    if (keys.len > 0) alloc.free(keys);
+}
+
+fn extensionDependencyRemoveKeysAlloc(
+    alloc: std.mem.Allocator,
+    dependencies: []const extension_domain.ExtensionDependency,
+) ![]metadata_mod.storage.ExtensionDependencyKey {
+    const out = try alloc.alloc(metadata_mod.storage.ExtensionDependencyKey, dependencies.len);
+    errdefer alloc.free(out);
+    for (dependencies, 0..) |dependency, i| {
+        out[i] = .{
+            .extension_name = dependency.extension_name,
+            .required_extension_name = dependency.required_extension_name,
+            .package_name = dependency.package_name,
+        };
+    }
+    return out;
+}
+
+fn missingExtensionDependencyKeysAlloc(
+    alloc: std.mem.Allocator,
+    dependencies: []const extension_domain.ExtensionDependency,
+    remaining_dependencies: []const extension_domain.ExtensionDependency,
+) ![]metadata_mod.storage.ExtensionDependencyKey {
+    var out = std.ArrayListUnmanaged(metadata_mod.storage.ExtensionDependencyKey).empty;
+    errdefer out.deinit(alloc);
+    for (dependencies) |dependency| {
+        if (extensionDependencyExists(remaining_dependencies, dependency)) continue;
+        try out.append(alloc, .{
+            .extension_name = dependency.extension_name,
+            .required_extension_name = dependency.required_extension_name,
+            .package_name = dependency.package_name,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionDependencyRemoveKeys(alloc: std.mem.Allocator, keys: []metadata_mod.storage.ExtensionDependencyKey) void {
+    if (keys.len > 0) alloc.free(keys);
+}
+
+fn missingInstalledExtensionNamesAlloc(
+    alloc: std.mem.Allocator,
+    installed_extensions: []const extension_domain.InstalledExtension,
+    remaining_installed: []const extension_domain.InstalledExtension,
+) ![]const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer out.deinit(alloc);
+    for (installed_extensions) |installed| {
+        if (installedExtensionExists(remaining_installed, installed.name)) continue;
+        try out.append(alloc, installed.name);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionInstalledRemoveNames(alloc: std.mem.Allocator, names: []const []const u8) void {
+    if (names.len > 0) alloc.free(@constCast(names));
+}
+
+fn extensionMembersForName(
+    alloc: std.mem.Allocator,
+    members: []const extension_domain.ExtensionMember,
+    extension_name: []const u8,
+) ![]extension_domain.ExtensionMember {
+    var count: usize = 0;
+    for (members) |member| {
+        if (std.mem.eql(u8, member.extension_name, extension_name)) count += 1;
+    }
+    const out = try alloc.alloc(extension_domain.ExtensionMember, count);
+    var i: usize = 0;
+    for (members) |member| {
+        if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
+        out[i] = member;
+        i += 1;
+    }
+    return out;
+}
+
+fn extensionDependenciesForName(
+    alloc: std.mem.Allocator,
+    dependencies: []const extension_domain.ExtensionDependency,
+    extension_name: []const u8,
+) ![]extension_domain.ExtensionDependency {
+    var count: usize = 0;
+    for (dependencies) |dependency| {
+        if (std.mem.eql(u8, dependency.extension_name, extension_name)) count += 1;
+    }
+    const out = try alloc.alloc(extension_domain.ExtensionDependency, count);
+    var i: usize = 0;
+    for (dependencies) |dependency| {
+        if (!std.mem.eql(u8, dependency.extension_name, extension_name)) continue;
+        out[i] = dependency;
+        i += 1;
+    }
+    return out;
+}
+
+fn extensionMemberExists(members: []const extension_domain.ExtensionMember, needle: extension_domain.ExtensionMember) bool {
+    for (members) |member| {
+        if (std.mem.eql(u8, member.extension_name, needle.extension_name) and
+            member.object_kind == needle.object_kind and
+            std.mem.eql(u8, member.object_name, needle.object_name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDependency, needle: extension_domain.ExtensionDependency) bool {
+    for (dependencies) |dependency| {
+        if (std.mem.eql(u8, dependency.extension_name, needle.extension_name) and
+            std.mem.eql(u8, dependency.required_extension_name, needle.required_extension_name) and
+            std.mem.eql(u8, dependency.package_name, needle.package_name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
     if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
@@ -6039,11 +7427,24 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
 }
 
+fn isExtensionPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, routes.Routes.extensions_v1) or
+        std.mem.eql(u8, path, routes.Routes.extensions_v1_packages) or
+        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_packages_prefix) or
+        std.mem.eql(u8, path, routes.Routes.extensions_v1_installed) or
+        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_installed_prefix);
+}
+
 pub const RequiredPermission = struct {
     resource_type: usermgr.ResourceType,
     resource: []const u8,
     permission_type: usermgr.PermissionType,
 };
+
+fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
+    if (encoded_job_id.len == 0) return error.InvalidJobId;
+    return std.fmt.parseUnsigned(u64, encoded_job_id, 10);
+}
 
 pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
@@ -6063,6 +7464,70 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .resource_type = .table,
         .resource = query.table_name,
         .permission_type = .read,
+    };
+    if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableDocumentArtifact(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableDocumentArtifactReprocess(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobs(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJob(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobAdvance(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobCancel(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocess(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
     };
     if (routes.Routes.matchTablePath(path)) |table_path| {
         return .{
@@ -6147,6 +7612,58 @@ pub fn permissionsAllow(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
+}
+
+test "document artifact routes declare read and admin permissions" {
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/cancel").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    try std.testing.expect(requiredPermissionForRequest(.GET, "/tables/docs/artifacts/document_units_v1/reprocess") == null);
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -7057,6 +8574,88 @@ test "effective resolved row filter prefers table filter before wildcard" {
     try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
 }
 
+test "artifact operations apply source document row filter visibility" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            if (!std.mem.eql(u8, table_name, "docs")) return null;
+            const json = if (std.mem.eql(u8, key, "doc:public"))
+                "{\"tenant\":\"acme\"}"
+            else if (std.mem.eql(u8, key, "doc:private"))
+                "{\"tenant\":\"other\"}"
+            else
+                return null;
+            return .{
+                .json = try inner_alloc.dupe(u8, json),
+                .version = 1,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.TestUnexpectedResult;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+
+    var row_filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tenant\":\"acme\"}}"),
+    };
+    defer row_filters[0].deinit(alloc);
+    const identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = row_filters[0..],
+    };
+    defer alloc.free(identity.username);
+
+    try std.testing.expect(try server.sourceDocumentVisibleToIdentity("docs", "doc:public", identity));
+    try std.testing.expect(!try server.sourceDocumentVisibleToIdentity("docs", "doc:private", identity));
+    try std.testing.expect(!try server.sourceDocumentVisibleToIdentity("docs", "doc:missing", identity));
+    try std.testing.expect(try server.sourceDocumentVisibleToIdentity("docs", "doc:private", null));
+}
+
 test "join auth applies read permission and row filters to joined tables" {
     const alloc = std.testing.allocator;
     var permissions = [_]usermgr.Permission{
@@ -7420,6 +9019,820 @@ test "api http server serves status" {
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 
+test "api http server serves extension catalog reads" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_extension_packages = 1,
+                .projected_installed_extensions = 1,
+                .projected_extension_members = 2,
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
+                    .name = "memoryaf",
+                    .version = "1.0.0",
+                    .digest = "sha256:abc",
+                    .trusted = true,
+                    .install = .{
+                        .scopes_supported = &.{.table},
+                        .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
+                    },
+                }})[0..]),
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{.{
+                    .name = "memoryaf",
+                    .package_name = "memoryaf",
+                    .package_version = "1.0.0",
+                    .package_digest = "sha256:abc",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .status = .ready,
+                }})[0..]),
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .data_shape,
+                        .object_name = "memory_record",
+                    },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "recall",
+                        .table_name = "memories",
+                    },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+
+    var packages_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
+    defer packages_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), packages_resp.status);
+    var packages = try std.json.parseFromSlice([]extension_domain.PackageManifest, std.testing.allocator, packages_resp.body, .{ .ignore_unknown_fields = true });
+    defer packages.deinit();
+    try std.testing.expectEqual(@as(usize, 1), packages.value.len);
+    try std.testing.expectEqualStrings("memoryaf", packages.value[0].name);
+
+    var package_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
+    defer package_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), package_resp.status);
+    var package = try std.json.parseFromSlice(extension_domain.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
+    defer package.deinit();
+    try std.testing.expectEqualStrings("sha256:abc", package.value.digest);
+
+    var installed_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
+    defer installed_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), installed_resp.status);
+    var installed = try std.json.parseFromSlice(extension_domain.InstalledExtension, std.testing.allocator, installed_resp.body, .{ .ignore_unknown_fields = true });
+    defer installed.deinit();
+    try std.testing.expectEqualStrings("1.0.0", installed.value.package_version);
+
+    var objects_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
+    defer objects_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), objects_resp.status);
+    var objects = try std.json.parseFromSlice([]extension_domain.ExtensionMember, std.testing.allocator, objects_resp.body, .{ .ignore_unknown_fields = true });
+    defer objects.deinit();
+    try std.testing.expectEqual(@as(usize, 2), objects.value.len);
+
+    var missing_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/missing" });
+    defer missing_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), missing_resp.status);
+
+    var write_resp = try server.handle(.{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
+    defer write_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), write_resp.status);
+}
+
+test "api http server validates writes against extension data shape members" {
+    const alloc = std.testing.allocator;
+    const shape_schema = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"},\"kind\":{\"type\":\"keyword\"}}}}}}";
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_tables = 1,
+                .projected_extension_members = 1,
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 10,
+                    .name = "memories",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{.{
+                    .extension_name = "memoryaf",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .object_kind = .data_shape,
+                    .object_name = "memory_record",
+                    .shape_kind = .document,
+                    .table_name = "memories",
+                    .owner_metadata_json = shape_schema,
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+
+    try server.validateTableWritesAgainstSchema("memories", &[_]db_mod.types.BatchWrite{.{
+        .key = "doc:a",
+        .value = "{\"body\":\"remember this\",\"kind\":\"note\"}",
+    }});
+
+    try std.testing.expectError(error.InvalidBatchRequest, server.validateTableWritesAgainstSchema("memories", &[_]db_mod.types.BatchWrite{.{
+        .key = "doc:b",
+        .value = "{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}",
+    }}));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/extension-shape-batch", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    var table_source = table_writes.BoundTableWriteSource.init("memories", &db);
+    var routed_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+
+    const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
+    defer alloc.free(valid_body);
+    var valid_resp = try routed_server.handle(.{
+        .method = .POST,
+        .uri = "/tables/memories/batch",
+        .content_type = "application/json",
+        .body = valid_body,
+    });
+    defer valid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), valid_resp.status);
+
+    const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:d\":{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}}}");
+    defer alloc.free(invalid_body);
+    var invalid_resp = try routed_server.handle(.{
+        .method = .POST,
+        .uri = "/tables/memories/batch",
+        .content_type = "application/json",
+        .body = invalid_body,
+    });
+    defer invalid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+}
+
+test "api http server dispatches extension lifecycle mutations" {
+    const FakeSource = struct {
+        install_called: bool = false,
+        install_dry_run: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .install_extension = installExtension,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.install_called = true;
+            self.install_dry_run = req.dry_run;
+            return .{
+                .name = try alloc.dupe(u8, name),
+                .package_name = try alloc.dupe(u8, name),
+                .package_version = try alloc.dupe(u8, if (req.version.len > 0) req.version else "1.0.0"),
+                .package_digest = try alloc.dupe(u8, "sha256:test"),
+                .scope = .{
+                    .kind = req.scope.kind,
+                    .table_name = if (req.scope.table_name.len > 0) try alloc.dupe(u8, req.scope.table_name) else "",
+                },
+                .config_json = try alloc.dupe(u8, req.config_json),
+                .granted_capabilities = &.{},
+                .installed_at_epoch_ms = 123,
+                .status = .ready,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var install_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/extensions/v1/installed/memoryaf",
+        .content_type = "application/json",
+        .body = "{\"version\":\"1.2.3\",\"scope\":{\"kind\":\"table\",\"table_name\":\"memories\"},\"config_json\":\"{\\\"tenant\\\":\\\"acme\\\"}\",\"dry_run\":true}",
+    });
+    defer install_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), install_resp.status);
+    try std.testing.expect(source.install_called);
+    try std.testing.expect(source.install_dry_run);
+    var installed = try std.json.parseFromSlice(extension_domain.InstalledExtension, std.testing.allocator, install_resp.body, .{ .ignore_unknown_fields = true });
+    defer installed.deinit();
+    try std.testing.expectEqualStrings("memoryaf", installed.value.name);
+    try std.testing.expectEqualStrings("1.2.3", installed.value.package_version);
+    try std.testing.expectEqualStrings("memories", installed.value.scope.table_name);
+}
+
+test "extension lifecycle maps unrequested capability grants to client errors" {
+    var resp = try extensionLifecycleErrorResponse(std.testing.allocator, error.UnrequestedCapabilityGrant);
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid extension lifecycle request") != null);
+}
+
+test "extension lifecycle materializes table index and enrichment members" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{}",
+            .placement_role = "data",
+        },
+        package_record: extension_domain.PackageManifest = .{
+            .name = "memoryaf",
+            .version = "1.0.0",
+            .digest = "sha256:memoryaf",
+            .install = .{
+                .scopes_supported = &.{.table},
+                .shapes = &.{
+                    .{
+                        .name = "memory_record",
+                        .kind = .document,
+                        .version = "1",
+                        .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+                    },
+                    .{
+                        .name = "memory_embedding",
+                        .kind = .generated_artifact,
+                        .version = "1",
+                        .schema_json = "{\"type\":\"object\",\"properties\":{\"vector\":{\"type\":\"array\"}}}",
+                    },
+                },
+                .objects = &.{
+                    .{ .kind = .generated_artifact, .name = "memory_embedding", .shape = "memory_embedding", .config_json = "{\"kind\":\"embedding\",\"source_shape\":\"memory_record\"}" },
+                    .{ .kind = .index, .name = "memory_text", .config_json = "{\"type\":\"full_text\"}" },
+                    .{ .kind = .enrichment, .name = "memory_embed", .config_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}" },
+                    .{ .kind = .mcp_tool, .name = "recall" },
+                },
+            },
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+        upserted_indexes_json: ?[]u8 = null,
+        upsert_table_count: usize = 0,
+        installed_upserts: usize = 0,
+        member_upserts: usize = 0,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.upserted_indexes_json) |indexes_json| alloc.free(indexes_json);
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn packageSlice(self: *@This()) []extension_domain.PackageManifest {
+            return @as([*]extension_domain.PackageManifest, @ptrCast(&self.package_record))[0..1];
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_packages = @constCast(self.packageSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+            self.upserted_indexes_json = try std.testing.allocator.dupe(u8, record.indexes_json);
+            self.upsert_table_count += 1;
+        }
+
+        pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+            const Command = @TypeOf(command);
+            if (@hasField(Command, "apply_extension_lifecycle")) {
+                const delta = command.apply_extension_lifecycle;
+                self.upsert_table_count += delta.upsert_tables.len;
+                if (delta.upsert_tables.len > 0) {
+                    if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+                    self.upserted_indexes_json = try std.testing.allocator.dupe(u8, delta.upsert_tables[0].indexes_json);
+                }
+                self.installed_upserts += delta.upsert_installed_extensions.len;
+                self.member_upserts += delta.upsert_extension_members.len;
+            }
+        }
+    };
+
+    var service = FakeService{};
+    defer service.deinit(std.testing.allocator);
+    var installed = try installExtensionOnService(&service, std.testing.allocator, "memoryaf", .{
+        .scope = .{ .kind = .table, .table_name = "memories" },
+    });
+    defer installed.deinitOwned(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
+    try std.testing.expect(service.upserted_indexes_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"expected_dims\":384") != null);
+    try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
+    try std.testing.expectEqual(@as(usize, 6), service.member_upserts);
+}
+
+test "extension lifecycle drops extension-owned table index and enrichment members" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384},{\"name\":\"manual_embed\",\"kind\":\"embedding\",\"field\":\"summary\",\"expected_dims\":384}]}",
+            .placement_role = "data",
+        },
+        installed_record: extension_domain.InstalledExtension = .{
+            .name = "memoryaf",
+            .package_name = "memoryaf",
+            .package_version = "1.0.0",
+            .package_digest = "sha256:memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .status = .ready,
+        },
+        member_records: [2]extension_domain.ExtensionMember = .{
+            .{
+                .extension_name = "memoryaf",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .object_kind = .index,
+                .object_name = "memory_text",
+                .table_name = "memories",
+                .owner_metadata_json = "{\"type\":\"full_text\"}",
+            },
+            .{
+                .extension_name = "memoryaf",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .object_kind = .enrichment,
+                .object_name = "memory_embed",
+                .table_name = "memories",
+                .owner_metadata_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}",
+            },
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+        upserted_indexes_json: ?[]u8 = null,
+        upsert_table_count: usize = 0,
+        installed_removes: usize = 0,
+        member_removes: usize = 0,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.upserted_indexes_json) |indexes_json| alloc.free(indexes_json);
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn installedSlice(self: *@This()) []extension_domain.InstalledExtension {
+            return @as([*]extension_domain.InstalledExtension, @ptrCast(&self.installed_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return self.member_records[0..];
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .installed_extensions = @constCast(self.installedSlice()),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+            self.upserted_indexes_json = try std.testing.allocator.dupe(u8, record.indexes_json);
+            self.upsert_table_count += 1;
+        }
+
+        pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+            const Command = @TypeOf(command);
+            if (@hasField(Command, "apply_extension_lifecycle")) {
+                const delta = command.apply_extension_lifecycle;
+                self.upsert_table_count += delta.upsert_tables.len;
+                if (delta.upsert_tables.len > 0) {
+                    if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+                    self.upserted_indexes_json = try std.testing.allocator.dupe(u8, delta.upsert_tables[0].indexes_json);
+                }
+                self.installed_removes += delta.remove_installed_extensions.len;
+                self.member_removes += delta.remove_extension_members.len;
+            }
+        }
+    };
+
+    var service = FakeService{};
+    defer service.deinit(std.testing.allocator);
+    try dropExtensionOnService(&service, std.testing.allocator, "memoryaf", .{});
+
+    try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
+    try std.testing.expect(service.upserted_indexes_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual_embed\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), service.installed_removes);
+    try std.testing.expectEqual(@as(usize, 2), service.member_removes);
+}
+
+test "direct index deletion rejects extension-owned indexes" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+        member_record: extension_domain.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+            .owner_metadata_json = "{\"type\":\"full_text\"}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedUpsert;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedRunRound;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(error.ExtensionOwnedObject, dropIndexOnService(&service, std.testing.allocator, "memories", "memory_text"));
+}
+
+test "direct index creation rejects extension-owned index names" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+        member_record: extension_domain.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+            .owner_metadata_json = "{\"type\":\"full_text\"}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedUpsert;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedRunRound;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(error.ExtensionOwnedObject, createIndexOnService(&service, std.testing.allocator, "memories", "memory_text", "{\"type\":\"full_text\"}"));
+}
+
+test "direct schema update rejects extension-owned data shapes" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .schema_json = "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"}}}",
+            .placement_role = "data",
+        },
+        member_record: extension_domain.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .data_shape,
+            .object_name = "memory_record",
+            .shape_kind = .document,
+            .table_name = "memories",
+            .shape_version = "1",
+            .owner_metadata_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedUpsert;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedRunRound;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(
+        error.ExtensionOwnedObject,
+        updateSchemaOnService(&service, std.testing.allocator, "memories", "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\"}}}"),
+    );
+}
+
+test "extension table ownership recognizes scoped objects for table drop guards" {
+    var member_record = extension_domain.ExtensionMember{
+        .extension_name = "memoryaf",
+        .scope = .{ .kind = .table, .table_name = "memories" },
+        .object_kind = .mcp_tool,
+        .object_name = "recall",
+        .owner_metadata_json = "{\"handler\":\"antfly_api_template\"}",
+    };
+    var empty_tables: [0]metadata_table_manager.TableRecord = .{};
+    var empty_ranges: [0]metadata_table_manager.RangeRecord = .{};
+    var empty_stores: [0]metadata_table_manager.StoreRecord = .{};
+    var empty_placements: [0]raft_reconciler.PlacementIntent = .{};
+    var empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{};
+    var empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = empty_tables[0..],
+        .ranges = empty_ranges[0..],
+        .stores = empty_stores[0..],
+        .placement_intents = empty_placements[0..],
+        .extension_members = @as([*]extension_domain.ExtensionMember, @ptrCast(&member_record))[0..1],
+        .split_transitions = empty_splits[0..],
+        .merge_transitions = empty_merges[0..],
+    };
+
+    try std.testing.expect(extensionOwnsTableScopedObject(&snapshot, "memories"));
+    try std.testing.expect(!extensionOwnsTableScopedObject(&snapshot, "sessions"));
+}
+
+test "api http server serves connections with partial provider failures" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const config_json =
+        \\{
+        \\  "connections": {
+        \\    "mocked": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.generate"],
+        \\      "inference": {
+        \\        "provider": "mock",
+        \\        "configured_model_types": ["generator"]
+        \\      }
+        \\    },
+        \\    "broken-openai": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": {
+        \\        "provider": "openai",
+        \\        "url": "http://127.0.0.1:9",
+        \\        "api_key": "test-key",
+        \\        "configured_model_types": ["embedder"]
+        \\      }
+        \\    },
+        \\    "wiki": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["content.fetch", "indexing.use"],
+        \\      "external_io": {
+        \\        "protocol": "http",
+        \\        "hosts": ["https://en.wikipedia.org"]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var node_config = try common_config.Config.parseFromSlice(std.testing.allocator, config_json);
+    defer node_config.deinit();
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{ .node_config = &node_config },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    var resp = try server.handle(.{ .method = .GET, .uri = "/connections?include=models" });
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const connection_list = parsed.value.object.get("connections").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), connection_list.len);
+
+    var saw_mock = false;
+    var saw_openai = false;
+    var saw_wiki = false;
+    for (connection_list) |connection| {
+        const name = connection.object.get("name").?.string;
+        const conn_status = connection.object.get("status").?.string;
+        if (std.mem.eql(u8, name, "mocked")) {
+            saw_mock = true;
+            try std.testing.expectEqualStrings("connected", conn_status);
+            const provider = connection.object.get("inference").?.object;
+            const models = provider.get("models").?.object;
+            try std.testing.expect(models.get("generators") != null);
+        } else if (std.mem.eql(u8, name, "broken-openai")) {
+            saw_openai = true;
+            // Partial failure: the unreachable provider reports an error
+            // without failing the whole response.
+            try std.testing.expectEqualStrings("error", conn_status);
+            try std.testing.expect(connection.object.get("error").? == .string);
+        } else if (std.mem.eql(u8, name, "wiki")) {
+            saw_wiki = true;
+            try std.testing.expectEqualStrings("external_io", connection.object.get("kind").?.string);
+            try std.testing.expectEqualStrings("configured", conn_status);
+        }
+    }
+    try std.testing.expect(saw_mock);
+    try std.testing.expect(saw_openai);
+    try std.testing.expect(saw_wiki);
+
+    // The kind filter trims the response to the requested connection types.
+    var filtered = try server.handle(.{ .method = .GET, .uri = "/connections?types=external_io" });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), filtered.status);
+    var parsed_filtered = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, filtered.body, .{});
+    defer parsed_filtered.deinit();
+    const filtered_list = parsed_filtered.value.object.get("connections").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), filtered_list.len);
+    try std.testing.expectEqualStrings("wiki", filtered_list[0].object.get("name").?.string);
+
+    // The /db/v1 prefix variant resolves to the same route.
+    var prefixed = try server.handle(.{ .method = .GET, .uri = "/db/v1/connections" });
+    defer prefixed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), prefixed.status);
+}
+
 test "api http server serves mcp and a2a protocol surfaces" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -7543,6 +9956,182 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
 }
 
+test "api http server lists extension-owned mcp tools" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 1, .projected_extension_members = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{.{
+                    .name = "memoryaf",
+                    .package_name = "memoryaf",
+                    .package_version = "1.0.0",
+                    .package_digest = "sha256:abc",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .status = .ready,
+                }})[0..]),
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{.{
+                    .extension_name = "memoryaf",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .object_kind = .mcp_tool,
+                    .object_name = "search_memories",
+                    .table_name = "memories",
+                    .owner_metadata_json = "{\"description\":\"Search long-term memory\",\"input_schema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"}}},\"handler\":\"wasm:memoryaf_wasm/search_memories\"}",
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"description\":\"Search long-term memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"query\"]") != null);
+}
+
+test "api http server scopes mcp endpoint to one extension" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 2 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{
+                    .{
+                        .name = "memoryaf",
+                        .package_name = "memoryaf",
+                        .package_version = "1.0.0",
+                        .package_digest = "sha256:abc",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .status = .ready,
+                    },
+                    .{
+                        .name = "otheraf",
+                        .package_name = "otheraf",
+                        .package_version = "1.0.0",
+                        .package_digest = "sha256:def",
+                        .scope = .{ .kind = .cluster },
+                        .status = .ready,
+                    },
+                })[0..]),
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "recall",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"description\":\"Search long-term memory\",\"input_schema\":{\"type\":\"object\"}}",
+                    },
+                    .{
+                        .extension_name = "otheraf",
+                        .scope = .{ .kind = .cluster },
+                        .object_kind = .mcp_tool,
+                        .object_name = "other_tool",
+                        .owner_metadata_json = "{\"description\":\"Other tool\",\"input_schema\":{\"type\":\"object\"}}",
+                    },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    const scoped_uri = "/mcp/v1/extensions/memoryaf";
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = scoped_uri,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = scoped_uri,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"other_tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"create_table\"") == null);
+}
+
 test "api http server authenticates trusted principal" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -7590,6 +10179,16 @@ test "api http server authenticates trusted principal" {
     try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
     try std.testing.expectEqualStrings("docs", identity.row_filter[0].table);
     try std.testing.expect(std.mem.indexOf(u8, identity.row_filter[0].filter, "\"tenant_id\":\"t1\"") != null);
+}
+
+test "api http server treats only exact extension prefixes as admin routes" {
+    try std.testing.expect(requiresAdminPermission("/extensions/v1"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/packages"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/packages/memoryaf"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/installed"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/installed/memoryaf"));
+    try std.testing.expect(!requiresAdminPermission("/extensions/v1/packagesXYZ"));
+    try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
 }
 
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
@@ -8800,7 +11399,7 @@ test "api http server serves table lookup with version header" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/lookup/doc:a?fields=title" });
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -8876,7 +11475,7 @@ test "api http server decodes percent-encoded lookup keys" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/lookup/docs%2Fgetting-started.md?fields=title" });
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
@@ -8884,9 +11483,9 @@ test "api http server decodes percent-encoded lookup keys" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
-test "api http server serves lookup through mcp tool" {
+test "api http server serves document lookup through mcp tool" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-mcp-lookup";
+    const path = "/tmp/antfly-api-http-mcp-get-document";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -8940,7 +11539,7 @@ test "api http server serves lookup through mcp tool" {
     };
 
     var source = FakeSource{};
-    const trusted_principal_secret = "mcp-lookup-trusted-principal-secret";
+    const trusted_principal_secret = "mcp-get-document-trusted-principal-secret";
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -8991,14 +11590,15 @@ test "api http server serves lookup through mcp tool" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
 
     var call_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"lookup\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"get_document\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
     });
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
@@ -12159,7 +14759,7 @@ test "api http server handleInternalRoute matches handle for internal group look
 
     const req: http_common.HttpRequest = .{
         .method = .GET,
-        .uri = "/internal/v1/groups/7/tables/docs/lookup/doc:a?fields=title",
+        .uri = "/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title",
     };
 
     var via_handle = try server.handle(req);
@@ -15999,6 +18599,485 @@ test "api http server table restore is triggered when read path is still empty" 
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     try std.testing.expect(write_source.restored);
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"triggered\"") != null);
+}
+
+test "api http server cluster overwrite restore tolerates already absent metadata drop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-overwrite", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    const table_backup_id = try backups_api.clusterTableBackupId(alloc, "snap-cluster", "docs");
+    defer alloc.free(table_backup_id);
+
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    shards[0] = .{
+        .group_id = 42,
+        .start_key = try alloc.dupe(u8, ""),
+        .end_key = null,
+        .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, table_backup_id, 42),
+    };
+    defer freeBackupShards(alloc, shards);
+
+    var table_manifest = try backups_api.createManifest(alloc, table_backup_id, &.{
+        .table_id = 1,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, shards);
+    defer table_manifest.deinit(alloc);
+    try backups_api.writeManifest(alloc, backup_root_abs, &table_manifest);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, table_backup_id),
+    };
+    defer cluster_entry.deinit(alloc);
+    var cluster_manifest = try backups_api.createClusterManifest(alloc, "snap-cluster", location_uri, &.{cluster_entry});
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        present: bool = true,
+        restored: bool = false,
+        local_drop_used_manifest_group: bool = false,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                    .drop_table = dropTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = if (self.state.present)
+                @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..])
+            else
+                @constCast((&[_]metadata_table_manager.TableRecord{})[0..]);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.state.present = true;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.state.present = false;
+            return error.TableNotFound;
+        }
+    };
+
+    const FakeReads = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            const body = if (self.state.restored) "{\"_id\":\"doc:1\"}\n" else "";
+            return .{ .ndjson = try inner_alloc.dupe(u8, body) };
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    const FakeWrites = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .drop_table = dropTable,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 1), group_ids.len);
+            try std.testing.expectEqual(@as(u64, 42), group_ids[0]);
+            self.state.local_drop_used_manifest_group = true;
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("docs-snap-cluster", plan.manifest.backup_id);
+            self.state.restored = true;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var read_source = FakeReads{ .state = &state };
+    var write_source = FakeWrites{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"restore_mode\":\"overwrite\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expect(state.local_drop_used_manifest_group);
+    try std.testing.expect(state.restored);
+    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"status\":\"triggered\"") != null);
+}
+
+test "api http server cluster restore rejects missing extension package digest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-extension-preflight", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, "docs-snap-cluster"),
+    };
+    defer cluster_entry.deinit(alloc);
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:backup",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .status = .ready,
+    }};
+    var cluster_manifest = try backups_api.createClusterManifestWithExtensions(
+        alloc,
+        "snap-cluster",
+        location_uri,
+        &.{cluster_entry},
+        &installed,
+        &.{},
+        &.{},
+    );
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        restored: bool = false,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
+                    .name = "memoryaf",
+                    .version = "1.0.0",
+                    .digest = "sha256:target",
+                    .install = .{ .scopes_supported = &.{.table} },
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeWrites = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: backups_api.TableRestorePlan) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.state.restored = true;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var write_source = FakeWrites{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, write_source.source());
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), restore_resp.status);
+    try std.testing.expectEqualStrings("invalid restore request", restore_resp.body);
+    try std.testing.expect(!state.restored);
+}
+
+test "api http server cluster restore rehydrates extension metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-extension-restore", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, "docs-snap-cluster"),
+    };
+    defer cluster_entry.deinit(alloc);
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:memory",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "memoryaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .mcp_tool,
+        .object_name = "recall",
+    }};
+    const dependencies = [_]extension_domain.ExtensionDependency{.{
+        .extension_name = "memoryaf",
+        .required_extension_name = "antfly_core",
+        .package_name = "antfly_core",
+    }};
+    var cluster_manifest = try backups_api.createClusterManifestWithExtensions(
+        alloc,
+        "snap-cluster",
+        location_uri,
+        &.{cluster_entry},
+        &installed,
+        &members,
+        &dependencies,
+    );
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        table_restored: bool = false,
+        installed_count: usize = 0,
+        member_count: usize = 0,
+        dependency_count: usize = 0,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .restore_table = restoreTable,
+                    .restore_extensions = restoreExtensions,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
+                    .name = "memoryaf",
+                    .version = "1.0.0",
+                    .digest = "sha256:memory",
+                    .install = .{ .scopes_supported = &.{.table} },
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri_arg: []const u8, backup_id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(location_uri_arg.len > 0);
+            try std.testing.expectEqualStrings("docs-snap-cluster", backup_id);
+            self.state.table_restored = true;
+        }
+
+        fn restoreExtensions(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            restored_installed: []const extension_domain.InstalledExtension,
+            restored_members: []const extension_domain.ExtensionMember,
+            restored_dependencies: []const extension_domain.ExtensionDependency,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.state.installed_count = restored_installed.len;
+            self.state.member_count = restored_members.len;
+            self.state.dependency_count = restored_dependencies.len;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .body = restore_body,
+        .content_type = "application/json",
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expect(state.table_restored);
+    try std.testing.expectEqual(@as(usize, 1), state.installed_count);
+    try std.testing.expectEqual(@as(usize, 1), state.member_count);
+    try std.testing.expectEqual(@as(usize, 1), state.dependency_count);
 }
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {

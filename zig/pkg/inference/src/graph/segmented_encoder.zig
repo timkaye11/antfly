@@ -35,6 +35,7 @@ const Graph = ml.graph.Graph;
 const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
+const null_node = ml.graph.null_node;
 const graph_lora = ml.graph.lora;
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
@@ -163,6 +164,47 @@ pub const SegmentVJPResult = struct {
     }
 };
 
+pub const NamedGradient = struct {
+    name: []u8,
+    values: []f32,
+
+    pub fn deinit(self: *NamedGradient, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub const LayerBackwardSubstageInputs = struct {
+    upstream_grad: []const f32,
+    primary: ?[]const f32 = null,
+    q_raw: ?[]const f32 = null,
+    k_raw: ?[]const f32 = null,
+    v_raw: ?[]const f32 = null,
+    hidden_in_aux: ?[]const f32 = null,
+    hidden_after_attn_aux: ?[]const f32 = null,
+    gate_input_aux: ?[]const f32 = null,
+    gate_value_aux: ?[]const f32 = null,
+    attention_mask: []const f32,
+};
+
+pub const LayerBackwardSubstageResult = struct {
+    allocator: std.mem.Allocator,
+    stage: modern_bert_graph.LayerBackwardSubstage,
+    loss: f32,
+    profile: SegmentVJPProfile = .{},
+    stage_grads: []NamedGradient = &.{},
+    adapter_grads: []NamedGradient = &.{},
+
+    pub fn deinit(self: *LayerBackwardSubstageResult) void {
+        for (self.stage_grads) |*grad| grad.deinit(self.allocator);
+        if (self.stage_grads.len > 0) self.allocator.free(self.stage_grads);
+        for (self.adapter_grads) |*grad| grad.deinit(self.allocator);
+        if (self.adapter_grads.len > 0) self.allocator.free(self.adapter_grads);
+        self.* = undefined;
+    }
+};
+
 pub const SegmentVJPProfile = struct {
     runtime_input_ns: u64 = 0,
     compiled_execute_ns: u64 = 0,
@@ -234,6 +276,554 @@ const SegmentLayerInputBinding = struct {
     rope_sin_id: NodeId,
     is_local_attention: bool,
     rope_theta: f32,
+};
+
+const stage_mlp_wo_names = [_][]const u8{"__substage_mlp_wo_input"};
+const stage_mlp_gelu_input_names = [_][]const u8{"__substage_gelu_input"};
+const stage_mlp_gate_value_names = [_][]const u8{"__substage_gate_value"};
+const stage_mlp_gate_input_names = [_][]const u8{"__substage_gate_input"};
+const stage_mlp_wi_output_names = [_][]const u8{"__substage_wi_output"};
+const stage_mlp_norm_output_names = [_][]const u8{"__substage_mlp_norm_output"};
+const stage_mlp_hidden_after_attn_names = [_][]const u8{"__substage_hidden_after_attn"};
+const stage_attn_out_proj_names = [_][]const u8{"__substage_attn_merged"};
+const stage_attention_core_names = [_][]const u8{ "__substage_q_raw", "__substage_k_raw", "__substage_v_raw" };
+const stage_attention_core_post_rope_names = [_][]const u8{ "__substage_q_rope", "__substage_k_rope", "__substage_v_attention_input" };
+const stage_attention_scores_raw_names = [_][]const u8{"__substage_scores_raw"};
+const stage_attention_scores_masked_names = [_][]const u8{"__substage_scores_masked"};
+const stage_attention_probs_names = [_][]const u8{ "__substage_attention_probs", "__substage_v_attention_input" };
+const stage_qkv_proj_names = [_][]const u8{"__substage_attn_normed"};
+const stage_qkv_proj_split_names = [_][]const u8{ "__substage_q_attn_normed", "__substage_k_attn_normed", "__substage_v_attn_normed" };
+const stage_attn_norm_hidden_in_names = [_][]const u8{"__substage_hidden_in"};
+
+fn substageInputParamNames(stage: modern_bert_graph.LayerBackwardSubstage) []const []const u8 {
+    return switch (stage) {
+        .mlp_wo => stage_mlp_wo_names[0..],
+        .mlp_gelu_input => stage_mlp_gelu_input_names[0..],
+        .mlp_gate_value => stage_mlp_gate_value_names[0..],
+        .mlp_gate_input => stage_mlp_gate_input_names[0..],
+        .mlp_wi_output => stage_mlp_wi_output_names[0..],
+        .mlp_norm_output => stage_mlp_norm_output_names[0..],
+        .mlp_hidden_after_attn => stage_mlp_hidden_after_attn_names[0..],
+        .attn_out_proj => stage_attn_out_proj_names[0..],
+        .attention_core => stage_attention_core_names[0..],
+        .attention_core_post_rope => stage_attention_core_post_rope_names[0..],
+        .attention_scores_raw => stage_attention_scores_raw_names[0..],
+        .attention_scores_masked => stage_attention_scores_masked_names[0..],
+        .attention_probs => stage_attention_probs_names[0..],
+        .qkv_proj => stage_qkv_proj_names[0..],
+        .qkv_proj_split => stage_qkv_proj_split_names[0..],
+        .attn_norm_hidden_in => stage_attn_norm_hidden_in_names[0..],
+    };
+}
+
+fn substageUsesAttentionBias(stage: modern_bert_graph.LayerBackwardSubstage) bool {
+    return switch (stage) {
+        .attention_core, .attention_core_post_rope, .attention_scores_raw, .qkv_proj, .qkv_proj_split, .attn_norm_hidden_in => true,
+        else => false,
+    };
+}
+
+fn substageUsesRope(stage: modern_bert_graph.LayerBackwardSubstage) bool {
+    return switch (stage) {
+        .attention_core, .qkv_proj, .qkv_proj_split, .attn_norm_hidden_in => true,
+        else => false,
+    };
+}
+
+fn substagePrimaryInputIsAttentionMatrix(stage: modern_bert_graph.LayerBackwardSubstage) bool {
+    return switch (stage) {
+        .attention_scores_raw, .attention_scores_masked, .attention_probs => true,
+        else => false,
+    };
+}
+
+fn substageUsesVAttentionInput(stage: modern_bert_graph.LayerBackwardSubstage) bool {
+    return switch (stage) {
+        .attention_scores_raw, .attention_scores_masked, .attention_probs => true,
+        else => false,
+    };
+}
+
+fn substagePrimaryInputName(stage: modern_bert_graph.LayerBackwardSubstage) ?[]const u8 {
+    return switch (stage) {
+        .mlp_wo => "__substage_mlp_wo_input",
+        .mlp_gelu_input => "__substage_gelu_input",
+        .mlp_gate_value => "__substage_gate_value",
+        .mlp_gate_input => "__substage_gate_input",
+        .mlp_wi_output => "__substage_wi_output",
+        .mlp_norm_output => "__substage_mlp_norm_output",
+        .mlp_hidden_after_attn => "__substage_hidden_after_attn",
+        .attn_out_proj => "__substage_attn_merged",
+        .attention_scores_raw => "__substage_scores_raw",
+        .attention_scores_masked => "__substage_scores_masked",
+        .attention_probs => "__substage_attention_probs",
+        .qkv_proj => "__substage_attn_normed",
+        .attn_norm_hidden_in => "__substage_hidden_in",
+        .attention_core, .attention_core_post_rope, .qkv_proj_split => null,
+    };
+}
+
+fn substagePrimaryInputCols(stage: modern_bert_graph.LayerBackwardSubstage, hidden_size: usize, intermediate_size: usize) usize {
+    return switch (stage) {
+        .mlp_wo,
+        .mlp_gelu_input,
+        .mlp_gate_value,
+        .mlp_gate_input,
+        => intermediate_size,
+        .mlp_wi_output => intermediate_size * 2,
+        else => hidden_size,
+    };
+}
+
+pub const ModernBertLayerBackwardSubstageSession = struct {
+    allocator: std.mem.Allocator,
+    config: modern_bert_graph.Config,
+    batch: u32,
+    seq_len: u32,
+    layer_idx: u32,
+    stage: modern_bert_graph.LayerBackwardSubstage,
+    primary_input_id: NodeId,
+    q_raw_id: NodeId,
+    k_raw_id: NodeId,
+    v_raw_id: NodeId,
+    hidden_in_aux_id: NodeId,
+    hidden_after_attn_aux_id: NodeId,
+    gate_input_aux_id: NodeId,
+    gate_value_aux_id: NodeId,
+    upstream_grad_id: NodeId,
+    attn_bias_id: NodeId,
+    rope_cos_id: NodeId,
+    rope_sin_id: NodeId,
+    layer_input: SegmentLayerInputBinding,
+    base_params: []ParamBinding,
+    adapters: []AdapterBinding,
+    trainable_param_names: [][]const u8,
+    session: training.CompiledTrainSession,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: modern_bert_graph.Config,
+        batch: u32,
+        seq_len: u32,
+        layer_idx: u32,
+        stage: modern_bert_graph.LayerBackwardSubstage,
+        lora_rank: u32,
+        lora_alpha: f32,
+        execution_strategy: training.CompiledExecutionStrategy,
+    ) !ModernBertLayerBackwardSubstageSession {
+        if (lora_rank == 0) return error.LoRARankRequired;
+        if (layer_idx >= config.num_hidden_layers) return error.InvalidLayerRange;
+
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var bld = Builder.init(&g);
+
+        const graph = try modern_bert_graph.buildEncoderLayerBackwardSubstageGraph(
+            &bld,
+            config,
+            stage,
+            batch,
+            seq_len,
+            layer_idx,
+        );
+
+        var lora_result = try graph_lora.injectLoRA(allocator, &g, .{
+            .rank = lora_rank,
+            .alpha = lora_alpha,
+            .target_patterns = segment_lora_targets[0..],
+        });
+        defer lora_result.deinit();
+
+        var base_params_list: std.ArrayListUnmanaged(ParamBinding) = .empty;
+        errdefer {
+            for (base_params_list.items) |*p| p.deinit(allocator);
+            base_params_list.deinit(allocator);
+        }
+        for (lora_result.graph.parameters.items) |param_id| {
+            const n = lora_result.graph.node(param_id);
+            if (n.op != .parameter) continue;
+            const name = lora_result.graph.parameterName(n);
+            if (std.mem.startsWith(u8, name, "__")) continue;
+            if (std.mem.indexOf(u8, name, ".lora_A") != null or
+                std.mem.indexOf(u8, name, ".lora_B") != null)
+            {
+                continue;
+            }
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
+            try base_params_list.append(allocator, .{
+                .node_id = param_id,
+                .name = owned_name,
+            });
+        }
+
+        var adapter_list: std.ArrayListUnmanaged(AdapterBinding) = .empty;
+        errdefer {
+            for (adapter_list.items) |*a| a.deinit(allocator);
+            adapter_list.deinit(allocator);
+        }
+        for (lora_result.adapter.adapterNames()) |info| {
+            const stable_base_name = stripLoRASuffix(info.lora_a_name) orelse info.base_name;
+            const mapped = moduleFromModernBertBaseName(stable_base_name) catch continue;
+            const base_name = try allocator.dupe(u8, stable_base_name);
+            errdefer allocator.free(base_name);
+            const a_name = try allocator.dupe(u8, info.lora_a_name);
+            errdefer allocator.free(a_name);
+            const b_name = try allocator.dupe(u8, info.lora_b_name);
+            errdefer allocator.free(b_name);
+            const module_name = try allocator.dupe(u8, mapped.module_name);
+            errdefer allocator.free(module_name);
+            const a_shape = lora_result.graph.node(info.lora_a_id).output_shape;
+            const b_shape = lora_result.graph.node(info.lora_b_id).output_shape;
+            try adapter_list.append(allocator, .{
+                .base_name = base_name,
+                .lora_a_name = a_name,
+                .lora_b_name = b_name,
+                .lora_a_id = info.lora_a_id,
+                .lora_b_id = info.lora_b_id,
+                .lora_a_rows = @intCast(a_shape.dim(0)),
+                .lora_a_cols = @intCast(a_shape.dim(1)),
+                .lora_b_rows = @intCast(b_shape.dim(0)),
+                .lora_b_cols = @intCast(b_shape.dim(1)),
+                .layer_idx = mapped.layer_idx,
+                .module_name = module_name,
+            });
+        }
+
+        const stage_names = substageInputParamNames(stage);
+        var trainable_names = try allocator.alloc([]const u8, stage_names.len + adapter_list.items.len * 2);
+        errdefer allocator.free(trainable_names);
+        var tn: usize = 0;
+        for (stage_names) |name| {
+            trainable_names[tn] = name;
+            tn += 1;
+        }
+        for (adapter_list.items) |adapter| {
+            trainable_names[tn] = adapter.lora_a_name;
+            tn += 1;
+            trainable_names[tn] = adapter.lora_b_name;
+            tn += 1;
+        }
+
+        var session = try training.CompiledTrainSession.init(
+            allocator,
+            &lora_result.graph,
+            graph.loss_node,
+            .{
+                .trainable_params = trainable_names,
+                .execution_strategy = execution_strategy,
+            },
+        );
+        errdefer session.deinit();
+
+        const layer_is_global = modern_bert_graph.isGlobalAttentionLayer(config, layer_idx);
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .batch = batch,
+            .seq_len = seq_len,
+            .layer_idx = layer_idx,
+            .stage = stage,
+            .primary_input_id = graph.primary_input_node,
+            .q_raw_id = graph.q_raw_node,
+            .k_raw_id = graph.k_raw_node,
+            .v_raw_id = graph.v_raw_node,
+            .hidden_in_aux_id = graph.hidden_in_aux_node,
+            .hidden_after_attn_aux_id = graph.hidden_after_attn_aux_node,
+            .gate_input_aux_id = graph.gate_input_aux_node,
+            .gate_value_aux_id = graph.gate_value_aux_node,
+            .upstream_grad_id = graph.upstream_grad_node,
+            .attn_bias_id = graph.attn_bias_node,
+            .rope_cos_id = graph.rope_cos_node,
+            .rope_sin_id = graph.rope_sin_node,
+            .layer_input = .{
+                .layer_idx = layer_idx,
+                .attn_bias_id = graph.attn_bias_node,
+                .rope_cos_id = graph.rope_cos_node,
+                .rope_sin_id = graph.rope_sin_node,
+                .is_local_attention = !layer_is_global,
+                .rope_theta = modern_bert_graph.ropeThetaForLayer(config, layer_idx),
+            },
+            .base_params = try base_params_list.toOwnedSlice(allocator),
+            .adapters = try adapter_list.toOwnedSlice(allocator),
+            .trainable_param_names = trainable_names,
+            .session = session,
+        };
+    }
+
+    pub fn deinit(self: *ModernBertLayerBackwardSubstageSession) void {
+        self.session.deinit();
+        for (self.base_params) |*p| p.deinit(self.allocator);
+        self.allocator.free(self.base_params);
+        for (self.adapters) |*adapter| adapter.deinit(self.allocator);
+        self.allocator.free(self.adapters);
+        self.allocator.free(self.trainable_param_names);
+        self.* = undefined;
+    }
+
+    pub fn execute(
+        self: *ModernBertLayerBackwardSubstageSession,
+        cb: *const ComputeBackend,
+        inputs: LayerBackwardSubstageInputs,
+        lora_layers: []fused_chunker_lora.LoRALayer,
+    ) !LayerBackwardSubstageResult {
+        const total_start_ns = nowNs();
+        const total: usize = @as(usize, self.batch) * @as(usize, self.seq_len);
+        const H: usize = @intCast(self.config.hidden_size);
+        const I: usize = @intCast(self.config.intermediate_size);
+        if (inputs.upstream_grad.len != total * H) return error.InvalidSegmentTensorShape;
+        if (inputs.attention_mask.len != total) return error.InvalidAttentionMaskShape;
+
+        var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+        defer rt.deinit(self.allocator);
+        var owned_cts: std.ArrayListUnmanaged(CT) = .empty;
+        defer {
+            for (owned_cts.items) |ct| cb.free(ct);
+            owned_cts.deinit(self.allocator);
+        }
+
+        try self.putOwnedTensor(cb, &rt, &owned_cts, self.upstream_grad_id, inputs.upstream_grad, &.{ @intCast(total), @intCast(H) });
+        if (substagePrimaryInputName(self.stage) != null) {
+            const primary = inputs.primary orelse return error.MissingSubstageInput;
+            if (substagePrimaryInputIsAttentionMatrix(self.stage)) {
+                const bh: usize = @as(usize, self.batch) * @as(usize, self.config.num_attention_heads);
+                const seq: usize = @intCast(self.seq_len);
+                if (primary.len != bh * seq * seq) return error.InvalidSegmentTensorShape;
+                try self.putOwnedTensor(cb, &rt, &owned_cts, self.primary_input_id, primary, &.{ @intCast(bh), @intCast(seq), @intCast(seq) });
+            } else {
+                const primary_cols = substagePrimaryInputCols(self.stage, H, I);
+                if (primary.len != total * primary_cols) return error.InvalidSegmentTensorShape;
+                try self.putOwnedTensor(cb, &rt, &owned_cts, self.primary_input_id, primary, &.{ @intCast(total), @intCast(primary_cols) });
+            }
+        }
+        if (self.stage == .attention_core or self.stage == .attention_core_post_rope) {
+            const q = inputs.q_raw orelse return error.MissingSubstageInput;
+            const k = inputs.k_raw orelse return error.MissingSubstageInput;
+            const v = inputs.v_raw orelse return error.MissingSubstageInput;
+            if (q.len != total * H or k.len != total * H or v.len != total * H) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.q_raw_id, q, &.{ @intCast(total), @intCast(H) });
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.k_raw_id, k, &.{ @intCast(total), @intCast(H) });
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.v_raw_id, v, &.{ @intCast(total), @intCast(H) });
+        }
+        if (substageUsesVAttentionInput(self.stage)) {
+            const v = inputs.v_raw orelse return error.MissingSubstageInput;
+            if (v.len != total * H) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.v_raw_id, v, &.{ @intCast(total), @intCast(H) });
+        }
+        if (self.stage == .qkv_proj_split) {
+            const primary = inputs.primary orelse return error.MissingSubstageInput;
+            if (primary.len != total * H) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.q_raw_id, primary, &.{ @intCast(total), @intCast(H) });
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.k_raw_id, primary, &.{ @intCast(total), @intCast(H) });
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.v_raw_id, primary, &.{ @intCast(total), @intCast(H) });
+        }
+        if (self.hidden_in_aux_id != null_node) {
+            const hidden_in = inputs.hidden_in_aux orelse return error.MissingSubstageInput;
+            if (hidden_in.len != total * H) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.hidden_in_aux_id, hidden_in, &.{ @intCast(total), @intCast(H) });
+        }
+        if (self.hidden_after_attn_aux_id != null_node) {
+            const hidden_after_attn = inputs.hidden_after_attn_aux orelse return error.MissingSubstageInput;
+            if (hidden_after_attn.len != total * H) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.hidden_after_attn_aux_id, hidden_after_attn, &.{ @intCast(total), @intCast(H) });
+        }
+        if (self.gate_input_aux_id != null_node) {
+            const gate_input = inputs.gate_input_aux orelse return error.MissingSubstageInput;
+            if (gate_input.len != total * I) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.gate_input_aux_id, gate_input, &.{ @intCast(total), @intCast(I) });
+        }
+        if (self.gate_value_aux_id != null_node) {
+            const gate_value = inputs.gate_value_aux orelse return error.MissingSubstageInput;
+            if (gate_value.len != total * I) return error.InvalidSegmentTensorShape;
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.gate_value_aux_id, gate_value, &.{ @intCast(total), @intCast(I) });
+        }
+        if (substageUsesAttentionBias(self.stage)) {
+            const attn_bias = try buildSegmentAttnBias(
+                self.allocator,
+                inputs.attention_mask,
+                self.batch,
+                self.seq_len,
+                self.config.num_attention_heads,
+                self.layer_input.is_local_attention,
+                self.config.local_attention_window,
+            );
+            defer self.allocator.free(attn_bias);
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.attn_bias_id, attn_bias, &.{
+                @intCast(self.batch * self.config.num_attention_heads),
+                @intCast(self.seq_len),
+                @intCast(self.seq_len),
+            });
+        }
+
+        if (substageUsesRope(self.stage)) {
+            const rope = try graph_input_binder.QwenPlaceholderPrep.buildRopeCosSin(
+                self.allocator,
+                self.seq_len,
+                self.config.head_dim,
+                self.layer_input.rope_theta,
+            );
+            defer {
+                self.allocator.free(rope.cos);
+                self.allocator.free(rope.sin);
+            }
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.rope_cos_id, rope.cos, &.{ @intCast(self.seq_len), @intCast(self.config.head_dim) });
+            try self.putOwnedTensor(cb, &rt, &owned_cts, self.rope_sin_id, rope.sin, &.{ @intCast(self.seq_len), @intCast(self.config.head_dim) });
+        }
+
+        for (self.base_params) |binding| {
+            const weight = cb.getWeight(binding.name) catch |err| switch (err) {
+                error.MissingWeight => if (std.mem.endsWith(u8, binding.name, ".bias")) blk: {
+                    const zero_bias = try self.allocator.alloc(f32, self.config.hidden_size);
+                    defer self.allocator.free(zero_bias);
+                    @memset(zero_bias, 0);
+                    const dims = [_]i32{@intCast(self.config.hidden_size)};
+                    break :blk try cb.fromFloat32Shape(zero_bias, &dims);
+                } else {
+                    std.log.warn("substage VJP missing base weight: {s}", .{binding.name});
+                    return err;
+                },
+                else => return err,
+            };
+            errdefer cb.free(weight);
+            try rt.put(self.allocator, binding.node_id, weight);
+            try owned_cts.append(self.allocator, weight);
+        }
+
+        for (self.adapters) |adapter| {
+            if (findLoRALayer(lora_layers, adapter.layer_idx, adapter.module_name)) |layer| {
+                try self.putOwnedTensor(cb, &rt, &owned_cts, adapter.lora_a_id, layer.A, &.{
+                    @intCast(adapter.lora_a_rows),
+                    @intCast(adapter.lora_a_cols),
+                });
+                try self.putOwnedTensor(cb, &rt, &owned_cts, adapter.lora_b_id, layer.B, &.{
+                    @intCast(adapter.lora_b_rows),
+                    @intCast(adapter.lora_b_cols),
+                });
+            } else {
+                try self.putZeroOwnedTensor(cb, &rt, &owned_cts, adapter.lora_a_id, adapter.lora_a_rows, adapter.lora_a_cols);
+                try self.putZeroOwnedTensor(cb, &rt, &owned_cts, adapter.lora_b_id, adapter.lora_b_rows, adapter.lora_b_cols);
+            }
+        }
+        const runtime_input_ns = elapsedNs(total_start_ns);
+
+        var step_result = try self.session.execute(cb, rt);
+        defer step_result.deinit();
+
+        var stage_grads_list: std.ArrayListUnmanaged(NamedGradient) = .empty;
+        errdefer {
+            for (stage_grads_list.items) |*grad| grad.deinit(self.allocator);
+            stage_grads_list.deinit(self.allocator);
+        }
+        for (substageInputParamNames(self.stage)) |name| {
+            const values = step_result.gradients.get(name) orelse {
+                std.log.warn("substage VJP missing gradient stage={s} name={s} available_gradients={d}", .{
+                    @tagName(self.stage),
+                    name,
+                    step_result.gradients.count(),
+                });
+                return error.MissingSubstageGradient;
+            };
+            const owned_name = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(owned_name);
+            const owned_values = try self.allocator.dupe(f32, values);
+            errdefer self.allocator.free(owned_values);
+            try stage_grads_list.append(self.allocator, .{
+                .name = owned_name,
+                .values = owned_values,
+            });
+        }
+
+        var adapter_grads_list: std.ArrayListUnmanaged(NamedGradient) = .empty;
+        errdefer {
+            for (adapter_grads_list.items) |*grad| grad.deinit(self.allocator);
+            adapter_grads_list.deinit(self.allocator);
+        }
+        for (self.adapters) |adapter| {
+            if (step_result.gradients.get(adapter.lora_a_name)) |grad_a| {
+                const name = try std.fmt.allocPrint(self.allocator, "layer_{d:0>2}_{s}_A", .{ adapter.layer_idx, adapter.module_name });
+                errdefer self.allocator.free(name);
+                const values = try self.allocator.dupe(f32, grad_a);
+                errdefer self.allocator.free(values);
+                try adapter_grads_list.append(self.allocator, .{ .name = name, .values = values });
+            }
+            if (step_result.gradients.get(adapter.lora_b_name)) |grad_b| {
+                const name = try std.fmt.allocPrint(self.allocator, "layer_{d:0>2}_{s}_B", .{ adapter.layer_idx, adapter.module_name });
+                errdefer self.allocator.free(name);
+                const values = try self.allocator.dupe(f32, grad_b);
+                errdefer self.allocator.free(values);
+                try adapter_grads_list.append(self.allocator, .{ .name = name, .values = values });
+            }
+        }
+
+        const stage_grads = try stage_grads_list.toOwnedSlice(self.allocator);
+        stage_grads_list = .empty;
+        errdefer {
+            for (stage_grads) |*grad| grad.deinit(self.allocator);
+            if (stage_grads.len > 0) self.allocator.free(stage_grads);
+        }
+
+        const adapter_grads = try adapter_grads_list.toOwnedSlice(self.allocator);
+        adapter_grads_list = .empty;
+        errdefer {
+            for (adapter_grads) |*grad| grad.deinit(self.allocator);
+            if (adapter_grads.len > 0) self.allocator.free(adapter_grads);
+        }
+
+        return .{
+            .allocator = self.allocator,
+            .stage = self.stage,
+            .loss = step_result.loss,
+            .profile = .{
+                .runtime_input_ns = runtime_input_ns,
+                .compiled_execute_ns = step_result.profile.execute_ns,
+                .compiled_extract_ns = step_result.profile.extract_ns,
+                .compiled_total_ns = step_result.profile.total_ns,
+                .total_ns = elapsedNs(total_start_ns),
+                .partitioned_runtime = step_result.profile.partitioned_runtime,
+                .mpsgraph_runtime = step_result.profile.mpsgraph_runtime,
+                .partitions_executed = step_result.profile.partitions_executed,
+                .backend_command_dispatches = step_result.profile.backend_command_dispatches,
+                .planned_operator_dispatches = step_result.profile.planned_operator_dispatches,
+                .interpreter_fallbacks = step_result.profile.interpreter_fallbacks,
+                .graph_region_dispatches = step_result.profile.graph_region_dispatches,
+            },
+            .stage_grads = stage_grads,
+            .adapter_grads = adapter_grads,
+        };
+    }
+
+    fn putOwnedTensor(
+        self: *ModernBertLayerBackwardSubstageSession,
+        cb: *const ComputeBackend,
+        rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+        owned_cts: *std.ArrayListUnmanaged(CT),
+        node_id: NodeId,
+        data: []const f32,
+        dims: []const i32,
+    ) !void {
+        const ct = try cb.fromFloat32Shape(data, dims);
+        errdefer cb.free(ct);
+        try rt.put(self.allocator, node_id, ct);
+        try owned_cts.append(self.allocator, ct);
+    }
+
+    fn putZeroOwnedTensor(
+        self: *ModernBertLayerBackwardSubstageSession,
+        cb: *const ComputeBackend,
+        rt: *std.AutoHashMapUnmanaged(NodeId, CT),
+        owned_cts: *std.ArrayListUnmanaged(CT),
+        node_id: NodeId,
+        rows: usize,
+        cols: usize,
+    ) !void {
+        const zeros = try self.allocator.alloc(f32, rows * cols);
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0.0);
+        try self.putOwnedTensor(cb, rt, owned_cts, node_id, zeros, &.{
+            @intCast(rows),
+            @intCast(cols),
+        });
+    }
 };
 
 /// Reusable compiled synthetic-loss VJP for a ModernBERT encoder segment.

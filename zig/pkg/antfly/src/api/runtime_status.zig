@@ -767,12 +767,56 @@ fn cloneAlgebraicProgressStatuses(
     return out;
 }
 
+fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.ResolverReplayDiagnostics) !db_mod.types.ResolverReplayDiagnostics {
+    var resolvers = try alloc.alloc(db_mod.types.ResolverReplayDiagnostic, stats.resolvers.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (resolvers[0..initialized]) |resolver| {
+            alloc.free(resolver.name);
+            alloc.free(resolver.table);
+            alloc.free(resolver.source_artifact);
+            alloc.free(resolver.resolution_artifact);
+        }
+        if (resolvers.len > 0) alloc.free(resolvers);
+    }
+
+    for (stats.resolvers, 0..) |resolver, i| {
+        const name = try alloc.dupe(u8, resolver.name);
+        errdefer alloc.free(name);
+        const table = try alloc.dupe(u8, resolver.table);
+        errdefer alloc.free(table);
+        const source_artifact = try alloc.dupe(u8, resolver.source_artifact);
+        errdefer alloc.free(source_artifact);
+        const resolution_artifact = try alloc.dupe(u8, resolver.resolution_artifact);
+        errdefer alloc.free(resolution_artifact);
+        resolvers[i] = .{
+            .name = name,
+            .table = table,
+            .source_artifact = source_artifact,
+            .resolution_artifact = resolution_artifact,
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .resolver_count = stats.resolver_count,
+        .resolution_runtime_present = stats.resolution_runtime_present,
+        .resolution_worker_started = stats.resolution_worker_started,
+        .promotion_runtime_present = stats.promotion_runtime_present,
+        .promotion_worker_started = stats.promotion_worker_started,
+        .resolvers = resolvers,
+    };
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
+    const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
+    errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, stats.indexes.len);
     var initialized: usize = 0;
     errdefer {
         for (indexes[0..initialized]) |item| {
             alloc.free(item.name);
+            if (item.load_error) |value| alloc.free(value);
             if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
             if (item.algebraic_last_error_reason) |value| alloc.free(value);
             if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -811,6 +855,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     for (stats.indexes, 0..) |item, i| {
+        const load_error = if (item.load_error) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (load_error) |value| alloc.free(value);
         const algebraic_last_error_doc_key = if (item.algebraic_last_error_doc_key) |value|
             try alloc.dupe(u8, value)
         else
@@ -900,6 +949,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         indexes[i] = .{
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
+            .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
@@ -987,6 +1037,9 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
         .enrichment = stats.enrichment,
+        .resolution = stats.resolution,
+        .promotion = stats.promotion,
+        .resolver_replay = resolver_replay,
         .ttl_cleanup = stats.ttl_cleanup,
         .transaction_recovery = stats.transaction_recovery,
         .text_merge = stats.text_merge,

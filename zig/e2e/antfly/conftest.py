@@ -109,7 +109,7 @@ def antfly_public_api_url(base_url: str, *, binary: str | None = None, root: str
 
 
 def lookup_key_path(table_name: str, key: str) -> str:
-    return f"/tables/{table_name}/lookup/{quote(key, safe='')}"
+    return f"/tables/{table_name}/documents/{quote(key, safe='')}"
 
 
 def antfly_internal_api_path(path: str) -> str:
@@ -254,7 +254,7 @@ def raise_request_error_with_logs(
     ) from err
 
 
-def _read_log_tail(path: Path, *, limit: int = 20000) -> str:
+def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     if not path.exists():
         return ""
     data = path.read_text(errors="replace")

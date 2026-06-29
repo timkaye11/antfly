@@ -14,4 +14,5 @@
 
 test {
     _ = @import("inference_internal").finetune.fused_chunker_train;
+    _ = @import("inference_internal").finetune.fused_chunker_train_cli;
 }

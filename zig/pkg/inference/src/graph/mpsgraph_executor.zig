@@ -467,6 +467,21 @@ const Lowerer = struct {
         return self.slice(x, shape, attrs);
     }
 
+    fn sliceLastStrided(self: *Lowerer, x: ?*anyopaque, shape: Shape, start: i64, end: i64, stride: i64) !?*anyopaque {
+        var attrs = ml.graph.node.SliceAttrs{};
+        attrs.num_axes = shape.rank();
+        for (0..shape.rank()) |axis| {
+            attrs.starts[axis] = 0;
+            attrs.limits[axis] = shape.dim(@intCast(axis));
+            attrs.strides[axis] = 1;
+        }
+        const last = shape.rank() - 1;
+        attrs.starts[last] = start;
+        attrs.limits[last] = end;
+        attrs.strides[last] = stride;
+        return self.slice(x, shape, attrs);
+    }
+
     fn concat(self: *Lowerer, lhs: ?*anyopaque, rhs: ?*anyopaque, axis: u8) !?*anyopaque {
         var handles = [_]?*anyopaque{ lhs, rhs };
         var err: CError = .{};
@@ -545,7 +560,7 @@ const Lowerer = struct {
     }
 
     fn rope(self: *Lowerer, x: ?*anyopaque, cos: ?*anyopaque, sin: ?*anyopaque, input_shape: Shape, attrs: ml.graph.node.RopeAttrs) !?*anyopaque {
-        if (attrs.consecutive_pairs or input_shape.rank() < 2) return error.MpsGraphUnsupportedRope;
+        if (input_shape.rank() < 2) return error.MpsGraphUnsupportedRope;
         const head_dim: i64 = @intCast(attrs.head_dim);
         const rope_dim: i64 = if (attrs.rope_dim > 0) @intCast(attrs.rope_dim) else head_dim;
         if (rope_dim <= 0 or @rem(rope_dim, 2) != 0 or rope_dim > head_dim) return error.MpsGraphUnsupportedRope;
@@ -556,8 +571,6 @@ const Lowerer = struct {
         var half_shape = input_shape;
         half_shape.dims[last_axis] = half;
 
-        const x0 = try self.sliceLast(x, input_shape, 0, half);
-        const x1 = try self.sliceLast(x, input_shape, half, rope_dim);
         const cos_shape = Shape.init(.f32, &.{ attrs.seq_len, attrs.head_dim });
         const cos_half = try self.sliceLast(cos, cos_shape, 0, half);
         const sin_half = try self.sliceLast(sin, cos_shape, 0, half);
@@ -566,9 +579,44 @@ const Lowerer = struct {
         const bcos = try self.broadcastTo(cos_half, half_target);
         const bsin = try self.broadcastTo(sin_half, half_target);
 
+        const x0 = if (attrs.consecutive_pairs)
+            try self.sliceLastStrided(x, input_shape, 0, rope_dim, 2)
+        else
+            try self.sliceLast(x, input_shape, 0, half);
+        const x1 = if (attrs.consecutive_pairs)
+            try self.sliceLastStrided(x, input_shape, 1, rope_dim, 2)
+        else
+            try self.sliceLast(x, input_shape, half, rope_dim);
+
         const out0 = try self.binary(.sub, try self.binary(.mul, x0, bcos), try self.binary(.mul, x1, bsin));
         const out1 = try self.binary(.add, try self.binary(.mul, x0, bsin), try self.binary(.mul, x1, bcos));
         var rotated = try self.concat(out0, out1, last_axis);
+        if (attrs.consecutive_pairs) {
+            const rank: usize = input_shape.rank();
+            if (rank >= 8) return error.MpsGraphUnsupportedRope;
+            var pair_dims: [8]i64 = undefined;
+            for (0..(rank - 1)) |axis| {
+                pair_dims[axis] = input_shape.dim(@intCast(axis));
+            }
+            pair_dims[rank - 1] = 2;
+            pair_dims[rank] = half;
+            const paired = try self.reshapeToDims(rotated, pair_dims[0 .. rank + 1]);
+
+            var perm: [8]c_int = undefined;
+            for (0..(rank - 1)) |axis| {
+                perm[axis] = @intCast(axis);
+            }
+            perm[rank - 1] = @intCast(rank);
+            perm[rank] = @intCast(rank - 1);
+            const transposed = try self.transposeExplicit(paired, perm[0 .. rank + 1]);
+
+            var rotated_dims: [8]i64 = undefined;
+            for (0..rank) |axis| {
+                rotated_dims[axis] = input_shape.dim(@intCast(axis));
+            }
+            rotated_dims[last_axis] = rope_dim;
+            rotated = try self.reshapeToDims(transposed, rotated_dims[0..rank]);
+        }
         if (rope_dim < head_dim) {
             const passthrough = try self.sliceLast(x, input_shape, rope_dim, head_dim);
             rotated = try self.concat(rotated, passthrough, last_axis);

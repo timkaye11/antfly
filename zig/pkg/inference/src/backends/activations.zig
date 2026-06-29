@@ -39,8 +39,24 @@ inline fn tanhVec(x: F32xN) F32xN {
     return one - two / (expVec(x2) + one);
 }
 
-/// GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+/// Exact GELU activation: x * 0.5 * (1 + erf(x / sqrt(2))).
 pub fn gelu(data: []f32) void {
+    const half: F32xN = @splat(0.5);
+    const one: F32xN = @splat(1.0);
+    const inv_sqrt2: F32xN = @splat(0.7071067811865475);
+    var i: usize = 0;
+    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
+        const v: F32xN = data[i..][0..VEC_LEN].*;
+        data[i..][0..VEC_LEN].* = half * v * (one + erfApproxVec(v * inv_sqrt2));
+    }
+    while (i < data.len) : (i += 1) {
+        const val = data[i];
+        data[i] = 0.5 * val * (1.0 + erfApprox(val * 0.7071067811865475));
+    }
+}
+
+/// Tanh-approximate GELU activation used by GGUF `gelu_pytorch_tanh`.
+pub fn geluTanh(data: []f32) void {
     const sqrt_2_over_pi_s: f32 = 0.7978845608028654;
     const sqrt_2_over_pi: F32xN = @splat(sqrt_2_over_pi_s);
     const c044715: F32xN = @splat(0.044715);
@@ -58,6 +74,37 @@ pub fn gelu(data: []f32) void {
         const inner = sqrt_2_over_pi_s * (val + 0.044715 * val * val * val);
         data[i] = 0.5 * val * (1.0 + std.math.tanh(inner));
     }
+}
+
+inline fn erfApprox(x: f32) f32 {
+    const a1: f32 = 0.254829592;
+    const a2: f32 = -0.284496736;
+    const a3: f32 = 1.421413741;
+    const a4: f32 = -1.453152027;
+    const a5: f32 = 1.061405429;
+    const p: f32 = 0.3275911;
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + p * ax);
+    const poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    return sign * (1.0 - poly * @exp(-ax * ax));
+}
+
+inline fn erfApproxVec(x: F32xN) F32xN {
+    const a1: F32xN = @splat(0.254829592);
+    const a2: F32xN = @splat(-0.284496736);
+    const a3: F32xN = @splat(1.421413741);
+    const a4: F32xN = @splat(-1.453152027);
+    const a5: F32xN = @splat(1.061405429);
+    const p: F32xN = @splat(0.3275911);
+    const zero: F32xN = @splat(0.0);
+    const one: F32xN = @splat(1.0);
+    const neg_one: F32xN = @splat(-1.0);
+    const sign = @select(f32, x < zero, neg_one, one);
+    const ax = @abs(x);
+    const t = one / (one + p * ax);
+    const poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    return sign * (one - poly * expVec(-(ax * ax)));
 }
 
 /// ReLU activation: max(0, x)

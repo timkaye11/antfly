@@ -31,12 +31,51 @@
 //   model.layers.N.mlp.Wo.weight          [hidden_size, intermediate_size]
 //   model.final_norm.{weight,bias}
 //
-// Single implementation works with any ComputeBackend (BLAS, MLX, etc).
+// Single implementation works with any ComputeBackend (native, etc).
 
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
+
+const tensor_probe_hash_offset: u64 = 14695981039346656037;
+const tensor_probe_hash_prime: u64 = 1099511628211;
+const tensor_probe_top_abs_count: usize = 8;
+
+fn getenvBool(comptime name: [*:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    if (raw[0] == 0) return false;
+    return !(raw[0] == '0' and raw[1] == 0);
+}
+
+fn layerTimingEnabled() bool {
+    return getenvBool("ANTFLY_MODERN_BERT_LAYER_TIMING");
+}
+
+fn monotonicNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn elapsedNs(start_ns: u64) u64 {
+    const end_ns = monotonicNowNs();
+    return if (end_ns > start_ns) end_ns - start_ns else 0;
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn printModernBertTiming(layer_idx: usize, stage: []const u8, ns: u64) void {
+    if (layer_idx == std.math.maxInt(usize)) {
+        std.debug.print("modernbert_timing layer=none stage={s} ms={d:.3}\n", .{ stage, nsToMs(ns) });
+    } else {
+        std.debug.print("modernbert_timing layer={d} stage={s} ms={d:.3}\n", .{ layer_idx, stage, nsToMs(ns) });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -110,10 +149,17 @@ pub fn forwardCT(
     batch: usize,
     seq_len: usize,
 ) !CT {
+    const trace_timing = layerTimingEnabled();
+    var stage_start_ns = if (trace_timing) monotonicNowNs() else 0;
+
     // 1. Token embeddings + embedding LayerNorm.
     //    ModernBERT has no absolute position embeddings; RoPE is applied in each
     //    attention layer instead.
-    var hidden = try embeddingsBlock(cb, allocator, config, input_ids, batch * seq_len, seq_len);
+    var hidden = try embeddingsBlock(cb, allocator, config, input_ids, batch * seq_len, seq_len, null);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "embeddings", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
     var local_window_bias: ?CT = null;
     defer if (local_window_bias) |bias| cb.free(bias);
 
@@ -133,6 +179,7 @@ pub fn forwardCT(
         cb.free(hidden);
         hidden = new_hidden;
     }
+    if (trace_timing) stage_start_ns = monotonicNowNs();
 
     // 3. Final layer norm
     var name_buf: [128]u8 = undefined;
@@ -143,6 +190,7 @@ pub fn forwardCT(
 
     const normed_final = try cb.layerNorm(hidden, fn_w, fn_b, @intCast(config.hidden_size), config.layer_norm_eps);
     cb.free(hidden);
+    if (trace_timing) printModernBertTiming(std.math.maxInt(usize), "final_norm", elapsedNs(stage_start_ns));
     return normed_final;
 }
 
@@ -157,6 +205,7 @@ fn embeddingsBlock(
     input_ids: []const i64,
     total: usize,
     seq_len: usize,
+    captures: ?*ActivationBuffer,
 ) !CT {
     const H = config.hidden_size;
     const H_usize: usize = @intCast(H);
@@ -199,6 +248,18 @@ fn embeddingsBlock(
     defer cb.free(ln_b);
 
     const normed = try cb.layerNorm(embedded, ln_w, ln_b, H, 1e-5);
+    errdefer cb.free(normed);
+    if (captures) |capture_buf| {
+        const embedded_f32 = try cb.toFloat32(embedded, allocator);
+        var owns_embedded = true;
+        errdefer if (owns_embedded) allocator.free(embedded_f32);
+        const normed_f32 = try cb.toFloat32(normed, allocator);
+        var owns_normed = true;
+        errdefer if (owns_normed) allocator.free(normed_f32);
+        try capture_buf.setEmbeddingOwned(embedded_f32, normed_f32, total, H_usize);
+        owns_embedded = false;
+        owns_normed = false;
+    }
     cb.free(embedded);
     return normed;
 }
@@ -282,6 +343,9 @@ fn encoderLayer(
     layer_idx: usize,
     local_window_bias_cache: ?*?CT,
 ) !CT {
+    const trace_timing = layerTimingEnabled();
+    const layer_start_ns = if (trace_timing) monotonicNowNs() else 0;
+    var stage_start_ns = layer_start_ns;
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
     const head_dim = H / num_heads;
@@ -300,6 +364,10 @@ fn encoderLayer(
 
     const normed_attn = try preAttentionNorm(cb, allocator, config, hidden, layer_idx, total, H, &name_buf);
     defer cb.free(normed_attn);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "pre_attn_norm", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // Q projection — use linearLoRA if LoRA is enabled in the config.
     const q_w = try getLayerWeight(cb, layer_idx, "attn.query_proj.weight", &name_buf);
@@ -324,6 +392,10 @@ fn encoderLayer(
     defer cb.free(v_b);
     const V = try linearWithLoRA(cb, allocator, normed_attn, v_w, v_b, layer_idx, "value_proj", config.lora_rank, config.lora_alpha, total, H, H);
     defer cb.free(V);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "qkv_project", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // Apply RoPE to Q and K.
     // consecutive_pairs=true: ModernBERT uses interleaved rotation pairs
@@ -333,7 +405,10 @@ fn encoderLayer(
     defer cb.free(Q);
     const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
     defer cb.free(K);
-
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "rope", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
     // Bidirectional scaled dot-product attention (encoder, no causal mask).
     // The padding mask (attention_mask) is consumed by the backend: positions
     // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
@@ -353,6 +428,10 @@ fn encoderLayer(
         local_window_bias_cache,
     );
     defer cb.free(attn_out);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "attention", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // Output projection
     const out_w = try getLayerWeight(cb, layer_idx, "attn.Wo.weight", &name_buf);
@@ -366,6 +445,10 @@ fn encoderLayer(
     // hidden state — pre-norm residual pattern.
     const hidden_after_attn = try cb.add(attn_proj, hidden);
     defer cb.free(hidden_after_attn);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "attn_output_residual", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // -----------------------------------------------------------------------
     // FFN sub-layer  (pre-norm, GeGLU)
@@ -378,6 +461,10 @@ fn encoderLayer(
     defer cb.free(mlp_ln_b);
     const normed_ffn = try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
     defer cb.free(normed_ffn);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "ffn_norm", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // GeGLU feed-forward (Wi and Wo both have no bias in ModernBERT's MLP)
     const Wi_w = try getLayerWeight(cb, layer_idx, "mlp.Wi.weight", &name_buf);
@@ -387,9 +474,18 @@ fn encoderLayer(
 
     const ffn_out = try geGluFfn(cb, allocator, normed_ffn, Wi_w, Wo_w, layer_idx, config.lora_rank, config.lora_alpha, total, H, intermediate, null);
     defer cb.free(ffn_out);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "geglu", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // Residual: add FFN output to post-attention hidden state
-    return cb.add(ffn_out, hidden_after_attn);
+    const layer_out = try cb.add(ffn_out, hidden_after_attn);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "ffn_residual", elapsedNs(stage_start_ns));
+        printModernBertTiming(layer_idx, "total", elapsedNs(layer_start_ns));
+    }
+    return layer_out;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +501,7 @@ fn encoderLayer(
 //   output = act @ Wo^T          [total, hidden]           (no bias)
 //
 // Keep the gate/value split on the active backend.  Metal wires slice,
-// GELU, and multiply to resident device ops, which avoids a per-layer
+// exact GELU, and multiply to resident device ops, which avoids a per-layer
 // download/re-upload of the large [total, 2*intermediate] projection.
 
 fn geGluFfn(
@@ -432,8 +528,35 @@ fn geGluFfn(
     const value_ct = try cb.sliceLastDim(gated_ct, intermediate_size, 2 * intermediate_size);
     defer cb.free(value_ct);
 
-    const activated_ct = (try cb.activationMultiply(gate_ct, value_ct, .gelu_new, total, intermediate_size)) orelse blk: {
-        const gate_gelu_ct = try cb.geluNew(gate_ct);
+    var gate_gelu_capture_ct: ?CT = null;
+    defer if (gate_gelu_capture_ct) |ct| cb.free(ct);
+    if (captures) |capture_buf| {
+        if (capture_buf.capture_layer_state_layer != null and capture_buf.capture_layer_state_layer.? == layer_idx) {
+            const gated = try cb.toFloat32(gated_ct, allocator);
+            defer allocator.free(gated);
+            if (gated.len != total * intermediate_size * 2) return error.UnexpectedOutputShape;
+            try capture_buf.addLayerState(@intCast(layer_idx), "wi_output", gated);
+
+            const gate = try cb.toFloat32(gate_ct, allocator);
+            defer allocator.free(gate);
+            if (gate.len != total * intermediate_size) return error.UnexpectedOutputShape;
+            try capture_buf.addLayerState(@intCast(layer_idx), "gate_input", gate);
+
+            const value = try cb.toFloat32(value_ct, allocator);
+            defer allocator.free(value);
+            if (value.len != total * intermediate_size) return error.UnexpectedOutputShape;
+            try capture_buf.addLayerState(@intCast(layer_idx), "gate_value", value);
+
+            gate_gelu_capture_ct = try cb.gelu(gate_ct);
+            const gelu = try cb.toFloat32(gate_gelu_capture_ct.?, allocator);
+            defer allocator.free(gelu);
+            if (gelu.len != total * intermediate_size) return error.UnexpectedOutputShape;
+            try capture_buf.addLayerState(@intCast(layer_idx), "gelu_input", gelu);
+        }
+    }
+
+    const activated_ct = (try cb.activationMultiply(gate_ct, value_ct, .gelu, total, intermediate_size)) orelse blk: {
+        const gate_gelu_ct = try cb.gelu(gate_ct);
         defer cb.free(gate_gelu_ct);
         break :blk try cb.multiply(gate_gelu_ct, value_ct);
     };
@@ -443,11 +566,43 @@ fn geGluFfn(
         const activated = try cb.toFloat32(activated_ct, allocator);
         defer allocator.free(activated);
         if (activated.len != total * intermediate_size) return error.UnexpectedOutputShape;
+        if (capture_buf.capture_layer_state_layer != null and capture_buf.capture_layer_state_layer.? == layer_idx) {
+            try capture_buf.addLayerState(@intCast(layer_idx), "wo_input", activated);
+        }
         try capture_buf.add(@intCast(layer_idx), "wo", activated, intermediate_size, hidden_size, total);
+        if (capture_buf.capture_projection_decomposition_layer != null and capture_buf.capture_projection_decomposition_layer.? == layer_idx) {
+            try captureProjectionDecomposition(
+                cb,
+                allocator,
+                capture_buf,
+                @intCast(layer_idx),
+                "wo",
+                activated_ct,
+                Wo_w,
+                null,
+                "mlp",
+                "Wo",
+                lora_rank,
+                lora_alpha,
+                total,
+                intermediate_size,
+                hidden_size,
+            );
+        }
     }
 
     // Wo is [hidden, intermediate] so the output is [total, hidden].
-    return linearWithScopedLoRA(cb, allocator, activated_ct, Wo_w, null, layer_idx, "mlp", "Wo", lora_rank, lora_alpha, total, intermediate_size, hidden_size);
+    const ffn_out_ct = try linearWithScopedLoRA(cb, allocator, activated_ct, Wo_w, null, layer_idx, "mlp", "Wo", lora_rank, lora_alpha, total, intermediate_size, hidden_size);
+    errdefer cb.free(ffn_out_ct);
+    if (captures) |capture_buf| {
+        if (capture_buf.capture_layer_state_layer != null and capture_buf.capture_layer_state_layer.? == layer_idx) {
+            const ffn_out = try cb.toFloat32(ffn_out_ct, allocator);
+            defer allocator.free(ffn_out);
+            if (ffn_out.len != total * hidden_size) return error.UnexpectedOutputShape;
+            try capture_buf.addLayerState(@intCast(layer_idx), "ffn_out", ffn_out);
+        }
+    }
+    return ffn_out_ct;
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +692,17 @@ fn zeroBiasTensor(
     return cb.fromFloat32Shape(zeros, &.{@as(i32, @intCast(dim))});
 }
 
+fn oneWeightTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    dim: usize,
+) !CT {
+    const ones = try allocator.alloc(f32, dim);
+    defer allocator.free(ones);
+    @memset(ones, 1.0);
+    return cb.fromFloat32Shape(ones, &.{@as(i32, @intCast(dim))});
+}
+
 fn cloneHiddenForNormSkip(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -557,12 +723,16 @@ fn preAttentionNorm(
     config: Config,
     hidden: CT,
     layer_idx: usize,
-    total: usize,
+    _: usize,
     hidden_size: usize,
     name_buf: *[256]u8,
 ) !CT {
     if (layer_idx == 0) {
-        return cloneHiddenForNormSkip(cb, allocator, hidden, total, hidden_size);
+        const attn_ln_w = try oneWeightTensor(cb, allocator, hidden_size);
+        defer cb.free(attn_ln_w);
+        const attn_ln_b = try zeroBiasTensor(cb, allocator, hidden_size);
+        defer cb.free(attn_ln_b);
+        return cb.layerNorm(hidden, attn_ln_w, attn_ln_b, hidden_size, config.layer_norm_eps);
     }
     const attn_ln_w = try getLayerWeight(cb, layer_idx, "attn_norm.weight", name_buf);
     defer cb.free(attn_ln_w);
@@ -677,6 +847,166 @@ fn linearNoBiasWithLoRADelta(
     return out;
 }
 
+fn tensorProbeStatsFromCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tensor: CT,
+) !TensorProbeStats {
+    const values = try cb.toFloat32(tensor, allocator);
+    defer allocator.free(values);
+    return computeTensorProbeStats(values);
+}
+
+fn optionalTensorProbeStatsFromCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tensor: ?CT,
+) !TensorProbeStats {
+    if (tensor) |t| return tensorProbeStatsFromCT(cb, allocator, t);
+    return .{};
+}
+
+fn captureProjectionDecomposition(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    capture_buf: *ActivationBuffer,
+    layer_idx: u32,
+    name: []const u8,
+    input: CT,
+    base_w: CT,
+    base_b: ?CT,
+    scope_name: []const u8,
+    proj_name: []const u8,
+    lora_rank: u32,
+    lora_alpha: f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    const base = try linearFallback(cb, input, base_w, base_b, rows, in_dim, out_dim);
+    defer cb.free(base);
+
+    const input_values = try cb.toFloat32(input, allocator);
+    defer allocator.free(input_values);
+    const base_values = try cb.toFloat32(base, allocator);
+    defer allocator.free(base_values);
+    const weight_values = try cb.toFloat32(base_w, allocator);
+    defer allocator.free(weight_values);
+
+    var bias_values_opt: ?[]f32 = null;
+    defer if (bias_values_opt) |bias_values| allocator.free(bias_values);
+    if (base_b) |bias_tensor| bias_values_opt = try cb.toFloat32(bias_tensor, allocator);
+
+    const input_stats = tensorProbeStatsFromScratch(input_values);
+    const base_stats = tensorProbeStatsFromScratch(base_values);
+    const weight_stats = tensorProbeStatsFromScratch(weight_values);
+    const bias_stats = if (bias_values_opt) |bias_values| tensorProbeStatsFromScratch(bias_values) else TensorProbeStats{};
+    const base_reference_error = computeLinearReferenceErrorSample(base_values, input_values, weight_values, bias_values_opt, rows, in_dim, out_dim);
+
+    var lora_a_stats = TensorProbeStats{};
+    var lora_b_stats = TensorProbeStats{};
+    var delta_stats = computeZeroTensorProbeStats(rows * out_dim);
+    var output_stats = base_stats;
+    var lora_a_weight_stats = TensorProbeStats{};
+    var lora_b_weight_stats = TensorProbeStats{};
+    var lora_a_reference_error = TensorProbeStats{};
+    var lora_b_reference_error = TensorProbeStats{};
+    var delta_reference_error = TensorProbeStats{};
+    var output_reference_error = base_reference_error;
+    var actual_rank: usize = 0;
+    var scale: f32 = 0.0;
+
+    if (lora_rank > 0 and cb.vtable.linearLoRA != null) lora_blk: {
+        var key_a_buf: [128]u8 = undefined;
+        var key_b_buf: [128]u8 = undefined;
+        const key_a = std.fmt.bufPrint(&key_a_buf, "model.layers.{d}.{s}.{s}.lora_a", .{ layer_idx, scope_name, proj_name }) catch break :lora_blk;
+        const key_b = std.fmt.bufPrint(&key_b_buf, "model.layers.{d}.{s}.{s}.lora_b", .{ layer_idx, scope_name, proj_name }) catch break :lora_blk;
+
+        const lora_a = cb.getWeight(key_a) catch |err| switch (err) {
+            error.MissingWeight => break :lora_blk,
+            else => return err,
+        };
+        defer cb.free(lora_a);
+        const lora_b = cb.getWeight(key_b) catch |err| switch (err) {
+            error.MissingWeight => break :lora_blk,
+            else => return err,
+        };
+        defer cb.free(lora_b);
+
+        actual_rank = @intCast(lora_rank);
+        const effective_alpha: f32 = if (lora_alpha == 0.0) @floatFromInt(lora_rank) else lora_alpha;
+        scale = if (actual_rank == 0) 0.0 else effective_alpha / @as(f32, @floatFromInt(actual_rank));
+        const lora_a_values = try cb.toFloat32(lora_a, allocator);
+        defer allocator.free(lora_a_values);
+        const lora_b_values = try cb.toFloat32(lora_b, allocator);
+        defer allocator.free(lora_b_values);
+        lora_a_weight_stats = tensorProbeStatsFromScratch(lora_a_values);
+        lora_b_weight_stats = tensorProbeStatsFromScratch(lora_b_values);
+
+        if (actual_rank == 0 or effective_alpha == 0.0) break :lora_blk;
+
+        const a_proj = try cb.linearNoBias(input, lora_a, rows, in_dim, actual_rank);
+        defer cb.free(a_proj);
+        const b_proj = try cb.linearNoBias(a_proj, lora_b, rows, actual_rank, out_dim);
+        defer cb.free(b_proj);
+
+        const scaled_delta = if (scale == 1.0) b_proj else scaled_blk: {
+            const scale_shape = [_]i32{1};
+            const scale_tensor = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+            defer cb.free(scale_tensor);
+            break :scaled_blk try cb.multiply(b_proj, scale_tensor);
+        };
+        defer if (scaled_delta != b_proj) cb.free(scaled_delta);
+
+        const output = try cb.add(base, scaled_delta);
+        defer cb.free(output);
+
+        const a_proj_values = try cb.toFloat32(a_proj, allocator);
+        defer allocator.free(a_proj_values);
+        const b_proj_values = try cb.toFloat32(b_proj, allocator);
+        defer allocator.free(b_proj_values);
+        const scaled_delta_values = try cb.toFloat32(scaled_delta, allocator);
+        defer allocator.free(scaled_delta_values);
+        const output_values = try cb.toFloat32(output, allocator);
+        defer allocator.free(output_values);
+
+        lora_a_stats = tensorProbeStatsFromScratch(a_proj_values);
+        lora_b_stats = tensorProbeStatsFromScratch(b_proj_values);
+        delta_stats = tensorProbeStatsFromScratch(scaled_delta_values);
+        output_stats = tensorProbeStatsFromScratch(output_values);
+        lora_a_reference_error = computeLinearReferenceErrorSample(a_proj_values, input_values, lora_a_values, null, rows, in_dim, actual_rank);
+        lora_b_reference_error = computeLinearReferenceErrorSample(b_proj_values, a_proj_values, lora_b_values, null, rows, actual_rank, out_dim);
+        delta_reference_error = computeScaleReferenceErrorSample(scaled_delta_values, b_proj_values, scale);
+        output_reference_error = computeAddReferenceErrorSample(output_values, base_values, scaled_delta_values);
+    }
+
+    try capture_buf.addProjectionDecomposition(.{
+        .layer_idx = layer_idx,
+        .name = name,
+        .input = input_stats,
+        .base = base_stats,
+        .lora_a = lora_a_stats,
+        .lora_b = lora_b_stats,
+        .delta = delta_stats,
+        .output = output_stats,
+        .weight = weight_stats,
+        .bias = bias_stats,
+        .lora_a_weight = lora_a_weight_stats,
+        .lora_b_weight = lora_b_weight_stats,
+        .base_reference_error = base_reference_error,
+        .lora_a_reference_error = lora_a_reference_error,
+        .lora_b_reference_error = lora_b_reference_error,
+        .delta_reference_error = delta_reference_error,
+        .output_reference_error = output_reference_error,
+        .scale = scale,
+        .rank = actual_rank,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .has_bias = base_b != null,
+    });
+}
+
 fn linearWithLoRA(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -717,10 +1047,214 @@ pub const ActivationCapture = struct {
     }
 };
 
+pub const AttentionInternalCapture = struct {
+    layer_idx: u32,
+    name: []const u8,
+    values: []f32,
+
+    pub fn deinit(self: *AttentionInternalCapture, allocator: std.mem.Allocator) void {
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub const LayerStateCapture = struct {
+    layer_idx: u32,
+    name: []const u8,
+    values: []f32,
+
+    pub fn deinit(self: *LayerStateCapture, allocator: std.mem.Allocator) void {
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub const TensorProbeStats = struct {
+    elems: u64 = 0,
+    mean: f32 = 0,
+    rms: f32 = 0,
+    max_abs: f32 = 0,
+    max_abs_index: u64 = 0,
+    max_abs_value: f32 = 0,
+    hash: u64 = tensor_probe_hash_offset,
+    sample_len: u8 = 0,
+    sample: [16]f32 = [_]f32{0} ** 16,
+    top_abs_len: u8 = 0,
+    top_abs_indices: [tensor_probe_top_abs_count]u64 = [_]u64{0} ** tensor_probe_top_abs_count,
+    top_abs_values: [tensor_probe_top_abs_count]f32 = [_]f32{0} ** tensor_probe_top_abs_count,
+};
+
+fn hashProbeF32(hash: *u64, value: f32) void {
+    var bits: u32 = @bitCast(value);
+    for (0..4) |_| {
+        hash.* ^= bits & 0xff;
+        hash.* *%= tensor_probe_hash_prime;
+        bits >>= 8;
+    }
+}
+
+fn addTensorProbeTopAbs(stats: *TensorProbeStats, index: usize, value: f32) void {
+    const ax = @abs(value);
+    if (ax > stats.max_abs) {
+        stats.max_abs = ax;
+        stats.max_abs_index = @intCast(index);
+        stats.max_abs_value = value;
+    }
+
+    var insert_at: usize = undefined;
+    if (stats.top_abs_len < stats.top_abs_values.len) {
+        insert_at = stats.top_abs_len;
+        stats.top_abs_len += 1;
+    } else if (ax > @abs(stats.top_abs_values[stats.top_abs_values.len - 1])) {
+        insert_at = stats.top_abs_values.len - 1;
+    } else {
+        return;
+    }
+
+    while (insert_at > 0 and ax > @abs(stats.top_abs_values[insert_at - 1])) : (insert_at -= 1) {
+        stats.top_abs_values[insert_at] = stats.top_abs_values[insert_at - 1];
+        stats.top_abs_indices[insert_at] = stats.top_abs_indices[insert_at - 1];
+    }
+    stats.top_abs_values[insert_at] = value;
+    stats.top_abs_indices[insert_at] = @intCast(index);
+}
+
+pub fn computeTensorProbeStats(values: []const f32) TensorProbeStats {
+    var out = TensorProbeStats{
+        .elems = @intCast(values.len),
+    };
+    var sum: f64 = 0;
+    var sum_sq: f64 = 0;
+    var finite_count: u64 = 0;
+    for (values, 0..) |value, i| {
+        if (i < out.sample.len) {
+            out.sample[i] = value;
+            out.sample_len = @intCast(i + 1);
+        }
+        hashProbeF32(&out.hash, value);
+        if (!std.math.isFinite(value)) continue;
+        const v: f64 = @floatCast(value);
+        sum += v;
+        sum_sq += v * v;
+        addTensorProbeTopAbs(&out, i, value);
+        finite_count += 1;
+    }
+    if (finite_count > 0) {
+        const denom = @as(f64, @floatFromInt(finite_count));
+        out.mean = @floatCast(sum / denom);
+        out.rms = @floatCast(@sqrt(sum_sq / denom));
+    }
+    return out;
+}
+
+pub fn computeZeroTensorProbeStats(elems: usize) TensorProbeStats {
+    var out = TensorProbeStats{
+        .elems = @intCast(elems),
+        .sample_len = @intCast(@min(elems, 16)),
+    };
+    for (0..elems) |_| hashProbeF32(&out.hash, 0);
+    return out;
+}
+
+fn tensorProbeStatsFromScratch(values: []const f32) TensorProbeStats {
+    return computeTensorProbeStats(values);
+}
+
+fn computeLinearReferenceErrorSample(
+    actual: []const f32,
+    input: []const f32,
+    weight: []const f32,
+    bias: ?[]const f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) TensorProbeStats {
+    if (input.len != rows * in_dim or weight.len != out_dim * in_dim or actual.len < rows * out_dim) return .{};
+    if (bias) |b| {
+        if (b.len < out_dim) return .{};
+    }
+    var errors: [16]f32 = [_]f32{0} ** 16;
+    const count = @min(errors.len, actual.len);
+    for (0..count) |flat_idx| {
+        const row = flat_idx / out_dim;
+        const col = flat_idx % out_dim;
+        var ref: f32 = if (bias) |b| b[col] else 0.0;
+        const input_row = input[row * in_dim ..][0..in_dim];
+        const weight_row = weight[col * in_dim ..][0..in_dim];
+        for (input_row, weight_row) |x, w| {
+            ref += x * w;
+        }
+        errors[flat_idx] = actual[flat_idx] - ref;
+    }
+    return tensorProbeStatsFromScratch(errors[0..count]);
+}
+
+fn computeScaleReferenceErrorSample(
+    actual: []const f32,
+    input: []const f32,
+    scale: f32,
+) TensorProbeStats {
+    var errors: [16]f32 = [_]f32{0} ** 16;
+    const count = @min(@min(errors.len, actual.len), input.len);
+    for (0..count) |i| {
+        errors[i] = actual[i] - input[i] * scale;
+    }
+    return tensorProbeStatsFromScratch(errors[0..count]);
+}
+
+fn computeAddReferenceErrorSample(
+    actual: []const f32,
+    lhs: []const f32,
+    rhs: []const f32,
+) TensorProbeStats {
+    var errors: [16]f32 = [_]f32{0} ** 16;
+    const count = @min(@min(@min(errors.len, actual.len), lhs.len), rhs.len);
+    for (0..count) |i| {
+        errors[i] = actual[i] - (lhs[i] + rhs[i]);
+    }
+    return tensorProbeStatsFromScratch(errors[0..count]);
+}
+
+pub const ProjectionDecompositionCapture = struct {
+    layer_idx: u32,
+    name: []const u8,
+    input: TensorProbeStats = .{},
+    base: TensorProbeStats = .{},
+    lora_a: TensorProbeStats = .{},
+    lora_b: TensorProbeStats = .{},
+    delta: TensorProbeStats = .{},
+    output: TensorProbeStats = .{},
+    weight: TensorProbeStats = .{},
+    bias: TensorProbeStats = .{},
+    lora_a_weight: TensorProbeStats = .{},
+    lora_b_weight: TensorProbeStats = .{},
+    base_reference_error: TensorProbeStats = .{},
+    lora_a_reference_error: TensorProbeStats = .{},
+    lora_b_reference_error: TensorProbeStats = .{},
+    delta_reference_error: TensorProbeStats = .{},
+    output_reference_error: TensorProbeStats = .{},
+    scale: f32 = 0,
+    rank: usize = 0,
+    rows: usize = 0,
+    in_dim: usize = 0,
+    out_dim: usize = 0,
+    has_bias: bool = false,
+};
+
 /// Buffer of ActivationCapture records from one forward pass.
 pub const ActivationBuffer = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayListUnmanaged(ActivationCapture),
+    capture_attention_internal_layer: ?u32 = null,
+    capture_projection_decomposition_layer: ?u32 = null,
+    capture_layer_state_layer: ?u32 = null,
+    attention_internals: std.ArrayListUnmanaged(AttentionInternalCapture) = .empty,
+    layer_states: std.ArrayListUnmanaged(LayerStateCapture) = .empty,
+    projection_decompositions: std.ArrayListUnmanaged(ProjectionDecompositionCapture) = .empty,
+    embedding_lookup: ?[]f32 = null,
+    embedding_output: ?[]f32 = null,
+    embedding_total: usize = 0,
+    embedding_hidden: usize = 0,
     final_norm_input: ?[]f32 = null,
     final_norm_weight: ?[]f32 = null,
     final_norm_total: usize = 0,
@@ -734,6 +1268,13 @@ pub const ActivationBuffer = struct {
     pub fn deinit(self: *ActivationBuffer) void {
         for (self.items.items) |*cap| cap.deinit(self.allocator);
         self.items.deinit(self.allocator);
+        for (self.attention_internals.items) |*cap| cap.deinit(self.allocator);
+        self.attention_internals.deinit(self.allocator);
+        for (self.layer_states.items) |*cap| cap.deinit(self.allocator);
+        self.layer_states.deinit(self.allocator);
+        self.projection_decompositions.deinit(self.allocator);
+        if (self.embedding_lookup) |buf| self.allocator.free(buf);
+        if (self.embedding_output) |buf| self.allocator.free(buf);
         if (self.final_norm_input) |buf| self.allocator.free(buf);
         if (self.final_norm_weight) |buf| self.allocator.free(buf);
         for (self.layer_inputs.items) |*cap| cap.deinit(self.allocator);
@@ -763,6 +1304,43 @@ pub const ActivationBuffer = struct {
         });
     }
 
+    pub fn addAttentionInternal(
+        self: *ActivationBuffer,
+        layer_idx: u32,
+        name: []const u8,
+        values: []const f32,
+    ) !void {
+        const owned = try self.allocator.dupe(f32, values);
+        errdefer self.allocator.free(owned);
+        try self.attention_internals.append(self.allocator, .{
+            .layer_idx = layer_idx,
+            .name = name,
+            .values = owned,
+        });
+    }
+
+    pub fn addLayerState(
+        self: *ActivationBuffer,
+        layer_idx: u32,
+        name: []const u8,
+        values: []const f32,
+    ) !void {
+        const owned = try self.allocator.dupe(f32, values);
+        errdefer self.allocator.free(owned);
+        try self.layer_states.append(self.allocator, .{
+            .layer_idx = layer_idx,
+            .name = name,
+            .values = owned,
+        });
+    }
+
+    pub fn addProjectionDecomposition(
+        self: *ActivationBuffer,
+        capture: ProjectionDecompositionCapture,
+    ) !void {
+        try self.projection_decompositions.append(self.allocator, capture);
+    }
+
     pub fn addAlias(
         self: *ActivationBuffer,
         layer_idx: u32,
@@ -781,6 +1359,22 @@ pub const ActivationBuffer = struct {
             .out_features = out_features,
             .total = total,
         });
+    }
+
+    pub fn setEmbeddingOwned(
+        self: *ActivationBuffer,
+        lookup: []f32,
+        output: []f32,
+        total: usize,
+        hidden: usize,
+    ) !void {
+        if (lookup.len != total * hidden or output.len != total * hidden) return error.InvalidEmbeddingCaptureShape;
+        if (self.embedding_lookup) |old| self.allocator.free(old);
+        if (self.embedding_output) |old| self.allocator.free(old);
+        self.embedding_lookup = lookup;
+        self.embedding_output = output;
+        self.embedding_total = total;
+        self.embedding_hidden = hidden;
     }
 
     pub fn setFinalNormOwned(
@@ -823,6 +1417,13 @@ pub const ActivationBuffer = struct {
         }
         return null;
     }
+
+    pub fn findLayerState(self: *const ActivationBuffer, layer_idx: u32, name: []const u8) ?[]const f32 {
+        for (self.layer_states.items) |*cap| {
+            if (cap.layer_idx == layer_idx and std.mem.eql(u8, cap.name, name)) return cap.values;
+        }
+        return null;
+    }
 };
 
 pub const LayerInputCapture = struct {
@@ -856,6 +1457,9 @@ pub fn forwardCapturingActivations(
     capture_all_layer_inputs: bool,
     captures: *ActivationBuffer,
 ) ![]f32 {
+    const trace_timing = layerTimingEnabled();
+    const total_start_ns = if (trace_timing) monotonicNowNs() else 0;
+    var stage_start_ns = total_start_ns;
     const result_ct = try forwardCapturingActivationsCT(
         cb,
         allocator,
@@ -870,7 +1474,16 @@ pub fn forwardCapturingActivations(
         captures,
     );
     defer cb.free(result_ct);
-    return cb.toFloat32(result_ct, allocator);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_forward_ct", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+    const out = try cb.toFloat32(result_ct, allocator);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_output_to_float32", elapsedNs(stage_start_ns));
+        printModernBertTiming(std.math.maxInt(usize), "capture_forward_total", elapsedNs(total_start_ns));
+    }
+    return out;
 }
 
 fn shouldCaptureLoRALayer(active_layers: ?[]const bool, layer_idx: usize) bool {
@@ -893,10 +1506,12 @@ fn forwardCapturingActivationsCT(
 ) !CT {
     const total_tokens = batch * seq_len;
     const H: usize = @intCast(config.hidden_size);
+    const trace_timing = layerTimingEnabled();
+    var stage_start_ns = if (trace_timing) monotonicNowNs() else 0;
 
     // Collect normed_attn CTs from all layers without downloading them yet.
-    // This lets us batch-evaluate all 22 tensors in one GPU sync instead of
-    // one per layer.
+    // This lets us batch-evaluate all 22 tensors in one GPU sync (one Metal
+    // command buffer submission on device backends) instead of one per layer.
     var normed_attn_cts = std.ArrayListUnmanaged(CT).empty;
     defer {
         for (normed_attn_cts.items) |ct| cb.free(ct);
@@ -917,7 +1532,11 @@ fn forwardCapturingActivationsCT(
     var captured_layer_input_indices = std.ArrayListUnmanaged(u32).empty;
     defer captured_layer_input_indices.deinit(allocator);
 
-    var hidden = try embeddingsBlock(cb, allocator, config, input_ids, total_tokens, seq_len);
+    var hidden = try embeddingsBlock(cb, allocator, config, input_ids, total_tokens, seq_len, captures);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_embeddings", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
     // Free hidden on any error path; the happy path frees it explicitly below.
     errdefer cb.free(hidden);
     var local_window_bias: ?CT = null;
@@ -981,14 +1600,23 @@ fn forwardCapturingActivationsCT(
             return err;
         };
     }
+    if (trace_timing) stage_start_ns = monotonicNowNs();
 
-    // Batch-download captured tensors to keep GPU syncs amortized.
+    // Batch-download all normed_attn tensors — single GPU sync on Metal.
     const batch_results = try cb.toFloat32Batch(normed_attn_cts.items, allocator);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_normed_attn_download", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
     defer {
         for (batch_results) |r| allocator.free(r);
         allocator.free(batch_results);
     }
     const attn_out_results = try cb.toFloat32Batch(attn_out_cts.items, allocator);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_attn_out_download", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
     defer {
         for (attn_out_results) |r| allocator.free(r);
         allocator.free(attn_out_results);
@@ -1006,6 +1634,10 @@ fn forwardCapturingActivationsCT(
 
     if (layer_input_cts.items.len > 0) {
         const layer_input_results = try cb.toFloat32Batch(layer_input_cts.items, allocator);
+        if (trace_timing) {
+            printModernBertTiming(std.math.maxInt(usize), "capture_layer_input_download", elapsedNs(stage_start_ns));
+            stage_start_ns = monotonicNowNs();
+        }
         defer {
             for (layer_input_results) |r| allocator.free(r);
             allocator.free(layer_input_results);
@@ -1023,12 +1655,19 @@ fn forwardCapturingActivationsCT(
     defer cb.free(fn_b);
     const normed_final = try cb.layerNorm(hidden, fn_w, fn_b, @intCast(config.hidden_size), config.layer_norm_eps);
     errdefer cb.free(normed_final);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_final_norm", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
     const final_norm_input = try cb.toFloat32(hidden, allocator);
     var owns_final_norm_input = true;
     errdefer if (owns_final_norm_input) allocator.free(final_norm_input);
     const final_norm_weight = try cb.toFloat32(fn_w, allocator);
     var owns_final_norm_weight = true;
     errdefer if (owns_final_norm_weight) allocator.free(final_norm_weight);
+    if (trace_timing) {
+        printModernBertTiming(std.math.maxInt(usize), "capture_final_norm_download", elapsedNs(stage_start_ns));
+    }
     try captures.setFinalNormOwned(final_norm_input, final_norm_weight, total_tokens, H);
     owns_final_norm_input = false;
     owns_final_norm_weight = false;
@@ -1068,6 +1707,9 @@ fn encoderLayerWithNormedAttn(
     local_window_bias_cache: ?*?CT,
     captures: ?*ActivationBuffer,
 ) !LayerWithNormedAttn {
+    const trace_timing = layerTimingEnabled();
+    const layer_start_ns = if (trace_timing) monotonicNowNs() else 0;
+    var stage_start_ns = layer_start_ns;
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
     const head_dim = H / num_heads;
@@ -1087,6 +1729,10 @@ fn encoderLayerWithNormedAttn(
     const normed_attn = try preAttentionNorm(cb, allocator, config, hidden, layer_idx, total, H, &name_buf);
     errdefer cb.free(normed_attn);
     // NOTE: no `defer cb.free(normed_attn)` here — returned to caller.
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_pre_attn_norm", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // Q projection — use linearLoRA if LoRA is enabled in the config.
     const q_w = try getLayerWeight(cb, layer_idx, "attn.query_proj.weight", &name_buf);
@@ -1111,12 +1757,57 @@ fn encoderLayerWithNormedAttn(
     defer cb.free(v_b);
     const V = try linearWithLoRA(cb, allocator, normed_attn, v_w, v_b, layer_idx, "value_proj", config.lora_rank, config.lora_alpha, total, H, H);
     defer cb.free(V);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_qkv_project", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+
+    const should_capture_projection_decomposition = if (captures) |capture_buf|
+        capture_buf.capture_projection_decomposition_layer != null and capture_buf.capture_projection_decomposition_layer.? == layer_idx
+    else
+        false;
+    if (should_capture_projection_decomposition) {
+        const capture_buf = captures.?;
+        try captureProjectionDecomposition(cb, allocator, capture_buf, @intCast(layer_idx), "query_proj", normed_attn, q_w, q_b, "attn", "query_proj", config.lora_rank, config.lora_alpha, total, H, H);
+        try captureProjectionDecomposition(cb, allocator, capture_buf, @intCast(layer_idx), "key_proj", normed_attn, k_w, k_b, "attn", "key_proj", config.lora_rank, config.lora_alpha, total, H, H);
+        try captureProjectionDecomposition(cb, allocator, capture_buf, @intCast(layer_idx), "value_proj", normed_attn, v_w, v_b, "attn", "value_proj", config.lora_rank, config.lora_alpha, total, H, H);
+    }
+
+    const should_capture_attention_internals = if (captures) |capture_buf|
+        capture_buf.capture_attention_internal_layer != null and capture_buf.capture_attention_internal_layer.? == layer_idx
+    else
+        false;
+    if (should_capture_attention_internals) {
+        const capture_buf = captures.?;
+        const q_raw_f32 = try cb.toFloat32(Q_raw, allocator);
+        defer allocator.free(q_raw_f32);
+        try capture_buf.addAttentionInternal(@intCast(layer_idx), "q_raw", q_raw_f32);
+        const k_raw_f32 = try cb.toFloat32(K_raw, allocator);
+        defer allocator.free(k_raw_f32);
+        try capture_buf.addAttentionInternal(@intCast(layer_idx), "k_raw", k_raw_f32);
+        const v_raw_f32 = try cb.toFloat32(V, allocator);
+        defer allocator.free(v_raw_f32);
+        try capture_buf.addAttentionInternal(@intCast(layer_idx), "v_raw", v_raw_f32);
+    }
 
     // RoPE
     const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
     defer cb.free(Q);
     const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
     defer cb.free(K);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_rope", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+    if (should_capture_attention_internals) {
+        const capture_buf = captures.?;
+        const q_rope_f32 = try cb.toFloat32(Q, allocator);
+        defer allocator.free(q_rope_f32);
+        try capture_buf.addAttentionInternal(@intCast(layer_idx), "q_rope", q_rope_f32);
+        const k_rope_f32 = try cb.toFloat32(K, allocator);
+        defer allocator.free(k_rope_f32);
+        try capture_buf.addAttentionInternal(@intCast(layer_idx), "k_rope", k_rope_f32);
+    }
 
     // Bidirectional scaled dot-product attention.
     const attn_out = try modernBertAttention(
@@ -1135,6 +1826,10 @@ fn encoderLayerWithNormedAttn(
         local_window_bias_cache,
     );
     errdefer cb.free(attn_out);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_attention", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
 
     // Output projection
     const out_w = try getLayerWeight(cb, layer_idx, "attn.Wo.weight", &name_buf);
@@ -1143,10 +1838,28 @@ fn encoderLayerWithNormedAttn(
     defer cb.free(out_b);
     const attn_proj = try linearWithLoRA(cb, allocator, attn_out, out_w, out_b, layer_idx, "Wo", config.lora_rank, config.lora_alpha, total, H, H);
     defer cb.free(attn_proj);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_attn_output_project", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+    if (should_capture_projection_decomposition) {
+        try captureProjectionDecomposition(cb, allocator, captures.?, @intCast(layer_idx), "out_proj", attn_out, out_w, out_b, "attn", "Wo", config.lora_rank, config.lora_alpha, total, H, H);
+    }
 
     // Residual
     const hidden_after_attn = try cb.add(attn_proj, hidden);
     defer cb.free(hidden_after_attn);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_attn_residual", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+    if (captures) |capture_buf| {
+        if (capture_buf.capture_layer_state_layer != null and capture_buf.capture_layer_state_layer.? == layer_idx) {
+            const hidden_after_attn_f32 = try cb.toFloat32(hidden_after_attn, allocator);
+            defer allocator.free(hidden_after_attn_f32);
+            try capture_buf.addLayerState(@intCast(layer_idx), "hidden_after_attn", hidden_after_attn_f32);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // FFN sub-layer  (pre-norm, GeGLU)
@@ -1158,6 +1871,17 @@ fn encoderLayerWithNormedAttn(
     defer cb.free(mlp_ln_b);
     const normed_ffn = try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
     defer cb.free(normed_ffn);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_ffn_norm", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+    if (captures) |capture_buf| {
+        if (capture_buf.capture_layer_state_layer != null and capture_buf.capture_layer_state_layer.? == layer_idx) {
+            const normed_ffn_f32 = try cb.toFloat32(normed_ffn, allocator);
+            defer allocator.free(normed_ffn_f32);
+            try capture_buf.addLayerState(@intCast(layer_idx), "mlp_norm_output", normed_ffn_f32);
+        }
+    }
 
     const Wi_w = try getLayerWeight(cb, layer_idx, "mlp.Wi.weight", &name_buf);
     defer cb.free(Wi_w);
@@ -1166,9 +1890,27 @@ fn encoderLayerWithNormedAttn(
 
     const ffn_out = try geGluFfn(cb, allocator, normed_ffn, Wi_w, Wo_w, layer_idx, config.lora_rank, config.lora_alpha, total, H, intermediate, captures);
     defer cb.free(ffn_out);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_geglu", elapsedNs(stage_start_ns));
+        stage_start_ns = monotonicNowNs();
+    }
+
+    const layer_output = try cb.add(ffn_out, hidden_after_attn);
+    errdefer cb.free(layer_output);
+    if (trace_timing) {
+        printModernBertTiming(layer_idx, "capture_ffn_residual", elapsedNs(stage_start_ns));
+        printModernBertTiming(layer_idx, "capture_total", elapsedNs(layer_start_ns));
+    }
+    if (captures) |capture_buf| {
+        if (capture_buf.capture_layer_state_layer != null and capture_buf.capture_layer_state_layer.? == layer_idx) {
+            const layer_output_f32 = try cb.toFloat32(layer_output, allocator);
+            defer allocator.free(layer_output_f32);
+            try capture_buf.addLayerState(@intCast(layer_idx), "layer_output", layer_output_f32);
+        }
+    }
 
     return .{
-        .hidden = try cb.add(ffn_out, hidden_after_attn),
+        .hidden = layer_output,
         .normed_attn = normed_attn,
         .attn_out = attn_out,
     };
