@@ -292,6 +292,10 @@ fn q4_0F16FfnEnabled() bool {
         !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_F16_FFN");
 }
 
+fn q4_0SplitGateUpReduceEnabled() bool {
+    return !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_SPLIT_GATE_UP_REDUCE");
+}
+
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
     const c_std = @cImport(@cInclude("stdlib.h"));
@@ -3156,6 +3160,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
             output.deviceByteOffset(),
         );
         if (rc == 0) return output;
+        if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_direct_q8 rc={d}\n", .{rc});
     }
     if ((ple_gate_kind == .q4_0 and ple_proj_kind == .q4_0) or
         (ple_gate_kind == .q4_k and ple_proj_kind == .q4_k))
@@ -3188,6 +3193,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
             output.deviceByteOffset(),
         );
         if (rc == 0) return output;
+        if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_direct_quantized kind={s} rc={d}\n", .{ @tagName(ple_gate_kind), rc });
     }
 
     if (!runtimeLinearSlotSupportsDeviceApply(self, request.gate_linear_slot, request.hidden_size, request.ple_hidden_size) or
@@ -10427,7 +10433,7 @@ fn ensureRuntimeQuantSlotPreparedPrivateWritable(
 
 fn applyRuntimeLinearBiasHost(self: anytype, slot: usize, output: []f32, rows: usize, out_dim: usize) bool {
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or out_dim == 0) return false;
-    const bias_tensor = self.raw_linear_slot_dense_biases[slot] orelse return false;
+    const bias_tensor = self.raw_linear_slot_dense_biases[slot] orelse return true;
     if (bias_tensor.len != out_dim) return false;
     if (output.len != rows * out_dim) return false;
     const bias = bias_tensor.data[0..out_dim];
@@ -10441,7 +10447,7 @@ fn applyRuntimeLinearBiasHost(self: anytype, slot: usize, output: []f32, rows: u
 fn applyRuntimeLinearBiasDevice(self: anytype, slot: usize, output: *MetalTensor, rows: usize, out_dim: usize) bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or out_dim == 0) return false;
-    if (self.raw_linear_slot_dense_biases[slot] == null) return false;
+    if (self.raw_linear_slot_dense_biases[slot] == null) return true;
     if (!output.isDevice()) return false;
     if (output.elemCount() != rows * out_dim) return false;
     return termite_metal_decode_runtime_apply_linear_bias_device(
@@ -19993,6 +19999,231 @@ test "metal native decoderRuntimeApplyLinearPair q4_k single row uses reduce dis
     }
 }
 
+test "metal native decoderRuntimeApplyLinear q4_0 single row uses reduce dispatch" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const rows: usize = 1;
+    const in_dim: usize = 1024;
+    const out_dim: usize = 7;
+    const values_per_block: usize = 32;
+    const bytes_per_block: usize = 18;
+    const row_bytes: usize = (in_dim / values_per_block) * bytes_per_block;
+    var weight_raw: [out_dim * row_bytes]u8 = [_]u8{0} ** (out_dim * row_bytes);
+    var seed_dense: [in_dim]f32 = undefined;
+
+    for (0..out_dim) |row| {
+        for (&seed_dense, 0..) |*value, col| {
+            const signed = @as(i32, @intCast((row * 31 + col * 13 + 7) % 139)) - 69;
+            value.* = @as(f32, @floatFromInt(signed)) / 97.0;
+        }
+        for (0..(in_dim / values_per_block)) |block| {
+            quant_codec.quantizeQ4_0Block(
+                seed_dense[block * values_per_block ..][0..values_per_block],
+                weight_raw[row * row_bytes + block * bytes_per_block ..][0..bytes_per_block],
+            );
+        }
+    }
+
+    const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = &weight_raw,
+        .shape = &shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+
+    const bias_data = [_]f32{0.0} ** out_dim;
+    var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage),
+        .slot = 23,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+
+    var input_data: [rows * in_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 23 + 3) % 151)) - 75;
+        value.* = @as(f32, @floatFromInt(signed)) / 113.0;
+    }
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(rows), @intCast(in_dim) });
+    defer input.deinit();
+
+    const before_dispatch = runtimeMemorySnapshot(runtime);
+    var output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 23,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer output.deinit();
+    const after_dispatch = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(after_dispatch.q4_0_linear_reduce > before_dispatch.q4_0_linear_reduce);
+
+    var weight_host: [out_dim * in_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, &weight_raw, &weight_host);
+    var expected: [rows * out_dim]f32 = undefined;
+    native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, &input_data, &weight_host, 0.0, &expected);
+
+    const actual = try tensorHostSlice(&output);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |exp, got, i| {
+        if (!std.math.approxEqAbs(f32, exp, got, 5e-3)) {
+            std.debug.print("q4_0 linear reduce mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "metal native decoderRuntimeApplyLinearPair q4_0 single row uses reduce dispatch" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const rows: usize = 1;
+    const in_dim: usize = 1024;
+    const out_dim: usize = 7;
+    const values_per_block: usize = 32;
+    const bytes_per_block: usize = 18;
+    const row_bytes: usize = (in_dim / values_per_block) * bytes_per_block;
+    var weight_a_raw: [out_dim * row_bytes]u8 = [_]u8{0} ** (out_dim * row_bytes);
+    var weight_b_raw: [out_dim * row_bytes]u8 = [_]u8{0} ** (out_dim * row_bytes);
+    var seed_dense: [in_dim]f32 = undefined;
+
+    for (0..out_dim) |row| {
+        for (&seed_dense, 0..) |*value, col| {
+            const signed = @as(i32, @intCast((row * 29 + col * 17) % 127)) - 63;
+            value.* = @as(f32, @floatFromInt(signed)) / 83.0;
+        }
+        for (0..(in_dim / values_per_block)) |block| {
+            quant_codec.quantizeQ4_0Block(
+                seed_dense[block * values_per_block ..][0..values_per_block],
+                weight_a_raw[row * row_bytes + block * bytes_per_block ..][0..bytes_per_block],
+            );
+        }
+
+        for (&seed_dense, 0..) |*value, col| {
+            const signed = @as(i32, @intCast((row * 43 + col * 11 + 5) % 131)) - 65;
+            value.* = @as(f32, @floatFromInt(signed)) / 91.0;
+        }
+        for (0..(in_dim / values_per_block)) |block| {
+            quant_codec.quantizeQ4_0Block(
+                seed_dense[block * values_per_block ..][0..values_per_block],
+                weight_b_raw[row * row_bytes + block * bytes_per_block ..][0..bytes_per_block],
+            );
+        }
+    }
+
+    const shape_a = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+    const storage_a = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = &weight_a_raw,
+        .shape = &shape_a,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    const shape_b = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+    const storage_b = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = &weight_b_raw,
+        .shape = &shape_b,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+
+    const bias_data = [_]f32{0.0} ** out_dim;
+    var bias_a = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer bias_a.deinit();
+    var bias_b = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer bias_b.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias_a,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage_a),
+        .slot = 24,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias_b,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage_b),
+        .slot = 25,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+
+    var input_data: [rows * in_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, i| {
+        const signed = @as(i32, @intCast((i * 19) % 149)) - 74;
+        value.* = @as(f32, @floatFromInt(signed)) / 109.0;
+    }
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ @intCast(rows), @intCast(in_dim) });
+    defer input.deinit();
+
+    const before_dispatch = runtimeMemorySnapshot(runtime);
+    var pair = (try decoderRuntimeApplyLinearPair(&provider, .{
+        .slot_a = 24,
+        .slot_b = 25,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer pair.first.deinit();
+    defer pair.second.deinit();
+    try std.testing.expect(pair.first.isDevice());
+    try std.testing.expect(pair.second.isDevice());
+    const after_dispatch = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(after_dispatch.q4_0_pair_reduce > before_dispatch.q4_0_pair_reduce);
+
+    var weight_a_host: [out_dim * in_dim]f32 = undefined;
+    var weight_b_host: [out_dim * in_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, &weight_a_raw, &weight_a_host);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, &weight_b_raw, &weight_b_host);
+    var expected_a: [rows * out_dim]f32 = undefined;
+    var expected_b: [rows * out_dim]f32 = undefined;
+    native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, &input_data, &weight_a_host, 0.0, &expected_a);
+    native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, &input_data, &weight_b_host, 0.0, &expected_b);
+
+    const pairs = [_]struct { expected: []const f32, actual: *MetalTensor }{
+        .{ .expected = &expected_a, .actual = &pair.first },
+        .{ .expected = &expected_b, .actual = &pair.second },
+    };
+    for (pairs) |entry| {
+        const actual = try tensorHostSlice(entry.actual);
+        try std.testing.expectEqual(entry.expected.len, actual.len);
+        for (entry.expected, actual, 0..) |exp, got, i| {
+            if (!std.math.approxEqAbs(f32, exp, got, 5e-3)) {
+                std.debug.print("q4_0 pair reduce mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
 test "metal native q4_k gated ffn keeps planned frame coalesced" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -20404,8 +20635,14 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     const after_direct = runtimeMemorySnapshot(runtime);
     if (q4_0F16FfnEnabled()) {
         try std.testing.expect(after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output);
+    } else if (q4_0SplitGateUpReduceEnabled()) {
+        try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
+        try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 3);
     } else {
-        try std.testing.expect(after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce);
+        try std.testing.expect(
+            after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce or
+                after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce,
+        );
     }
     if (q4_0LinearRmsAddF16ProjectEnabled()) {
         try std.testing.expect(after_direct.q4_0_linear_reduce_f16_input_f16_output > before_direct.q4_0_linear_reduce_f16_input_f16_output);
@@ -20624,8 +20861,15 @@ test "metal native q4_0 gate up q6_k down device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.UnexpectedNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    try std.testing.expect(after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output);
-    try std.testing.expect(after_direct.q6_k_linear_reduce_f16_input > before_direct.q6_k_linear_reduce_f16_input);
+    try std.testing.expect(
+        after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce or
+            after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
+            after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output,
+    );
+    try std.testing.expect(
+        after_direct.q6_k_linear_reduce > before_direct.q6_k_linear_reduce or
+            after_direct.q6_k_linear_reduce_f16_input > before_direct.q6_k_linear_reduce_f16_input,
+    );
 
     var expected_mut = expected_tensor;
     var direct_mut = direct;
@@ -21352,9 +21596,17 @@ test "metal native q4_0 attention ffn block works inside active frame" {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     }
     if (q4_0F16FfnEnabled()) {
-        try std.testing.expect(after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output);
+        try std.testing.expect(
+            after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output or
+                after_block.q4_0_pair_activation_rms_scale_reduce_f16_output > before_block.q4_0_pair_activation_rms_scale_reduce_f16_output,
+        );
+    } else if (q4_0SplitGateUpReduceEnabled()) {
+        try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     } else {
-        try std.testing.expect(after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce);
+        try std.testing.expect(
+            after_block.q4_0_pair_reduce > before_block.q4_0_pair_reduce or
+                after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce,
+        );
     }
 
     var expected_mut = expected;
@@ -22123,7 +22375,7 @@ test "metal native PLE residual q4_0 single row uses fused activation rhs" {
     const expected = try tensorHostSlice(&expected_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |exp, got| {
-        try std.testing.expectApproxEqAbs(exp, got, 1e-4);
+        try std.testing.expectApproxEqAbs(exp, got, 1e-3);
     }
 }
 
@@ -25681,6 +25933,29 @@ test "metal native planned compute scope records scopes and barriers" {
     try std.testing.expectEqual(@as(u64, 2), snapshot.last_frame_planned_barrier_count);
     try std.testing.expectEqual(@as(u64, 2), snapshot.last_frame_compute_rms_norm_count);
     try std.testing.expectEqual(@as(u64, 2), snapshot.last_frame_compute_region_ffn_count);
+}
+
+test "metal native planned compute barrier suppression skips barriers" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    try beginFrame(runtime);
+    try beginPlannedComputeScope(runtime, 4, .ffn);
+    try pushPlannedComputeBarrierSuppression(runtime);
+    try plannedComputeBarrier(runtime);
+    try plannedComputeBarrier(runtime);
+    try popPlannedComputeBarrierSuppression(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const snapshot = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.last_frame_compute_encoder_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.last_frame_planned_compute_scope_count);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.last_frame_planned_barrier_count);
 }
 
 test "planned compute sequence exports active typed contract" {

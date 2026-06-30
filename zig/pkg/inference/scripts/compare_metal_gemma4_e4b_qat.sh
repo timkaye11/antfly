@@ -23,8 +23,27 @@ LEGACY_MODELS_DIR="${ANTFLY_INFERENCE_GEMMA4_LEGACY_MODELS_DIR:-/private/tmp/ant
 RUNS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_RUNS:-3}"
 TOKENS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_TOKENS:-256}"
 MIN_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_COMPARE_MIN_SPEEDUP:-1.10}"
-PROMPT="${ANTFLY_INFERENCE_GEMMA4_COMPARE_PROMPT:-Write a numbered list from 1 to 300. Each item must be exactly: local inference benchmark continues.}"
+RUN_LLAMA_BENCH="${ANTFLY_INFERENCE_GEMMA4_COMPARE_LLAMA_BENCH:-auto}"
+LLAMA_BENCH_BIN="${ANTFLY_INFERENCE_GEMMA4_LLAMA_BENCH_BIN:-llama-bench}"
+LLAMA_PROMPT_TOKENS="${ANTFLY_INFERENCE_GEMMA4_LLAMA_PROMPT_TOKENS:-37}"
+LLAMA_MIN_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_LLAMA_MIN_SPEEDUP:-1.0}"
+RUN_LLAMA_COMPLETION="${ANTFLY_INFERENCE_GEMMA4_COMPARE_LLAMA_COMPLETION:-0}"
+LLAMA_COMPLETION_BIN="${ANTFLY_INFERENCE_GEMMA4_LLAMA_COMPLETION_BIN:-llama-completion}"
+LLAMA_COMPLETION_MIN_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_LLAMA_COMPLETION_MIN_SPEEDUP:-1.0}"
+LLAMA_COMPLETION_MIN_EVAL_RUNS="${ANTFLY_INFERENCE_GEMMA4_LLAMA_COMPLETION_MIN_EVAL_RUNS:-}"
+RUN_MLX="${ANTFLY_INFERENCE_GEMMA4_COMPARE_MLX:-0}"
+MLX_PYTHON="${ANTFLY_INFERENCE_GEMMA4_MLX_PYTHON:-python3}"
+MLX_MODEL="${ANTFLY_INFERENCE_GEMMA4_MLX_MODEL:-mlx-community/gemma-4-e4b-it-4bit}"
+MLX_PROMPT="${ANTFLY_INFERENCE_GEMMA4_MLX_PROMPT:-Write one short paragraph about local inference.}"
+MLX_MIN_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_MLX_MIN_SPEEDUP:-0}"
+PROMPT="${ANTFLY_INFERENCE_GEMMA4_COMPARE_PROMPT:-Continue this sequence for many words: local inference benchmark continues, local inference benchmark continues,}"
 RUN_QAT_ORACLE="${ANTFLY_INFERENCE_GEMMA4_QAT_ORACLE:-1}"
+RUN_Q4K="${ANTFLY_INFERENCE_GEMMA4_COMPARE_Q4K:-1}"
+RUN_LLAMA_FIRST="${ANTFLY_INFERENCE_GEMMA4_COMPARE_LLAMA_FIRST:-0}"
+PHASE_COOLDOWN_SECONDS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_PHASE_COOLDOWN_SECONDS:-0}"
+QUIET_WAIT_SECONDS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_QUIET_WAIT_SECONDS:-0}"
+QUIET_MAX_CPU="${ANTFLY_INFERENCE_GEMMA4_COMPARE_QUIET_MAX_CPU:-20}"
+QUIET_PROCESS_PATTERN="${ANTFLY_INFERENCE_GEMMA4_COMPARE_QUIET_PROCESS_PATTERN:-syspolicyd|trustd|Xprotect|antfly-quant-kernel-metal-runtime-check|antfly-inference|/git$|zig|duetexpertd|airportd|mds|mdworker|mds_stores|fseventsd|deleted}"
 ORACLE_PROMPT="${ANTFLY_INFERENCE_GEMMA4_QAT_ORACLE_PROMPT:-Write one short paragraph about local inference.}"
 ORACLE_TOKENS="${ANTFLY_INFERENCE_GEMMA4_QAT_ORACLE_TOKENS:-8}"
 ORACLE_RENDERED_PROMPT="${ANTFLY_INFERENCE_GEMMA4_QAT_ORACLE_RENDERED_PROMPT:-}"
@@ -41,8 +60,77 @@ RUN_MTP_POLICY_CHECK="${ANTFLY_INFERENCE_GEMMA4_QAT_MTP_POLICY_CHECK:-1}"
 MIN_HOT_DECODE_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_HOT_DECODE_TOK_S:-1}"
 MIN_QAT_PLE_ACTIVATION_RHS_F16="${ANTFLY_INFERENCE_GEMMA4_COMPARE_MIN_QAT_PLE_ACTIVATION_RHS_F16:-${ANTFLY_INFERENCE_GEMMA4_MIN_Q4_0_PLE_ACTIVATION_RHS_REDUCE_OUT_F16:-1}}"
 MIN_QAT_PLE_LINEAR_F16="${ANTFLY_INFERENCE_GEMMA4_COMPARE_MIN_QAT_PLE_LINEAR_F16:-${ANTFLY_INFERENCE_GEMMA4_MIN_Q4_0_PLE_LINEAR_REDUCE_IN_F16:-1}}"
+HOST_LOAD_SNAPSHOTS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_HOST_LOAD_SNAPSHOTS:-1}"
+if [[ -z "$LLAMA_COMPLETION_MIN_EVAL_RUNS" ]]; then
+  if [[ "$TOKENS" =~ ^[0-9]+$ && "$TOKENS" -gt 1 ]]; then
+    LLAMA_COMPLETION_MIN_EVAL_RUNS=$((TOKENS - 1))
+  else
+    LLAMA_COMPLETION_MIN_EVAL_RUNS=0
+  fi
+fi
+
+case "${ANTFLY_INFERENCE_GEMMA4_COMPARE_CAFFEINATE:-1}:${ANTFLY_INFERENCE_GEMMA4_COMPARE_IN_CAFFEINATE:-0}" in
+  0:*|false:*|FALSE:*|no:*|NO:*|off:*|OFF:*|*:1) ;;
+  *)
+    if command -v caffeinate >/dev/null 2>&1; then
+      exec caffeinate -ims env ANTFLY_INFERENCE_GEMMA4_COMPARE_IN_CAFFEINATE=1 "$0" "$@"
+    fi
+    ;;
+esac
 
 mkdir -p "$ROOT_OUT_DIR"
+
+flag_enabled() {
+  case "${1:-}" in
+    ""|0|false|FALSE|no|NO|off|OFF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if flag_enabled "$RUN_LLAMA_COMPLETION" && [[ -z "${ANTFLY_INFERENCE_GEMMA4_RAW_PROMPT+x}" ]]; then
+  export ANTFLY_INFERENCE_GEMMA4_RAW_PROMPT=1
+fi
+
+capture_host_load() {
+  if [[ "$HOST_LOAD_SNAPSHOTS" == "0" ]]; then
+    return
+  fi
+  local label="$1"
+  {
+    date -u '+timestamp_utc=%Y-%m-%dT%H:%M:%SZ'
+    ps -axo pid,pcpu,pmem,comm -r | head -20
+  } >"$ROOT_OUT_DIR/host-load-$label.txt" 2>&1 || true
+}
+
+phase_cooldown() {
+  local label="$1"
+  if [[ "$PHASE_COOLDOWN_SECONDS" =~ ^[0-9]+$ && "$PHASE_COOLDOWN_SECONDS" -gt 0 ]]; then
+    sleep "$PHASE_COOLDOWN_SECONDS"
+    capture_host_load "after-cooldown-$label"
+  fi
+}
+
+wait_for_quiet() {
+  local label="$1"
+  if ! [[ "$QUIET_WAIT_SECONDS" =~ ^[0-9]+$ && "$QUIET_WAIT_SECONDS" -gt 0 ]]; then
+    return
+  fi
+  local deadline=$((SECONDS + QUIET_WAIT_SECONDS))
+  while true; do
+    if ps -axo pcpu,comm -r | awk -v max_cpu="$QUIET_MAX_CPU" -v pattern="$QUIET_PROCESS_PATTERN" '
+      NR > 1 && ($1 + 0) > max_cpu && $0 ~ pattern { bad = 1 }
+      END { exit bad ? 1 : 0 }
+    '; then
+      capture_host_load "quiet-$label"
+      return
+    fi
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      capture_host_load "quiet-timeout-$label"
+      return
+    fi
+    sleep 5
+  done
+}
 
 resolve_text_gguf() {
   local model="$1"
@@ -221,6 +309,12 @@ run_variant() {
   local q6_gate=0
   local q4_0_ple_activation_gate=0
   local q4_0_ple_linear_gate=0
+  local q4_0_sumsq_enable=0
+  local q4_0_sumsq_disable=1
+  local q4_0_sumsq_min=0
+  local q4_0_sumsq_max=0
+  local q4_0_f16_project="${TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT:-0}"
+  local q4_0_f16_project_experiment="${TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT_EXPERIMENT:-$q4_0_f16_project}"
   if [[ "$variant" == "standard" ]]; then
     q4_pair_gate="${ANTFLY_INFERENCE_GEMMA4_MIN_Q4_PAIR_ACT_REDUCE_OUT_F16:-1}"
     q6_gate="${ANTFLY_INFERENCE_GEMMA4_MIN_Q6_REDUCE_IN_F16:-1}"
@@ -250,21 +344,99 @@ run_variant() {
     ANTFLY_INFERENCE_GEMMA4_MIN_Q6_REDUCE_IN_F16="$q6_gate" \
     ANTFLY_INFERENCE_GEMMA4_MIN_Q4_0_PLE_ACTIVATION_RHS_REDUCE_OUT_F16="$q4_0_ple_activation_gate" \
     ANTFLY_INFERENCE_GEMMA4_MIN_Q4_0_PLE_LINEAR_REDUCE_IN_F16="$q4_0_ple_linear_gate" \
-    ANTFLY_INFERENCE_GEMMA4_MAX_Q4_0_LINEAR_REDUCE_SUMSQ=0 \
-    ANTFLY_INFERENCE_GEMMA4_MAX_RMS_NORM_ADD_SUMSQ=0 \
+    ANTFLY_INFERENCE_GEMMA4_MIN_Q4_0_LINEAR_REDUCE_SUMSQ="$q4_0_sumsq_min" \
+    ANTFLY_INFERENCE_GEMMA4_MIN_RMS_NORM_ADD_SUMSQ="$q4_0_sumsq_min" \
+    ANTFLY_INFERENCE_GEMMA4_MAX_Q4_0_LINEAR_REDUCE_SUMSQ="$q4_0_sumsq_max" \
+    ANTFLY_INFERENCE_GEMMA4_MAX_RMS_NORM_ADD_SUMSQ="$q4_0_sumsq_max" \
     ANTFLY_INFERENCE_GEMMA4_MIN_DECODE_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_DECODE_TOK_S:-1}" \
     ANTFLY_INFERENCE_GEMMA4_MIN_HOT_DECODE_TOK_S="$MIN_HOT_DECODE_TOK_S" \
-    TERMITE_METAL_DISABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ=1 \
-    TERMITE_METAL_ENABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ=0 \
-    TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_SUMSQ_EXPERIMENT=0 \
+    TERMITE_METAL_DISABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ="$q4_0_sumsq_disable" \
+    TERMITE_METAL_ENABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ="$q4_0_sumsq_enable" \
+    TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_SUMSQ_EXPERIMENT="$q4_0_sumsq_enable" \
     TERMITE_METAL_ENABLE_Q4_0_F16_FFN=0 \
     TERMITE_METAL_Q4_0_F16_FFN_EXPERIMENT=0 \
     ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN=0 \
-    TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT=0 \
-    TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT_EXPERIMENT=0 \
+    TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT="$q4_0_f16_project" \
+    TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT_EXPERIMENT="$q4_0_f16_project_experiment" \
     ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=0 \
     OUT_DIR="$out" \
     "$SCRIPT_DIR/bench_metal_gemma4_e4b.sh"
+}
+
+run_llama_bench() {
+  local model="$1"
+  case "$RUN_LLAMA_BENCH" in
+    0|false|FALSE|no|NO|off|OFF) return ;;
+    auto)
+      command -v "$LLAMA_BENCH_BIN" >/dev/null 2>&1 || return
+      ;;
+    *)
+      if ! command -v "$LLAMA_BENCH_BIN" >/dev/null 2>&1; then
+        echo "llama-bench not found: $LLAMA_BENCH_BIN" >&2
+        exit 2
+      fi
+      ;;
+  esac
+  local gguf
+  gguf="$(resolve_text_gguf "$model")"
+  if [[ -z "$gguf" ]]; then
+    echo "llama-bench could not find text GGUF under: $model" >&2
+    exit 2
+  fi
+  "$LLAMA_BENCH_BIN" -m "$gguf" \
+    -p "$LLAMA_PROMPT_TOKENS" \
+    -n "$TOKENS" \
+    -pg "$LLAMA_PROMPT_TOKENS,$TOKENS" \
+    -r "$RUNS" \
+    -o json \
+	    >"$ROOT_OUT_DIR/llama-bench.json" 2>&1
+}
+
+run_llama_completion() {
+  local model="$1"
+  if ! flag_enabled "$RUN_LLAMA_COMPLETION"; then
+    return
+  fi
+  if ! command -v "$LLAMA_COMPLETION_BIN" >/dev/null 2>&1; then
+    echo "llama-completion not found: $LLAMA_COMPLETION_BIN" >&2
+    exit 2
+  fi
+  local gguf
+  gguf="$(resolve_text_gguf "$model")"
+  if [[ -z "$gguf" ]]; then
+    echo "llama-completion could not find text GGUF under: $model" >&2
+    exit 2
+  fi
+  for i in $(seq 1 "$RUNS"); do
+    "$LLAMA_COMPLETION_BIN" -m "$gguf" \
+      --no-conversation \
+      --no-jinja \
+      --special \
+      -p "$PROMPT" \
+      -n "$TOKENS" \
+      --temp 0 \
+      --no-display-prompt \
+      >"$ROOT_OUT_DIR/llama-completion-run-$i.txt" 2>&1
+  done
+}
+
+run_mlx_generate() {
+  if ! flag_enabled "$RUN_MLX"; then
+    return
+  fi
+  if ! "$MLX_PYTHON" -c 'import mlx_vlm' >/dev/null 2>&1; then
+    echo "mlx-vlm not available via $MLX_PYTHON; set ANTFLY_INFERENCE_GEMMA4_MLX_PYTHON" >&2
+    exit 2
+  fi
+  for i in $(seq 1 "$RUNS"); do
+    "$MLX_PYTHON" -m mlx_vlm.generate \
+      --model "$MLX_MODEL" \
+      --prompt "$MLX_PROMPT" \
+      --max-tokens "$TOKENS" \
+      --temperature 0 \
+      --verbose \
+      >"$ROOT_OUT_DIR/mlx-run-$i.txt" 2>&1
+  done
 }
 
 QAT_MODEL_DEFAULT="$DEFAULT_MODELS_DIR/google/gemma-4-E4B-it-qat-q4_0-gguf"
@@ -278,12 +450,44 @@ if [[ -z "$MTP_POLICY_DRAFT_MODEL" ]]; then
   [[ -e "$candidate" ]] && MTP_POLICY_DRAFT_MODEL="$candidate"
 fi
 
+capture_host_load before-oracle
 run_qat_oracle "$QAT_MODEL"
+capture_host_load after-oracle
 run_mtp_policy_check "$QAT_MODEL" "$MTP_POLICY_DRAFT_MODEL"
+capture_host_load after-mtp-policy
+if flag_enabled "$RUN_LLAMA_FIRST"; then
+  wait_for_quiet before-llama-bench
+  capture_host_load before-llama-bench
+  run_llama_bench "$QAT_MODEL"
+  run_llama_completion "$QAT_MODEL"
+  capture_host_load after-llama-bench
+  phase_cooldown llama-bench
+fi
+wait_for_quiet before-qat-q4_0
+capture_host_load before-qat-q4_0
 run_variant qat-q4_0 "$QAT_MODEL" "$ROOT_OUT_DIR/qat-q4_0"
-run_variant standard "$Q4K_MODEL" "$ROOT_OUT_DIR/q4_k_m"
+capture_host_load after-qat-q4_0
+phase_cooldown qat-q4_0
+if flag_enabled "$RUN_Q4K"; then
+  wait_for_quiet before-q4_k_m
+  capture_host_load before-q4_k_m
+  run_variant standard "$Q4K_MODEL" "$ROOT_OUT_DIR/q4_k_m"
+  capture_host_load after-q4_k_m
+  phase_cooldown q4_k_m
+fi
+if ! flag_enabled "$RUN_LLAMA_FIRST"; then
+  wait_for_quiet before-llama-bench
+  capture_host_load before-llama-bench
+  run_llama_bench "$QAT_MODEL"
+  run_llama_completion "$QAT_MODEL"
+  capture_host_load after-llama-bench
+fi
+wait_for_quiet before-mlx
+capture_host_load before-mlx
+run_mlx_generate
+capture_host_load after-mlx
 
-python3 - "$ROOT_OUT_DIR" "$MIN_SPEEDUP" <<'PY'
+python3 - "$ROOT_OUT_DIR" "$MIN_SPEEDUP" "$LLAMA_MIN_SPEEDUP" "$LLAMA_COMPLETION_MIN_SPEEDUP" "$TOKENS" "$MLX_MIN_SPEEDUP" "$LLAMA_COMPLETION_MIN_EVAL_RUNS" <<'PY'
 import json
 import re
 import sys
@@ -291,11 +495,18 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 min_speedup = float(sys.argv[2])
+llama_min_speedup = float(sys.argv[3])
+llama_completion_min_speedup = float(sys.argv[4])
+tokens = int(sys.argv[5])
+mlx_min_speedup = float(sys.argv[6])
+llama_completion_min_eval_runs = int(sys.argv[7])
 qat = json.loads((root / "qat-q4_0" / "summary.json").read_text())
-q4k = json.loads((root / "q4_k_m" / "summary.json").read_text())
+q4k_path = root / "q4_k_m" / "summary.json"
+q4k = json.loads(q4k_path.read_text()) if q4k_path.exists() else None
 qat_decode = float(qat["median_decode_tok_s"])
-q4k_decode = float(q4k["median_decode_tok_s"])
-speedup = qat_decode / q4k_decode if q4k_decode else 0.0
+qat_hot = float(qat["median_hot_decode_tok_s"])
+q4k_decode = float(q4k["median_decode_tok_s"]) if q4k else None
+speedup = qat_decode / q4k_decode if q4k_decode else None
 qat_rows = qat["rows"]
 qat_ple_activation_min = min(int(r.get("q4_0_ple_activation_rhs_reduce_out_f16", 0)) for r in qat_rows)
 qat_ple_linear_min = min(int(r.get("q4_0_ple_linear_reduce_in_f16", 0)) for r in qat_rows)
@@ -312,27 +523,110 @@ def mtp_policy_summary(path: Path):
         "matched": int((re.search(r"\bmatched=(\d+)", line) or [None, 0])[1]),
     }
 
+def llama_generation_tok_s(path: Path, n_gen: int):
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    start = text.find("[")
+    end = text.rfind("]")
+    if start < 0 or end < start:
+        raise SystemExit(f"llama-bench output did not contain JSON array: {path}")
+    rows = json.loads(text[start : end + 1])
+    matches = [
+        row for row in rows
+        if int(row.get("n_prompt", -1)) == 0 and int(row.get("n_gen", -1)) == n_gen
+    ]
+    if not matches:
+        raise SystemExit(f"llama-bench output missing tg row for n_gen={n_gen}: {path}")
+    return float(matches[0]["avg_ts"])
+
+def llama_completion_metrics(root: Path):
+    values = []
+    eval_runs = []
+    for path in sorted(root.glob("llama-completion-run-*.txt")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"eval time =\s+[0-9.]+ ms /\s+(\d+) runs\s+\([^)]*?,\s*([0-9.]+) tokens per second\)", text)
+        if not m:
+            raise SystemExit(f"llama-completion output missing eval timing: {path}")
+        eval_runs.append(int(m.group(1)))
+        values.append(float(m.group(2)))
+    if not values:
+        return None, None, []
+    values.sort()
+    return values[len(values) // 2], min(eval_runs), eval_runs
+
+def mlx_generation_tok_s(root: Path):
+    values = []
+    for path in sorted(root.glob("mlx-run-*.txt")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"Generation:\s+\d+\s+tokens,\s+([0-9.]+)\s+tokens-per-sec", text)
+        if not m:
+            raise SystemExit(f"MLX output missing generation timing: {path}")
+        values.append(float(m.group(1)))
+    if not values:
+        return None
+    values.sort()
+    return values[len(values) // 2]
+
+llama_tg = llama_generation_tok_s(root / "llama-bench.json", tokens)
+llama_speedup = qat_hot / llama_tg if llama_tg else None
+llama_completion_tg, llama_completion_eval_runs_min, llama_completion_eval_runs = llama_completion_metrics(root)
+llama_completion_speedup = qat_hot / llama_completion_tg if llama_completion_tg else None
+mlx_tg = mlx_generation_tok_s(root)
+mlx_speedup = qat_hot / mlx_tg if mlx_tg else None
+
 summary = {
     "qat_median_decode_tok_s": qat_decode,
+    "qat_median_hot_decode_tok_s": qat_hot,
     "q4k_median_decode_tok_s": q4k_decode,
     "speedup": speedup,
     "min_speedup": min_speedup,
+    "llama_generation_tok_s": llama_tg,
+    "llama_speedup": llama_speedup,
+    "llama_min_speedup": llama_min_speedup,
+    "llama_completion_eval_tok_s": llama_completion_tg,
+    "llama_completion_eval_runs": llama_completion_eval_runs,
+    "llama_completion_eval_runs_min": llama_completion_eval_runs_min,
+    "llama_completion_min_eval_runs": llama_completion_min_eval_runs,
+    "llama_completion_speedup": llama_completion_speedup,
+    "llama_completion_min_speedup": llama_completion_min_speedup,
+    "mlx_generation_tok_s": mlx_tg,
+    "mlx_speedup": mlx_speedup,
+    "mlx_min_speedup": mlx_min_speedup,
     "qat_ple_activation_rhs_reduce_out_f16_min": qat_ple_activation_min,
     "qat_ple_linear_reduce_in_f16_min": qat_ple_linear_min,
     "mtp_force": mtp_policy_summary(root / "qat-mtp-policy" / "force.txt"),
     "mtp_force_k1": mtp_policy_summary(root / "qat-mtp-policy" / "force-k1.txt"),
     "qat_speculative_decision": qat["rows"][0].get("speculative_decision", ""),
-    "q4k_speculative_decision": q4k["rows"][0].get("speculative_decision", ""),
+    "q4k_speculative_decision": q4k["rows"][0].get("speculative_decision", "") if q4k else "",
     "qat_runtime_toggles": qat.get("runtime_toggles", {}),
-    "q4k_runtime_toggles": q4k.get("runtime_toggles", {}),
+    "q4k_runtime_toggles": q4k.get("runtime_toggles", {}) if q4k else {},
+    "host_load_snapshots": [str(path) for path in sorted(root.glob("host-load-*.txt"))],
     "qat_summary": str(root / "qat-q4_0" / "summary.tsv"),
-    "q4k_summary": str(root / "q4_k_m" / "summary.tsv"),
+    "q4k_summary": str(root / "q4_k_m" / "summary.tsv") if q4k else "",
 }
 (root / "compare-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 print(f"compare summary: {root / 'compare-summary.json'}")
-print(f"qat_decode_tok_s={qat_decode:.3f} q4k_decode_tok_s={q4k_decode:.3f} speedup={speedup:.3f} min_speedup={min_speedup:.3f}")
-if speedup < min_speedup:
-    raise SystemExit(f"QAT speedup {speedup:.3f} below gate {min_speedup:.3f}")
+if speedup is not None:
+    print(f"qat_decode_tok_s={qat_decode:.3f} q4k_decode_tok_s={q4k_decode:.3f} speedup={speedup:.3f} min_speedup={min_speedup:.3f}")
+    if speedup < min_speedup:
+        raise SystemExit(f"QAT speedup {speedup:.3f} below gate {min_speedup:.3f}")
+else:
+    print(f"qat_decode_tok_s={qat_decode:.3f} q4k_decode_tok_s=skipped speedup=skipped")
+if llama_speedup is not None:
+    print(f"qat_hot_decode_tok_s={qat_hot:.3f} llama_generation_tok_s={llama_tg:.3f} llama_speedup={llama_speedup:.3f} min_llama_speedup={llama_min_speedup:.3f}")
+    if llama_speedup < llama_min_speedup:
+        raise SystemExit(f"QAT/llama.cpp speedup {llama_speedup:.3f} below gate {llama_min_speedup:.3f}")
+if llama_completion_speedup is not None:
+    print(f"qat_hot_decode_tok_s={qat_hot:.3f} llama_completion_eval_tok_s={llama_completion_tg:.3f} llama_completion_eval_runs_min={llama_completion_eval_runs_min} min_llama_completion_eval_runs={llama_completion_min_eval_runs} llama_completion_speedup={llama_completion_speedup:.3f} min_llama_completion_speedup={llama_completion_min_speedup:.3f}")
+    if llama_completion_eval_runs_min is not None and llama_completion_eval_runs_min < llama_completion_min_eval_runs:
+        raise SystemExit(f"llama-completion eval runs {llama_completion_eval_runs_min} below gate {llama_completion_min_eval_runs}")
+    if llama_completion_speedup < llama_completion_min_speedup:
+        raise SystemExit(f"QAT/llama-completion speedup {llama_completion_speedup:.3f} below gate {llama_completion_min_speedup:.3f}")
+if mlx_speedup is not None:
+    print(f"qat_hot_decode_tok_s={qat_hot:.3f} mlx_generation_tok_s={mlx_tg:.3f} mlx_speedup={mlx_speedup:.3f} min_mlx_speedup={mlx_min_speedup:.3f}")
+    if mlx_speedup < mlx_min_speedup:
+        raise SystemExit(f"QAT/MLX speedup {mlx_speedup:.3f} below gate {mlx_min_speedup:.3f}")
 PY
 
 echo "raw output: $ROOT_OUT_DIR"

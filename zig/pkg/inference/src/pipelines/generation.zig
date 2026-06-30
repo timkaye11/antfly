@@ -903,7 +903,7 @@ fn gemma4MtpMetalAutoEnabled() bool {
 }
 
 fn gemma4MetalDirectGreedyDefault() bool {
-    return false;
+    return true;
 }
 
 fn gemma4MetalDirectGreedyEnabled() bool {
@@ -7962,8 +7962,8 @@ test "Gemma4 MTP cached first choice requires multi draft" {
     try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(2));
 }
 
-test "Gemma4 Metal direct greedy is opt-in" {
-    try std.testing.expectEqual(false, gemma4MetalDirectGreedyDefault());
+test "Gemma4 Metal direct greedy is default" {
+    try std.testing.expectEqual(true, gemma4MetalDirectGreedyDefault());
 }
 
 test "gemma4 mtp adaptive k starts with probe and ramps on accepted windows" {

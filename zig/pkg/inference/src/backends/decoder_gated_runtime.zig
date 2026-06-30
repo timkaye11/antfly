@@ -324,6 +324,19 @@ fn disableGemmaFusedQkvRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_GEMMA_FUSED_QKV");
 }
 
+fn enableGemmaFusedQkvRequested() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_GEMMA_FUSED_QKV");
+}
+
+fn preferSplitGemmaDecodeQkv(gpt_config: gpt_mod.Config, phase: BlockTimingPhase, query_sequence_len: usize) bool {
+    if (enableGemmaFusedQkvRequested()) return false;
+    return phase != .prefill and
+        query_sequence_len == 1 and
+        gpt_config.family == .gemma and
+        gpt_config.hidden_size >= 2304 and
+        gpt_config.ple_hidden_size != 0;
+}
+
 fn disableGemma4E4bFastResidencyRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_GEMMA4_E4B_FAST_RESIDENCY");
 }
@@ -1693,6 +1706,11 @@ fn forwardFinalHiddenTensorGemmaDirect(
             ple_vectors != null,
         },
     );
+    var planned_barriers_suppressed = false;
+    if (decoder_frame_active and phase != .prefill) {
+        planned_barriers_suppressed = try cb.decoderRuntimePushPlannedComputeBarrierSuppression();
+    }
+    defer if (planned_barriers_suppressed) cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch {};
     var return_decoder_frame = false;
     defer if (!return_decoder_frame) finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     errdefer cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
@@ -2048,7 +2066,9 @@ fn forwardFinalHiddenTensorGemmaDirect(
             const zero_v = try createZeroTensor(cb, allocator, decode_context.query_sequence_len * kv_dim);
             break :blk .{ q_local, zero_k, zero_v };
         } else blk: {
-            if (!disableGemmaFusedQkvRequested()) {
+            if (!disableGemmaFusedQkvRequested() and
+                !preferSplitGemmaDecodeQkv(gpt_config, phase, decode_context.query_sequence_len))
+            {
                 if (try cb.decoderRuntimeApplyLinearQkv(&.{
                     .q_slot = linearSlot(layer, .attn_q),
                     .k_slot = linearSlot(layer, .attn_k),

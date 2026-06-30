@@ -65,6 +65,7 @@ MIN_SERVER_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S:-0}"
 MAX_SERVER_WARM_MS="${ANTFLY_INFERENCE_GEMMA4_MAX_SERVER_WARM_MS:-0}"
 CACHE_DTYPE="${ANTFLY_INFERENCE_GEMMA4_CACHE_DTYPE:-}"
 REUSE_PROBE="${ANTFLY_INFERENCE_GEMMA4_REUSE_PROBE:-1}"
+RAW_PROMPT="${ANTFLY_INFERENCE_GEMMA4_RAW_PROMPT:-0}"
 DRAFT_MODEL="${ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL:-}"
 SPECULATIVE_K="${ANTFLY_INFERENCE_GEMMA4_SPECULATIVE_K:-4}"
 SPECULATION_POLICY="${ANTFLY_INFERENCE_GEMMA4_SPECULATION_POLICY:-auto}"
@@ -184,13 +185,18 @@ TOGGLE_NAMES = [
     "TERMITE_METAL_DISABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
     "TERMITE_METAL_ENABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_SUMSQ_EXPERIMENT",
+    "TERMITE_METAL_DISABLE_Q4_0_SPLIT_GATE_UP_REDUCE",
+    "TERMITE_METAL_DISABLE_GEMMA_FUSED_QKV",
+    "TERMITE_METAL_ENABLE_GEMMA_FUSED_QKV",
     "TERMITE_METAL_ENABLE_Q4_0_F16_FFN",
     "TERMITE_METAL_Q4_0_F16_FFN_EXPERIMENT",
     "ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT_EXPERIMENT",
+    "TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS",
     "ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO",
     "ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL",
+    "ANTFLY_INFERENCE_GEMMA4_RAW_PROMPT",
 ]
 
 out_dir = Path(sys.argv[1])
@@ -312,6 +318,9 @@ run_case() {
   if [[ -n "$CACHE_DTYPE" ]]; then
     args+=(--cache-dtype "$CACHE_DTYPE")
   fi
+  if [[ "$RAW_PROMPT" != "0" ]]; then
+    args+=(--raw-prompt)
+  fi
   if [[ -n "$DRAFT_MODEL" ]]; then
     args+=(
       --draft-model "$DRAFT_MODEL"
@@ -348,13 +357,18 @@ TOGGLE_NAMES = [
     "TERMITE_METAL_DISABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
     "TERMITE_METAL_ENABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_SUMSQ_EXPERIMENT",
+    "TERMITE_METAL_DISABLE_Q4_0_SPLIT_GATE_UP_REDUCE",
+    "TERMITE_METAL_DISABLE_GEMMA_FUSED_QKV",
+    "TERMITE_METAL_ENABLE_GEMMA_FUSED_QKV",
     "TERMITE_METAL_ENABLE_Q4_0_F16_FFN",
     "TERMITE_METAL_Q4_0_F16_FFN_EXPERIMENT",
     "ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT_EXPERIMENT",
+    "TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS",
     "ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO",
     "ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL",
+    "ANTFLY_INFERENCE_GEMMA4_RAW_PROMPT",
 ]
 
 out_dir = Path(sys.argv[1])
@@ -425,6 +439,8 @@ for path in sorted(out_dir.glob("*.txt")):
     frame_gpu_ms = grab(r"metal_decoder_frame:.*\bgpu_ms=(\d+)", text, default=0)
     last_compute_encoders = grab(r"metal_decoder_frame:.*\blast_compute_encoders=(\d+)", text, default=-1)
     last_blit_encoders = grab(r"metal_decoder_frame:.*\blast_blit_encoders=(\d+)", text, default=-1)
+    planned_scopes = grab(r"metal_runtime_encoders:.*\bplanned_scopes=(\d+)", text, default=0)
+    planned_barriers = grab(r"metal_runtime_encoders:.*\bplanned_barriers=(\d+)", text, default=0)
     q8_mmv = grab(r"metal_q8_0_dispatch:.*\bmmv=(\d+)", text, default=0)
     q8_mm = grab(r"metal_q8_0_dispatch:.*\bmm=(\d+)", text, default=0)
     q4_0_linear_reduce = grab(r"metal_q4_0_dispatch:.*\blinear_reduce=(\d+)", text, default=0)
@@ -460,6 +476,26 @@ for path in sorted(out_dir.glob("*.txt")):
     active_decode_frame_attempts = grab(r"metal_frame_fallbacks:\s+decode_attempts=(\d+)", text, default=0)
     active_decode_frame_success = grab(r"metal_frame_fallbacks:.*\bdecode_success=(\d+)", text, default=0)
     command_ops = grab(r"metal_runtime_command_ops:\s+total=(\d+)", text, default=0)
+    command_op_attention = grab(r"metal_runtime_command_ops:.*\battention=(\d+)", text, default=0)
+    command_op_ffn_pre_norm_scale = grab(r"metal_runtime_command_ops:.*\bffn_pre_norm_scale=(\d+)", text, default=0)
+    command_op_ffn_gate_up_activation = grab(r"metal_runtime_command_ops:.*\bffn_gate_up_activation=(\d+)", text, default=0)
+    command_op_ple_projection = grab(r"metal_runtime_command_ops:.*\bple_projection=(\d+)", text, default=0)
+    command_op_ple_post_norm_residual = grab(r"metal_runtime_command_ops:.*\bple_post_norm_residual=(\d+)", text, default=0)
+    command_op_tail_lm_head = grab(r"metal_runtime_command_ops:.*\btail_lm_head=(\d+)", text, default=0)
+    command_operator_mul_mv = grab(r"metal_runtime_command_operators:.*\bmul_mv=(\d+)", text, default=0)
+    command_operator_mul_mm = grab(r"metal_runtime_command_operators:.*\bmul_mm=(\d+)", text, default=0)
+    command_operator_attention_paged = grab(r"metal_runtime_command_operators:.*\battention_paged=(\d+)", text, default=0)
+    runtime_region_attention_project = grab(r"metal_runtime_compute_regions:.*\battention_project=(\d+)", text, default=0)
+    runtime_region_ffn = grab(r"metal_runtime_compute_regions:.*\bffn=(\d+)", text, default=0)
+    runtime_region_ple = grab(r"metal_runtime_compute_regions:.*\bple=(\d+)", text, default=0)
+    runtime_region_embedding = grab(r"metal_runtime_compute_regions:.*\bembedding=(\d+)", text, default=0)
+    runtime_region_layer = grab(r"metal_runtime_compute_regions:.*\blayer=(\d+)", text, default=0)
+    quant_block_apply_ms = grab(r"metal_quant_block_apply_ms:.*\btotal=(\d+)", text, default=0)
+    quant_block_attention_span_ms = grab(r"metal_quant_block_apply_ms:.*\battention_span=(\d+)", text, default=0)
+    quant_block_attention_prefix_ms = grab(r"metal_quant_block_apply_ms:.*\battention_prefix=(\d+)", text, default=0)
+    quant_block_gated_ffn_ms = grab(r"metal_quant_block_apply_ms:.*\bgated_ffn=(\d+)", text, default=0)
+    quant_block_command_wait_ms = grab(r"metal_quant_block_apply_ms:.*\bcommand_wait=(\d+)", text, default=0)
+    quant_block_gpu_ms = grab(r"metal_quant_block_apply_ms:.*\bgpu=(\d+)", text, default=0)
     greedy_calls = grab(r"metal_executor_ms:.*\bgreedy_calls=(\d+)", text, default=0)
     greedy_direct_ms = grab(r"metal_executor_ms:.*\bgreedy_direct=(\d+)", text, default=0)
     greedy_layer_specs_ms = grab(r"decoder_gated_decode_ms:.*\bgreedy_layer_specs=(\d+)", text, default=0)
@@ -499,6 +535,14 @@ for path in sorted(out_dir.glob("*.txt")):
     e2e_tok_s = tokens / (total_ms / 1000.0) if total_ms else 0.0
     hot_decode_tok_s = greedy_calls / (greedy_direct_ms / 1000.0) if greedy_calls and greedy_direct_ms else 0.0
     prefill_tok_s = prefill_tokens / (prefill_direct_family_ms / 1000.0) if prefill_tokens and prefill_direct_family_ms else 0.0
+    timing_invalid_reasons = []
+    max_internal_ms = total_ms * 3
+    if total_ms and greedy_direct_ms > max_internal_ms:
+        timing_invalid_reasons.append(f"greedy_direct_ms={greedy_direct_ms}>3x_total_ms={max_internal_ms}")
+    if total_ms and frame_wait_ms > max_internal_ms:
+        timing_invalid_reasons.append(f"frame_wait_ms={frame_wait_ms}>3x_total_ms={max_internal_ms}")
+    if total_ms and prefill_direct_family_ms > max_internal_ms:
+        timing_invalid_reasons.append(f"prefill_direct_family_ms={prefill_direct_family_ms}>3x_total_ms={max_internal_ms}")
     rows.append({
         "label": path.stem,
         "tokens": tokens,
@@ -524,6 +568,8 @@ for path in sorted(out_dir.glob("*.txt")):
         "frame_gpu_ms": frame_gpu_ms,
         "last_compute_encoders": last_compute_encoders,
         "last_blit_encoders": last_blit_encoders,
+        "planned_scopes": planned_scopes,
+        "planned_barriers": planned_barriers,
         "q8_mmv": q8_mmv,
         "q8_mm": q8_mm,
         "q4_0_linear_reduce": q4_0_linear_reduce,
@@ -559,6 +605,26 @@ for path in sorted(out_dir.glob("*.txt")):
         "active_decode_frame_attempts": active_decode_frame_attempts,
         "active_decode_frame_success": active_decode_frame_success,
         "command_ops": command_ops,
+        "command_op_attention": command_op_attention,
+        "command_op_ffn_pre_norm_scale": command_op_ffn_pre_norm_scale,
+        "command_op_ffn_gate_up_activation": command_op_ffn_gate_up_activation,
+        "command_op_ple_projection": command_op_ple_projection,
+        "command_op_ple_post_norm_residual": command_op_ple_post_norm_residual,
+        "command_op_tail_lm_head": command_op_tail_lm_head,
+        "command_operator_mul_mv": command_operator_mul_mv,
+        "command_operator_mul_mm": command_operator_mul_mm,
+        "command_operator_attention_paged": command_operator_attention_paged,
+        "runtime_region_attention_project": runtime_region_attention_project,
+        "runtime_region_ffn": runtime_region_ffn,
+        "runtime_region_ple": runtime_region_ple,
+        "runtime_region_embedding": runtime_region_embedding,
+        "runtime_region_layer": runtime_region_layer,
+        "quant_block_apply_ms": quant_block_apply_ms,
+        "quant_block_attention_span_ms": quant_block_attention_span_ms,
+        "quant_block_attention_prefix_ms": quant_block_attention_prefix_ms,
+        "quant_block_gated_ffn_ms": quant_block_gated_ffn_ms,
+        "quant_block_command_wait_ms": quant_block_command_wait_ms,
+        "quant_block_gpu_ms": quant_block_gpu_ms,
         "greedy_calls": greedy_calls,
         "greedy_direct_ms": greedy_direct_ms,
         "hot_decode_tok_s": hot_decode_tok_s,
@@ -592,17 +658,23 @@ for path in sorted(out_dir.glob("*.txt")):
         "mtp_draft_ms": mtp_draft_ms,
         "mtp_verify_ms": mtp_verify_ms,
         "mtp_materialization_ms": mtp_materialization_ms,
+        "timing_valid": not timing_invalid_reasons,
+        "timing_invalid_reason": ";".join(timing_invalid_reasons),
         "file": str(path),
     })
 
 measured = [r for r in rows if r["label"].startswith("run-")]
 if not measured:
     raise SystemExit("no measured run-* files found")
-median_decode = statistics.median(r["decode_tok_s"] for r in measured)
-mean_decode = statistics.mean(r["decode_tok_s"] for r in measured)
-median_e2e = statistics.median(r["e2e_tok_s"] for r in measured)
-median_hot_decode = statistics.median(r["hot_decode_tok_s"] for r in measured)
-mean_hot_decode = statistics.mean(r["hot_decode_tok_s"] for r in measured)
+invalid_timings = [r for r in measured if not r["timing_valid"]]
+valid_measured = [r for r in measured if r["timing_valid"]]
+if not valid_measured:
+    raise SystemExit("no valid measured run-* timing rows found")
+median_decode = statistics.median(r["decode_tok_s"] for r in valid_measured)
+mean_decode = statistics.mean(r["decode_tok_s"] for r in valid_measured)
+median_e2e = statistics.median(r["e2e_tok_s"] for r in valid_measured)
+median_hot_decode = statistics.median(r["hot_decode_tok_s"] for r in valid_measured)
+mean_hot_decode = statistics.mean(r["hot_decode_tok_s"] for r in valid_measured)
 summary = {
     "median_decode_tok_s": median_decode,
     "mean_decode_tok_s": mean_decode,
@@ -645,12 +717,16 @@ summary = {
     "max_last_compute_encoders": max_last_compute_encoders,
     "max_q4_0_linear_reduce_sumsq": max_q4_0_linear_sumsq,
     "max_rms_norm_add_sumsq": max_rms_norm_add_sumsq,
+    "invalid_timing_rows": [
+        {"label": r["label"], "reason": r["timing_invalid_reason"], "file": r["file"]}
+        for r in invalid_timings
+    ],
     "runtime_toggles": {name: os.environ.get(name, "") for name in TOGGLE_NAMES},
     "rows": rows,
 }
 (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
-    f.write("label\ttokens\tfinish_reason\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tprefill_execute\tprefill_execute_fail\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tlast_compute_encoders\tlast_blit_encoders\tq8_mmv\tq8_mm\tq4_0_linear_reduce\tq4_0_linear_reduce_in_f16\tq4_0_linear_reduce_out_f16\tq4_0_linear_reduce_in_f16_out_f16\tq4_0_linear_reduce_sumsq\tq4_0_pair_act_reduce\tq4_0_pair_act_reduce_out_f16\tq4_0_pair_act_rms_scale_reduce_out_f16\tq4_0_activation_rhs_reduce\tq4_0_activation_rhs_reduce_out_f16\tq4_0_ple_activation_rhs_reduce_out_f16\tq4_0_ple_linear_reduce_in_f16\trms_norm_add_sumsq\tpaged_attention_1x\tq4_0_pair_reduce\tq4_0_pair\tq4_0_linear_reduce_encode_us\tq4_0_pair_reduce_encode_us\tq4_0_pair_act_reduce_encode_us\tq4_0_activation_rhs_reduce_encode_us\tq4_linear_reduce\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_in_f16\tactive_decode_layers\tactive_decode_final_fused_argmax\tactive_decode_final_split_argmax\tactive_decode_frame_attempts\tactive_decode_frame_success\tcommand_ops\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tspeculative_policy\tspeculative_decision\tspeculative_rounds\tspeculative_drafted\tspeculative_matched\tspeculative_accepted\tspeculative_mtp_enabled\tspeculative_acceptance_permille\tmtp_draft_steps\tmtp_resident_draft_steps\tmtp_host_draft_steps\tmtp_target_verify_calls\tmtp_dedicated_runtime_hits\tmtp_dedicated_runtime_fallbacks\tmtp_device_verify_commit_hits\tmtp_commit_forwards_required\tmtp_commit_forwards_avoided\tmtp_materializations\tmtp_draft_ms\tmtp_verify_ms\tmtp_materialization_ms\tfile\n")
+    f.write("label\ttokens\tfinish_reason\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tprefill_execute\tprefill_execute_fail\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tlast_compute_encoders\tlast_blit_encoders\tplanned_scopes\tplanned_barriers\tq8_mmv\tq8_mm\tq4_0_linear_reduce\tq4_0_linear_reduce_in_f16\tq4_0_linear_reduce_out_f16\tq4_0_linear_reduce_in_f16_out_f16\tq4_0_linear_reduce_sumsq\tq4_0_pair_act_reduce\tq4_0_pair_act_reduce_out_f16\tq4_0_pair_act_rms_scale_reduce_out_f16\tq4_0_activation_rhs_reduce\tq4_0_activation_rhs_reduce_out_f16\tq4_0_ple_activation_rhs_reduce_out_f16\tq4_0_ple_linear_reduce_in_f16\trms_norm_add_sumsq\tpaged_attention_1x\tq4_0_pair_reduce\tq4_0_pair\tq4_0_linear_reduce_encode_us\tq4_0_pair_reduce_encode_us\tq4_0_pair_act_reduce_encode_us\tq4_0_activation_rhs_reduce_encode_us\tq4_linear_reduce\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_in_f16\tactive_decode_layers\tactive_decode_final_fused_argmax\tactive_decode_final_split_argmax\tactive_decode_frame_attempts\tactive_decode_frame_success\tcommand_ops\tcommand_op_attention\tcommand_op_ffn_pre_norm_scale\tcommand_op_ffn_gate_up_activation\tcommand_op_ple_projection\tcommand_op_ple_post_norm_residual\tcommand_op_tail_lm_head\tcommand_operator_mul_mv\tcommand_operator_mul_mm\tcommand_operator_attention_paged\truntime_region_attention_project\truntime_region_ffn\truntime_region_ple\truntime_region_embedding\truntime_region_layer\tquant_block_apply_ms\tquant_block_attention_span_ms\tquant_block_attention_prefix_ms\tquant_block_gated_ffn_ms\tquant_block_command_wait_ms\tquant_block_gpu_ms\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tspeculative_policy\tspeculative_decision\tspeculative_rounds\tspeculative_drafted\tspeculative_matched\tspeculative_accepted\tspeculative_mtp_enabled\tspeculative_acceptance_permille\tmtp_draft_steps\tmtp_resident_draft_steps\tmtp_host_draft_steps\tmtp_target_verify_calls\tmtp_dedicated_runtime_hits\tmtp_dedicated_runtime_fallbacks\tmtp_device_verify_commit_hits\tmtp_commit_forwards_required\tmtp_commit_forwards_avoided\tmtp_materializations\tmtp_draft_ms\tmtp_verify_ms\tmtp_materialization_ms\ttiming_valid\ttiming_invalid_reason\tfile\n")
     for r in rows:
         f.write(
             f"{r['label']}\t{r['tokens']}\t{r['finish_reason']}\t{r['generate_ms']}\t{r['total_ms']}\t{r['runtime_prewarm_ms']}\t"
@@ -661,7 +737,7 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
             f"{r['prefill_tokens']}\t{r['prefill_tok_s']:.3f}\t{r['backend']}\t"
             f"{r['decode_fallback']}\t{r['prefill_execute']}\t{r['prefill_execute_fail']}\t"
             f"{r['frame_begins']}\t{r['frame_wait_ms']}\t"
-            f"{r['frame_gpu_ms']}\t{r['last_compute_encoders']}\t{r['last_blit_encoders']}\t{r['q8_mmv']}\t{r['q8_mm']}\t"
+            f"{r['frame_gpu_ms']}\t{r['last_compute_encoders']}\t{r['last_blit_encoders']}\t{r['planned_scopes']}\t{r['planned_barriers']}\t{r['q8_mmv']}\t{r['q8_mm']}\t"
             f"{r['q4_0_linear_reduce']}\t{r['q4_0_linear_reduce_in_f16']}\t{r['q4_0_linear_reduce_out_f16']}\t{r['q4_0_linear_reduce_in_f16_out_f16']}\t{r['q4_0_linear_reduce_sumsq']}\t{r['q4_0_pair_act_reduce']}\t{r['q4_0_pair_act_reduce_out_f16']}\t{r['q4_0_pair_act_rms_scale_reduce_out_f16']}\t{r['q4_0_activation_rhs_reduce']}\t{r['q4_0_activation_rhs_reduce_out_f16']}\t{r['q4_0_ple_activation_rhs_reduce_out_f16']}\t{r['q4_0_ple_linear_reduce_in_f16']}\t{r['rms_norm_add_sumsq']}\t{r['paged_attention_1x']}\t{r['q4_0_pair_reduce']}\t{r['q4_0_pair']}\t"
             f"{r['q4_0_linear_reduce_encode_us']}\t{r['q4_0_pair_reduce_encode_us']}\t{r['q4_0_pair_act_reduce_encode_us']}\t{r['q4_0_activation_rhs_reduce_encode_us']}\t"
             f"{r['q4_linear_reduce']}\t{r['q4_pair_reduce']}\t"
@@ -670,6 +746,15 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
             f"{r['q6_linear_reduce_in_f16']}\t{r['active_decode_layers']}\t"
             f"{r['active_decode_final_fused_argmax']}\t{r['active_decode_final_split_argmax']}\t"
             f"{r['active_decode_frame_attempts']}\t{r['active_decode_frame_success']}\t{r['command_ops']}\t"
+            f"{r['command_op_attention']}\t{r['command_op_ffn_pre_norm_scale']}\t"
+            f"{r['command_op_ffn_gate_up_activation']}\t{r['command_op_ple_projection']}\t"
+            f"{r['command_op_ple_post_norm_residual']}\t{r['command_op_tail_lm_head']}\t"
+            f"{r['command_operator_mul_mv']}\t{r['command_operator_mul_mm']}\t"
+            f"{r['command_operator_attention_paged']}\t"
+            f"{r['runtime_region_attention_project']}\t{r['runtime_region_ffn']}\t"
+            f"{r['runtime_region_ple']}\t{r['runtime_region_embedding']}\t{r['runtime_region_layer']}\t"
+            f"{r['quant_block_apply_ms']}\t{r['quant_block_attention_span_ms']}\t{r['quant_block_attention_prefix_ms']}\t"
+            f"{r['quant_block_gated_ffn_ms']}\t{r['quant_block_command_wait_ms']}\t{r['quant_block_gpu_ms']}\t"
             f"{r['greedy_calls']}\t{r['greedy_direct_ms']}\t{r['greedy_layer_specs_ms']}\t"
             f"{r['prefill_direct_family_ms']}\t{r['ple_prepare_ms']}\t{r['quant_private_ms']}\t"
             f"{r['quant_private_slots']}\t{r['quant_mapped_slots']}\t{r['quant_mapped_failures']}\t"
@@ -681,6 +766,7 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
             f"{r['mtp_device_verify_commit_hits']}\t{r['mtp_commit_forwards_required']}\t"
             f"{r['mtp_commit_forwards_avoided']}\t{r['mtp_materializations']}\t"
             f"{r['mtp_draft_ms']}\t{r['mtp_verify_ms']}\t{r['mtp_materialization_ms']}\t"
+            f"{str(r['timing_valid']).lower()}\t{r['timing_invalid_reason']}\t"
             f"{r['file']}\n"
         )
 
@@ -727,6 +813,15 @@ last_compute_encoder_regressions = [
 print(f"summary: {out_dir / 'summary.tsv'}")
 print(f"median_decode_tok_s={median_decode:.3f} mean_decode_tok_s={mean_decode:.3f} median_e2e_tok_s={median_e2e:.3f}")
 print(f"median_hot_decode_tok_s={median_hot_decode:.3f} mean_hot_decode_tok_s={mean_hot_decode:.3f}")
+graph_row = valid_measured[-1]
+print(
+    "last_frame_graph="
+    f"command_ops={graph_row['command_ops']} "
+    f"regions(attention_project={graph_row['runtime_region_attention_project']},ffn={graph_row['runtime_region_ffn']},ple={graph_row['runtime_region_ple']},layer={graph_row['runtime_region_layer']}) "
+    f"operators(mul_mv={graph_row['command_operator_mul_mv']},mul_mm={graph_row['command_operator_mul_mm']},attention_paged={graph_row['command_operator_attention_paged']})"
+)
+if invalid_timings:
+    raise SystemExit(f"invalid timing counters in measured runs: {[(r['label'], r['timing_invalid_reason']) for r in invalid_timings]}")
 if any(r["speculative_policy"] for r in measured):
     print("speculative_mtp=" + ",".join(
         f"{r['label']}:enabled={str(r['speculative_mtp_enabled']).lower()}:decision={r['speculative_decision']}:accepted={r['speculative_accepted']}:drafted={r['speculative_drafted']}"

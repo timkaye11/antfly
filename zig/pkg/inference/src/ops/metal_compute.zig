@@ -16723,6 +16723,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             active_frame = try self.beginDecoderRuntimeFrame(runtime);
         }
         errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
+        var planned_barriers_suppressed = false;
+        if (active_frame) {
+            try metal_runtime.pushPlannedComputeBarrierSuppression(runtime);
+            planned_barriers_suppressed = true;
+        }
+        defer if (planned_barriers_suppressed) metal_runtime.popPlannedComputeBarrierSuppression(runtime) catch {};
         var queued_token_id = false;
         var immediate_token_id: u32 = 0;
         var queued_final_input: ?MetalTensor = null;
@@ -17531,6 +17537,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeHasActiveFrameOp(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+    }
+
+    fn decoderRuntimePushPlannedComputeBarrierSuppressionOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        try metal_runtime.pushPlannedComputeBarrierSuppression(runtime);
+        return true;
+    }
+
+    fn decoderRuntimePopPlannedComputeBarrierSuppressionOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        try metal_runtime.popPlannedComputeBarrierSuppression(runtime);
     }
 
     fn decoderRuntimeSubmitAndWaitFrameOp(ctx: *anyopaque) anyerror!void {
@@ -18969,6 +18988,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeExecuteGraphCommandPlanFrame = decoderRuntimeExecuteGraphCommandPlanFrameOp;
         vt.decoderRuntimeBeginFrame = decoderRuntimeBeginFrameOp;
         vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
+        vt.decoderRuntimePushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
+        vt.decoderRuntimePopPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimeSubmitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
         vt.decoderRuntimeFlushActiveFrame = decoderRuntimeFlushActiveFrameOp;
         vt.decoderRuntimeCancelFrame = decoderRuntimeCancelFrameOp;
