@@ -942,6 +942,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
     }
 
+    pub fn stop(self: *@This()) void {
+        _ = self;
+    }
+
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
@@ -1162,16 +1166,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        self.stop();
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
@@ -1182,7 +1177,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn stop(self: *EnrichmentRuntime) void {
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            self.shutdown = true;
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+
+            if (self.future) |*future| _ = future.await(io);
+        }
+        self.future = null;
+        self.shutdown = false;
+        self.ownership.release();
+    }
+
     pub fn start(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
@@ -4286,7 +4297,7 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(runtime.alloc, runtime.config, raw, request) catch null;
+        const source_parts = try renderSourceParts(runtime.alloc, runtime.config, raw, request);
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
@@ -6359,12 +6370,10 @@ fn extractSourceText(
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         // Render via Handlebars template
-        const rendered = template_remote.renderJsonToTextWithConfig(
-            alloc,
-            request.source_template,
-            raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content),
-        ) catch return null;
+        const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
@@ -6381,6 +6390,28 @@ fn extractSourceText(
     return try alloc.dupe(u8, source.string);
 }
 
+fn renderSourceTemplateText(
+    alloc: Allocator,
+    config: Config,
+    raw_doc: []const u8,
+    source_template: []const u8,
+) ![]const u8 {
+    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
+        return try template_remote.renderJsonToValidatedTextWithConfig(
+            alloc,
+            source_template,
+            raw_doc,
+            remoteRenderConfig(config.secret_store, config.remote_content),
+        );
+    }
+    return try template_remote.renderJsonToTextWithConfig(
+        alloc,
+        source_template,
+        raw_doc,
+        remoteRenderConfig(config.secret_store, config.remote_content),
+    );
+}
+
 fn extractAssetSourceValue(
     alloc: Allocator,
     config: Config,
@@ -6388,12 +6419,10 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
-        const rendered = template_remote.renderJsonToTextWithConfig(
-            alloc,
-            request.source_template,
-            raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content),
-        ) catch return null;
+        const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
@@ -6429,9 +6458,15 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch return null
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        }
     else
-        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch return null;
+        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
     if (parts.len == 0) {
         template.freeContentParts(alloc, parts);
         return null;
@@ -6764,6 +6799,19 @@ test "extractSourceText with template and invalid JSON returns null" {
     };
     const result = try extractSourceText(alloc, .{}, "not json", request);
     try std.testing.expect(result == null);
+}
+
+test "enrichment extractSourceText with template error directive fails instead of returning text" {
+    const alloc = std.testing.allocator;
+    const doc = "{\"body\":\"large image description\"}";
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .source_template = "<<<error:status=413 message=StreamTooLong>>> fallback text",
+    };
+    try std.testing.expectError(error.PermanentPromptFailure, extractSourceText(alloc, .{}, doc, request));
 }
 
 test "extractSourceText with template and scrubHtml helper" {

@@ -2772,8 +2772,11 @@ pub fn build(b: *std.Build) void {
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned table write cache retires stale db when index metadata changes",
+        "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
+        "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
@@ -3024,12 +3027,15 @@ pub fn build(b: *std.Build) void {
         "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime data changes mark provisioned startup catch-up dirty",
+        "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "data runtime live writer source follows raft apply ownership",
         "data runtime local split fallback preserves source identity namespace",
+        "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data runtime resolves extension package store env before local default",
         "data runtime cli accepts ARD identity flags",
@@ -3061,6 +3067,7 @@ pub fn build(b: *std.Build) void {
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "db split destination read-only open does not create missing root",
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db merge coordinator opt-in applies configured receiver identity namespace",
@@ -3492,6 +3499,7 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
+        "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
         "api http server serves public transaction commit route",
@@ -3516,6 +3524,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
+        "api http server forwards cluster backup mutations to metadata leader",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "public API request body limit matches Go linear merge contract",
@@ -3561,6 +3570,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves user management routes when auth is enabled",
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
+            "document artifact routes declare read and admin permissions",
             "api http server serves mcp and a2a protocol surfaces",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
             "api http server requires auth for ARD tenant catalog when auth is enabled",
@@ -3794,13 +3804,25 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a portable local table",
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
+            "provisioned table restore retry skips exact incomplete restore state with active writer",
             "provisioned restore repair open rejects stale doc identity namespace",
-            "write cache reserves retirement slots when pruning multiple leased generations",
+            "write cache blocks same-root generation replacement while stale lease stays live",
+            "provisioned create index updates cached writer in place",
+            "write cache metadata refresh preserves inactive adoptable seed",
+            "write cache adopts active just-created db across generation bump",
+            "runtime status collection leaves active stale write lease live",
             "primary lookup adopts seeded write cache across visible generation bump",
+            "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
+            "managed startup catch-up repeats replay while dense debt progresses",
+            "provisioned group storage wires remote content to writer caches",
+            "startup runtime status snapshot publishes live db when active cache is empty",
+            "best effort startup runtime status publishes live db when cache is empty",
+            "idle startup runtime status publish is live when startup flag is still set",
+            "managed startup catch-up uses provided indexes json without catalog fetch",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3823,6 +3845,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
+            "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
@@ -3867,6 +3890,8 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
+    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
