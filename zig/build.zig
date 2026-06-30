@@ -2249,6 +2249,19 @@ pub fn build(b: *std.Build) void {
     const lib_chunking_test_step = b.step("lib-chunking-test", "Run standalone lib/chunking tests");
     lib_chunking_test_step.dependOn(&run_lib_chunking_tests.step);
 
+    const antfly_chunking_provider_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/chunking_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, antfly_chunking_provider_test_mod, false, true);
+    const antfly_chunking_provider_tests = b.addTest(.{
+        .root_module = antfly_chunking_provider_test_mod,
+    });
+    const run_antfly_chunking_provider_tests = b.addRunArtifact(antfly_chunking_provider_tests);
+    const antfly_chunking_provider_test_step = b.step("antfly-chunking-provider-test", "Run Antfly chunking provider tests");
+    antfly_chunking_provider_test_step.dependOn(&run_antfly_chunking_provider_tests.step);
+
     const lib_readers_tests = b.addTest(.{
         .root_module = readers_mod,
     });
@@ -4017,6 +4030,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
     unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
+    unit_test_step.dependOn(&run_antfly_chunking_provider_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);

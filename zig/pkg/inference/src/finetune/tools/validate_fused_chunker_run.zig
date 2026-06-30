@@ -30,6 +30,7 @@ const Options = struct {
     min_steps: usize = 1,
     min_fixed_f1: ?f64 = null,
     min_best_f1: ?f64 = null,
+    min_mean_positive_probability_gap: ?f64 = null,
     max_avg_step_ms: ?f64 = null,
     max_peak_rss_bytes: ?usize = null,
     max_vjp_fallbacks: u64 = 0,
@@ -66,6 +67,8 @@ const MetricsInspection = struct {
     non_mpsgraph_vjp_step_count: usize = 0,
     best_fixed_f1: f64 = 0,
     best_threshold_f1: f64 = 0,
+    probability_gap_count: usize = 0,
+    min_mean_positive_probability_gap: f64 = std.math.inf(f64),
 
     fn avgStepMs(self: MetricsInspection) f64 {
         if (self.step_count == 0) return 0;
@@ -105,6 +108,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !?Options {
             opts.min_fixed_f1 = try std.fmt.parseFloat(f64, args.next() orelse return error.MissingMinFixedF1);
         } else if (std.mem.eql(u8, arg, "--min-best-f1")) {
             opts.min_best_f1 = try std.fmt.parseFloat(f64, args.next() orelse return error.MissingMinBestF1);
+        } else if (std.mem.eql(u8, arg, "--min-mean-positive-probability-gap")) {
+            opts.min_mean_positive_probability_gap = try std.fmt.parseFloat(f64, args.next() orelse return error.MissingMinMeanPositiveProbabilityGap);
         } else if (std.mem.eql(u8, arg, "--max-avg-step-ms")) {
             opts.max_avg_step_ms = try std.fmt.parseFloat(f64, args.next() orelse return error.MissingMaxAvgStepMs);
         } else if (std.mem.eql(u8, arg, "--max-peak-rss-gb")) {
@@ -165,6 +170,10 @@ fn validate(allocator: std.mem.Allocator, opts: Options) !void {
     if (opts.min_best_f1) |min_f1| {
         if (metrics.best_threshold_f1 < min_f1) return error.BestF1BelowThreshold;
     }
+    if (opts.min_mean_positive_probability_gap) |min_gap| {
+        if (metrics.probability_gap_count == 0) return error.MissingBoundaryProbabilityDiagnostics;
+        if (metrics.min_mean_positive_probability_gap < min_gap) return error.BoundaryProbabilityGapBelowThreshold;
+    }
     if (opts.max_avg_step_ms) |max_ms| {
         if (metrics.avgStepMs() > max_ms) return error.AvgStepMsAboveThreshold;
     }
@@ -189,6 +198,7 @@ fn validate(allocator: std.mem.Allocator, opts: Options) !void {
         .mpsgraph_vjp_steps = metrics.mpsgraph_step_count,
         .best_fixed_f1 = metrics.best_fixed_f1,
         .best_threshold_f1 = metrics.best_threshold_f1,
+        .min_mean_positive_probability_gap = if (metrics.probability_gap_count > 0) metrics.min_mean_positive_probability_gap else null,
         .first_loss = metrics.first_loss,
         .final_loss = metrics.final_loss,
     }, .{ .whitespace = .indent_2 }, &stdout.interface);
@@ -258,6 +268,14 @@ fn inspectMetrics(allocator: std.mem.Allocator, path: []const u8) !MetricsInspec
             out.validation_count += 1;
             out.best_fixed_f1 = @max(out.best_fixed_f1, jsonF64(obj.get("f1")) orelse 0);
             out.best_threshold_f1 = @max(out.best_threshold_f1, jsonF64(obj.get("best_f1")) orelse 0);
+            if (jsonF64(obj.get("mean_positive_probability_gold_positive"))) |pos| {
+                if (jsonF64(obj.get("mean_positive_probability_gold_negative"))) |neg| {
+                    if (std.math.isFinite(pos) and std.math.isFinite(neg)) {
+                        out.probability_gap_count += 1;
+                        out.min_mean_positive_probability_gap = @min(out.min_mean_positive_probability_gap, pos - neg);
+                    }
+                }
+            }
         }
     }
     return out;
@@ -345,6 +363,8 @@ fn usage() void {
         \\  --min-steps <n>            Minimum step records (default: 1)
         \\  --min-fixed-f1 <f>         Minimum fixed-threshold validation F1
         \\  --min-best-f1 <f>          Minimum best-threshold validation F1
+        \\  --min-mean-positive-probability-gap <f>
+        \\                             Minimum mean P(boundary) gap for gold-positive minus gold-negative labels
         \\  --max-avg-step-ms <f>      Maximum average step wall time
         \\  --max-peak-rss-gb <f>      Maximum peak RSS in GiB
         \\  --max-vjp-fallbacks <n>    Maximum VJP interpreter fallbacks (default: 0)

@@ -46,6 +46,26 @@ components:
           type: integer
           description: "Animation: display delay in milliseconds"
 
+    SparseVector:
+      type: object
+      description: "A sparse vector with parallel index/value arrays, sorted by index ascending."
+      required:
+        - indices
+        - values
+      properties:
+        indices:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: "Token IDs from the model vocabulary."
+        values:
+          type: array
+          items:
+            type: number
+            format: float
+          description: "Corresponding positive weights for each index."
+
     Chunk:
       description: "A chunk of content. Text chunks have mime_type text/plain."
       allOf:
@@ -64,6 +84,33 @@ components:
             mime_type:
               type: string
               description: "MIME type: text/plain, audio/wav, image/png, etc."
+            start_token:
+              type: integer
+              description: "Token position in the model input where this chunk starts."
+            end_token:
+              type: integer
+              description: "Token position in the model input where this chunk ends (exclusive)."
+            boundary_score:
+              type: number
+              format: float
+              description: "Model confidence for the boundary that starts this chunk."
+            embedding:
+              type: array
+              items:
+                type: number
+                format: float
+              description: "Optional contextual dense embedding for this chunk."
+            embedding_dimension:
+              type: integer
+              description: "Dimension of the returned contextual dense embedding."
+            sparse_embedding:
+              $ref: "#/components/schemas/SparseVector"
+            model_version:
+              type: string
+              description: "Chunker model or checkpoint version that produced this chunk."
+            artifact_family:
+              type: string
+              description: "Artifact family/version for the model that produced this chunk."
 
     TextChunkOptions:
       type: object
@@ -101,6 +148,24 @@ components:
           type: number
           format: float
           description: "Confidence threshold for model-based chunking (0.0-1.0)."
+        include_embeddings:
+          type: boolean
+          description: "Return contextual dense embeddings for each chunk when the selected chunker supports them."
+          default: false
+        include_sparse:
+          type: boolean
+          description: "Return SPLADE sparse embeddings for each chunk when the selected chunker supports them."
+          default: false
+        output_dimension:
+          type: integer
+          description: "Requested dense embedding dimension for Matryoshka-capable chunker models."
+        sparse_top_k:
+          type: integer
+          description: "Maximum number of non-zero SPLADE entries to return per chunk."
+        include_boundary_scores:
+          type: boolean
+          description: "Return model boundary scores for each chunk when available."
+          default: false
         text:
           $ref: "#/components/schemas/TextChunkOptions"
         audio:

@@ -69,6 +69,11 @@ pub const Config = struct {
     full_text_index_json: []const u8 = "",
     max_chunks: u32 = 0,
     threshold: ?f32 = null,
+    include_embeddings: bool = false,
+    include_sparse: bool = false,
+    output_dimension: u32 = 0,
+    sparse_top_k: u32 = 0,
+    include_boundary_scores: bool = false,
     text: TextChunkOptions = .{},
     audio: AudioChunkOptions = .{},
 
@@ -81,6 +86,11 @@ pub const Config = struct {
             .full_text_index_json = if (self.full_text_index_json.len > 0) try alloc.dupe(u8, self.full_text_index_json) else "",
             .max_chunks = self.max_chunks,
             .threshold = self.threshold,
+            .include_embeddings = self.include_embeddings,
+            .include_sparse = self.include_sparse,
+            .output_dimension = self.output_dimension,
+            .sparse_top_k = self.sparse_top_k,
+            .include_boundary_scores = self.include_boundary_scores,
             .text = try self.text.clone(alloc),
             .audio = self.audio,
         };
@@ -182,6 +192,17 @@ fn configFromOpenApi(
         else
             0,
         .threshold = chunk_options.threshold,
+        .include_embeddings = chunk_options.include_embeddings orelse false,
+        .include_sparse = chunk_options.include_sparse orelse false,
+        .output_dimension = if (chunk_options.output_dimension) |dim|
+            std.math.cast(u32, dim) orelse return error.InvalidChunkerConfig
+        else
+            0,
+        .sparse_top_k = if (chunk_options.sparse_top_k) |top_k|
+            std.math.cast(u32, top_k) orelse return error.InvalidChunkerConfig
+        else
+            0,
+        .include_boundary_scores = chunk_options.include_boundary_scores orelse false,
         .text = try textChunkOptionsFromOpenApi(alloc, chunk_options.text),
         .audio = try audioChunkOptionsFromOpenApi(chunk_options.audio),
     };
@@ -231,6 +252,11 @@ const CombinedChunkerConfig = struct {
     full_text_index: ?json.Value = null,
     max_chunks: ?u32 = null,
     threshold: ?f32 = null,
+    include_embeddings: ?bool = null,
+    include_sparse: ?bool = null,
+    output_dimension: ?u32 = null,
+    sparse_top_k: ?u32 = null,
+    include_boundary_scores: ?bool = null,
     text: ?api_openapi.TextChunkOptions = null,
     audio: ?api_openapi.AudioChunkOptions = null,
 };
@@ -243,6 +269,11 @@ fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
     return .{
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
+        .include_embeddings = if (cfg.include_embeddings) true else null,
+        .include_sparse = if (cfg.include_sparse) true else null,
+        .output_dimension = if (cfg.output_dimension > 0) cfg.output_dimension else null,
+        .sparse_top_k = if (cfg.sparse_top_k > 0) cfg.sparse_top_k else null,
+        .include_boundary_scores = if (cfg.include_boundary_scores) true else null,
         .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
             .overlap_tokens = if (cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,

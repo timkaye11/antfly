@@ -48,6 +48,7 @@ memory_warn_rss_gb="${ANTFLY_FUSED_CHUNKER_MEMORY_WARN_RSS_GB:-36}"
 max_avg_step_ms="${ANTFLY_FUSED_CHUNKER_MAX_AVG_STEP_MS:-12000}"
 max_peak_rss_gb="${ANTFLY_FUSED_CHUNKER_MAX_PEAK_RSS_GB:-44}"
 require_encoder_neftune="${ANTFLY_FUSED_CHUNKER_REQUIRE_ENCODER_NEFTUNE:-0}"
+min_probability_gap="${ANTFLY_FUSED_CHUNKER_MIN_PROBABILITY_GAP:-0}"
 
 case "$mode" in
   probe)
@@ -81,7 +82,12 @@ export ANTFLY_FUSED_CHUNKER_ENCODER_VJP_EXECUTION="${ANTFLY_FUSED_CHUNKER_ENCODE
 export TERMITE_MPSGRAPH_SMOKE="${TERMITE_MPSGRAPH_SMOKE:-1}"
 
 echo "fused chunker readiness mode=$mode out_dir=$out_dir log=$log_path"
-echo "gates min_steps=$min_steps min_fixed_f1=$min_fixed_f1 min_best_f1=$min_best_f1 max_avg_step_ms=$max_avg_step_ms max_peak_rss_gb=$max_peak_rss_gb require_encoder_neftune=$require_encoder_neftune"
+echo "gates min_steps=$min_steps min_fixed_f1=$min_fixed_f1 min_best_f1=$min_best_f1 min_probability_gap=$min_probability_gap max_avg_step_ms=$max_avg_step_ms max_peak_rss_gb=$max_peak_rss_gb require_encoder_neftune=$require_encoder_neftune"
+
+probability_gap_args=()
+if [[ "$min_probability_gap" != "skip" ]]; then
+  probability_gap_args=(--min-mean-positive-probability-gap "$min_probability_gap")
+fi
 
 if [[ "$skip_batch_parity" != "1" ]]; then
   ANTFLY_FUSED_CHUNKER_PARITY_DATA="$train_data" \
@@ -110,6 +116,7 @@ fi
     --min-steps "$min_steps" \
     --min-fixed-f1 "$min_fixed_f1" \
     --min-best-f1 "$min_best_f1" \
+    "${probability_gap_args[@]}" \
     --max-avg-step-ms "$max_avg_step_ms" \
     --max-peak-rss-gb "$max_peak_rss_gb" \
     ${ANTFLY_FUSED_CHUNKER_REQUIRE_COMPLETE:+--require-complete}

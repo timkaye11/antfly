@@ -1,0 +1,41 @@
+{
+  "schema_version": "fused_chunker_benchmark_results/v1",
+  "fixture": true,
+  "boundary_f1": {
+    "internal_phase20_best_f1": 0.8,
+    "fixed_threshold_f1": 0.78,
+    "best_threshold_f1": 0.8,
+    "dataset_results": [
+      {
+        "name": "bookcorpus",
+        "f1": 0.82
+      },
+      {
+        "name": "en_judgements",
+        "f1": 0.32
+      },
+      {
+        "name": "paul_graham",
+        "f1": 0.72
+      },
+      {
+        "name": "20_newsgroups",
+        "f1": 0.2
+      }
+    ]
+  },
+  "retrieval_ndcg": {
+    "output_dimension": 256,
+    "overall_ndcg_at_10": 0.74,
+    "baselines": [
+      {
+        "name": "fixed_500_50_same_encoder",
+        "overall_ndcg_at_10": 0.68
+      },
+      {
+        "name": "chonky_boundaries_same_encoder",
+        "overall_ndcg_at_10": 0.7
+      }
+    ]
+  }
+}

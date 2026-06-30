@@ -713,6 +713,14 @@ fn runEvalProgram(allocator: std.mem.Allocator, io: std.Io, program: []const u8)
     return if (result.success) result.exit_code orelse 0 else error.EvalFailed;
 }
 
+fn childSignalCode(signal: anytype) u32 {
+    return switch (@typeInfo(@TypeOf(signal))) {
+        .@"enum" => @intFromEnum(signal),
+        .int, .comptime_int => @intCast(signal),
+        else => @compileError("unsupported child signal payload type"),
+    };
+}
+
 pub fn runEvalCapture(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -734,7 +742,7 @@ pub fn runEvalCapture(
         .signal => |sig| .{
             .phase = phase,
             .term = "signal",
-            .signal = @intFromEnum(sig),
+            .signal = childSignalCode(sig),
             .stdout = result.stdout,
             .stderr = result.stderr,
             .success = false,
@@ -742,7 +750,7 @@ pub fn runEvalCapture(
         .stopped => |sig| .{
             .phase = phase,
             .term = "stopped",
-            .signal = @intFromEnum(sig),
+            .signal = childSignalCode(sig),
             .stdout = result.stdout,
             .stderr = result.stderr,
             .success = false,

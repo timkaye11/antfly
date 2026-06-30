@@ -1,0 +1,80 @@
+{
+  "schema_version": "fused_chunker_eval_manifest/v1",
+  "result_schema_version": "fused_chunker_benchmark_results/v1",
+  "boundary_f1": {
+    "metric": "separator_exact_f1",
+    "source": "https://github.com/mirth/chonky",
+    "token_limit_per_dataset": 1000000,
+    "datasets": [
+      {
+        "name": "bookcorpus",
+        "splitter": "chonky_generate_eval_datasets",
+        "chonky_large_f1": 0.79,
+        "chonky_base_f1": 0.72
+      },
+      {
+        "name": "en_judgements",
+        "splitter": "chonky_generate_eval_datasets",
+        "chonky_large_f1": 0.29,
+        "chonky_base_f1": 0.08
+      },
+      {
+        "name": "paul_graham",
+        "splitter": "chonky_generate_eval_datasets",
+        "chonky_large_f1": 0.69,
+        "chonky_base_f1": 0.63
+      },
+      {
+        "name": "20_newsgroups",
+        "splitter": "chonky_generate_eval_datasets",
+        "chonky_large_f1": 0.17,
+        "chonky_base_f1": 0.15
+      }
+    ],
+    "release_gate": {
+      "min_internal_phase20_best_f1": 0.78,
+      "fixed_threshold_max_delta_from_best_f1": 0.03,
+      "must_beat_chonky_base_each_dataset": true,
+      "must_match_or_beat_chonky_large_mean": true
+    }
+  },
+  "retrieval_ndcg": {
+    "metric": "ndcg_at_10",
+    "source": "https://blog.voyageai.com/2026/06/29/voyage-context-4/",
+    "external_target_sheet": "https://docs.google.com/spreadsheets/d/12qJvkUIcjQiP_w8QjVaGy1FWq3d0yeLLzz3mSAmQzXM/edit?gid=1142553667#gid=1142553667",
+    "local_claim_policy": "open_reproducible_only",
+    "modes": [
+      "single_embedding",
+      "contextual_chunk_embedding",
+      "splade_only",
+      "dense_splade_hybrid"
+    ],
+    "domains": [
+      "technical_docs",
+      "web",
+      "code",
+      "medical",
+      "conversation",
+      "law",
+      "finance",
+      "long_context"
+    ],
+    "baselines": [
+      "fixed_500_50_same_encoder",
+      "chonky_boundaries_same_encoder",
+      "dense_only_contextual_chunks",
+      "splade_only",
+      "dense_splade_rrf"
+    ],
+    "external_targets": {
+      "voyage_context_4_chunk_embedding_overall_ndcg_at_10": 0.844,
+      "voyage_context_4_1024d_chunk_embedding_overall_ndcg_at_10": 0.8381,
+      "voyage_context_4_512d_chunk_embedding_overall_ndcg_at_10": 0.8266,
+      "voyage_context_4_256d_chunk_embedding_overall_ndcg_at_10": 0.8054
+    },
+    "release_gate": {
+      "min_relative_gain_over_best_local_baseline": 0.05,
+      "must_report_distance_to_external_voyage_target": true
+    }
+  }
+}

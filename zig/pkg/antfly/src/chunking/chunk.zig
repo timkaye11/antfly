@@ -86,24 +86,24 @@ pub fn appendArtifactFieldsWithProvenance(
     include_payload: bool,
     provenance: ProvenanceOptions,
 ) !void {
-    try obj.put(alloc, try alloc.dupe(u8, "_chunk_id"), .{ .integer = chunk.chunk_id });
-    try obj.put(alloc, try alloc.dupe(u8, "_mime_type"), .{ .string = try alloc.dupe(u8, chunk.mime_type) });
-    if (chunk.start_offset) |value| try obj.put(alloc, try alloc.dupe(u8, "_start_offset"), .{ .integer = value });
-    if (chunk.end_offset) |value| try obj.put(alloc, try alloc.dupe(u8, "_end_offset"), .{ .integer = value });
-    if (chunk.start_time_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_start_time_ms"), .{ .float = value });
-    if (chunk.end_time_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_end_time_ms"), .{ .float = value });
-    if (chunk.frame_index) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_index"), .{ .integer = value });
-    if (chunk.frame_delay_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_delay_ms"), .{ .integer = value });
+    try obj.put(try alloc.dupe(u8, "_chunk_id"), .{ .integer = chunk.chunk_id });
+    try obj.put(try alloc.dupe(u8, "_mime_type"), .{ .string = try alloc.dupe(u8, chunk.mime_type) });
+    if (chunk.start_offset) |value| try obj.put(try alloc.dupe(u8, "_start_offset"), .{ .integer = value });
+    if (chunk.end_offset) |value| try obj.put(try alloc.dupe(u8, "_end_offset"), .{ .integer = value });
+    if (chunk.start_time_ms) |value| try obj.put(try alloc.dupe(u8, "_start_time_ms"), .{ .float = value });
+    if (chunk.end_time_ms) |value| try obj.put(try alloc.dupe(u8, "_end_time_ms"), .{ .float = value });
+    if (chunk.frame_index) |value| try obj.put(try alloc.dupe(u8, "_frame_index"), .{ .integer = value });
+    if (chunk.frame_delay_ms) |value| try obj.put(try alloc.dupe(u8, "_frame_delay_ms"), .{ .integer = value });
     try appendProvenanceFields(alloc, obj, source_field, chunk, provenance);
 
     if (!include_payload) return;
 
     if (chunk.text) |text| {
-        try obj.put(alloc, try alloc.dupe(u8, source_field), .{ .string = try alloc.dupe(u8, text) });
+        try obj.put(try alloc.dupe(u8, source_field), .{ .string = try alloc.dupe(u8, text) });
     } else if (chunk.data) |data| {
         const encoded = try base64EncodeAlloc(alloc, data);
         errdefer alloc.free(encoded);
-        try obj.put(alloc, try alloc.dupe(u8, "_data"), .{ .string = encoded });
+        try obj.put(try alloc.dupe(u8, "_data"), .{ .string = encoded });
     }
 }
 
@@ -114,14 +114,14 @@ fn appendProvenanceFields(
     chunk: Chunk,
     options: ProvenanceOptions,
 ) !void {
-    var provenance = std.json.ObjectMap.empty;
+    var provenance = std.json.ObjectMap.init(alloc);
     errdefer {
         var it = provenance.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
             freeJsonValue(alloc, entry.value_ptr.*);
         }
-        provenance.deinit(alloc);
+        provenance.deinit();
     }
 
     try putString(alloc, &provenance, "source_field", source_field);
@@ -133,46 +133,46 @@ fn appendProvenanceFields(
     if (options.parent_unit_key) |value| try putString(alloc, &provenance, "parent_unit_key", value);
     if (options.parent_unit_id) |value| try putString(alloc, &provenance, "parent_unit_id", value);
     if (options.source_artifact_name) |value| try putString(alloc, &provenance, "source_artifact_name", value);
-    if (options.page_number) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_number"), .{ .integer = value });
+    if (options.page_number) |value| try provenance.put(try alloc.dupe(u8, "page_number"), .{ .integer = value });
     if (options.page_label) |value| try putString(alloc, &provenance, "page_label", value);
-    if (options.page_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
-    if (options.page_rotation) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
+    if (options.page_bbox) |bbox| try provenance.put(try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
+    if (options.page_rotation) |value| try provenance.put(try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
     if (options.extraction_status) |value| try putString(alloc, &provenance, "extraction_status", value);
-    if (options.confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
-    try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
-    if (options.ocr_confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
-    if (options.ocr_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
-    try provenance.put(alloc, try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
-    if (options.transcript_confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "transcript_confidence"), .{ .float = value });
+    if (options.confidence) |value| try provenance.put(try alloc.dupe(u8, "confidence"), .{ .float = value });
+    try provenance.put(try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
+    if (options.ocr_confidence) |value| try provenance.put(try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
+    if (options.ocr_bbox) |bbox| try provenance.put(try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
+    try provenance.put(try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
+    if (options.transcript_confidence) |value| try provenance.put(try alloc.dupe(u8, "transcript_confidence"), .{ .float = value });
     if (options.extraction_warning) |value| try putString(alloc, &provenance, "extraction_warning", value);
     try appendFormatProvenance(alloc, &provenance, options);
 
     if (chunk.start_offset) |start| {
-        try provenance.put(alloc, try alloc.dupe(u8, "char_start"), .{ .integer = start });
+        try provenance.put(try alloc.dupe(u8, "char_start"), .{ .integer = start });
         switch (options.scope) {
-            .document => try provenance.put(alloc, try alloc.dupe(u8, "document_char_start"), .{ .integer = start }),
+            .document => try provenance.put(try alloc.dupe(u8, "document_char_start"), .{ .integer = start }),
             .unit => {
-                try provenance.put(alloc, try alloc.dupe(u8, "unit_char_start"), .{ .integer = start });
+                try provenance.put(try alloc.dupe(u8, "unit_char_start"), .{ .integer = start });
                 if (options.document_char_base) |base| {
-                    try provenance.put(alloc, try alloc.dupe(u8, "document_char_start"), .{ .integer = @as(i64, @intCast(base)) + @as(i64, @intCast(start)) });
+                    try provenance.put(try alloc.dupe(u8, "document_char_start"), .{ .integer = @as(i64, @intCast(base)) + @as(i64, @intCast(start)) });
                 }
             },
         }
     }
     if (chunk.end_offset) |end| {
-        try provenance.put(alloc, try alloc.dupe(u8, "char_end"), .{ .integer = end });
+        try provenance.put(try alloc.dupe(u8, "char_end"), .{ .integer = end });
         switch (options.scope) {
-            .document => try provenance.put(alloc, try alloc.dupe(u8, "document_char_end"), .{ .integer = end }),
+            .document => try provenance.put(try alloc.dupe(u8, "document_char_end"), .{ .integer = end }),
             .unit => {
-                try provenance.put(alloc, try alloc.dupe(u8, "unit_char_end"), .{ .integer = end });
+                try provenance.put(try alloc.dupe(u8, "unit_char_end"), .{ .integer = end });
                 if (options.document_char_base) |base| {
-                    try provenance.put(alloc, try alloc.dupe(u8, "document_char_end"), .{ .integer = @as(i64, @intCast(base)) + @as(i64, @intCast(end)) });
+                    try provenance.put(try alloc.dupe(u8, "document_char_end"), .{ .integer = @as(i64, @intCast(base)) + @as(i64, @intCast(end)) });
                 }
             },
         }
     }
 
-    try obj.put(alloc, try alloc.dupe(u8, "provenance"), .{ .object = provenance });
+    try obj.put(try alloc.dupe(u8, "provenance"), .{ .object = provenance });
 }
 
 fn appendFormatProvenance(
@@ -182,37 +182,37 @@ fn appendFormatProvenance(
 ) !void {
     if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and options.ocr_confidence == null and options.ocr_bbox == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
-    var format = std.json.ObjectMap.empty;
+    var format = std.json.ObjectMap.init(alloc);
     errdefer {
         var it = format.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
             freeJsonValue(alloc, entry.value_ptr.*);
         }
-        format.deinit(alloc);
+        format.deinit();
     }
 
     try putString(alloc, &format, "schema", "antfly.document_format_provenance.v1");
     try putString(alloc, &format, "coordinate_system", "source_page_points");
     try putString(alloc, &format, "extraction_method", options.extraction_method orelse "mechanical_text");
     if (options.extraction_status) |value| try putString(alloc, &format, "extraction_status", value);
-    if (options.confidence) |value| try format.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
-    try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
-    if (options.ocr_confidence) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
-    if (options.ocr_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
-    try format.put(alloc, try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
-    if (options.transcript_confidence) |value| try format.put(alloc, try alloc.dupe(u8, "transcript_confidence"), .{ .float = value });
+    if (options.confidence) |value| try format.put(try alloc.dupe(u8, "confidence"), .{ .float = value });
+    try format.put(try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
+    if (options.ocr_confidence) |value| try format.put(try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
+    if (options.ocr_bbox) |bbox| try format.put(try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
+    try format.put(try alloc.dupe(u8, "transcript_used"), .{ .bool = options.transcript_used });
+    if (options.transcript_confidence) |value| try format.put(try alloc.dupe(u8, "transcript_confidence"), .{ .float = value });
     if (options.extraction_warning) |value| try putString(alloc, &format, "extraction_warning", value);
-    if (options.page_number) |value| try format.put(alloc, try alloc.dupe(u8, "page_number"), .{ .integer = value });
+    if (options.page_number) |value| try format.put(try alloc.dupe(u8, "page_number"), .{ .integer = value });
     if (options.page_label) |value| try putString(alloc, &format, "page_label", value);
-    if (options.page_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
-    if (options.page_rotation) |value| try format.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
+    if (options.page_bbox) |bbox| try format.put(try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
+    if (options.page_rotation) |value| try format.put(try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
 
-    try provenance.put(alloc, try alloc.dupe(u8, "format_provenance"), .{ .object = format });
+    try provenance.put(try alloc.dupe(u8, "format_provenance"), .{ .object = format });
 }
 
 fn putString(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try obj.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
+    try obj.put(try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
 }
 
 fn jsonFloatArrayAlloc(alloc: Allocator, values: []const f64) !std.json.Array {
@@ -231,14 +231,14 @@ fn base64EncodeAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
 
 test "append artifact fields stores text offsets and payload" {
     const alloc = std.testing.allocator;
-    var obj = std.json.ObjectMap.empty;
+    var obj = std.json.ObjectMap.init(alloc);
     defer {
         var it = obj.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
             freeJsonValue(alloc, entry.value_ptr.*);
         }
-        obj.deinit(alloc);
+        obj.deinit();
     }
 
     const chunk = Chunk{
@@ -268,14 +268,14 @@ test "append artifact fields stores text offsets and payload" {
 
 test "append artifact fields stores unit-local and document-global provenance" {
     const alloc = std.testing.allocator;
-    var obj = std.json.ObjectMap.empty;
+    var obj = std.json.ObjectMap.init(alloc);
     defer {
         var it = obj.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
             freeJsonValue(alloc, entry.value_ptr.*);
         }
-        obj.deinit(alloc);
+        obj.deinit();
     }
 
     const chunk = Chunk{
@@ -329,14 +329,14 @@ test "append artifact fields stores unit-local and document-global provenance" {
 
 test "append artifact fields stores binary metadata and base64 payload" {
     const alloc = std.testing.allocator;
-    var obj = std.json.ObjectMap.empty;
+    var obj = std.json.ObjectMap.init(alloc);
     defer {
         var it = obj.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
             freeJsonValue(alloc, entry.value_ptr.*);
         }
-        obj.deinit(alloc);
+        obj.deinit();
     }
 
     const chunk = Chunk{
@@ -371,7 +371,7 @@ fn freeJsonValue(alloc: Allocator, value: std.json.Value) void {
                 alloc.free(entry.key_ptr.*);
                 freeJsonValue(alloc, entry.value_ptr.*);
             }
-            mutable.deinit(alloc);
+            mutable.deinit();
         },
         else => {},
     }

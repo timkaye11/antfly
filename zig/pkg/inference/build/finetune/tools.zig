@@ -182,6 +182,42 @@ const commands = [_]common.CommandSpec{
         .imports = &.{.termite_io_compat},
     },
     .{
+        .name = "verify-fused-chunker-benchmark",
+        .root_source_file = "src/finetune/tools/verify_fused_chunker_benchmark.zig",
+        .description = "Verify fused-chunker benchmark results against Chonky F1 and Voyage-style NDCG@10 gates",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "aggregate-fused-chunker-benchmark",
+        .root_source_file = "src/finetune/tools/aggregate_fused_chunker_benchmark.zig",
+        .description = "Aggregate per-dataset fused-chunker benchmark JSON results into a verifier-ready result file",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "prepare-fused-chunker-boundary-eval",
+        .root_source_file = "src/finetune/tools/prepare_fused_chunker_boundary_eval.zig",
+        .description = "Materialize Chonky-compatible token/paragraph boundary data into fused-chunker eval JSONL",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "score-fused-chunker-retrieval-benchmark",
+        .root_source_file = "src/finetune/tools/score_fused_chunker_retrieval_benchmark.zig",
+        .description = "Score ranked retrieval runs into Voyage-style fused-chunker NDCG@10 benchmark JSON",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "rank-fused-chunker-retrieval-benchmark",
+        .root_source_file = "src/finetune/tools/rank_fused_chunker_retrieval_benchmark.zig",
+        .description = "Rank query/doc dense and SPLADE embeddings into retrieval benchmark run JSONL",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "materialize-fused-chunker-retrieval-embeddings",
+        .root_source_file = "src/finetune/tools/materialize_fused_chunker_retrieval_embeddings.zig",
+        .description = "Normalize strict chunk/query dense and SPLADE responses into retrieval embedding JSONL",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
         .name = "convert-fused-chunker-checkpoint-for-go",
         .root_source_file = "src/finetune/tools/convert_fused_chunker_checkpoint_for_go.zig",
         .description = "Convert a Zig fused-chunker checkpoint to Go fused trainer SafeTensors names",

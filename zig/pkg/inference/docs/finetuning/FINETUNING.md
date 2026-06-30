@@ -617,6 +617,24 @@ Phase-20 runner forwards memory watchdog settings with
 `ANTFLY_FUSED_CHUNKER_MEMORY_WARN_RSS_GB` and
 `ANTFLY_FUSED_CHUNKER_MEMORY_ABORT_RSS_GB`; aborts save a
 `checkpoint_memory_abort_<step>.safetensors` checkpoint before failing.
+The wrapper also gates the validation probability ordering with
+`ANTFLY_FUSED_CHUNKER_MIN_PROBABILITY_GAP` (default `0`), which rejects the
+known collapse mode where gold-positive boundaries score below gold-negative
+boundaries. Set it to `skip` only when inspecting legacy artifacts that lack
+the probability diagnostics.
+
+Production graduation now has two explicit benchmark lanes under
+`evals/chunker/`: a chonky-compatible separator F1 lane over the first 1M
+tokens of each public dataset, and a Voyage-style retrieval lane reporting
+chunk/document `NDCG@10`. The standalone `eval-fused-chunker` binary reports
+`NDCG@10` alongside recall and MRR for dense chunk embeddings, and exposes
+separator-offset F1 helpers for chonky-compatible fixtures. The chunk API has
+optional request flags for contextual dense embeddings, SPLADE sparse vectors,
+output dimension, sparse top-k, and boundary scores; default fixed chunking
+responses are unchanged, but requests for learned boundaries, contextual dense
+embeddings, or SPLADE vectors must select a model-backed chunker. The fixed
+chunker now rejects those flags instead of returning null embedding fields that
+could accidentally be benchmarked as model output.
 
 | Feature | Fused Chunker | LayoutLMv3 Seq | LayoutLMv3 Token | Reranker LoRA | ColQwen2 | GLiNER2 LoRA | Gemma4 LoRA |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|

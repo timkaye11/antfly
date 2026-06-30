@@ -102,7 +102,7 @@ const Parser = struct {
         self.pos += 1;
         self.skipWhitespace();
 
-        var object = json.ObjectMap.empty;
+        var object = json.ObjectMap.init(self.allocator);
         errdefer {
             var temp: json.Value = .{ .object = object };
             deinitValue(self.allocator, &temp);
@@ -132,7 +132,7 @@ const Parser = struct {
                 var value_owned = true;
                 errdefer if (value_owned) deinitValue(self.allocator, &value);
 
-                const gop = try object.getOrPut(self.allocator, key);
+                const gop = try object.getOrPut(key);
                 if (gop.found_existing) {
                     switch (self.options.duplicate_field_behavior) {
                         .use_first => {
@@ -456,7 +456,7 @@ fn deinitValue(allocator: Allocator, value: *json.Value) void {
                 allocator.free(@constCast(entry.key_ptr.*));
                 deinitValue(allocator, entry.value_ptr);
             }
-            object.deinit(allocator);
+            object.deinit();
         },
         else => {},
     }

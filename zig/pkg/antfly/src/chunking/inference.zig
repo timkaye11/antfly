@@ -86,6 +86,11 @@ fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteI
     if (cfg.model.len > 0) fixed_cfg.model = cfg.model;
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
     fixed_cfg.threshold = cfg.threshold;
+    fixed_cfg.include_embeddings = cfg.include_embeddings;
+    fixed_cfg.include_sparse = cfg.include_sparse;
+    if (cfg.output_dimension > 0) fixed_cfg.output_dimension = cfg.output_dimension;
+    if (cfg.sparse_top_k > 0) fixed_cfg.sparse_top_k = cfg.sparse_top_k;
+    fixed_cfg.include_boundary_scores = cfg.include_boundary_scores;
     if (cfg.text.target_tokens > 0) fixed_cfg.text.target_tokens = @intCast(cfg.text.target_tokens);
     if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) fixed_cfg.text.overlap_tokens = @intCast(cfg.text.overlap_tokens);
     if (cfg.text.separator.len > 0) fixed_cfg.text.separator = cfg.text.separator;
@@ -109,23 +114,76 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
     }
 
     for (source, 0..) |chunk, i| {
-        chunks[i] = .{
+        var out = RemoteChunk{
             .id = chunk.id,
             .mime_type = try alloc.dupe(u8, chunk.mime_type),
-            .text = if (chunk.text) |text| try alloc.dupe(u8, text) else null,
+            .text = null,
             .start_char = chunk.start_char,
             .end_char = chunk.end_char,
-            .data = if (chunk.data) |data| try alloc.dupe(u8, data) else null,
+            .start_token = chunk.start_token,
+            .end_token = chunk.end_token,
+            .boundary_score = chunk.boundary_score,
+            .embedding = null,
+            .embedding_dimension = chunk.embedding_dimension,
+            .sparse_embedding = null,
+            .model_version = null,
+            .artifact_family = null,
+            .data = null,
             .start_time_ms = chunk.start_time_ms,
             .end_time_ms = chunk.end_time_ms,
             .frame_index = chunk.frame_index,
             .frame_delay_ms = chunk.frame_delay_ms,
-            .owns_text = chunk.text != null,
-            .owns_data = chunk.data != null,
+            .owns_text = false,
+            .owns_data = false,
+            .owns_embedding = false,
+            .owns_model_version = false,
+            .owns_artifact_family = false,
         };
+        errdefer {
+            alloc.free(@constCast(out.mime_type));
+            out.deinit(alloc);
+        }
+        if (chunk.text) |text| {
+            out.text = try alloc.dupe(u8, text);
+            out.owns_text = true;
+        }
+        if (chunk.data) |data| {
+            out.data = try alloc.dupe(u8, data);
+            out.owns_data = true;
+        }
+        if (chunk.embedding) |embedding| {
+            out.embedding = try alloc.dupe(f32, embedding);
+            out.owns_embedding = true;
+            if (out.embedding_dimension == null) out.embedding_dimension = std.math.cast(u32, embedding.len);
+        }
+        if (chunk.sparse_embedding) |sparse| {
+            out.sparse_embedding = try cloneSparseVector(alloc, sparse);
+        }
+        if (chunk.model_version) |model_version| {
+            out.model_version = try alloc.dupe(u8, model_version);
+            out.owns_model_version = true;
+        }
+        if (chunk.artifact_family) |artifact_family| {
+            out.artifact_family = try alloc.dupe(u8, artifact_family);
+            out.owns_artifact_family = true;
+        }
+        chunks[i] = out;
         initialized += 1;
     }
     return chunks;
+}
+
+fn cloneSparseVector(alloc: Allocator, sparse: inference_chunker.types.SparseVector) !inference_chunker.types.SparseVector {
+    const indices = try alloc.dupe(i32, sparse.indices);
+    errdefer alloc.free(indices);
+    const values = try alloc.dupe(f32, sparse.values);
+    errdefer alloc.free(values);
+    return .{
+        .indices = indices,
+        .values = values,
+        .owns_indices = true,
+        .owns_values = true,
+    };
 }
 
 pub fn freeRemoteChunks(alloc: Allocator, chunks: []RemoteChunk) void {
@@ -141,6 +199,11 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
         .model = cfg.model,
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
+        .include_embeddings = if (cfg.include_embeddings) true else null,
+        .include_sparse = if (cfg.include_sparse) true else null,
+        .output_dimension = if (cfg.output_dimension > 0) cfg.output_dimension else null,
+        .sparse_top_k = if (cfg.sparse_top_k > 0) cfg.sparse_top_k else null,
+        .include_boundary_scores = if (cfg.include_boundary_scores) true else null,
         .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
             .overlap_tokens = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,
@@ -180,6 +243,10 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
 }
 
 fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChunk {
+    const SparsePayload = struct {
+        indices: []const i32,
+        values: []const f32,
+    };
     const Response = struct {
         data: []const struct {
             id: i64,
@@ -187,6 +254,14 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
             text: ?[]const u8 = null,
             start_char: ?i64 = null,
             end_char: ?i64 = null,
+            start_token: ?i64 = null,
+            end_token: ?i64 = null,
+            boundary_score: ?f32 = null,
+            embedding: ?[]const f32 = null,
+            embedding_dimension: ?i64 = null,
+            sparse_embedding: ?SparsePayload = null,
+            model_version: ?[]const u8 = null,
+            artifact_family: ?[]const u8 = null,
             data: ?[]const u8 = null,
             start_time_ms: ?f32 = null,
             end_time_ms: ?f32 = null,
@@ -211,6 +286,14 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
             .text = null,
             .start_char = if (chunk.start_char) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
             .end_char = if (chunk.end_char) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
+            .start_token = if (chunk.start_token) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
+            .end_token = if (chunk.end_token) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
+            .boundary_score = chunk.boundary_score,
+            .embedding = null,
+            .embedding_dimension = if (chunk.embedding_dimension) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
+            .sparse_embedding = null,
+            .model_version = null,
+            .artifact_family = null,
             .data = null,
             .start_time_ms = chunk.start_time_ms,
             .end_time_ms = chunk.end_time_ms,
@@ -218,15 +301,37 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
             .frame_delay_ms = if (chunk.frame_delay_ms) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
             .owns_text = false,
             .owns_data = false,
+            .owns_embedding = false,
+            .owns_model_version = false,
+            .owns_artifact_family = false,
         };
         errdefer {
             if (out.mime_type.len > 0) alloc.free(@constCast(out.mime_type));
-            if (out.owns_text and out.text != null) alloc.free(out.text.?);
-            if (out.owns_data and out.data != null) alloc.free(out.data.?);
+            out.deinit(alloc);
         }
         if (chunk.text) |value| {
             out.text = try alloc.dupe(u8, value);
             out.owns_text = true;
+        }
+        if (chunk.embedding) |value| {
+            out.embedding = try alloc.dupe(f32, value);
+            out.owns_embedding = true;
+            if (out.embedding_dimension == null) out.embedding_dimension = std.math.cast(u32, value.len);
+        }
+        if (chunk.sparse_embedding) |value| {
+            if (value.indices.len != value.values.len) return error.InvalidChunkerResponse;
+            out.sparse_embedding = try cloneSparseVector(alloc, .{
+                .indices = value.indices,
+                .values = value.values,
+            });
+        }
+        if (chunk.model_version) |value| {
+            out.model_version = try alloc.dupe(u8, value);
+            out.owns_model_version = true;
+        }
+        if (chunk.artifact_family) |value| {
+            out.artifact_family = try alloc.dupe(u8, value);
+            out.owns_artifact_family = true;
         }
         if (chunk.data) |value| {
             out.data = try base64DecodeAlloc(alloc, value);
@@ -361,6 +466,70 @@ test "antfly chunker binary round trip" {
     try std.testing.expectEqual(@as(?u32, 0), chunks[0].frame_index);
     try std.testing.expectEqual(@as(?u32, 50), chunks[0].frame_delay_ms);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, chunks[0].data.?[0..8]);
+}
+
+test "antfly chunker preserves contextual embedding response fields" {
+    const alloc = std.testing.allocator;
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, req_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"include_embeddings\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"include_sparse\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"output_dimension\":256") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"sparse_top_k\":4") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"include_boundary_scores\":true") != null);
+            return .{
+                .status = 200,
+                .content_type = try req_alloc.dupe(u8, "application/json"),
+                .body = try req_alloc.dupe(u8,
+                    \\{"object":"list","data":[
+                    \\  {"object":"chunk","index":0,"id":0,"mime_type":"text/plain","text":"alpha body","start_char":0,"end_char":10,"start_token":1,"end_token":5,"boundary_score":0.91,"embedding":[0.5,0.25],"embedding_dimension":2,"sparse_embedding":{"indices":[7,11],"values":[1.25,0.75]},"model_version":"ckpt-1","artifact_family":"fused_chunker_embedder/v1"}
+                    \\],"model":"chunker-v1","usage":{"prompt_tokens":2,"completion_tokens":0,"total_tokens":2},"cache_hit":false}
+                ),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    const cfg = chunking_types.Config{
+        .provider = .antfly,
+        .api_url = base_uri,
+        .model = "chunker-v1",
+        .include_embeddings = true,
+        .include_sparse = true,
+        .output_dimension = 256,
+        .sparse_top_k = 4,
+        .include_boundary_scores = true,
+    };
+
+    const chunks = try chunkInput(alloc, cfg, .{ .text = "alpha beta" });
+    defer freeRemoteChunks(alloc, chunks);
+
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqual(@as(?u32, 1), chunks[0].start_token);
+    try std.testing.expectEqual(@as(?u32, 5), chunks[0].end_token);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.91), chunks[0].boundary_score.?, 1e-6);
+    try std.testing.expectEqual(@as(?u32, 2), chunks[0].embedding_dimension);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, chunks[0].embedding.?);
+    try std.testing.expectEqualSlices(i32, &.{ 7, 11 }, chunks[0].sparse_embedding.?.indices);
+    try std.testing.expectEqualSlices(f32, &.{ 1.25, 0.75 }, chunks[0].sparse_embedding.?.values);
+    try std.testing.expectEqualStrings("ckpt-1", chunks[0].model_version.?);
+    try std.testing.expectEqualStrings("fused_chunker_embedder/v1", chunks[0].artifact_family.?);
 }
 
 test "antfly chunker with empty api_url runs locally" {

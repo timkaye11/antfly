@@ -64,6 +64,7 @@ pub const finetune = struct {
     pub const infonce_cpu = @import("finetune/infonce_cpu.zig");
     pub const fused_chunker_splade = @import("finetune/fused_chunker_splade.zig");
     pub const fused_chunker_train = @import("finetune/fused_chunker_train.zig");
+    pub const fused_chunker_eval = @import("finetune/eval/eval_fused_chunker.zig");
     pub const fused_chunker_train_cli = @import("finetune_train_fused_chunker_root.zig");
     pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
     pub const peft = @import("finetune/peft.zig");

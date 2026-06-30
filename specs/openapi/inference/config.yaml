@@ -280,6 +280,24 @@ components:
           type: number
           format: float
           description: "Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models."
+        include_embeddings:
+          type: boolean
+          description: "Return contextual dense embeddings for each chunk when the selected chunker supports them."
+          default: false
+        include_sparse:
+          type: boolean
+          description: "Return SPLADE sparse embeddings for each chunk when the selected chunker supports them."
+          default: false
+        output_dimension:
+          type: integer
+          description: "Requested dense embedding dimension for Matryoshka-capable chunker models."
+        sparse_top_k:
+          type: integer
+          description: "Maximum number of non-zero SPLADE entries to return per chunk."
+        include_boundary_scores:
+          type: boolean
+          description: "Return model boundary scores for each chunk when available."
+          default: false
         text:
           $ref: "../shared/chunking.yaml#/components/schemas/TextChunkOptions"
         audio:

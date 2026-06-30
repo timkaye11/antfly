@@ -65,9 +65,158 @@ const print = std.debug.print;
 pub const RetrievalMetrics = struct {
     recall_at_1: f64,
     recall_at_10: f64,
+    ndcg_at_10: f64,
     mrr: f64,
     num_queries: usize,
 };
+
+pub const BenchmarkBaseline = struct {
+    name: []const u8,
+    overall_ndcg_at_10: f64,
+};
+
+const BenchmarkDatasetResult = struct {
+    name: []const u8,
+    f1: f64,
+    precision: f64,
+    recall: f64,
+    tp: u64,
+    fp: u64,
+    fn_count: u64,
+};
+
+const BenchmarkBoundaryLane = struct {
+    internal_phase20_best_f1: f64,
+    fixed_threshold_f1: f64,
+    best_threshold_f1: f64,
+    best_threshold: f64,
+    dataset_results: []const BenchmarkDatasetResult,
+};
+
+const BenchmarkRetrievalLane = struct {
+    output_dimension: u32,
+    overall_ndcg_at_10: f64,
+    recall_at_1: f64,
+    recall_at_10: f64,
+    mrr: f64,
+    queries: usize,
+    baselines: []const BenchmarkBaseline,
+};
+
+const BenchmarkSourceEval = struct {
+    checkpoint: []const u8,
+    data: []const u8,
+    split: []const u8,
+    backend: []const u8,
+    samples: usize,
+    max_seq_len: u32,
+    max_chunks: u32,
+};
+
+const BenchmarkResultFile = struct {
+    schema_version: []const u8 = "fused_chunker_benchmark_results/v1",
+    source_eval: BenchmarkSourceEval,
+    boundary_f1: BenchmarkBoundaryLane,
+    retrieval_ndcg: ?BenchmarkRetrievalLane,
+};
+
+const BenchmarkResultInput = struct {
+    dataset_name: []const u8,
+    checkpoint_path: []const u8,
+    data_path: []const u8,
+    split: []const u8,
+    backend_name: []const u8,
+    samples: usize,
+    max_seq_len: u32,
+    max_chunks: u32,
+    output_dimension: u32,
+    internal_phase20_best_f1: f64,
+    summary: fused_chunker_train.EvalSummary,
+    retrieval: ?RetrievalMetrics,
+    baselines: []const BenchmarkBaseline,
+};
+
+pub const SeparatorBoundaryMetrics = struct {
+    precision: f64,
+    recall: f64,
+    f1: f64,
+    tp: usize,
+    fp: usize,
+    fn_count: usize,
+};
+
+/// Chonky-compatible separator F1 over sorted, unique separator offsets.
+///
+/// Chonky's published eval turns paragraph separators into a sequence labeling
+/// task and reports seqeval overall_f1. For single-position separator labels,
+/// exact matching of sorted separator offsets is equivalent and much cheaper to
+/// run inside the Zig benchmark harness.
+pub fn computeSortedSeparatorBoundaryMetrics(
+    gold_offsets: []const u32,
+    predicted_offsets: []const u32,
+) SeparatorBoundaryMetrics {
+    var gi: usize = 0;
+    var pi: usize = 0;
+    var tp: usize = 0;
+    var fp: usize = 0;
+    var fn_count: usize = 0;
+
+    while (gi < gold_offsets.len and pi < predicted_offsets.len) {
+        const gold = gold_offsets[gi];
+        const pred = predicted_offsets[pi];
+        if (gold == pred) {
+            tp += 1;
+            gi += 1;
+            pi += 1;
+        } else if (pred < gold) {
+            fp += 1;
+            pi += 1;
+        } else {
+            fn_count += 1;
+            gi += 1;
+        }
+    }
+    fp += predicted_offsets.len - pi;
+    fn_count += gold_offsets.len - gi;
+
+    const precision = if (tp + fp == 0) 0.0 else @as(f64, @floatFromInt(tp)) / @as(f64, @floatFromInt(tp + fp));
+    const recall = if (tp + fn_count == 0) 0.0 else @as(f64, @floatFromInt(tp)) / @as(f64, @floatFromInt(tp + fn_count));
+    const f1 = if (precision + recall == 0.0) 0.0 else 2.0 * precision * recall / (precision + recall);
+    return .{
+        .precision = precision,
+        .recall = recall,
+        .f1 = f1,
+        .tp = tp,
+        .fp = fp,
+        .fn_count = fn_count,
+    };
+}
+
+fn binaryDcgAtKFromRankedMatches(matches: []const bool, k: usize) f64 {
+    const top_k = @min(matches.len, k);
+    var dcg: f64 = 0.0;
+    for (0..top_k) |rank_idx| {
+        if (!matches[rank_idx]) continue;
+        dcg += 1.0 / @log2(@as(f64, @floatFromInt(rank_idx + 2)));
+    }
+    return dcg;
+}
+
+fn binaryIdealDcgAtK(positive_count: usize, k: usize) f64 {
+    const ideal_len = @min(positive_count, k);
+    var idcg: f64 = 0.0;
+    for (0..ideal_len) |rank_idx| {
+        idcg += 1.0 / @log2(@as(f64, @floatFromInt(rank_idx + 2)));
+    }
+    return idcg;
+}
+
+pub fn binaryNdcgAtKFromRankedMatches(matches: []const bool, positive_count: usize, k: usize) f64 {
+    if (positive_count == 0) return 0.0;
+    const idcg = binaryIdealDcgAtK(positive_count, k);
+    if (idcg == 0.0) return 0.0;
+    return binaryDcgAtKFromRankedMatches(matches, k) / idcg;
+}
 
 /// Compute retrieval metrics from chunk embeddings.
 ///
@@ -106,6 +255,7 @@ pub fn computeRetrievalMetrics(
         return RetrievalMetrics{
             .recall_at_1 = 0,
             .recall_at_10 = 0,
+            .ndcg_at_10 = 0,
             .mrr = 0,
             .num_queries = 0,
         };
@@ -141,19 +291,19 @@ pub fn computeRetrievalMetrics(
 
     var sum_r1: f64 = 0;
     var sum_r10: f64 = 0;
+    var sum_ndcg10: f64 = 0;
     var sum_mrr: f64 = 0;
     var num_queries: usize = 0;
 
     for (0..V) |qi| {
         // Check whether this query has any positives.
-        var has_positive = false;
+        var positive_count: usize = 0;
         for (0..V) |j| {
             if (j != qi and compact_doc_ids[j] == compact_doc_ids[qi]) {
-                has_positive = true;
-                break;
+                positive_count += 1;
             }
         }
-        if (!has_positive) continue;
+        if (positive_count == 0) continue;
 
         // Compute dot-product similarities to all other valid chunks.
         const qi_base = qi * embed_dim;
@@ -190,9 +340,11 @@ pub fn computeRetrievalMetrics(
         var found_r10 = false;
         var first_positive_rank: usize = 0; // 1-based, 0 means not found yet
         const top_k = @min(V - 1, 10); // at most V-1 non-self results
+        var dcg10: f64 = 0.0;
         for (0..top_k) |rank_idx| {
             const j = rank_buf[rank_idx];
             if (compact_doc_ids[j] == compact_doc_ids[qi]) {
+                dcg10 += 1.0 / @log2(@as(f64, @floatFromInt(rank_idx + 2)));
                 if (!found_r10) {
                     sum_r10 += 1.0;
                     found_r10 = true;
@@ -202,10 +354,13 @@ pub fn computeRetrievalMetrics(
                 }
             }
         }
+        const idcg10 = binaryIdealDcgAtK(positive_count, 10);
+        if (idcg10 > 0.0) sum_ndcg10 += dcg10 / idcg10;
         // If the first positive wasn't in top-10, search the rest for MRR.
         if (first_positive_rank == 0) {
-            for (10..V - 1) |rank_idx| {
+            for (top_k..V) |rank_idx| {
                 const j = rank_buf[rank_idx];
+                if (j == qi) continue;
                 if (compact_doc_ids[j] == compact_doc_ids[qi]) {
                     first_positive_rank = rank_idx + 1;
                     break;
@@ -223,6 +378,7 @@ pub fn computeRetrievalMetrics(
         return RetrievalMetrics{
             .recall_at_1 = 0,
             .recall_at_10 = 0,
+            .ndcg_at_10 = 0,
             .mrr = 0,
             .num_queries = 0,
         };
@@ -232,9 +388,173 @@ pub fn computeRetrievalMetrics(
     return RetrievalMetrics{
         .recall_at_1 = sum_r1 / nq_f,
         .recall_at_10 = sum_r10 / nq_f,
+        .ndcg_at_10 = sum_ndcg10 / nq_f,
         .mrr = sum_mrr / nq_f,
         .num_queries = num_queries,
     };
+}
+
+test "separator boundary metrics match exact sorted offsets" {
+    const gold = [_]u32{ 4, 12, 20, 28 };
+    const pred = [_]u32{ 4, 10, 20, 32 };
+    const metrics = computeSortedSeparatorBoundaryMetrics(&gold, &pred);
+    try std.testing.expectEqual(@as(usize, 2), metrics.tp);
+    try std.testing.expectEqual(@as(usize, 2), metrics.fp);
+    try std.testing.expectEqual(@as(usize, 2), metrics.fn_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), metrics.precision, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), metrics.recall, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), metrics.f1, 1e-12);
+}
+
+test "binary ndcg uses Voyage-style top-k ranking discount" {
+    const matches = [_]bool{ false, true, true, false };
+    const ndcg = binaryNdcgAtKFromRankedMatches(&matches, 2, 10);
+    const expected = (1.0 / @log2(@as(f64, 3.0)) + 1.0 / @log2(@as(f64, 4.0))) /
+        (1.0 + 1.0 / @log2(@as(f64, 3.0)));
+    try std.testing.expectApproxEqAbs(expected, ndcg, 1e-12);
+}
+
+test "dense retrieval metrics report perfect ndcg for nearest positive chunks" {
+    const allocator = std.testing.allocator;
+    const embeddings = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+        0.9, 0.1,
+        0.1, 0.9,
+    };
+    const doc_ids = [_]u32{ 0, 1, 0, 1 };
+    const mask = [_]f32{ 1, 1, 1, 1 };
+    const metrics = try computeRetrievalMetrics(allocator, &embeddings, &doc_ids, &mask, 4, 2);
+    try std.testing.expectEqual(@as(usize, 4), metrics.num_queries);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.recall_at_1, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.recall_at_10, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.ndcg_at_10, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.mrr, 1e-12);
+}
+
+pub fn parseBenchmarkBaseline(raw: []const u8) !BenchmarkBaseline {
+    const sep = std.mem.lastIndexOfScalar(u8, raw, ':') orelse return error.InvalidBenchmarkBaseline;
+    if (sep == 0 or sep + 1 >= raw.len) return error.InvalidBenchmarkBaseline;
+    const name = raw[0..sep];
+    const ndcg = try std.fmt.parseFloat(f64, raw[sep + 1 ..]);
+    if (!std.math.isFinite(ndcg) or ndcg < 0.0 or ndcg > 1.0) return error.InvalidBenchmarkBaseline;
+    return .{
+        .name = name,
+        .overall_ndcg_at_10 = ndcg,
+    };
+}
+
+pub fn renderBenchmarkResultsJson(allocator: std.mem.Allocator, input: BenchmarkResultInput) ![]u8 {
+    const dataset_results = [_]BenchmarkDatasetResult{.{
+        .name = input.dataset_name,
+        .f1 = input.summary.boundary_f1,
+        .precision = input.summary.boundary_precision,
+        .recall = input.summary.boundary_recall,
+        .tp = input.summary.boundary_tp,
+        .fp = input.summary.boundary_fp,
+        .fn_count = input.summary.boundary_fn,
+    }};
+    const retrieval_lane: ?BenchmarkRetrievalLane = if (input.retrieval) |retrieval| .{
+        .output_dimension = input.output_dimension,
+        .overall_ndcg_at_10 = retrieval.ndcg_at_10,
+        .recall_at_1 = retrieval.recall_at_1,
+        .recall_at_10 = retrieval.recall_at_10,
+        .mrr = retrieval.mrr,
+        .queries = retrieval.num_queries,
+        .baselines = input.baselines,
+    } else null;
+    const file = BenchmarkResultFile{
+        .source_eval = .{
+            .checkpoint = input.checkpoint_path,
+            .data = input.data_path,
+            .split = input.split,
+            .backend = input.backend_name,
+            .samples = input.samples,
+            .max_seq_len = input.max_seq_len,
+            .max_chunks = input.max_chunks,
+        },
+        .boundary_f1 = .{
+            .internal_phase20_best_f1 = input.internal_phase20_best_f1,
+            .fixed_threshold_f1 = input.summary.boundary_f1,
+            .best_threshold_f1 = input.summary.best_boundary_f1,
+            .best_threshold = input.summary.best_boundary_threshold,
+            .dataset_results = &dataset_results,
+        },
+        .retrieval_ndcg = retrieval_lane,
+    };
+
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buffer.deinit();
+    try std.json.Stringify.value(file, .{ .whitespace = .indent_2 }, &buffer.writer);
+    try buffer.writer.writeByte('\n');
+    return buffer.toOwnedSlice();
+}
+
+fn writeBenchmarkResultsJson(allocator: std.mem.Allocator, path: []const u8, input: BenchmarkResultInput) !void {
+    const json = try renderBenchmarkResultsJson(allocator, input);
+    defer allocator.free(json);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = json });
+}
+
+test "parse benchmark baseline accepts name and ndcg" {
+    const baseline = try parseBenchmarkBaseline("fixed_500_50_same_encoder:0.7125");
+    try std.testing.expectEqualStrings("fixed_500_50_same_encoder", baseline.name);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.7125), baseline.overall_ndcg_at_10, 1e-12);
+    try std.testing.expectError(error.InvalidBenchmarkBaseline, parseBenchmarkBaseline("bad"));
+    try std.testing.expectError(error.InvalidBenchmarkBaseline, parseBenchmarkBaseline("bad:1.2"));
+}
+
+test "render benchmark results JSON matches verifier schema" {
+    const allocator = std.testing.allocator;
+    const summary = fused_chunker_train.EvalSummary{
+        .boundary_f1 = 0.82,
+        .boundary_precision = 0.83,
+        .boundary_recall = 0.81,
+        .boundary_tp = 82,
+        .boundary_fp = 17,
+        .boundary_fn = 19,
+        .best_boundary_f1 = 0.84,
+        .best_boundary_threshold = 0.42,
+    };
+    const retrieval = RetrievalMetrics{
+        .recall_at_1 = 0.55,
+        .recall_at_10 = 0.91,
+        .ndcg_at_10 = 0.74,
+        .mrr = 0.63,
+        .num_queries = 12,
+    };
+    const baselines = [_]BenchmarkBaseline{.{
+        .name = "fixed_500_50_same_encoder",
+        .overall_ndcg_at_10 = 0.68,
+    }};
+    const json = try renderBenchmarkResultsJson(allocator, .{
+        .dataset_name = "bookcorpus",
+        .checkpoint_path = "ckpt.safetensors",
+        .data_path = "eval.jsonl",
+        .split = "val",
+        .backend_name = "native",
+        .samples = 8,
+        .max_seq_len = 384,
+        .max_chunks = 32,
+        .output_dimension = 256,
+        .internal_phase20_best_f1 = 0.86,
+        .summary = summary,
+        .retrieval = retrieval,
+        .baselines = &baselines,
+    });
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("fused_chunker_benchmark_results/v1", obj.get("schema_version").?.string);
+    const boundary = obj.get("boundary_f1").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.86), boundary.get("internal_phase20_best_f1").?.float, 1e-12);
+    const datasets = boundary.get("dataset_results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), datasets.len);
+    try std.testing.expectEqualStrings("bookcorpus", datasets[0].object.get("name").?.string);
+    const retrieval_obj = obj.get("retrieval_ndcg").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.74), retrieval_obj.get("overall_ndcg_at_10").?.float, 1e-12);
 }
 
 const FusedBackend = enum {
@@ -248,6 +568,11 @@ const Options = struct {
     checkpoint_path: []const u8,
     model_dir: ?[]const u8 = null,
     split: []const u8 = "val",
+    results_out: ?[]const u8 = null,
+    benchmark_dataset_name: ?[]const u8 = null,
+    internal_phase20_best_f1: ?f64 = null,
+    output_dimension: ?u32 = null,
+    retrieval_baselines: []const BenchmarkBaseline = &.{},
     batch_size: u32 = 32,
     max_examples: usize = 0,
     hidden_size: u32 = 768,
@@ -267,6 +592,13 @@ fn printUsage() void {
         \\  --checkpoint <file>      Checkpoint file written by train_fused_chunker
         \\  --model-dir <dir>        Model directory (tokenizer + encoder weights)
         \\  --split <name>           Dataset split filter (default: "val")
+        \\  --results-out <path>     Write fused_chunker_benchmark_results/v1 JSON
+        \\  --benchmark-dataset-name <name>
+        \\                           Dataset name to emit in --results-out (default: data basename)
+        \\  --internal-phase20-best-f1 <f>
+        \\                           Internal validation gate F1 to emit (default: this eval's best F1)
+        \\  --output-dimension <n>   Dense output dimension for Voyage target mapping (default: hidden size)
+        \\  --baseline <name:ndcg>   Add local retrieval baseline for verifier comparison; repeatable
         \\  --batch-size <n>         Batch size (default: 32)
         \\  --max-examples <n>       Maximum eval examples (default: 0 = all)
         \\  --hidden-size <n>        Hidden size (default: 768)
@@ -821,6 +1153,12 @@ pub fn main(init: std.process.Init) !void {
     var max_seq_len: u32 = 384;
     var max_chunks: u32 = 32;
     var intermediate_size: u32 = 1152;
+    var results_out: ?[]const u8 = null;
+    var benchmark_dataset_name: ?[]const u8 = null;
+    var internal_phase20_best_f1: ?f64 = null;
+    var output_dimension: ?u32 = null;
+    var retrieval_baselines = std.ArrayListUnmanaged(BenchmarkBaseline).empty;
+    defer retrieval_baselines.deinit(allocator);
     var backend: @TypeOf((Options{
         .data_path = "",
         .checkpoint_path = "",
@@ -847,6 +1185,44 @@ pub fn main(init: std.process.Init) !void {
                 print("error: --split requires a value\n", .{});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, arg, "--results-out")) {
+            results_out = args.next() orelse {
+                print("error: --results-out requires a value\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--benchmark-dataset-name")) {
+            benchmark_dataset_name = args.next() orelse {
+                print("error: --benchmark-dataset-name requires a value\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--internal-phase20-best-f1")) {
+            const value = args.next() orelse {
+                print("error: --internal-phase20-best-f1 requires a value\n", .{});
+                std.process.exit(1);
+            };
+            internal_phase20_best_f1 = std.fmt.parseFloat(f64, value) catch {
+                print("error: invalid --internal-phase20-best-f1 value: {s}\n", .{value});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--output-dimension")) {
+            const value = args.next() orelse {
+                print("error: --output-dimension requires a value\n", .{});
+                std.process.exit(1);
+            };
+            output_dimension = std.fmt.parseUnsigned(u32, value, 10) catch {
+                print("error: invalid --output-dimension value: {s}\n", .{value});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--baseline")) {
+            const value = args.next() orelse {
+                print("error: --baseline requires a value\n", .{});
+                std.process.exit(1);
+            };
+            const baseline = parseBenchmarkBaseline(value) catch {
+                print("error: invalid --baseline value '{s}', expected name:ndcg\n", .{value});
+                std.process.exit(1);
+            };
+            try retrieval_baselines.append(allocator, baseline);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
             const value = args.next() orelse {
                 print("error: --batch-size requires a value\n", .{});
@@ -948,6 +1324,11 @@ pub fn main(init: std.process.Init) !void {
         },
         .model_dir = model_dir,
         .split = split,
+        .results_out = results_out,
+        .benchmark_dataset_name = benchmark_dataset_name,
+        .internal_phase20_best_f1 = internal_phase20_best_f1,
+        .output_dimension = output_dimension,
+        .retrieval_baselines = retrieval_baselines.items,
         .batch_size = batch_size,
         .max_examples = max_examples,
         .hidden_size = hidden_size,
@@ -1293,6 +1674,7 @@ pub fn main(init: std.process.Init) !void {
     var emb_sum: f32 = 0;
     for (emb_slice) |v| emb_sum += @abs(v);
 
+    var retrieval_result: ?RetrievalMetrics = null;
     if (emb_sum > 0.0) {
         const total_chunks_all = chunk_mask_all.items.len;
         const retrieval = try computeRetrievalMetrics(
@@ -1303,12 +1685,35 @@ pub fn main(init: std.process.Init) !void {
             total_chunks_all,
             hs,
         );
+        retrieval_result = retrieval;
         print("\n=== Dense Retrieval Metrics ===\n", .{});
         print("Queries:     {d}\n", .{retrieval.num_queries});
         print("Recall@1:    {d:.4}\n", .{retrieval.recall_at_1});
         print("Recall@10:   {d:.4}\n", .{retrieval.recall_at_10});
+        print("NDCG@10:     {d:.4}\n", .{retrieval.ndcg_at_10});
         print("MRR:         {d:.4}\n", .{retrieval.mrr});
     } else {
         print("\n(Dense retrieval metrics skipped: chunk embeddings are zero-filled)\n", .{});
+    }
+
+    if (opts.results_out) |results_path| {
+        const dataset_name = opts.benchmark_dataset_name orelse std.fs.path.basename(opts.data_path);
+        const backend_name = if (use_metal) "metal" else "native";
+        try writeBenchmarkResultsJson(allocator, results_path, .{
+            .dataset_name = dataset_name,
+            .checkpoint_path = opts.checkpoint_path,
+            .data_path = opts.data_path,
+            .split = opts.split,
+            .backend_name = backend_name,
+            .samples = samples.len,
+            .max_seq_len = opts.max_seq_len,
+            .max_chunks = opts.max_chunks,
+            .output_dimension = opts.output_dimension orelse opts.hidden_size,
+            .internal_phase20_best_f1 = opts.internal_phase20_best_f1 orelse summary.best_boundary_f1,
+            .summary = summary,
+            .retrieval = retrieval_result,
+            .baselines = opts.retrieval_baselines,
+        });
+        print("Wrote benchmark results: {s}\n", .{results_path});
     }
 }

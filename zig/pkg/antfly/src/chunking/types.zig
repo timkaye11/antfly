@@ -61,6 +61,11 @@ pub const Config = if (build_options.bench_minimal_deps) struct {
     full_text_index_json: []const u8 = "",
     max_chunks: u32 = 0,
     threshold: ?f32 = null,
+    include_embeddings: bool = false,
+    include_sparse: bool = false,
+    output_dimension: u32 = 0,
+    sparse_top_k: u32 = 0,
+    include_boundary_scores: bool = false,
     text: TextChunkOptions = .{},
     audio: AudioChunkOptions = .{},
 
@@ -73,6 +78,11 @@ pub const Config = if (build_options.bench_minimal_deps) struct {
             .full_text_index_json = if (self.full_text_index_json.len > 0) try alloc.dupe(u8, self.full_text_index_json) else "",
             .max_chunks = self.max_chunks,
             .threshold = self.threshold,
+            .include_embeddings = self.include_embeddings,
+            .include_sparse = self.include_sparse,
+            .output_dimension = self.output_dimension,
+            .sparse_top_k = self.sparse_top_k,
+            .include_boundary_scores = self.include_boundary_scores,
             .text = try self.text.clone(alloc),
             .audio = self.audio,
         };
@@ -147,6 +157,24 @@ pub fn parseConfigFromValue(alloc: Allocator, value: std.json.Value) !Config {
             .integer => @floatFromInt(threshold.integer),
             else => return error.InvalidChunkerConfig,
         };
+    }
+    if (value.object.get("include_embeddings")) |include| {
+        if (include != .bool) return error.InvalidChunkerConfig;
+        cfg.include_embeddings = include.bool;
+    }
+    if (value.object.get("include_sparse")) |include| {
+        if (include != .bool) return error.InvalidChunkerConfig;
+        cfg.include_sparse = include.bool;
+    }
+    if (value.object.get("output_dimension")) |dimension| {
+        cfg.output_dimension = parseU32Value(dimension) orelse return error.InvalidChunkerConfig;
+    }
+    if (value.object.get("sparse_top_k")) |top_k| {
+        cfg.sparse_top_k = parseU32Value(top_k) orelse return error.InvalidChunkerConfig;
+    }
+    if (value.object.get("include_boundary_scores")) |include| {
+        if (include != .bool) return error.InvalidChunkerConfig;
+        cfg.include_boundary_scores = include.bool;
     }
     if (value.object.get("text")) |text_value| {
         if (text_value != .object) return error.InvalidChunkerConfig;
@@ -226,6 +254,26 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
     if (cfg.threshold) |threshold| {
         try appendJsonFieldName(alloc, &out, &wrote, "threshold");
         try appendJsonFloat(alloc, &out, threshold);
+    }
+    if (cfg.include_embeddings) {
+        try appendJsonFieldName(alloc, &out, &wrote, "include_embeddings");
+        try out.appendSlice(alloc, "true");
+    }
+    if (cfg.include_sparse) {
+        try appendJsonFieldName(alloc, &out, &wrote, "include_sparse");
+        try out.appendSlice(alloc, "true");
+    }
+    if (cfg.output_dimension != 0) {
+        try appendJsonFieldName(alloc, &out, &wrote, "output_dimension");
+        try appendJsonNumber(alloc, &out, cfg.output_dimension);
+    }
+    if (cfg.sparse_top_k != 0) {
+        try appendJsonFieldName(alloc, &out, &wrote, "sparse_top_k");
+        try appendJsonNumber(alloc, &out, cfg.sparse_top_k);
+    }
+    if (cfg.include_boundary_scores) {
+        try appendJsonFieldName(alloc, &out, &wrote, "include_boundary_scores");
+        try out.appendSlice(alloc, "true");
     }
     if (cfg.text.target_tokens != 0 or cfg.text.overlap_tokens != 0 or cfg.text.separator.len > 0) {
         try appendJsonFieldName(alloc, &out, &wrote, "text");

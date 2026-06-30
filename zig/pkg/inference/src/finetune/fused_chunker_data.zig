@@ -891,7 +891,7 @@ test "charToTokenBoundary: basic span mapping" {
 
 test "assembleTokenBatch masks chunks outside tokenized window" {
     const allocator = std.testing.allocator;
-    const boundaries = [_]FusedChunkBoundary{
+    var boundaries = [_]FusedChunkBoundary{
         .{ .start_char = 0, .end_char = 3 },
         .{ .start_char = 100, .end_char = 110 },
     };
@@ -930,7 +930,7 @@ test "assembleTokenBatch masks chunks outside tokenized window" {
 
 test "assembleTokenBatch honors provided token boundaries" {
     const allocator = std.testing.allocator;
-    const boundaries = [_]FusedChunkBoundary{
+    var boundaries = [_]FusedChunkBoundary{
         .{ .start_char = 0, .end_char = 3 },
         .{ .start_char = 100, .end_char = 110, .start_token = 1, .end_token = 2 },
     };

@@ -131,6 +131,42 @@ const tests = [_]common.TestSpec{
         .native_link = .default,
     },
     .{
+        .step_name = "test-fused-chunker-benchmark-verify",
+        .root_source_file = "src/finetune/tools/verify_fused_chunker_benchmark.zig",
+        .description = "Run fused chunker benchmark verifier tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-benchmark-aggregate",
+        .root_source_file = "src/finetune/tools/aggregate_fused_chunker_benchmark.zig",
+        .description = "Run fused chunker benchmark aggregation tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-boundary-eval-prepare",
+        .root_source_file = "src/finetune/tools/prepare_fused_chunker_boundary_eval.zig",
+        .description = "Run fused chunker boundary eval materialization tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-retrieval-benchmark-score",
+        .root_source_file = "src/finetune/tools/score_fused_chunker_retrieval_benchmark.zig",
+        .description = "Run fused chunker retrieval benchmark scorer tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-retrieval-benchmark-rank",
+        .root_source_file = "src/finetune/tools/rank_fused_chunker_retrieval_benchmark.zig",
+        .description = "Run fused chunker retrieval benchmark ranker tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-retrieval-embedding-materialize",
+        .root_source_file = "src/finetune/tools/materialize_fused_chunker_retrieval_embeddings.zig",
+        .description = "Run fused chunker retrieval embedding materializer tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
         .step_name = "test-fused-chunker-lora",
         .root_source_file = "src/finetune/test/test_fused_chunker_lora.zig",
         .description = "Run fused chunker LoRA adapter tests",

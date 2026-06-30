@@ -102,6 +102,7 @@ pub const NodeConfig = struct {
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
     pool_size: usize = 2,
+    allow_downloads: bool = true,
     generation_budget_overrides: BudgetOverrides = .{},
 };
 
@@ -260,6 +261,31 @@ fn estimateTextTokens(text: []const u8) usize {
         }
     }
     return count;
+}
+
+fn isFixedChunkerModel(model: []const u8) bool {
+    return model.len == 0 or
+        std.mem.eql(u8, model, "fixed") or
+        std.mem.eql(u8, model, "fixed-bert-tokenizer");
+}
+
+fn fixedChunkerUnsupportedFeature(config: lib_chunker.FixedChunkConfig) ?[]const u8 {
+    if (config.include_embeddings) {
+        return "fixed chunking cannot return contextual dense embeddings; select a model-backed chunker";
+    }
+    if (config.include_sparse) {
+        return "fixed chunking cannot return SPLADE sparse embeddings; select a model-backed chunker";
+    }
+    if (config.include_boundary_scores) {
+        return "fixed chunking cannot return learned boundary scores; select a model-backed chunker";
+    }
+    if (config.output_dimension != null) {
+        return "output_dimension requires contextual dense embeddings from a model-backed chunker";
+    }
+    if (config.sparse_top_k != null) {
+        return "sparse_top_k requires SPLADE sparse embeddings from a model-backed chunker";
+    }
+    return null;
 }
 
 fn estimateTextsTokens(texts: []const []const u8) usize {
@@ -485,6 +511,11 @@ pub const Node = struct {
         self.registry.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
+    }
+
+    pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
+        _ = tabular_mod.discovery.seedBuiltins(io, self.config.ml_dir) catch {};
+        _ = tabular_mod.discovery.discover(io, self.allocator, &self.tabular_registry, self.config.ml_dir) catch {};
     }
 
     pub fn embedDenseTextsDirect(
@@ -1530,6 +1561,11 @@ pub const Node = struct {
             if (cfg.model) |model| config.model = model;
             if (cfg.max_chunks) |max_chunks| config.max_chunks = @intCast(max_chunks);
             config.threshold = cfg.threshold;
+            if (cfg.include_embeddings) |include| config.include_embeddings = include;
+            if (cfg.include_sparse) |include| config.include_sparse = include;
+            if (cfg.output_dimension) |dim| config.output_dimension = @intCast(dim);
+            if (cfg.sparse_top_k) |top_k| config.sparse_top_k = @intCast(top_k);
+            if (cfg.include_boundary_scores) |include| config.include_boundary_scores = include;
             if (cfg.text) |text_cfg| {
                 if (text_cfg.target_tokens) |tt| config.text.target_tokens = @intCast(tt);
                 if (text_cfg.overlap_tokens) |ot| config.text.overlap_tokens = @intCast(ot);
@@ -1539,6 +1575,34 @@ pub const Node = struct {
                 if (audio_cfg.window_duration_ms) |window| config.audio.window_duration_ms = @intCast(window);
                 if (audio_cfg.overlap_duration_ms) |overlap| config.audio.overlap_duration_ms = @intCast(overlap);
             }
+        }
+
+        if (!isFixedChunkerModel(config.model)) {
+            const model_path = self.resolveModelPath(ctx.io, config.model, "chunkers") catch
+                return ctx.status(404).json(.{
+                    .@"error" = "MODEL_NOT_FOUND",
+                    .message = "chunker model not found; install it under models/chunkers or use model=fixed",
+                });
+            var manifest = manifest_mod.loadListingFromDir(ctx.allocator, model_path) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            defer manifest.deinit();
+            if (manifest.model_type != .chunker and !manifest.hasTask("chunk")) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "selected model is not a chunker",
+                });
+            }
+            return ctx.status(501).json(.{
+                .@"error" = "CHUNKER_MODEL_NOT_IMPLEMENTED",
+                .message = "checkpoint-backed fused chunker inference is not wired yet; fixed chunking cannot synthesize model boundaries, dense embeddings, or SPLADE embeddings",
+            });
+        }
+
+        if (fixedChunkerUnsupportedFeature(config)) |message| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = message,
+            });
         }
 
         const chunks = lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
@@ -1574,6 +1638,26 @@ pub const Node = struct {
                 .text = chunk.text,
                 .start_char = if (chunk.start_char) |v| @intCast(v) else null,
                 .end_char = if (chunk.end_char) |v| @intCast(v) else null,
+                .start_token = if (chunk.start_token) |v| @intCast(v) else null,
+                .end_token = if (chunk.end_token) |v| @intCast(v) else null,
+                .boundary_score = if (config.include_boundary_scores) chunk.boundary_score else null,
+                .embedding = if (config.include_embeddings) chunk.embedding else null,
+                .embedding_dimension = if (config.include_embeddings) blk: {
+                    if (chunk.embedding_dimension) |dim| break :blk @intCast(dim);
+                    if (chunk.embedding) |embedding| break :blk @as(i64, @intCast(embedding.len));
+                    break :blk null;
+                } else null,
+                .sparse_embedding = if (config.include_sparse) blk: {
+                    if (chunk.sparse_embedding) |sparse| {
+                        break :blk api.SparseVector{
+                            .indices = sparse.indices,
+                            .values = sparse.values,
+                        };
+                    }
+                    break :blk null;
+                } else null,
+                .model_version = chunk.model_version,
+                .artifact_family = chunk.artifact_family,
                 .data = encoded_data,
                 .start_time_ms = chunk.start_time_ms,
                 .end_time_ms = chunk.end_time_ms,
@@ -3508,16 +3592,16 @@ pub const Node = struct {
         };
         defer ctx.allocator.free(results);
 
-        var input_obj: std.json.ObjectMap = .empty;
-        defer input_obj.deinit(ctx.allocator);
-        try input_obj.put(ctx.allocator, "image_path", .{ .string = body.image_path });
-        try input_obj.put(ctx.allocator, "num_tokens", .{ .integer = @intCast(num_tokens) });
+        var input_obj = std.json.ObjectMap.init(ctx.allocator);
+        defer input_obj.deinit();
+        try input_obj.put("image_path", .{ .string = body.image_path });
+        try input_obj.put("num_tokens", .{ .integer = @intCast(num_tokens) });
 
-        var best_obj: std.json.ObjectMap = .empty;
-        defer best_obj.deinit(ctx.allocator);
+        var best_obj = std.json.ObjectMap.init(ctx.allocator);
+        defer best_obj.deinit();
         const best_value: ?std.json.Value = if (results.len > 0) blk: {
-            try best_obj.put(ctx.allocator, "label", .{ .string = results[0].label });
-            try best_obj.put(ctx.allocator, "score", .{ .float = results[0].score });
+            try best_obj.put("label", .{ .string = results[0].label });
+            try best_obj.put("score", .{ .float = results[0].score });
             break :blk .{ .object = best_obj };
         } else null;
 
@@ -4392,13 +4476,13 @@ pub const Node = struct {
         _ = tabular_mod.discovery.discover(ctx.io, ctx.allocator, &self.tabular_registry, self.config.ml_dir) catch {};
     }
 
-    pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {
+    pub fn getVersion(self: *Node, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
             .version = build_options.inference_version,
             .git_commit = build_options.git_commit,
             .build_time = build_options.build_time,
             .go_version = build_options.go_version,
-            .allow_downloads = build_options.allow_downloads,
+            .allow_downloads = self.config.allow_downloads,
             .runtime = "antfly-inference",
             .backends = .{
                 .native = build_options.enable_native,
@@ -4587,10 +4671,10 @@ fn buildExtractionResponse(
         for (result.structures) |structure| {
             const instances = try alloc.alloc(std.json.Value, structure.instances.len);
             for (structure.instances, 0..) |instance, instance_index| {
-                var instance_obj: std.json.ObjectMap = .empty;
-                try instance_obj.ensureTotalCapacity(alloc, instance.fields.len);
+                var instance_obj = std.json.ObjectMap.init(alloc);
+                try instance_obj.ensureTotalCapacity(instance.fields.len);
                 for (instance.fields) |field| {
-                    try instance_obj.put(alloc, field.name, try extractedFieldToValue(alloc, field.value));
+                    try instance_obj.put(field.name, try extractedFieldToValue(alloc, field.value));
                 }
                 instances[instance_index] = .{ .object = instance_obj };
             }
@@ -4627,10 +4711,10 @@ fn extractionResponseJsonAlloc(
         for (result.structures) |structure| {
             const instances = try alloc.alloc(std.json.Value, structure.instances.len);
             for (structure.instances, 0..) |instance, instance_index| {
-                var instance_obj: std.json.ObjectMap = .empty;
-                try instance_obj.ensureTotalCapacity(alloc, instance.fields.len);
+                var instance_obj = std.json.ObjectMap.init(alloc);
+                try instance_obj.ensureTotalCapacity(instance.fields.len);
                 for (instance.fields) |field| {
-                    try instance_obj.put(alloc, field.name, try extractedFieldToValue(alloc, field.value));
+                    try instance_obj.put(field.name, try extractedFieldToValue(alloc, field.value));
                 }
                 instances[instance_index] = .{ .object = instance_obj };
             }
@@ -4656,10 +4740,10 @@ fn readerFieldsJsonAlloc(allocator: std.mem.Allocator, fields: []const readers_m
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var obj: std.json.ObjectMap = .empty;
-    try obj.ensureTotalCapacity(alloc, fields.len);
+    var obj = std.json.ObjectMap.init(alloc);
+    try obj.ensureTotalCapacity(fields.len);
     for (fields) |field| {
-        try obj.put(alloc, field.name, .{ .string = field.value });
+        try obj.put(field.name, .{ .string = field.value });
     }
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
 }
@@ -4672,15 +4756,15 @@ fn readerRegionsJsonAlloc(allocator: std.mem.Allocator, regions: []const readers
     var arr = std.json.Array.init(alloc);
     try arr.ensureTotalCapacity(regions.len);
     for (regions) |region| {
-        var obj: std.json.ObjectMap = .empty;
-        try obj.ensureTotalCapacity(alloc, 4);
-        try obj.put(alloc, "text", .{ .string = region.text });
+        var obj = std.json.ObjectMap.init(alloc);
+        try obj.ensureTotalCapacity(4);
+        try obj.put("text", .{ .string = region.text });
         var bbox = std.json.Array.init(alloc);
         try bbox.ensureTotalCapacity(region.bbox.len);
         for (region.bbox) |coord| bbox.appendAssumeCapacity(.{ .float = coord });
-        try obj.put(alloc, "bbox", .{ .array = bbox });
-        if (region.confidence) |confidence| try obj.put(alloc, "confidence", .{ .float = confidence });
-        if (region.label) |label| try obj.put(alloc, "label", .{ .string = label });
+        try obj.put("bbox", .{ .array = bbox });
+        if (region.confidence) |confidence| try obj.put("confidence", .{ .float = confidence });
+        if (region.label) |label| try obj.put("label", .{ .string = label });
         arr.appendAssumeCapacity(.{ .object = obj });
     }
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = arr }, .{});
@@ -4889,8 +4973,8 @@ fn extractedFieldValueToValue(
     alloc: std.mem.Allocator,
     value: extraction_mod.ExtractedFieldValue,
 ) !std.json.Value {
-    var obj: std.json.ObjectMap = .empty;
-    try obj.ensureTotalCapacity(alloc, 4);
+    var obj = std.json.ObjectMap.init(alloc);
+    try obj.ensureTotalCapacity(4);
     obj.putAssumeCapacity("value", .{ .string = value.value });
     if (value.score) |score| obj.putAssumeCapacity("score", .{ .float = score });
     if (value.start) |start| obj.putAssumeCapacity("start", .{ .integer = @intCast(start) });
@@ -6187,9 +6271,9 @@ fn buildEmbedSparseResponse(
         try values.ensureTotalCapacity(sv.values.len);
         for (sv.values) |val| values.appendAssumeCapacity(.{ .float = val });
 
-        var obj: std.json.ObjectMap = .empty;
-        try obj.put(arena, "indices", .{ .array = indices });
-        try obj.put(arena, "values", .{ .array = values });
+        var obj = std.json.ObjectMap.init(arena);
+        try obj.put("indices", .{ .array = indices });
+        try obj.put("values", .{ .array = values });
 
         data[i] = .{
             .object = "embedding",
@@ -6347,6 +6431,20 @@ fn expectJsonNumber(expected: f64, value: std.json.Value) !void {
         else => return error.ExpectedJsonNumber,
     };
     try std.testing.expectEqual(expected, actual);
+}
+
+test "fixed chunker request guard rejects model-generated fields" {
+    try std.testing.expect(isFixedChunkerModel(""));
+    try std.testing.expect(isFixedChunkerModel("fixed"));
+    try std.testing.expect(isFixedChunkerModel("fixed-bert-tokenizer"));
+    try std.testing.expect(!isFixedChunkerModel("fused-context-chunker"));
+
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{}) == null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true }) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_sparse = true }) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_boundary_scores = true }) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .output_dimension = 256 }) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .sparse_top_k = 128 }) != null);
 }
 
 test "Antfly inference embeddings dense response supports truncation" {

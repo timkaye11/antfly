@@ -567,6 +567,16 @@ pub const ChunkConfig = struct {
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
     threshold: ?f32 = null,
+    /// Return contextual dense embeddings for each chunk when the selected chunker supports them.
+    include_embeddings: ?bool = null,
+    /// Return SPLADE sparse embeddings for each chunk when the selected chunker supports them.
+    include_sparse: ?bool = null,
+    /// Requested dense embedding dimension for Matryoshka-capable chunker models.
+    output_dimension: ?i64 = null,
+    /// Maximum number of non-zero SPLADE entries to return per chunk.
+    sparse_top_k: ?i64 = null,
+    /// Return model boundary scores for each chunk when available.
+    include_boundary_scores: ?bool = null,
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
     audio: ?AudioChunkConfig = null,
 };

@@ -14,12 +14,33 @@
 
 const std = @import("std");
 
+pub const SparseVector = struct {
+    indices: []const i32,
+    values: []const f32,
+    owns_indices: bool = false,
+    owns_values: bool = false,
+
+    pub fn deinit(self: *SparseVector, alloc: std.mem.Allocator) void {
+        if (self.owns_indices) alloc.free(self.indices);
+        if (self.owns_values) alloc.free(self.values);
+        self.* = undefined;
+    }
+};
+
 pub const Chunk = struct {
     id: u32,
     mime_type: []const u8,
     text: ?[]const u8 = null,
     start_char: ?u32 = null,
     end_char: ?u32 = null,
+    start_token: ?u32 = null,
+    end_token: ?u32 = null,
+    boundary_score: ?f32 = null,
+    embedding: ?[]const f32 = null,
+    embedding_dimension: ?u32 = null,
+    sparse_embedding: ?SparseVector = null,
+    model_version: ?[]const u8 = null,
+    artifact_family: ?[]const u8 = null,
     data: ?[]const u8 = null,
     start_time_ms: ?f32 = null,
     end_time_ms: ?f32 = null,
@@ -27,6 +48,9 @@ pub const Chunk = struct {
     frame_delay_ms: ?u32 = null,
     owns_text: bool = false,
     owns_data: bool = false,
+    owns_embedding: bool = false,
+    owns_model_version: bool = false,
+    owns_artifact_family: bool = false,
 
     pub fn initText(id: u32, text: []const u8, start: usize, end: usize) Chunk {
         return .{
@@ -58,6 +82,10 @@ pub const Chunk = struct {
     pub fn deinit(self: *Chunk, alloc: std.mem.Allocator) void {
         if (self.owns_text and self.text != null) alloc.free(self.text.?);
         if (self.owns_data and self.data != null) alloc.free(self.data.?);
+        if (self.owns_embedding and self.embedding != null) alloc.free(self.embedding.?);
+        if (self.sparse_embedding) |*sparse| sparse.deinit(alloc);
+        if (self.owns_model_version and self.model_version != null) alloc.free(self.model_version.?);
+        if (self.owns_artifact_family and self.artifact_family != null) alloc.free(self.artifact_family.?);
         self.* = undefined;
     }
 };
@@ -78,6 +106,11 @@ pub const FixedChunkConfig = struct {
     model: []const u8 = "fixed-bert-tokenizer",
     max_chunks: usize = 50,
     threshold: ?f32 = null,
+    include_embeddings: bool = false,
+    include_sparse: bool = false,
+    output_dimension: ?u32 = null,
+    sparse_top_k: ?usize = null,
+    include_boundary_scores: bool = false,
     text: FixedTextConfig = .{},
     audio: AudioChunkOptions = .{},
 };
