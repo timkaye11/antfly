@@ -15,6 +15,8 @@ Environment:
 
   RUN_BUILD=1
   RUN_SMOKE=1
+  RUN_CUDA_ARTIFACT_CHECK=1
+  RUN_E4B_QAT_PREFILL_SMOKE=1
   RUN_MICROBENCH=0
   RUN_DEFAULT_POLICY=1
   RUN_TARGET_ONLY=1
@@ -43,6 +45,7 @@ Environment:
   MAX_TOKENS=16
   E4B_QAT_TOKENS=512
   E4B_QAT_REPEATS=2
+  E4B_QAT_CACHE_DTYPE=polar4
   E4B_QAT_LONG_TOKENS=1024
   E4B_QAT_LONG_MIN_TOKENS=768
   E4B_QAT_LONG_KV_BUDGET_MB=1024
@@ -55,6 +58,7 @@ Environment:
   E4B_QAT_COMPRESSED_KV_MIN_TOKENS=512
   E4B_QAT_COMPRESSED_KV_MIN_TOK_S=36.0
   E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS=auto
+  E4B_QAT_COMPRESSED_KV_MAX_GRAPH_DISCARDS=1
   E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS=4
   E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS=0
   E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS=1
@@ -63,12 +67,15 @@ Environment:
   E4B_QAT_COMPRESSED_KV_MIN_IDENTITY_ATTENTION_READS=1
   E4B_QAT_COMPRESSED_KV_MIN_FAST_GQA=1
   E4B_QAT_COMPRESSED_KV_MAX_FAIL_WRITES=0
+  E4B_QAT_COMPRESSED_KV_MIN_GATED_DOWN_PRECOMPUTE=1
+  E4B_QAT_COMPRESSED_KV_MAX_GATED_DOWN_TILE4=0
   E4B_QAT_COMPRESSED_KV_TURBOQUANT_MIN_TOKENS=0
   E4B_QAT_RESIDENT_TOKENS=512
   E4B_QAT_RESIDENT_MIN_COMPLETION_TOKENS=512
   E4B_QAT_RESIDENT_WARM_REPEATS=2
   E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY=required
   E4B_QAT_RESIDENT_MIN_GRAPH_REPLAYS=auto
+  E4B_QAT_RESIDENT_CAPTURE_MIN_ALLOC_SEQ=200000
   E4B_QAT_RESIDENT_PORT=auto
   E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS=
   E4B_QAT_RESIDENT_SOAK_REQUESTS=6
@@ -132,6 +139,7 @@ Environment:
   PROMPT_FILTER="ants_chat code_chat"
   SPEC_KS="1 2 4"
   MTP_MIN_ACTIVE_SPEED_RATIO=1.0
+  MTP_MIN_ACTIVE_SPEED_TOKENS=1
   MTP_MIN_BENEFIT_RATIO=1.02
   MTP_REPLAY_512_MIN_BENEFIT_RATIO=1.02
   E4B_QAT_MTP_REQUIRE_PREPROJECT_FUSION=1
@@ -151,11 +159,12 @@ Environment:
   E4B_QAT_MAX_DOWNLOAD_SYNCS=4
   E4B_QAT_REQUIRE_PLE_FUSION=1
   E4B_QAT_MIN_GRAPH_REPLAYS=auto
-  E4B_QAT_MAX_LAUNCHES_PER_TOKEN=22.5
-  E4B_QAT_TEMP_SLOT_PERIOD=0
+  E4B_QAT_MAX_LAUNCHES_PER_TOKEN=26.0
+  E4B_QAT_TEMP_SLOT_PERIOD=863
+  E4B_QAT_TEMP_SLOT_SKIP=2500
   E4B_QAT_CAPTURE_ALLOW_UNPINNED=1
-  E4B_QAT_CAPTURE_MIN_ALLOC_SEQ=10000
-  E4B_QAT_FORCE_KV_CAPACITY=1024
+  E4B_QAT_CAPTURE_MIN_ALLOC_SEQ=3363
+  E4B_QAT_FORCE_KV_CAPACITY=544
   MIN_E4B_QAT_OVER_Q4K_RATIO=1.25
   MTP_VERIFY_DEVICE_RESULT=auto|0|1
   MIN_12B_Q8_TOK_S=13.0
@@ -195,6 +204,8 @@ OUT_DIR="${OUT_DIR:-/tmp/gemma4-cuda-production-gate-$(date +%Y%m%d-%H%M%S)}"
 
 RUN_BUILD="${RUN_BUILD:-1}"
 RUN_SMOKE="${RUN_SMOKE:-1}"
+RUN_CUDA_ARTIFACT_CHECK="${RUN_CUDA_ARTIFACT_CHECK:-1}"
+RUN_E4B_QAT_PREFILL_SMOKE="${RUN_E4B_QAT_PREFILL_SMOKE:-$RUN_SMOKE}"
 RUN_MICROBENCH="${RUN_MICROBENCH:-0}"
 RUN_DEFAULT_POLICY="${RUN_DEFAULT_POLICY:-1}"
 RUN_TARGET_ONLY="${RUN_TARGET_ONLY:-1}"
@@ -224,6 +235,7 @@ RUN_E2B_MTP="${RUN_E2B_MTP:-1}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
 E4B_QAT_TOKENS="${E4B_QAT_TOKENS:-512}"
 E4B_QAT_REPEATS="${E4B_QAT_REPEATS:-${RUN_E4B_QAT_REPEATS:-2}}"
+E4B_QAT_CACHE_DTYPE="${E4B_QAT_CACHE_DTYPE:-polar4}"
 E4B_QAT_LONG_TOKENS="${E4B_QAT_LONG_TOKENS:-1024}"
 E4B_QAT_LONG_MIN_TOKENS="${E4B_QAT_LONG_MIN_TOKENS:-768}"
 E4B_QAT_LONG_KV_BUDGET_MB="${E4B_QAT_LONG_KV_BUDGET_MB:-1024}"
@@ -236,6 +248,7 @@ E4B_QAT_COMPRESSED_KV_TOKENS="${E4B_QAT_COMPRESSED_KV_TOKENS:-512}"
 E4B_QAT_COMPRESSED_KV_MIN_TOKENS="${E4B_QAT_COMPRESSED_KV_MIN_TOKENS:-$E4B_QAT_COMPRESSED_KV_TOKENS}"
 E4B_QAT_COMPRESSED_KV_MIN_TOK_S="${E4B_QAT_COMPRESSED_KV_MIN_TOK_S:-36.0}"
 E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS="${E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS:-auto}"
+E4B_QAT_COMPRESSED_KV_MAX_GRAPH_DISCARDS="${E4B_QAT_COMPRESSED_KV_MAX_GRAPH_DISCARDS:-1}"
 E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS="${E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS:-4}"
 E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS="${E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS:-0}"
 E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS="${E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS:-1}"
@@ -244,6 +257,8 @@ E4B_QAT_COMPRESSED_KV_MIN_PAGED_UPLOADS="${E4B_QAT_COMPRESSED_KV_MIN_PAGED_UPLOA
 E4B_QAT_COMPRESSED_KV_MIN_IDENTITY_ATTENTION_READS="${E4B_QAT_COMPRESSED_KV_MIN_IDENTITY_ATTENTION_READS:-1}"
 E4B_QAT_COMPRESSED_KV_MIN_FAST_GQA="${E4B_QAT_COMPRESSED_KV_MIN_FAST_GQA:-1}"
 E4B_QAT_COMPRESSED_KV_MAX_FAIL_WRITES="${E4B_QAT_COMPRESSED_KV_MAX_FAIL_WRITES:-$E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS}"
+E4B_QAT_COMPRESSED_KV_MIN_GATED_DOWN_PRECOMPUTE="${E4B_QAT_COMPRESSED_KV_MIN_GATED_DOWN_PRECOMPUTE:-1}"
+E4B_QAT_COMPRESSED_KV_MAX_GATED_DOWN_TILE4="${E4B_QAT_COMPRESSED_KV_MAX_GATED_DOWN_TILE4:-0}"
 E4B_QAT_COMPRESSED_KV_TURBOQUANT_MIN_TOKENS="${E4B_QAT_COMPRESSED_KV_TURBOQUANT_MIN_TOKENS:-0}"
 E4B_QAT_RESIDENT_TOKENS="${E4B_QAT_RESIDENT_TOKENS:-512}"
 E4B_QAT_RESIDENT_MIN_COMPLETION_TOKENS="${E4B_QAT_RESIDENT_MIN_COMPLETION_TOKENS:-$E4B_QAT_RESIDENT_TOKENS}"
@@ -251,6 +266,7 @@ E4B_QAT_RESIDENT_WARM_REPEATS="${E4B_QAT_RESIDENT_WARM_REPEATS:-${RUN_E4B_QAT_RE
 E4B_QAT_RESIDENT_PROMPT="${E4B_QAT_RESIDENT_PROMPT:-Write a detailed technical explanation of how database indexes improve read queries while slowing down writes. Include examples, tradeoffs, tuning advice, and operational caveats.}"
 E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY="${E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY:-required}"
 E4B_QAT_RESIDENT_MIN_GRAPH_REPLAYS="${E4B_QAT_RESIDENT_MIN_GRAPH_REPLAYS:-auto}"
+E4B_QAT_RESIDENT_CAPTURE_MIN_ALLOC_SEQ="${E4B_QAT_RESIDENT_CAPTURE_MIN_ALLOC_SEQ:-200000}"
 E4B_QAT_RESIDENT_PORT="${E4B_QAT_RESIDENT_PORT:-}"
 E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS="${E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS:-}"
 E4B_QAT_RESIDENT_SOAK_REQUESTS="${E4B_QAT_RESIDENT_SOAK_REQUESTS:-6}"
@@ -269,6 +285,7 @@ E4B_Q4K_RESIDENT_DECODE_GRAPH_REPLAY="${E4B_Q4K_RESIDENT_DECODE_GRAPH_REPLAY:-re
 PROMPT_FILTER="${PROMPT_FILTER:-ants_chat code_chat}"
 SPEC_KS="${SPEC_KS:-1 2 4}"
 MTP_MIN_ACTIVE_SPEED_RATIO="${MTP_MIN_ACTIVE_SPEED_RATIO:-1.0}"
+MTP_MIN_ACTIVE_SPEED_TOKENS="${MTP_MIN_ACTIVE_SPEED_TOKENS:-1}"
 MTP_MIN_BENEFIT_RATIO="${MTP_MIN_BENEFIT_RATIO:-1.02}"
 MTP_REPLAY_512_MIN_BENEFIT_RATIO="${MTP_REPLAY_512_MIN_BENEFIT_RATIO:-1.02}"
 RUN_E4B_QAT_COMPETITIVE_FLOOR="${RUN_E4B_QAT_COMPETITIVE_FLOOR:-off}"
@@ -288,11 +305,12 @@ E4B_QAT_PENDING_TOKEN_READBACK="${E4B_QAT_PENDING_TOKEN_READBACK:-1}"
 E4B_QAT_MAX_DOWNLOAD_SYNCS="${E4B_QAT_MAX_DOWNLOAD_SYNCS:-4}"
 E4B_QAT_REQUIRE_PLE_FUSION="${E4B_QAT_REQUIRE_PLE_FUSION:-1}"
 E4B_QAT_MIN_GRAPH_REPLAYS="${E4B_QAT_MIN_GRAPH_REPLAYS:-auto}"
-E4B_QAT_MAX_LAUNCHES_PER_TOKEN="${E4B_QAT_MAX_LAUNCHES_PER_TOKEN:-22.5}"
-E4B_QAT_TEMP_SLOT_PERIOD="${E4B_QAT_TEMP_SLOT_PERIOD:-0}"
+E4B_QAT_MAX_LAUNCHES_PER_TOKEN="${E4B_QAT_MAX_LAUNCHES_PER_TOKEN:-26.0}"
+E4B_QAT_TEMP_SLOT_PERIOD="${E4B_QAT_TEMP_SLOT_PERIOD:-863}"
+E4B_QAT_TEMP_SLOT_SKIP="${E4B_QAT_TEMP_SLOT_SKIP:-2500}"
 E4B_QAT_CAPTURE_ALLOW_UNPINNED="${E4B_QAT_CAPTURE_ALLOW_UNPINNED:-1}"
-E4B_QAT_CAPTURE_MIN_ALLOC_SEQ="${E4B_QAT_CAPTURE_MIN_ALLOC_SEQ:-10000}"
-E4B_QAT_FORCE_KV_CAPACITY="${E4B_QAT_FORCE_KV_CAPACITY:-1024}"
+E4B_QAT_CAPTURE_MIN_ALLOC_SEQ="${E4B_QAT_CAPTURE_MIN_ALLOC_SEQ:-3363}"
+E4B_QAT_FORCE_KV_CAPACITY="${E4B_QAT_FORCE_KV_CAPACITY:-544}"
 MICROBENCH_WARMUP_ITERS="${MICROBENCH_WARMUP_ITERS:-2}"
 MICROBENCH_MEASURE_ITERS="${MICROBENCH_MEASURE_ITERS:-5}"
 MTP_VERIFY_DEVICE_RESULT="${MTP_VERIFY_DEVICE_RESULT:-auto}"
@@ -651,6 +669,7 @@ write_qat_production_summary() {
     --min-backpressure-rejected "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_REJECTED"
     --max-backpressure-reject-ms "$E4B_QAT_RESIDENT_BACKPRESSURE_MAX_REJECT_MS"
     --min-mtp-active-speed-ratio "$MTP_MIN_ACTIVE_SPEED_RATIO"
+    --min-mtp-active-speed-tokens "$MTP_MIN_ACTIVE_SPEED_TOKENS"
     --min-mtp-benefit-ratio "$MTP_MIN_BENEFIT_RATIO"
     --min-mtp-replay-512-benefit-ratio "$MTP_REPLAY_512_MIN_BENEFIT_RATIO"
     --min-mtp-hidden-ab-ratio "$E4B_QAT_MTP_HIDDEN_AB_MIN_RATIO"
@@ -741,6 +760,23 @@ write_qat_production_summary() {
   fi
 }
 
+run_e4b_qat_prefill_smoke() {
+  case "$RUN_E4B_QAT_PREFILL_SMOKE" in
+    1|true|True|on|ON|yes|YES|required)
+      run_logged "e4b_qat_prefill_smoke" "$OUT_DIR/e4b_qat_prefill_smoke.log" "$BIN" cuda-info --e4b-q8-prefill-smoke
+      ;;
+    0|false|False|off|OFF|no|NO)
+      record "e4b_qat_prefill_smoke" "skip" "RUN_E4B_QAT_PREFILL_SMOKE=$RUN_E4B_QAT_PREFILL_SMOKE"
+      ;;
+    auto)
+      run_logged "e4b_qat_prefill_smoke" "$OUT_DIR/e4b_qat_prefill_smoke.log" "$BIN" cuda-info --e4b-q8-prefill-smoke
+      ;;
+    *)
+      record "e4b_qat_prefill_smoke" "fail" "invalid RUN_E4B_QAT_PREFILL_SMOKE=$RUN_E4B_QAT_PREFILL_SMOKE"
+      ;;
+  esac
+}
+
 exists_path() {
   [[ -e "$1" ]]
 }
@@ -825,14 +861,14 @@ e4b_qat_resident_generate_request() {
   local endpoint="$2"
   local response_json="$3"
   local model="${4:-$E4B_QAT}"
-  python3 - "$endpoint" "$response_json" "$model" "$E4B_QAT_RESIDENT_PROMPT" "$E4B_QAT_RESIDENT_TOKENS" "$label" <<'PY'
+  python3 - "$endpoint" "$response_json" "$model" "$E4B_QAT_RESIDENT_PROMPT" "$E4B_QAT_RESIDENT_TOKENS" "$label" "$E4B_QAT_CACHE_DTYPE" <<'PY'
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
 
-url, response_path, model, prompt, tokens, label = sys.argv[1:7]
+url, response_path, model, prompt, tokens, label, cache_dtype = sys.argv[1:8]
 body = {
     "model": model,
     "backend": "cuda",
@@ -840,7 +876,7 @@ body = {
     "max_tokens": int(tokens),
     "temperature": 0,
     "stream": False,
-    "cache_dtype": "f32",
+    "cache_dtype": cache_dtype,
 }
 request = urllib.request.Request(
     url,
@@ -888,7 +924,7 @@ e4b_qat_resident_soak_requests() {
   local min_completion_tokens="$7"
   local tsv_path="$8"
   local meta_json="$9"
-  python3 - "$endpoint" "$response_prefix" "$model" "$E4B_QAT_RESIDENT_PROMPT" "$tokens" "$request_count" "$concurrency" "$min_completion_tokens" "$tsv_path" "$meta_json" <<'PY'
+  python3 - "$endpoint" "$response_prefix" "$model" "$E4B_QAT_RESIDENT_PROMPT" "$tokens" "$request_count" "$concurrency" "$min_completion_tokens" "$tsv_path" "$meta_json" "$E4B_QAT_CACHE_DTYPE" <<'PY'
 import concurrent.futures
 import csv
 import json
@@ -909,7 +945,8 @@ import urllib.request
     min_completion_tokens_arg,
     tsv_path,
     meta_json,
-) = sys.argv[1:11]
+    cache_dtype,
+) = sys.argv[1:12]
 tokens = int(tokens_arg)
 request_count = int(request_count_arg)
 concurrency = int(concurrency_arg)
@@ -931,7 +968,7 @@ def run_one(index):
         "max_tokens": tokens,
         "temperature": 0,
         "stream": False,
-        "cache_dtype": "f32",
+        "cache_dtype": cache_dtype,
     }
     request = urllib.request.Request(
         url,
@@ -1179,7 +1216,7 @@ if replay_mode == "required":
     if graph_floor_arg == "auto":
         requested_tokens = warm_repeats * warm_tokens + expected_requests * soak_tokens
         request_count = warm_repeats + expected_requests
-        graph_floor = max(1, requested_tokens - request_count * 8)
+        graph_floor = max(1, requested_tokens - request_count * 32)
     else:
         graph_floor = int(graph_floor_arg)
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1235,7 +1272,7 @@ e4b_qat_resident_backpressure_requests() {
   local request_count="$5"
   local concurrency="$6"
   local tsv_path="$7"
-  python3 - "$endpoint" "$response_prefix" "$model" "$E4B_QAT_RESIDENT_PROMPT" "$tokens" "$request_count" "$concurrency" "$tsv_path" <<'PY'
+  python3 - "$endpoint" "$response_prefix" "$model" "$E4B_QAT_RESIDENT_PROMPT" "$tokens" "$request_count" "$concurrency" "$tsv_path" "$E4B_QAT_CACHE_DTYPE" <<'PY'
 import concurrent.futures
 import csv
 import json
@@ -1245,7 +1282,7 @@ import time
 import urllib.error
 import urllib.request
 
-url, response_prefix, model, prompt, tokens_arg, request_count_arg, concurrency_arg, tsv_path = sys.argv[1:9]
+url, response_prefix, model, prompt, tokens_arg, request_count_arg, concurrency_arg, tsv_path, cache_dtype = sys.argv[1:10]
 tokens = int(tokens_arg)
 request_count = int(request_count_arg)
 concurrency = int(concurrency_arg)
@@ -1260,7 +1297,7 @@ def run_one(index):
         "max_tokens": tokens,
         "temperature": 0,
         "stream": False,
-        "cache_dtype": "f32",
+        "cache_dtype": cache_dtype,
     }
     request = urllib.request.Request(
         url,
@@ -1638,6 +1675,7 @@ run_e4b_qat_target_once() {
   local -a generate_cmd=(
     "$BIN" generate "$E4B_QAT" "Write one sentence about ants."
     --backend cuda
+    --cache-dtype "$E4B_QAT_CACHE_DTYPE"
     --max-tokens "$E4B_QAT_TOKENS"
     --temperature 0
     --host-budget-mb "$E4B_QAT_HOST_BUDGET_MB"
@@ -1650,19 +1688,43 @@ run_e4b_qat_target_once() {
     --json-timing "$json_path"
     --raw-prompt
     --no-chat-template
+    --ignore-eos
   )
   local -a env_cmd=(
     env
+    ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK=12
     ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$E4B_QAT_DECODE_GRAPH_REPLAY"
     ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$E4B_QAT_TEMP_SLOT_PERIOD"
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP="$E4B_QAT_TEMP_SLOT_SKIP"
     ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$E4B_QAT_CAPTURE_ALLOW_UNPINNED"
     ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$E4B_QAT_CAPTURE_MIN_ALLOC_SEQ"
     ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$E4B_QAT_FORCE_KV_CAPACITY"
     ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$E4B_QAT_Q4_0_GATED_DOWN_TILE8"
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$E4B_QAT_Q4_0_PLE_GATE_FUSION"
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$E4B_QAT_PLE_RMS_EMBED_FUSION"
     ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$E4B_QAT_PENDING_TOKEN_READBACK"
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=1
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS=1
   )
   if [[ -n "$RUN_TIMEOUT" && "$RUN_TIMEOUT" != "0" && "$RUN_TIMEOUT" != "off" && "$RUN_TIMEOUT" != "none" ]]; then
     run_logged "$label" "$log_path" "${env_cmd[@]}" timeout "$RUN_TIMEOUT" "${generate_cmd[@]}"
@@ -1715,20 +1777,44 @@ run_e4b_qat_compressed_kv() {
     --json-timing "$json_path"
     --raw-prompt
     --no-chat-template
+    --ignore-eos
   )
   local -a env_cmd=(
     env
+    ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK=12
     ANTFLY_INFERENCE_CUDA_TURBOQUANT_MIN_TOKENS="$E4B_QAT_COMPRESSED_KV_TURBOQUANT_MIN_TOKENS"
     ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$E4B_QAT_DECODE_GRAPH_REPLAY"
     ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$E4B_QAT_TEMP_SLOT_PERIOD"
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP="$E4B_QAT_TEMP_SLOT_SKIP"
     ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$E4B_QAT_CAPTURE_ALLOW_UNPINNED"
     ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$E4B_QAT_CAPTURE_MIN_ALLOC_SEQ"
     ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$E4B_QAT_FORCE_KV_CAPACITY"
     ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$E4B_QAT_Q4_0_GATED_DOWN_TILE8"
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$E4B_QAT_Q4_0_PLE_GATE_FUSION"
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$E4B_QAT_PLE_RMS_EMBED_FUSION"
     ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$E4B_QAT_PENDING_TOKEN_READBACK"
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=1
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS=1
   )
   if [[ -n "$RUN_TIMEOUT" && "$RUN_TIMEOUT" != "0" && "$RUN_TIMEOUT" != "off" && "$RUN_TIMEOUT" != "none" ]]; then
     run_logged "$label" "$log_path" "${env_cmd[@]}" timeout "$RUN_TIMEOUT" "${generate_cmd[@]}"
@@ -1744,7 +1830,7 @@ run_e4b_qat_compressed_kv() {
     fi
     return
   fi
-  if python3 - "$json_path" "$E4B_QAT_COMPRESSED_KV_MIN_TOKENS" "$E4B_QAT_COMPRESSED_KV_MIN_TOK_S" "$E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS" "$E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS" "$E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS" "$E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS" "$E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_WRITES" "$E4B_QAT_COMPRESSED_KV_MIN_PAGED_UPLOADS" "$E4B_QAT_COMPRESSED_KV_MIN_IDENTITY_ATTENTION_READS" "$E4B_QAT_COMPRESSED_KV_MIN_FAST_GQA" "$E4B_QAT_COMPRESSED_KV_MAX_FAIL_WRITES" >"$validation_path" 2>&1 <<'PY'
+  if python3 - "$json_path" "$E4B_QAT_COMPRESSED_KV_MIN_TOKENS" "$E4B_QAT_COMPRESSED_KV_MIN_TOK_S" "$E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS" "$E4B_QAT_COMPRESSED_KV_MAX_GRAPH_DISCARDS" "$E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS" "$E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS" "$E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS" "$E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_WRITES" "$E4B_QAT_COMPRESSED_KV_MIN_PAGED_UPLOADS" "$E4B_QAT_COMPRESSED_KV_MIN_IDENTITY_ATTENTION_READS" "$E4B_QAT_COMPRESSED_KV_MIN_FAST_GQA" "$E4B_QAT_COMPRESSED_KV_MAX_FAIL_WRITES" "$E4B_QAT_COMPRESSED_KV_MIN_GATED_DOWN_PRECOMPUTE" "$E4B_QAT_COMPRESSED_KV_MAX_GATED_DOWN_TILE4" >"$validation_path" 2>&1 <<'PY'
 import json
 import math
 import sys
@@ -1754,6 +1840,7 @@ import sys
     min_tokens_s,
     min_rate_s,
     min_replays_s,
+    max_discards_s,
     max_download_s,
     max_capacity_s,
     min_compressed_reads_s,
@@ -1762,7 +1849,9 @@ import sys
     min_identity_attention_reads_s,
     min_fast_gqa_s,
     max_fail_writes_s,
-) = sys.argv[1:13]
+    min_gated_down_precompute_s,
+    max_gated_down_tile4_s,
+) = sys.argv[1:16]
 with open(path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
 
@@ -1770,6 +1859,7 @@ tokens = int(data.get("tokens") or data.get("generated_tokens") or 0)
 rate = float(data.get("decode_tok_per_s") or 0.0)
 cuda = data.get("cuda") or {}
 replays = int(cuda.get("graph_capture_persistent_replays") or 0)
+discards = int(cuda.get("graph_capture_discards") or 0)
 downloads = int(cuda.get("download_syncs") or 0)
 capacity_skips = int(cuda.get("graph_capture_capacity_skips") or 0)
 compressed_reads = int(cuda.get("device_kv_compressed_v_reads") or 0)
@@ -1778,9 +1868,12 @@ paged_uploads = int(cuda.get("device_kv_paged_block_table_uploads") or 0)
 identity_attention_reads = int(cuda.get("device_kv_paged_identity_attention_reads") or 0)
 fast_gqa = int(cuda.get("launch_attention_gqa_decode_fast") or 0)
 fail_write = int(cuda.get("device_kv_fail_write") or 0)
+gated_down_precompute = int(cuda.get("gated_down_fused_q4_0_precompute") or 0)
+gated_down_tile4 = int(cuda.get("gated_down_fused_q4_0_tile4") or 0)
 
 min_tokens = int(min_tokens_s)
 min_rate = float(min_rate_s)
+max_discards = int(max_discards_s)
 max_downloads = int(max_download_s)
 max_capacity = int(max_capacity_s)
 min_compressed_reads = int(min_compressed_reads_s)
@@ -1789,6 +1882,8 @@ min_paged_uploads = int(min_paged_uploads_s)
 min_identity_attention_reads = int(min_identity_attention_reads_s)
 min_fast_gqa = int(min_fast_gqa_s)
 max_fail_writes = int(max_fail_writes_s)
+min_gated_down_precompute = int(min_gated_down_precompute_s)
+max_gated_down_tile4 = int(max_gated_down_tile4_s)
 if min_replays_s == "auto":
     min_replays = max(1, min_tokens - 32)
 else:
@@ -1798,6 +1893,7 @@ checks = [
     ("tokens", tokens >= min_tokens, f"{tokens} >= {min_tokens}"),
     ("decode_tok_per_s", rate >= min_rate and math.isfinite(rate), f"{rate:.3f} >= {min_rate:.3f}"),
     ("graph_replays", replays >= min_replays, f"{replays} >= {min_replays}"),
+    ("graph_discards", discards <= max_discards, f"{discards} <= {max_discards}"),
     ("download_syncs", downloads <= max_downloads, f"{downloads} <= {max_downloads}"),
     ("capacity_skips", capacity_skips <= max_capacity, f"{capacity_skips} <= {max_capacity}"),
     ("compressed_v_reads", compressed_reads >= min_compressed_reads, f"{compressed_reads} >= {min_compressed_reads}"),
@@ -1806,14 +1902,17 @@ checks = [
     ("identity_attention_reads", identity_attention_reads >= min_identity_attention_reads, f"{identity_attention_reads} >= {min_identity_attention_reads}"),
     ("fast_gqa", fast_gqa >= min_fast_gqa, f"{fast_gqa} >= {min_fast_gqa}"),
     ("write_fallbacks", fail_write <= max_fail_writes, f"{fail_write} <= {max_fail_writes}"),
+    ("gated_down_precompute", gated_down_precompute >= min_gated_down_precompute, f"{gated_down_precompute} >= {min_gated_down_precompute}"),
+    ("gated_down_tile4", gated_down_tile4 <= max_gated_down_tile4, f"{gated_down_tile4} <= {max_gated_down_tile4}"),
 ]
 
 failed = [f"{name}: {detail}" for name, ok, detail in checks if not ok]
 print(
     "compressed_kv "
-    f"tokens={tokens} tok_s={rate:.3f} replays={replays} downloads={downloads} "
+    f"tokens={tokens} tok_s={rate:.3f} replays={replays} discards={discards} downloads={downloads} "
     f"capacity_skips={capacity_skips} compressed_reads={compressed_reads} compressed_writes={compressed_writes} "
-    f"paged_uploads={paged_uploads} identity_attention_reads={identity_attention_reads} fast_gqa={fast_gqa} fail_write={fail_write}"
+    f"paged_uploads={paged_uploads} identity_attention_reads={identity_attention_reads} fast_gqa={fast_gqa} "
+    f"fail_write={fail_write} gated_down_precompute={gated_down_precompute} gated_down_tile4={gated_down_tile4}"
 )
 if failed:
     print("failed: " + "; ".join(failed))
@@ -1872,6 +1971,7 @@ run_e4b_qat_long_target() {
   local -a generate_cmd=(
     "$BIN" generate "$E4B_QAT" "Write one sentence about ants."
     --backend cuda
+    --cache-dtype "$E4B_QAT_CACHE_DTYPE"
     --max-tokens "$E4B_QAT_LONG_TOKENS"
     --temperature 0
     --host-budget-mb "$E4B_QAT_HOST_BUDGET_MB"
@@ -1884,19 +1984,43 @@ run_e4b_qat_long_target() {
     --json-timing "$json_path"
     --raw-prompt
     --no-chat-template
+    --ignore-eos
   )
   local -a env_cmd=(
     env
+    ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK=12
     ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$E4B_QAT_DECODE_GRAPH_REPLAY"
     ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$E4B_QAT_TEMP_SLOT_PERIOD"
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP="$E4B_QAT_TEMP_SLOT_SKIP"
     ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$E4B_QAT_CAPTURE_ALLOW_UNPINNED"
     ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$E4B_QAT_CAPTURE_MIN_ALLOC_SEQ"
     ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$E4B_QAT_LONG_FORCE_KV_CAPACITY"
     ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$E4B_QAT_Q4_0_GATED_DOWN_TILE8"
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$E4B_QAT_Q4_0_PLE_GATE_FUSION"
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$E4B_QAT_PLE_RMS_EMBED_FUSION"
     ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$E4B_QAT_PENDING_TOKEN_READBACK"
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=1
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS=1
   )
   if [[ -n "$RUN_TIMEOUT" && "$RUN_TIMEOUT" != "0" && "$RUN_TIMEOUT" != "off" && "$RUN_TIMEOUT" != "none" ]]; then
     run_logged "$label" "$log_path" "${env_cmd[@]}" timeout "$RUN_TIMEOUT" "${generate_cmd[@]}"
@@ -2005,17 +2129,40 @@ run_e4b_qat_resident() {
 
   echo "gate: e4b_qat_resident"
   env \
+    ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING=1 \
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=1 \
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK=12 \
     ANTFLY_INFERENCE_CUDA_GRAPH_CAPTURE_PROBE_TRACE="$resident_graph_probe_trace" \
     ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY" \
     ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$E4B_QAT_TEMP_SLOT_PERIOD" \
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP="$E4B_QAT_TEMP_SLOT_SKIP" \
     ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$E4B_QAT_CAPTURE_ALLOW_UNPINNED" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$E4B_QAT_CAPTURE_MIN_ALLOC_SEQ" \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$E4B_QAT_RESIDENT_CAPTURE_MIN_ALLOC_SEQ" \
     ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$E4B_QAT_FORCE_KV_CAPACITY" \
     ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1 \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1 \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1 \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1 \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1 \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1 \
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$E4B_QAT_Q4_0_GATED_DOWN_TILE8" \
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$E4B_QAT_Q4_0_PLE_GATE_FUSION" \
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$E4B_QAT_PLE_RMS_EMBED_FUSION" \
     ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$E4B_QAT_PENDING_TOKEN_READBACK" \
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1 \
+    ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A=1 \
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=1 \
+    ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS=1 \
     "$BIN" run \
       --host "$host" \
       --port "$port" \
@@ -2176,6 +2323,7 @@ run_e4b_q4k_resident_baseline() {
     ANTFLY_INFERENCE_CUDA_GRAPH_CAPTURE_PROBE_TRACE="$graph_probe_trace" \
     ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$E4B_Q4K_RESIDENT_DECODE_GRAPH_REPLAY" \
     ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$E4B_QAT_TEMP_SLOT_PERIOD" \
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP="$E4B_QAT_TEMP_SLOT_SKIP" \
     ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$E4B_QAT_CAPTURE_ALLOW_UNPINNED" \
     ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$E4B_QAT_CAPTURE_MIN_ALLOC_SEQ" \
     ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$E4B_QAT_FORCE_KV_CAPACITY" \
@@ -3049,11 +3197,18 @@ else
   record "build_cuda_sm89" "skip" "RUN_BUILD=0"
 fi
 
+if [[ "$RUN_CUDA_ARTIFACT_CHECK" == "1" ]]; then
+  run_logged "cuda_artifact_check" "$OUT_DIR/cuda_artifact_check.log" "$ROOT_DIR/zig/pkg/inference/scripts/regen-cuda-artifacts.sh" --check --all
+else
+  record "cuda_artifact_check" "skip" "RUN_CUDA_ARTIFACT_CHECK=$RUN_CUDA_ARTIFACT_CHECK"
+fi
+
 if [[ "$RUN_SMOKE" == "1" ]]; then
   run_logged "cuda_smoke" "$OUT_DIR/cuda_smoke.log" "$BIN" cuda-info --smoke
 else
   record "cuda_smoke" "skip" "RUN_SMOKE=0"
 fi
+run_e4b_qat_prefill_smoke
 write_cuda_environment
 
 if [[ "$RUN_MICROBENCH" == "1" ]]; then
@@ -3123,7 +3278,7 @@ run_e4b_qat_provider_benchmark
 write_qat_production_summary
 
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$OUT_DIR" "$TARGET_BASELINE_MIN_RATIO" "$AUTO_MIN_RATIO" "$PROMOTION_RATIO" "$MIN_12B_Q8_TOK_S" "$MIN_12B_Q4K_TOK_S" "$MIN_E2B_TOK_S" "$MIN_E4B_QAT_TOK_S" "$MIN_E4B_QAT_RUN_TOK_S" "$MIN_E4B_QAT_OVER_Q4K_RATIO" "$E4B_QAT_TOKENS" "$E4B_QAT_REPEATS" "$E4B_QAT_REQUIRE_FUSED" "$E4B_QAT_REQUIRE_FAST_GQA" "$E4B_QAT_REQUIRE_GRAPH_REPLAY" "$E4B_QAT_REQUIRE_DEVICE_TOKEN_HANDOFF" "$E4B_QAT_MIN_GRAPH_REPLAYS" "$E4B_QAT_MAX_LAUNCHES_PER_TOKEN" "$E4B_QAT_REQUIRE_GATED_DOWN_TILE8" "$E4B_QAT_REQUIRE_RAW_TOKEN_EXPORT" "$E4B_QAT_MAX_DOWNLOAD_SYNCS" "$E4B_QAT_REQUIRE_PLE_FUSION" "$E4B_QAT_LONG_TOKENS" "$E4B_QAT_LONG_MIN_TOKENS" "$MIN_E4B_QAT_LONG_TOK_S" "$E4B_QAT_LONG_MIN_GRAPH_REPLAYS" "$E4B_QAT_LONG_MAX_LAUNCHES_PER_TOKEN" "$E4B_QAT_LONG_MAX_DOWNLOAD_SYNCS" "$MIN_E4B_QAT_RESIDENT_OVER_Q4K_RATIO" "$RUN_E4B_QAT_RESIDENT_SOAK" "$E4B_QAT_RESIDENT_SOAK_REQUESTS" "$E4B_QAT_RESIDENT_SOAK_CONCURRENCY" "$E4B_QAT_RESIDENT_SOAK_TOKENS" "$E4B_QAT_RESIDENT_SOAK_MIN_COMPLETION_TOKENS" "$MIN_E4B_QAT_RESIDENT_SOAK_AGG_TOK_S" "$MIN_E4B_QAT_RESIDENT_SOAK_REQUEST_TOK_S" "$E4B_QAT_RESIDENT_SOAK_MAX_P95_E2E_MS" "$E4B_QAT_RESIDENT_SOAK_MIN_GRAPH_REPLAYS" "$RUN_E4B_QAT_RESIDENT_BACKPRESSURE" "$E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS" "$E4B_QAT_RESIDENT_BACKPRESSURE_REQUESTS" "$E4B_QAT_RESIDENT_BACKPRESSURE_CONCURRENCY" "$E4B_QAT_RESIDENT_BACKPRESSURE_TOKENS" "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_ACCEPTED" "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_REJECTED" "$E4B_QAT_RESIDENT_BACKPRESSURE_MAX_REJECT_MS" "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_GRAPH_REPLAYS" "$MTP_MIN_ACTIVE_SPEED_RATIO" <<'PY'
+  python3 - "$OUT_DIR" "$TARGET_BASELINE_MIN_RATIO" "$AUTO_MIN_RATIO" "$PROMOTION_RATIO" "$MIN_12B_Q8_TOK_S" "$MIN_12B_Q4K_TOK_S" "$MIN_E2B_TOK_S" "$MIN_E4B_QAT_TOK_S" "$MIN_E4B_QAT_RUN_TOK_S" "$MIN_E4B_QAT_OVER_Q4K_RATIO" "$E4B_QAT_TOKENS" "$E4B_QAT_REPEATS" "$E4B_QAT_REQUIRE_FUSED" "$E4B_QAT_REQUIRE_FAST_GQA" "$E4B_QAT_REQUIRE_GRAPH_REPLAY" "$E4B_QAT_REQUIRE_DEVICE_TOKEN_HANDOFF" "$E4B_QAT_MIN_GRAPH_REPLAYS" "$E4B_QAT_MAX_LAUNCHES_PER_TOKEN" "$E4B_QAT_REQUIRE_GATED_DOWN_TILE8" "$E4B_QAT_REQUIRE_RAW_TOKEN_EXPORT" "$E4B_QAT_MAX_DOWNLOAD_SYNCS" "$E4B_QAT_REQUIRE_PLE_FUSION" "$E4B_QAT_LONG_TOKENS" "$E4B_QAT_LONG_MIN_TOKENS" "$MIN_E4B_QAT_LONG_TOK_S" "$E4B_QAT_LONG_MIN_GRAPH_REPLAYS" "$E4B_QAT_LONG_MAX_LAUNCHES_PER_TOKEN" "$E4B_QAT_LONG_MAX_DOWNLOAD_SYNCS" "$MIN_E4B_QAT_RESIDENT_OVER_Q4K_RATIO" "$RUN_E4B_QAT_RESIDENT_SOAK" "$E4B_QAT_RESIDENT_SOAK_REQUESTS" "$E4B_QAT_RESIDENT_SOAK_CONCURRENCY" "$E4B_QAT_RESIDENT_SOAK_TOKENS" "$E4B_QAT_RESIDENT_SOAK_MIN_COMPLETION_TOKENS" "$MIN_E4B_QAT_RESIDENT_SOAK_AGG_TOK_S" "$MIN_E4B_QAT_RESIDENT_SOAK_REQUEST_TOK_S" "$E4B_QAT_RESIDENT_SOAK_MAX_P95_E2E_MS" "$E4B_QAT_RESIDENT_SOAK_MIN_GRAPH_REPLAYS" "$RUN_E4B_QAT_RESIDENT_BACKPRESSURE" "$E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS" "$E4B_QAT_RESIDENT_BACKPRESSURE_REQUESTS" "$E4B_QAT_RESIDENT_BACKPRESSURE_CONCURRENCY" "$E4B_QAT_RESIDENT_BACKPRESSURE_TOKENS" "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_ACCEPTED" "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_REJECTED" "$E4B_QAT_RESIDENT_BACKPRESSURE_MAX_REJECT_MS" "$E4B_QAT_RESIDENT_BACKPRESSURE_MIN_GRAPH_REPLAYS" "$MTP_MIN_ACTIVE_SPEED_RATIO" "$MTP_MIN_ACTIVE_SPEED_TOKENS" <<'PY'
 import csv
 import json
 import pathlib
@@ -3179,6 +3334,7 @@ e4b_qat_resident_backpressure_min_rejected = int(float(sys.argv[45]))
 e4b_qat_resident_backpressure_max_reject_ms = float(sys.argv[46])
 e4b_qat_resident_backpressure_min_graph_replays = sys.argv[47]
 mtp_min_active_speed_ratio = float(sys.argv[48])
+mtp_min_active_speed_tokens = int(float(sys.argv[49]))
 if e4b_qat_resident_max_concurrent_requests_arg == "":
     e4b_qat_resident_max_concurrent_requests = None
 else:
@@ -3314,10 +3470,16 @@ def analyze_summary(summary_path):
         ratio = rate / target_rate if target_rate > 0 else 0.0
         if decision in {"active", "forced"}:
             if not diagnostic_matrix:
+                tokens = to_int(row.get("tokens"))
+                enforce_speed = tokens is None or tokens >= mtp_min_active_speed_tokens
                 add_check(
                     f"{summary_path.parent.name}_{label}_{case}_active_ratio",
-                    ratio >= mtp_min_active_speed_ratio,
-                    f"ratio={ratio:.3f} floor={mtp_min_active_speed_ratio:.3f} rate={rate:.3f} target={target_rate:.3f}",
+                    (not enforce_speed) or ratio >= mtp_min_active_speed_ratio,
+                    (
+                        f"ratio={ratio:.3f} floor={mtp_min_active_speed_ratio:.3f} "
+                        f"rate={rate:.3f} target={target_rate:.3f} tokens={tokens} "
+                        f"min_tokens={mtp_min_active_speed_tokens}"
+                    ),
                 )
             fallbacks = to_int(row.get("dedicated_runtime_fallbacks"))
             if fallbacks is not None:

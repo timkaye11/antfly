@@ -1198,11 +1198,17 @@ def make_verdict(report: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
                 f"{matrix_name}_{candidate.get('assistant')}_k{candidate.get('spec_k')}_{candidate.get('case')}"
             )
             ratio = to_float(candidate.get("target_ratio"))
+            tokens = to_int(candidate.get("tokens"))
+            enforce_speed = tokens is None or tokens >= args.min_mtp_active_speed_tokens
             add_verdict_check(
                 verdict,
                 candidate_name + "_active_ratio",
-                ratio is not None and ratio >= args.min_mtp_active_speed_ratio,
-                f"ratio={ratio} floor={args.min_mtp_active_speed_ratio} rate={candidate.get('decode_tok_s')} target={candidate.get('target_decode_tok_s')}",
+                (not enforce_speed) or (ratio is not None and ratio >= args.min_mtp_active_speed_ratio),
+                (
+                    f"ratio={ratio} floor={args.min_mtp_active_speed_ratio} "
+                    f"rate={candidate.get('decode_tok_s')} target={candidate.get('target_decode_tok_s')} "
+                    f"tokens={tokens} min_tokens={args.min_mtp_active_speed_tokens}"
+                ),
             )
             dedicated_fallbacks = to_int(candidate.get("dedicated_runtime_fallbacks"))
             if dedicated_fallbacks is not None:
@@ -1551,6 +1557,7 @@ def main() -> int:
     parser.add_argument("--min-backpressure-rejected", type=int, default=1)
     parser.add_argument("--max-backpressure-reject-ms", type=float, default=float("inf"))
     parser.add_argument("--min-mtp-active-speed-ratio", type=float, default=1.0)
+    parser.add_argument("--min-mtp-active-speed-tokens", type=int, default=1)
     parser.add_argument("--min-mtp-benefit-ratio", type=float, default=1.02)
     parser.add_argument("--min-mtp-replay-512-benefit-ratio", type=float, default=1.02)
     parser.add_argument("--min-mtp-hidden-ab-ratio", type=float, default=1.03)

@@ -22,6 +22,7 @@ Environment overrides:
   RUN_E4B_Q4K_BASELINE          auto|required|off (default: auto)
   RUN_E4B_Q4K_RESIDENT_BASELINE auto|required|off (default: auto)
   RUN_CUDA_ENV                  auto|required|off capture cuda-info --smoke metadata (default: auto)
+  RUN_E4B_QAT_PREFILL_SMOKE     auto|required|off capture E4B Q8_1 row-prefill smoke (default: RUN_CUDA_ENV)
   RUN_E4B_QAT_PROVIDER_COMPARISON auto|required|off require local QAT to clear provider baselines (default: off)
   RUN_E4B_QAT_PROVIDER_BENCHMARK auto|required|off collect OpenAI-compatible provider baseline (default: off)
   RUN_E4B_QAT_COMPETITIVE_FLOOR auto|required|off require local QAT to clear named tok/s floors (default: off)
@@ -42,6 +43,7 @@ Environment overrides:
   E4B_Q4K_BASELINE_MODEL        Gemma4 E4B Q4_K baseline model directory
   E4B_QAT_TOKENS                E4B QAT target-only generated tokens (default: 512)
   E4B_QAT_REPEATS               E4B QAT target-only repeat runs (default: 2)
+  E4B_QAT_CACHE_DTYPE           E4B QAT target/resident KV cache dtype (default: polar4)
   E4B_QAT_LONG_TOKENS           E4B QAT long generated-token request (default: 1024)
   E4B_QAT_LONG_MIN_TOKENS       E4B QAT long generated-token floor, EOS-aware (default: 768)
   E4B_QAT_LONG_KV_BUDGET_MB     E4B QAT long KV budget (default: 1024)
@@ -57,6 +59,7 @@ Environment overrides:
   E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS weighted in-flight request capacity for server overload checks
   E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY off|auto|required for server gate (default: required)
   E4B_QAT_RESIDENT_MIN_GRAPH_REPLAYS server replay floor, or auto for tokens/3 (default: auto)
+  E4B_QAT_RESIDENT_CAPTURE_MIN_ALLOC_SEQ delayed server capture warmup allocation sequence (default: 200000)
   E4B_QAT_RESIDENT_SOAK_REQUESTS concurrent soak requests after warm pass (default: 6)
   E4B_QAT_RESIDENT_SOAK_CONCURRENCY soak request concurrency (default: 2)
   E4B_QAT_RESIDENT_SOAK_TOKENS soak generated tokens per request (default: 256)
@@ -83,12 +86,16 @@ Environment overrides:
   E4B_QAT_PENDING_TOKEN_READBACK 1 to enable delayed CUDA token readback for QAT (default: 1)
   E4B_QAT_MAX_DOWNLOAD_SYNCS    QAT generate download-sync ceiling, off to disable (default: 4)
   E4B_QAT_REQUIRE_PLE_FUSION    1 to require fused PLE add-multiply counters (default: 1)
+  E4B_QAT_REQUIRE_Q8_1_PRECOMPUTE 1 to require row-aware Q8_1 precompute counters (default: 1)
+  E4B_QAT_MAX_GRAPH_DISCARDS    graph-capture discard ceiling (default: 1)
   E4B_QAT_MIN_GRAPH_REPLAYS     replay floor, or auto for tokens-64 (default: auto)
-  E4B_QAT_MAX_LAUNCHES_PER_TOKEN QAT launch density ceiling (default: 22.5)
-  E4B_QAT_TEMP_SLOT_PERIOD      pinned temp slot period for graph capture (default: 0)
+  E4B_QAT_MAX_LAUNCHES_PER_TOKEN QAT launch density ceiling (default: 26.0)
+  E4B_QAT_TEMP_SLOT_PERIOD      pinned temp slot period for graph capture (default: 863)
+  E4B_QAT_TEMP_SLOT_SKIP        pinned temp slot warmup skip for graph capture (default: 2500)
   E4B_QAT_CAPTURE_ALLOW_UNPINNED allow stable-reuse graph capture without pinned slots (default: 1)
-  E4B_QAT_CAPTURE_MIN_ALLOC_SEQ delayed capture warmup allocation sequence (default: 10000)
-  E4B_QAT_FORCE_KV_CAPACITY     forced graph replay KV capacity tokens (default: 1024)
+  E4B_QAT_CAPTURE_MIN_ALLOC_SEQ delayed capture warmup allocation sequence (default: 3363)
+  E4B_QAT_FORCE_KV_CAPACITY     forced graph replay KV capacity tokens (default: 544)
+  E4B_QAT_FAST_Q4_0_ENV         enable QAT CUDA DP4A/Q8_1 fast env bundle (default: 1)
   GEMMA12B_Q4_MODEL             Gemma4 12B Q4 model path/directory
   LONG_CONTEXT_TOKENS           full-mode E2B polar4 stress tokens (default: 512)
   REQUIRE_SPEED_THRESHOLDS      1 to enforce tok/s floors (default: full only)
@@ -120,6 +127,7 @@ Environment overrides:
   MTP_CACHE_DTYPE               target/draft KV cache dtype for MTP (default: f32)
   MTP_TURBOQUANT_MIN_TOKENS     TurboQuant min token threshold for MTP (default: 0)
   MTP_MIN_ACTIVE_SPEED_RATIO    active-MTP tok/s floor vs target-only (default: 1.0)
+  MTP_MIN_ACTIVE_SPEED_TOKENS   generated-token floor before enforcing active-MTP tok/s (default: 1)
   MTP_TARGET_REPLAY             off|auto|required target-side replay policy (default: auto)
   MTP_REPLAY_CONTEXT_KEY        auto|0|1 context-keyed replay cache (default: auto)
   MTP_UNSAFE_TARGET_REPLAY      auto|0|1 allow unsafe target replay testing (default: auto)
@@ -179,6 +187,7 @@ run_e4b_qat_resident_backpressure="${RUN_E4B_QAT_RESIDENT_BACKPRESSURE:-off}"
 run_e4b_q4k_baseline="${RUN_E4B_Q4K_BASELINE:-auto}"
 run_e4b_q4k_resident_baseline="${RUN_E4B_Q4K_RESIDENT_BASELINE:-auto}"
 run_cuda_env="${RUN_CUDA_ENV:-auto}"
+run_e4b_qat_prefill_smoke="${RUN_E4B_QAT_PREFILL_SMOKE:-$run_cuda_env}"
 run_e4b_qat_provider_comparison="${RUN_E4B_QAT_PROVIDER_COMPARISON:-off}"
 run_e4b_qat_provider_benchmark="${RUN_E4B_QAT_PROVIDER_BENCHMARK:-off}"
 run_e4b_qat_competitive_floor="${RUN_E4B_QAT_COMPETITIVE_FLOOR:-off}"
@@ -203,6 +212,7 @@ e4b_qat_resident_port="${E4B_QAT_RESIDENT_PORT:-}"
 e4b_qat_resident_max_concurrent_requests="${E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS:-}"
 e4b_qat_resident_decode_graph_replay="${E4B_QAT_RESIDENT_DECODE_GRAPH_REPLAY:-required}"
 e4b_qat_resident_min_graph_replays="${E4B_QAT_RESIDENT_MIN_GRAPH_REPLAYS:-auto}"
+e4b_qat_resident_capture_min_alloc_seq="${E4B_QAT_RESIDENT_CAPTURE_MIN_ALLOC_SEQ:-200000}"
 e4b_qat_resident_soak_request_count="${E4B_QAT_RESIDENT_SOAK_REQUESTS:-6}"
 e4b_qat_resident_soak_concurrency="${E4B_QAT_RESIDENT_SOAK_CONCURRENCY:-2}"
 e4b_qat_resident_soak_tokens="${E4B_QAT_RESIDENT_SOAK_TOKENS:-256}"
@@ -229,12 +239,16 @@ e4b_qat_require_raw_token_export="${E4B_QAT_REQUIRE_RAW_TOKEN_EXPORT:-1}"
 e4b_qat_pending_token_readback="${E4B_QAT_PENDING_TOKEN_READBACK:-1}"
 e4b_qat_max_download_syncs="${E4B_QAT_MAX_DOWNLOAD_SYNCS:-4}"
 e4b_qat_require_ple_fusion="${E4B_QAT_REQUIRE_PLE_FUSION:-1}"
+e4b_qat_require_q8_1_precompute="${E4B_QAT_REQUIRE_Q8_1_PRECOMPUTE:-1}"
+e4b_qat_max_graph_discards="${E4B_QAT_MAX_GRAPH_DISCARDS:-1}"
 e4b_qat_min_graph_replays="${E4B_QAT_MIN_GRAPH_REPLAYS:-auto}"
-e4b_qat_max_launches_per_token="${E4B_QAT_MAX_LAUNCHES_PER_TOKEN:-22.5}"
-e4b_qat_temp_slot_period="${E4B_QAT_TEMP_SLOT_PERIOD:-0}"
+e4b_qat_max_launches_per_token="${E4B_QAT_MAX_LAUNCHES_PER_TOKEN:-26.0}"
+e4b_qat_temp_slot_period="${E4B_QAT_TEMP_SLOT_PERIOD:-863}"
+e4b_qat_temp_slot_skip="${E4B_QAT_TEMP_SLOT_SKIP:-2500}"
 e4b_qat_capture_allow_unpinned="${E4B_QAT_CAPTURE_ALLOW_UNPINNED:-1}"
-e4b_qat_capture_min_alloc_seq="${E4B_QAT_CAPTURE_MIN_ALLOC_SEQ:-10000}"
-e4b_qat_force_kv_capacity="${E4B_QAT_FORCE_KV_CAPACITY:-1024}"
+e4b_qat_capture_min_alloc_seq="${E4B_QAT_CAPTURE_MIN_ALLOC_SEQ:-3363}"
+e4b_qat_force_kv_capacity="${E4B_QAT_FORCE_KV_CAPACITY:-544}"
+e4b_qat_fast_q4_0_env="${E4B_QAT_FAST_Q4_0_ENV:-1}"
 min_e4b_qat_tok_s="${MIN_E4B_QAT_TOK_S:-24.0}"
 min_e4b_qat_run_tok_s="${MIN_E4B_QAT_RUN_TOK_S:-24.0}"
 min_e4b_qat_long_tok_s="${MIN_E4B_QAT_LONG_TOK_S:-15.0}"
@@ -268,6 +282,7 @@ e4b_qat_provider_baseline_stats="${E4B_QAT_PROVIDER_BASELINE_STATS:-avg,median,m
 e4b_qat_provider_max_token_field="${E4B_QAT_PROVIDER_MAX_TOKEN_FIELD:-max_completion_tokens}"
 e4b_qat_provider_notes="${E4B_QAT_PROVIDER_NOTES:-gate-collected provider baseline}"
 e4b_qat_prompt="${E4B_QAT_PROMPT:-Write one sentence about ants.}"
+e4b_qat_cache_dtype="${E4B_QAT_CACHE_DTYPE:-polar4}"
 e4b_qat_host_budget_mb="${E4B_QAT_HOST_BUDGET_MB:-8000}"
 e4b_qat_combined_budget_mb="${E4B_QAT_COMBINED_BUDGET_MB:-18000}"
 e4b_qat_backend_budget_mb="${E4B_QAT_BACKEND_BUDGET_MB:-12000}"
@@ -287,6 +302,7 @@ mtp_speculative_k="${MTP_SPECULATIVE_K:-2}"
 mtp_cache_dtype="${MTP_CACHE_DTYPE:-f32}"
 mtp_turboquant_min_tokens="${MTP_TURBOQUANT_MIN_TOKENS:-0}"
 mtp_min_active_speed_ratio="${MTP_MIN_ACTIVE_SPEED_RATIO:-1.0}"
+mtp_min_active_speed_tokens="${MTP_MIN_ACTIVE_SPEED_TOKENS:-1}"
 mtp_target_replay="${MTP_TARGET_REPLAY:-auto}"
 mtp_replay_context_key="${MTP_REPLAY_CONTEXT_KEY:-auto}"
 mtp_unsafe_target_replay="${MTP_UNSAFE_TARGET_REPLAY:-auto}"
@@ -325,6 +341,63 @@ e4b_qat_provider_generated_baseline_json=""
 
 log() {
   printf '%s\n' "$*" | tee -a "$summary"
+}
+
+case "$run_mtp" in
+  auto|required|off)
+    ;;
+  *)
+    log "invalid RUN_MTP=$run_mtp; expected auto|required|off"
+    exit 2
+    ;;
+esac
+if [ "$mode" = "mtp-only" ] && [ "$run_mtp" = "off" ]; then
+  log "invalid --mtp-only with RUN_MTP=off; use RUN_MTP=auto or RUN_MTP=required"
+  exit 2
+fi
+
+e4b_qat_cuda_env() {
+  local -a env_args=(
+    ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING=1
+    ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$e4b_qat_decode_graph_replay"
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$e4b_qat_temp_slot_period"
+    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP="$e4b_qat_temp_slot_skip"
+    ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$e4b_qat_capture_allow_unpinned"
+    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$e4b_qat_capture_min_alloc_seq"
+    ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$e4b_qat_force_kv_capacity"
+    ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY=1
+    ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1
+    ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$e4b_qat_pending_token_readback"
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=1
+    ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK=12
+  )
+  case "$e4b_qat_fast_q4_0_env" in
+    0|false|False|off|OFF|no|NO)
+      ;;
+    *)
+      env_args+=(
+        ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=1
+        ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_EXACT_THREADS=1
+      )
+      ;;
+  esac
+  env "${env_args[@]}" "$@"
 }
 
 capture_cuda_environment() {
@@ -383,6 +456,36 @@ PY
   fi
   python3 "$parser" --log "$log_path" --out "$json_path" --status skip --detail "$detail" >/dev/null
   log "SKIP cuda_environment: $detail"
+}
+
+run_e4b_qat_prefill_smoke_if_enabled() {
+  case "$run_e4b_qat_prefill_smoke" in
+    auto|required|off)
+      ;;
+    *)
+      log "invalid RUN_E4B_QAT_PREFILL_SMOKE=$run_e4b_qat_prefill_smoke; expected auto|required|off"
+      exit 2
+      ;;
+  esac
+
+  if [ "$run_e4b_qat_prefill_smoke" = "off" ]; then
+    log "SKIP e4b_qat_prefill_smoke: RUN_E4B_QAT_PREFILL_SMOKE=off"
+    return 0
+  fi
+
+  local log_path="$out_dir/e4b_qat_prefill_smoke.log"
+  log "RUN e4b_qat_prefill_smoke: $antfly_bin cuda-info --e4b-q8-prefill-smoke"
+  if "$antfly_bin" cuda-info --e4b-q8-prefill-smoke >"$log_path" 2>&1; then
+    log "PASS e4b_qat_prefill_smoke: $log_path"
+    return 0
+  fi
+
+  local status=$?
+  if [ "$run_e4b_qat_prefill_smoke" = "required" ]; then
+    log "FAIL e4b_qat_prefill_smoke: exit_$status $log_path"
+    exit "$status"
+  fi
+  log "SKIP e4b_qat_prefill_smoke: exit_$status $log_path"
 }
 
 run_e4b_qat_provider_benchmark() {
@@ -541,6 +644,7 @@ write_qat_production_summary() {
     --min-backpressure-rejected "$e4b_qat_resident_backpressure_min_rejected"
     --max-backpressure-reject-ms "$e4b_qat_resident_backpressure_max_reject_ms"
     --min-mtp-active-speed-ratio "$mtp_min_active_speed_ratio"
+    --min-mtp-active-speed-tokens "$mtp_min_active_speed_tokens"
   )
   if [ "$run_cuda_env" = "required" ]; then
     summary_args+=(--require-cuda-environment)
@@ -563,7 +667,7 @@ write_qat_production_summary() {
       summary_args+=(--require-backpressure)
     fi
   fi
-  if [ "$run_mtp" != "off" ] || [ "$mode" = "mtp-only" ]; then
+  if [ "$run_mtp" != "off" ]; then
     summary_args+=(--require-mtp)
   fi
   if [ "$run_e4b_qat_provider_comparison" != "off" ] || [ -n "$e4b_qat_provider_generated_baseline_json" ] || [ "$run_e4b_qat_provider_benchmark" = "required" ]; then
@@ -891,20 +995,13 @@ run_e4b_qat_gate_if_enabled() {
 
 run_e4b_qat_gate_once() {
   local label="$1"
-  run_generate_json "$label" env \
-    ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$e4b_qat_decode_graph_replay" \
-    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$e4b_qat_temp_slot_period" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$e4b_qat_capture_allow_unpinned" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$e4b_qat_capture_min_alloc_seq" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$e4b_qat_force_kv_capacity" \
-    ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1 \
+  run_generate_json "$label" e4b_qat_cuda_env \
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$e4b_qat_q4_0_gated_down_tile8" \
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$e4b_qat_q4_0_ple_gate_fusion" \
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$e4b_qat_ple_rms_embed_fusion" \
-    ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$e4b_qat_pending_token_readback" \
     "$antfly_bin" generate "$e4b_qat_model" "$e4b_qat_prompt" \
     --backend cuda \
-    --cache-dtype f32 \
+    --cache-dtype "$e4b_qat_cache_dtype" \
     --max-tokens "$e4b_qat_tokens" \
     --temperature 0 \
     --raw-prompt \
@@ -963,20 +1060,14 @@ run_e4b_qat_long_gate_if_enabled() {
     exit 2
   fi
 
-  run_generate_json e4b_qat_cuda_long env \
-    ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$e4b_qat_decode_graph_replay" \
-    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$e4b_qat_temp_slot_period" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$e4b_qat_capture_allow_unpinned" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$e4b_qat_capture_min_alloc_seq" \
+  run_generate_json e4b_qat_cuda_long e4b_qat_cuda_env \
     ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$e4b_qat_long_force_kv_capacity" \
-    ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1 \
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$e4b_qat_q4_0_gated_down_tile8" \
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$e4b_qat_q4_0_ple_gate_fusion" \
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$e4b_qat_ple_rms_embed_fusion" \
-    ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$e4b_qat_pending_token_readback" \
     "$antfly_bin" generate "$e4b_qat_model" "$e4b_qat_prompt" \
     --backend cuda \
-    --cache-dtype f32 \
+    --cache-dtype "$e4b_qat_cache_dtype" \
     --max-tokens "$e4b_qat_long_tokens" \
     --temperature 0 \
     --raw-prompt \
@@ -1029,13 +1120,13 @@ run_e4b_q4k_baseline_if_enabled() {
 }
 
 check_e4b_qat_gate_json_if_present() {
-  python3 - "$out_dir" "$min_e4b_qat_tok_s" "$min_e4b_qat_run_tok_s" "$min_e4b_qat_over_q4k_ratio" "$e4b_qat_tokens" "$e4b_qat_repeats" "$e4b_qat_require_fused" "$e4b_qat_require_fast_gqa" "$e4b_qat_require_graph_replay" "$e4b_qat_require_device_token_handoff" "$e4b_qat_min_graph_replays" "$e4b_qat_max_launches_per_token" "$e4b_qat_require_gated_down_tile8" "$e4b_qat_require_raw_token_export" "$e4b_qat_max_download_syncs" "$e4b_qat_require_ple_fusion" <<'PY'
+  python3 - "$out_dir" "$min_e4b_qat_tok_s" "$min_e4b_qat_run_tok_s" "$min_e4b_qat_over_q4k_ratio" "$e4b_qat_tokens" "$e4b_qat_repeats" "$e4b_qat_require_fused" "$e4b_qat_require_fast_gqa" "$e4b_qat_require_graph_replay" "$e4b_qat_require_device_token_handoff" "$e4b_qat_min_graph_replays" "$e4b_qat_max_launches_per_token" "$e4b_qat_require_gated_down_tile8" "$e4b_qat_require_raw_token_export" "$e4b_qat_max_download_syncs" "$e4b_qat_require_ple_fusion" "$e4b_qat_require_q8_1_precompute" "$e4b_qat_max_graph_discards" <<'PY'
 import glob
 import json
 import os
 import sys
 
-out_dir, min_tok_s, min_run_tok_s, min_qat_over_q4k_ratio, min_tokens, repeats, require_fused, require_fast_gqa, require_graph, require_device_token_handoff, min_graph_replays, max_launches, require_gated_down_tile8, require_raw_token_export, max_download_syncs, require_ple_fusion = sys.argv[1:17]
+out_dir, min_tok_s, min_run_tok_s, min_qat_over_q4k_ratio, min_tokens, repeats, require_fused, require_fast_gqa, require_graph, require_device_token_handoff, min_graph_replays, max_launches, require_gated_down_tile8, require_raw_token_export, max_download_syncs, require_ple_fusion, require_q8_1_precompute, max_graph_discards = sys.argv[1:19]
 min_tok_s = float(min_tok_s)
 min_run_tok_s = float(min_run_tok_s)
 min_qat_over_q4k_ratio = float(min_qat_over_q4k_ratio)
@@ -1049,6 +1140,8 @@ require_gated_down_tile8 = require_gated_down_tile8.lower() not in {"0", "false"
 require_raw_token_export = require_raw_token_export.lower() not in {"0", "false", "off", "no"}
 max_download_syncs = None if max_download_syncs.lower() in {"", "off", "none", "no"} else int(float(max_download_syncs))
 require_ple_fusion = require_ple_fusion.lower() not in {"0", "false", "off", "no"}
+require_q8_1_precompute = require_q8_1_precompute.lower() not in {"0", "false", "off", "no"}
+max_graph_discards = int(float(max_graph_discards))
 if min_graph_replays.lower() in {"", "auto"}:
     min_graph_replays = max(1, min_tokens - 64)
 else:
@@ -1085,6 +1178,13 @@ for path in paths:
         add_mul_fused = int(cuda.get("add_mul_scalar_fused") or 0)
         if add_mul_fused < min_tokens:
             errors.append(f"{name}: add_mul_scalar_fused={add_mul_fused} < {min_tokens}")
+    if require_q8_1_precompute:
+        gated_down_precompute = int(cuda.get("gated_down_fused_q4_0_precompute") or 0)
+        if gated_down_precompute <= 0:
+            errors.append(f"{name}: gated_down_fused_q4_0_precompute={gated_down_precompute}")
+        gated_down_tile4 = int(cuda.get("gated_down_fused_q4_0_tile4") or 0)
+        if gated_down_tile4 != 0:
+            errors.append(f"{name}: gated_down_fused_q4_0_tile4={gated_down_tile4} > 0")
     scalar_launches_raw = cuda.get("launch_scalar")
     if scalar_launches_raw is None:
         errors.append(f"{name}: launch_scalar missing")
@@ -1128,6 +1228,9 @@ for path in paths:
         graph_replays = int(cuda.get("graph_capture_persistent_replays") or 0)
         if graph_replays < min_graph_replays:
             errors.append(f"{name}: graph_capture_persistent_replays={graph_replays} < {min_graph_replays}")
+        graph_discards = int(cuda.get("graph_capture_discards") or 0)
+        if graph_discards > max_graph_discards:
+            errors.append(f"{name}: graph_capture_discards={graph_discards} > {max_graph_discards}")
         capacity_skips = int(cuda.get("graph_capture_capacity_skips") or 0)
         if capacity_skips != 0:
             errors.append(f"{name}: graph_capture_capacity_skips={capacity_skips}")
@@ -1451,7 +1554,8 @@ e4b_qat_resident_soak_requests() {
   local min_completion_tokens="$7"
   local tsv_path="$8"
   local meta_json="$9"
-  python3 - "$endpoint" "$response_prefix" "$model" "$e4b_qat_resident_prompt" "$tokens" "$request_count" "$concurrency" "$min_completion_tokens" "$tsv_path" "$meta_json" <<'PY'
+  local cache_dtype="${10}"
+  python3 - "$endpoint" "$response_prefix" "$model" "$e4b_qat_resident_prompt" "$tokens" "$request_count" "$concurrency" "$min_completion_tokens" "$tsv_path" "$meta_json" "$cache_dtype" <<'PY'
 import concurrent.futures
 import csv
 import json
@@ -1472,7 +1576,8 @@ import urllib.request
     min_completion_tokens_arg,
     tsv_path,
     meta_json,
-) = sys.argv[1:11]
+    cache_dtype,
+) = sys.argv[1:12]
 tokens = int(tokens_arg)
 request_count = int(request_count_arg)
 concurrency = int(concurrency_arg)
@@ -1489,8 +1594,9 @@ def run_one(index):
         "max_tokens": tokens,
         "temperature": 0,
         "stream": False,
-        "cache_dtype": "f32",
     }
+    if cache_dtype:
+        body["cache_dtype"] = cache_dtype
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -1645,7 +1751,8 @@ run_e4b_qat_resident_soak_if_enabled() {
     "$e4b_qat_resident_soak_concurrency" \
     "$e4b_qat_resident_soak_min_completion_tokens" \
     "$tsv_path" \
-    "$meta_json" | tee -a "$summary"
+    "$meta_json" \
+    "$e4b_qat_cache_dtype" | tee -a "$summary"
 
   python3 - "$tsv_path" "$meta_json" "$server_log" "$min_e4b_qat_resident_soak_agg_tok_s" "$min_e4b_qat_resident_soak_request_tok_s" "$e4b_qat_resident_soak_max_p95_e2e_ms" "$e4b_qat_resident_soak_request_count" "$e4b_qat_resident_soak_min_completion_tokens" "$e4b_qat_resident_decode_graph_replay" "$e4b_qat_resident_soak_min_graph_replays" "$e4b_qat_resident_warm_repeats" "$e4b_qat_resident_tokens" "$e4b_qat_resident_soak_tokens" <<'PY' | tee -a "$summary"
 import csv
@@ -1727,7 +1834,7 @@ if replay_mode == "required":
     if graph_floor_arg == "auto":
         requested_tokens = warm_repeats * warm_tokens + expected_requests * soak_tokens
         request_count = warm_repeats + expected_requests
-        graph_floor = max(1, requested_tokens - request_count * 8)
+        graph_floor = max(1, requested_tokens - request_count * 32)
     else:
         graph_floor = int(graph_floor_arg)
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1772,7 +1879,8 @@ e4b_qat_resident_backpressure_requests() {
   local request_count="$5"
   local concurrency="$6"
   local tsv_path="$7"
-  python3 - "$endpoint" "$response_prefix" "$model" "$e4b_qat_resident_prompt" "$tokens" "$request_count" "$concurrency" "$tsv_path" <<'PY'
+  local cache_dtype="$8"
+  python3 - "$endpoint" "$response_prefix" "$model" "$e4b_qat_resident_prompt" "$tokens" "$request_count" "$concurrency" "$tsv_path" "$cache_dtype" <<'PY'
 import concurrent.futures
 import csv
 import json
@@ -1782,7 +1890,7 @@ import time
 import urllib.error
 import urllib.request
 
-url, response_prefix, model, prompt, tokens_arg, request_count_arg, concurrency_arg, tsv_path = sys.argv[1:9]
+url, response_prefix, model, prompt, tokens_arg, request_count_arg, concurrency_arg, tsv_path, cache_dtype = sys.argv[1:10]
 tokens = int(tokens_arg)
 request_count = int(request_count_arg)
 concurrency = int(concurrency_arg)
@@ -1797,8 +1905,9 @@ def run_one(index):
         "max_tokens": tokens,
         "temperature": 0,
         "stream": False,
-        "cache_dtype": "f32",
     }
+    if cache_dtype:
+        body["cache_dtype"] = cache_dtype
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -1932,7 +2041,8 @@ run_e4b_qat_resident_backpressure_if_enabled() {
     "$e4b_qat_resident_backpressure_tokens" \
     "$e4b_qat_resident_backpressure_request_count" \
     "$e4b_qat_resident_backpressure_concurrency" \
-    "$tsv_path"
+    "$tsv_path" \
+    "$e4b_qat_cache_dtype"
 
   python3 - "$tsv_path" "$server_log" "$metrics_url" "$metrics_path" "$e4b_qat_resident_backpressure_min_accepted" "$e4b_qat_resident_backpressure_min_rejected" "$e4b_qat_resident_backpressure_max_reject_ms" "$e4b_qat_resident_warm_repeats" "$e4b_qat_resident_tokens" "$e4b_qat_resident_backpressure_tokens" "$e4b_qat_resident_max_concurrent_requests" "$e4b_qat_resident_decode_graph_replay" "$e4b_qat_resident_backpressure_min_graph_replays" <<'PY' | tee -a "$summary"
 import csv
@@ -2202,18 +2312,13 @@ run_e4b_qat_resident_gate_if_enabled() {
     resident_graph_probe_trace=1
   fi
   log "RUN e4b_qat_resident_cuda_server: model=$qat_model tokens=$e4b_qat_resident_tokens repeats=$e4b_qat_resident_warm_repeats port=$port"
-  env \
+  e4b_qat_cuda_env \
     ANTFLY_INFERENCE_CUDA_GRAPH_CAPTURE_PROBE_TRACE="$resident_graph_probe_trace" \
     ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY="$e4b_qat_resident_decode_graph_replay" \
-    ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD="$e4b_qat_temp_slot_period" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED="$e4b_qat_capture_allow_unpinned" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$e4b_qat_capture_min_alloc_seq" \
-    ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="$e4b_qat_force_kv_capacity" \
-    ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE=1 \
+    ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ="$e4b_qat_resident_capture_min_alloc_seq" \
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE8="$e4b_qat_q4_0_gated_down_tile8" \
     ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION="$e4b_qat_q4_0_ple_gate_fusion" \
     ANTFLY_INFERENCE_CUDA_PLE_RMS_EMBED_FUSION="$e4b_qat_ple_rms_embed_fusion" \
-    ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$e4b_qat_pending_token_readback" \
     "$antfly_bin" run \
       --host "$resident_host" \
       --port "$port" \
@@ -2227,7 +2332,7 @@ run_e4b_qat_resident_gate_if_enabled() {
     printf 'case\te2e_ms\tcompletion_tokens\te2e_tok_s\n'
     local repeat=1
     while [ "$repeat" -le "$e4b_qat_resident_warm_repeats" ]; do
-      resident_generate_request "e4b_qat_resident_warm${repeat}" "$endpoint" "$out_dir/e4b_qat_resident_warm${repeat}.json" "$qat_model" "$e4b_qat_resident_prompt" "$e4b_qat_resident_tokens" "f32"
+      resident_generate_request "e4b_qat_resident_warm${repeat}" "$endpoint" "$out_dir/e4b_qat_resident_warm${repeat}.json" "$qat_model" "$e4b_qat_resident_prompt" "$e4b_qat_resident_tokens" "$e4b_qat_cache_dtype"
       repeat=$((repeat + 1))
     done
   } | tee "$resident_tsv"
@@ -2574,12 +2679,13 @@ PY
 check_mtp_policy() {
   local target_json="$1"
   local mtp_json="$2"
-  python3 - "$target_json" "$mtp_json" "$mtp_min_active_speed_ratio" <<'PY'
+  python3 - "$target_json" "$mtp_json" "$mtp_min_active_speed_ratio" "$mtp_min_active_speed_tokens" <<'PY'
 import json
 import sys
 
-target_path, mtp_path, min_ratio = sys.argv[1:4]
+target_path, mtp_path, min_ratio, min_tokens = sys.argv[1:5]
 min_ratio = float(min_ratio)
+min_tokens = int(float(min_tokens))
 with open(target_path, "r", encoding="utf-8") as f:
     target = json.load(f)
 with open(mtp_path, "r", encoding="utf-8") as f:
@@ -2588,6 +2694,7 @@ with open(mtp_path, "r", encoding="utf-8") as f:
 errors = []
 target_tps = float(target.get("decode_tok_per_s", 0.0))
 mtp_tps = float(mtp.get("decode_tok_per_s", 0.0))
+mtp_tokens = int(mtp.get("tokens", 0) or 0)
 spec = mtp.get("speculative")
 if target_tps <= 0:
     errors.append(f"target decode_tok_per_s={target_tps}, expected > 0")
@@ -2624,7 +2731,7 @@ if spec.get("mtp_enabled"):
     device_fallbacks = int(cuda.get("mtp_verify_commit_device_fallbacks", 0)) + int(cuda_generate.get("mtp_verify_commit_device_fallbacks", 0))
     if device_fallbacks != 0:
         errors.append(f"mtp_verify_commit_device_fallbacks={device_fallbacks}, expected 0")
-    if decision == "active" and mtp_tps < target_tps * min_ratio:
+    if decision == "active" and mtp_tokens >= min_tokens and mtp_tps < target_tps * min_ratio:
         errors.append(
             f"MTP auto remained active at {mtp_tps:.3f} tok/s, below target-only floor "
             f"{target_tps * min_ratio:.3f} tok/s"
@@ -2639,13 +2746,15 @@ if errors:
 
 print(
     f"PASS mtp_policy: target_tok_s={target_tps:.3f} mtp_tok_s={mtp_tps:.3f} "
-    f"decision={decision} acceptance_permille={spec.get('mtp_acceptance_permille')}"
+    f"decision={decision} tokens={mtp_tokens} min_speed_tokens={min_tokens} "
+    f"acceptance_permille={spec.get('mtp_acceptance_permille')}"
 )
 PY
 }
 
 require_path "antfly-inference binary" "$antfly_bin"
 capture_cuda_environment
+run_e4b_qat_prefill_smoke_if_enabled
 
 if [ "$mode" != "mtp-only" ]; then
   validate_mode="$mode"
@@ -2671,15 +2780,6 @@ check_e4b_qat_gate_json_if_present
 check_e4b_qat_long_gate_json_if_present
 run_e4b_qat_resident_gate_if_enabled
 run_resident_gate_if_enabled
-
-case "$run_mtp" in
-  auto|required|off)
-    ;;
-  *)
-    log "invalid RUN_MTP=$run_mtp; expected auto|required|off"
-    exit 2
-    ;;
-esac
 
 last_json_file=""
 if [ "$run_mtp" != "off" ]; then

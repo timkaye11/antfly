@@ -104,6 +104,8 @@ const Options = struct {
     scratch_budget_mb: usize = 0,
     raw_prompt: bool = false,
     no_bos: bool = false,
+    raw_decode_bench: bool = false,
+    ignore_eos: bool = false,
     cache_dtype: ?[]const u8 = null,
     cache_compaction_ratio: ?f32 = null,
     mode: ?ExecutionMode = null,
@@ -118,10 +120,14 @@ const Options = struct {
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
     const effective_draft_model = if (opts.speculation_policy == .off) null else opts.draft_model;
+    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
+    if (opts.raw_decode_bench and effective_draft_model != null) return error.RawDecodeBenchSpeculationUnsupported;
+    if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
     try native_backend_choice.validate(opts.backend);
     const require_server = requireWarmServer(opts);
     if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
     if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
+        if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
         var server_opts = opts;
         server_opts.server_url = server_url;
         if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
@@ -209,6 +215,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .ignore_eos = opts.ignore_eos,
     };
 
     const artifact_backend = switch (opts.backend) {
@@ -743,6 +750,75 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
     else
         null;
+    if (opts.raw_decode_bench) {
+        const bench_result = runRawDecodeBench(
+            allocator,
+            io,
+            &cb,
+            gpt_config,
+            prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
+            @intCast(@max(opts.max_tokens, 0)),
+            config.prefill_chunk_size,
+            &decode_state,
+        ) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                printBudgetExceeded(model.session, &run_budget);
+            }
+            return err;
+        };
+        const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+        const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
+            session_factory.getCudaRuntimeStats(model.session)
+        else
+            null;
+        const cuda_generate_stats = if (comptime build_options.enable_cuda)
+            if (cuda_stats_after_generate) |after|
+                if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+            else
+                null
+        else
+            null;
+
+        if (opts.print_token_count) print("tokens={d}\n", .{bench_result.tokens});
+        if (opts.print_timing) {
+            print(
+                "timing_ms: load_model={d} prompt_prep={d} scheduler={d} backend_setup={d} decode_setup={d} prefill={d} device_warmup={d} warmup={d} decode={d} total={d}\n",
+                .{
+                    durationMillis(started_at, loaded_model_at),
+                    durationMillis(loaded_model_at, encoded_prompt_at),
+                    durationMillis(encoded_prompt_at, acquired_scheduler_at),
+                    durationMillis(acquired_scheduler_at, created_backend_at),
+                    durationMillis(created_backend_at, created_decode_state_at),
+                    bench_result.prefill_ms,
+                    bench_result.device_warmup_ms,
+                    bench_result.warmup_ms,
+                    bench_result.decode_ms,
+                    durationMillis(started_at, finished_generate_at),
+                },
+            );
+            print("raw_decode_tok_per_s={d:.3}\n", .{tokensPerSecond(bench_result.tokens, bench_result.decode_ms)});
+            print("raw_decode_scope={s}\n", .{bench_result.scope});
+        }
+        if (opts.json_timing_path) |path| {
+            try writeRawDecodeBenchJson(
+                allocator,
+                io,
+                path,
+                opts.model_dir,
+                @tagName(model.session.backend()),
+                bench_result,
+                durationMillis(started_at, loaded_model_at),
+                durationMillis(loaded_model_at, encoded_prompt_at),
+                durationMillis(encoded_prompt_at, acquired_scheduler_at),
+                durationMillis(acquired_scheduler_at, created_backend_at),
+                durationMillis(created_backend_at, created_decode_state_at),
+                durationMillis(started_at, finished_generate_at),
+                cuda_stats_after_generate,
+                cuda_generate_stats,
+            );
+        }
+        return;
+    }
     var result = generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
@@ -1212,12 +1288,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
+                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fused_q6_panel8={d} fused_q6_panel16={d} fused_q6_panel32={d} fallbacks={d}\n",
                         .{
                             generate_stats.lm_head_argmax_fused_q8,
                             generate_stats.lm_head_argmax_fused_q4_0,
                             generate_stats.lm_head_argmax_fused_q4,
                             generate_stats.lm_head_argmax_fused_q6,
+                            generate_stats.lm_head_argmax_fused_q6_panel8,
+                            generate_stats.lm_head_argmax_fused_q6_panel16,
+                            generate_stats.lm_head_argmax_fused_q6_panel32,
                             generate_stats.lm_head_argmax_fallbacks,
                         },
                     );
@@ -1531,12 +1610,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
+                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fused_q6_panel8={d} fused_q6_panel16={d} fused_q6_panel32={d} fallbacks={d}\n",
                     .{
                         cuda_stats.lm_head_argmax_fused_q8,
                         cuda_stats.lm_head_argmax_fused_q4_0,
                         cuda_stats.lm_head_argmax_fused_q4,
                         cuda_stats.lm_head_argmax_fused_q6,
+                        cuda_stats.lm_head_argmax_fused_q6_panel8,
+                        cuda_stats.lm_head_argmax_fused_q6_panel16,
+                        cuda_stats.lm_head_argmax_fused_q6_panel32,
                         cuda_stats.lm_head_argmax_fallbacks,
                     },
                 );
@@ -1738,6 +1820,359 @@ fn durationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
 fn tokensPerSecond(tokens: usize, millis: u64) f64 {
     if (tokens == 0 or millis == 0) return 0.0;
     return @as(f64, @floatFromInt(tokens)) * 1000.0 / @as(f64, @floatFromInt(millis));
+}
+
+const RawDecodeBenchResult = struct {
+    tokens: usize,
+    warmup_tokens: usize,
+    prompt_tokens: usize,
+    scope: []const u8,
+    device_warmup_ms: u64,
+    prefill_ms: u64,
+    warmup_ms: u64,
+    decode_ms: u64,
+};
+
+fn runRawDecodeBench(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    prompt_ids_i32: []const i32,
+    tokens: usize,
+    prefill_chunk_size: usize,
+    decode_state: *generation.NativeDecodeState,
+) !RawDecodeBenchResult {
+    const prompt_ids = try allocator.alloc(i64, prompt_ids_i32.len);
+    defer allocator.free(prompt_ids);
+    for (prompt_ids_i32, 0..) |id, idx| prompt_ids[idx] = id;
+
+    var last_hidden: ?ops.CT = null;
+    defer if (last_hidden) |hidden| cb.free(hidden);
+    var last_token_tensor: ?ops.CT = null;
+    defer if (last_token_tensor) |token| cb.free(token);
+    const include_greedy_token = rawDecodeBenchGreedyTokenTensorEnabled();
+    const scope = if (include_greedy_token)
+        "greedy_token_tensor_no_host_resolution"
+    else
+        "hidden_decode_no_lm_head_sampler";
+
+    const prefill_started_at = std.Io.Timestamp.now(io, .awake);
+    var offset: usize = 0;
+    const chunk_size = if (prefill_chunk_size > 0) prefill_chunk_size else prompt_ids.len;
+    while (offset < prompt_ids.len) {
+        const remaining = prompt_ids.len - offset;
+        const query_len = @min(remaining, chunk_size);
+        try decode_state.appendPrefillChunk(query_len);
+        const seq_len = decode_state.total_tokens;
+        var decode_context = decode_state.gptDecodeContext(seq_len, query_len);
+        if (last_hidden) |hidden| {
+            cb.free(hidden);
+            last_hidden = null;
+        }
+        last_hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(
+            cb,
+            allocator,
+            gpt_config,
+            prompt_ids[offset..][0..query_len],
+            1,
+            seq_len,
+            &decode_context,
+            "gpt.raw_hidden_decode",
+        );
+        offset += query_len;
+    }
+    const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
+
+    var token_buf: [1]i64 = undefined;
+    var token_buf_i32: [1]i32 = undefined;
+    const token_shape = [_]i32{1};
+    const warmup_tokens = rawDecodeBenchWarmupTokens();
+    const total_decode_steps = try std.math.add(usize, warmup_tokens, tokens);
+    var resident_token_tensors = std.ArrayListUnmanaged(ops.CT).empty;
+    defer {
+        for (resident_token_tensors.items) |token_tensor| cb.free(token_tensor);
+        resident_token_tensors.deinit(allocator);
+    }
+    if (rawDecodeBenchResidentTokenInputsEnabled()) {
+        var idx: usize = 0;
+        while (idx < total_decode_steps) : (idx += 1) {
+            const token_id = rawDecodeBenchToken(idx, gpt_config.vocab_size);
+            const token_id_i32 = std.math.cast(i32, token_id) orelse return error.InvalidTokenId;
+            token_buf_i32[0] = token_id_i32;
+            const token_tensor = (try cb.fromInt32Shape(token_buf_i32[0..], &token_shape)) orelse break;
+            try resident_token_tensors.append(allocator, token_tensor);
+        }
+        if (resident_token_tensors.items.len != total_decode_steps) {
+            for (resident_token_tensors.items) |token_tensor| cb.free(token_tensor);
+            resident_token_tensors.clearRetainingCapacity();
+        }
+    }
+    const use_resident_token_tensors = resident_token_tensors.items.len == total_decode_steps;
+    const device_warmup_ms = try runRawDecodeDeviceWarmup(allocator, io, cb);
+
+    const warmup_started_at = std.Io.Timestamp.now(io, .awake);
+    for (0..warmup_tokens) |idx| {
+        try decode_state.appendGeneratedToken();
+        const seq_len = decode_state.total_tokens;
+        var decode_context = decode_state.gptDecodeContext(seq_len, 1);
+        const need_hidden = idx + 1 == warmup_tokens;
+        token_buf[0] = rawDecodeBenchToken(idx, gpt_config.vocab_size);
+        if (last_hidden) |hidden| {
+            cb.free(hidden);
+            last_hidden = null;
+        }
+        if (last_token_tensor) |token| {
+            cb.free(token);
+            last_token_tensor = null;
+        }
+        token_buf_i32[0] = std.math.cast(i32, token_buf[0]) orelse return error.InvalidTokenId;
+        const token_tensor_opt: ?ops.CT = if (use_resident_token_tensors)
+            resident_token_tensors.items[idx]
+        else
+            try cb.fromInt32Shape(token_buf_i32[0..], &token_shape);
+        if (token_tensor_opt) |token_tensor| {
+            defer if (!use_resident_token_tensors) cb.free(token_tensor);
+            if (include_greedy_token) {
+                last_token_tensor = (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(
+                    cb,
+                    allocator,
+                    gpt_config,
+                    token_tensor,
+                    1,
+                    seq_len,
+                    &decode_context,
+                )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
+                continue;
+            }
+            if (!need_hidden and try gpt_arch.forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) {
+                continue;
+            }
+            if (try gpt_arch.forwardHiddenTensorFromTokenTensorWithCudaReplay(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) |hidden| {
+                last_hidden = hidden;
+                continue;
+            }
+        }
+        last_hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(cb, allocator, gpt_config, token_buf[0..], 1, seq_len, &decode_context, "gpt.raw_hidden_decode");
+    }
+    if (last_hidden) |hidden| try cb.evalTensor(hidden);
+    if (last_token_tensor) |token| try cb.evalTensor(token);
+    const finished_warmup_at = std.Io.Timestamp.now(io, .awake);
+
+    const decode_started_at = std.Io.Timestamp.now(io, .awake);
+    for (0..tokens) |idx| {
+        const token_index = warmup_tokens + idx;
+        try decode_state.appendGeneratedToken();
+        const seq_len = decode_state.total_tokens;
+        var decode_context = decode_state.gptDecodeContext(seq_len, 1);
+        const need_hidden = idx + 1 == tokens;
+        token_buf[0] = rawDecodeBenchToken(token_index, gpt_config.vocab_size);
+        if (last_hidden) |hidden| {
+            cb.free(hidden);
+            last_hidden = null;
+        }
+        if (last_token_tensor) |token| {
+            cb.free(token);
+            last_token_tensor = null;
+        }
+        token_buf_i32[0] = std.math.cast(i32, token_buf[0]) orelse return error.InvalidTokenId;
+        const token_tensor_opt: ?ops.CT = if (use_resident_token_tensors)
+            resident_token_tensors.items[token_index]
+        else
+            try cb.fromInt32Shape(token_buf_i32[0..], &token_shape);
+        if (token_tensor_opt) |token_tensor| {
+            defer if (!use_resident_token_tensors) cb.free(token_tensor);
+            if (include_greedy_token) {
+                last_token_tensor = (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(
+                    cb,
+                    allocator,
+                    gpt_config,
+                    token_tensor,
+                    1,
+                    seq_len,
+                    &decode_context,
+                )) orelse return error.RawDecodeGreedyTokenTensorUnavailable;
+                continue;
+            }
+            if (!need_hidden and try gpt_arch.forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) {
+                continue;
+            }
+            if (try gpt_arch.forwardHiddenTensorFromTokenTensorWithCudaReplay(
+                cb,
+                allocator,
+                gpt_config,
+                token_tensor,
+                1,
+                seq_len,
+                &decode_context,
+                "gpt.raw_hidden_decode",
+            )) |hidden| {
+                last_hidden = hidden;
+                continue;
+            }
+        }
+        last_hidden = try gpt_arch.forwardHiddenTensorWithCudaReplay(cb, allocator, gpt_config, token_buf[0..], 1, seq_len, &decode_context, "gpt.raw_hidden_decode");
+    }
+    if (last_hidden) |hidden| try cb.evalTensor(hidden);
+    if (last_token_tensor) |token| try cb.evalTensor(token);
+    const finished_decode_at = std.Io.Timestamp.now(io, .awake);
+
+    return .{
+        .tokens = tokens,
+        .warmup_tokens = warmup_tokens,
+        .prompt_tokens = prompt_ids.len,
+        .scope = scope,
+        .device_warmup_ms = device_warmup_ms,
+        .prefill_ms = durationMillis(prefill_started_at, finished_prefill_at),
+        .warmup_ms = durationMillis(warmup_started_at, finished_warmup_at),
+        .decode_ms = durationMillis(decode_started_at, finished_decode_at),
+    };
+}
+
+fn runRawDecodeDeviceWarmup(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cb: *const ops.ComputeBackend,
+) !u64 {
+    _ = allocator;
+    const target_ms = platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_DEVICE_WARMUP_MS") orelse 0;
+    const fixed_iters = platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_DEVICE_WARMUP_ITERS") orelse 0;
+    if (target_ms == 0 and fixed_iters == 0) return 0;
+
+    const warmup_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_DEVICE_WARMUP_MB") orelse 256;
+    const warmup_bytes = try std.math.mul(usize, warmup_mb, 1024 * 1024);
+    const iterations = if (fixed_iters != 0) fixed_iters else @max(target_ms, 1);
+    const started_at = std.Io.Timestamp.now(io, .awake);
+    if (!(try cb.debugCudaDeviceWarmup(warmup_bytes, iterations))) return 0;
+    return durationMillis(started_at, std.Io.Timestamp.now(io, .awake));
+}
+
+fn rawDecodeBenchWarmupTokens() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_RAW_DECODE_WARMUP_TOKENS") orelse 0;
+}
+
+fn rawDecodeBenchResidentTokenInputsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_RAW_DECODE_RESIDENT_TOKEN_INPUTS", false);
+}
+
+fn rawDecodeBenchGreedyTokenTensorEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_RAW_DECODE_GREEDY_TOKEN_TENSOR", false);
+}
+
+fn rawDecodeBenchToken(index: usize, vocab_size: u32) i64 {
+    if (vocab_size <= 1) return 0;
+    var x: u64 = @as(u64, @intCast(index)) +% 1;
+    x = x *% 6364136223846793005 +% 1442695040888963407;
+    return @intCast((x % @as(u64, vocab_size - 1)) + 1);
+}
+
+fn writeRawDecodeBenchJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    model_dir: []const u8,
+    backend_name: []const u8,
+    result: RawDecodeBenchResult,
+    load_model_ms: u64,
+    prompt_prep_ms: u64,
+    scheduler_ms: u64,
+    backend_setup_ms: u64,
+    decode_setup_ms: u64,
+    total_ms: u64,
+    cuda_stats_opt: ?session_factory.CudaRuntimeStats,
+    cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
+) !void {
+    const cuda_json = if (comptime build_options.enable_cuda)
+        try cudaStatsCompactJson(allocator, cuda_stats_opt, result.tokens)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_json);
+
+    const cuda_generate_json = if (comptime build_options.enable_cuda)
+        try cudaStatsCompactJson(allocator, cuda_generate_stats_opt, result.tokens)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(cuda_generate_json);
+
+    const json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\"model_dir":{f},
+        \\"backend":{f},
+        \\"tokens":{d},
+        \\"warmup_tokens":{d},
+        \\"prompt_tokens":{d},
+        \\"benchmark_type":"raw_decode",
+        \\"benchmark_scope":{f},
+        \\"raw_decode_tok_per_s":{d:.6},
+        \\"timing_ms":{{
+        \\"load_model":{d},
+        \\"prompt_prep":{d},
+        \\"scheduler":{d},
+        \\"backend_setup":{d},
+        \\"decode_setup":{d},
+        \\"prefill":{d},
+        \\"device_warmup":{d},
+        \\"warmup":{d},
+        \\"decode":{d},
+        \\"total":{d}
+        \\}},
+        \\"cuda":{s},
+        \\"cuda_generate":{s}
+        \\}}
+        \\
+    ,
+        .{
+            std.json.fmt(model_dir, .{}),
+            std.json.fmt(backend_name, .{}),
+            result.tokens,
+            result.warmup_tokens,
+            result.prompt_tokens,
+            std.json.fmt(result.scope, .{}),
+            tokensPerSecond(result.tokens, result.decode_ms),
+            load_model_ms,
+            prompt_prep_ms,
+            scheduler_ms,
+            backend_setup_ms,
+            decode_setup_ms,
+            result.prefill_ms,
+            result.device_warmup_ms,
+            result.warmup_ms,
+            result.decode_ms,
+            total_ms,
+            cuda_json,
+            cuda_generate_json,
+        },
+    );
+    defer allocator.free(json);
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn perToken(count: usize, tokens: usize) f64 {
@@ -3019,6 +3454,7 @@ fn writeJsonTiming(
         \\"runtime_prepare_inner":{d},
         \\"prefill_inner":{d},
         \\"decode_inner":{d},
+        \\"text_decode_inner":{d},
         \\"total_inner":{d}
         \\}},
         \\"runtime":{s},
@@ -3050,6 +3486,7 @@ fn writeJsonTiming(
             inner_timing.runtime_prepare,
             inner_timing.prefill,
             inner_timing.decode,
+            inner_timing.text_decode,
             inner_timing.total,
             runtime_json,
             generation_decoder_runtime_json,
@@ -4227,6 +4664,8 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         opts.audio_count == 0 and
         !opts.raw_prompt and
         !opts.no_bos and
+        !opts.raw_decode_bench and
+        !opts.ignore_eos and
         !opts.no_chat_template and
         opts.draft_model == null and
         opts.speculation_policy == .auto and
@@ -4427,6 +4866,10 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--no-bos")) {
             opts.no_bos = true;
+        } else if (std.mem.eql(u8, arg, "--raw-decode-bench")) {
+            opts.raw_decode_bench = true;
+        } else if (std.mem.eql(u8, arg, "--ignore-eos")) {
+            opts.ignore_eos = true;
         } else if (std.mem.eql(u8, arg, "--cache-dtype")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
@@ -4838,7 +5281,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -4849,6 +5292,8 @@ fn printUsage() void {
         \\  artifact-dir overrides that lookup root.
         \\  whole-model compiled generate prefers package manifests before raw sidecar scanning.
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.
+        \\  raw-decode-bench runs transformer-body decode without logits/sampling for llama-bench-style baselines.
+        \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
         \\
     , .{});
 }
@@ -5006,6 +5451,18 @@ test "server generate rejects unsupported server options" {
         .prompt = "hello",
         .backend = .metal,
         .json_timing_path = "/tmp/timing.json",
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .raw_decode_bench = true,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .ignore_eos = true,
     }));
 }
 

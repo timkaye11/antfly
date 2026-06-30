@@ -49,11 +49,14 @@ export RUN_E4B_QAT_PROVIDER_BENCHMARK
 export RUN_E4B_QAT_PROVIDER_COMPARISON
 export RUN_TIMEOUT="${RUN_TIMEOUT:-900}"
 
-export E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS="${E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS:-6}"
+export E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS="${E4B_QAT_RESIDENT_MAX_CONCURRENT_REQUESTS:-16}"
+export E4B_QAT_RESIDENT_BACKPRESSURE_REQUESTS="${E4B_QAT_RESIDENT_BACKPRESSURE_REQUESTS:-8}"
+export E4B_QAT_RESIDENT_BACKPRESSURE_CONCURRENCY="${E4B_QAT_RESIDENT_BACKPRESSURE_CONCURRENCY:-8}"
 export E4B_QAT_COMPETITIVE_FLOORS="${E4B_QAT_COMPETITIVE_FLOORS:-compressed_kv_decode_tok_s=36.0}"
 export E4B_QAT_COMPRESSED_KV_MIN_TOK_S="${E4B_QAT_COMPRESSED_KV_MIN_TOK_S:-36.0}"
 export E4B_QAT_COMPRESSED_KV_MIN_TOKENS="${E4B_QAT_COMPRESSED_KV_MIN_TOKENS:-512}"
 export E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS="${E4B_QAT_COMPRESSED_KV_MIN_GRAPH_REPLAYS:-auto}"
+export E4B_QAT_COMPRESSED_KV_MAX_GRAPH_DISCARDS="${E4B_QAT_COMPRESSED_KV_MAX_GRAPH_DISCARDS:-1}"
 export E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS="${E4B_QAT_COMPRESSED_KV_MAX_DOWNLOAD_SYNCS:-4}"
 export E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS="${E4B_QAT_COMPRESSED_KV_MAX_CAPACITY_SKIPS:-0}"
 export E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS="${E4B_QAT_COMPRESSED_KV_MIN_COMPRESSED_V_READS:-1}"
@@ -66,6 +69,7 @@ export E4B_QAT_MTP_TARGET_EQUIV_TOKENS="${E4B_QAT_MTP_TARGET_EQUIV_TOKENS:-16}"
 export E4B_QAT_MTP_TARGET_EQUIV_PROMPT_FILTER="${E4B_QAT_MTP_TARGET_EQUIV_PROMPT_FILTER:-ants_chat factual_chat explain_chat code_chat}"
 export E4B_QAT_MTP_HIDDEN_AB_REPEATS="${E4B_QAT_MTP_HIDDEN_AB_REPEATS:-2}"
 export E4B_QAT_MTP_HIDDEN_AB_MIN_RATIO="${E4B_QAT_MTP_HIDDEN_AB_MIN_RATIO:-1.03}"
+export MTP_MIN_ACTIVE_SPEED_TOKENS="${MTP_MIN_ACTIVE_SPEED_TOKENS:-1}"
 
 echo "gemma4_qat_cuda_release_gate_out_dir=$OUT_DIR"
 scripts/gemma4_cuda_production_gate.sh
@@ -99,14 +103,17 @@ required_positive = {
     "device_kv_paged_block_table_uploads": 1,
     "device_kv_paged_identity_attention_reads": 1,
     "launch_attention_gqa_decode_fast": 1,
+    "gated_down_fused_q4_0_precompute": 1,
 }
 for name, floor in required_positive.items():
     value = counter_mins.get(name)
     if value is None or float(value) < floor:
         errors.append(f"{name} min={value} floor={floor}")
 for name, ceiling in {
+    "graph_capture_discards": 1,
     "graph_capture_capacity_skips": 0,
     "device_kv_fail_write": 0,
+    "gated_down_fused_q4_0_tile4": 0,
 }.items():
     value = counter_maxs.get(name)
     if value is None or float(value) > ceiling:

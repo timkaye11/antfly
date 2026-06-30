@@ -633,6 +633,149 @@ pub fn forwardHiddenOnly(
     cb.free(hidden_result.hidden);
 }
 
+pub fn forwardHiddenTensorWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !CT {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+
+    const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    var deepseek_v4_decode_context_storage: DecodeContext = undefined;
+    const effective_decode_context = deepSeekV4DecodeContextWithInputIds(
+        config,
+        input_ids,
+        total,
+        seq_len,
+        query_seq_len,
+        decode_context,
+        &deepseek_v4_decode_context_storage,
+    );
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        effective_decode_context,
+        ple_vectors,
+        replay_label,
+    );
+    return hidden_result.hidden;
+}
+
+pub fn forwardHiddenOnlyWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !void {
+    const hidden = try forwardHiddenTensorWithCudaReplay(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        replay_label,
+    );
+    cb.free(hidden);
+}
+
+pub fn forwardHiddenTensorFromTokenTensorWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !?CT {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    if (batch != 1 or query_seq_len != 1 or total != 1) return null;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        replay_label,
+    );
+    return hidden_result.hidden;
+}
+
+pub fn forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !bool {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    if (batch != 1 or query_seq_len != 1 or total != 1) return false;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return false;
+    var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
+
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    owns_hidden = false;
+    try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        replay_label,
+    );
+    return true;
+}
+
 pub fn forwardGreedyLastToken(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -920,10 +1063,7 @@ pub fn forwardLastLogitsFromPositionedEmbeddingsWithLayer0Overrides(
     const hidden = hidden_result.hidden;
     defer cb.free(hidden);
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
@@ -965,10 +1105,7 @@ pub fn forwardLastLogitsFromEmbeddingsWithLayer0Overrides(
     const hidden = hidden_result.hidden;
     defer cb.free(hidden);
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
@@ -1015,10 +1152,7 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
         try cb.sliceRows2D(allocator, hidden, hidden_result.total_rows - 1, 1, config.hidden_size);
     defer if (last_hidden != hidden) cb.free(last_hidden);
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
@@ -1113,7 +1247,9 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
 ) !GreedyDeviceTokenResult {
     var capture_final_hidden = false;
     var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
     var original_hidden_input: CT = undefined;
     var owns_original_hidden_input = false;
     if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
@@ -1122,46 +1258,75 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
             prepared_final_hidden_input = true;
             original_hidden_input = hidden_input;
             owns_original_hidden_input = true;
-        }
-        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
-
-        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
-        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
-        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
-        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
-        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
-        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
-        const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
-        if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
-            if (prepared_final_hidden_input) {
+            var replay_inputs_ready = true;
+            if (ple_vectors) |ple| {
+                if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                    final_ple_vectors = prepared_ple;
+                    prepared_ple_vectors = true;
+                } else {
+                    replay_inputs_ready = false;
+                }
+            }
+            if (!replay_inputs_ready) {
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
-            }
-            if (owns_original_hidden_input) {
-                cb.free(original_hidden_input);
+                final_hidden_input = original_hidden_input;
                 owns_original_hidden_input = false;
             }
-            if (capture_greedy_token) {
-                return greedyResultFromTokenTensor(cb, allocator, replayed);
-            }
-            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, .{
-                .hidden = replayed,
-                .total_rows = batch * query_seq_len,
-            });
         }
-        capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
-        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
-        if (capture_final_hidden) try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+        if (prepared_final_hidden_input) {
+            const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+            const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+            const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+            const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+            const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+            _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+            const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+            if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+                if (prepared_ple_vectors) {
+                    cb.free(final_ple_vectors.?);
+                    prepared_ple_vectors = false;
+                    final_ple_vectors = ple_vectors;
+                }
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
+                if (capture_greedy_token) {
+                    return greedyResultFromTokenTensor(cb, allocator, replayed);
+                }
+                return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, .{
+                    .hidden = replayed,
+                    .total_rows = batch * query_seq_len,
+                });
+            }
+            capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+            if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
+            if (capture_final_hidden) {
+                try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+                if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+            }
+        }
     }
     errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
 
     prepared_final_hidden_input = false;
     const hidden_result = hidden_result_blk: {
-        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors) catch |err| {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
             if (capture_final_hidden) {
                 cb.debugCudaGraphCaptureEnd(false) catch {};
                 capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
             }
             if (owns_original_hidden_input) {
                 const fallback_input = original_hidden_input;
@@ -1171,6 +1336,11 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
             return err;
         };
     };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
     if (owns_original_hidden_input) {
         cb.free(original_hidden_input);
         owns_original_hidden_input = false;
@@ -1210,7 +1380,9 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
 ) !?CT {
     var capture_final_hidden = false;
     var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
     var original_hidden_input: CT = undefined;
     var owns_original_hidden_input = false;
     if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
@@ -1219,45 +1391,74 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
             prepared_final_hidden_input = true;
             original_hidden_input = hidden_input;
             owns_original_hidden_input = true;
-        }
-        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
-        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
-
-        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
-        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
-        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
-        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
-        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
-        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
-        const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
-        if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
-            if (prepared_final_hidden_input) {
+            var replay_inputs_ready = true;
+            if (ple_vectors) |ple| {
+                if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                    final_ple_vectors = prepared_ple;
+                    prepared_ple_vectors = true;
+                } else {
+                    replay_inputs_ready = false;
+                }
+            }
+            if (!replay_inputs_ready) {
                 cb.free(final_hidden_input);
                 prepared_final_hidden_input = false;
-            }
-            if (owns_original_hidden_input) {
-                cb.free(original_hidden_input);
+                final_hidden_input = original_hidden_input;
                 owns_original_hidden_input = false;
             }
-            if (capture_greedy_token) return replayed;
-            defer cb.free(replayed);
-            return try greedyLastTokenTensorOnlyFromFinalHiddenRetain(cb, config, .{
-                .hidden = replayed,
-                .total_rows = batch * query_seq_len,
-            });
         }
-        capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
-        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
-        if (capture_final_hidden) try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+        if (prepared_final_hidden_input) {
+            const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+            const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+            const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+            const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+            const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+            _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+            const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+            if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+                if (prepared_ple_vectors) {
+                    cb.free(final_ple_vectors.?);
+                    prepared_ple_vectors = false;
+                    final_ple_vectors = ple_vectors;
+                }
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
+                if (capture_greedy_token) return replayed;
+                defer cb.free(replayed);
+                return try greedyLastTokenTensorOnlyFromFinalHiddenRetain(cb, config, .{
+                    .hidden = replayed,
+                    .total_rows = batch * query_seq_len,
+                });
+            }
+            capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+            if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
+            if (capture_final_hidden) {
+                try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+                if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+            }
+        }
     }
     errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
 
     prepared_final_hidden_input = false;
     const hidden_result = hidden_result_blk: {
-        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, ple_vectors) catch |err| {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
             if (capture_final_hidden) {
                 cb.debugCudaGraphCaptureEnd(false) catch {};
                 capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
             }
             if (owns_original_hidden_input) {
                 const fallback_input = original_hidden_input;
@@ -1267,6 +1468,11 @@ fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
             return err;
         };
     };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
     if (owns_original_hidden_input) {
         cb.free(original_hidden_input);
         owns_original_hidden_input = false;
@@ -1436,10 +1642,7 @@ fn greedyLastTokenTensorFromFinalHiddenRetain(
         return greedyResultFromTokenTensor(cb, allocator, token);
     }
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
@@ -1480,10 +1683,7 @@ fn greedyLastTokenTensorOnlyFromFinalHiddenRetain(
     }
 
     if (!canUseFastGreedyArgmaxForConfig(config)) return null;
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
@@ -1501,10 +1701,7 @@ fn tryGreedyLastTokenTensorFastPathFromFinalHidden(
     if (!canUseFastGreedyArgmaxForConfig(config)) return null;
 
     const hidden = hidden_result.hidden;
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const suppress_token_ids = config.suppressTokenIds();
@@ -1578,10 +1775,7 @@ fn forwardLogitsTensorFromEmbeddings(
     errdefer cb.free(hidden);
 
     // 5. LM head: project to vocab
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
     cb.free(hidden);
@@ -1613,6 +1807,236 @@ fn forwardFinalHiddenTensorFromEmbeddings(
         decode_context,
         ple_vectors,
     );
+}
+
+fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    replay_label: []const u8,
+) !HiddenTensorResult {
+    if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        return forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+    }
+
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) |prepared| {
+        final_hidden_input = prepared;
+        prepared_final_hidden_input = true;
+        original_hidden_input = hidden_input;
+        owns_original_hidden_input = true;
+        var replay_inputs_ready = true;
+        if (ple_vectors) |ple| {
+            if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                final_ple_vectors = prepared_ple;
+                prepared_ple_vectors = true;
+            } else {
+                replay_inputs_ready = false;
+            }
+        }
+        if (!replay_inputs_ready) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            final_hidden_input = original_hidden_input;
+            owns_original_hidden_input = false;
+        }
+    }
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+    if (prepared_final_hidden_input) {
+        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+        if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            cb.free(original_hidden_input);
+            owns_original_hidden_input = false;
+            return .{
+                .hidden = replayed,
+                .total_rows = batch * query_seq_len,
+            };
+        }
+        capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
+        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.raw_capture_input", final_hidden_input);
+        if (capture_final_hidden) {
+            try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+            if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+        }
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
+    return hidden_result;
+}
+
+fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    replay_label: []const u8,
+) !void {
+    if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+        cb.free(hidden_result.hidden);
+        return;
+    }
+
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) |prepared| {
+        final_hidden_input = prepared;
+        prepared_final_hidden_input = true;
+        original_hidden_input = hidden_input;
+        owns_original_hidden_input = true;
+        var replay_inputs_ready = true;
+        if (ple_vectors) |ple| {
+            if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                final_ple_vectors = prepared_ple;
+                prepared_ple_vectors = true;
+            } else {
+                replay_inputs_ready = false;
+            }
+        }
+        if (!replay_inputs_ready) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            final_hidden_input = original_hidden_input;
+            owns_original_hidden_input = false;
+        }
+    }
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+    if (prepared_final_hidden_input) {
+        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+        if (try cb.debugCudaGraphReplayFinalHiddenDiscard(final_hidden_input)) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            cb.free(original_hidden_input);
+            owns_original_hidden_input = false;
+            return;
+        }
+        capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
+        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.raw_capture_input", final_hidden_input);
+        if (capture_final_hidden) {
+            try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+            if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+        }
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    defer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
 }
 
 pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
@@ -1686,7 +2110,9 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
 
     var capture_final_hidden = false;
     var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
     var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
     var original_hidden_input: CT = undefined;
     var owns_original_hidden_input = false;
     const prepared = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) orelse
@@ -1705,7 +2131,29 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
     prepared_final_hidden_input = true;
     original_hidden_input = hidden_input;
     owns_original_hidden_input = true;
+    if (ple_vectors) |ple| {
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+            final_ple_vectors = prepared_ple;
+            prepared_ple_vectors = true;
+        } else {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            owns_original_hidden_input = false;
+            return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+                cb,
+                allocator,
+                config,
+                original_hidden_input,
+                overrides,
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+            );
+        }
+    }
     errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
     errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
 
     _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
@@ -1713,6 +2161,11 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
         if (prepared_final_hidden_input) {
             cb.free(final_hidden_input);
             prepared_final_hidden_input = false;
+        }
+        if (prepared_ple_vectors) {
+            cb.free(final_ple_vectors.?);
+            prepared_ple_vectors = false;
+            final_ple_vectors = ple_vectors;
         }
         if (owns_original_hidden_input) {
             cb.free(original_hidden_input);
@@ -1726,7 +2179,10 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
 
     capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
     if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.mtp_capture_input", final_hidden_input);
-    if (capture_final_hidden) try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+        if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+    }
     errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
 
     prepared_final_hidden_input = false;
@@ -1739,12 +2195,17 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
         batch,
         seq_len,
         decode_context,
-        ple_vectors,
+        final_ple_vectors,
         null,
     ) catch |err| {
         if (capture_final_hidden) {
             cb.debugCudaGraphCaptureEnd(false) catch {};
             capture_final_hidden = false;
+        }
+        if (prepared_ple_vectors) {
+            cb.free(final_ple_vectors.?);
+            prepared_ple_vectors = false;
+            final_ple_vectors = ple_vectors;
         }
         if (owns_original_hidden_input) {
             const fallback_input = original_hidden_input;
@@ -1764,6 +2225,11 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
         }
         return err;
     };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
     if (owns_original_hidden_input) {
         cb.free(original_hidden_input);
         owns_original_hidden_input = false;
@@ -4074,10 +4540,12 @@ fn finishGemmaDenseNoPleFfnTail(
     mlp_up_slot: ?usize,
     mlp_down_slot: ?usize,
     mlp_sub_norm_slot: ?usize,
+    ple_vectors: ?CT,
     decode_context: ?*const DecodeContext,
     trace_sink: ?*ActivationTraceSink,
 ) !?CT {
-    if (config.family != .gemma or config.usesMoe() or config.hasPle()) return null;
+    if (config.family != .gemma or config.usesMoe()) return null;
+    if (config.hasPle() and ple_vectors == null) return null;
     if (trace_sink != null) return null;
 
     var name_buf: [256]u8 = undefined;
@@ -4100,7 +4568,7 @@ fn finishGemmaDenseNoPleFfnTail(
 
     const ffn_started_at = monotonicNowNs();
     if (!disableDecoderRuntimeActivationDebug() and mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and mlp_sub_norm_slot != null) {
-        const ffn_output_scale = if (branchGemma4LayerOutputScaleDebug())
+        const ffn_output_scale = if (config.hasPle() or branchGemma4LayerOutputScaleDebug())
             null
         else
             try getLayerOutputScaleWeight(cb, config, layer);
@@ -4122,12 +4590,22 @@ fn finishGemmaDenseNoPleFfnTail(
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
             try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_residual", layer, ffn_residual, hidden_size);
 
-            const scaled = if (branchGemma4LayerOutputScaleDebug())
-                ffn_residual
-            else if (ffn_output_scale != null)
-                ffn_residual
+            var layer_result = ffn_residual;
+            var layer_result_output_scaled = ffn_output_scale != null;
+            if (config.hasPle()) {
+                const ple = ple_vectors.?;
+                const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+                defer if (output_scale) |scale| cb.free(scale);
+                const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, output_scale, &name_buf);
+                layer_result_output_scaled = output_scale != null;
+                cb.free(layer_result);
+                layer_result = ple_result;
+            }
+
+            const scaled = if (branchGemma4LayerOutputScaleDebug() or layer_result_output_scaled)
+                layer_result
             else
-                try applyLayerOutputScale(cb, allocator, config, ffn_residual, total, hidden_size, layer);
+                try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
             try maybeCaptureActivationTrace(trace_sink, cb, allocator, "output_scale", layer, scaled, hidden_size);
             try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
@@ -4144,7 +4622,7 @@ fn finishGemmaDenseNoPleFfnTail(
     debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
     const ffn_residual = residual_blk: {
-        if (allowGemmaRmsNormAddResidualFusion(trace_sink) and !branchGemma4LayerOutputScaleDebug()) {
+        if (allowGemmaRmsNormAddResidualFusion(trace_sink) and (config.hasPle() or !branchGemma4LayerOutputScaleDebug())) {
             if (try applyGemmaFfnPostNormResidual(cb, allocator, config, ffn_out_raw, sa_out, layer, &name_buf)) |fused| {
                 break :residual_blk fused;
             }
@@ -4153,7 +4631,7 @@ fn finishGemmaDenseNoPleFfnTail(
         defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
         try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
-        if (!branchGemma4LayerOutputScaleDebug()) {
+        if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
             break :residual_blk try cb.add(ffn_out, sa_out);
         }
         break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
@@ -4161,10 +4639,22 @@ fn finishGemmaDenseNoPleFfnTail(
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_residual", layer, ffn_residual, hidden_size);
 
-    const scaled = if (branchGemma4LayerOutputScaleDebug())
-        ffn_residual
+    var layer_result = ffn_residual;
+    var layer_result_output_scaled = false;
+    if (config.hasPle()) {
+        const ple = ple_vectors.?;
+        const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+        defer if (output_scale) |scale| cb.free(scale);
+        const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, output_scale, &name_buf);
+        layer_result_output_scaled = output_scale != null;
+        cb.free(layer_result);
+        layer_result = ple_result;
+    }
+
+    const scaled = if (branchGemma4LayerOutputScaleDebug() or layer_result_output_scaled)
+        layer_result
     else
-        try applyLayerOutputScale(cb, allocator, config, ffn_residual, total, hidden_size, layer);
+        try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "output_scale", layer, scaled, hidden_size);
     try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
@@ -4320,11 +4810,35 @@ fn decoderBlock(
         config.family != .qwen3 and config.family != .qwen3_5 and
         attn_q_slot != null and attn_k_slot != null and attn_v_slot != null and
         attn_out_proj_linear_slot != null and mlp_gate_slot != null and
-        mlp_up_slot != null and mlp_down_slot != null)
+        mlp_up_slot != null and mlp_down_slot != null and
+        (!config.hasPle() or cb.kind() != .cuda or platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GATED_BLOCK")))
     {
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill and layer == 0) {
             debugPrint("prefill-trace: gpt layer0 gated block attempt input path\n", .{});
         }
+        var block_ple_input: ?CT = null;
+        defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
+        var block_output_scale: ?CT = null;
+        defer if (block_output_scale) |scale| cb.free(scale);
+        if (config.family == .gemma and config.hasPle()) {
+            if (ple_vectors) |ple| {
+                const ple_dim: usize = config.ple_hidden_size;
+                const ple_offset = layer * ple_dim;
+                block_ple_input = try cb.sliceLastDim(ple, ple_offset, ple_offset + ple_dim);
+                block_output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+            }
+        }
+        const block_rope_active_dim = if (config.family == .gemma and config.position_encoding == .rope)
+            config.layerRopeActiveDim(layer)
+        else
+            0;
+        const block_rope_theta = if (block_rope_active_dim != 0) theta_blk: {
+            const base_theta = config.layerRopeTheta(layer);
+            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
+            const active_dim: f32 = @floatFromInt(block_rope_active_dim);
+            if (active_dim < freq_dim) break :theta_blk std.math.pow(f32, base_theta, active_dim / freq_dim);
+            break :theta_blk base_theta;
+        } else 10000.0;
         const block_started_at = monotonicNowNs();
         debug_timing_stats.gated_block_attempts += 1;
         debug_timing_stats.gated_block_input_attempts += 1;
@@ -4345,17 +4859,27 @@ fn decoderBlock(
             .q_linear_slot = attn_q_slot.?,
             .k_linear_slot = attn_k_slot.?,
             .v_linear_slot = attn_v_slot.?,
+            .rope_active_dim = block_rope_active_dim,
+            .rope_theta = block_rope_theta,
+            .rope_freq_scale = config.rope_freq_scale,
+            .rope_consecutive_pairs = config.rope_layout == .consecutive_pairs,
+            .global_head_dim = config.global_head_dim,
             .attention_linear_slot = attn_out_proj_linear_slot.?,
+            .attention_post_linear_rms_norm_slot = if (config.family == .gemma) attn_sub_norm_slot else null,
             .hidden_size = hidden_size,
             .eps = config.norm_eps,
             .ffn_layer_norm_slot = if (config.norm_type == .layer_norm) ffn_norm_slot.? else null,
             .ffn_rms_norm_slot = if (config.norm_type == .rms_norm) ffn_norm_slot.? else null,
             .ffn_post_gate_rms_norm_slot = if (config.family == .bitnet) mlp_sub_norm_slot else null,
+            .ffn_post_down_rms_norm_slot = if (config.family == .gemma) mlp_sub_norm_slot else null,
             .gate_ffn_linear_slot = mlp_gate_slot.?,
             .up_ffn_linear_slot = mlp_up_slot.?,
             .down_ffn_linear_slot = mlp_down_slot.?,
             .intermediate_size = config.intermediateSize(layer),
             .activation = decoderRuntimeActivationKind(config.activation),
+            .ple = block_ple_input,
+            .ple_hidden_size = if (block_ple_input != null) config.ple_hidden_size else 0,
+            .output_scale = block_output_scale,
             .graph_plan_tail_vocab_size = config.vocab_size,
         })) |block_out| {
             debug_timing_stats.gated_block_successes += 1;
@@ -4791,8 +5315,8 @@ fn decoderBlock(
 
     const attn_res = blk: {
         if (attn_out_proj_linear_slot != null and config.family == .gemma and
-            attn_sub_norm_slot != null and !config.usesMoe() and !config.hasPle() and
-            ple_vectors == null and allowGemmaRmsNormAddResidualFusion(trace_sink))
+            attn_sub_norm_slot != null and !config.usesMoe() and
+            (!config.hasPle() or ple_vectors != null) and allowGemmaRmsNormAddResidualFusion(trace_sink))
         {
             const fused_attn_started_at = monotonicNowNs();
             const fused_sa_out = if (qk_already_roped)
@@ -4856,6 +5380,7 @@ fn decoderBlock(
                     mlp_up_slot,
                     mlp_down_slot,
                     mlp_sub_norm_slot,
+                    ple_vectors,
                     decode_context,
                     trace_sink,
                 )) |layer_out| {
@@ -9437,7 +9962,7 @@ pub fn applyPle(
     };
     defer cb.free(gated);
 
-    // 3. Project back to hidden_size.
+    // 3. Load projection and post-norm weights.
     var proj_buf: [256]u8 = undefined;
     const proj_name = std.fmt.bufPrint(&proj_buf, "model.layers.{d}.per_layer_input.proj.weight", .{layer}) catch return error.NameTooLong;
     const proj_w = getModelWeight(cb, config, proj_name) catch |err| switch (err) {
@@ -9449,10 +9974,7 @@ pub fn applyPle(
         else => return err,
     };
     defer cb.free(proj_w);
-    const projected = try cb.linearNoBias(gated, proj_w, total, ple_dim, hidden_size);
-    defer cb.free(projected);
 
-    // 4. Post-PLE RMSNorm on hidden_size.
     var norm_name_buf: [256]u8 = undefined;
     const norm_name = std.fmt.bufPrint(&norm_name_buf, "model.layers.{d}.per_layer_input.post_norm.weight", .{layer}) catch return error.NameTooLong;
     const post_norm_base_w = getModelWeight(cb, config, norm_name) catch |err| switch (err) {
@@ -9466,6 +9988,11 @@ pub fn applyPle(
     defer cb.free(post_norm_base_w);
     const post_norm_w = try maybeAdjustNormWeight(cb, allocator, config, post_norm_base_w, hidden_size);
     defer if (post_norm_w != post_norm_base_w) cb.free(post_norm_w);
+
+    // 4. Project back to hidden_size and apply post-PLE RMSNorm.
+    const projected = try cb.linearNoBias(gated, proj_w, total, ple_dim, hidden_size);
+    defer cb.free(projected);
+
     if (output_scale) |scale| {
         if (try cb.rmsNormAddOutputScaleTensor(projected, post_norm_w, hidden, scale, hidden_size, config.norm_eps)) |fused| {
             return fused;
@@ -9619,4 +10146,11 @@ pub fn getEmbeddingWeight(cb: *const ComputeBackend, config: Config) !CT {
         .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet, .phi => getModelWeight(cb, config, "model.embed_tokens.weight"),
         else => getModelWeight(cb, config, "model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
     };
+}
+
+pub fn getLmHeadWeight(cb: *const ComputeBackend, config: Config) !CT {
+    if (config.weight_tying) {
+        return try getEmbeddingWeight(cb, config);
+    }
+    return cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
 }

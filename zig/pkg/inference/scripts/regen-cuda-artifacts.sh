@@ -121,6 +121,9 @@ required_symbols=(
   termite_gqa_attention_decode_scalars_f32
   termite_kv_write_suffix_decode_scalars_f32
   termite_gqa_attention_decode_turboquant_fast_f32
+  termite_gqa_attention_decode_turboquant_split_stage1_f32
+  termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32
+  termite_gqa_attention_decode_turboquant_split_stage2_f32
   termite_gqa_attention_decode_turboquant_f32
   termite_kv_write_suffix_turboquant_f32
   termite_gemma4_mtp_preproject_f32
@@ -134,6 +137,7 @@ required_symbols=(
   termite_gemma4_mtp_verify_commit_u32
   termite_linear_q8_0_argmax_rows_stage1_tile4
   termite_linear_q4_0_argmax_rows_stage1_tile4
+  termite_linear_q4_0_argmax_rows_stage1_tile16
   termite_linear_q4_k_argmax_rows_stage1_tile4
   termite_argmax_reduce_rows_pairs_f32
   termite_linear_q8_0_f32_tile4_r2
@@ -161,6 +165,9 @@ required_symbols=(
   termite_linear_q4_0_pair_nobias_f32_tile4_w4
   termite_linear_q4_0_pair_activation_f32_tile4_w4
   termite_linear_q4_0_f32_tile8
+  termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down
+  termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn
+  termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
   termite_linear_q4_0_pair_nobias_f32_tile8
   termite_linear_q4_0_qkv_nobias_f32_tile8
   termite_linear_q4_0_gated_down_f32_tile8

@@ -152,10 +152,7 @@ pub fn forwardPreparedGreedyFromFinalHidden(
 }
 
 pub fn getLmHeadWeight(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Config) !ops.CT {
-    return if (gpt_config.weight_tying)
-        try gpt_arch.getEmbeddingWeight(cb, gpt_config)
-    else
-        cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(cb, gpt_config);
+    return try gpt_arch.getLmHeadWeight(cb, gpt_config);
 }
 
 pub fn forwardGreedyFromFinalHidden(

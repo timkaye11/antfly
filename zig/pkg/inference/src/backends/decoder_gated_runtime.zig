@@ -1078,6 +1078,8 @@ fn applyPleDirect(
     output_scale: ?ops.CT,
     allow_host_fallback: bool,
 ) !?ops.CT {
+    if (cb.kind() != .metal) return null;
+
     const ple_dim: usize = gpt_config.ple_hidden_size;
     const hidden_size: usize = gpt_config.hidden_size;
     const ple_offset = layer * ple_dim;
@@ -1898,11 +1900,11 @@ fn forwardFinalHiddenTensorGemmaDirect(
         {
             var block_ple_input: ?ops.CT = null;
             defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
-            if (ple_vectors) |ple| {
+            if (cb.kind() == .metal) if (ple_vectors) |ple| {
                 const ple_dim: usize = gpt_config.ple_hidden_size;
                 const ple_offset = layer * ple_dim;
                 block_ple_input = try cb.sliceLastDim(ple, ple_offset, ple_offset + ple_dim);
-            }
+            };
 
             var block_output_scale: ?ops.CT = null;
             defer if (block_output_scale) |scale| cb.free(scale);
@@ -2562,13 +2564,13 @@ fn forwardFinalHiddenTensorGemmaDirect(
 
             var block_ple_input: ?ops.CT = null;
             defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
-            if (ple_vectors) |ple| {
+            if (cb.kind() == .metal) if (ple_vectors) |ple| {
                 if (!disableDirectPleRequested()) {
                     const ple_dim: usize = gpt_config.ple_hidden_size;
                     const ple_offset = layer * ple_dim;
                     block_ple_input = try cb.sliceLastDim(ple, ple_offset, ple_offset + ple_dim);
                 }
-            }
+            };
             var block_output_scale: ?ops.CT = null;
             defer if (block_output_scale) |scale| cb.free(scale);
             if (block_ple_input != null or ple_vectors == null) {

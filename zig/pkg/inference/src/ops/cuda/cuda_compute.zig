@@ -35,6 +35,7 @@ const kv_pool_mod = @import("../../runtime/kv/pool.zig");
 const kv_block_mod = @import("../../runtime/kv/block.zig");
 const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
 const gpt_arch = @import("../../architectures/gpt.zig");
+const gemma4_runtime = @import("../../architectures/gemma4_runtime.zig");
 const gpt_model = @import("../../models/gpt.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
@@ -56,6 +57,9 @@ pub const CudaTensor = struct {
 pub const CudaTensorCoreQuantLayout = enum {
     q8_0_hmma,
     q4_k_hmma,
+    q6_k_panel8,
+    q6_k_panel16,
+    q6_k_panel32,
 };
 
 pub const CudaTensorCoreQuantBuffer = struct {
@@ -121,6 +125,23 @@ const CudaDispatchEpilogue = enum {
     pair_relu,
     pair_inputs,
 };
+
+const cudaBf16LmHeadSidecarName = "__cuda_bf16_lm_head.weight";
+const cudaQ4_0LmHeadSidecarName = "__cuda_q4_0_lm_head.weight";
+const cuda_q6_k_panel8_nr: usize = 8;
+const cuda_q6_k_panel8_d_offset: usize = 0;
+const cuda_q6_k_panel8_scales_offset: usize = cuda_q6_k_panel8_nr * @sizeOf(f32);
+const cuda_q6_k_panel8_values_offset: usize = cuda_q6_k_panel8_scales_offset + 16 * cuda_q6_k_panel8_nr;
+const cuda_q6_k_panel8_block_bytes: usize = cuda_q6_k_panel8_values_offset + 256 * cuda_q6_k_panel8_nr;
+const cuda_q6_k_panel16_nr: usize = 16;
+const cuda_q6_k_panel16_scales_offset: usize = cuda_q6_k_panel16_nr * @sizeOf(f32);
+const cuda_q6_k_panel16_values_offset: usize = cuda_q6_k_panel16_scales_offset + 16 * cuda_q6_k_panel16_nr;
+const cuda_q6_k_panel16_block_bytes: usize = cuda_q6_k_panel16_values_offset + 256 * cuda_q6_k_panel16_nr;
+const cuda_q6_k_panel32_nr: usize = 32;
+const cuda_q6_k_panel32_d_offset: usize = 0;
+const cuda_q6_k_panel32_scales_offset: usize = cuda_q6_k_panel32_nr * @sizeOf(f32);
+const cuda_q6_k_panel32_values_offset: usize = cuda_q6_k_panel32_scales_offset + 16 * cuda_q6_k_panel32_nr;
+const cuda_q6_k_panel32_block_bytes: usize = cuda_q6_k_panel32_values_offset + 256 * cuda_q6_k_panel32_nr;
 
 const CudaDispatchFallback = enum {
     none,
@@ -322,6 +343,9 @@ const PinnedScalarDownloadBuffer = struct {
 
 const AsyncI32ScalarDownload = struct {
     host: buffer_mod.HostBuffer = .{},
+    staging: buffer_mod.DeviceBuffer = .{},
+    copy_stream: driver_mod.CUstream = null,
+    ready_event: driver_mod.CUevent = null,
     event: driver_mod.CUevent = null,
     in_use: bool = false,
     handle: usize = 0,
@@ -511,6 +535,9 @@ pub const RuntimeStats = struct {
     lm_head_argmax_fused_q4_0: usize = 0,
     lm_head_argmax_fused_q4: usize = 0,
     lm_head_argmax_fused_q6: usize = 0,
+    lm_head_argmax_fused_q6_panel8: usize = 0,
+    lm_head_argmax_fused_q6_panel16: usize = 0,
+    lm_head_argmax_fused_q6_panel32: usize = 0,
     lm_head_argmax_fallbacks: usize = 0,
     bf16_cublaslt_linear_calls: usize = 0,
     bf16_cublaslt_qkv_calls: usize = 0,
@@ -694,16 +721,23 @@ const CudaGraphReplaySlot = struct {
     exec: driver_mod.CUgraphExec = null,
     replay_key: u64 = 0,
     input_storage: buffer_mod.DeviceBuffer = .{},
+    aux_input_storage: buffer_mod.DeviceBuffer = .{},
     output_storage: buffer_mod.DeviceBuffer = .{},
     input: buffer_mod.DeviceBuffer = .{},
+    aux_input: buffer_mod.DeviceBuffer = .{},
     output: buffer_mod.DeviceBuffer = .{},
     shape: ?[]i64 = null,
     elem_count: usize = 0,
     dtype: tensor_mod.DType = .f32,
     input_valid: bool = false,
+    aux_input_valid: bool = false,
+    aux_input_required: bool = false,
+    aux_input_prepared: bool = false,
     valid: bool = false,
     kv_replay_capacity_tokens: usize = 0,
     kv_replay_capacity_valid: bool = false,
+    decode_scalars_auto_advance: bool = false,
+    decode_scalars_auto_advance_delta: [5]u32 = .{ 1, 1, 1, 1, 0 },
 };
 
 pub const CudaCompute = struct {
@@ -749,7 +783,14 @@ pub const CudaCompute = struct {
     debug_cuda_graph_prepared_slot: ?usize = null,
     debug_cuda_graph_next_evict_slot: usize = 0,
     debug_cuda_decode_scalars: buffer_mod.DeviceBuffer = .{},
+    debug_cuda_decode_scalars_host: [5]u32 = .{ 0, 0, 0, 0, 0 },
+    debug_cuda_decode_scalars_host_valid: bool = false,
+    debug_cuda_decode_scalars_device: [5]u32 = .{ 0, 0, 0, 0, 0 },
+    debug_cuda_decode_scalars_device_valid: bool = false,
+    debug_cuda_decode_scalars_auto_advance_blocked: bool = false,
+    debug_cuda_decode_scalars_upload_deferred: bool = false,
     debug_cuda_graph_decode_kv_seq_len: usize = 0,
+    decode_profile_gqa_attention_active: bool = false,
     pinned_scalar_upload_ring: PinnedScalarUploadRing = .{},
     pinned_scalar_download_buffer: PinnedScalarDownloadBuffer = .{},
     async_i32_scalar_download: AsyncI32ScalarDownload = .{},
@@ -813,8 +854,18 @@ pub const CudaCompute = struct {
         self.debug_cuda_decode_scalars.free(&self.ctx);
         self.pinned_scalar_upload_ring.host.free(&self.ctx);
         self.pinned_scalar_download_buffer.host.free(&self.ctx);
+        if (self.async_i32_scalar_download.in_use and self.async_i32_scalar_download.event != null) {
+            self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(self.async_i32_scalar_download.event)) catch {};
+            self.async_i32_scalar_download.in_use = false;
+        }
+        self.async_i32_scalar_download.staging.free(&self.ctx);
         self.async_i32_scalar_download.host.free(&self.ctx);
+        self.ctx.destroyEvent(self.async_i32_scalar_download.ready_event);
         self.ctx.destroyEvent(self.async_i32_scalar_download.event);
+        if (self.async_i32_scalar_download.copy_stream != null) {
+            _ = self.ctx.driver.fns.cuStreamDestroy(self.async_i32_scalar_download.copy_stream);
+            self.async_i32_scalar_download.copy_stream = null;
+        }
         if (self.florence_tail_row_f32) |tensor| freeTensor(self, tensor);
         if (self.florence_tail_col_f32) |tensor| freeTensor(self, tensor);
         if (self.florence_tail_temporal_f32) |tensor| freeTensor(self, tensor);
@@ -901,8 +952,81 @@ pub const CudaCompute = struct {
         self.stats.device_allocated_bytes += bytes;
     }
 
+    fn insertBf16LmHeadSidecarFromQuantizedStorage(self: *CudaCompute, storage: weight_source_mod.QuantizedStorage) !void {
+        if (self.resident_weights.contains(cudaBf16LmHeadSidecarName)) return;
+
+        const elem_count = try elementCountFromShape(storage.shape);
+        const f32_data = try self.allocator.alloc(f32, elem_count);
+        defer self.allocator.free(f32_data);
+        try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, f32_data);
+
+        const bf16_data = try self.allocator.alloc(u16, elem_count);
+        defer self.allocator.free(bf16_data);
+        for (f32_data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
+
+        const shape = try self.allocator.dupe(i64, storage.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, bf16_data.len * @sizeOf(u16));
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, std.mem.sliceAsBytes(bf16_data));
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
+
+        const sidecar_key = try self.allocator.dupe(u8, cudaBf16LmHeadSidecarName);
+        errdefer self.allocator.free(sidecar_key);
+        try self.resident_weights.put(self.allocator, sidecar_key, .{
+            .buffer = device,
+            .dtype = .bf16,
+            .shape = shape,
+            .elem_count = elem_count,
+            .quant_type = null,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+    }
+
+    fn insertQ4_0LmHeadSidecarFromQuantizedStorage(self: *CudaCompute, storage: weight_source_mod.QuantizedStorage) !void {
+        if (self.resident_weights.contains(cudaQ4_0LmHeadSidecarName)) return;
+
+        const elem_count = try elementCountFromShape(storage.shape);
+        const f32_data = try self.allocator.alloc(f32, elem_count);
+        defer self.allocator.free(f32_data);
+        try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, f32_data);
+
+        const q4_raw = try quant_codec.quantizeQ4_0FromF32(self.allocator, f32_data);
+        defer self.allocator.free(q4_raw);
+
+        const shape = try self.allocator.dupe(i64, storage.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, q4_raw.len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, q4_raw);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        self.stats.resident_weight_bytes += q4_raw.len;
+
+        const sidecar_key = try self.allocator.dupe(u8, cudaQ4_0LmHeadSidecarName);
+        errdefer self.allocator.free(sidecar_key);
+        try self.resident_weights.put(self.allocator, sidecar_key, .{
+            .buffer = device,
+            .dtype = .u8,
+            .shape = shape,
+            .elem_count = elem_count,
+            .quant_type = .{ .known = .Q4_0 },
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+    }
+
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
         if (loaded.quantized_storage) |storage| {
+            if (cudaQ4_0Q6KLmHeadSidecarEnabled(owned_key, storage)) {
+                try self.insertQ4_0LmHeadSidecarFromQuantizedStorage(storage);
+            }
+            if (cudaBf16Q6KLmHeadSidecarEnabled(owned_key, storage)) {
+                try self.insertBf16LmHeadSidecarFromQuantizedStorage(storage);
+            }
             if (cudaDequantizeQuantWeightsOnUpload() or cudaShouldDequantizeWeightOnUpload(owned_key, storage)) {
                 const elem_count = try elementCountFromShape(storage.shape);
                 const data = try self.allocator.alloc(f32, elem_count);
@@ -936,6 +1060,38 @@ pub const CudaCompute = struct {
             errdefer device.free(&self.ctx);
             try copyFromHostTracked(self, device, storage.raw_bytes);
             var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, storage.raw_bytes);
+            if (cudaQ6KLmHeadPanelTraceEnabled() and isKnownQuantStorage(storage, .Q6_K) and storage.shape.len == 2) {
+                std.log.info(
+                    "cuda_q6_lm_head_panel_trace: name={s} shape={d}x{d} lm_candidate={} panel16_enabled={} panel32_enabled={} panel8_enabled={}",
+                    .{
+                        owned_key,
+                        storage.shape[0],
+                        storage.shape[1],
+                        isLmHeadOrTiedTokenEmbeddingWeightName(owned_key),
+                        cudaQ6KLmHeadPanel16Enabled(owned_key, storage),
+                        cudaQ6KLmHeadPanel32Enabled(owned_key, storage),
+                        cudaQ6KLmHeadPanel8Enabled(owned_key, storage),
+                    },
+                );
+            }
+            if (tc_quant == null and cudaQ6KLmHeadPanel16Enabled(owned_key, storage)) {
+                tc_quant = try self.prepareQ6KLmHeadPanel16OnUpload(storage.shape, storage.raw_bytes);
+                if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                    std.log.info("cuda_q6_lm_head_panel_trace: panel16_result name={s} packed={}", .{ owned_key, tc_quant != null });
+                }
+            }
+            if (tc_quant == null and cudaQ6KLmHeadPanel32Enabled(owned_key, storage)) {
+                tc_quant = try self.prepareQ6KLmHeadPanel32OnUpload(storage.shape, storage.raw_bytes);
+                if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                    std.log.info("cuda_q6_lm_head_panel_trace: panel32_result name={s} packed={}", .{ owned_key, tc_quant != null });
+                }
+            }
+            if (tc_quant == null and cudaQ6KLmHeadPanel8Enabled(owned_key, storage)) {
+                tc_quant = try self.prepareQ6KLmHeadPanel8OnUpload(storage.shape, storage.raw_bytes);
+                if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                    std.log.info("cuda_q6_lm_head_panel_trace: panel8_result name={s} packed={}", .{ owned_key, tc_quant != null });
+                }
+            }
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             try synchronizeAndDrainDeferredDeviceFrees(self);
             self.stats.resident_weight_bytes += storage.raw_bytes.len;
@@ -1012,6 +1168,109 @@ pub const CudaCompute = struct {
             .row_blocks = packed_quant.row_blocks,
             .bytes = packed_quant.bytes.len,
         };
+    }
+
+    fn prepareQ6KLmHeadPanelOnUpload(
+        self: *CudaCompute,
+        shape: []const i64,
+        raw_bytes: []const u8,
+        panel_nr: usize,
+        scales_offset: usize,
+        values_offset: usize,
+        block_bytes: usize,
+        layout: CudaTensorCoreQuantLayout,
+    ) !?CudaTensorCoreQuantBuffer {
+        if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0) return null;
+        const out_dim: usize = @intCast(shape[0]);
+        const in_dim: usize = @intCast(shape[1]);
+        if (panel_nr == 0 or out_dim % panel_nr != 0 or in_dim % 256 != 0) return null;
+        const row_blocks = in_dim / 256;
+        const block_count = try checkedMul(out_dim, row_blocks);
+        if (raw_bytes.len != try checkedMul(block_count, @as(usize, 210))) return null;
+
+        const panel_count = out_dim / panel_nr;
+        const panel_blocks = try checkedMul(panel_count, row_blocks);
+        const panel_bytes = try checkedMul(panel_blocks, block_bytes);
+        const panel = try self.allocator.alloc(u8, panel_bytes);
+        defer self.allocator.free(panel);
+
+        for (0..panel_count) |panel_idx| {
+            for (0..row_blocks) |block_idx| {
+                const dest_base = (panel_idx * row_blocks + block_idx) * block_bytes;
+                for (0..panel_nr) |lane| {
+                    const out_row = panel_idx * panel_nr + lane;
+                    const raw_base = (out_row * row_blocks + block_idx) * 210;
+                    const raw = raw_bytes[raw_base..][0..210];
+                    const d = quant_codec.decodeFp16Le(raw[208], raw[209]);
+                    writeF32Le(panel[dest_base + lane * @sizeOf(f32) ..][0..4], d);
+                    for (0..16) |sub| {
+                        panel[dest_base + scales_offset + sub * panel_nr + lane] = raw[192 + sub];
+                        const values_base = dest_base + values_offset + (sub * panel_nr + lane) * 16;
+                        for (0..16) |i| {
+                            panel[values_base + i] = @bitCast(q6KQuantValue(raw, sub, i));
+                        }
+                    }
+                }
+            }
+        }
+
+        var device = try allocDeviceBuffer(self, panel.len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, panel);
+        return .{
+            .buffer = device,
+            .layout = layout,
+            .row_blocks = row_blocks,
+            .bytes = panel.len,
+        };
+    }
+
+    fn prepareQ6KLmHeadPanel8OnUpload(
+        self: *CudaCompute,
+        shape: []const i64,
+        raw_bytes: []const u8,
+    ) !?CudaTensorCoreQuantBuffer {
+        return self.prepareQ6KLmHeadPanelOnUpload(
+            shape,
+            raw_bytes,
+            cuda_q6_k_panel8_nr,
+            cuda_q6_k_panel8_scales_offset,
+            cuda_q6_k_panel8_values_offset,
+            cuda_q6_k_panel8_block_bytes,
+            .q6_k_panel8,
+        );
+    }
+
+    fn prepareQ6KLmHeadPanel16OnUpload(
+        self: *CudaCompute,
+        shape: []const i64,
+        raw_bytes: []const u8,
+    ) !?CudaTensorCoreQuantBuffer {
+        return self.prepareQ6KLmHeadPanelOnUpload(
+            shape,
+            raw_bytes,
+            cuda_q6_k_panel16_nr,
+            cuda_q6_k_panel16_scales_offset,
+            cuda_q6_k_panel16_values_offset,
+            cuda_q6_k_panel16_block_bytes,
+            .q6_k_panel16,
+        );
+    }
+
+    fn prepareQ6KLmHeadPanel32OnUpload(
+        self: *CudaCompute,
+        shape: []const i64,
+        raw_bytes: []const u8,
+    ) !?CudaTensorCoreQuantBuffer {
+        return self.prepareQ6KLmHeadPanelOnUpload(
+            shape,
+            raw_bytes,
+            cuda_q6_k_panel32_nr,
+            cuda_q6_k_panel32_scales_offset,
+            cuda_q6_k_panel32_values_offset,
+            cuda_q6_k_panel32_block_bytes,
+            .q6_k_panel32,
+        );
     }
 
     pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
@@ -1265,7 +1524,7 @@ const CudaKvDeviceStorage = struct {
     }
 
     fn layerKey(self: *const CudaKvDeviceStorage, sequence_id: kv_storage_runtime.SequenceId, layer_index: usize) !u64 {
-        if (cudaTurboquantKvFormat(self.dtype) != null) return key(0, layer_index);
+        if (cudaPagedKvFormat(self.dtype) != null) return key(0, layer_index);
         return key(sequence_id, layer_index);
     }
 
@@ -1353,7 +1612,7 @@ const CudaKvDeviceStorage = struct {
 
     fn ensureLayer(self: *CudaKvDeviceStorage, write: kv_storage_runtime.KvSuffixWrite) !*CudaKvLayer {
         const row_width = try checkedMul(@as(usize, write.num_kv_heads), @as(usize, write.head_dim));
-        const compressed_format = cudaTurboquantKvFormat(self.dtype);
+        const compressed_format = cudaPagedKvFormat(self.dtype);
         const key_row_bytes = if (compressed_format != null)
             self.dtype.bytesForKeyRow(write.num_kv_heads, write.head_dim)
         else
@@ -1364,14 +1623,19 @@ const CudaKvDeviceStorage = struct {
                 @as(usize, write.num_kv_heads) * ((32 + 7) / 8),
             else => key_row_bytes,
         };
-        const value_format: u32 = if (compressed_format != null and !cudaTurboquantCompressedVDisabled())
+        const value_format: u32 = if (compressed_format != null and self.dtype == .f16)
+            cuda_kv_value_format_f16
+        else if (compressed_format != null and cudaTurboquantInt4ValuesEnabled())
+            cuda_kv_value_format_int4_group
+        else if (compressed_format != null and !cudaTurboquantCompressedVDisabled())
             cuda_kv_value_format_int8_per_head
         else
             cuda_kv_value_format_f32;
-        const value_row_bytes = if (value_format == cuda_kv_value_format_int8_per_head)
-            self.dtype.bytesForValueRow(write.num_kv_heads, write.head_dim)
-        else
-            try checkedMul(row_width, @sizeOf(f32));
+        const value_row_bytes = switch (value_format) {
+            cuda_kv_value_format_int8_per_head, cuda_kv_value_format_f16 => self.dtype.bytesForValueRow(write.num_kv_heads, write.head_dim),
+            cuda_kv_value_format_int4_group => kv_pool_mod.KvDType.int4.bytesForValueRow(write.num_kv_heads, write.head_dim),
+            else => try checkedMul(row_width, @sizeOf(f32)),
+        };
         if (value_row_bytes == 0) return error.DeviceWriteFormatUnsupported;
         const layer_key = try self.layerKey(write.sequence_id, write.layer_index);
         const gop = try self.layers.getOrPut(self.allocator, layer_key);
@@ -1488,7 +1752,7 @@ const CudaKvDeviceStorage = struct {
             layer.token_count = @max(layer.token_count, write.total_token_count);
             layer.position_offset = write.position_offset;
             self.compute.stats.device_kv_writes += 1;
-            if (layer.value_format == cuda_kv_value_format_int8_per_head) {
+            if (cudaKvValueFormatCompressed(layer.value_format)) {
                 self.compute.stats.device_kv_compressed_v_writes += 1;
                 self.compute.stats.device_kv_compressed_v_bytes += try checkedMul(write.suffix_token_count, layer.value_row_bytes);
             }
@@ -1634,8 +1898,20 @@ fn cudaCublasLtEnabled() bool {
 
 const cuda_kv_format_polar4: u32 = 0;
 const cuda_kv_format_turbo3: u32 = 1;
+const cuda_kv_format_f16: u32 = 2;
 const cuda_kv_value_format_f32: u32 = 0;
 const cuda_kv_value_format_int8_per_head: u32 = 1;
+const cuda_kv_value_format_f16: u32 = 2;
+const cuda_kv_value_format_int4_group: u32 = 3;
+
+fn cudaPagedKvFormat(dtype: kv_pool_mod.KvDType) ?u32 {
+    return switch (dtype) {
+        .f16 => cuda_kv_format_f16,
+        .polar4 => cuda_kv_format_polar4,
+        .turbo3 => cuda_kv_format_turbo3,
+        else => null,
+    };
+}
 
 fn cudaTurboquantKvFormat(dtype: kv_pool_mod.KvDType) ?u32 {
     return switch (dtype) {
@@ -1651,6 +1927,15 @@ fn cudaTurboquantKvDisabled() bool {
 
 fn cudaTurboquantCompressedVDisabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_TURBOQUANT_COMPRESSED_V", false);
+}
+
+fn cudaTurboquantInt4ValuesEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TURBOQUANT_INT4_VALUES", false);
+}
+
+fn cudaKvValueFormatCompressed(value_format: u32) bool {
+    return value_format == cuda_kv_value_format_int8_per_head or
+        value_format == cuda_kv_value_format_int4_group;
 }
 
 fn cudaFfnStreamEnabled() bool {
@@ -1729,9 +2014,71 @@ fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_m
     return false;
 }
 
+fn cudaDequantizeQ6KEmbeddingEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q6K_EMBED", false);
+}
+
+fn cudaBf16Q6KLmHeadSidecarEnvEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BF16_Q6K_LM_HEAD", false);
+}
+
+fn cudaQ4_0Q6KLmHeadSidecarEnvEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_Q6K_LM_HEAD", false);
+}
+
+fn isTiedTokenEmbeddingWeightName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "token_embd.weight") or
+        std.mem.eql(u8, name, "model.embed_tokens.weight");
+}
+
+fn isLmHeadOrTiedTokenEmbeddingWeightName(name: []const u8) bool {
+    return isTiedTokenEmbeddingWeightName(name) or
+        std.mem.eql(u8, name, "lm_head.weight") or
+        std.mem.eql(u8, name, "model.lm_head.weight") or
+        std.mem.eql(u8, name, "output.weight");
+}
+
+fn cudaBf16Q6KLmHeadSidecarEnabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    return cudaBf16Q6KLmHeadSidecarEnvEnabled() and
+        isLmHeadOrTiedTokenEmbeddingWeightName(name) and
+        isKnownQuantStorage(storage, .Q6_K);
+}
+
+fn cudaQ4_0Q6KLmHeadSidecarEnabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    return cudaQ4_0Q6KLmHeadSidecarEnvEnabled() and
+        isLmHeadOrTiedTokenEmbeddingWeightName(name) and
+        isKnownQuantStorage(storage, .Q6_K);
+}
+
+fn cudaQ6KLmHeadPanel8Enabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_PANEL8", false) and
+        isLmHeadOrTiedTokenEmbeddingWeightName(name) and
+        isKnownQuantStorage(storage, .Q6_K);
+}
+
+fn cudaQ6KLmHeadPanel16Enabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_PANEL16", false) and
+        isLmHeadOrTiedTokenEmbeddingWeightName(name) and
+        isKnownQuantStorage(storage, .Q6_K);
+}
+
+fn cudaQ6KLmHeadPanel32Enabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_PANEL32", false) and
+        isLmHeadOrTiedTokenEmbeddingWeightName(name) and
+        isKnownQuantStorage(storage, .Q6_K);
+}
+
+fn cudaQ6KLmHeadPanelTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_PANEL_TRACE", false);
+}
+
 fn cudaKeepQ6KQuantizedByName(name: []const u8) bool {
-    if (std.mem.eql(u8, name, "token_embd.weight") or
-        std.mem.eql(u8, name, "model.embed_tokens.weight") or
+    if (cudaDequantizeQ6KEmbeddingEnabled() and
+        isTiedTokenEmbeddingWeightName(name))
+    {
+        return false;
+    }
+    if (isTiedTokenEmbeddingWeightName(name) or
         std.mem.eql(u8, name, "per_layer_token_embd.weight") or
         std.mem.eql(u8, name, "model.per_layer_input.per_layer_token_embd.weight"))
     {
@@ -1747,6 +2094,34 @@ fn isKnownQuantStorage(storage: weight_source_mod.QuantizedStorage, known: gguf_
         .known => |actual| actual == known,
         else => false,
     };
+}
+
+fn f32ToBf16BitsRoundNearestEven(value: f32) u16 {
+    const bits: u32 = @bitCast(value);
+    const lsb = (bits >> 16) & 1;
+    const rounded = bits +% (0x7fff + lsb);
+    return @intCast(rounded >> 16);
+}
+
+fn writeF32Le(dst: []u8, value: f32) void {
+    std.debug.assert(dst.len >= @sizeOf(f32));
+    std.mem.writeInt(u32, dst[0..4], @bitCast(value), .little);
+}
+
+fn q6KQuantValue(raw_block: []const u8, sub: usize, i: usize) i8 {
+    const ql = raw_block[0..128];
+    const qh = raw_block[128..192];
+    const half = sub / 8;
+    const group = (sub % 8) / 2;
+    const l_base = (sub & 1) * 16;
+    const ql_off = half * 64 + (group & 1) * 32;
+    const qh_off = half * 32;
+    const qh_shift: u3 = @intCast(group * 2);
+    const nibble_shift: u3 = @intCast((group / 2) * 4);
+    const l = l_base + i;
+    const low4: i32 = (ql[ql_off + l] >> nibble_shift) & 0x0f;
+    const high2: i32 = (qh[qh_off + l] >> qh_shift) & 0x03;
+    return @intCast((low4 | (high2 << 4)) - 32);
 }
 
 fn cudaGlinerSpanQ4KernelsEnabled() bool {
@@ -1993,7 +2368,7 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
     invalidateDebugFinalHiddenGraph(self);
     if (storage.device_write_hook != null) return;
     const config = storage.storage.config;
-    if (config.dtype != .f32 and cudaTurboquantKvFormat(config.dtype) == null) return;
+    if (config.dtype != .f32 and cudaPagedKvFormat(config.dtype) == null) return;
     if (config.num_kv_heads == 0 or config.head_dim == 0) return;
     const device_storage = try CudaKvDeviceStorage.create(self.allocator, self, storage.storage.config.dtype);
     errdefer {
@@ -2528,6 +2903,10 @@ fn cudaPinnedScalarDownloadsDisabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_PINNED_SCALAR_DOWNLOADS", false);
 }
 
+fn cudaAsyncI32ScalarDownloadStagingEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING", false);
+}
+
 fn cudaQ4_0DecodeTile8GlobalEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_DECODE_TILE8", false);
 }
@@ -2536,8 +2915,60 @@ fn cudaQ4_0LinearTile8Enabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_TILE8", cudaQ4_0DecodeTile8GlobalEnabled());
 }
 
+fn cudaQ4_0LinearTile4W4Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_TILE4_W4", false);
+}
+
+fn cudaQ4_0LinearQ8_1Dp4aEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A", false);
+}
+
+fn cudaQ4_0LinearQ8_1Tile8Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE8", false);
+}
+
+fn cudaQ4_0LinearQ8_1Tile4W8Enabled(in_dim: usize) bool {
+    return in_dim >= 8192 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8", false);
+}
+
+fn cudaQ6KLmHeadQ8_1Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1", false);
+}
+
+fn cudaQ6KLmHeadQ8_1Tile() usize {
+    const tile = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE") orelse 8;
+    return switch (tile) {
+        8, 16, 32 => tile,
+        else => 8,
+    };
+}
+
+fn cudaQ6KLmHeadQ8_1Tile8W4Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1_TILE8_W4", false);
+}
+
+fn cudaQ6KLmHeadTile16Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_TILE16", true);
+}
+
 fn cudaQ4_0QkvTile8Enabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_QKV_TILE8", cudaQ4_0DecodeTile8GlobalEnabled());
+}
+
+fn cudaQ4_0QkvTile4W4Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_QKV_TILE4_W4", false);
+}
+
+fn cudaQ4_0QkvQ8_1Dp4aEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A", false);
+}
+
+fn cudaQ4_0QkvQ8_1Tile8Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8", false);
+}
+
+fn cudaQ4_0QkvQ8_1Tile8W8Enabled(in_dim: usize) bool {
+    return in_dim >= 2048 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8_W8", false);
 }
 
 fn cudaQ4_0PairTile8Enabled() bool {
@@ -2546,6 +2977,34 @@ fn cudaQ4_0PairTile8Enabled() bool {
 
 fn cudaQ4_0PairTile4W4Enabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_TILE4_W4", true);
+}
+
+fn cudaQ4_0PairQ8_1Dp4aEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A", false);
+}
+
+fn cudaQ4_0PairQ8_1Tile8Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE8", false);
+}
+
+fn cudaQ4_0PairQ8_1Tile4W8Enabled(in_dim: usize) bool {
+    return in_dim >= 2048 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8", false);
+}
+
+fn cudaQ4_0PairActivationQ8_1Dp4aEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A", false);
+}
+
+fn cudaQ4_0PairActivationQ8_1Tile8Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_TILE8", false);
+}
+
+fn cudaQ4_0PairActivationQ8_1Tile4W8Enabled(in_dim: usize) bool {
+    return in_dim >= 2048 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_TILE4_W8", true);
+}
+
+fn cudaQ4_0ActivationSliceQ8_1Dp4aEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A", false);
 }
 
 fn cudaQ4_0GatedDownTile8Enabled() bool {
@@ -2560,6 +3019,10 @@ fn cudaQ4_0GatedDownTile16Enabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_TILE16", false);
 }
 
+fn cudaQ4_0GatedDownQ8_1Dp4aEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A", false);
+}
+
 fn cudaQ4_0GatedDownPrecomputeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_PRECOMPUTE", true);
 }
@@ -2568,8 +3031,16 @@ fn cudaQ4_0GateUpActivationPrecomputeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE", false);
 }
 
+fn cudaQ4_0GateUpActivationQ8_1PrecomputeEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE", false);
+}
+
 fn cudaQ4_0PleGateFusionEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PLE_GATE_FUSION", true);
+}
+
+fn cudaF32LinearTiledEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F32_LINEAR_TILED", true);
 }
 
 fn cudaPleRmsEmbeddingFusionEnabled() bool {
@@ -2578,6 +3049,10 @@ fn cudaPleRmsEmbeddingFusionEnabled() bool {
 
 fn cudaQ4_0LmHeadArgmaxEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_ARGMAX", false);
+}
+
+fn cudaQ4_0LmHeadTile16Enabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_TILE16", false);
 }
 
 fn pinnedScalarUploadEligible(self: *CudaCompute, bytes: []const u8) bool {
@@ -2626,6 +3101,93 @@ fn copyFromPinnedScalarUploadRing(self: *CudaCompute, device: buffer_mod.DeviceB
     self.stats.pinned_scalar_uploads += 1;
     self.stats.pinned_scalar_upload_bytes += bytes.len;
     return true;
+}
+
+fn uploadDecodeScalars(self: *CudaCompute, scalars: [5]u32) !void {
+    if (self.debug_cuda_decode_scalars.ptr == 0) return error.InvalidCudaState;
+    const scalar_bytes = std.mem.sliceAsBytes(&scalars);
+    const tried_pinned_scalar_upload = pinnedScalarUploadEligible(self, scalar_bytes);
+    if (!(try copyFromPinnedScalarUploadRing(self, self.debug_cuda_decode_scalars, scalar_bytes))) {
+        if (tried_pinned_scalar_upload) self.stats.pinned_scalar_upload_fallbacks += 1;
+        try copyFromHostTracked(self, self.debug_cuda_decode_scalars, scalar_bytes);
+    }
+    self.stats.cuda_graph_capture_scalar_updates += 1;
+    self.debug_cuda_decode_scalars_device = scalars;
+    self.debug_cuda_decode_scalars_device_valid = true;
+    self.debug_cuda_decode_scalars_upload_deferred = false;
+}
+
+fn uploadCachedDecodeScalars(self: *CudaCompute) !void {
+    if (!self.debug_cuda_decode_scalars_host_valid) return error.InvalidCudaState;
+    try uploadDecodeScalars(self, self.debug_cuda_decode_scalars_host);
+    self.debug_cuda_decode_scalars_upload_deferred = false;
+}
+
+fn decodeScalarsAutoAdvanceReplaySlot(self: *const CudaCompute) ?usize {
+    if (!cudaDebugGraphAutoAdvanceDecodeScalarsEnabled()) return null;
+    if (!cudaDebugGraphPersistentReplayEnabled()) return null;
+    if (self.debug_cuda_decode_scalars.ptr == 0) return null;
+    const slot_idx = self.debug_cuda_graph_prepared_slot orelse return null;
+    const slot = &self.debug_cuda_graph_slots[slot_idx];
+    if (slot.exec == null or !slot.valid or !slot.decode_scalars_auto_advance) return null;
+    return slot_idx;
+}
+
+fn decodeScalarsAutoAdvanceExpected(self: *const CudaCompute, slot_idx: usize) ?[5]u32 {
+    if (!self.debug_cuda_decode_scalars_device_valid) return null;
+    const slot = &self.debug_cuda_graph_slots[slot_idx];
+    var expected = self.debug_cuda_decode_scalars_device;
+    inline for (0..5) |idx| {
+        expected[idx] = std.math.add(u32, expected[idx], slot.decode_scalars_auto_advance_delta[idx]) catch return null;
+    }
+    return expected;
+}
+
+fn decodeScalarsEqual(a: [5]u32, b: [5]u32) bool {
+    inline for (0..5) |idx| {
+        if (a[idx] != b[idx]) return false;
+    }
+    return true;
+}
+
+fn decodeScalarsAutoAdvanceDeltaForScalars(scalars: [5]u32) [5]u32 {
+    return if (scalars[4] == 0 or !cudaDebugGraphSlidingDecodeScalarsEnabled())
+        .{ 1, 1, 1, 1, 0 }
+    else
+        .{ 1, 1, 0, 1, 1 };
+}
+
+fn decodeScalarsAutoAdvanceDeltaSupported(delta: [5]u32) bool {
+    return decodeScalarsEqual(delta, .{ 1, 1, 1, 1, 0 }) or
+        (cudaDebugGraphSlidingDecodeScalarsEnabled() and decodeScalarsEqual(delta, .{ 1, 1, 0, 1, 1 }));
+}
+
+fn decodeScalarsAutoAdvanceDeltaBetween(previous: [5]u32, next: [5]u32) ?[5]u32 {
+    var delta: [5]u32 = .{ 0, 0, 0, 0, 0 };
+    inline for (0..5) |idx| {
+        if (next[idx] < previous[idx]) return null;
+        delta[idx] = next[idx] - previous[idx];
+    }
+    return delta;
+}
+
+fn decodeScalarsCanPreAdvance(scalars: [5]u32, delta: [5]u32) bool {
+    inline for (0..5) |idx| {
+        if (scalars[idx] < delta[idx]) return false;
+    }
+    return true;
+}
+
+fn markDecodeScalarsDeviceMatchesHost(self: *CudaCompute) void {
+    if (!self.debug_cuda_decode_scalars_host_valid) return;
+    self.debug_cuda_decode_scalars_device = self.debug_cuda_decode_scalars_host;
+    self.debug_cuda_decode_scalars_device_valid = true;
+    self.debug_cuda_decode_scalars_upload_deferred = false;
+}
+
+fn flushDeferredDecodeScalarUpload(self: *CudaCompute) !void {
+    if (!self.debug_cuda_decode_scalars_upload_deferred) return;
+    try uploadCachedDecodeScalars(self);
 }
 
 fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
@@ -2705,12 +3267,50 @@ fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI3
         .ptr = cuda_tensor.buffer.ptr,
         .len = byte_len,
     };
-    try logical_buffer.copyToHost(&self.ctx, slot);
-    try self.ctx.recordEvent(self.async_i32_scalar_download.event);
+    var staged_download_started = false;
+    if (cudaAsyncI32ScalarDownloadStagingEnabled()) staged: {
+        if (self.ctx.debug_graph_capture_active) break :staged;
+        if (self.async_i32_scalar_download.staging.ptr == 0) {
+            self.async_i32_scalar_download.staging = buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len) catch {
+                break :staged;
+            };
+            self.noteDeviceBytes(byte_len);
+            self.stats.device_alloc_calls += 1;
+        } else if (self.async_i32_scalar_download.staging.len < byte_len) {
+            break :staged;
+        }
+        if (self.async_i32_scalar_download.copy_stream == null) {
+            try self.ctx.makeCurrent();
+            var copy_stream: driver_mod.CUstream = null;
+            self.ctx.driver.check(self.ctx.driver.fns.cuStreamCreate(&copy_stream, 0)) catch {
+                break :staged;
+            };
+            self.async_i32_scalar_download.copy_stream = copy_stream;
+        }
+        if (self.async_i32_scalar_download.ready_event == null) {
+            self.async_i32_scalar_download.ready_event = self.ctx.createStreamEvent() catch {
+                break :staged;
+            };
+        }
+
+        try self.async_i32_scalar_download.staging.copyFromDevice(&self.ctx, logical_buffer, byte_len);
+        self.stats.d2d_bytes += byte_len;
+        try self.ctx.recordEvent(self.async_i32_scalar_download.ready_event);
+        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamWaitEvent(self.async_i32_scalar_download.copy_stream, self.async_i32_scalar_download.ready_event, 0));
+        try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyDtoHAsync(slot.ptr, self.async_i32_scalar_download.staging.ptr, byte_len, self.async_i32_scalar_download.copy_stream));
+        try self.ctx.driver.check(self.ctx.driver.fns.cuEventRecord(self.async_i32_scalar_download.event, self.async_i32_scalar_download.copy_stream));
+        self.stats.d2h_bytes += byte_len;
+        staged_download_started = true;
+        break :staged;
+    }
+    if (!staged_download_started) {
+        try logical_buffer.copyToHost(&self.ctx, slot);
+        try self.ctx.recordEvent(self.async_i32_scalar_download.event);
+        self.stats.d2h_bytes += byte_len;
+    }
     self.async_i32_scalar_download.in_use = true;
     self.async_i32_scalar_download.handle +%= 1;
     if (self.async_i32_scalar_download.handle == 0) self.async_i32_scalar_download.handle = 1;
-    self.stats.d2h_bytes += byte_len;
     self.stats.pinned_scalar_downloads += 1;
     self.stats.pinned_scalar_download_bytes += byte_len;
     self.stats.async_i32_scalar_downloads += 1;
@@ -2800,7 +3400,9 @@ fn tryCublasLtF32Linear(
 ) !bool {
     if (!cudaCublasLtEnabled()) return false;
     if (self.ctx.info.compute_major < 8) return false;
-    if (rows < 128 or in_dim < 64 or out_dim < 64) return false;
+    const single_row_lm_head = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT_F32_LM_HEAD", false) and
+        rows == 1 and in_dim >= 512 and out_dim >= 65536;
+    if (!single_row_lm_head and (rows < 128 or in_dim < 64 or out_dim < 64)) return false;
     const blas = &(self.cublaslt orelse return false);
     blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch return false;
     return true;
@@ -2829,7 +3431,11 @@ fn tryCublasLtBf16Qkv(
     return true;
 }
 
-const max_temp_buffers = 256;
+const default_max_temp_buffers = 256;
+
+fn cudaTempCacheMaxBuffers() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS") orelse default_max_temp_buffers;
+}
 
 fn cudaTempCacheBudgetBytes() usize {
     const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB") orelse 1024;
@@ -2965,6 +3571,9 @@ const CudaDecodeProfileScope = struct {
     pair: context_mod.ProfileEventPair,
 
     fn end(self: *CudaDecodeProfileScope) void {
+        defer {
+            if (self.category == .gqa_attention) self.compute.decode_profile_gqa_attention_active = false;
+        }
         const elapsed_us = self.compute.ctx.endProfileEventPairUs(self.pair) catch return;
         noteDecodeProfileUs(self.compute, self.category, elapsed_us);
     }
@@ -2974,7 +3583,14 @@ fn beginDecodeProfile(self: *CudaCompute, category: CudaDecodeProfileCategory, r
     if (rows != 1) return null;
     if (!cudaDecodeProfileEnabled()) return null;
     if (self.debug_cuda_graph_capture_active) return null;
-    const pair = self.ctx.beginProfileEventPair() catch return null;
+    if (category == .gqa_attention) {
+        if (self.decode_profile_gqa_attention_active) return null;
+        self.decode_profile_gqa_attention_active = true;
+    }
+    const pair = self.ctx.beginProfileEventPair() catch {
+        if (category == .gqa_attention) self.decode_profile_gqa_attention_active = false;
+        return null;
+    };
     return .{ .compute = self, .category = category, .pair = pair };
 }
 
@@ -2997,6 +3613,22 @@ fn cudaDebugGraphCaptureDeviceScalarsEnabled() bool {
     return cudaDecodeGraphReplayEnabled() or
         platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS", false) or
         (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled());
+}
+
+fn cudaTurboquantSplitAttentionEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION", false);
+}
+
+fn cudaTurboquantSplitAttentionChunkSize() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK") orelse 128;
+}
+
+fn cudaDebugGraphAutoAdvanceDecodeScalarsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_AUTO_ADVANCE_SCALARS", true);
+}
+
+fn cudaDebugGraphSlidingDecodeScalarsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_SLIDING_SCALARS", false);
 }
 
 fn cudaDebugGraphCaptureAllowUnpinned() bool {
@@ -3319,7 +3951,7 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     const cache_budget = cudaTempCacheBudgetBytes();
     var cached_bytes: usize = 0;
     for (self.temp_buffers.items) |cached| cached_bytes += cached.len;
-    if (self.temp_buffers.items.len < max_temp_buffers and buffer.len <= cache_budget and cached_bytes + buffer.len <= cache_budget) {
+    if (self.temp_buffers.items.len < cudaTempCacheMaxBuffers() and buffer.len <= cache_budget and cached_bytes + buffer.len <= cache_budget) {
         self.temp_buffers.append(self.allocator, buffer.*) catch {
             self.stats.temp_buffer_evictions += 1;
             self.stats.device_free_calls += 1;
@@ -3606,7 +4238,13 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         }
     }
     return materializeLazyWeight(self, name) catch |err| switch (err) {
-        error.MissingWeight => error.WeightNotFound,
+        error.MissingWeight => {
+            if (std.mem.eql(u8, name, "lm_head.weight")) {
+                if (self.resident_weights.getPtr(cudaQ4_0LmHeadSidecarName)) |tensor| return tensor;
+                if (self.resident_weights.getPtr(cudaBf16LmHeadSidecarName)) |tensor| return tensor;
+            }
+            return error.WeightNotFound;
+        },
         else => err,
     };
 }
@@ -3719,21 +4357,63 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     if (cudaTempSlotPeriod() == 0 and !cudaDebugGraphCaptureAllowUnpinned()) return false;
     const min_alloc_seq = cudaDebugGraphCaptureMinAllocSeq();
     if (self.temp_trace_seq < min_alloc_seq) return false;
+    if (self.debug_cuda_decode_scalars_host_valid and self.debug_cuda_decode_scalars_host[4] != 0 and !cudaDebugGraphSlidingDecodeScalarsEnabled()) return false;
+    const active_slot_idx = self.debug_cuda_graph_prepared_slot orelse 0;
+    const auto_decode_scalars_delta = if (self.debug_cuda_decode_scalars_host_valid)
+        decodeScalarsAutoAdvanceDeltaForScalars(self.debug_cuda_decode_scalars_host)
+    else
+        [_]u32{ 1, 1, 1, 1, 0 };
+    const use_auto_decode_scalars =
+        cudaDebugGraphAutoAdvanceDecodeScalarsEnabled() and
+        cudaDebugGraphPersistentReplayEnabled() and
+        !self.debug_cuda_decode_scalars_auto_advance_blocked and
+        self.kernels.supportsDecodeScalarsAdvance() and
+        self.debug_cuda_decode_scalars.ptr != 0 and
+        self.debug_cuda_decode_scalars_host_valid and
+        self.debug_cuda_decode_scalars_host[0] != 0 and
+        self.debug_cuda_decode_scalars_host[1] != 0 and
+        self.debug_cuda_decode_scalars_host[2] != 0 and
+        self.debug_cuda_decode_scalars_host[3] != 0 and
+        decodeScalarsCanPreAdvance(self.debug_cuda_decode_scalars_host, auto_decode_scalars_delta);
+    if (use_auto_decode_scalars) {
+        var pre_advance_scalars = self.debug_cuda_decode_scalars_host;
+        inline for (0..5) |idx| {
+            pre_advance_scalars[idx] -= auto_decode_scalars_delta[idx];
+        }
+        try uploadDecodeScalars(self, pre_advance_scalars);
+    }
     try self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
     self.debug_cuda_graph_capture_active = true;
-    self.debug_cuda_graph_active_slot = self.debug_cuda_graph_prepared_slot orelse 0;
+    self.debug_cuda_graph_active_slot = active_slot_idx;
+    self.debug_cuda_graph_slots[active_slot_idx].decode_scalars_auto_advance = false;
+    self.debug_cuda_graph_slots[active_slot_idx].decode_scalars_auto_advance_delta = auto_decode_scalars_delta;
+    self.debug_cuda_graph_slots[active_slot_idx].aux_input_valid = false;
+    self.debug_cuda_graph_slots[active_slot_idx].aux_input_required = false;
     if (cudaDebugGraphPersistentReplayEnabled()) {
         const slot = &self.debug_cuda_graph_slots[self.debug_cuda_graph_active_slot.?];
         slot.kv_replay_capacity_tokens = 0;
         slot.kv_replay_capacity_valid = false;
     }
+    if (use_auto_decode_scalars) {
+        try self.kernels.launchDecodeScalarsAdvance(
+            &self.ctx,
+            self.debug_cuda_decode_scalars,
+            auto_decode_scalars_delta[0],
+            auto_decode_scalars_delta[1],
+            auto_decode_scalars_delta[2],
+            auto_decode_scalars_delta[3],
+            auto_decode_scalars_delta[4],
+        );
+        self.debug_cuda_graph_slots[active_slot_idx].decode_scalars_auto_advance = true;
+    }
     self.stats.cuda_graph_capture_begins += 1;
     if (cudaDebugGraphCaptureProbeTraceEnabled()) {
-        std.log.info("cuda_graph_capture_probe: begin label={s} slot={d} alloc_seq={d} min_alloc_seq={d}", .{
+        std.log.info("cuda_graph_capture_probe: begin label={s} slot={d} alloc_seq={d} min_alloc_seq={d} auto_decode_scalars={d}", .{
             label,
             self.debug_cuda_graph_active_slot.?,
             self.temp_trace_seq,
             min_alloc_seq,
+            @intFromBool(use_auto_decode_scalars),
         });
     }
     return true;
@@ -3754,20 +4434,47 @@ fn debugCudaGraphPrepareDecodeScalars(
     if (self.debug_cuda_decode_scalars.ptr == 0) {
         self.debug_cuda_decode_scalars = try buffer_mod.DeviceBuffer.alloc(&self.ctx, 5 * @sizeOf(u32));
     }
-    var scalars = [_]u32{
+    const scalars = [_]u32{
         std.math.cast(u32, position_offset) orelse return error.InvalidCudaState,
         std.math.cast(u32, query_position_offset) orelse return error.InvalidCudaState,
         std.math.cast(u32, kv_seq_len) orelse return error.InvalidCudaState,
         std.math.cast(u32, total_sequence_len) orelse return error.InvalidCudaState,
         std.math.cast(u32, kv_position_offset) orelse return error.InvalidCudaState,
     };
-    const scalar_bytes = std.mem.sliceAsBytes(&scalars);
-    const tried_pinned_scalar_upload = pinnedScalarUploadEligible(self, scalar_bytes);
-    if (!(try copyFromPinnedScalarUploadRing(self, self.debug_cuda_decode_scalars, scalar_bytes))) {
-        if (tried_pinned_scalar_upload) self.stats.pinned_scalar_upload_fallbacks += 1;
-        try copyFromHostTracked(self, self.debug_cuda_decode_scalars, scalar_bytes);
+    self.debug_cuda_decode_scalars_host = scalars;
+    self.debug_cuda_decode_scalars_host_valid = true;
+    if (decodeScalarsAutoAdvanceReplaySlot(self)) |slot_idx| {
+        const expected_before_reset = decodeScalarsAutoAdvanceExpected(self, slot_idx) orelse [_]u32{ 0, 0, 0, 0, 0 };
+        if (decodeScalarsAutoAdvanceExpected(self, slot_idx)) |expected| {
+            if (decodeScalarsEqual(expected, scalars)) {
+                self.debug_cuda_decode_scalars_upload_deferred = true;
+                return true;
+            }
+        }
+        const slot = &self.debug_cuda_graph_slots[slot_idx];
+        const mode_transition_supported = if (self.debug_cuda_decode_scalars_device_valid)
+            if (decodeScalarsAutoAdvanceDeltaBetween(self.debug_cuda_decode_scalars_device, scalars)) |delta|
+                decodeScalarsAutoAdvanceDeltaSupported(delta)
+            else
+                false
+        else
+            false;
+        if (!mode_transition_supported) {
+            self.debug_cuda_decode_scalars_auto_advance_blocked = true;
+            resetCudaGraphReplaySlotMetadata(self, slot);
+        } else {
+            resetCudaGraphReplaySlotMetadataKeepExec(self, slot);
+        }
+        if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+            std.log.info("cuda_graph_capture_probe: auto_decode_scalars_mismatch slot={d} expected={any} actual={any} mode_transition_supported={d} fallback=scalar_upload", .{
+                slot_idx,
+                expected_before_reset,
+                scalars,
+                @intFromBool(mode_transition_supported),
+            });
+        }
     }
-    self.stats.cuda_graph_capture_scalar_updates += 1;
+    try uploadDecodeScalars(self, scalars);
     if (cudaDebugGraphCaptureProbeTraceEnabled()) {
         std.log.info("cuda_graph_capture_probe: decode_scalars position_offset={d} query_position_offset={d} kv_seq_len={d} total_sequence_len={d} kv_position_offset={d} ptr=0x{x}", .{
             scalars[0],
@@ -3813,25 +4520,37 @@ fn resetCudaGraphReplaySlotMetadata(self: *CudaCompute, slot: *CudaGraphReplaySl
         self.ctx.destroyGraphExec(exec);
         slot.exec = null;
     }
+    resetCudaGraphReplaySlotMetadataKeepExec(self, slot);
+}
+
+fn resetCudaGraphReplaySlotMetadataKeepExec(self: *CudaCompute, slot: *CudaGraphReplaySlot) void {
     if (slot.shape) |shape| {
         self.allocator.free(shape);
         slot.shape = null;
     }
     slot.input = .{};
+    slot.aux_input = .{};
     slot.output = .{};
     slot.elem_count = 0;
     slot.dtype = .f32;
     slot.input_valid = false;
+    slot.aux_input_valid = false;
+    slot.aux_input_required = false;
+    slot.aux_input_prepared = false;
     slot.valid = false;
     slot.kv_replay_capacity_tokens = 0;
     slot.kv_replay_capacity_valid = false;
+    slot.decode_scalars_auto_advance = false;
+    slot.decode_scalars_auto_advance_delta = .{ 1, 1, 1, 1, 0 };
 }
 
 fn deinitCudaGraphReplaySlot(self: *CudaCompute, slot: *CudaGraphReplaySlot) void {
     resetCudaGraphReplaySlotMetadata(self, slot);
     slot.input_storage.free(&self.ctx);
+    slot.aux_input_storage.free(&self.ctx);
     slot.output_storage.free(&self.ctx);
     slot.input_storage = .{};
+    slot.aux_input_storage = .{};
     slot.output_storage = .{};
 }
 
@@ -3907,6 +4626,27 @@ fn ensureCudaGraphReplaySlotStorage(self: *CudaCompute, slot: *CudaGraphReplaySl
     }
 }
 
+fn ensureCudaGraphReplayAuxInputStorage(self: *CudaCompute, slot: *CudaGraphReplaySlot, byte_len: usize) !void {
+    if (slot.aux_input_storage.ptr != 0 and slot.aux_input_storage.len == byte_len) {
+        return;
+    }
+    resetCudaGraphReplaySlotMetadata(self, slot);
+    if (slot.aux_input_storage.ptr != 0) {
+        self.stats.device_free_calls += 1;
+        slot.aux_input_storage.free(&self.ctx);
+        slot.aux_input_storage = .{};
+    }
+    slot.aux_input_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
+    self.noteDeviceBytes(byte_len);
+    self.stats.device_alloc_calls += 1;
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_aux_input_alloc ptr=0x{x} len={d}", .{
+            slot.aux_input_storage.ptr,
+            slot.aux_input_storage.len,
+        });
+    }
+}
+
 fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u8, input: CT) !?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     self.debug_cuda_graph_prepared_slot = null;
@@ -3932,6 +4672,7 @@ fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u
         resetCudaGraphReplaySlotMetadata(self, slot);
         slot.replay_key = replay_key;
     }
+    slot.aux_input_prepared = false;
 
     try copyFromDeviceTracked(self, slot.input_storage, input_tensor.buffer, byte_len);
 
@@ -3940,6 +4681,36 @@ fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u
     const tensor = try self.allocator.create(CudaTensor);
     tensor.* = .{
         .buffer = slot.input_storage,
+        .dtype = .f32,
+        .shape = shape,
+        .elem_count = input_tensor.elem_count,
+        .owns_buffer = false,
+    };
+    return tensor;
+}
+
+fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(ctx: *anyopaque, input: CT) !?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) return null;
+    if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    const slot_idx = self.debug_cuda_graph_prepared_slot orelse return null;
+    const slot = &self.debug_cuda_graph_slots[slot_idx];
+
+    const input_tensor = tensorFromCt(input);
+    if (input_tensor.dtype != .f32 or input_tensor.quant_type != null) return null;
+    const byte_len = try checkedMul(input_tensor.elem_count, @sizeOf(f32));
+    if (byte_len == 0) return null;
+    if (input_tensor.buffer.len < byte_len) return error.InvalidCudaState;
+
+    try ensureCudaGraphReplayAuxInputStorage(self, slot, byte_len);
+    try copyFromDeviceTracked(self, slot.aux_input_storage, input_tensor.buffer, byte_len);
+    slot.aux_input_prepared = true;
+
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = slot.aux_input_storage,
         .dtype = .f32,
         .shape = shape,
         .elem_count = input_tensor.elem_count,
@@ -3960,6 +4731,26 @@ fn debugCudaGraphRegisterFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !voi
     slot.input_valid = true;
     if (cudaDebugGraphCaptureProbeTraceEnabled()) {
         std.log.info("cuda_graph_capture_probe: persistent_input slot={d} input=0x{x} len={d}", .{
+            slot_idx,
+            input_tensor.buffer.ptr,
+            input_tensor.buffer.len,
+        });
+    }
+}
+
+fn debugCudaGraphRegisterFinalHiddenReplayAuxInput(ctx: *anyopaque, input: CT) !void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) return;
+    if (!self.debug_cuda_graph_capture_active) return;
+    const slot_idx = self.debug_cuda_graph_active_slot orelse return;
+    const slot = &self.debug_cuda_graph_slots[slot_idx];
+
+    const input_tensor = tensorFromCt(input);
+    slot.aux_input = input_tensor.buffer;
+    slot.aux_input_valid = true;
+    slot.aux_input_required = true;
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_aux_input slot={d} input=0x{x} len={d}", .{
             slot_idx,
             input_tensor.buffer.ptr,
             input_tensor.buffer.len,
@@ -4011,13 +4802,28 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
 
 fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (!cudaDebugGraphPersistentReplayEnabled()) return null;
+    if (!cudaDebugGraphPersistentReplayEnabled()) {
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    }
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
-    const slot_idx = self.debug_cuda_graph_prepared_slot orelse return null;
+    const slot_idx = self.debug_cuda_graph_prepared_slot orelse {
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    };
     const slot = &self.debug_cuda_graph_slots[slot_idx];
-    const exec = slot.exec orelse return null;
-    if (!slot.valid) return null;
-    const shape_src = slot.shape orelse return null;
+    const exec = slot.exec orelse {
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    };
+    if (!slot.valid) {
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    }
+    const shape_src = slot.shape orelse {
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    };
     if (slot.kv_replay_capacity_valid and self.debug_cuda_graph_decode_kv_seq_len > slot.kv_replay_capacity_tokens) {
         self.stats.cuda_graph_capture_capacity_skips += 1;
         std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded slot={d} kv_seq_len={d} capacity={d}", .{
@@ -4025,6 +4831,7 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
             self.debug_cuda_graph_decode_kv_seq_len,
             slot.kv_replay_capacity_tokens,
         });
+        try flushDeferredDecodeScalarUpload(self);
         return null;
     }
 
@@ -4037,18 +4844,40 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
             input_tensor.buffer.ptr,
             input_tensor.buffer.len,
         });
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    }
+    if (slot.aux_input_required) {
+        if (!slot.aux_input_valid or !slot.aux_input_prepared) {
+            try flushDeferredDecodeScalarUpload(self);
+            return null;
+        }
+        if (slot.aux_input_storage.ptr != slot.aux_input.ptr or slot.aux_input_storage.len != slot.aux_input.len) {
+            std.log.warn("cuda_graph_capture_probe: persistent_replay_aux_input_mismatch slot={d} expected=0x{x}/{d} actual=0x{x}/{d}", .{
+                slot_idx,
+                slot.aux_input.ptr,
+                slot.aux_input.len,
+                slot.aux_input_storage.ptr,
+                slot.aux_input_storage.len,
+            });
+            try flushDeferredDecodeScalarUpload(self);
+            return null;
+        }
+    }
+
+    const output = slot.output;
+    if (output.ptr == 0) {
+        try flushDeferredDecodeScalarUpload(self);
         return null;
     }
 
     const shape = try dupeShape(self.allocator, shape_src);
     errdefer self.allocator.free(shape);
 
-    const output = slot.output;
-    if (output.ptr == 0) return null;
-
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
     try self.ctx.launchGraph(exec);
+    if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
     self.stats.cuda_graph_capture_replays += 1;
     self.stats.cuda_graph_capture_persistent_replays += 1;
     if (cudaDebugGraphCaptureProbeTraceEnabled()) {
@@ -4070,6 +4899,93 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
         .owns_buffer = false,
     };
     return tensor;
+}
+
+fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaDebugGraphPersistentReplayEnabled()) {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+    if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    const slot_idx = self.debug_cuda_graph_prepared_slot orelse {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    };
+    const slot = &self.debug_cuda_graph_slots[slot_idx];
+    const exec = slot.exec orelse {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    };
+    if (!slot.valid) {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+    if (slot.shape == null) {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+    if (slot.kv_replay_capacity_valid and self.debug_cuda_graph_decode_kv_seq_len > slot.kv_replay_capacity_tokens) {
+        self.stats.cuda_graph_capture_capacity_skips += 1;
+        std.log.warn("cuda_graph_capture_probe: persistent_replay_kv_capacity_exceeded slot={d} kv_seq_len={d} capacity={d}", .{
+            slot_idx,
+            self.debug_cuda_graph_decode_kv_seq_len,
+            slot.kv_replay_capacity_tokens,
+        });
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+
+    const input_tensor = tensorFromCt(input);
+    if (input_tensor.buffer.ptr != slot.input.ptr or input_tensor.buffer.len != slot.input.len) {
+        std.log.warn("cuda_graph_capture_probe: persistent_replay_input_mismatch slot={d} expected=0x{x}/{d} actual=0x{x}/{d}", .{
+            slot_idx,
+            slot.input.ptr,
+            slot.input.len,
+            input_tensor.buffer.ptr,
+            input_tensor.buffer.len,
+        });
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+    if (slot.aux_input_required) {
+        if (!slot.aux_input_valid or !slot.aux_input_prepared) {
+            try flushDeferredDecodeScalarUpload(self);
+            return false;
+        }
+        if (slot.aux_input_storage.ptr != slot.aux_input.ptr or slot.aux_input_storage.len != slot.aux_input.len) {
+            std.log.warn("cuda_graph_capture_probe: persistent_replay_aux_input_mismatch slot={d} expected=0x{x}/{d} actual=0x{x}/{d}", .{
+                slot_idx,
+                slot.aux_input.ptr,
+                slot.aux_input.len,
+                slot.aux_input_storage.ptr,
+                slot.aux_input_storage.len,
+            });
+            try flushDeferredDecodeScalarUpload(self);
+            return false;
+        }
+    }
+    if (slot.output.ptr == 0) {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+
+    var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
+    defer if (profile_scope) |*scope| scope.end();
+    try self.ctx.launchGraph(exec);
+    if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
+    self.stats.cuda_graph_capture_replays += 1;
+    self.stats.cuda_graph_capture_persistent_replays += 1;
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_replayed_discard slot={d} input=0x{x} output=0x{x} kv_seq_len={d} kv_capacity={d}", .{
+            slot_idx,
+            input_tensor.buffer.ptr,
+            slot.output.ptr,
+            self.debug_cuda_graph_decode_kv_seq_len,
+            if (slot.kv_replay_capacity_valid) slot.kv_replay_capacity_tokens else 0,
+        });
+    }
+    return true;
 }
 
 fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph) !void {
@@ -4141,7 +5057,12 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         } else {
             try replayCapturedDebugGraphOneShot(self, graph);
         }
+        markDecodeScalarsDeviceMatchesHost(self);
     } else {
+        self.debug_cuda_graph_slots[slot_idx].decode_scalars_auto_advance = false;
+        if (self.debug_cuda_decode_scalars_host_valid and self.debug_cuda_decode_scalars.ptr != 0) {
+            uploadCachedDecodeScalars(self) catch {};
+        }
         self.stats.cuda_graph_capture_discards += 1;
         if (cudaDebugGraphCaptureProbeTraceEnabled()) {
             std.log.info("cuda_graph_capture_probe: discarded", .{});
@@ -4368,6 +5289,26 @@ fn evalTensorOp(ctx: *anyopaque, _: CT) anyerror!void {
     try synchronizeAndDrainDeferredDeviceFrees(self);
     self.stats.eval_syncs += 1;
     self.stats.eval_forced_syncs += 1;
+}
+
+fn debugCudaDeviceWarmup(ctx: *anyopaque, bytes: usize, iterations: usize) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (bytes == 0 or iterations == 0) return false;
+    const elem_count = @max(bytes / @sizeOf(f32), 1);
+    var buffer = try buffer_mod.DeviceBuffer.alloc(&self.ctx, elem_count * @sizeOf(f32));
+    self.noteDeviceBytes(buffer.len);
+    self.stats.device_alloc_calls += 1;
+    defer {
+        self.stats.device_free_calls += 1;
+        buffer.free(&self.ctx);
+    }
+    var iteration: usize = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        const value: f32 = @as(f32, @floatFromInt(iteration % 251)) * 0.001;
+        try self.kernels.launchFillF32(&self.ctx, buffer, elem_count, value);
+    }
+    try self.ctx.synchronize();
+    return true;
 }
 
 fn createTensor(
@@ -5999,6 +6940,243 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     return try createTensor(self, device, shape, out_count);
 }
 
+fn tryLaunchLinearQ4_0Q8_1Dp4a(
+    self: *CudaCompute,
+    device: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (!cudaQ4_0LinearQ8_1Dp4aEnabled()) return false;
+    if (rows != 1 or in_dim == 0 or out_dim == 0 or in_dim % 32 != 0) return false;
+    const row_blocks = in_dim / 32;
+    const q8_blocks = try checkedMul(rows, row_blocks);
+    const q8_bytes = try checkedMul(q8_blocks, 36);
+    if (q8_bytes == 0) return false;
+
+    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &q8_input);
+
+    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+        else => return err,
+    };
+    if (cudaQ4_0LinearQ8_1Tile8Enabled()) {
+        self.kernels.launchLinearQ4_0Q8_1Tile8F32(&self.ctx, device, q8_input, weight, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    } else if (cudaQ4_0LinearQ8_1Tile4W8Enabled(in_dim)) {
+        self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, device, q8_input, weight, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    } else {
+        self.kernels.launchLinearQ4_0Q8_1Tile4F32(&self.ctx, device, q8_input, weight, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    }
+    return true;
+}
+
+fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
+    self: *CudaCompute,
+    device_a: buffer_mod.DeviceBuffer,
+    device_b: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight_a: buffer_mod.DeviceBuffer,
+    weight_b: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (!cudaQ4_0PairQ8_1Dp4aEnabled()) return false;
+    if (rows != 1 or in_dim == 0 or out_dim == 0 or in_dim % 32 != 0) return false;
+    const row_blocks = in_dim / 32;
+    const q8_blocks = try checkedMul(rows, row_blocks);
+    const q8_bytes = try checkedMul(q8_blocks, 36);
+    if (q8_bytes == 0) return false;
+
+    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &q8_input);
+
+    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+        else => return err,
+    };
+    if (cudaQ4_0PairQ8_1Tile8Enabled()) {
+        self.kernels.launchLinearQ4_0PairNoBiasQ8_1Tile8F32(&self.ctx, device_a, device_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    } else if (cudaQ4_0PairQ8_1Tile4W8Enabled(in_dim)) {
+        self.kernels.launchLinearQ4_0PairNoBiasQ8_1Tile4W8F32(&self.ctx, device_a, device_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    } else {
+        self.kernels.launchLinearQ4_0PairNoBiasQ8_1Tile4F32(&self.ctx, device_a, device_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    }
+    return true;
+}
+
+fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
+    self: *CudaCompute,
+    q_device: buffer_mod.DeviceBuffer,
+    k_device: buffer_mod.DeviceBuffer,
+    v_device: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    q_weight: buffer_mod.DeviceBuffer,
+    k_weight: buffer_mod.DeviceBuffer,
+    v_weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+) !bool {
+    if (!cudaQ4_0QkvQ8_1Dp4aEnabled()) return false;
+    if (rows != 1 or in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or in_dim % 32 != 0) return false;
+    const row_blocks = in_dim / 32;
+    const q8_blocks = try checkedMul(rows, row_blocks);
+    const q8_bytes = try checkedMul(q8_blocks, 36);
+    if (q8_bytes == 0) return false;
+
+    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &q8_input);
+
+    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+        else => return err,
+    };
+    if (cudaQ4_0QkvQ8_1Tile8Enabled()) {
+        if (cudaQ4_0QkvQ8_1Tile8W8Enabled(in_dim)) {
+            self.kernels.launchLinearQ4_0QkvNoBiasQ8_1Tile8W8F32(&self.ctx, q_device, k_device, v_device, q8_input, q_weight, k_weight, v_weight, rows, in_dim, q_out_dim, kv_out_dim) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+                else => return err,
+            };
+        } else {
+            self.kernels.launchLinearQ4_0QkvNoBiasQ8_1Tile8F32(&self.ctx, q_device, k_device, v_device, q8_input, q_weight, k_weight, v_weight, rows, in_dim, q_out_dim, kv_out_dim) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+                else => return err,
+            };
+        }
+    } else {
+        self.kernels.launchLinearQ4_0QkvNoBiasQ8_1Tile4F32(&self.ctx, q_device, k_device, v_device, q8_input, q_weight, k_weight, v_weight, rows, in_dim, q_out_dim, kv_out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+    }
+    return true;
+}
+
+fn tryLinearNoBiasGatedDownQ8_1Dp4a(
+    ctx: *anyopaque,
+    gate: CT,
+    up: CT,
+    weight: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation: ops.DecoderRuntimeActivationKind,
+) !?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaQ4_0GatedDownQ8_1Dp4aEnabled()) return null;
+    if (rows != 1 or in_dim == 0 or out_dim == 0 or in_dim % 32 != 0) return null;
+    const gate_tensor = tensorFromCt(gate);
+    const up_tensor = tensorFromCt(up);
+    const weight_tensor = tensorFromCt(weight);
+    if (!isKnownQuant(weight_tensor, .Q4_0)) return null;
+
+    const out_count = try checkedMul(rows, out_dim);
+    const shape = try allocShape2(self.allocator, rows, out_dim);
+    var shape_owned = false;
+    errdefer if (!shape_owned) self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    var device_owned = false;
+    errdefer if (!device_owned) device.free(&self.ctx);
+
+    const row_blocks = in_dim / 32;
+    const q8_blocks = try checkedMul(rows, row_blocks);
+    const q8_bytes = try checkedMul(q8_blocks, 36);
+    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => {
+            releaseDeviceBuffer(self, &device);
+            device_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &q8_input);
+
+    self.kernels.launchQuantizeGatedF32Q8_1Rows(&self.ctx, q8_input, gate_tensor.buffer, up_tensor.buffer, rows, in_dim, @intFromEnum(activation)) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            device.free(&self.ctx);
+            device_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+    if (cudaQ4_0LinearQ8_1Tile8Enabled()) {
+        self.kernels.launchLinearQ4_0Q8_1Tile8F32(&self.ctx, device, q8_input, weight_tensor.buffer, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                device.free(&self.ctx);
+                device_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => return err,
+        };
+    } else if (cudaQ4_0LinearQ8_1Tile4W8Enabled(in_dim)) {
+        self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, device, q8_input, weight_tensor.buffer, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                device.free(&self.ctx);
+                device_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => return err,
+        };
+    } else {
+        self.kernels.launchLinearQ4_0Q8_1Tile4F32(&self.ctx, device, q8_input, weight_tensor.buffer, rows, in_dim, out_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                device.free(&self.ctx);
+                device_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => return err,
+        };
+    }
+
+    self.stats.launch_linear += 1;
+    const result = try createTensor(self, device, shape, out_count);
+    shape_owned = true;
+    device_owned = true;
+    return result;
+}
+
 fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -6043,13 +7221,35 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q8_0, .q8_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 .Q4_0 => {
-                    if (rows == 1 and cudaQ4_0LinearTile8Enabled()) {
+                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+                        // Prototype path is still reported as the Q4_0 SIMT backend until it proves out.
+                    } else if (rows == 1 and cudaQ4_0LinearTile8Enabled()) {
                         self.kernels.launchLinearQ4_0Tile8F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile8_err| switch (tile8_err) {
+                            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                                if (cudaQ4_0LinearTile4W4Enabled()) {
+                                    self.kernels.launchLinearQ4_0Tile4W4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4w4_err| switch (tile4w4_err) {
+                                        error.CudaKernelUnavailable, error.InvalidCudaState => self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
+                                            error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                                            else => return tile4_err,
+                                        },
+                                        else => return tile4w4_err,
+                                    };
+                                } else {
+                                    self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
+                                        error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                                        else => return tile4_err,
+                                    };
+                                }
+                            },
+                            else => return tile8_err,
+                        };
+                    } else if (rows == 1 and cudaQ4_0LinearTile4W4Enabled()) {
+                        self.kernels.launchLinearQ4_0Tile4W4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4w4_err| switch (tile4w4_err) {
                             error.CudaKernelUnavailable, error.InvalidCudaState => self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
                                 error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                                 else => return tile4_err,
                             },
-                            else => return tile8_err,
+                            else => return tile4w4_err,
                         };
                     } else if (rows == 1) {
                         self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
@@ -6117,6 +7317,12 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     } else {
         if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+        } else if (cudaF32LinearTiledEnabled() and rows <= 16 and in_dim >= 512 and out_dim >= 512) {
+            self.kernels.launchLinearF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tiled_err| switch (tiled_err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                else => return tiled_err,
+            };
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
         } else {
             try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
@@ -6300,8 +7506,26 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         return token_tensor;
     }
     if (use_q6) {
-        if (rows != 1) return null;
-        var token_device = (try linearNoBiasArgmaxRowsSuppressDevice(ctx, input, weight, rows, in_dim, out_dim, suppress_token_ids)) orelse return null;
+        var last_row_shape = [_]i64{ 1, @intCast(in_dim) };
+        var last_row_tensor: CudaTensor = undefined;
+        const argmax_input: CT = if (rows == 1) input else blk: {
+            const last_row_elems = try checkedMul(rows - 1, in_dim);
+            const last_row_bytes = try checkedMul(last_row_elems, @sizeOf(f32));
+            const row_bytes = try checkedMul(in_dim, @sizeOf(f32));
+            if (last_row_bytes + row_bytes > input_tensor.buffer.len) return error.InvalidShape;
+            last_row_tensor = input_tensor.*;
+            last_row_tensor.buffer = .{
+                .ptr = input_tensor.buffer.ptr + last_row_bytes,
+                .len = row_bytes,
+            };
+            last_row_tensor.shape = last_row_shape[0..];
+            last_row_tensor.elem_count = in_dim;
+            last_row_tensor.owns_buffer = false;
+            last_row_tensor.owns_shape = false;
+            last_row_tensor.owned_by_tensor = false;
+            break :blk @ptrCast(&last_row_tensor);
+        };
+        var token_device = (try linearNoBiasArgmaxRowsSuppressDevice(ctx, argmax_input, weight, 1, in_dim, out_dim, suppress_token_ids)) orelse return null;
         var token_device_owned = false;
         errdefer if (!token_device_owned) releaseDeviceBuffer(self, &token_device);
 
@@ -6436,6 +7660,12 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         return null;
     }
 
+    var profile_scope = if (out_dim >= 100_000)
+        beginDecodeProfile(self, .lm_head_argmax, rows)
+    else
+        null;
+    defer if (profile_scope) |*scope| scope.end();
+
     const col_tiles = (out_dim + 3) / 4;
     const partial_count = try checkedMul(rows, col_tiles);
     var partial_values = try allocDeviceBuffer(self, try checkedMul(partial_count, @sizeOf(f32)));
@@ -6479,28 +7709,50 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         };
         self.stats.lm_head_argmax_fused_q8 += 1;
     } else if (use_q4_0) {
-        self.kernels.launchLinearQ4_0ArgmaxRowsTile4F32(
-            &self.ctx,
-            token_device,
-            partial_values,
-            partial_indices,
-            input_tensor.buffer,
-            weight_tensor.buffer,
-            suppress_device,
-            rows,
-            in_dim,
-            out_dim,
-            suppress_token_ids.len,
-        ) catch |err| switch (err) {
-            error.CudaKernelUnavailable, error.InvalidCudaState => {
-                std.log.err("cuda_lm_argmax_rows_unsupported: reason=q4_0_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
-                self.stats.lm_head_argmax_fallbacks += 1;
-                releaseDeviceBuffer(self, &token_device);
-                token_device_owned = true;
-                return null;
-            },
-            else => return err,
+        const launched_tile16 = blk: {
+            if (!cudaQ4_0LmHeadTile16Enabled()) break :blk false;
+            self.kernels.launchLinearQ4_0ArgmaxRowsTile16F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                weight_tensor.buffer,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            break :blk true;
         };
+        if (!launched_tile16) {
+            self.kernels.launchLinearQ4_0ArgmaxRowsTile4F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                weight_tensor.buffer,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    std.log.err("cuda_lm_argmax_rows_unsupported: reason=q4_0_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
+                    self.stats.lm_head_argmax_fallbacks += 1;
+                    releaseDeviceBuffer(self, &token_device);
+                    token_device_owned = true;
+                    return null;
+                },
+                else => return err,
+            };
+        }
         self.stats.lm_head_argmax_fused_q4_0 += 1;
     } else if (use_q4) {
         self.kernels.launchLinearQ4KArgmaxRowsTile4F32(
@@ -6527,28 +7779,317 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         };
         self.stats.lm_head_argmax_fused_q4 += 1;
     } else {
-        self.kernels.launchLinearQ6KArgmaxRowsTile4F32(
-            &self.ctx,
-            token_device,
-            partial_values,
-            partial_indices,
-            input_tensor.buffer,
-            weight_tensor.buffer,
-            suppress_device,
-            rows,
-            in_dim,
-            out_dim,
-            suppress_token_ids.len,
-        ) catch |err| switch (err) {
-            error.CudaKernelUnavailable, error.InvalidCudaState => {
-                std.log.err("cuda_lm_argmax_rows_unsupported: reason=q6k_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
-                self.stats.lm_head_argmax_fallbacks += 1;
-                releaseDeviceBuffer(self, &token_device);
-                token_device_owned = true;
-                return null;
-            },
-            else => return err,
+        if (cudaQ6KLmHeadPanelTraceEnabled() and rows == 1 and out_dim >= 100_000) {
+            if (weight_tensor.tc_quant) |tc_quant| {
+                std.log.info(
+                    "cuda_q6_lm_head_panel_trace: dispatch rows={d} in_dim={d} out_dim={d} tc_layout={s} tc_bytes={d}",
+                    .{ rows, in_dim, out_dim, @tagName(tc_quant.layout), tc_quant.bytes },
+                );
+            } else {
+                std.log.info(
+                    "cuda_q6_lm_head_panel_trace: dispatch rows={d} in_dim={d} out_dim={d} tc_layout=none",
+                    .{ rows, in_dim, out_dim },
+                );
+            }
+        }
+        const launched_panel32_q8_1 = if (cudaQ6KLmHeadQ8_1Enabled()) blk: {
+            const panel32 = tcQuantBuffer(weight_tensor, .q6_k_panel32) orelse break :blk false;
+            if (rows != 1 or in_dim % 256 != 0 or out_dim % cuda_q6_k_panel32_nr != 0) break :blk false;
+            const q8_row_blocks = in_dim / 32;
+            const q8_blocks = checkedMul(rows, q8_row_blocks) catch break :blk false;
+            const q8_bytes = checkedMul(q8_blocks, 36) catch break :blk false;
+            var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+                error.CudaGraphCaptureUnsafeTempAlloc => break :blk false,
+                else => return err,
+            };
+            defer releaseDeviceBuffer(self, &q8_input);
+
+            self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            self.kernels.launchLinearQ6KPanel32Q8_1ArgmaxRowsTile32F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                q8_input,
+                panel32,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                        std.log.info("cuda_q6_lm_head_panel_trace: panel32_q8_1_launch_failed err={s}", .{@errorName(err)});
+                    }
+                    break :blk false;
+                },
+                else => return err,
+            };
+            self.stats.lm_head_argmax_fused_q6_panel32 += 1;
+            break :blk true;
+        } else false;
+        const launched_panel16 = blk: {
+            if (launched_panel32_q8_1) break :blk true;
+            const panel16 = tcQuantBuffer(weight_tensor, .q6_k_panel16) orelse break :blk false;
+            if (rows != 1 or in_dim % 256 != 0 or out_dim % cuda_q6_k_panel16_nr != 0) break :blk false;
+            self.kernels.launchLinearQ6KPanel16ArgmaxRowsTile16F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                panel16,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                        std.log.info("cuda_q6_lm_head_panel_trace: panel16_launch_failed err={s}", .{@errorName(err)});
+                    }
+                    break :blk false;
+                },
+                else => return err,
+            };
+            self.stats.lm_head_argmax_fused_q6_panel16 += 1;
+            break :blk true;
         };
+        const launched_panel32 = blk: {
+            if (launched_panel32_q8_1 or launched_panel16) break :blk true;
+            const panel32 = tcQuantBuffer(weight_tensor, .q6_k_panel32) orelse break :blk false;
+            if (rows != 1 or in_dim % 256 != 0 or out_dim % cuda_q6_k_panel32_nr != 0) break :blk false;
+            self.kernels.launchLinearQ6KPanel32ArgmaxRowsTile32F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                panel32,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                        std.log.info("cuda_q6_lm_head_panel_trace: panel32_launch_failed err={s}", .{@errorName(err)});
+                    }
+                    break :blk false;
+                },
+                else => return err,
+            };
+            self.stats.lm_head_argmax_fused_q6_panel32 += 1;
+            break :blk true;
+        };
+        const launched_panel8 = blk: {
+            if (launched_panel32_q8_1 or launched_panel16 or launched_panel32) break :blk true;
+            const panel8 = tcQuantBuffer(weight_tensor, .q6_k_panel8) orelse break :blk false;
+            if (rows != 1 or in_dim % 256 != 0 or out_dim % cuda_q6_k_panel8_nr != 0) break :blk false;
+            const q8_row_blocks = in_dim / 32;
+            const q8_blocks = checkedMul(rows, q8_row_blocks) catch break :blk false;
+            const q8_bytes = checkedMul(q8_blocks, 36) catch break :blk false;
+            var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+                error.CudaGraphCaptureUnsafeTempAlloc => break :blk false,
+                else => return err,
+            };
+            defer releaseDeviceBuffer(self, &q8_input);
+
+            self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            self.kernels.launchLinearQ6KPanel8Q8_1ArgmaxRowsTile8F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                q8_input,
+                panel8,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    if (cudaQ6KLmHeadPanelTraceEnabled()) {
+                        std.log.info("cuda_q6_lm_head_panel_trace: panel8_launch_failed err={s}", .{@errorName(err)});
+                    }
+                    break :blk false;
+                },
+                else => return err,
+            };
+            self.stats.lm_head_argmax_fused_q6_panel8 += 1;
+            break :blk true;
+        };
+        const launched_q8_1 = if (!launched_panel32_q8_1 and !launched_panel8 and cudaQ6KLmHeadQ8_1Enabled()) blk: {
+            if (rows != 1 or in_dim % 256 != 0) break :blk false;
+            const q8_row_blocks = in_dim / 32;
+            const q8_blocks = checkedMul(rows, q8_row_blocks) catch break :blk false;
+            const q8_bytes = checkedMul(q8_blocks, 36) catch break :blk false;
+            var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+                error.CudaGraphCaptureUnsafeTempAlloc => break :blk false,
+                else => return err,
+            };
+            defer releaseDeviceBuffer(self, &q8_input);
+
+            self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            const q8_1_tile = cudaQ6KLmHeadQ8_1Tile();
+            const launched_tile32 = tile32_blk: {
+                if (q8_1_tile != 32) break :tile32_blk false;
+                self.kernels.launchLinearQ6KQ8_1ArgmaxRowsTile32F32(
+                    &self.ctx,
+                    token_device,
+                    partial_values,
+                    partial_indices,
+                    q8_input,
+                    weight_tensor.buffer,
+                    suppress_device,
+                    rows,
+                    in_dim,
+                    out_dim,
+                    suppress_token_ids.len,
+                ) catch |err| switch (err) {
+                    error.CudaKernelUnavailable, error.InvalidCudaState => break :tile32_blk false,
+                    else => return err,
+                };
+                break :tile32_blk true;
+            };
+            const launched_tile16 = if (launched_tile32) true else tile16_blk: {
+                if (q8_1_tile != 16) break :tile16_blk false;
+                self.kernels.launchLinearQ6KQ8_1ArgmaxRowsTile16F32(
+                    &self.ctx,
+                    token_device,
+                    partial_values,
+                    partial_indices,
+                    q8_input,
+                    weight_tensor.buffer,
+                    suppress_device,
+                    rows,
+                    in_dim,
+                    out_dim,
+                    suppress_token_ids.len,
+                ) catch |err| switch (err) {
+                    error.CudaKernelUnavailable, error.InvalidCudaState => break :tile16_blk false,
+                    else => return err,
+                };
+                break :tile16_blk true;
+            };
+            const launched_tile8_w4 = if (launched_tile16) true else tile8_w4_blk: {
+                if (q8_1_tile != 8 or !cudaQ6KLmHeadQ8_1Tile8W4Enabled()) break :tile8_w4_blk false;
+                self.kernels.launchLinearQ6KQ8_1ArgmaxRowsTile8W4F32(
+                    &self.ctx,
+                    token_device,
+                    partial_values,
+                    partial_indices,
+                    q8_input,
+                    weight_tensor.buffer,
+                    suppress_device,
+                    rows,
+                    in_dim,
+                    out_dim,
+                    suppress_token_ids.len,
+                ) catch |err| switch (err) {
+                    error.CudaKernelUnavailable, error.InvalidCudaState => break :tile8_w4_blk false,
+                    else => return err,
+                };
+                break :tile8_w4_blk true;
+            };
+            if (!launched_tile8_w4) {
+                self.kernels.launchLinearQ6KQ8_1ArgmaxRowsTile8F32(
+                    &self.ctx,
+                    token_device,
+                    partial_values,
+                    partial_indices,
+                    q8_input,
+                    weight_tensor.buffer,
+                    suppress_device,
+                    rows,
+                    in_dim,
+                    out_dim,
+                    suppress_token_ids.len,
+                ) catch |err| switch (err) {
+                    error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                    else => return err,
+                };
+            }
+            break :blk true;
+        } else false;
+        const launched_tile16 = blk: {
+            if (launched_panel32_q8_1 or launched_panel16 or launched_panel32 or launched_panel8 or launched_q8_1) break :blk true;
+            if (!cudaQ6KLmHeadTile16Enabled()) break :blk false;
+            self.kernels.launchLinearQ6KArgmaxRowsTile16F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                weight_tensor.buffer,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        const launched_tile8 = blk: {
+            if (launched_panel32_q8_1 or launched_panel16 or launched_panel32 or launched_panel8 or launched_q8_1 or launched_tile16) break :blk true;
+            self.kernels.launchLinearQ6KArgmaxRowsTile8F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                weight_tensor.buffer,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (!launched_tile8) {
+            self.kernels.launchLinearQ6KArgmaxRowsTile4F32(
+                &self.ctx,
+                token_device,
+                partial_values,
+                partial_indices,
+                input_tensor.buffer,
+                weight_tensor.buffer,
+                suppress_device,
+                rows,
+                in_dim,
+                out_dim,
+                suppress_token_ids.len,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    std.log.err("cuda_lm_argmax_rows_unsupported: reason=q6k_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
+                    self.stats.lm_head_argmax_fallbacks += 1;
+                    releaseDeviceBuffer(self, &token_device);
+                    token_device_owned = true;
+                    return null;
+                },
+                else => return err,
+            };
+        }
         self.stats.lm_head_argmax_fused_q6 += 1;
     }
 
@@ -7111,8 +8652,22 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
         self.stats.qkv_fused_q8 += 1;
         self.stats.launch_linear_qkv += 1;
     } else if (use_q4_0) {
+        const used_q4_0_q8_1_dp4a = try tryLaunchLinearQ4_0QkvQ8_1Dp4a(
+            self,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor.buffer,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        );
         const used_q4_0_tile8 = blk: {
-            if (rows == 1 and cudaQ4_0QkvTile8Enabled()) {
+            if (!used_q4_0_q8_1_dp4a and rows == 1 and cudaQ4_0QkvTile8Enabled()) {
                 self.kernels.launchLinearQ4_0QkvNoBiasTile8F32(
                     &self.ctx,
                     q_device,
@@ -7134,30 +8689,55 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             }
             break :blk false;
         };
-        if (!used_q4_0_tile8) {
-            self.kernels.launchLinearQ4_0QkvNoBiasTile4F32(
-                &self.ctx,
-                q_device,
-                k_device,
-                v_device,
-                input_tensor.buffer,
-                q_weight_tensor.buffer,
-                k_weight_tensor.buffer,
-                v_weight_tensor.buffer,
-                rows,
-                in_dim,
-                q_out_dim,
-                kv_out_dim,
-            ) catch |err| switch (err) {
-                error.CudaKernelUnavailable => {
-                    self.stats.qkv_kernel_unavailable += 1;
-                    return null;
-                },
-                else => return err,
+        if (!used_q4_0_q8_1_dp4a and !used_q4_0_tile8) {
+            const used_q4_0_tile4_w4 = blk: {
+                if (rows == 1 and cudaQ4_0QkvTile4W4Enabled()) {
+                    self.kernels.launchLinearQ4_0QkvNoBiasTile4W4F32(
+                        &self.ctx,
+                        q_device,
+                        k_device,
+                        v_device,
+                        input_tensor.buffer,
+                        q_weight_tensor.buffer,
+                        k_weight_tensor.buffer,
+                        v_weight_tensor.buffer,
+                        rows,
+                        in_dim,
+                        q_out_dim,
+                        kv_out_dim,
+                    ) catch |err| switch (err) {
+                        error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                        else => return err,
+                    };
+                    break :blk true;
+                }
+                break :blk false;
             };
+            if (!used_q4_0_tile4_w4) {
+                self.kernels.launchLinearQ4_0QkvNoBiasTile4F32(
+                    &self.ctx,
+                    q_device,
+                    k_device,
+                    v_device,
+                    input_tensor.buffer,
+                    q_weight_tensor.buffer,
+                    k_weight_tensor.buffer,
+                    v_weight_tensor.buffer,
+                    rows,
+                    in_dim,
+                    q_out_dim,
+                    kv_out_dim,
+                ) catch |err| switch (err) {
+                    error.CudaKernelUnavailable => {
+                        self.stats.qkv_kernel_unavailable += 1;
+                        return null;
+                    },
+                    else => return err,
+                };
+            }
         }
         self.stats.qkv_fused_q4_0 += 1;
-        if (used_q4_0_tile8) {
+        if (used_q4_0_tile8 or (used_q4_0_q8_1_dp4a and cudaQ4_0QkvQ8_1Tile8Enabled())) {
             self.stats.qkv_fused_q4_0_tile8 += 1;
         } else {
             self.stats.qkv_fused_q4_0_tile4 += 1;
@@ -7482,8 +9062,19 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         };
         self.stats.linear_pair_fused_q8 += 1;
     } else if (use_q4_0) {
+        const used_q4_0_q8_1_dp4a = try tryLaunchLinearQ4_0PairQ8_1Dp4a(
+            self,
+            device_a,
+            device_b,
+            input_tensor.buffer,
+            weight_a_tensor.buffer,
+            weight_b_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+        );
         const used_q4_0_tile8 = blk: {
-            if (rows == 1 and cudaQ4_0PairTile8Enabled()) {
+            if (!used_q4_0_q8_1_dp4a and rows == 1 and cudaQ4_0PairTile8Enabled()) {
                 self.kernels.launchLinearQ4_0PairNoBiasTile8F32(
                     &self.ctx,
                     device_a,
@@ -7502,7 +9093,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             }
             break :blk false;
         };
-        if (!used_q4_0_tile8) {
+        if (!used_q4_0_q8_1_dp4a and !used_q4_0_tile8) {
             const used_q4_0_tile4_w4 = blk: {
                 if (rows == 1 and cudaQ4_0PairTile4W4Enabled()) {
                     self.kernels.launchLinearQ4_0PairNoBiasTile4W4F32(
@@ -7555,7 +9146,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             }
         }
         self.stats.linear_pair_fused_q4_0 += 1;
-        if (used_q4_0_tile8) {
+        if (used_q4_0_tile8 or (used_q4_0_q8_1_dp4a and cudaQ4_0PairQ8_1Tile8Enabled())) {
             self.stats.linear_pair_fused_q4_0_tile8 += 1;
         } else {
             self.stats.linear_pair_fused_q4_0_tile4 += 1;
@@ -7636,7 +9227,73 @@ fn linearNoBiasPairActivationQ4_0(
     var device_owned = false;
     errdefer if (!device_owned) device.free(&self.ctx);
 
-    self.kernels.launchLinearQ4_0PairActivationTile4W4F32(
+    var used_q8_1_dp4a = false;
+    var used_q8_1_tile8 = false;
+    if (cudaQ4_0PairActivationQ8_1Dp4aEnabled()) q8_1_blk: {
+        const row_blocks = in_dim / 32;
+        const q8_blocks = try checkedMul(rows, row_blocks);
+        const q8_bytes = try checkedMul(q8_blocks, 36);
+        var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => break :q8_1_blk,
+            else => return err,
+        };
+        defer releaseDeviceBuffer(self, &q8_input);
+
+        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
+            else => return err,
+        };
+        if (cudaQ4_0PairActivationQ8_1Tile8Enabled()) {
+            self.kernels.launchLinearQ4_0PairActivationQ8_1Tile8F32(
+                &self.ctx,
+                device,
+                q8_input,
+                weight_gate_tensor.buffer,
+                weight_up_tensor.buffer,
+                rows,
+                in_dim,
+                out_dim,
+                @intFromEnum(activation),
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
+                else => return err,
+            };
+            used_q8_1_tile8 = true;
+        } else if (cudaQ4_0PairActivationQ8_1Tile4W8Enabled(in_dim)) {
+            self.kernels.launchLinearQ4_0PairActivationQ8_1Tile4W8F32(
+                &self.ctx,
+                device,
+                q8_input,
+                weight_gate_tensor.buffer,
+                weight_up_tensor.buffer,
+                rows,
+                in_dim,
+                out_dim,
+                @intFromEnum(activation),
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
+                else => return err,
+            };
+        } else {
+            self.kernels.launchLinearQ4_0PairActivationQ8_1Tile4F32(
+                &self.ctx,
+                device,
+                q8_input,
+                weight_gate_tensor.buffer,
+                weight_up_tensor.buffer,
+                rows,
+                in_dim,
+                out_dim,
+                @intFromEnum(activation),
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
+                else => return err,
+            };
+        }
+        used_q8_1_dp4a = true;
+    }
+
+    if (!used_q8_1_dp4a) self.kernels.launchLinearQ4_0PairActivationTile4W4F32(
         &self.ctx,
         device,
         input_tensor.buffer,
@@ -7660,7 +9317,11 @@ fn linearNoBiasPairActivationQ4_0(
     self.stats.launch_linear += 1;
     self.stats.linear_pair_fused_q4_0 += 1;
     self.stats.linear_pair_fused_q4_0_activation += 1;
-    self.stats.linear_pair_fused_q4_0_tile4 += 1;
+    if (used_q8_1_tile8) {
+        self.stats.linear_pair_fused_q4_0_tile8 += 1;
+    } else {
+        self.stats.linear_pair_fused_q4_0_tile4 += 1;
+    }
     return createTensor(self, device, shape, out_count);
 }
 
@@ -8417,7 +10078,41 @@ fn linearNoBiasActivationSliceLastDim(
     var device_owned = false;
     errdefer if (!device_owned) device.free(&self.ctx);
 
-    self.kernels.launchLinearQ4_0ActivationSliceLastDimTile4F32(
+    var used_q8_1_dp4a = false;
+    if (cudaQ4_0ActivationSliceQ8_1Dp4aEnabled()) q8_1_blk: {
+        const row_blocks = in_dim / 32;
+        const q8_blocks = try checkedMul(rows, row_blocks);
+        const q8_bytes = try checkedMul(q8_blocks, 36);
+        var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => break :q8_1_blk,
+            else => return err,
+        };
+        defer releaseDeviceBuffer(self, &q8_input);
+
+        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
+            else => return err,
+        };
+        self.kernels.launchLinearQ4_0ActivationSliceLastDimQ8_1Tile4F32(
+            &self.ctx,
+            device,
+            q8_input,
+            weight_tensor.buffer,
+            source_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+            source_cols,
+            start,
+            @intFromEnum(activation),
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
+            else => return err,
+        };
+        used_q8_1_dp4a = true;
+    }
+
+    if (!used_q8_1_dp4a) self.kernels.launchLinearQ4_0ActivationSliceLastDimTile4F32(
         &self.ctx,
         device,
         input_tensor.buffer,
@@ -8495,6 +10190,14 @@ fn linearNoBiasGatedDown(
     if (!use_q8 and !use_q4_0 and !use_q4 and !use_q6) {
         self.stats.gated_down_fallbacks += 1;
         return null;
+    }
+
+    if (use_q4_0 and rows == 1) {
+        if (try tryLinearNoBiasGatedDownQ8_1Dp4a(ctx, gate, up, weight, rows, in_dim, out_dim, activation)) |projected| {
+            self.stats.gated_down_fused_q4_0 += 1;
+            self.stats.gated_down_fused_q4_0_tile4 += 1;
+            return projected;
+        }
     }
 
     if (use_q4_0 and rows == 1 and cudaQ4_0GatedDownPrecomputeEnabled()) {
@@ -9243,6 +10946,8 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     if (layer.key_row_bytes != paged.key_row_bytes or layer.value_row_bytes != paged.v_row_stride) return error.DeviceReadFallback;
     if (layer.value_format == cuda_kv_value_format_f32 and layer.value_row_bytes < h_kv * @sizeOf(f32)) return error.DeviceReadFallback;
     if (layer.value_format == cuda_kv_value_format_int8_per_head and layer.value_row_bytes != kv_pool_mod.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
+    if (layer.value_format == cuda_kv_value_format_int4_group and layer.value_row_bytes != kv_pool_mod.KvDType.int4.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
+    if (layer.value_format == cuda_kv_value_format_f16 and layer.value_row_bytes != kv_pool_mod.KvDType.f16.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
     const logical_blocks = if (attention.kv_cache) |kv| blk: {
         if (kv.logical_blocks) |blocks| break :blk blocks;
         const storage = attention.kv_storage orelse return error.DeviceReadFallback;
@@ -9271,7 +10976,81 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     if (layer.block_table_identity) {
         self.stats.device_kv_paged_identity_attention_reads += 1;
     }
+    const decode_scalars = if (cudaDebugDecodeScalarsReady(self))
+        self.debug_cuda_decode_scalars
+    else
+        buffer_mod.DeviceBuffer{};
 
+    var profile_scope = beginDecodeProfile(self, .gqa_attention, attention.query_sequence_len);
+    defer if (profile_scope) |*scope| scope.end();
+    if (cudaTurboquantSplitAttentionEnabled() and
+        batch == 1 and
+        attention.query_sequence_len == 1 and
+        bias_mode == 0 and
+        mask_len == 0 and
+        (paged.format == cuda_kv_format_polar4 or paged.format == cuda_kv_format_f16) and
+        paged.base_key_row_bytes == paged.key_row_bytes)
+    split_attention_blk: {
+        const chunk_size = cudaTurboquantSplitAttentionChunkSize();
+        if (chunk_size == 0) break :split_attention_blk;
+        const split_capacity = @max(layer.capacity_tokens, attention.kv_sequence_len);
+        const chunk_count = (split_capacity + chunk_size - 1) / chunk_size;
+        if (chunk_count <= 1 or chunk_count > 128) break :split_attention_blk;
+        const partial_acc_count = checkedMul(try checkedMul(num_heads, chunk_count), head_dim) catch break :split_attention_blk;
+        const partial_meta_count = checkedMul(try checkedMul(num_heads, chunk_count), @as(usize, 2)) catch break :split_attention_blk;
+        var partial_acc = allocDeviceBuffer(self, partial_acc_count * @sizeOf(f32)) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => break :split_attention_blk,
+            else => return err,
+        };
+        defer releaseDeviceBuffer(self, &partial_acc);
+        var partial_meta = allocDeviceBuffer(self, partial_meta_count * @sizeOf(f32)) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => break :split_attention_blk,
+            else => return err,
+        };
+        defer releaseDeviceBuffer(self, &partial_meta);
+        const split_launched = self.kernels.launchGqaAttentionDecodeTurboquantSplitF32(
+            &self.ctx,
+            device,
+            partial_acc,
+            partial_meta,
+            q_tensor.buffer,
+            layer.k,
+            layer.v,
+            attention_block_table,
+            q_count,
+            attention.kv_sequence_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            query_position_offset,
+            attention.kv_position_offset,
+            attention.sliding_window,
+            paged.key_row_bytes,
+            paged.v_row_stride,
+            attention_block_table_len,
+            paged.page_size_tokens,
+            paged.format,
+            layer.value_format,
+            layer.capacity_tokens,
+            decode_scalars,
+            chunk_size,
+            chunk_count,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => break :split_attention_blk,
+            else => return err,
+        };
+        if (split_launched) {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_fast += 1;
+            if (cudaKvValueFormatCompressed(layer.value_format)) {
+                self.stats.device_kv_compressed_v_reads += 1;
+                self.stats.device_kv_compressed_v_bytes += try checkedMul(attention.kv_sequence_len, layer.value_row_bytes);
+            }
+            _ = kv_count;
+            return createTensor(self, device, shape, q_count);
+        }
+    }
     const launch_kind = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
         &self.ctx,
         device,
@@ -9301,6 +11080,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         paged.format,
         layer.value_format,
         layer.capacity_tokens,
+        decode_scalars,
     );
     switch (launch_kind) {
         .decode => {
@@ -9323,7 +11103,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         },
         .none => {},
     }
-    if (layer.value_format == cuda_kv_value_format_int8_per_head) {
+    if (cudaKvValueFormatCompressed(layer.value_format)) {
         self.stats.device_kv_compressed_v_reads += 1;
         self.stats.device_kv_compressed_v_bytes += try checkedMul(attention.kv_sequence_len, layer.value_row_bytes);
     }
@@ -9369,8 +11149,8 @@ fn gqaPagedAttentionWithDeviceKv(
         return error.InvalidShape;
     }
     const h_kv = try checkedMul(num_kv_heads, head_dim);
-    const compressed_format = cudaTurboquantKvFormat(storage.storage.config.dtype);
-    if (compressed_format != null and cudaTurboquantKvDisabled()) {
+    const compressed_format = cudaPagedKvFormat(storage.storage.config.dtype);
+    if (cudaTurboquantKvFormat(storage.storage.config.dtype) != null and cudaTurboquantKvDisabled()) {
         self.stats.device_kv_fail_read += 1;
         return error.CudaPagedKvUnsupported;
     }
@@ -10093,6 +11873,7 @@ fn cudaPrepareGemmaDecoderRuntimeFamily(
     const prepared_layer_count = cudaGemmaPreparedLayers(@min(configured_layer_count, layer_count));
     const override_level = cudaDecoderRuntimeOverrideLevel();
     if (override_level == 0) return false;
+    const prepare_gated_block_slots = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GATED_BLOCK");
 
     for (0..prepared_layer_count) |layer| {
         var name_buf: [256]u8 = undefined;
@@ -10127,6 +11908,15 @@ fn cudaPrepareGemmaDecoderRuntimeFamily(
 
             const attn_out_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
             if (!(try cudaPrepareLinearNoBiasSlotByName(self, &cb, config, cudaGemmaLinearSlot(layer, .attn_out_proj), attn_out_name, attention_input_size, config.hidden_size))) return false;
+
+            if (prepare_gated_block_slots and config.position_encoding == .rope) {
+                const q_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_norm.weight", .{layer});
+                if (!(try cudaPrepareRmsNormSlotByName(self, &cb, config, gemma4_runtime.qHeadNormSlot(configured_layer_count, layer), q_head_norm_name, layer_head_dim))) return false;
+                if (!shares_kv) {
+                    const k_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+                    if (!(try cudaPrepareRmsNormSlotByName(self, &cb, config, gemma4_runtime.kHeadNormSlot(configured_layer_count, layer), k_head_norm_name, layer_head_dim))) return false;
+                }
+            }
         }
 
         if (override_level >= 3) {
@@ -10163,6 +11953,45 @@ fn cudaPrepareGemmaDecoderRuntimeFamily(
             const down_w = try gpt_arch.getFFNWeight(&cb, config, layer, "down", &name_buf);
             defer cb.free(down_w);
             if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, cudaGemmaLinearSlot(layer, .mlp_down), down_w, config.intermediateSize(layer), config.hidden_size))) return false;
+
+            if (prepare_gated_block_slots and config.hasPle()) {
+                const ple_gate_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.inp_gate.weight", .{layer});
+                const ple_gate_w = gpt_arch.getModelWeight(&cb, config, ple_gate_name) catch |err| switch (err) {
+                    error.MissingWeight, error.WeightNotFound => blk: {
+                        const fallback = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input_gate.weight", .{layer});
+                        break :blk try gpt_arch.getModelWeight(&cb, config, fallback);
+                    },
+                    else => return err,
+                };
+                defer cb.free(ple_gate_w);
+                if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, gemma4_runtime.pleGateSlot(configured_layer_count, layer), ple_gate_w, config.hidden_size, config.ple_hidden_size))) return false;
+
+                const ple_proj_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.proj.weight", .{layer});
+                const ple_proj_w = gpt_arch.getModelWeight(&cb, config, ple_proj_name) catch |err| switch (err) {
+                    error.MissingWeight, error.WeightNotFound => blk: {
+                        const fallback = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_projection.weight", .{layer});
+                        break :blk try gpt_arch.getModelWeight(&cb, config, fallback);
+                    },
+                    else => return err,
+                };
+                defer cb.free(ple_proj_w);
+                if (!(try cudaPrepareLinearNoBiasSlotFromWeight(self, gemma4_runtime.pleProjSlot(configured_layer_count, layer), ple_proj_w, config.ple_hidden_size, config.hidden_size))) return false;
+
+                const ple_post_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.post_norm.weight", .{layer});
+                const ple_post_norm_w = gpt_arch.getModelWeight(&cb, config, ple_post_norm_name) catch |err| switch (err) {
+                    error.MissingWeight, error.WeightNotFound => blk: {
+                        const fallback = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_per_layer_input_norm.weight", .{layer});
+                        break :blk try gpt_arch.getModelWeight(&cb, config, fallback);
+                    },
+                    else => return err,
+                };
+                defer cb.free(ple_post_norm_w);
+                if (!(try decoderRuntimePrepareRmsNormOp(self, &.{
+                    .slot = gemma4_runtime.plePostNormSlot(configured_layer_count, layer),
+                    .weight = ple_post_norm_w,
+                    .hidden_size = config.hidden_size,
+                }))) return false;
+            }
         }
     }
 
@@ -10408,12 +12237,20 @@ fn decoderRuntimeApplyLinearArgmaxOp(ctx: *anyopaque, request: *const ops.Decode
     if (slot.in_dim != request.in_dim or slot.out_dim != request.out_dim) return error.UnexpectedOutputShape;
     self.stats.decoder_runtime_linear_apply_hits += 1;
     const rows = try decoderRuntimeInputRows(request.input, request.in_dim);
-    var profile_scope = if (request.out_dim >= 100_000)
-        beginDecodeProfile(self, .lm_head_argmax, rows)
-    else
-        null;
-    defer if (profile_scope) |*scope| scope.end();
     if (slot.bias == null) {
+        if (try linearNoBiasArgmaxRowsSuppress(
+            ctx,
+            request.input,
+            &slot.weight,
+            rows,
+            request.in_dim,
+            request.out_dim,
+            &.{},
+            self.allocator,
+        )) |tokens| {
+            defer self.allocator.free(tokens);
+            return @intCast(tokens[rows - 1]);
+        }
         const token = (try linearNoBiasArgmaxLastRow(ctx, request.input, &slot.weight, rows, request.in_dim, request.out_dim)) orelse return null;
         return @intCast(token);
     }
@@ -10506,6 +12343,123 @@ fn decoderRuntimeApplyBlockRmsNorm(
     });
 }
 
+fn tryRunQ4_0GateUpActivationQ8_1Precompute(
+    ctx: *anyopaque,
+    request: *const ops.RunGatedFfnResidualRequest,
+    rows: usize,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!cudaQ4_0GateUpActivationQ8_1PrecomputeEnabled()) return null;
+    if (rows == 0 or request.post_gate_rms_norm_slot != null) return null;
+    // Keep this tied to Gemma4 E4B FFN shapes until the matching CUDA kernel is generalized.
+    if (request.hidden_size != 2560 or request.intermediate_size != 10240) return null;
+
+    const gate_slot = self.decoder_runtime_linear_slots.getPtr(request.gate_linear_slot) orelse return null;
+    const up_slot = self.decoder_runtime_linear_slots.getPtr(request.up_linear_slot) orelse return null;
+    const down_slot = self.decoder_runtime_linear_slots.getPtr(request.down_linear_slot) orelse return null;
+    if (gate_slot.in_dim != request.hidden_size or up_slot.in_dim != request.hidden_size or
+        gate_slot.out_dim != request.intermediate_size or up_slot.out_dim != request.intermediate_size or
+        down_slot.in_dim != request.intermediate_size or down_slot.out_dim != request.hidden_size)
+    {
+        return error.UnexpectedOutputShape;
+    }
+    if (gate_slot.bias != null or up_slot.bias != null or down_slot.bias != null) return null;
+    const input_tensor = tensorFromCt(request.input);
+    try ensureF32(input_tensor);
+    if (input_tensor.elem_count != rows * request.hidden_size) return error.InvalidShape;
+    if (!isKnownQuant(&gate_slot.weight, .Q4_0) or !isKnownQuant(&up_slot.weight, .Q4_0) or !isKnownQuant(&down_slot.weight, .Q4_0)) return null;
+
+    const hidden_q8_blocks = request.hidden_size / 32;
+    const hidden_q8_bytes = try checkedMul(try checkedMul(rows, hidden_q8_blocks), 36);
+    const activated_q8_blocks = request.intermediate_size / 32;
+    const activated_q8_bytes = try checkedMul(try checkedMul(rows, activated_q8_blocks), 36);
+    const out_count = try checkedMul(rows, request.hidden_size);
+    const shape = try allocShape2(self.allocator, rows, request.hidden_size);
+    var shape_owned = false;
+    errdefer if (!shape_owned) self.allocator.free(shape);
+    var projected_device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    var projected_owned = false;
+    errdefer if (!projected_owned) projected_device.free(&self.ctx);
+
+    var q8_hidden = allocDeviceBuffer(self, hidden_q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => {
+            releaseDeviceBuffer(self, &projected_device);
+            projected_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &q8_hidden);
+
+    var q8_activated = allocDeviceBuffer(self, activated_q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => {
+            releaseDeviceBuffer(self, &projected_device);
+            projected_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &q8_activated);
+
+    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_hidden, input_tensor.buffer, rows, request.hidden_size) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            projected_device.free(&self.ctx);
+            projected_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+    self.kernels.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+        &self.ctx,
+        q8_activated,
+        q8_hidden,
+        gate_slot.weight.buffer,
+        up_slot.weight.buffer,
+        rows,
+        request.hidden_size,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            projected_device.free(&self.ctx);
+            projected_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+    self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, projected_device, q8_activated, down_slot.weight.buffer, rows, request.intermediate_size, request.hidden_size) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            projected_device.free(&self.ctx);
+            projected_owned = true;
+            self.allocator.free(shape);
+            shape_owned = true;
+            return null;
+        },
+        else => return err,
+    };
+
+    self.stats.launch_linear += 2;
+    self.stats.linear_pair_fused_q4_0 += 1;
+    self.stats.linear_pair_fused_q4_0_activation += 1;
+    self.stats.linear_pair_fused_q4_0_tile4 += 1;
+    self.stats.decoder_runtime_linear_apply_hits += 3;
+    self.stats.decoder_runtime_linear_pair_apply_hits += 1;
+    self.stats.gated_down_fused_q4_0 += 1;
+    self.stats.gated_down_fused_q4_0_precompute += 1;
+    const result = try createTensor(self, projected_device, shape, out_count);
+    shape_owned = true;
+    projected_owned = true;
+    return result;
+}
+
 fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidualRequest) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     self.stats.decoder_runtime_gated_ffn_attempts += 1;
@@ -10527,7 +12481,13 @@ fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidua
     var current: CT = undefined;
     var current_is_down_projection = false;
 
+    if (try tryRunQ4_0GateUpActivationQ8_1Precompute(ctx, request, rows)) |projected| {
+        current = projected;
+        current_is_down_projection = true;
+    }
+
     if (request.post_gate_rms_norm_slot == null and cudaQ4_0GateUpActivationPrecomputeEnabled()) pair_activation_blk: {
+        if (current_is_down_projection) break :pair_activation_blk;
         const gate_slot = self.decoder_runtime_linear_slots.getPtr(request.gate_linear_slot) orelse break :pair_activation_blk;
         const up_slot = self.decoder_runtime_linear_slots.getPtr(request.up_linear_slot) orelse break :pair_activation_blk;
         const down_slot = self.decoder_runtime_linear_slots.getPtr(request.down_linear_slot) orelse break :pair_activation_blk;
@@ -10693,6 +12653,378 @@ fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidua
     } else added;
     self.stats.decoder_runtime_gated_ffn_hits += 1;
     return result;
+}
+
+fn decoderRuntimeApplyHeadNormRopeSlot(
+    ctx: *anyopaque,
+    input: CT,
+    slot_id: usize,
+    rows: usize,
+    total_dim: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    eps: f32,
+    theta: f32,
+    freq_scale: f32,
+    position_offset: usize,
+    seq_len: usize,
+    consecutive_pairs: bool,
+    scale: f32,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const slot = self.decoder_runtime_rms_norm_slots.getPtr(slot_id) orelse {
+        traceCudaGatedBlockDecline("headnorm-slot-unprepared");
+        return null;
+    };
+    if (slot.hidden_size != head_dim) {
+        traceCudaGatedBlockDecline("headnorm-slot-shape");
+        return null;
+    }
+    return (try rmsNormHeadsRope(
+        ctx,
+        input,
+        &slot.weight,
+        rows,
+        total_dim,
+        head_dim,
+        rope_dim,
+        eps,
+        theta,
+        freq_scale,
+        position_offset,
+        seq_len,
+        consecutive_pairs,
+        scale,
+    )) orelse {
+        traceCudaGatedBlockDecline("headnorm-kernel");
+        return null;
+    };
+}
+
+fn traceCudaGatedBlockDecline(comptime reason: []const u8) void {
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TRACE_GATED_BLOCK_DECLINE")) {
+        std.debug.print("cuda_gated_block_decline: reason={s}\n", .{reason});
+    }
+}
+
+fn inferCudaGemmaHeadNormSlotFromQSlot(self: *const CudaCompute, q_slot: usize, comptime kind: enum { q, k }) ?usize {
+    const state = self.decoder_runtime_family_state;
+    if (!state.prepared or state.configured_layer_count == 0) return null;
+    if (q_slot % 7 != 0) return null;
+    const layer = q_slot / 7;
+    if (layer >= state.configured_layer_count or layer >= @as(usize, @intCast(state.num_hidden_layers))) return null;
+    return switch (kind) {
+        .q => gemma4_runtime.qHeadNormSlot(state.configured_layer_count, layer),
+        .k => gemma4_runtime.kHeadNormSlot(state.configured_layer_count, layer),
+    };
+}
+
+fn inferCudaGemmaPleSlotFromQSlot(self: *const CudaCompute, q_slot: usize, comptime kind: enum { gate, proj, post_norm }) ?usize {
+    const state = self.decoder_runtime_family_state;
+    if (!state.prepared or state.configured_layer_count == 0) return null;
+    if (q_slot % 7 != 0) return null;
+    const layer = q_slot / 7;
+    if (layer >= state.configured_layer_count or layer >= @as(usize, @intCast(state.num_hidden_layers))) return null;
+    return switch (kind) {
+        .gate => gemma4_runtime.pleGateSlot(state.configured_layer_count, layer),
+        .proj => gemma4_runtime.pleProjSlot(state.configured_layer_count, layer),
+        .post_norm => gemma4_runtime.plePostNormSlot(state.configured_layer_count, layer),
+    };
+}
+
+fn runGatedDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunGatedDecoderBlockRequest) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GATED_BLOCK")) {
+        traceCudaGatedBlockDecline("disabled");
+        return null;
+    }
+    if (self.debug_cuda_graph_capture_active) {
+        traceCudaGatedBlockDecline("graph-capture");
+        return null;
+    }
+    if (request.ffn_layer_norm_slot != null) {
+        traceCudaGatedBlockDecline("layer-norm-ffn");
+        return null;
+    }
+
+    var q_for_attention: CT = undefined;
+    var k_for_attention: CT = undefined;
+    var v_for_attention: CT = undefined;
+    var owns_q_for_attention = false;
+    var owns_k_for_attention = false;
+    var owns_v_for_attention = false;
+    var v_normed_flat: ?CT = null;
+    var qkv_first_owner: ?CT = null;
+    var qkv_second_owner: ?CT = null;
+    var qkv_third_owner: ?CT = null;
+    defer if (qkv_third_owner) |tensor| freeTensor(ctx, tensor);
+    defer if (qkv_second_owner) |tensor| freeTensor(ctx, tensor);
+    defer if (qkv_first_owner) |tensor| freeTensor(ctx, tensor);
+    defer if (v_normed_flat) |flat| freeTensor(ctx, flat);
+    defer if (owns_v_for_attention) freeTensor(ctx, v_for_attention);
+    defer if (owns_k_for_attention) freeTensor(ctx, k_for_attention);
+    defer if (owns_q_for_attention) freeTensor(ctx, q_for_attention);
+
+    if (request.attention_input) |attention_input| {
+        const q_slot = request.q_linear_slot orelse {
+            traceCudaGatedBlockDecline("missing-q-slot");
+            return null;
+        };
+        const k_slot = request.k_linear_slot orelse {
+            traceCudaGatedBlockDecline("missing-k-slot");
+            return null;
+        };
+        const v_slot = request.v_linear_slot orelse {
+            traceCudaGatedBlockDecline("missing-v-slot");
+            return null;
+        };
+        const q_head_norm_slot = request.q_head_norm_slot orelse inferCudaGemmaHeadNormSlotFromQSlot(self, q_slot, .q) orelse {
+            traceCudaGatedBlockDecline("missing-q-head-norm");
+            return null;
+        };
+        const k_head_norm_slot = request.k_head_norm_slot orelse inferCudaGemmaHeadNormSlotFromQSlot(self, q_slot, .k) orelse {
+            traceCudaGatedBlockDecline("missing-k-head-norm");
+            return null;
+        };
+        if (request.rope_active_dim == 0) {
+            traceCudaGatedBlockDecline("missing-rope");
+            return null;
+        }
+
+        const rows = decoderRuntimeInputRows(attention_input, request.hidden_size) catch return null;
+        if (rows == 0 or rows != request.attention.query_sequence_len) {
+            traceCudaGatedBlockDecline("rows-mismatch");
+            return null;
+        }
+        const q_dim = try checkedMul(request.num_heads, request.head_dim);
+        const kv_dim = try checkedMul(request.num_kv_heads, request.head_dim);
+        const qkv = (try decoderRuntimeApplyLinearQkvOp(ctx, &.{
+            .q_slot = q_slot,
+            .k_slot = k_slot,
+            .v_slot = v_slot,
+            .input = attention_input,
+            .in_dim = request.hidden_size,
+            .q_out_dim = q_dim,
+            .kv_out_dim = kv_dim,
+        })) orelse {
+            traceCudaGatedBlockDecline("qkv");
+            return null;
+        };
+        qkv_first_owner = qkv.first;
+        qkv_second_owner = qkv.second;
+        qkv_third_owner = qkv.third;
+
+        const position_offset = if (request.attention.total_sequence_len >= request.attention.query_sequence_len)
+            request.attention.total_sequence_len - request.attention.query_sequence_len
+        else
+            request.attention.kv_position_offset;
+        const q_scale: f32 = if (request.global_head_dim != 0)
+            @sqrt(@as(f32, @floatFromInt(request.head_dim)))
+        else
+            1.0;
+        q_for_attention = (try decoderRuntimeApplyHeadNormRopeSlot(
+            ctx,
+            qkv.first,
+            q_head_norm_slot,
+            rows,
+            q_dim,
+            request.head_dim,
+            request.rope_active_dim,
+            request.eps,
+            request.rope_theta,
+            request.rope_freq_scale,
+            position_offset,
+            rows,
+            request.rope_consecutive_pairs,
+            q_scale,
+        )) orelse {
+            traceCudaGatedBlockDecline("q-head-norm-rope");
+            return null;
+        };
+        owns_q_for_attention = true;
+
+        k_for_attention = (try decoderRuntimeApplyHeadNormRopeSlot(
+            ctx,
+            qkv.second,
+            k_head_norm_slot,
+            rows,
+            kv_dim,
+            request.head_dim,
+            request.rope_active_dim,
+            request.eps,
+            request.rope_theta,
+            request.rope_freq_scale,
+            position_offset,
+            rows,
+            request.rope_consecutive_pairs,
+            1.0,
+        )) orelse {
+            traceCudaGatedBlockDecline("k-head-norm-rope");
+            return null;
+        };
+        owns_k_for_attention = true;
+
+        if (request.global_head_dim != 0) {
+            const reshaped_v = try reshape2dOp(ctx, qkv.third, rows * request.num_kv_heads, request.head_dim);
+            defer freeTensor(ctx, reshaped_v);
+            const normed_flat = (try rmsNormBare(ctx, reshaped_v, request.head_dim, request.eps)) orelse {
+                traceCudaGatedBlockDecline("v-rms-bare");
+                return null;
+            };
+            v_normed_flat = normed_flat;
+            v_for_attention = try reshape2dOp(ctx, normed_flat, rows, kv_dim);
+            owns_v_for_attention = true;
+        } else {
+            v_for_attention = qkv.third;
+        }
+    } else {
+        q_for_attention = request.q orelse {
+            traceCudaGatedBlockDecline("missing-q");
+            return null;
+        };
+        k_for_attention = request.k orelse {
+            traceCudaGatedBlockDecline("missing-k");
+            return null;
+        };
+        v_for_attention = request.v orelse {
+            traceCudaGatedBlockDecline("missing-v");
+            return null;
+        };
+    }
+
+    const attention_residual = (try runAttentionResidualOp(ctx, &.{
+        .q = q_for_attention,
+        .k = k_for_attention,
+        .v = v_for_attention,
+        .residual = request.residual,
+        .attention = request.attention,
+        .attention_sink = request.attention.attention_sink,
+        .num_heads = request.num_heads,
+        .num_kv_heads = request.num_kv_heads,
+        .head_dim = request.head_dim,
+        .linear_slot = request.attention_linear_slot,
+        .pre_linear_rms_norm_slot = request.attention_pre_linear_rms_norm_slot,
+        .post_linear_rms_norm_slot = request.attention_post_linear_rms_norm_slot,
+        .hidden_size = request.hidden_size,
+        .eps = request.eps,
+    })) orelse return null;
+    errdefer freeTensor(ctx, attention_residual);
+
+    var ffn_input = attention_residual;
+    var owns_ffn_input = false;
+    if (request.ffn_rms_norm_slot) |slot_id| {
+        const normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            .slot = slot_id,
+            .input = attention_residual,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+        })) orelse {
+            freeTensor(ctx, attention_residual);
+            return null;
+        };
+        ffn_input = normed;
+        owns_ffn_input = true;
+    }
+    defer if (owns_ffn_input) freeTensor(ctx, ffn_input);
+
+    const block_output = (try runGatedFfnResidualOp(ctx, &.{
+        .gate_linear_slot = request.gate_ffn_linear_slot,
+        .up_linear_slot = request.up_ffn_linear_slot,
+        .down_linear_slot = request.down_ffn_linear_slot,
+        .input = ffn_input,
+        .residual = attention_residual,
+        .post_gate_rms_norm_slot = request.ffn_post_gate_rms_norm_slot,
+        .post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
+        .output_scale = if (request.ple == null) request.output_scale else null,
+        .hidden_size = request.hidden_size,
+        .intermediate_size = request.intermediate_size,
+        .eps = request.eps,
+        .activation = request.activation,
+        .planned_layer_contract = request.planned_layer_contract,
+    })) orelse {
+        freeTensor(ctx, attention_residual);
+        return null;
+    };
+    freeTensor(ctx, attention_residual);
+    errdefer freeTensor(ctx, block_output);
+
+    if (request.ple) |ple| {
+        const q_slot = request.q_linear_slot orelse {
+            traceCudaGatedBlockDecline("ple-missing-q-slot");
+            return null;
+        };
+        const ple_dim = request.ple_hidden_size;
+        if (ple_dim == 0) {
+            traceCudaGatedBlockDecline("ple-missing-dim");
+            return null;
+        }
+        const gate_slot_id = request.ple_gate_linear_slot orelse inferCudaGemmaPleSlotFromQSlot(self, q_slot, .gate) orelse {
+            traceCudaGatedBlockDecline("ple-missing-gate-slot");
+            return null;
+        };
+        const proj_slot_id = request.ple_proj_linear_slot orelse inferCudaGemmaPleSlotFromQSlot(self, q_slot, .proj) orelse {
+            traceCudaGatedBlockDecline("ple-missing-proj-slot");
+            return null;
+        };
+        const post_norm_slot_id = request.ple_post_norm_slot orelse inferCudaGemmaPleSlotFromQSlot(self, q_slot, .post_norm) orelse {
+            traceCudaGatedBlockDecline("ple-missing-post-norm-slot");
+            return null;
+        };
+        const gate_slot = self.decoder_runtime_linear_slots.getPtr(gate_slot_id) orelse {
+            traceCudaGatedBlockDecline("ple-gate-slot-unprepared");
+            return null;
+        };
+        const proj_slot = self.decoder_runtime_linear_slots.getPtr(proj_slot_id) orelse {
+            traceCudaGatedBlockDecline("ple-proj-slot-unprepared");
+            return null;
+        };
+        const post_norm_slot = self.decoder_runtime_rms_norm_slots.getPtr(post_norm_slot_id) orelse {
+            traceCudaGatedBlockDecline("ple-post-norm-unprepared");
+            return null;
+        };
+        if (gate_slot.in_dim != request.hidden_size or gate_slot.out_dim != ple_dim or
+            proj_slot.in_dim != ple_dim or proj_slot.out_dim != request.hidden_size or
+            post_norm_slot.hidden_size != request.hidden_size or gate_slot.bias != null or proj_slot.bias != null)
+        {
+            traceCudaGatedBlockDecline("ple-slot-shape");
+            return null;
+        }
+        const rows = decoderRuntimeInputRows(block_output, request.hidden_size) catch {
+            traceCudaGatedBlockDecline("ple-rows");
+            return null;
+        };
+        const gated = (try linearNoBiasActivationSliceLastDim(
+            ctx,
+            block_output,
+            &gate_slot.weight,
+            ple,
+            rows,
+            request.hidden_size,
+            ple_dim,
+            0,
+            request.activation,
+        )) orelse {
+            traceCudaGatedBlockDecline("ple-gate-fused");
+            return null;
+        };
+        defer freeTensor(ctx, gated);
+        const projected = (try linearNoBias(ctx, gated, &proj_slot.weight, rows, ple_dim, request.hidden_size));
+        defer freeTensor(ctx, projected);
+        const result = if (request.output_scale) |scale|
+            (try rmsNormAddOutputScaleTensor(ctx, projected, &post_norm_slot.weight, block_output, scale, request.hidden_size, request.eps)) orelse {
+                traceCudaGatedBlockDecline("ple-post-scale");
+                return null;
+            }
+        else
+            (try rmsNormAddTensor(ctx, projected, &post_norm_slot.weight, block_output, request.hidden_size, request.eps)) orelse {
+                traceCudaGatedBlockDecline("ple-post");
+                return null;
+            };
+        freeTensor(ctx, block_output);
+        return result;
+    }
+
+    return block_output;
 }
 
 fn runAttentionOutputResidualOp(ctx: *anyopaque, request: *const ops.RunAttentionOutputResidualRequest) anyerror!?CT {
@@ -10902,8 +13234,11 @@ const vtable = ops.ComputeBackend.VTable{
     .debugCudaTraceTensor = &debugCudaTraceTensor,
     .debugCudaGraphRegisterFinalHiddenReplayBoundary = &debugCudaGraphRegisterFinalHiddenReplayBoundary,
     .debugCudaGraphRegisterFinalHiddenReplayInput = &debugCudaGraphRegisterFinalHiddenReplayInput,
+    .debugCudaGraphRegisterFinalHiddenReplayAuxInput = &debugCudaGraphRegisterFinalHiddenReplayAuxInput,
     .debugCudaGraphPrepareFinalHiddenReplayInput = &debugCudaGraphPrepareFinalHiddenReplayInput,
+    .debugCudaGraphPrepareFinalHiddenReplayAuxInput = &debugCudaGraphPrepareFinalHiddenReplayAuxInput,
     .debugCudaGraphReplayFinalHidden = &debugCudaGraphReplayFinalHidden,
+    .debugCudaGraphReplayFinalHiddenDiscard = &debugCudaGraphReplayFinalHiddenDiscard,
     .debugCudaGraphCaptureEnd = &debugCudaGraphCaptureEnd,
     .embeddingLookup = &embeddingLookup,
     .embeddingLookupScaled = &embeddingLookupScaled,
@@ -10956,6 +13291,7 @@ const vtable = ops.ComputeBackend.VTable{
     .decoderRuntimeApplyLinearQkv = &decoderRuntimeApplyLinearQkvOp,
     .decoderRuntimeApplyScaledAddScale = &decoderRuntimeApplyScaledAddScaleOp,
     .runGatedFfnResidual = &runGatedFfnResidualOp,
+    .runGatedDecoderBlock = &runGatedDecoderBlockOp,
     .runAttentionOutputResidual = &runAttentionOutputResidualOp,
     .multiplyScalar = &multiplyScalar,
     .addScalar = &addScalar,
@@ -11025,6 +13361,7 @@ const vtable = ops.ComputeBackend.VTable{
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
     .evalTensor = &evalTensorOp,
+    .debugCudaDeviceWarmup = &debugCudaDeviceWarmup,
     .zeroTensor = &zeroTensorOp,
 };
 

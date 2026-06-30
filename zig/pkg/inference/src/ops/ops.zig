@@ -918,9 +918,19 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
+    pub fn debugCudaGraphRegisterFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayAuxInput orelse return;
+        return op(self.ptr, input);
+    }
+
     pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
         return op(self.ptr, label, input);
+    }
+
+    pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayAuxInput orelse return null;
+        return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphReplayFinalHidden(self: *const ComputeBackend, input: CT) !?CT {
@@ -928,9 +938,19 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
+    pub fn debugCudaGraphReplayFinalHiddenDiscard(self: *const ComputeBackend, input: CT) !bool {
+        const op = self.vtable.debugCudaGraphReplayFinalHiddenDiscard orelse return false;
+        return op(self.ptr, input);
+    }
+
     pub fn debugCudaGraphCaptureEnd(self: *const ComputeBackend, replay: bool) !void {
         const op = self.vtable.debugCudaGraphCaptureEnd orelse return;
         return op(self.ptr, replay);
+    }
+
+    pub fn debugCudaDeviceWarmup(self: *const ComputeBackend, bytes: usize, iterations: usize) !bool {
+        const op = self.vtable.debugCudaDeviceWarmup orelse return false;
+        return op(self.ptr, bytes, iterations);
     }
 
     pub const VTable = struct {
@@ -967,9 +987,13 @@ pub const ComputeBackend = struct {
         debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
         debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
+        debugCudaDeviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
 
         /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,

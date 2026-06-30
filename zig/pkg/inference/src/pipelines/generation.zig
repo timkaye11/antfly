@@ -34,6 +34,7 @@ const ComputeBackend = ops.ComputeBackend;
 const activations = @import("../backends/activations.zig");
 const backends = @import("../backends/backends.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
+const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
 const runtime = @import("../runtime/root.zig");
 const jinja = @import("jinja");
 const grammar_mod = @import("grammar.zig");
@@ -177,6 +178,9 @@ pub const GenerationConfig = struct {
     /// KV cache compaction ratio after prefill. null = no compaction.
     /// 0.02 = 50x compression, 0.1 = 10x compression.
     cache_compaction_ratio: ?f32 = null,
+    /// Benchmark/compatibility mode: continue decoding when the model emits an
+    /// EOS token. Defaults to production stop-on-EOS behavior.
+    ignore_eos: bool = false,
 };
 
 /// Parsed chat template for rendering messages via Jinja2.
@@ -269,6 +273,7 @@ pub const GenerationTimingMs = struct {
     runtime_prepare: u64 = 0,
     prefill: u64 = 0,
     decode: u64 = 0,
+    text_decode: u64 = 0,
     total: u64 = 0,
 };
 
@@ -453,6 +458,11 @@ pub const OwnedBatchDecodeContext = struct {
 
 const SamplingPenaltyState = struct {
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    enabled: bool = true,
+
+    fn init(enabled: bool) SamplingPenaltyState {
+        return .{ .enabled = enabled };
+    }
 
     fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
         self.counts.deinit(allocator);
@@ -464,6 +474,7 @@ const SamplingPenaltyState = struct {
     }
 
     fn noteToken(self: *SamplingPenaltyState, allocator: std.mem.Allocator, token_id: i64) !void {
+        if (!self.enabled) return;
         if (token_id < 0) return;
         const entry = try self.counts.getOrPut(allocator, @intCast(token_id));
         if (!entry.found_existing) entry.value_ptr.* = 0;
@@ -475,7 +486,7 @@ const SamplingPenaltyState = struct {
     }
 
     fn clone(self: *const SamplingPenaltyState, allocator: std.mem.Allocator) !SamplingPenaltyState {
-        var copy = SamplingPenaltyState{};
+        var copy = SamplingPenaltyState.init(self.enabled);
         errdefer copy.deinit(allocator);
 
         var it = self.counts.iterator();
@@ -504,6 +515,10 @@ fn enableCudaPrefillFirstToken() bool {
 
 fn enableCudaPrefillGreedyToken() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", true);
+}
+
+fn enableCudaPreparedTailPrefillGreedy() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_PREPARED_TAIL_GREEDY", false);
 }
 
 fn enableCudaGreedyDeviceTokenHandoff() bool {
@@ -1249,10 +1264,10 @@ pub const NativeDecodeState = struct {
         return if (pool.config.sliding_window_size) |size| @intCast(size) else null;
     }
 
-    fn cudaCompressedKvReplayCapacityTokens(self: *const NativeDecodeState) ?usize {
+    fn cudaPagedKvReplayCapacityTokens(self: *const NativeDecodeState) ?usize {
         const storage = self.kv_storage orelse return null;
         switch (storage.storage.config.dtype) {
-            .polar4, .turbo3 => {},
+            .f16, .polar4, .turbo3 => {},
             else => return null,
         }
         const forced = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse return null;
@@ -1260,7 +1275,7 @@ pub const NativeDecodeState = struct {
     }
 
     fn reservePagedKvReplayCapacity(self: *NativeDecodeState) !void {
-        const token_capacity = self.cudaCompressedKvReplayCapacityTokens() orelse return;
+        const token_capacity = self.cudaPagedKvReplayCapacityTokens() orelse return;
         const sequence_id = self.sequence_id orelse return;
         const manager = self.kv_manager orelse return;
         try manager.reserveTokenCapacity(sequence_id, token_capacity);
@@ -2019,6 +2034,10 @@ pub const NativeGenerationPipeline = struct {
     const prefetch_drain_budget_per_step: usize = 4;
     const default_mtp_zero_match_fallback_rounds: usize = 16;
 
+    fn shouldStopOnEos(self: *const NativeGenerationPipeline, config: GenerationConfig, token: usize) bool {
+        return !config.ignore_eos and self.gpt_config.isEosToken(token);
+    }
+
     fn rejectUnsupportedDeepSeekV4GraphMode(self: *const NativeGenerationPipeline) !void {
         if (!NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config)) return;
         if (self.graph_cache != null or self.compiled_partition_backend != null) {
@@ -2386,7 +2405,7 @@ pub const NativeGenerationPipeline = struct {
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
         var emitted_text: []u8 = if (stream_enabled) try allocator.dupe(u8, "") else &.{};
         defer if (stream_enabled) allocator.free(emitted_text);
-        var penalty_state = SamplingPenaltyState{};
+        var penalty_state = SamplingPenaltyState.init(hasSamplingPenalties(config));
         defer penalty_state.deinit(allocator);
         try penalty_state.seedFromHistory(allocator, token_ids[0..seq_len]);
 
@@ -2623,7 +2642,7 @@ pub const NativeGenerationPipeline = struct {
                 }
             }
 
-            const first_is_eos = self.gpt_config.isEosToken(first_token);
+            const first_is_eos = self.shouldStopOnEos(config, first_token);
             if (first_is_eos or first_outcome.grammar_complete) {
                 finish_reason = "stop";
             }
@@ -2905,6 +2924,7 @@ pub const NativeGenerationPipeline = struct {
         const gen_ids = try allocator.alloc(i32, seq_len - gen_start);
         for (0..gen_ids.len) |i| gen_ids[i] = @intCast(token_ids[gen_start + i]);
 
+        const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const text = try self.tokenizer.decode(allocator, gen_ids);
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
@@ -2913,24 +2933,30 @@ pub const NativeGenerationPipeline = struct {
             .runtime_prepare = timestampDurationMillis(runtime_prepare_started_at, prefill_started_at),
             .prefill = timestampDurationMillis(prefill_started_at, finished_prefill_at),
             .decode = timestampDurationMillis(finished_prefill_at, finished_generate_at),
+            .text_decode = timestampDurationMillis(text_decode_started_at, finished_generate_at),
             .total = timestampDurationMillis(started_at, finished_generate_at),
         } else null;
         if (self.print_timing and timing_ms != null) {
             const timing = timing_ms.?;
             std.debug.print(
-                "generate_timing_ms: prompt_format={d} tokenize={d} runtime_prepare={d} prefill={d} decode={d} total={d}\n",
+                "generate_timing_ms: prompt_format={d} tokenize={d} runtime_prepare={d} prefill={d} decode={d} text_decode={d} total={d}\n",
                 .{
                     timing.prompt_format,
                     timing.tokenize,
                     timing.runtime_prepare,
                     timing.prefill,
                     timing.decode,
+                    timing.text_decode,
                     timing.total,
                 },
             );
         }
         const final_mtp_auto_cost_probe_rounds: usize = if (speculative_stats.mtp_enabled and speculation_policy == .auto)
             gemma4MtpAutoCostProbeRounds()
+        else
+            0;
+        const final_mtp_auto_min_accepted_per_round_milli: usize = if (speculative_stats.mtp_enabled and speculation_policy == .auto)
+            gemma4MtpAutoMinAcceptedPerRoundMilli()
         else
             0;
         if (speculative_stats.mtp_enabled and
@@ -2941,6 +2967,18 @@ pub const NativeGenerationPipeline = struct {
         {
             speculative_stats.speculation_policy_decision = .disabled_insufficient_probe;
             speculative_stats.mtp_disabled_reason = "mtp_auto_insufficient_cost_probe";
+        } else if (speculative_stats.mtp_enabled and
+            speculation_policy == .auto and
+            speculative_stats.speculation_policy_decision == .active and
+            final_mtp_auto_cost_probe_rounds > 0 and
+            final_mtp_auto_min_accepted_per_round_milli > 0 and
+            speculative_stats.rounds >= final_mtp_auto_cost_probe_rounds)
+        {
+            const accepted_per_round_milli = (speculative_stats.accepted_tokens * 1000) / speculative_stats.rounds;
+            if (accepted_per_round_milli < final_mtp_auto_min_accepted_per_round_milli) {
+                speculative_stats.speculation_policy_decision = .disabled_slow;
+                speculative_stats.mtp_disabled_reason = "mtp_auto_cost_probe_slow";
+            }
         }
         return .{
             .text = text,
@@ -2960,6 +2998,64 @@ pub const NativeGenerationPipeline = struct {
         last_hidden: ?ops.CT = null,
         last_hidden_rows: usize = 0,
     };
+
+    fn tryCudaPreparedTailPrefillGreedy(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !?PrefillOutput {
+        if (!enableCudaPreparedTailPrefillGreedy()) return null;
+        if (self.cb.kind() != .cuda) return null;
+        if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
+
+        const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            input_ids,
+            seq_len,
+            decode_context,
+        )) orelse return null;
+        var owns_hidden = true;
+        errdefer if (owns_hidden) self.cb.free(tail.final_hidden);
+
+        var greedy = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            tail.final_hidden,
+            .rms,
+            tail.final_norm_slot,
+        )) orelse {
+            self.cb.free(tail.final_hidden);
+            return null;
+        };
+        if (greedy.token_tensor) |token_tensor| {
+            self.cb.free(token_tensor);
+            greedy.token_tensor = null;
+        }
+
+        const last_hidden = if (capture_last_hidden) blk: {
+            owns_hidden = false;
+            break :blk tail.final_hidden;
+        } else blk: {
+            self.cb.free(tail.final_hidden);
+            owns_hidden = false;
+            break :blk null;
+        };
+        debugGenerationStage(
+            "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
+            .{ greedy.token_id, capture_last_hidden },
+        );
+        return .{
+            .greedy_token = greedy.token_id,
+            .last_hidden = last_hidden,
+            .last_hidden_rows = if (last_hidden != null) 1 else 0,
+        };
+    }
 
     /// Run the prefill phase: process prompt tokens through the model,
     /// either chunked (for paged KV) or in one pass. Returns the logits
@@ -3103,7 +3199,11 @@ pub const NativeGenerationPipeline = struct {
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
                 if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
-                    if (capture_last_hidden) {
+                    if (try self.tryCudaPreparedTailPrefillGreedy(chunk, chunk_end, &decode_context, capture_last_hidden)) |prepared| {
+                        prefill_greedy_token = prepared.greedy_token;
+                        prefill_last_hidden = prepared.last_hidden;
+                        prefill_last_hidden_rows = prepared.last_hidden_rows;
+                    } else if (capture_last_hidden) {
                         var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
                             if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                 current_chunk_size = @max(chunk_size / 2, 1);
@@ -3362,7 +3462,7 @@ pub const NativeGenerationPipeline = struct {
         };
 
         const next_token = outcome.token;
-        if (self.gpt_config.isEosToken(next_token)) {
+        if (self.shouldStopOnEos(config, next_token)) {
             self.finishPrefillFirstTokenSchedulerTurn(0);
             debugFirstToken("prefill_first_token eos token={d}", .{next_token});
             return .{ .tokens_generated = 0, .finish_reason = "stop" };
@@ -3594,7 +3694,7 @@ pub const NativeGenerationPipeline = struct {
             );
 
             // Check EOS
-            if (self.gpt_config.isEosToken(next_token)) {
+            if (self.shouldStopOnEos(config, next_token)) {
                 if (next_device_token_tensor) |tensor| {
                     self.cb.free(tensor);
                     next_device_token_tensor = null;
@@ -3701,7 +3801,7 @@ pub const NativeGenerationPipeline = struct {
                 if (tokens_generated == 0) {
                     if (prefill_greedy_token.*) |token| {
                         prefill_greedy_token.* = null;
-                        if (self.gpt_config.isEosToken(token)) {
+                        if (self.shouldStopOnEos(config, token)) {
                             finish_reason = "stop";
                             break;
                         }
@@ -3727,7 +3827,7 @@ pub const NativeGenerationPipeline = struct {
                             gbnf_grammar,
                         );
                         const token = outcome.token;
-                        if (self.gpt_config.isEosToken(token)) {
+                        if (self.shouldStopOnEos(config, token)) {
                             finish_reason = "stop";
                             break;
                         }
@@ -3779,7 +3879,7 @@ pub const NativeGenerationPipeline = struct {
                     )) |resolved| {
                         var next_device_token_tensor = resolved.token_tensor;
                         errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
-                        if (self.gpt_config.isEosToken(resolved.token)) {
+                        if (self.shouldStopOnEos(config, resolved.token)) {
                             if (next_device_token_tensor) |tensor| self.cb.free(tensor);
                             finish_reason = "stop";
                             break;
@@ -3807,7 +3907,7 @@ pub const NativeGenerationPipeline = struct {
             const candidate = candidate_token_tensor.?;
             if (tokens_generated + 1 >= max_tokens) {
                 const token = try gpt_arch.resolveGreedyDeviceTokenTensor(&self.cb, allocator, candidate);
-                if (self.gpt_config.isEosToken(token)) {
+                if (self.shouldStopOnEos(config, token)) {
                     finish_reason = "stop";
                     break;
                 }
@@ -3824,7 +3924,7 @@ pub const NativeGenerationPipeline = struct {
 
             const pending = (try self.cb.beginI32ScalarDownload(candidate)) orelse {
                 const token = try gpt_arch.resolveGreedyDeviceTokenTensor(&self.cb, allocator, candidate);
-                if (self.gpt_config.isEosToken(token)) {
+                if (self.shouldStopOnEos(config, token)) {
                     finish_reason = "stop";
                     break;
                 }
@@ -3869,7 +3969,7 @@ pub const NativeGenerationPipeline = struct {
             pending_active = false;
             if (raw_token < 0) return error.InvalidTensorShape;
             const token: usize = @intCast(raw_token);
-            if (self.gpt_config.isEosToken(token)) {
+            if (self.shouldStopOnEos(config, token)) {
                 if (next_candidate) |tensor| {
                     self.cb.evalTensor(tensor) catch {};
                     self.cb.free(tensor);
@@ -4441,10 +4541,7 @@ pub const NativeGenerationPipeline = struct {
         defer self.cb.free(hidden_result.final_hidden);
         defer self.cb.free(hidden_result.pre_norm_hidden);
 
-        const lm_w = if (self.gpt_config.weight_tying)
-            try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config)
-        else
-            self.cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
         defer self.cb.free(lm_w);
 
         const logits_ct = try self.cb.linearNoBias(
@@ -4657,10 +4754,7 @@ pub const NativeGenerationPipeline = struct {
         errdefer self.cb.free(hidden_result.final_hidden);
         errdefer self.cb.free(hidden_result.pre_norm_hidden);
 
-        const lm_w = if (self.gpt_config.weight_tying)
-            try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config)
-        else
-            self.cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
         defer self.cb.free(lm_w);
 
         const logits_ct = try self.cb.linearNoBias(
@@ -5341,6 +5435,7 @@ pub const NativeGenerationPipeline = struct {
                 seq_len.*,
                 draft_tokens[0..draft_count],
                 cached_choice,
+                config,
             )) |cached_reject| {
                 verify_result = cached_reject;
                 used_cached_first_reject = true;
@@ -5410,6 +5505,7 @@ pub const NativeGenerationPipeline = struct {
                         combined_choices,
                         &round_penalties,
                         accept_bonus,
+                        config,
                     );
                     if (mtp_profile.sync_enabled) {
                         self.cb.evalTensor(target_hidden.hidden) catch {};
@@ -5453,14 +5549,16 @@ pub const NativeGenerationPipeline = struct {
                 } else if (gemma4MtpDedicatedRuntimeEnabled()) {
                     var eos_token_ids_buf: [1 + gpt_mod.max_extra_eos_token_ids]i32 = [_]i32{-1} ** (1 + gpt_mod.max_extra_eos_token_ids);
                     var eos_token_ids_len: usize = 0;
-                    if (self.gpt_config.eos_token_id >= 0) {
+                    if (!config.ignore_eos and self.gpt_config.eos_token_id >= 0) {
                         eos_token_ids_buf[eos_token_ids_len] = self.gpt_config.eos_token_id;
                         eos_token_ids_len += 1;
                     }
-                    for (self.gpt_config.extra_eos_token_ids[0..self.gpt_config.extra_eos_token_ids_len]) |eos| {
-                        if (eos < 0 or eos_token_ids_len >= eos_token_ids_buf.len) continue;
-                        eos_token_ids_buf[eos_token_ids_len] = eos;
-                        eos_token_ids_len += 1;
+                    if (!config.ignore_eos) {
+                        for (self.gpt_config.extra_eos_token_ids[0..self.gpt_config.extra_eos_token_ids_len]) |eos| {
+                            if (eos < 0 or eos_token_ids_len >= eos_token_ids_buf.len) continue;
+                            eos_token_ids_buf[eos_token_ids_len] = eos;
+                            eos_token_ids_len += 1;
+                        }
                     }
                     if (try self.cb.gemma4MtpVerifyCommit(&.{
                         .input = lm_input,
@@ -5553,6 +5651,7 @@ pub const NativeGenerationPipeline = struct {
                             target_choices,
                             &round_penalties,
                             accept_bonus,
+                            config,
                         );
                         if (!verify_result.correction_added and !verify_result.had_bonus and verify_result.accepted > 0 and verify_result.accepted < verify_len) {
                             next_cached_target_choice = target_choices[verify_result.accepted];
@@ -5619,6 +5718,7 @@ pub const NativeGenerationPipeline = struct {
                     &round_penalties,
                     accept_bonus,
                     mtp_profile,
+                    config,
                 );
                 if (mtp_profile.sync_enabled) {
                     self.cb.evalTensor(target_result.logits) catch {};
@@ -5859,6 +5959,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         draft_tokens: []const i64,
         cached_choice: u32,
+        config: GenerationConfig,
     ) !?SpeculativeVerificationResult {
         if (draft_tokens.len == 0) return null;
         const first_draft_raw = draft_tokens[0];
@@ -5872,7 +5973,7 @@ pub const NativeGenerationPipeline = struct {
         return .{
             .matched_drafts = 0,
             .accepted = 1,
-            .hit_eos = self.gpt_config.isEosToken(target_choice),
+            .hit_eos = self.shouldStopOnEos(config, target_choice),
             .hit_grammar_stop = false,
             .correction_added = true,
             .had_bonus = false,
@@ -5913,6 +6014,7 @@ pub const NativeGenerationPipeline = struct {
         round_penalties: *SamplingPenaltyState,
         accept_bonus: bool,
         mtp_profile: *MtpProfileStats,
+        config: GenerationConfig,
     ) !SpeculativeVerificationResult {
         const verify_len = draft_tokens.len + 1;
         if (target_query_len < verify_len or target_result.rows < target_query_len) return error.InvalidTensorShape;
@@ -5940,6 +6042,7 @@ pub const NativeGenerationPipeline = struct {
                 choices,
                 round_penalties,
                 accept_bonus,
+                config,
             );
         }
 
@@ -5961,6 +6064,7 @@ pub const NativeGenerationPipeline = struct {
             fallback_choices_buf[0..verify_len],
             round_penalties,
             accept_bonus,
+            config,
         );
     }
 
@@ -5972,6 +6076,7 @@ pub const NativeGenerationPipeline = struct {
         target_choices: []const u32,
         round_penalties: *SamplingPenaltyState,
         accept_bonus: bool,
+        config: GenerationConfig,
     ) !SpeculativeVerificationResult {
         const verify_len = draft_tokens.len + 1;
         if (target_choices.len < verify_len) return error.InvalidTensorShape;
@@ -5994,7 +6099,7 @@ pub const NativeGenerationPipeline = struct {
                 accepted += 1;
                 try round_penalties.noteToken(self.allocator, draft_tokens[i]);
 
-                if (self.gpt_config.isEosToken(@intCast(draft_tokens[i]))) {
+                if (self.shouldStopOnEos(config, @intCast(draft_tokens[i]))) {
                     hit_eos = true;
                     break;
                 }
@@ -6004,7 +6109,7 @@ pub const NativeGenerationPipeline = struct {
                 accepted = matched_drafts + 1;
                 correction_added = true;
 
-                if (self.gpt_config.isEosToken(target_choice)) {
+                if (self.shouldStopOnEos(config, target_choice)) {
                     hit_eos = true;
                 }
                 break;
@@ -6024,7 +6129,7 @@ pub const NativeGenerationPipeline = struct {
             token_ids[seq_len + accepted] = @intCast(bonus_token);
             accepted += 1;
 
-            if (self.gpt_config.isEosToken(bonus_token)) {
+            if (self.shouldStopOnEos(config, bonus_token)) {
                 hit_eos = true;
             }
         }
@@ -6214,7 +6319,7 @@ pub const NativeGenerationPipeline = struct {
                 accepted += 1;
                 try round_penalties.noteToken(self.allocator, draft_tokens[i]);
 
-                if (self.gpt_config.isEosToken(@intCast(draft_tokens[i]))) {
+                if (self.shouldStopOnEos(config, @intCast(draft_tokens[i]))) {
                     hit_eos = true;
                     break;
                 }
@@ -6228,7 +6333,7 @@ pub const NativeGenerationPipeline = struct {
                 accepted = matched_drafts + 1;
                 correction_added = true;
 
-                if (self.gpt_config.isEosToken(target_choice)) {
+                if (self.shouldStopOnEos(config, target_choice)) {
                     hit_eos = true;
                 }
                 if (outcome.grammar_complete) {
@@ -6262,7 +6367,7 @@ pub const NativeGenerationPipeline = struct {
             token_ids[seq_len + accepted] = @intCast(bonus_token);
             accepted += 1;
 
-            if (self.gpt_config.isEosToken(bonus_token)) {
+            if (self.shouldStopOnEos(config, bonus_token)) {
                 hit_eos = true;
             }
             if (outcome.grammar_complete) {
@@ -8520,6 +8625,7 @@ test "gemma4 mtp cached first choice rejects mismatched draft" {
         1,
         &.{4},
         4,
+        .{},
     );
     try std.testing.expect(matching == null);
     try std.testing.expectEqual(@as(i64, 0), matching_tokens[1]);
@@ -8530,6 +8636,7 @@ test "gemma4 mtp cached first choice rejects mismatched draft" {
         1,
         &.{4},
         7,
+        .{},
     )) orelse return error.TestExpectedNonNull;
 
     try std.testing.expectEqual(@as(usize, 0), rejected.matched_drafts);
@@ -8539,6 +8646,16 @@ test "gemma4 mtp cached first choice rejects mismatched draft" {
     try std.testing.expectEqual(true, rejected.hit_eos);
     try std.testing.expectEqual(@as(i64, 7), rejected_tokens[1]);
     try std.testing.expectEqual(@as(usize, 1), rejected.mtp_quality.mismatches);
+
+    var ignored_tokens = [_]i64{ 2, 0, 0 };
+    const ignored = (try pipeline.rejectMtpDraftFromCachedFirstChoice(
+        ignored_tokens[0..],
+        1,
+        &.{4},
+        7,
+        .{ .ignore_eos = true },
+    )) orelse return error.TestExpectedNonNull;
+    try std.testing.expectEqual(false, ignored.hit_eos);
 }
 
 test "gemma4 mtp verify-commit adapter handles correction metadata" {
