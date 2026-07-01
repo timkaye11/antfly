@@ -236,6 +236,12 @@ const commands = [_]common.CommandSpec{
         .imports = &.{.inference_internal},
     },
     .{
+        .name = "export-fused-chunker-model",
+        .root_source_file = "src/finetune/tools/export_fused_chunker_model.zig",
+        .description = "Export a trained fused-chunker checkpoint into a deployable serving model directory",
+        .imports = &.{.inference_internal},
+    },
+    .{
         .name = "train-eval-reranker-head",
         .root_source_file = "src/finetune/train/train_eval_reranker_head.zig",
         .description = "Train and evaluate a bounded termite-owned reranker head",
