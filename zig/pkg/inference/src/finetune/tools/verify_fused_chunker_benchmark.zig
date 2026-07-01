@@ -157,6 +157,10 @@ fn verifyBoundaryLane(manifest: std.json.ObjectMap, results: std.json.ObjectMap)
     const datasets = try requireArray(manifest_lane.get("datasets") orelse return error.MissingBoundaryDatasets);
     const dataset_results = try requireArray(result_lane.get("dataset_results") orelse return error.MissingBoundaryDatasetResults);
     const gate = try requireObject(manifest_lane.get("release_gate") orelse return error.MissingBoundaryReleaseGate);
+    if (jsonString(manifest_lane.get("metric"))) |manifest_metric| {
+        const result_metric = jsonString(result_lane.get("dataset_metric")) orelse return error.MissingBoundaryDatasetMetric;
+        if (!std.mem.eql(u8, manifest_metric, result_metric)) return error.BoundaryDatasetMetricMismatch;
+    }
 
     const min_internal_f1 = jsonF64(gate.get("min_internal_phase20_best_f1")) orelse return error.InvalidBoundaryReleaseGate;
     const max_fixed_delta = jsonF64(gate.get("fixed_threshold_max_delta_from_best_f1")) orelse return error.InvalidBoundaryReleaseGate;
@@ -248,7 +252,15 @@ fn verifyRetrievalLane(manifest: std.json.ObjectMap, results: std.json.ObjectMap
 
     const voyage_target = try voyageTargetForResult(targets, result_lane);
     const distance_to_target = voyage_target - overall;
-    if (must_report_distance and !std.math.isFinite(distance_to_target)) return error.InvalidVoyageDistance;
+    if (must_report_distance) {
+        const reported_target = jsonF64(result_lane.get("voyage_context_4_target_ndcg_at_10")) orelse return error.MissingVoyageTargetReport;
+        const reported_distance = jsonF64(result_lane.get("distance_to_voyage_context_4_target")) orelse return error.MissingVoyageDistanceReport;
+        if (!std.math.isFinite(reported_target) or !std.math.isFinite(reported_distance)) return error.InvalidVoyageDistance;
+        if (@abs(reported_target - voyage_target) > 1e-9) return error.VoyageTargetReportMismatch;
+        if (@abs(reported_distance - distance_to_target) > 1e-9) return error.VoyageDistanceReportMismatch;
+    } else if (!std.math.isFinite(distance_to_target)) {
+        return error.InvalidVoyageDistance;
+    }
 
     return .{
         .overall_ndcg_at_10 = overall,
@@ -341,6 +353,7 @@ test "benchmark verifier accepts boundary and retrieval lanes above gates" {
         \\{
         \\  "schema_version":"fused_chunker_eval_manifest/v1",
         \\  "boundary_f1":{
+        \\    "metric":"chonky_character_separator_f1",
         \\    "datasets":[
         \\      {"name":"a","chonky_base_f1":0.50,"chonky_large_f1":0.60},
         \\      {"name":"b","chonky_base_f1":0.40,"chonky_large_f1":0.50}
@@ -362,6 +375,7 @@ test "benchmark verifier accepts boundary and retrieval lanes above gates" {
         \\{
         \\  "schema_version":"fused_chunker_benchmark_results/v1",
         \\  "boundary_f1":{
+        \\    "dataset_metric":"chonky_character_separator_f1",
         \\    "internal_phase20_best_f1":0.80,
         \\    "fixed_threshold_f1":0.78,
         \\    "best_threshold_f1":0.80,
@@ -373,6 +387,8 @@ test "benchmark verifier accepts boundary and retrieval lanes above gates" {
         \\  "retrieval_ndcg":{
         \\    "output_dimension":256,
         \\    "overall_ndcg_at_10":0.74,
+        \\    "voyage_context_4_target_ndcg_at_10":0.8054,
+        \\    "distance_to_voyage_context_4_target":0.0654,
         \\    "baselines":[
         \\      {"name":"fixed","overall_ndcg_at_10":0.68},
         \\      {"name":"chonky","overall_ndcg_at_10":0.70}
@@ -393,6 +409,7 @@ test "benchmark verifier rejects boundary results below Chonky base" {
         \\{
         \\  "schema_version":"fused_chunker_eval_manifest/v1",
         \\  "boundary_f1":{
+        \\    "metric":"chonky_character_separator_f1",
         \\    "datasets":[{"name":"a","chonky_base_f1":0.50,"chonky_large_f1":0.50}],
         \\    "release_gate":{
         \\      "min_internal_phase20_best_f1":0.70,
@@ -408,6 +425,7 @@ test "benchmark verifier rejects boundary results below Chonky base" {
         \\{
         \\  "schema_version":"fused_chunker_benchmark_results/v1",
         \\  "boundary_f1":{
+        \\    "dataset_metric":"chonky_character_separator_f1",
         \\    "internal_phase20_best_f1":0.80,
         \\    "fixed_threshold_f1":0.79,
         \\    "best_threshold_f1":0.80,
@@ -416,6 +434,38 @@ test "benchmark verifier rejects boundary results below Chonky base" {
         \\}
     ;
     try std.testing.expectError(error.BoundaryF1BelowChonkyBase, verifyBenchmarkJson(std.testing.allocator, manifest, results, .boundary_f1));
+}
+
+test "benchmark verifier rejects boundary metric mismatch" {
+    const manifest =
+        \\{
+        \\  "schema_version":"fused_chunker_eval_manifest/v1",
+        \\  "boundary_f1":{
+        \\    "metric":"chonky_character_separator_f1",
+        \\    "datasets":[{"name":"a","chonky_base_f1":0.50,"chonky_large_f1":0.50}],
+        \\    "release_gate":{
+        \\      "min_internal_phase20_best_f1":0.70,
+        \\      "fixed_threshold_max_delta_from_best_f1":0.03,
+        \\      "must_beat_chonky_base_each_dataset":false,
+        \\      "must_match_or_beat_chonky_large_mean":false
+        \\    }
+        \\  },
+        \\  "retrieval_ndcg":{"external_targets":{"voyage_context_4_chunk_embedding_overall_ndcg_at_10":0.844},"release_gate":{"min_relative_gain_over_best_local_baseline":0.05,"must_report_distance_to_external_voyage_target":true}}
+        \\}
+    ;
+    const results =
+        \\{
+        \\  "schema_version":"fused_chunker_benchmark_results/v1",
+        \\  "boundary_f1":{
+        \\    "dataset_metric":"token_boundary_f1",
+        \\    "internal_phase20_best_f1":0.80,
+        \\    "fixed_threshold_f1":0.79,
+        \\    "best_threshold_f1":0.80,
+        \\    "dataset_results":[{"name":"a","f1":0.60}]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(error.BoundaryDatasetMetricMismatch, verifyBenchmarkJson(std.testing.allocator, manifest, results, .boundary_f1));
 }
 
 test "benchmark verifier rejects retrieval without required local baseline lift" {
@@ -434,9 +484,34 @@ test "benchmark verifier rejects retrieval without required local baseline lift"
         \\  "schema_version":"fused_chunker_benchmark_results/v1",
         \\  "retrieval_ndcg":{
         \\    "overall_ndcg_at_10":0.72,
+        \\    "voyage_context_4_target_ndcg_at_10":0.844,
+        \\    "distance_to_voyage_context_4_target":0.124,
         \\    "baselines":[{"name":"fixed","overall_ndcg_at_10":0.70}]
         \\  }
         \\}
     ;
     try std.testing.expectError(error.RetrievalNdcgRelativeGainBelowThreshold, verifyBenchmarkJson(std.testing.allocator, manifest, results, .retrieval_ndcg));
+}
+
+test "benchmark verifier rejects retrieval missing required Voyage target distance report" {
+    const manifest =
+        \\{
+        \\  "schema_version":"fused_chunker_eval_manifest/v1",
+        \\  "boundary_f1":{"datasets":[],"release_gate":{"min_internal_phase20_best_f1":0.0,"fixed_threshold_max_delta_from_best_f1":1.0,"must_beat_chonky_base_each_dataset":false,"must_match_or_beat_chonky_large_mean":false}},
+        \\  "retrieval_ndcg":{
+        \\    "external_targets":{"voyage_context_4_chunk_embedding_overall_ndcg_at_10":0.844},
+        \\    "release_gate":{"min_relative_gain_over_best_local_baseline":0.05,"must_report_distance_to_external_voyage_target":true}
+        \\  }
+        \\}
+    ;
+    const results =
+        \\{
+        \\  "schema_version":"fused_chunker_benchmark_results/v1",
+        \\  "retrieval_ndcg":{
+        \\    "overall_ndcg_at_10":0.80,
+        \\    "baselines":[{"name":"fixed","overall_ndcg_at_10":0.70}]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(error.MissingVoyageTargetReport, verifyBenchmarkJson(std.testing.allocator, manifest, results, .retrieval_ndcg));
 }

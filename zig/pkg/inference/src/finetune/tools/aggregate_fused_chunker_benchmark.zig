@@ -33,6 +33,7 @@ const ParsedDatasetResult = struct {
 };
 
 const ParsedBoundaryLane = struct {
+    dataset_metric: ?[]const u8 = null,
     internal_phase20_best_f1: f64,
     fixed_threshold_f1: f64,
     best_threshold_f1: f64,
@@ -50,6 +51,10 @@ const ParsedRetrievalLane = struct {
     output_dimension: ?u32 = null,
     overall_ndcg_at_10: ?f64 = null,
     ndcg_at_10: ?f64 = null,
+    voyage_context_4_target_ndcg_at_10: ?f64 = null,
+    distance_to_voyage_context_4_target: ?f64 = null,
+    best_local_baseline_ndcg_at_10: ?f64 = null,
+    relative_gain_over_best_local_baseline: ?f64 = null,
     recall_at_1: ?f64 = null,
     recall_at_10: ?f64 = null,
     mrr: ?f64 = null,
@@ -74,6 +79,7 @@ const OutputDatasetResult = struct {
 };
 
 const OutputBoundaryLane = struct {
+    dataset_metric: ?[]const u8 = null,
     internal_phase20_best_f1: f64,
     fixed_threshold_f1: f64,
     best_threshold_f1: f64,
@@ -89,6 +95,10 @@ const OutputBaseline = struct {
 const OutputRetrievalLane = struct {
     output_dimension: ?u32 = null,
     overall_ndcg_at_10: f64,
+    voyage_context_4_target_ndcg_at_10: ?f64 = null,
+    distance_to_voyage_context_4_target: ?f64 = null,
+    best_local_baseline_ndcg_at_10: ?f64 = null,
+    relative_gain_over_best_local_baseline: ?f64 = null,
     recall_at_1: ?f64 = null,
     recall_at_10: ?f64 = null,
     mrr: ?f64 = null,
@@ -193,6 +203,7 @@ pub fn aggregateBenchmarkJson(
     defer baseline_accs.deinit(allocator);
 
     var boundary_lane_count: usize = 0;
+    var boundary_dataset_metric: ?[]const u8 = null;
     var min_internal_phase20_best_f1 = std.math.inf(f64);
     var best_threshold_sum: f64 = 0;
     var best_threshold_count: usize = 0;
@@ -206,6 +217,8 @@ pub fn aggregateBenchmarkJson(
     var retrieval_count: usize = 0;
     var retrieval_weight_sum: f64 = 0;
     var retrieval_ndcg_sum: f64 = 0;
+    var retrieval_target_sum: f64 = 0;
+    var retrieval_target_weight: f64 = 0;
     var retrieval_queries: usize = 0;
     var recall_at_1_sum: f64 = 0;
     var recall_at_1_weight: f64 = 0;
@@ -222,6 +235,13 @@ pub fn aggregateBenchmarkJson(
 
         if (parsed.boundary_f1) |boundary| {
             if (boundary.dataset_results.len == 0) return error.MissingBoundaryDatasetResults;
+            if (boundary.dataset_metric) |metric| {
+                if (boundary_dataset_metric) |existing| {
+                    if (!std.mem.eql(u8, existing, metric)) return error.MixedBoundaryDatasetMetrics;
+                } else {
+                    boundary_dataset_metric = metric;
+                }
+            }
             if (!std.math.isFinite(boundary.internal_phase20_best_f1) or
                 !std.math.isFinite(boundary.fixed_threshold_f1) or
                 !std.math.isFinite(boundary.best_threshold_f1))
@@ -267,6 +287,15 @@ pub fn aggregateBenchmarkJson(
             retrieval_weight_sum += weight;
             retrieval_ndcg_sum += ndcg * weight;
             retrieval_queries += queries;
+            if (retrieval.voyage_context_4_target_ndcg_at_10) |target| {
+                if (!std.math.isFinite(target)) return error.InvalidRetrievalResults;
+                retrieval_target_sum += target * weight;
+                retrieval_target_weight += weight;
+            } else if (retrieval.output_dimension) |dim| {
+                const target = voyageContext4TargetForDimension(dim);
+                retrieval_target_sum += target * weight;
+                retrieval_target_weight += weight;
+            }
             if (retrieval.recall_at_1) |value| {
                 if (!std.math.isFinite(value)) return error.InvalidRetrievalResults;
                 recall_at_1_sum += value * weight;
@@ -303,11 +332,18 @@ pub fn aggregateBenchmarkJson(
 
     if (boundary_lane_count == 0 or datasets.items.len == 0) return error.MissingBoundaryResults;
     const boundary_count_f: f64 = @floatFromInt(boundary_lane_count);
-    const fixed_threshold_f1 = if (all_dataset_counts_present and fixed_counts_tp + fixed_counts_fp + fixed_counts_fn > 0)
+    const can_recompute_fixed_threshold_from_dataset_counts = if (boundary_dataset_metric) |metric|
+        std.mem.eql(u8, metric, "token_boundary_f1")
+    else
+        true;
+    const fixed_threshold_f1 = if (can_recompute_fixed_threshold_from_dataset_counts and
+        all_dataset_counts_present and
+        fixed_counts_tp + fixed_counts_fp + fixed_counts_fn > 0)
         f1FromCounts(fixed_counts_tp, fixed_counts_fp, fixed_counts_fn)
     else
         fixed_threshold_f1_sum / boundary_count_f;
     const boundary = OutputBoundaryLane{
+        .dataset_metric = boundary_dataset_metric,
         .internal_phase20_best_f1 = if (std.math.isFinite(min_internal_phase20_best_f1))
             min_internal_phase20_best_f1
         else
@@ -331,14 +367,38 @@ pub fn aggregateBenchmarkJson(
         });
     }
 
-    const retrieval_lane: ?OutputRetrievalLane = if (retrieval_count == 0) null else .{
-        .output_dimension = if (output_dimension_consistent) output_dimension else null,
-        .overall_ndcg_at_10 = retrieval_ndcg_sum / retrieval_weight_sum,
-        .recall_at_1 = if (recall_at_1_weight > 0) recall_at_1_sum / recall_at_1_weight else null,
-        .recall_at_10 = if (recall_at_10_weight > 0) recall_at_10_sum / recall_at_10_weight else null,
-        .mrr = if (mrr_weight > 0) mrr_sum / mrr_weight else null,
-        .queries = retrieval_queries,
-        .baselines = baselines.items,
+    var best_baseline_ndcg: ?f64 = null;
+    for (baselines.items) |baseline| {
+        best_baseline_ndcg = if (best_baseline_ndcg) |best|
+            @max(best, baseline.overall_ndcg_at_10)
+        else
+            baseline.overall_ndcg_at_10;
+    }
+
+    const retrieval_lane: ?OutputRetrievalLane = if (retrieval_count == 0) null else lane: {
+        const overall = retrieval_ndcg_sum / retrieval_weight_sum;
+        const target = if (retrieval_target_weight > 0)
+            retrieval_target_sum / retrieval_target_weight
+        else if (output_dimension_consistent)
+            if (output_dimension) |dim| voyageContext4TargetForDimension(dim) else null
+        else
+            null;
+        break :lane .{
+            .output_dimension = if (output_dimension_consistent) output_dimension else null,
+            .overall_ndcg_at_10 = overall,
+            .voyage_context_4_target_ndcg_at_10 = target,
+            .distance_to_voyage_context_4_target = if (target) |value| value - overall else null,
+            .best_local_baseline_ndcg_at_10 = best_baseline_ndcg,
+            .relative_gain_over_best_local_baseline = if (best_baseline_ndcg) |best|
+                if (best > 0.0) (overall - best) / best else null
+            else
+                null,
+            .recall_at_1 = if (recall_at_1_weight > 0) recall_at_1_sum / recall_at_1_weight else null,
+            .recall_at_10 = if (recall_at_10_weight > 0) recall_at_10_sum / recall_at_10_weight else null,
+            .mrr = if (mrr_weight > 0) mrr_sum / mrr_weight else null,
+            .queries = retrieval_queries,
+            .baselines = baselines.items,
+        };
     };
 
     const output = OutputBenchmarkFile{
@@ -399,6 +459,15 @@ fn f1FromCounts(tp: u64, fp: u64, fn_count: u64) f64 {
     return if (precision + recall == 0) 0.0 else 2.0 * precision * recall / (precision + recall);
 }
 
+fn voyageContext4TargetForDimension(output_dimension: u32) f64 {
+    return switch (output_dimension) {
+        256 => 0.8054,
+        512 => 0.8266,
+        1024 => 0.8381,
+        else => 0.8440,
+    };
+}
+
 fn usage() void {
     std.debug.print(
         \\usage: aggregate-fused-chunker-benchmark --out <path> --input <path> [--input <path> ...]
@@ -416,6 +485,7 @@ test "aggregate benchmark results combines datasets and retrieval baselines" {
         \\{
         \\  "schema_version":"fused_chunker_benchmark_results/v1",
         \\  "boundary_f1":{
+        \\    "dataset_metric":"chonky_character_separator_f1",
         \\    "internal_phase20_best_f1":0.82,
         \\    "fixed_threshold_f1":0.80,
         \\    "best_threshold_f1":0.82,
@@ -436,6 +506,7 @@ test "aggregate benchmark results combines datasets and retrieval baselines" {
         \\{
         \\  "schema_version":"fused_chunker_benchmark_results/v1",
         \\  "boundary_f1":{
+        \\    "dataset_metric":"chonky_character_separator_f1",
         \\    "internal_phase20_best_f1":0.81,
         \\    "fixed_threshold_f1":0.72,
         \\    "best_threshold_f1":0.74,
@@ -463,11 +534,14 @@ test "aggregate benchmark results combines datasets and retrieval baselines" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings(expected_results_schema, obj.get("schema_version").?.string);
     const boundary = obj.get("boundary_f1").?.object;
+    try std.testing.expectEqualStrings("chonky_character_separator_f1", boundary.get("dataset_metric").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), boundary.get("internal_phase20_best_f1").?.float, 1e-12);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.77), boundary.get("fixed_threshold_f1").?.float, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.76), boundary.get("fixed_threshold_f1").?.float, 1e-12);
     try std.testing.expectEqual(@as(usize, 2), boundary.get("dataset_results").?.array.items.len);
     const retrieval = obj.get("retrieval_ndcg").?.object;
     try std.testing.expectApproxEqAbs(@as(f64, 0.785), retrieval.get("overall_ndcg_at_10").?.float, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8054), retrieval.get("voyage_context_4_target_ndcg_at_10").?.float, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0204), retrieval.get("distance_to_voyage_context_4_target").?.float, 1e-12);
     const baselines = retrieval.get("baselines").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), baselines.len);
 }

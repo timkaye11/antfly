@@ -2,7 +2,7 @@
   "schema_version": "fused_chunker_eval_manifest/v1",
   "result_schema_version": "fused_chunker_benchmark_results/v1",
   "boundary_f1": {
-    "metric": "separator_exact_f1",
+    "metric": "chonky_character_separator_f1",
     "source": "https://github.com/mirth/chonky",
     "token_limit_per_dataset": 1000000,
     "datasets": [

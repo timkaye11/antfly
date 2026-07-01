@@ -2,6 +2,7 @@
   "schema_version": "fused_chunker_benchmark_results/v1",
   "fixture": true,
   "boundary_f1": {
+    "dataset_metric": "chonky_character_separator_f1",
     "internal_phase20_best_f1": 0.8,
     "fixed_threshold_f1": 0.78,
     "best_threshold_f1": 0.8,
@@ -27,6 +28,10 @@
   "retrieval_ndcg": {
     "output_dimension": 256,
     "overall_ndcg_at_10": 0.74,
+    "voyage_context_4_target_ndcg_at_10": 0.8054,
+    "distance_to_voyage_context_4_target": 0.0654,
+    "best_local_baseline_ndcg_at_10": 0.7,
+    "relative_gain_over_best_local_baseline": 0.057142857142857176,
     "baselines": [
       {
         "name": "fixed_500_50_same_encoder",

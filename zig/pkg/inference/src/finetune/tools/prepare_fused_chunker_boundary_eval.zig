@@ -64,6 +64,7 @@ const OutputRecord = struct {
     chunks: []const OutputChunk,
     dataset: []const u8,
     source_format: []const u8,
+    benchmark_include_final_boundary: bool,
     token_count: usize,
 };
 
@@ -118,7 +119,8 @@ const SampleBuilder = struct {
     }
 
     fn flush(self: *SampleBuilder, source_format: []const u8) !void {
-        if (self.chunks.items.len < 2) {
+        const include_final_boundary = std.mem.eql(u8, source_format, "final");
+        if (self.chunks.items.len < 2 and !(include_final_boundary and self.chunks.items.len == 1)) {
             if (self.chunks.items.len == 1) self.stats.skipped_single_chunk_records += 1;
             self.text.clearRetainingCapacity();
             self.chunks.clearRetainingCapacity();
@@ -130,6 +132,7 @@ const SampleBuilder = struct {
             .chunks = self.chunks.items,
             .dataset = self.cfg.dataset_name,
             .source_format = source_format,
+            .benchmark_include_final_boundary = include_final_boundary,
             .token_count = self.record_tokens,
         };
         try std.json.Stringify.value(record, .{}, &self.out.writer);
@@ -392,6 +395,7 @@ test "prepare boundary eval converts chonky token tags into fused chunks" {
     try std.testing.expectEqual(@as(i64, 10), chunks[0].object.get("end_char").?.integer);
     try std.testing.expectEqual(@as(i64, 11), chunks[1].object.get("start_char").?.integer);
     try std.testing.expectEqual(@as(i64, 22), chunks[1].object.get("end_char").?.integer);
+    try std.testing.expect(obj.get("benchmark_include_final_boundary").?.bool);
 }
 
 test "prepare boundary eval groups paragraph records by token budget" {
@@ -414,6 +418,35 @@ test "prepare boundary eval groups paragraph records by token budget" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, first, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqualStrings("one two three four", parsed.value.object.get("text").?.string);
+    try std.testing.expect(!parsed.value.object.get("benchmark_include_final_boundary").?.bool);
+    const second = lines.next().?;
+    var parsed_second = try std.json.parseFromSlice(std.json.Value, allocator, second, .{ .ignore_unknown_fields = true });
+    defer parsed_second.deinit();
+    try std.testing.expect(parsed_second.value.object.get("benchmark_include_final_boundary").?.bool);
+}
+
+test "prepare boundary eval preserves final one-chunk record for Chonky final separator" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{"paragraphs":["only final paragraph"]}
+        \\
+    ;
+    var prepared = try prepareBoundaryEvalJsonl(allocator, input, .{
+        .dataset_name = "toy",
+        .max_total_tokens = 20,
+        .max_record_tokens = 4,
+    });
+    defer prepared.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), prepared.stats.output_records);
+    try std.testing.expectEqual(@as(usize, 1), prepared.stats.chunks);
+    try std.testing.expectEqual(@as(usize, 0), prepared.stats.boundary_targets);
+    try std.testing.expectEqual(@as(usize, 0), prepared.stats.skipped_single_chunk_records);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, prepared.jsonl, " \t\r\n"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("only final paragraph", parsed.value.object.get("text").?.string);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("chunks").?.array.items.len);
+    try std.testing.expect(parsed.value.object.get("benchmark_include_final_boundary").?.bool);
 }
 
 test "prepare boundary eval respects total token cap" {

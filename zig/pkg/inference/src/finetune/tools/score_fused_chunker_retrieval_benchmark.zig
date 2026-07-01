@@ -65,6 +65,10 @@ const OutputBaseline = struct {
 const OutputRetrievalLane = struct {
     output_dimension: ?u32 = null,
     overall_ndcg_at_10: f64,
+    voyage_context_4_target_ndcg_at_10: f64,
+    distance_to_voyage_context_4_target: f64,
+    best_local_baseline_ndcg_at_10: ?f64 = null,
+    relative_gain_over_best_local_baseline: ?f64 = null,
     recall_at_1: f64,
     recall_at_10: f64,
     mrr: f64,
@@ -160,10 +164,15 @@ pub fn scoreRetrievalBenchmarkJson(
     const primary = try computeRetrievalMetricsFromJsonl(allocator, run_jsonl);
     var baselines = try allocator.alloc(OutputBaseline, baseline_inputs.len);
     errdefer allocator.free(baselines);
+    var best_baseline_ndcg: ?f64 = null;
     for (baseline_inputs, 0..) |baseline, i| {
         const raw = try compat.cwd().readFileAlloc(compat.io(), baseline.path, allocator, .limited(512 * 1024 * 1024));
         defer allocator.free(raw);
         const metrics = try computeRetrievalMetricsFromJsonl(allocator, raw);
+        best_baseline_ndcg = if (best_baseline_ndcg) |best|
+            @max(best, metrics.ndcg_at_10)
+        else
+            metrics.ndcg_at_10;
         baselines[i] = .{
             .name = baseline.name,
             .overall_ndcg_at_10 = metrics.ndcg_at_10,
@@ -174,9 +183,18 @@ pub fn scoreRetrievalBenchmarkJson(
         };
     }
 
+    const voyage_target = voyageContext4TargetForDimension(output_dimension);
+    const relative_gain = if (best_baseline_ndcg) |best|
+        if (best > 0.0) (primary.ndcg_at_10 - best) / best else null
+    else
+        null;
     const output = OutputFile{ .retrieval_ndcg = .{
         .output_dimension = output_dimension,
         .overall_ndcg_at_10 = primary.ndcg_at_10,
+        .voyage_context_4_target_ndcg_at_10 = voyage_target,
+        .distance_to_voyage_context_4_target = voyage_target - primary.ndcg_at_10,
+        .best_local_baseline_ndcg_at_10 = best_baseline_ndcg,
+        .relative_gain_over_best_local_baseline = relative_gain,
         .recall_at_1 = primary.recall_at_1,
         .recall_at_10 = primary.recall_at_10,
         .mrr = primary.mrr,
@@ -250,6 +268,15 @@ pub fn computeRetrievalMetricsFromJsonl(allocator: std.mem.Allocator, jsonl: []c
         .recall_at_10 = sum_r10 / denom,
         .ndcg_at_10 = sum_ndcg10 / denom,
         .mrr = sum_mrr / denom,
+    };
+}
+
+fn voyageContext4TargetForDimension(output_dimension: ?u32) f64 {
+    return switch (output_dimension orelse 0) {
+        256 => 0.8054,
+        512 => 0.8266,
+        1024 => 0.8381,
+        else => 0.8440,
     };
 }
 
@@ -331,4 +358,6 @@ test "retrieval result JSON matches benchmark schema" {
     const retrieval = obj.get("retrieval_ndcg").?.object;
     try std.testing.expectEqual(@as(i64, 256), retrieval.get("output_dimension").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), try jsonF64(retrieval.get("overall_ndcg_at_10").?), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8054), try jsonF64(retrieval.get("voyage_context_4_target_ndcg_at_10").?), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.1946), try jsonF64(retrieval.get("distance_to_voyage_context_4_target").?), 1e-12);
 }

@@ -26,6 +26,9 @@
 //   --hidden-size <n>    Hidden size (default: 768)
 //   --max-seq-len <n>    Max seq len (default: 384)
 //   --max-chunks <n>     Max chunks per sample (default: 32)
+//   --boundary-feature-mode token|prev-diff|prev-current-diff|prev-current-diff-concat|prev-current-next-diff-concat|window-context-diff
+//   --boundary-alignment-dump-dir <dir>
+//   --boundary-alignment-dump-top-k <n>
 //   --backend native|metal|auto  Compute backend (default: auto)
 
 const std = @import("std");
@@ -41,6 +44,8 @@ const metal_runtime = if (build_options.enable_metal) @import("../../backends/me
 const ops_mod = @import("../../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
 const fused_chunker_data = @import("../fused_chunker_data.zig");
+const fused_chunker_loss = @import("../fused_chunker_loss.zig");
+const fused_chunker_lora = @import("../lora_adapter_set.zig");
 const fused_chunker_train = @import("../fused_chunker_train.zig");
 const modern_bert = @import("../../architectures/modern_bert.zig");
 const tokenizer_batch_mod = @import("../tokenizer_batch.zig");
@@ -57,6 +62,15 @@ const FusedTrainingConfig = fused_chunker_train.FusedTrainingConfig;
 const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
 
 const print = std.debug.print;
+const chonky_boundary_metric = "chonky_character_separator_f1";
+const token_boundary_metric = "token_boundary_f1";
+const fused_chunker_lora_target_modules = [_][]const u8{
+    "query_proj",
+    "value_proj",
+    "key_proj",
+    "out_proj",
+    "wo",
+};
 
 // ---------------------------------------------------------------------------
 // Dense retrieval evaluation metrics
@@ -86,10 +100,55 @@ const BenchmarkDatasetResult = struct {
 };
 
 const BenchmarkBoundaryLane = struct {
+    dataset_metric: []const u8,
     internal_phase20_best_f1: f64,
     fixed_threshold_f1: f64,
     best_threshold_f1: f64,
     best_threshold: f64,
+    average_precision: f64,
+    precision_at_gold_count: f64,
+    recall_at_gold_count: f64,
+    f1_at_gold_count: f64,
+    threshold_at_gold_count: f64,
+    max_rank_f1: f64,
+    max_rank_precision: f64,
+    max_rank_recall: f64,
+    max_rank_threshold: f64,
+    sample_oracle_count_samples: u64,
+    sample_oracle_count_topk_f1: f64,
+    sample_oracle_count_topk_precision: f64,
+    sample_oracle_count_topk_recall: f64,
+    sample_oracle_count_topk_tp: u64,
+    sample_oracle_count_topk_fp: u64,
+    sample_oracle_count_topk_fn: u64,
+    sample_oracle_count_nms_f1: f64,
+    sample_oracle_count_nms_precision: f64,
+    sample_oracle_count_nms_recall: f64,
+    sample_oracle_count_nms_tp: u64,
+    sample_oracle_count_nms_fp: u64,
+    sample_oracle_count_nms_fn: u64,
+    sample_oracle_count_nms_radius: u32,
+    sample_oracle_count_length_window_f1: f64,
+    sample_oracle_count_length_window_precision: f64,
+    sample_oracle_count_length_window_recall: f64,
+    sample_oracle_count_length_window_tp: u64,
+    sample_oracle_count_length_window_fp: u64,
+    sample_oracle_count_length_window_fn: u64,
+    sample_oracle_count_length_window_min_radius: u32,
+    sample_oracle_count_length_window_radius_fraction: f64,
+    gold_positive_mean_rank: f64,
+    gold_positive_mean_rank_percentile: f64,
+    gold_positive_median_rank: u64,
+    gold_positive_median_rank_percentile: f64,
+    gold_positive_p90_rank: u64,
+    gold_positive_p90_rank_percentile: f64,
+    gold_positive_p99_rank: u64,
+    gold_positive_p99_rank_percentile: f64,
+    gold_positive_worst_rank: u64,
+    gold_positive_top_5x_count: u64,
+    gold_positive_top_5x_recall: f64,
+    gold_positive_top_10x_count: u64,
+    gold_positive_top_10x_recall: f64,
     dataset_results: []const BenchmarkDatasetResult,
 };
 
@@ -132,6 +191,7 @@ const BenchmarkResultInput = struct {
     output_dimension: u32,
     internal_phase20_best_f1: f64,
     summary: fused_chunker_train.EvalSummary,
+    separator_metrics: ?SeparatorBoundaryMetrics = null,
     retrieval: ?RetrievalMetrics,
     baselines: []const BenchmarkBaseline,
 };
@@ -190,6 +250,430 @@ pub fn computeSortedSeparatorBoundaryMetrics(
         .fp = fp,
         .fn_count = fn_count,
     };
+}
+
+const ChonkySeparatorAccumulator = struct {
+    tp: usize = 0,
+    fp: usize = 0,
+    fn_count: usize = 0,
+
+    fn addSample(
+        self: *ChonkySeparatorAccumulator,
+        allocator: std.mem.Allocator,
+        sample: fused_chunker_data.FusedSample,
+        logits: []const f32,
+        mask: []const f32,
+        offsets: []const [2]u32,
+        threshold: f32,
+    ) !void {
+        if (sample.text.len == 0) return;
+        if (sample.text.len > std.math.maxInt(u32)) return error.BenchmarkTextTooLong;
+
+        var gold = std.ArrayListUnmanaged(u32).empty;
+        defer gold.deinit(allocator);
+        try appendGoldChonkySeparatorOffsets(allocator, &gold, sample, offsets);
+        const gold_offsets = sortAndUniqueU32(gold.items);
+
+        var predicted = std.ArrayListUnmanaged(u32).empty;
+        defer predicted.deinit(allocator);
+        try appendPredictedChonkySeparatorOffsets(
+            allocator,
+            &predicted,
+            sample.text,
+            sample.benchmark_include_final_boundary,
+            logits,
+            mask,
+            offsets,
+            threshold,
+        );
+        const predicted_offsets = sortAndUniqueU32(predicted.items);
+
+        const metrics = computeSortedSeparatorBoundaryMetrics(gold_offsets, predicted_offsets);
+        self.tp += metrics.tp;
+        self.fp += metrics.fp;
+        self.fn_count += metrics.fn_count;
+    }
+
+    fn finish(self: ChonkySeparatorAccumulator) SeparatorBoundaryMetrics {
+        const precision = if (self.tp + self.fp == 0) 0.0 else @as(f64, @floatFromInt(self.tp)) / @as(f64, @floatFromInt(self.tp + self.fp));
+        const recall = if (self.tp + self.fn_count == 0) 0.0 else @as(f64, @floatFromInt(self.tp)) / @as(f64, @floatFromInt(self.tp + self.fn_count));
+        const f1 = if (precision + recall == 0.0) 0.0 else 2.0 * precision * recall / (precision + recall);
+        return .{
+            .precision = precision,
+            .recall = recall,
+            .f1 = f1,
+            .tp = self.tp,
+            .fp = self.fp,
+            .fn_count = self.fn_count,
+        };
+    }
+};
+
+fn u32LessThan(_: void, a: u32, b: u32) bool {
+    return a < b;
+}
+
+fn sortAndUniqueU32(items: []u32) []u32 {
+    if (items.len == 0) return items;
+    std.mem.sort(u32, items, {}, u32LessThan);
+    var write: usize = 1;
+    for (items[1..]) |value| {
+        if (value == items[write - 1]) continue;
+        items[write] = value;
+        write += 1;
+    }
+    return items[0..write];
+}
+
+fn appendGoldChonkySeparatorOffsets(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u32),
+    sample: fused_chunker_data.FusedSample,
+    offsets: []const [2]u32,
+) !void {
+    if (sample.text.len == 0) return;
+    if (sample.text.len > std.math.maxInt(u32)) return error.BenchmarkTextTooLong;
+
+    var valid_chunk_idx: usize = 0;
+    for (sample.chunk_boundaries) |chunk| {
+        const span = fused_chunker_data.charToTokenBoundary(chunk.start_char, chunk.end_char, offsets);
+        const resolved_start = if (chunk.start_token > 0) chunk.start_token else span.start_token;
+        const resolved_end = if (chunk.end_token > 0) chunk.end_token else span.end_token;
+        if (resolved_end <= resolved_start) continue;
+        valid_chunk_idx += 1;
+        if (valid_chunk_idx == 1) continue;
+        if (chunk.start_char == 0) continue;
+        try out.append(allocator, chunk.start_char - 1);
+    }
+    if (sample.benchmark_include_final_boundary) {
+        try out.append(allocator, @as(u32, @intCast(sample.text.len - 1)));
+    }
+}
+
+fn appendPredictedChonkySeparatorOffsets(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u32),
+    text: []const u8,
+    include_final_boundary: bool,
+    logits: []const f32,
+    mask: []const f32,
+    offsets: []const [2]u32,
+    threshold: f32,
+) !void {
+    const text_len = text.len;
+    if (text_len == 0) return;
+    if (text_len > std.math.maxInt(u32)) return error.BenchmarkTextTooLong;
+    const token_count = @min(@min(mask.len, offsets.len), logits.len / 2);
+    const final_offset: u32 = @intCast(text_len - 1);
+
+    for (0..token_count) |token_idx| {
+        if (mask[token_idx] <= 0.5) continue;
+        const off = offsets[token_idx];
+        if (off[0] == 0 and off[1] == 0) continue;
+        if (off[0] == 0) continue;
+        const probability = fused_chunker_loss.positiveBoundaryProbability(logits[token_idx * 2], logits[token_idx * 2 + 1]);
+        if (probability <= threshold) continue;
+        try out.append(allocator, tokenStartSeparatorOffset(text, off, final_offset) orelse continue);
+    }
+    if (include_final_boundary) {
+        try out.append(allocator, final_offset);
+    }
+}
+
+fn tokenStartSeparatorOffset(text: []const u8, offset: [2]u32, final_offset: u32) ?u32 {
+    if (text.len == 0) return null;
+    if (offset[0] >= text.len) return null;
+    var token_start: usize = offset[0];
+    const token_end = @min(@as(usize, offset[1]), text.len);
+    while (token_start < token_end and std.ascii.isWhitespace(text[token_start])) {
+        token_start += 1;
+    }
+    if (token_start == 0) return null;
+    return @min(@as(u32, @intCast(token_start - 1)), final_offset);
+}
+
+fn accumulateChonkySeparatorBatch(
+    allocator: std.mem.Allocator,
+    acc: *ChonkySeparatorAccumulator,
+    tokenizer: *TokenizerBatch,
+    samples: []const fused_chunker_data.FusedSample,
+    indices: []const usize,
+    logits: []const f32,
+    mask: []const f32,
+    max_seq_len: usize,
+    threshold: f32,
+) !void {
+    var tok_ctx = tokenizer.makeTokenFnCtx();
+    const ids = try allocator.alloc(i32, max_seq_len);
+    defer allocator.free(ids);
+    const token_mask = try allocator.alloc(i32, max_seq_len);
+    defer allocator.free(token_mask);
+    const offsets = try allocator.alloc([2]u32, max_seq_len);
+    defer allocator.free(offsets);
+
+    for (indices, 0..) |sample_index, local_idx| {
+        @memset(ids, 0);
+        @memset(token_mask, 0);
+        @memset(offsets, .{ 0, 0 });
+
+        const sample = samples[sample_index];
+        const n_tokens = TokenFnCtx.call(&tok_ctx, sample.text, ids, token_mask, offsets);
+        const active_offsets = offsets[0..@min(n_tokens, max_seq_len)];
+        const token_base = local_idx * max_seq_len;
+        try acc.addSample(
+            allocator,
+            sample,
+            logits[token_base * 2 .. (token_base + max_seq_len) * 2],
+            mask[token_base .. token_base + max_seq_len],
+            active_offsets,
+            threshold,
+        );
+    }
+}
+
+const BoundaryAlignmentCandidate = struct {
+    probability: f32,
+    flat_index: usize,
+};
+
+const BoundaryAlignmentFeatureStats = struct {
+    mean: f32,
+    rms: f32,
+    l2: f32,
+    max_abs: f32,
+    first0: f32,
+    first1: f32,
+    first2: f32,
+    first3: f32,
+};
+
+const BoundaryAlignmentChunkMarkers = struct {
+    chunk_start_index: ?usize = null,
+    chunk_end_exclusive_index: ?usize = null,
+    previous_chunk_end_index: ?usize = null,
+};
+
+fn boundaryAlignmentCandidateGreaterThan(_: void, a: BoundaryAlignmentCandidate, b: BoundaryAlignmentCandidate) bool {
+    if (a.probability == b.probability) return a.flat_index < b.flat_index;
+    return a.probability > b.probability;
+}
+
+fn boundaryAlignmentDumpPath(
+    allocator: std.mem.Allocator,
+    dump_dir: []const u8,
+    eval_label: []const u8,
+    step: u64,
+) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}/boundary_alignment_{s}_step_{d}.jsonl", .{ dump_dir, eval_label, step });
+}
+
+fn boundaryAlignmentChunkMarkers(
+    batch: *const fused_chunker_data.FusedBatch,
+    local_sample_idx: usize,
+    token_idx: usize,
+) BoundaryAlignmentChunkMarkers {
+    const base = local_sample_idx * batch.max_chunks;
+    var markers = BoundaryAlignmentChunkMarkers{};
+    for (0..batch.max_chunks) |chunk_idx| {
+        if (batch.chunk_mask[base + chunk_idx] <= 0.5) continue;
+        const start = batch.chunk_starts[base + chunk_idx];
+        const end = batch.chunk_ends[base + chunk_idx];
+        if (start >= 0 and @as(usize, @intCast(start)) == token_idx) {
+            markers.chunk_start_index = chunk_idx;
+        }
+        if (end >= 0 and @as(usize, @intCast(end)) == token_idx) {
+            markers.chunk_end_exclusive_index = chunk_idx;
+        }
+        if (end > 0 and @as(usize, @intCast(end - 1)) == token_idx) {
+            markers.previous_chunk_end_index = chunk_idx;
+        }
+    }
+    return markers;
+}
+
+fn nearestBoundaryGoldDelta(
+    batch: *const fused_chunker_data.FusedBatch,
+    local_sample_idx: usize,
+    token_idx: usize,
+) ?i32 {
+    const base = local_sample_idx * batch.max_seq_len;
+    var best_delta: ?i32 = null;
+    var best_abs: u32 = std.math.maxInt(u32);
+    for (0..batch.max_seq_len) |candidate_idx| {
+        if (batch.boundary_labels[base + candidate_idx] <= 0.5) continue;
+        const delta = @as(i32, @intCast(candidate_idx)) - @as(i32, @intCast(token_idx));
+        const abs_delta: u32 = @intCast(if (delta < 0) -delta else delta);
+        if (abs_delta < best_abs) {
+            best_abs = abs_delta;
+            best_delta = delta;
+        }
+    }
+    return best_delta;
+}
+
+fn boundaryAlignmentFeatureStats(
+    features: []const f32,
+    flat_index: usize,
+    hidden_size: usize,
+) ?BoundaryAlignmentFeatureStats {
+    if (hidden_size == 0) return null;
+    const start = flat_index * hidden_size;
+    const end = start + hidden_size;
+    if (end > features.len) return null;
+
+    var sum: f64 = 0;
+    var sum_sq: f64 = 0;
+    var max_abs: f32 = 0;
+    for (features[start..end]) |value| {
+        sum += value;
+        sum_sq += @as(f64, value) * @as(f64, value);
+        const abs_value = @abs(value);
+        if (abs_value > max_abs) max_abs = abs_value;
+    }
+    const hidden_f64: f64 = @floatFromInt(hidden_size);
+    const row = features[start..end];
+    return .{
+        .mean = @floatCast(sum / hidden_f64),
+        .rms = @floatCast(@sqrt(sum_sq / hidden_f64)),
+        .l2 = @floatCast(@sqrt(sum_sq)),
+        .max_abs = max_abs,
+        .first0 = row[0],
+        .first1 = if (hidden_size > 1) row[1] else 0,
+        .first2 = if (hidden_size > 2) row[2] else 0,
+        .first3 = if (hidden_size > 3) row[3] else 0,
+    };
+}
+
+fn writeBoundaryAlignmentRecord(
+    writer: *std.Io.Writer,
+    eval_label: []const u8,
+    step: u64,
+    batch_idx: usize,
+    batch: *const fused_chunker_data.FusedBatch,
+    logits: []const f32,
+    features: []const f32,
+    hidden_size: usize,
+    flat_index: usize,
+    record_kind: []const u8,
+    top_probability_rank: ?usize,
+    probability_rank: ?usize,
+    valid_token_count: usize,
+) !void {
+    const local_sample_idx = flat_index / batch.max_seq_len;
+    const token_idx = flat_index % batch.max_seq_len;
+    const logit0 = logits[flat_index * 2 + 0];
+    const logit1 = logits[flat_index * 2 + 1];
+    const probability = fused_chunker_loss.positiveBoundaryProbability(logit0, logit1);
+    const markers = boundaryAlignmentChunkMarkers(batch, local_sample_idx, token_idx);
+    const probability_rank_percentile: ?f64 = if (probability_rank) |rank|
+        @as(f64, @floatFromInt(rank)) / @as(f64, @floatFromInt(valid_token_count))
+    else
+        null;
+    try std.json.Stringify.value(.{
+        .event = "boundary_alignment_token",
+        .schema_version = 2,
+        .eval = eval_label,
+        .step = step,
+        .batch = batch_idx,
+        .record_kind = record_kind,
+        .top_probability_rank = top_probability_rank,
+        .probability_rank = probability_rank,
+        .probability_rank_percentile = probability_rank_percentile,
+        .valid_token_count = valid_token_count,
+        .eval_sample_index = batch.sample_indices[local_sample_idx],
+        .local_sample_index = local_sample_idx,
+        .sample_token_index = token_idx,
+        .token_id = batch.input_ids[flat_index],
+        .attention = batch.attention_mask[flat_index],
+        .gold_boundary = batch.boundary_labels[flat_index] > 0.5,
+        .probability = probability,
+        .margin = logit1 - logit0,
+        .logit0 = logit0,
+        .logit1 = logit1,
+        .nearest_gold_delta = nearestBoundaryGoldDelta(batch, local_sample_idx, token_idx),
+        .chunk_start_index = markers.chunk_start_index,
+        .chunk_end_exclusive_index = markers.chunk_end_exclusive_index,
+        .previous_chunk_end_index = markers.previous_chunk_end_index,
+        .feature_stats = boundaryAlignmentFeatureStats(features, flat_index, hidden_size),
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeBoundaryAlignmentDumpBatch(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    eval_label: []const u8,
+    step: u64,
+    batch_idx: usize,
+    batch: *const fused_chunker_data.FusedBatch,
+    logits: []const f32,
+    features: []const f32,
+    hidden_size: usize,
+    top_k: usize,
+) !void {
+    const total_tokens = batch.batch_size * batch.max_seq_len;
+
+    var candidates = std.ArrayListUnmanaged(BoundaryAlignmentCandidate).empty;
+    defer candidates.deinit(allocator);
+    try candidates.ensureTotalCapacity(allocator, total_tokens);
+
+    for (0..total_tokens) |flat_index| {
+        if (batch.attention_mask[flat_index] == 0) continue;
+        const logit0 = logits[flat_index * 2 + 0];
+        const logit1 = logits[flat_index * 2 + 1];
+        try candidates.append(allocator, .{
+            .probability = fused_chunker_loss.positiveBoundaryProbability(logit0, logit1),
+            .flat_index = flat_index,
+        });
+    }
+
+    std.mem.sort(BoundaryAlignmentCandidate, candidates.items, {}, boundaryAlignmentCandidateGreaterThan);
+
+    const rank_by_flat_index = try allocator.alloc(usize, total_tokens);
+    defer allocator.free(rank_by_flat_index);
+    @memset(rank_by_flat_index, 0);
+    for (candidates.items, 0..) |candidate, rank| {
+        rank_by_flat_index[candidate.flat_index] = rank + 1;
+    }
+
+    for (0..total_tokens) |flat_index| {
+        if (batch.boundary_labels[flat_index] > 0.5) {
+            try writeBoundaryAlignmentRecord(
+                writer,
+                eval_label,
+                step,
+                batch_idx,
+                batch,
+                logits,
+                features,
+                hidden_size,
+                flat_index,
+                "gold_boundary",
+                null,
+                if (rank_by_flat_index[flat_index] == 0) null else rank_by_flat_index[flat_index],
+                candidates.items.len,
+            );
+        }
+    }
+
+    const limit = @min(top_k, candidates.items.len);
+    for (candidates.items[0..limit], 0..) |candidate, rank| {
+        try writeBoundaryAlignmentRecord(
+            writer,
+            eval_label,
+            step,
+            batch_idx,
+            batch,
+            logits,
+            features,
+            hidden_size,
+            candidate.flat_index,
+            "top_probability",
+            rank + 1,
+            rank + 1,
+            candidates.items.len,
+        );
+    }
 }
 
 fn binaryDcgAtKFromRankedMatches(matches: []const bool, k: usize) f64 {
@@ -406,6 +890,139 @@ test "separator boundary metrics match exact sorted offsets" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), metrics.f1, 1e-12);
 }
 
+test "chonky separator accumulator maps token starts and final boundary" {
+    const allocator = std.testing.allocator;
+    var chunks = [_]fused_chunker_data.FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 10 },
+        .{ .start_char = 11, .end_char = 22 },
+    };
+    const sample = fused_chunker_data.FusedSample{
+        .text = "alpha beta gamma delta",
+        .chunk_boundaries = &chunks,
+        .positive_texts = &.{},
+        .benchmark_include_final_boundary = true,
+    };
+    const offsets = [_][2]u32{
+        .{ 0, 5 },
+        .{ 6, 10 },
+        .{ 11, 16 },
+        .{ 17, 22 },
+    };
+    const mask = [_]f32{ 1, 1, 1, 1 };
+    const logits = [_]f32{
+        3,  -3,
+        3,  -3,
+        -3, 3,
+        3,  -3,
+    };
+
+    var acc = ChonkySeparatorAccumulator{};
+    try acc.addSample(allocator, sample, &logits, &mask, &offsets, 0.5);
+    const metrics = acc.finish();
+    try std.testing.expectEqual(@as(usize, 2), metrics.tp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fn_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.f1, 1e-12);
+}
+
+test "chonky separator accumulator skips final boundary for split windows" {
+    const allocator = std.testing.allocator;
+    var chunks = [_]fused_chunker_data.FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 10 },
+        .{ .start_char = 11, .end_char = 22 },
+    };
+    const sample = fused_chunker_data.FusedSample{
+        .text = "alpha beta gamma delta",
+        .chunk_boundaries = &chunks,
+        .positive_texts = &.{},
+        .benchmark_include_final_boundary = false,
+    };
+    const offsets = [_][2]u32{
+        .{ 0, 5 },
+        .{ 6, 10 },
+        .{ 11, 16 },
+        .{ 17, 22 },
+    };
+    const mask = [_]f32{ 1, 1, 1, 1 };
+    const logits = [_]f32{
+        3,  -3,
+        3,  -3,
+        -3, 3,
+        3,  -3,
+    };
+
+    var acc = ChonkySeparatorAccumulator{};
+    try acc.addSample(allocator, sample, &logits, &mask, &offsets, 0.5);
+    const metrics = acc.finish();
+    try std.testing.expectEqual(@as(usize, 1), metrics.tp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fn_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.f1, 1e-12);
+}
+
+test "chonky separator accumulator handles token offset with leading separator whitespace" {
+    const allocator = std.testing.allocator;
+    var chunks = [_]fused_chunker_data.FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 5 },
+        .{ .start_char = 6, .end_char = 10 },
+    };
+    const sample = fused_chunker_data.FusedSample{
+        .text = "alpha beta",
+        .chunk_boundaries = &chunks,
+        .positive_texts = &.{},
+        .benchmark_include_final_boundary = false,
+    };
+    const offsets = [_][2]u32{
+        .{ 0, 5 },
+        .{ 5, 10 },
+    };
+    const mask = [_]f32{ 1, 1 };
+    const logits = [_]f32{
+        3,  -3,
+        -3, 3,
+    };
+
+    var acc = ChonkySeparatorAccumulator{};
+    try acc.addSample(allocator, sample, &logits, &mask, &offsets, 0.5);
+    const metrics = acc.finish();
+    try std.testing.expectEqual(@as(usize, 1), metrics.tp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fn_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.f1, 1e-12);
+}
+
+test "chonky separator accumulator filters source boundaries outside tokenized window" {
+    const allocator = std.testing.allocator;
+    var chunks = [_]fused_chunker_data.FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 5 },
+        .{ .start_char = 6, .end_char = 10 },
+        .{ .start_char = 50, .end_char = 60 },
+    };
+    const sample = fused_chunker_data.FusedSample{
+        .text = "alpha beta trailing text beyond window",
+        .chunk_boundaries = &chunks,
+        .positive_texts = &.{},
+        .benchmark_include_final_boundary = false,
+    };
+    const offsets = [_][2]u32{
+        .{ 0, 5 },
+        .{ 5, 10 },
+    };
+    const mask = [_]f32{ 1, 1 };
+    const logits = [_]f32{
+        3,  -3,
+        -3, 3,
+    };
+
+    var acc = ChonkySeparatorAccumulator{};
+    try acc.addSample(allocator, sample, &logits, &mask, &offsets, 0.5);
+    const metrics = acc.finish();
+    try std.testing.expectEqual(@as(usize, 1), metrics.tp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fp);
+    try std.testing.expectEqual(@as(usize, 0), metrics.fn_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metrics.f1, 1e-12);
+}
+
 test "binary ndcg uses Voyage-style top-k ranking discount" {
     const matches = [_]bool{ false, true, true, false };
     const ndcg = binaryNdcgAtKFromRankedMatches(&matches, 2, 10);
@@ -444,15 +1061,34 @@ pub fn parseBenchmarkBaseline(raw: []const u8) !BenchmarkBaseline {
     };
 }
 
+fn parseBoundaryFeatureMode(raw: []const u8) !fused_chunker_train.BoundaryFeatureMode {
+    if (std.mem.eql(u8, raw, "token")) return .token;
+    if (std.mem.eql(u8, raw, "prev-diff")) return .prev_diff;
+    if (std.mem.eql(u8, raw, "prev-current-diff")) return .prev_current_diff;
+    if (std.mem.eql(u8, raw, "prev-current-diff-concat")) return .prev_current_diff_concat;
+    if (std.mem.eql(u8, raw, "prev-current-next-diff-concat")) return .prev_current_next_diff_concat;
+    if (std.mem.eql(u8, raw, "window-context-diff")) return .window_context_diff;
+    return error.InvalidBoundaryFeatureMode;
+}
+
 pub fn renderBenchmarkResultsJson(allocator: std.mem.Allocator, input: BenchmarkResultInput) ![]u8 {
-    const dataset_results = [_]BenchmarkDatasetResult{.{
-        .name = input.dataset_name,
-        .f1 = input.summary.boundary_f1,
+    const dataset_boundary = input.separator_metrics orelse SeparatorBoundaryMetrics{
         .precision = input.summary.boundary_precision,
         .recall = input.summary.boundary_recall,
-        .tp = input.summary.boundary_tp,
-        .fp = input.summary.boundary_fp,
-        .fn_count = input.summary.boundary_fn,
+        .f1 = input.summary.boundary_f1,
+        .tp = @intCast(input.summary.boundary_tp),
+        .fp = @intCast(input.summary.boundary_fp),
+        .fn_count = @intCast(input.summary.boundary_fn),
+    };
+    const dataset_metric = if (input.separator_metrics != null) chonky_boundary_metric else token_boundary_metric;
+    const dataset_results = [_]BenchmarkDatasetResult{.{
+        .name = input.dataset_name,
+        .f1 = dataset_boundary.f1,
+        .precision = dataset_boundary.precision,
+        .recall = dataset_boundary.recall,
+        .tp = @intCast(dataset_boundary.tp),
+        .fp = @intCast(dataset_boundary.fp),
+        .fn_count = @intCast(dataset_boundary.fn_count),
     }};
     const retrieval_lane: ?BenchmarkRetrievalLane = if (input.retrieval) |retrieval| .{
         .output_dimension = input.output_dimension,
@@ -474,10 +1110,55 @@ pub fn renderBenchmarkResultsJson(allocator: std.mem.Allocator, input: Benchmark
             .max_chunks = input.max_chunks,
         },
         .boundary_f1 = .{
+            .dataset_metric = dataset_metric,
             .internal_phase20_best_f1 = input.internal_phase20_best_f1,
             .fixed_threshold_f1 = input.summary.boundary_f1,
             .best_threshold_f1 = input.summary.best_boundary_f1,
             .best_threshold = input.summary.best_boundary_threshold,
+            .average_precision = input.summary.average_precision,
+            .precision_at_gold_count = input.summary.precision_at_gold_count,
+            .recall_at_gold_count = input.summary.recall_at_gold_count,
+            .f1_at_gold_count = input.summary.f1_at_gold_count,
+            .threshold_at_gold_count = input.summary.threshold_at_gold_count,
+            .max_rank_f1 = input.summary.max_rank_f1,
+            .max_rank_precision = input.summary.max_rank_precision,
+            .max_rank_recall = input.summary.max_rank_recall,
+            .max_rank_threshold = input.summary.max_rank_threshold,
+            .sample_oracle_count_samples = input.summary.sample_oracle_count_samples,
+            .sample_oracle_count_topk_f1 = input.summary.sample_oracle_count_topk_f1,
+            .sample_oracle_count_topk_precision = input.summary.sample_oracle_count_topk_precision,
+            .sample_oracle_count_topk_recall = input.summary.sample_oracle_count_topk_recall,
+            .sample_oracle_count_topk_tp = input.summary.sample_oracle_count_topk_tp,
+            .sample_oracle_count_topk_fp = input.summary.sample_oracle_count_topk_fp,
+            .sample_oracle_count_topk_fn = input.summary.sample_oracle_count_topk_fn,
+            .sample_oracle_count_nms_f1 = input.summary.sample_oracle_count_nms_f1,
+            .sample_oracle_count_nms_precision = input.summary.sample_oracle_count_nms_precision,
+            .sample_oracle_count_nms_recall = input.summary.sample_oracle_count_nms_recall,
+            .sample_oracle_count_nms_tp = input.summary.sample_oracle_count_nms_tp,
+            .sample_oracle_count_nms_fp = input.summary.sample_oracle_count_nms_fp,
+            .sample_oracle_count_nms_fn = input.summary.sample_oracle_count_nms_fn,
+            .sample_oracle_count_nms_radius = input.summary.sample_oracle_count_nms_radius,
+            .sample_oracle_count_length_window_f1 = input.summary.sample_oracle_count_length_window_f1,
+            .sample_oracle_count_length_window_precision = input.summary.sample_oracle_count_length_window_precision,
+            .sample_oracle_count_length_window_recall = input.summary.sample_oracle_count_length_window_recall,
+            .sample_oracle_count_length_window_tp = input.summary.sample_oracle_count_length_window_tp,
+            .sample_oracle_count_length_window_fp = input.summary.sample_oracle_count_length_window_fp,
+            .sample_oracle_count_length_window_fn = input.summary.sample_oracle_count_length_window_fn,
+            .sample_oracle_count_length_window_min_radius = input.summary.sample_oracle_count_length_window_min_radius,
+            .sample_oracle_count_length_window_radius_fraction = input.summary.sample_oracle_count_length_window_radius_fraction,
+            .gold_positive_mean_rank = input.summary.gold_positive_mean_rank,
+            .gold_positive_mean_rank_percentile = input.summary.gold_positive_mean_rank_percentile,
+            .gold_positive_median_rank = input.summary.gold_positive_median_rank,
+            .gold_positive_median_rank_percentile = input.summary.gold_positive_median_rank_percentile,
+            .gold_positive_p90_rank = input.summary.gold_positive_p90_rank,
+            .gold_positive_p90_rank_percentile = input.summary.gold_positive_p90_rank_percentile,
+            .gold_positive_p99_rank = input.summary.gold_positive_p99_rank,
+            .gold_positive_p99_rank_percentile = input.summary.gold_positive_p99_rank_percentile,
+            .gold_positive_worst_rank = input.summary.gold_positive_worst_rank,
+            .gold_positive_top_5x_count = input.summary.gold_positive_top_5x_count,
+            .gold_positive_top_5x_recall = input.summary.gold_positive_top_5x_recall,
+            .gold_positive_top_10x_count = input.summary.gold_positive_top_10x_count,
+            .gold_positive_top_10x_recall = input.summary.gold_positive_top_10x_recall,
             .dataset_results = &dataset_results,
         },
         .retrieval_ndcg = retrieval_lane,
@@ -515,6 +1196,15 @@ test "render benchmark results JSON matches verifier schema" {
         .boundary_fn = 19,
         .best_boundary_f1 = 0.84,
         .best_boundary_threshold = 0.42,
+        .average_precision = 0.85,
+        .precision_at_gold_count = 0.80,
+        .recall_at_gold_count = 0.79,
+        .f1_at_gold_count = 0.795,
+        .threshold_at_gold_count = 0.51,
+        .max_rank_f1 = 0.86,
+        .max_rank_precision = 0.84,
+        .max_rank_recall = 0.88,
+        .max_rank_threshold = 0.47,
     };
     const retrieval = RetrievalMetrics{
         .recall_at_1 = 0.55,
@@ -549,12 +1239,65 @@ test "render benchmark results JSON matches verifier schema" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("fused_chunker_benchmark_results/v1", obj.get("schema_version").?.string);
     const boundary = obj.get("boundary_f1").?.object;
+    try std.testing.expectEqualStrings(token_boundary_metric, boundary.get("dataset_metric").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 0.86), boundary.get("internal_phase20_best_f1").?.float, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.85), boundary.get("average_precision").?.float, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.86), boundary.get("max_rank_f1").?.float, 1e-12);
     const datasets = boundary.get("dataset_results").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), datasets.len);
     try std.testing.expectEqualStrings("bookcorpus", datasets[0].object.get("name").?.string);
     const retrieval_obj = obj.get("retrieval_ndcg").?.object;
     try std.testing.expectApproxEqAbs(@as(f64, 0.74), retrieval_obj.get("overall_ndcg_at_10").?.float, 1e-12);
+}
+
+test "render benchmark results uses chonky separator metrics for dataset result" {
+    const allocator = std.testing.allocator;
+    const summary = fused_chunker_train.EvalSummary{
+        .boundary_f1 = 0.20,
+        .boundary_precision = 0.25,
+        .boundary_recall = 0.166,
+        .boundary_tp = 1,
+        .boundary_fp = 3,
+        .boundary_fn = 5,
+        .best_boundary_f1 = 0.30,
+        .best_boundary_threshold = 0.4,
+    };
+    const separator = SeparatorBoundaryMetrics{
+        .precision = 0.75,
+        .recall = 0.60,
+        .f1 = 2.0 / 3.0,
+        .tp = 6,
+        .fp = 2,
+        .fn_count = 4,
+    };
+
+    const json = try renderBenchmarkResultsJson(allocator, .{
+        .dataset_name = "bookcorpus",
+        .checkpoint_path = "/tmp/checkpoint.safetensors",
+        .data_path = "/tmp/bookcorpus.jsonl",
+        .split = "val",
+        .backend_name = "native",
+        .samples = 8,
+        .max_seq_len = 384,
+        .max_chunks = 32,
+        .output_dimension = 256,
+        .internal_phase20_best_f1 = 0.80,
+        .summary = summary,
+        .separator_metrics = separator,
+        .retrieval = null,
+        .baselines = &.{},
+    });
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const boundary = parsed.value.object.get("boundary_f1").?.object;
+    try std.testing.expectEqualStrings(chonky_boundary_metric, boundary.get("dataset_metric").?.string);
+    const dataset = boundary.get("dataset_results").?.array.items[0].object;
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0 / 3.0), dataset.get("f1").?.float, 1e-12);
+    try std.testing.expectEqual(@as(i64, 6), dataset.get("tp").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), dataset.get("fp").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), dataset.get("fn_count").?.integer);
 }
 
 const FusedBackend = enum {
@@ -580,6 +1323,9 @@ const Options = struct {
     max_seq_len: u32 = 384,
     max_chunks: u32 = 32,
     intermediate_size: u32 = 1152,
+    boundary_feature_mode: fused_chunker_train.BoundaryFeatureMode = .token,
+    boundary_alignment_dump_dir: ?[]const u8 = null,
+    boundary_alignment_dump_top_k: usize = 32,
     backend: FusedBackend = .auto,
 };
 
@@ -607,6 +1353,9 @@ fn printUsage() void {
         \\  --max-seq-len <n>        Max seq len (default: 384)
         \\  --max-chunks <n>         Max chunks per sample (default: 32)
         \\  --intermediate-size <n>  ModernBERT intermediate_size (default: 1152)
+        \\  --boundary-feature-mode token|prev-diff|prev-current-diff|prev-current-diff-concat|prev-current-next-diff-concat|window-context-diff Boundary head input feature view (default: token)
+        \\  --boundary-alignment-dump-dir <dir> Write JSONL token alignment dump for gold and high-probability boundary tokens
+        \\  --boundary-alignment-dump-top-k <n> High-probability tokens to dump per eval batch (default: 32)
         \\  --backend native|metal|auto  Compute backend (default: auto; auto prefers Metal)
         \\
     , .{});
@@ -670,6 +1419,34 @@ fn cloneLoadedWeight(allocator: std.mem.Allocator, loaded: LoadedWeight) !Loaded
         },
         .quantized = false,
     };
+}
+
+fn isGoFusedEmbeddingWeightName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "model.embeddings.tok_embeddings.weight");
+}
+
+fn transposeLoadedEmbeddingWeightLikeGoFused(allocator: std.mem.Allocator, loaded: *LoadedWeight) !void {
+    if (loaded.tensor.dtype != .f32) return error.UnsupportedGoFusedEmbeddingTensor;
+    if (loaded.tensor.shape.len != 2) return error.InvalidGoFusedEmbeddingTensor;
+    if (loaded.tensor.shape[0] < 0 or loaded.tensor.shape[1] < 0) return error.InvalidGoFusedEmbeddingTensor;
+
+    const rows: usize = @intCast(loaded.tensor.shape[0]);
+    const cols: usize = @intCast(loaded.tensor.shape[1]);
+    const values = loaded.tensor.asFloat32();
+    if (values.len != rows * cols) return error.InvalidGoFusedEmbeddingTensor;
+
+    const transposed = try allocator.alloc(f32, values.len);
+    defer allocator.free(transposed);
+    for (0..cols) |r| {
+        for (0..rows) |c| {
+            transposed[c * cols + r] = values[r * rows + c];
+        }
+    }
+
+    var tensor = try tensor_mod.Tensor.initFloat32(allocator, loaded.tensor.name, loaded.tensor.shape, transposed);
+    errdefer tensor.deinit();
+    loaded.tensor.deinit();
+    loaded.tensor = tensor;
 }
 
 fn modernBertQkvLayer(name: []const u8) ?[]const u8 {
@@ -762,6 +1539,29 @@ const FusedLoRALoadResult = struct {
     alpha: f32 = 0.0,
 };
 
+const ParsedRuntimeLoRAKey = struct {
+    layer_idx: u32,
+    module_name: []const u8,
+    is_a: bool,
+};
+
+const LoRARuntimeTarget = struct {
+    scope: []const u8,
+    projection: []const u8,
+};
+
+fn loraRuntimeTarget(module_name: []const u8) ?LoRARuntimeTarget {
+    if (std.mem.eql(u8, module_name, "query_proj") or
+        std.mem.eql(u8, module_name, "key_proj") or
+        std.mem.eql(u8, module_name, "value_proj"))
+    {
+        return .{ .scope = "attn", .projection = module_name };
+    }
+    if (std.mem.eql(u8, module_name, "out_proj")) return .{ .scope = "attn", .projection = "Wo" };
+    if (std.mem.eql(u8, module_name, "wo")) return .{ .scope = "mlp", .projection = "Wo" };
+    return null;
+}
+
 fn readOptionalScalarF32(reader: *const safetensors.MMapReader, name: []const u8) !?f32 {
     if (!reader.header.tensors.contains(name)) return null;
     var tensor = try reader.readTensor(name);
@@ -801,6 +1601,173 @@ fn transpose2DF32Alloc(allocator: std.mem.Allocator, values: []const f32, rows: 
         }
     }
     return out;
+}
+
+fn parseRuntimeLoRAKey(key: []const u8) !?ParsedRuntimeLoRAKey {
+    const prefix = "model.layers.";
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    var rest = key[prefix.len..];
+    const layer_end = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const layer_idx = try std.fmt.parseUnsigned(u32, rest[0..layer_end], 10);
+    rest = rest[layer_end + 1 ..];
+
+    const scope_end = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const scope = rest[0..scope_end];
+    rest = rest[scope_end + 1 ..];
+
+    const projection_end = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const projection = rest[0..projection_end];
+    const suffix = rest[projection_end + 1 ..];
+    const is_a = if (std.mem.eql(u8, suffix, "lora_a"))
+        true
+    else if (std.mem.eql(u8, suffix, "lora_b"))
+        false
+    else
+        return null;
+
+    const module_name: []const u8 = if (std.mem.eql(u8, scope, "attn")) blk: {
+        if (std.mem.eql(u8, projection, "Wo")) break :blk "out_proj";
+        if (std.mem.eql(u8, projection, "query_proj") or
+            std.mem.eql(u8, projection, "key_proj") or
+            std.mem.eql(u8, projection, "value_proj"))
+        {
+            break :blk projection;
+        }
+        return null;
+    } else if (std.mem.eql(u8, scope, "mlp") and std.mem.eql(u8, projection, "Wo"))
+        "wo"
+    else
+        return null;
+
+    return .{
+        .layer_idx = layer_idx,
+        .module_name = module_name,
+        .is_a = is_a,
+    };
+}
+
+fn inspectFusedLoRAMetadata(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+) !FusedLoRALoadResult {
+    const file_bytes = try compat.cwd().readFileAlloc(compat.io(), checkpoint_path, allocator, .unlimited);
+    var reader = safetensors.MMapReader.fromBytes(allocator, file_bytes) catch |err| {
+        allocator.free(file_bytes);
+        return err;
+    };
+    defer reader.deinit();
+
+    var result = FusedLoRALoadResult{};
+    if (try readOptionalScalarF32(&reader, "lora_rank")) |rank_value| {
+        if (rank_value < 0) return error.InvalidFusedLoRAScalar;
+        result.rank = @intFromFloat(rank_value);
+    }
+    result.alpha = (try readOptionalScalarF32(&reader, "lora_alpha")) orelse 32.0;
+
+    const names = try reader.header.tensorNames(allocator);
+    defer allocator.free(names);
+
+    for (names) |name| {
+        if (std.mem.indexOf(u8, name, ".lora_") == null and
+            std.mem.indexOf(u8, name, "/lora_") == null)
+        {
+            continue;
+        }
+        var tensor = try reader.readTensor(name);
+        defer tensor.deinit();
+        if (tensor.dtype != .f32 or tensor.shape.len != 2) return error.InvalidFusedLoRATensor;
+
+        var key_buf: [256]u8 = undefined;
+        var normalized = (try normalizeFusedLoRATensor(
+            allocator,
+            name,
+            tensor.asFloat32(),
+            tensor.shape,
+            &key_buf,
+        )) orelse continue;
+        defer normalized.deinit(allocator);
+
+        const parsed = (try parseRuntimeLoRAKey(normalized.key)) orelse continue;
+        _ = parsed;
+        const tensor_rank = normalized.rank;
+        if (result.rank == 0) {
+            result.rank = tensor_rank;
+        } else if (result.rank != tensor_rank) {
+            return error.FusedLoRARankMismatch;
+        }
+        result.count += 1;
+    }
+
+    if (result.count == 0) return .{};
+    if (result.rank == 0 or result.alpha == 0.0) return error.InvalidFusedLoRAScalar;
+    return result;
+}
+
+fn copyNormalizedLoRATensorIntoAdapter(
+    adapter: *fused_chunker_lora.LoRAAdapterSet,
+    normalized: NormalizedLoRATensor,
+) !bool {
+    const parsed = (try parseRuntimeLoRAKey(normalized.key)) orelse return false;
+    const layer = adapter.get(parsed.layer_idx, parsed.module_name) orelse return false;
+    const dest = if (parsed.is_a) layer.A else layer.B;
+    if (normalized.values.len != dest.len) return error.InvalidFusedLoRATensor;
+
+    if (parsed.is_a) {
+        if (normalized.shape[0] != @as(i64, @intCast(adapter.config.rank)) or
+            normalized.shape[1] != @as(i64, @intCast(layer.in_features)))
+        {
+            return error.InvalidFusedLoRATensor;
+        }
+    } else {
+        if (normalized.shape[0] != @as(i64, @intCast(layer.out_features)) or
+            normalized.shape[1] != @as(i64, @intCast(adapter.config.rank)))
+        {
+            return error.InvalidFusedLoRATensor;
+        }
+    }
+    @memcpy(dest, normalized.values);
+    return true;
+}
+
+fn loadFusedLoRAAdapterSetFromCheckpoint(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+    adapter: *fused_chunker_lora.LoRAAdapterSet,
+) !usize {
+    const file_bytes = try compat.cwd().readFileAlloc(compat.io(), checkpoint_path, allocator, .unlimited);
+    var reader = safetensors.MMapReader.fromBytes(allocator, file_bytes) catch |err| {
+        allocator.free(file_bytes);
+        return err;
+    };
+    defer reader.deinit();
+
+    const names = try reader.header.tensorNames(allocator);
+    defer allocator.free(names);
+
+    var loaded: usize = 0;
+    for (names) |name| {
+        if (std.mem.indexOf(u8, name, ".lora_") == null and
+            std.mem.indexOf(u8, name, "/lora_") == null)
+        {
+            continue;
+        }
+        var tensor = try reader.readTensor(name);
+        defer tensor.deinit();
+        if (tensor.dtype != .f32 or tensor.shape.len != 2) return error.InvalidFusedLoRATensor;
+
+        var key_buf: [256]u8 = undefined;
+        var normalized = (try normalizeFusedLoRATensor(
+            allocator,
+            name,
+            tensor.asFloat32(),
+            tensor.shape,
+            &key_buf,
+        )) orelse continue;
+        defer normalized.deinit(allocator);
+
+        if (try copyNormalizedLoRATensorIntoAdapter(adapter, normalized)) loaded += 1;
+    }
+    return loaded;
 }
 
 fn normalizeGoFusedLoRAName(name: []const u8, key_buf: *[256]u8) !?struct {
@@ -984,6 +1951,33 @@ fn insertLoRATensorIntoMetalStore(
     if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
     if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0) return error.InvalidFusedLoRATensor;
     const shape_i64 = [_]i64{ shape[0], shape[1] };
+    if (weight_store.lazy_weights.getPtr(key)) |entry| {
+        const src_bytes = std.mem.sliceAsBytes(values);
+        if (entry.host_loaded) |*loaded| {
+            if (loaded.tensor.dtype == .f32 and
+                loaded.tensor.shape.len == shape_i64.len and
+                loaded.tensor.shape[0] == shape_i64[0] and
+                loaded.tensor.shape[1] == shape_i64[1] and
+                loaded.tensor.data.len == src_bytes.len)
+            {
+                @memcpy(loaded.tensor.data, src_bytes);
+                entry.active_tier = .host;
+                entry.loaded_bytes = loaded.tensor.data.len;
+                return;
+            }
+            loaded.deinit();
+        }
+        if (entry.quantized_storage) |*storage| storage.deinit();
+        var tensor = try tensor_mod.Tensor.initFloat32(allocator, key, &shape_i64, values);
+        errdefer tensor.deinit();
+        entry.* = .{
+            .tensor_ref = undefined,
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+        };
+        return;
+    }
     const owned_key = try allocator.dupe(u8, key);
     errdefer allocator.free(owned_key);
     var tensor = try tensor_mod.Tensor.initFloat32(allocator, owned_key, &shape_i64, values);
@@ -994,6 +1988,40 @@ fn insertLoRATensorIntoMetalStore(
         .active_tier = .host,
         .loaded_bytes = tensor.data.len,
     });
+}
+
+fn refreshLoRAWeightsForForward(
+    allocator: std.mem.Allocator,
+    use_metal: bool,
+    native_weight_store: *native_compute.WeightStore,
+    metal_weight_store: *MetalWeightStore,
+    adapter: *const fused_chunker_lora.LoRAAdapterSet,
+) !void {
+    const rank: usize = @intCast(adapter.config.rank);
+    for (adapter.layers) |*ll| {
+        const target = loraRuntimeTarget(ll.module_name) orelse continue;
+
+        var key_buf_a: [128]u8 = undefined;
+        var key_buf_b: [128]u8 = undefined;
+        const key_a = try std.fmt.bufPrint(
+            &key_buf_a,
+            "model.layers.{d}.{s}.{s}.lora_a",
+            .{ ll.layer_idx, target.scope, target.projection },
+        );
+        const key_b = try std.fmt.bufPrint(
+            &key_buf_b,
+            "model.layers.{d}.{s}.{s}.lora_b",
+            .{ ll.layer_idx, target.scope, target.projection },
+        );
+
+        if (use_metal) {
+            try insertLoRATensorIntoMetalStore(allocator, metal_weight_store, key_a, ll.A, &.{ @intCast(rank), @intCast(ll.in_features) });
+            try insertLoRATensorIntoMetalStore(allocator, metal_weight_store, key_b, ll.B, &.{ @intCast(ll.out_features), @intCast(rank) });
+        } else {
+            try insertLoRATensorIntoNativeStore(allocator, native_weight_store, key_a, ll.A, &.{ @intCast(rank), @intCast(ll.in_features) });
+            try insertLoRATensorIntoNativeStore(allocator, native_weight_store, key_b, ll.B, &.{ @intCast(ll.out_features), @intCast(rank) });
+        }
+    }
 }
 
 fn loadFusedLoRAFromCheckpoint(
@@ -1095,6 +2123,9 @@ fn loadSafetensorsIntoNativeStore(
         errdefer owned_loaded.deinit();
         const owned_name = try normalizeModernBertWeightName(allocator, name);
         errdefer allocator.free(owned_name);
+        if (isGoFusedEmbeddingWeightName(owned_name)) {
+            try transposeLoadedEmbeddingWeightLikeGoFused(allocator, &owned_loaded);
+        }
         try weight_store.resident_weights.put(allocator, owned_name, owned_loaded);
         loaded_count += 1;
         loaded_count += try insertModernBertQkvSplitsIntoNativeStore(allocator, weight_store, owned_name, loaded);
@@ -1123,6 +2154,9 @@ fn loadSafetensorsIntoMetalStore(
         errdefer owned_loaded.deinit();
         const owned_name = try normalizeModernBertWeightName(allocator, name);
         errdefer allocator.free(owned_name);
+        if (isGoFusedEmbeddingWeightName(owned_name)) {
+            try transposeLoadedEmbeddingWeightLikeGoFused(allocator, &owned_loaded);
+        }
         try weight_store.lazy_weights.put(allocator, owned_name, .{
             .tensor_ref = undefined,
             .host_loaded = owned_loaded,
@@ -1153,6 +2187,9 @@ pub fn main(init: std.process.Init) !void {
     var max_seq_len: u32 = 384;
     var max_chunks: u32 = 32;
     var intermediate_size: u32 = 1152;
+    var boundary_feature_mode: fused_chunker_train.BoundaryFeatureMode = .token;
+    var boundary_alignment_dump_dir: ?[]const u8 = null;
+    var boundary_alignment_dump_top_k: usize = 32;
     var results_out: ?[]const u8 = null;
     var benchmark_dataset_name: ?[]const u8 = null;
     var internal_phase20_best_f1: ?f64 = null;
@@ -1286,6 +2323,29 @@ pub fn main(init: std.process.Init) !void {
                 print("error: invalid --intermediate-size value: {s}\n", .{value});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, arg, "--boundary-feature-mode")) {
+            const value = args.next() orelse {
+                print("error: --boundary-feature-mode requires a value\n", .{});
+                std.process.exit(1);
+            };
+            boundary_feature_mode = parseBoundaryFeatureMode(value) catch {
+                print("error: unknown boundary feature mode '{s}': expected token, prev-diff, prev-current-diff, prev-current-diff-concat, prev-current-next-diff-concat, or window-context-diff\n", .{value});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--boundary-alignment-dump-dir")) {
+            boundary_alignment_dump_dir = args.next() orelse {
+                print("error: --boundary-alignment-dump-dir requires a value\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--boundary-alignment-dump-top-k")) {
+            const value = args.next() orelse {
+                print("error: --boundary-alignment-dump-top-k requires a value\n", .{});
+                std.process.exit(1);
+            };
+            boundary_alignment_dump_top_k = std.fmt.parseUnsigned(usize, value, 10) catch {
+                print("error: invalid --boundary-alignment-dump-top-k value: {s}\n", .{value});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "--backend")) {
             const value = args.next() orelse {
                 print("error: --backend requires a value\n", .{});
@@ -1336,6 +2396,9 @@ pub fn main(init: std.process.Init) !void {
         .max_seq_len = max_seq_len,
         .max_chunks = max_chunks,
         .intermediate_size = intermediate_size,
+        .boundary_feature_mode = boundary_feature_mode,
+        .boundary_alignment_dump_dir = boundary_alignment_dump_dir,
+        .boundary_alignment_dump_top_k = boundary_alignment_dump_top_k,
         .backend = backend,
     };
 
@@ -1427,6 +2490,7 @@ pub fn main(init: std.process.Init) !void {
         .max_seq_len = opts.max_seq_len,
         .max_chunks = opts.max_chunks,
         .batch_size = opts.batch_size,
+        .boundary_feature_mode = opts.boundary_feature_mode,
     };
     var trainer = try FusedTrainer.init(allocator, config, &cb);
     defer trainer.deinit();
@@ -1439,24 +2503,47 @@ pub fn main(init: std.process.Init) !void {
 
     var eval_lora_rank: u32 = 0;
     var eval_lora_alpha: f32 = 0.0;
+    var eval_lora_adapters_opt: ?fused_chunker_lora.LoRAAdapterSet = null;
+    defer if (eval_lora_adapters_opt) |*adapter| adapter.deinit();
     if (encoder_loaded) {
-        const lora_load = loadFusedLoRAFromCheckpoint(
+        const lora_meta = inspectFusedLoRAMetadata(
             allocator,
             opts.checkpoint_path,
-            use_metal,
-            &weight_store,
-            &metal_weight_store,
         ) catch |err| blk: {
-            print("warning: could not load LoRA tensors from checkpoint '{s}': {}\n", .{ opts.checkpoint_path, err });
+            print("warning: could not inspect LoRA tensors from checkpoint '{s}': {}\n", .{ opts.checkpoint_path, err });
             break :blk FusedLoRALoadResult{};
         };
-        if (lora_load.count > 0) {
-            eval_lora_rank = lora_load.rank;
-            eval_lora_alpha = lora_load.alpha;
-            print("loaded {d} LoRA tensors from checkpoint (rank={d} alpha={d:.3})\n", .{
-                lora_load.count,
-                lora_load.rank,
-                lora_load.alpha,
+        if (lora_meta.count > 0) {
+            eval_lora_adapters_opt = try fused_chunker_lora.LoRAAdapterSet.init(
+                allocator,
+                fused_chunker_lora.LoRAConfig{
+                    .rank = lora_meta.rank,
+                    .alpha = lora_meta.alpha,
+                    .target_modules = fused_chunker_lora_target_modules[0..],
+                    .num_layers = opts.num_layers,
+                },
+                @intCast(opts.hidden_size),
+                @intCast(opts.intermediate_size),
+            );
+            const loaded_lora_tensors = try loadFusedLoRAAdapterSetFromCheckpoint(
+                allocator,
+                opts.checkpoint_path,
+                &eval_lora_adapters_opt.?,
+            );
+            try refreshLoRAWeightsForForward(
+                allocator,
+                use_metal,
+                &weight_store,
+                &metal_weight_store,
+                &eval_lora_adapters_opt.?,
+            );
+            eval_lora_rank = lora_meta.rank;
+            eval_lora_alpha = lora_meta.alpha;
+            print("loaded {d}/{d} LoRA tensors from checkpoint via adapter set (rank={d} alpha={d:.3})\n", .{
+                loaded_lora_tensors,
+                lora_meta.count,
+                lora_meta.rank,
+                lora_meta.alpha,
             });
         }
     }
@@ -1485,6 +2572,9 @@ pub fn main(init: std.process.Init) !void {
     });
 
     var boundary_acc = fused_chunker_train.BoundaryEvalAccumulator{};
+    defer boundary_acc.deinit(allocator);
+    var chonky_separator_acc = ChonkySeparatorAccumulator{};
+    var chonky_separator_available = false;
 
     // Accumulate chunk-level data for dense retrieval evaluation.
     // chunk_embeddings_all: flat [total_chunks * hs] from mean-pooled encoder features.
@@ -1505,6 +2595,21 @@ pub fn main(init: std.process.Init) !void {
     const mc: usize = @intCast(opts.max_chunks);
     const hs: usize = @intCast(opts.hidden_size);
 
+    var alignment_path: ?[]u8 = null;
+    defer if (alignment_path) |path| allocator.free(path);
+    var alignment_file: ?std.Io.File = null;
+    if (opts.boundary_alignment_dump_dir) |dump_dir| {
+        try compat.cwd().createDirPath(compat.io(), dump_dir);
+        const path = try boundaryAlignmentDumpPath(allocator, dump_dir, opts.split, 0);
+        alignment_path = path;
+        alignment_file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+        print("Writing boundary alignment dump to {s}\n", .{path});
+    }
+    defer if (alignment_file) |*file| file.close(compat.io());
+    var alignment_buf: [8192]u8 = undefined;
+    var alignment_writer = if (alignment_file) |*file| file.writerStreaming(compat.io(), &alignment_buf) else null;
+    defer if (alignment_writer) |*writer| writer.interface.flush() catch {};
+
     // Dummy tokeniser: fills ids/mask with zeros, returns max_seq_len tokens
     const dummy_token_fn = struct {
         fn call(
@@ -1524,6 +2629,7 @@ pub fn main(init: std.process.Init) !void {
     }.call;
 
     var sample_idx: usize = 0;
+    var eval_batch_idx: usize = 0;
     while (sample_idx < samples.len) {
         const end = @min(sample_idx + bs, samples.len);
         const count = end - sample_idx;
@@ -1614,7 +2720,38 @@ pub fn main(init: std.process.Init) !void {
             mask[t] = if (batch.attention_mask[t] != 0) 1.0 else 0.0;
         }
 
-        try trainer.evaluateBatchInto(allocator, &boundary_acc, features, labels, mask, total_tokens);
+        const logits = try trainer.evaluateBoundaryLogitsOwnedWithMask(allocator, features, mask, total_tokens);
+        defer allocator.free(logits);
+
+        try boundary_acc.addLogitsBySample(allocator, logits, labels, mask, msl);
+        if (alignment_writer) |*writer| {
+            try writeBoundaryAlignmentDumpBatch(
+                allocator,
+                &writer.interface,
+                opts.split,
+                0,
+                eval_batch_idx + 1,
+                &batch,
+                logits,
+                features,
+                hs,
+                opts.boundary_alignment_dump_top_k,
+            );
+        }
+        if (tokenizer_opt) |*tb| {
+            try accumulateChonkySeparatorBatch(
+                allocator,
+                &chonky_separator_acc,
+                tb,
+                samples,
+                indices,
+                logits,
+                mask,
+                msl,
+                0.5,
+            );
+            chonky_separator_available = true;
+        }
 
         const num_chunks_batch = count * mc;
         const chunk_embeddings = try fused_chunker_data.meanPoolChunkEmbeddings(allocator, features, &batch, hs);
@@ -1629,10 +2766,15 @@ pub fn main(init: std.process.Init) !void {
             try chunk_doc_ids_all.append(allocator, @intCast(global_sample));
         }
 
+        eval_batch_idx += 1;
         sample_idx = end;
     }
 
-    const summary = boundary_acc.finish();
+    const summary = try boundary_acc.finish(allocator);
+    const chonky_separator_metrics: ?SeparatorBoundaryMetrics = if (chonky_separator_available)
+        chonky_separator_acc.finish()
+    else
+        null;
 
     // Print results
     print("\n=== Eval Results ===\n", .{});
@@ -1647,6 +2789,74 @@ pub fn main(init: std.process.Init) !void {
     print("Best Prec:   {d:.4}\n", .{summary.best_boundary_precision});
     print("Best Recall: {d:.4}\n", .{summary.best_boundary_recall});
     print("Best Counts: tp={d} fp={d} fn={d}\n", .{ summary.best_boundary_tp, summary.best_boundary_fp, summary.best_boundary_fn });
+    print("AP:          {d:.6}\n", .{summary.average_precision});
+    print("P@Gold:      {d:.4} R@Gold: {d:.4} F1@Gold: {d:.4} threshold={d:.6} pred_rate={d:.6}\n", .{
+        summary.precision_at_gold_count,
+        summary.recall_at_gold_count,
+        summary.f1_at_gold_count,
+        summary.threshold_at_gold_count,
+        summary.predicted_positive_rate_at_gold_count,
+    });
+    print("Rank Best:   f1={d:.4} precision={d:.4} recall={d:.4} threshold={d:.6} pred_rate={d:.6}\n", .{
+        summary.max_rank_f1,
+        summary.max_rank_precision,
+        summary.max_rank_recall,
+        summary.max_rank_threshold,
+        summary.max_rank_predicted_positive_rate,
+    });
+    print("Rank Counts: top_gold tp={d} fp={d} fn={d} best tp={d} fp={d} fn={d}\n", .{
+        summary.gold_count_tp,
+        summary.gold_count_fp,
+        summary.gold_count_fn,
+        summary.max_rank_tp,
+        summary.max_rank_fp,
+        summary.max_rank_fn,
+    });
+    if (summary.sample_oracle_count_samples > 0) {
+        print("Sample Oracle: samples={d} topk_f1={d:.4} topk_p={d:.4} topk_r={d:.4} nms_f1={d:.4} nms_p={d:.4} nms_r={d:.4} nms_radius={d} length_window_f1={d:.4} length_window_p={d:.4} length_window_r={d:.4} length_window_min_radius={d} length_window_radius_fraction={d:.3}\n", .{
+            summary.sample_oracle_count_samples,
+            summary.sample_oracle_count_topk_f1,
+            summary.sample_oracle_count_topk_precision,
+            summary.sample_oracle_count_topk_recall,
+            summary.sample_oracle_count_nms_f1,
+            summary.sample_oracle_count_nms_precision,
+            summary.sample_oracle_count_nms_recall,
+            summary.sample_oracle_count_nms_radius,
+            summary.sample_oracle_count_length_window_f1,
+            summary.sample_oracle_count_length_window_precision,
+            summary.sample_oracle_count_length_window_recall,
+            summary.sample_oracle_count_length_window_min_radius,
+            summary.sample_oracle_count_length_window_radius_fraction,
+        });
+        print("Sample Counts: topk tp={d} fp={d} fn={d} nms tp={d} fp={d} fn={d} length_window tp={d} fp={d} fn={d}\n", .{
+            summary.sample_oracle_count_topk_tp,
+            summary.sample_oracle_count_topk_fp,
+            summary.sample_oracle_count_topk_fn,
+            summary.sample_oracle_count_nms_tp,
+            summary.sample_oracle_count_nms_fp,
+            summary.sample_oracle_count_nms_fn,
+            summary.sample_oracle_count_length_window_tp,
+            summary.sample_oracle_count_length_window_fp,
+            summary.sample_oracle_count_length_window_fn,
+        });
+    }
+    print("Gold Ranks:  mean={d:.2}({d:.4}) median={d}({d:.4}) p90={d}({d:.4}) p99={d}({d:.4}) worst={d}\n", .{
+        summary.gold_positive_mean_rank,
+        summary.gold_positive_mean_rank_percentile,
+        summary.gold_positive_median_rank,
+        summary.gold_positive_median_rank_percentile,
+        summary.gold_positive_p90_rank,
+        summary.gold_positive_p90_rank_percentile,
+        summary.gold_positive_p99_rank,
+        summary.gold_positive_p99_rank_percentile,
+        summary.gold_positive_worst_rank,
+    });
+    print("Gold Recall: top5x={d}/{d:.4} top10x={d}/{d:.4}\n", .{
+        summary.gold_positive_top_5x_count,
+        summary.gold_positive_top_5x_recall,
+        summary.gold_positive_top_10x_count,
+        summary.gold_positive_top_10x_recall,
+    });
     print("Valid Tok:   {d}\n", .{summary.valid_tokens});
     print("Gold Pos:    {d} ({d:.6})\n", .{ summary.gold_positives, summary.gold_positive_rate });
     print("Pred Pos:    {d} ({d:.6})\n", .{ summary.predicted_positives, summary.predicted_positive_rate });
@@ -1655,6 +2865,16 @@ pub fn main(init: std.process.Init) !void {
         summary.mean_positive_probability_gold_positive,
         summary.mean_positive_probability_gold_negative,
     });
+    if (chonky_separator_metrics) |separator| {
+        print("Chonky F1:   {d:.4} precision={d:.4} recall={d:.4} counts tp={d} fp={d} fn={d}\n", .{
+            separator.f1,
+            separator.precision,
+            separator.recall,
+            separator.tp,
+            separator.fp,
+            separator.fn_count,
+        });
+    }
     print("Mean Margin: gold_pos={d:.4} gold_neg={d:.4}\n", .{
         summary.mean_boundary_margin_gold_positive,
         summary.mean_boundary_margin_gold_negative,
@@ -1711,6 +2931,7 @@ pub fn main(init: std.process.Init) !void {
             .output_dimension = opts.output_dimension orelse opts.hidden_size,
             .internal_phase20_best_f1 = opts.internal_phase20_best_f1 orelse summary.best_boundary_f1,
             .summary = summary,
+            .separator_metrics = chonky_separator_metrics,
             .retrieval = retrieval_result,
             .baselines = opts.retrieval_baselines,
         });
