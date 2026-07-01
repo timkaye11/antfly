@@ -496,7 +496,6 @@ with open(go_path, "r", encoding="utf-8") as f:
     go = json.load(f)
 
 fields = [
-    "schema_version",
     "offset",
     "samples",
     "batches",
