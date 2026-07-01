@@ -182,6 +182,11 @@ jobs:
         if: needs.changes.outputs.zig_tests == 'true'
         run: make zig-unit-test
 
+      - name: Run inference finetune unit tests
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig/pkg/inference
+        run: zig build -Dskip-openapi=true test-finetune
+
   tla-verify:
     needs: changes
     if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
