@@ -262,10 +262,12 @@ pub const KvStorageRuntime = struct {
         const hook = self.device_write_hook orelse return error.DeviceWriteUnsupported;
         const sequence_state = try self.sequenceMut(write.sequence_id);
         if (write.suffix_token_count > write.total_token_count) return error.InvalidKvShape;
-        if (write.total_token_count > sequence_state.block_table.tokenCount(self.storage.config.page_size_tokens)) return error.KvCapacityTooSmall;
+        const page_size = self.storage.config.page_size_tokens;
+        const reserved_capacity = (sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len) * page_size;
+        if (write.total_token_count > reserved_capacity) return error.KvCapacityTooSmall;
         var enriched = write;
         enriched.logical_blocks = try self.logicalBlocksWithReservations(write.sequence_id);
-        enriched.page_size_tokens = self.storage.config.page_size_tokens;
+        enriched.page_size_tokens = page_size;
         try hook.writeLayerKvSuffix(enriched, k, v);
     }
 
@@ -665,4 +667,71 @@ test "storage runtime reserves future token capacity without advancing token cou
 
     const logical_blocks_after_append = try runtime.logicalBlocksWithReservations(sequence_id);
     try std.testing.expectEqual(@as(usize, 3), logical_blocks_after_append.len);
+}
+
+const TestDeviceWriteHookContext = struct {
+    calls: usize = 0,
+    last_total_token_count: usize = 0,
+    last_logical_block_count: usize = 0,
+    last_page_size_tokens: u16 = 0,
+};
+
+fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) anyerror!void {
+    const typed: *TestDeviceWriteHookContext = @ptrCast(@alignCast(ctx));
+    typed.calls += 1;
+    typed.last_total_token_count = write.total_token_count;
+    typed.last_logical_block_count = if (write.logical_blocks) |blocks| blocks.len else 0;
+    typed.last_page_size_tokens = write.page_size_tokens;
+}
+
+fn testDeviceWriteHookDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
+
+const test_device_write_hook_vtable = DeviceWriteHook.VTable{
+    .writeLayerKvSuffix = testDeviceWriteLayerKvSuffix,
+    .deinit = testDeviceWriteHookDeinit,
+};
+
+test "storage runtime device writes count reserved blocks as capacity" {
+    const allocator = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    defer runtime.deinit();
+
+    var hook_context = TestDeviceWriteHookContext{};
+    runtime.setDeviceWriteHook(.{
+        .ctx = &hook_context,
+        .vtable = &test_device_write_hook_vtable,
+    });
+
+    const sequence_id = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence_id, 2);
+    try runtime.reserveTokenCapacity(sequence_id, 10);
+
+    var k_value: f32 = 1.0;
+    var v_value: f32 = 2.0;
+    const ref_len = @sizeOf(f32);
+    try runtime.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = sequence_id,
+            .layer_index = 0,
+            .total_token_count = 10,
+            .suffix_token_count = 1,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 1,
+        },
+        .{ .handle = @ptrCast(&k_value), .byte_offset = 0, .byte_len = ref_len },
+        .{ .handle = @ptrCast(&v_value), .byte_offset = 0, .byte_len = ref_len },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), hook_context.calls);
+    try std.testing.expectEqual(@as(usize, 10), hook_context.last_total_token_count);
+    try std.testing.expectEqual(@as(usize, 3), hook_context.last_logical_block_count);
+    try std.testing.expectEqual(@as(u16, 4), hook_context.last_page_size_tokens);
 }
