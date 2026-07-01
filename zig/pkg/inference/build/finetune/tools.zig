@@ -182,6 +182,18 @@ const commands = [_]common.CommandSpec{
         .imports = &.{.termite_io_compat},
     },
     .{
+        .name = "analyze-fused-chunker-validation-failure",
+        .root_source_file = "src/finetune/tools/analyze_fused_chunker_validation_failure.zig",
+        .description = "Classify fused-chunker validation failures from training metrics JSONL",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .name = "analyze-fused-chunker-boundary-alignment-dump",
+        .root_source_file = "src/finetune/tools/analyze_fused_chunker_boundary_alignment_dump.zig",
+        .description = "Summarize fused-chunker boundary alignment dump rank and offset diagnostics",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
         .name = "verify-fused-chunker-benchmark",
         .root_source_file = "src/finetune/tools/verify_fused_chunker_benchmark.zig",
         .description = "Verify fused-chunker benchmark results against Chonky F1 and Voyage-style NDCG@10 gates",

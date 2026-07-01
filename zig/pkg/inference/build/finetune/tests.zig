@@ -149,6 +149,13 @@ const tests = [_]common.TestSpec{
         .imports = &.{.termite_io_compat},
     },
     .{
+        .step_name = "test-fused-chunker-eval",
+        .root_source_file = "src/finetune_eval_fused_chunker_root.zig",
+        .description = "Run fused chunker eval and benchmark result tests",
+        .imports = &.{ .antfly_platform, .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
+        .native_link = .default,
+    },
+    .{
         .step_name = "test-fused-chunker-retrieval-benchmark-score",
         .root_source_file = "src/finetune/tools/score_fused_chunker_retrieval_benchmark.zig",
         .description = "Run fused chunker retrieval benchmark scorer tests",
@@ -164,6 +171,24 @@ const tests = [_]common.TestSpec{
         .step_name = "test-fused-chunker-retrieval-embedding-materialize",
         .root_source_file = "src/finetune/tools/materialize_fused_chunker_retrieval_embeddings.zig",
         .description = "Run fused chunker retrieval embedding materializer tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-run-validate",
+        .root_source_file = "src/finetune/tools/validate_fused_chunker_run.zig",
+        .description = "Run fused chunker readiness run validator tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-validation-failure-analysis",
+        .root_source_file = "src/finetune/tools/analyze_fused_chunker_validation_failure.zig",
+        .description = "Run fused chunker validation failure analyzer tests",
+        .imports = &.{.termite_io_compat},
+    },
+    .{
+        .step_name = "test-fused-chunker-boundary-alignment-analysis",
+        .root_source_file = "src/finetune/tools/analyze_fused_chunker_boundary_alignment_dump.zig",
+        .description = "Run fused chunker boundary alignment dump analyzer tests",
         .imports = &.{.termite_io_compat},
     },
     .{
