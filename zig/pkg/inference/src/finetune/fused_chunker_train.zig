@@ -50,18 +50,57 @@ const LoRAAdapterSet = fused_chunker_lora.LoRAAdapterSet;
 // FusedTrainingConfig
 // ----------------------------------------------------------------------------
 
+pub const BoundaryFeatureMode = enum {
+    token,
+    prev_diff,
+    prev_current_diff,
+    prev_current_diff_concat,
+    prev_current_next_diff_concat,
+    window_context_diff,
+};
+
+pub fn boundaryFeatureModeName(mode: BoundaryFeatureMode) []const u8 {
+    return switch (mode) {
+        .token => "token",
+        .prev_diff => "prev-diff",
+        .prev_current_diff => "prev-current-diff",
+        .prev_current_diff_concat => "prev-current-diff-concat",
+        .prev_current_next_diff_concat => "prev-current-next-diff-concat",
+        .window_context_diff => "window-context-diff",
+    };
+}
+
+pub fn boundaryFeatureMultiplier(mode: BoundaryFeatureMode) usize {
+    return switch (mode) {
+        .token,
+        .prev_diff,
+        .prev_current_diff,
+        => 1,
+        .prev_current_diff_concat => 3,
+        .prev_current_next_diff_concat,
+        .window_context_diff,
+        => 5,
+    };
+}
+
+pub fn boundaryFeatureDim(mode: BoundaryFeatureMode, hidden_size: usize) usize {
+    return hidden_size * boundaryFeatureMultiplier(mode);
+}
+
 pub const FusedTrainingConfig = struct {
     // Model
     max_seq_len: u32 = 384,
     embedding_dim: u32 = 768,
     hidden_size: u32 = 768,
     boundary_mlp_dim: u32 = 256,
+    boundary_feature_mode: BoundaryFeatureMode = .token,
     max_chunks: u32 = 32,
 
     // Training
     batch_size: u32 = 16,
     num_epochs: u32 = 10,
     learning_rate: f32 = 1e-4,
+    boundary_head_lr_multiplier: f32 = 1.0,
     warmup_steps: u32 = 50,
     total_steps: u32 = 1000,
     weight_decay: f32 = 0.01,
@@ -84,6 +123,21 @@ pub const FusedTrainingConfig = struct {
     contrastive_focal_gamma: f32 = 0.0,
     contrastive_focal_alpha: f32 = 0.75,
     pos_weight: f32 = 5.0,
+    boundary_rank_loss_weight: f32 = 0.0,
+    boundary_rank_loss_margin: f32 = 1.0,
+    boundary_rank_loss_top_k: u32 = 1,
+    boundary_same_token_rank_loss_weight: f32 = 0.0,
+    boundary_same_token_rank_loss_top_k: u32 = 4,
+    boundary_same_token_negative_weight: f32 = 1.0,
+    boundary_same_token_negative_top_k: u32 = 0,
+    boundary_candidate_rank_loss_weight: f32 = 0.0,
+    boundary_candidate_rank_loss_top_k: u32 = 8,
+    boundary_candidate_negative_weight: f32 = 1.0,
+    boundary_gold_count_rank_loss_weight: f32 = 0.0,
+    boundary_gold_count_rank_loss_margin: f32 = 1.0,
+    boundary_gold_count_rank_loss_negative_multiplier: u32 = 1,
+    boundary_local_window_loss_weight: f32 = 0.0,
+    boundary_local_window_radius: u32 = 12,
     boundary_dropout: f32 = 0.1,
 
     // Curriculum
@@ -136,6 +190,10 @@ pub const FusedTrainingConfig = struct {
             .warmup_steps = self.warmup_steps,
             .total_steps = self.total_steps,
         } };
+    }
+
+    pub fn boundaryHeadLearningRate(self: FusedTrainingConfig, base_lr: f32) f32 {
+        return base_lr * self.boundary_head_lr_multiplier;
     }
 };
 
@@ -389,6 +447,247 @@ fn fillDenseHeNormalTransposed(values: []f32, fan_in: usize, fan_out: usize, rng
     }
 }
 
+fn hasPreviousValidToken(attention_mask: []const f32, flat_index: usize, max_seq_len: usize) bool {
+    if (max_seq_len == 0 or flat_index == 0) return false;
+    if (flat_index % max_seq_len == 0) return false;
+    return attention_mask[flat_index] > 0.5 and attention_mask[flat_index - 1] > 0.5;
+}
+
+fn hasNextValidToken(attention_mask: []const f32, flat_index: usize, total_tokens: usize, max_seq_len: usize) bool {
+    if (max_seq_len == 0 or flat_index + 1 >= total_tokens) return false;
+    if ((flat_index + 1) % max_seq_len == 0) return false;
+    return attention_mask[flat_index] > 0.5 and attention_mask[flat_index + 1] > 0.5;
+}
+
+const boundary_window_context_radius: usize = 16;
+
+fn windowContextMean(
+    features: []const f32,
+    attention_mask: []const f32,
+    flat_index: usize,
+    hidden_index: usize,
+    hidden_size: usize,
+    total_tokens: usize,
+    max_seq_len: usize,
+    comptime direction: enum { left, right },
+) struct { mean: f32, count: usize } {
+    const seq_start = (flat_index / max_seq_len) * max_seq_len;
+    const seq_end = @min(seq_start + max_seq_len, total_tokens);
+    var sum: f32 = 0.0;
+    var count: usize = 0;
+    switch (direction) {
+        .left => {
+            var j = flat_index;
+            while (j > seq_start and count < boundary_window_context_radius) {
+                j -= 1;
+                if (attention_mask[j] <= 0.5) continue;
+                sum += features[j * hidden_size + hidden_index];
+                count += 1;
+            }
+        },
+        .right => {
+            var j = flat_index + 1;
+            while (j < seq_end and count < boundary_window_context_radius) : (j += 1) {
+                if (attention_mask[j] <= 0.5) continue;
+                sum += features[j * hidden_size + hidden_index];
+                count += 1;
+            }
+        },
+    }
+    return .{
+        .mean = if (count == 0) 0.0 else sum / @as(f32, @floatFromInt(count)),
+        .count = count,
+    };
+}
+
+fn scatterWindowContextMeanGrad(
+    out: []f32,
+    attention_mask: []const f32,
+    flat_index: usize,
+    hidden_index: usize,
+    hidden_size: usize,
+    total_tokens: usize,
+    max_seq_len: usize,
+    grad: f32,
+    comptime direction: enum { left, right },
+) void {
+    const seq_start = (flat_index / max_seq_len) * max_seq_len;
+    const seq_end = @min(seq_start + max_seq_len, total_tokens);
+    var count: usize = 0;
+    switch (direction) {
+        .left => {
+            var j = flat_index;
+            while (j > seq_start and count < boundary_window_context_radius) {
+                j -= 1;
+                if (attention_mask[j] <= 0.5) continue;
+                count += 1;
+            }
+            if (count == 0) return;
+            const each = grad / @as(f32, @floatFromInt(count));
+            j = flat_index;
+            var seen: usize = 0;
+            while (j > seq_start and seen < boundary_window_context_radius) {
+                j -= 1;
+                if (attention_mask[j] <= 0.5) continue;
+                out[j * hidden_size + hidden_index] += each;
+                seen += 1;
+            }
+        },
+        .right => {
+            var j = flat_index + 1;
+            while (j < seq_end and count < boundary_window_context_radius) : (j += 1) {
+                if (attention_mask[j] <= 0.5) continue;
+                count += 1;
+            }
+            if (count == 0) return;
+            const each = grad / @as(f32, @floatFromInt(count));
+            j = flat_index + 1;
+            var seen: usize = 0;
+            while (j < seq_end and seen < boundary_window_context_radius) : (j += 1) {
+                if (attention_mask[j] <= 0.5) continue;
+                out[j * hidden_size + hidden_index] += each;
+                seen += 1;
+            }
+        },
+    }
+}
+
+pub fn transformBoundaryFeaturesForHead(
+    allocator: std.mem.Allocator,
+    mode: BoundaryFeatureMode,
+    features: []const f32,
+    attention_mask: []const f32,
+    total_tokens: usize,
+    hidden_size: usize,
+    max_seq_len: usize,
+) !?[]f32 {
+    if (mode == .token) return null;
+    if (max_seq_len == 0) return error.InvalidBoundaryFeatureMaxSeqLen;
+    if (features.len != total_tokens * hidden_size) return error.UnexpectedOutputShape;
+    if (attention_mask.len != total_tokens) return error.UnexpectedOutputShape;
+
+    const head_dim = boundaryFeatureDim(mode, hidden_size);
+    const out = try allocator.alloc(f32, total_tokens * head_dim);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+
+    for (0..total_tokens) |i| {
+        if (attention_mask[i] <= 0.5) continue;
+        const has_prev = hasPreviousValidToken(attention_mask, i, max_seq_len);
+        const has_next = hasNextValidToken(attention_mask, i, total_tokens, max_seq_len);
+        for (0..hidden_size) |k| {
+            const current = features[i * hidden_size + k];
+            const prev = if (has_prev) features[(i - 1) * hidden_size + k] else 0.0;
+            const next = if (has_next) features[(i + 1) * hidden_size + k] else 0.0;
+            switch (mode) {
+                .token => out[i * head_dim + k] = current,
+                .prev_diff => out[i * head_dim + k] = if (has_prev) current - prev else current,
+                .prev_current_diff => out[i * head_dim + k] = if (has_prev) current + (current - prev) else current,
+                .prev_current_diff_concat => {
+                    const base = i * head_dim;
+                    out[base + k] = prev;
+                    out[base + hidden_size + k] = current;
+                    out[base + 2 * hidden_size + k] = if (has_prev) current - prev else current;
+                },
+                .prev_current_next_diff_concat => {
+                    const base = i * head_dim;
+                    out[base + k] = prev;
+                    out[base + hidden_size + k] = current;
+                    out[base + 2 * hidden_size + k] = next;
+                    out[base + 3 * hidden_size + k] = if (has_prev) current - prev else current;
+                    out[base + 4 * hidden_size + k] = if (has_next) current - next else current;
+                },
+                .window_context_diff => {
+                    const left = windowContextMean(features, attention_mask, i, k, hidden_size, total_tokens, max_seq_len, .left).mean;
+                    const right = windowContextMean(features, attention_mask, i, k, hidden_size, total_tokens, max_seq_len, .right).mean;
+                    const base = i * head_dim;
+                    out[base + k] = left;
+                    out[base + hidden_size + k] = current;
+                    out[base + 2 * hidden_size + k] = right;
+                    out[base + 3 * hidden_size + k] = current - left;
+                    out[base + 4 * hidden_size + k] = current - right;
+                },
+            }
+        }
+    }
+
+    return out;
+}
+
+pub fn scatterBoundaryFeatureGradToEncoder(
+    allocator: std.mem.Allocator,
+    mode: BoundaryFeatureMode,
+    transformed_grad: []const f32,
+    attention_mask: []const f32,
+    total_tokens: usize,
+    hidden_size: usize,
+    max_seq_len: usize,
+) !?[]f32 {
+    if (mode == .token) return null;
+    if (max_seq_len == 0) return error.InvalidBoundaryFeatureMaxSeqLen;
+    const head_dim = boundaryFeatureDim(mode, hidden_size);
+    if (transformed_grad.len != total_tokens * head_dim) return error.UnexpectedOutputShape;
+    if (attention_mask.len != total_tokens) return error.UnexpectedOutputShape;
+
+    const out = try allocator.alloc(f32, total_tokens * hidden_size);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+
+    for (0..total_tokens) |i| {
+        if (attention_mask[i] <= 0.5) continue;
+        const has_prev = hasPreviousValidToken(attention_mask, i, max_seq_len);
+        const has_next = hasNextValidToken(attention_mask, i, total_tokens, max_seq_len);
+        for (0..hidden_size) |k| {
+            const grad = transformed_grad[i * head_dim + k];
+            switch (mode) {
+                .token => out[i * hidden_size + k] += grad,
+                .prev_diff => {
+                    out[i * hidden_size + k] += grad;
+                    if (has_prev) out[(i - 1) * hidden_size + k] -= grad;
+                },
+                .prev_current_diff => {
+                    out[i * hidden_size + k] += if (has_prev) 2.0 * grad else grad;
+                    if (has_prev) out[(i - 1) * hidden_size + k] -= grad;
+                },
+                .prev_current_diff_concat => {
+                    const base = i * head_dim;
+                    const prev_grad = transformed_grad[base + k];
+                    const current_grad = transformed_grad[base + hidden_size + k];
+                    const diff_grad = transformed_grad[base + 2 * hidden_size + k];
+                    out[i * hidden_size + k] += current_grad + diff_grad;
+                    if (has_prev) {
+                        out[(i - 1) * hidden_size + k] += prev_grad - diff_grad;
+                    }
+                },
+                .prev_current_next_diff_concat => {
+                    const base = i * head_dim;
+                    const prev_grad = transformed_grad[base + k];
+                    const current_grad = transformed_grad[base + hidden_size + k];
+                    const next_grad = transformed_grad[base + 2 * hidden_size + k];
+                    const diff_prev_grad = transformed_grad[base + 3 * hidden_size + k];
+                    const diff_next_grad = transformed_grad[base + 4 * hidden_size + k];
+                    out[i * hidden_size + k] += current_grad + diff_prev_grad + diff_next_grad;
+                    if (has_prev) out[(i - 1) * hidden_size + k] += prev_grad - diff_prev_grad;
+                    if (has_next) out[(i + 1) * hidden_size + k] += next_grad - diff_next_grad;
+                },
+                .window_context_diff => {
+                    const base = i * head_dim;
+                    const left_grad = transformed_grad[base + k];
+                    const current_grad = transformed_grad[base + hidden_size + k];
+                    const right_grad = transformed_grad[base + 2 * hidden_size + k];
+                    const diff_left_grad = transformed_grad[base + 3 * hidden_size + k];
+                    const diff_right_grad = transformed_grad[base + 4 * hidden_size + k];
+                    out[i * hidden_size + k] += current_grad + diff_left_grad + diff_right_grad;
+                    scatterWindowContextMeanGrad(out, attention_mask, i, k, hidden_size, total_tokens, max_seq_len, left_grad - diff_left_grad, .left);
+                    scatterWindowContextMeanGrad(out, attention_mask, i, k, hidden_size, total_tokens, max_seq_len, right_grad - diff_right_grad, .right);
+                },
+            }
+        }
+    }
+
+    return out;
+}
+
 pub const LegacyDenseBoundaryHead = struct {
     allocator: std.mem.Allocator,
     weight: []f32, // [2, hidden_dim]
@@ -423,6 +722,9 @@ pub const LegacyDenseBoundaryHead = struct {
 
 pub const TrainStepSummary = struct {
     boundary_loss: f32 = 0,
+    boundary_ce_loss: f32 = 0,
+    boundary_rank_loss: f32 = 0,
+    boundary_local_window_loss: f32 = 0,
     contrastive_loss: f64 = 0,
     total_loss: f32 = 0,
     boundary_grad_norm: f64 = 0,
@@ -431,6 +733,7 @@ pub const TrainStepSummary = struct {
     boundary_fn: u64 = 0,
     step: u32 = 0,
     learning_rate: f32 = 0,
+    boundary_head_learning_rate: f32 = 0,
 };
 
 pub const TrainStepWithGradSummary = struct {
@@ -507,7 +810,7 @@ pub const BoundaryCheckpointProbe = struct {
 // ----------------------------------------------------------------------------
 
 pub const EvalSummary = struct {
-    pub const diagnostic_threshold_count = 9;
+    pub const diagnostic_threshold_count = 14;
     pub const histogram_bucket_count = 10;
 
     pub const ThresholdPoint = struct {
@@ -534,6 +837,76 @@ pub const EvalSummary = struct {
     best_boundary_tp: u64 = 0,
     best_boundary_fp: u64 = 0,
     best_boundary_fn: u64 = 0,
+    calibrated_threshold_available: bool = false,
+    calibrated_boundary_threshold: f32 = 0,
+    calibrated_boundary_f1: f32 = 0,
+    calibrated_boundary_precision: f32 = 0,
+    calibrated_boundary_recall: f32 = 0,
+    calibrated_boundary_tp: u64 = 0,
+    calibrated_boundary_fp: u64 = 0,
+    calibrated_boundary_fn: u64 = 0,
+    calibrated_predicted_positive_rate: f32 = 0,
+    fitted_threshold_available: bool = false,
+    fitted_boundary_threshold: f32 = 0,
+    fitted_boundary_f1: f32 = 0,
+    fitted_boundary_precision: f32 = 0,
+    fitted_boundary_recall: f32 = 0,
+    fitted_boundary_tp: u64 = 0,
+    fitted_boundary_fp: u64 = 0,
+    fitted_boundary_fn: u64 = 0,
+    fitted_predicted_positive_rate: f32 = 0,
+    average_precision: f32 = 0,
+    precision_at_gold_count: f32 = 0,
+    recall_at_gold_count: f32 = 0,
+    f1_at_gold_count: f32 = 0,
+    threshold_at_gold_count: f32 = 0,
+    predicted_positive_rate_at_gold_count: f32 = 0,
+    gold_count_tp: u64 = 0,
+    gold_count_fp: u64 = 0,
+    gold_count_fn: u64 = 0,
+    max_rank_f1: f32 = 0,
+    max_rank_precision: f32 = 0,
+    max_rank_recall: f32 = 0,
+    max_rank_threshold: f32 = 0,
+    max_rank_predicted_positive_rate: f32 = 0,
+    max_rank_tp: u64 = 0,
+    max_rank_fp: u64 = 0,
+    max_rank_fn: u64 = 0,
+    sample_oracle_count_samples: u64 = 0,
+    sample_oracle_count_topk_f1: f32 = 0,
+    sample_oracle_count_topk_precision: f32 = 0,
+    sample_oracle_count_topk_recall: f32 = 0,
+    sample_oracle_count_topk_tp: u64 = 0,
+    sample_oracle_count_topk_fp: u64 = 0,
+    sample_oracle_count_topk_fn: u64 = 0,
+    sample_oracle_count_nms_f1: f32 = 0,
+    sample_oracle_count_nms_precision: f32 = 0,
+    sample_oracle_count_nms_recall: f32 = 0,
+    sample_oracle_count_nms_tp: u64 = 0,
+    sample_oracle_count_nms_fp: u64 = 0,
+    sample_oracle_count_nms_fn: u64 = 0,
+    sample_oracle_count_nms_radius: u32 = 8,
+    sample_oracle_count_length_window_f1: f32 = 0,
+    sample_oracle_count_length_window_precision: f32 = 0,
+    sample_oracle_count_length_window_recall: f32 = 0,
+    sample_oracle_count_length_window_tp: u64 = 0,
+    sample_oracle_count_length_window_fp: u64 = 0,
+    sample_oracle_count_length_window_fn: u64 = 0,
+    sample_oracle_count_length_window_min_radius: u32 = 16,
+    sample_oracle_count_length_window_radius_fraction: f32 = 0.35,
+    gold_positive_mean_rank: f32 = 0,
+    gold_positive_mean_rank_percentile: f32 = 0,
+    gold_positive_median_rank: u64 = 0,
+    gold_positive_median_rank_percentile: f32 = 0,
+    gold_positive_p90_rank: u64 = 0,
+    gold_positive_p90_rank_percentile: f32 = 0,
+    gold_positive_p99_rank: u64 = 0,
+    gold_positive_p99_rank_percentile: f32 = 0,
+    gold_positive_worst_rank: u64 = 0,
+    gold_positive_top_5x_count: u64 = 0,
+    gold_positive_top_5x_recall: f32 = 0,
+    gold_positive_top_10x_count: u64 = 0,
+    gold_positive_top_10x_recall: f32 = 0,
     valid_tokens: u64 = 0,
     gold_positives: u64 = 0,
     gold_positive_rate: f32 = 0,
@@ -557,10 +930,69 @@ pub const EvalSummary = struct {
 
 pub const BoundaryEvalAccumulator = struct {
     pub const sweep_count = 101;
-    pub const diagnostic_thresholds = [_]f32{ 0.01, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50 };
+    pub const oracle_count_nms_radius = 8;
+    pub const oracle_count_length_window_min_radius = 16;
+    pub const oracle_count_length_window_radius_fraction: f32 = 0.35;
+    pub const diagnostic_thresholds = [_]f32{ 0.01, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 0.80, 0.90, 0.95, 0.99 };
+
+    const RankItem = struct {
+        probability: f32,
+        label: bool,
+        ordinal: u64,
+    };
+
+    const SequenceRankItem = struct {
+        probability: f32,
+        label: bool,
+        position: usize,
+        ordinal: u64,
+    };
+
+    const RankMetrics = struct {
+        average_precision: f32 = 0,
+        precision_at_gold_count: f32 = 0,
+        recall_at_gold_count: f32 = 0,
+        f1_at_gold_count: f32 = 0,
+        threshold_at_gold_count: f32 = 0,
+        predicted_positive_rate_at_gold_count: f32 = 0,
+        gold_count_tp: u64 = 0,
+        gold_count_fp: u64 = 0,
+        gold_count_fn: u64 = 0,
+        max_rank_f1: f32 = 0,
+        max_rank_precision: f32 = 0,
+        max_rank_recall: f32 = 0,
+        max_rank_threshold: f32 = 0,
+        max_rank_predicted_positive_rate: f32 = 0,
+        max_rank_tp: u64 = 0,
+        max_rank_fp: u64 = 0,
+        max_rank_fn: u64 = 0,
+        gold_positive_mean_rank: f32 = 0,
+        gold_positive_mean_rank_percentile: f32 = 0,
+        gold_positive_median_rank: u64 = 0,
+        gold_positive_median_rank_percentile: f32 = 0,
+        gold_positive_p90_rank: u64 = 0,
+        gold_positive_p90_rank_percentile: f32 = 0,
+        gold_positive_p99_rank: u64 = 0,
+        gold_positive_p99_rank_percentile: f32 = 0,
+        gold_positive_worst_rank: u64 = 0,
+        gold_positive_top_5x_count: u64 = 0,
+        gold_positive_top_5x_recall: f32 = 0,
+        gold_positive_top_10x_count: u64 = 0,
+        gold_positive_top_10x_recall: f32 = 0,
+    };
 
     agg: fused_chunker_loss.BoundaryMetrics = .{ .tp = 0, .fp = 0, .fn_ = 0 },
     sweep_metrics: [sweep_count]fused_chunker_loss.BoundaryMetrics = [_]fused_chunker_loss.BoundaryMetrics{.{ .tp = 0, .fp = 0, .fn_ = 0 }} ** sweep_count,
+    rank_items: std.ArrayListUnmanaged(RankItem) = .empty,
+    calibrated_threshold: ?f32 = null,
+    fitted_threshold: ?f32 = null,
+    sample_oracle_count_topk: fused_chunker_loss.BoundaryMetrics = .{ .tp = 0, .fp = 0, .fn_ = 0 },
+    sample_oracle_count_nms: fused_chunker_loss.BoundaryMetrics = .{ .tp = 0, .fp = 0, .fn_ = 0 },
+    sample_oracle_count_length_window: fused_chunker_loss.BoundaryMetrics = .{ .tp = 0, .fp = 0, .fn_ = 0 },
+    sample_oracle_count_samples: u64 = 0,
+    sample_oracle_count_nms_radius: u32 = oracle_count_nms_radius,
+    sample_oracle_count_length_window_min_radius: u32 = oracle_count_length_window_min_radius,
+    sample_oracle_count_length_window_radius_fraction: f32 = oracle_count_length_window_radius_fraction,
     valid_tokens: u64 = 0,
     gold_positives: u64 = 0,
     prob_sum_gold_positive: f64 = 0,
@@ -581,12 +1013,280 @@ pub const BoundaryEvalAccumulator = struct {
         return @min(@as(usize, @intFromFloat(prob * @as(f32, @floatFromInt(EvalSummary.histogram_bucket_count)))), EvalSummary.histogram_bucket_count - 1);
     }
 
+    pub fn deinit(self: *BoundaryEvalAccumulator, allocator: std.mem.Allocator) void {
+        self.rank_items.deinit(allocator);
+    }
+
+    fn rankProbability(prob: f32) f32 {
+        return if (std.math.isFinite(prob)) prob else -std.math.floatMax(f32);
+    }
+
+    fn rankItemGreaterThan(_: void, a: RankItem, b: RankItem) bool {
+        const pa = rankProbability(a.probability);
+        const pb = rankProbability(b.probability);
+        if (pa == pb) return a.ordinal < b.ordinal;
+        return pa > pb;
+    }
+
+    fn sequenceRankItemGreaterThan(_: void, a: SequenceRankItem, b: SequenceRankItem) bool {
+        const pa = rankProbability(a.probability);
+        const pb = rankProbability(b.probability);
+        if (pa == pb) return a.ordinal < b.ordinal;
+        return pa > pb;
+    }
+
+    fn f1FromPrecisionRecall(precision: f32, recall: f32) f32 {
+        const denom = precision + recall;
+        return if (denom == 0) 0 else (2.0 * precision * recall) / denom;
+    }
+
+    fn percentileRank(ranks: []const u64, percentile: f32) u64 {
+        if (ranks.len == 0) return 0;
+        const raw_idx: usize = @intFromFloat(@ceil(percentile * @as(f32, @floatFromInt(ranks.len))));
+        const idx = if (raw_idx == 0) 0 else @min(raw_idx - 1, ranks.len - 1);
+        return ranks[idx];
+    }
+
+    fn computeRankMetrics(self: BoundaryEvalAccumulator, allocator: std.mem.Allocator) !RankMetrics {
+        if (self.rank_items.items.len == 0 or self.gold_positives == 0) return .{};
+
+        const items = try allocator.dupe(RankItem, self.rank_items.items);
+        defer allocator.free(items);
+        std.mem.sort(RankItem, items, {}, rankItemGreaterThan);
+        const gold_ranks = try allocator.alloc(u64, @intCast(self.gold_positives));
+        defer allocator.free(gold_ranks);
+
+        const valid_f: f32 = @floatFromInt(self.valid_tokens);
+        const gold_f: f32 = @floatFromInt(self.gold_positives);
+        const gold_cutoff: usize = @min(@as(usize, @intCast(self.gold_positives)), items.len);
+        const top_5x_cutoff: usize = @min(items.len, gold_cutoff *| 5);
+        const top_10x_cutoff: usize = @min(items.len, gold_cutoff *| 10);
+
+        var metrics = RankMetrics{};
+        var tp_seen: u64 = 0;
+        var ap_sum: f64 = 0;
+        var rank_sum: f64 = 0;
+
+        for (items, 0..) |item, i| {
+            const rank = i + 1;
+            if (item.label) {
+                gold_ranks[@intCast(tp_seen)] = @intCast(rank);
+                tp_seen += 1;
+                ap_sum += @as(f64, @floatFromInt(tp_seen)) / @as(f64, @floatFromInt(rank));
+                rank_sum += @as(f64, @floatFromInt(rank));
+                if (rank <= top_5x_cutoff) metrics.gold_positive_top_5x_count += 1;
+                if (rank <= top_10x_cutoff) metrics.gold_positive_top_10x_count += 1;
+            }
+
+            if (rank == gold_cutoff) {
+                metrics.gold_count_tp = tp_seen;
+                metrics.gold_count_fp = @as(u64, @intCast(gold_cutoff)) - tp_seen;
+                metrics.gold_count_fn = self.gold_positives - tp_seen;
+                metrics.precision_at_gold_count = @as(f32, @floatFromInt(tp_seen)) / @as(f32, @floatFromInt(gold_cutoff));
+                metrics.recall_at_gold_count = @as(f32, @floatFromInt(tp_seen)) / gold_f;
+                metrics.f1_at_gold_count = f1FromPrecisionRecall(metrics.precision_at_gold_count, metrics.recall_at_gold_count);
+                metrics.threshold_at_gold_count = item.probability;
+                metrics.predicted_positive_rate_at_gold_count = @as(f32, @floatFromInt(gold_cutoff)) / valid_f;
+            }
+
+            const rank_f: f32 = @floatFromInt(rank);
+            const precision = @as(f32, @floatFromInt(tp_seen)) / rank_f;
+            const recall = @as(f32, @floatFromInt(tp_seen)) / gold_f;
+            const f1 = f1FromPrecisionRecall(precision, recall);
+            if (f1 > metrics.max_rank_f1) {
+                metrics.max_rank_f1 = f1;
+                metrics.max_rank_precision = precision;
+                metrics.max_rank_recall = recall;
+                metrics.max_rank_threshold = item.probability;
+                metrics.max_rank_predicted_positive_rate = rank_f / valid_f;
+                metrics.max_rank_tp = tp_seen;
+                metrics.max_rank_fp = @as(u64, @intCast(rank)) - tp_seen;
+                metrics.max_rank_fn = self.gold_positives - tp_seen;
+            }
+        }
+
+        metrics.average_precision = @as(f32, @floatCast(ap_sum / @as(f64, @floatFromInt(self.gold_positives))));
+        metrics.gold_positive_mean_rank = @as(f32, @floatCast(rank_sum / @as(f64, @floatFromInt(self.gold_positives))));
+        metrics.gold_positive_mean_rank_percentile = metrics.gold_positive_mean_rank / valid_f;
+        metrics.gold_positive_median_rank = percentileRank(gold_ranks, 0.50);
+        metrics.gold_positive_median_rank_percentile = @as(f32, @floatFromInt(metrics.gold_positive_median_rank)) / valid_f;
+        metrics.gold_positive_p90_rank = percentileRank(gold_ranks, 0.90);
+        metrics.gold_positive_p90_rank_percentile = @as(f32, @floatFromInt(metrics.gold_positive_p90_rank)) / valid_f;
+        metrics.gold_positive_p99_rank = percentileRank(gold_ranks, 0.99);
+        metrics.gold_positive_p99_rank_percentile = @as(f32, @floatFromInt(metrics.gold_positive_p99_rank)) / valid_f;
+        metrics.gold_positive_worst_rank = gold_ranks[gold_ranks.len - 1];
+        metrics.gold_positive_top_5x_recall = @as(f32, @floatFromInt(metrics.gold_positive_top_5x_count)) / gold_f;
+        metrics.gold_positive_top_10x_recall = @as(f32, @floatFromInt(metrics.gold_positive_top_10x_count)) / gold_f;
+        return metrics;
+    }
+
+    fn computeMetricsAtProbabilityThreshold(self: BoundaryEvalAccumulator, threshold: f32) fused_chunker_loss.BoundaryMetrics {
+        var metrics = fused_chunker_loss.BoundaryMetrics{ .tp = 0, .fp = 0, .fn_ = 0 };
+        for (self.rank_items.items) |item| {
+            const predicted = item.probability > threshold;
+            if (predicted and item.label) {
+                metrics.tp += 1;
+            } else if (predicted and !item.label) {
+                metrics.fp += 1;
+            } else if (!predicted and item.label) {
+                metrics.fn_ += 1;
+            }
+        }
+        return metrics;
+    }
+
+    fn positionsWithinRadius(a: usize, b: usize, radius: u32) bool {
+        const delta = if (a >= b) a - b else b - a;
+        return delta <= radius;
+    }
+
+    fn positionAlreadySelected(position: usize, selected_positions: []const usize) bool {
+        for (selected_positions) |selected_position| {
+            if (position == selected_position) return true;
+        }
+        return false;
+    }
+
+    fn addSampleOracleCountMetrics(
+        self: *BoundaryEvalAccumulator,
+        allocator: std.mem.Allocator,
+        logits: []const f32,
+        scalar_labels: []const f32,
+        mask: ?[]const f32,
+        max_seq_len: usize,
+    ) !void {
+        if (max_seq_len == 0) return error.InvalidBoundaryEvalMaxSeqLen;
+        const total = scalar_labels.len;
+        if (logits.len < total * 2) return error.InvalidBoundaryLogitShape;
+
+        var base: usize = 0;
+        while (base < total) : (base += max_seq_len) {
+            const end = @min(base + max_seq_len, total);
+            const seq_len = end - base;
+            var items = try allocator.alloc(SequenceRankItem, seq_len);
+            defer allocator.free(items);
+
+            var active_count: usize = 0;
+            var gold_count: u64 = 0;
+            for (base..end) |flat_idx| {
+                if (mask) |m| {
+                    if (m[flat_idx] <= 0.5) continue;
+                }
+                const label = scalar_labels[flat_idx] > 0.5;
+                if (label) gold_count += 1;
+                items[active_count] = .{
+                    .probability = fused_chunker_loss.positiveBoundaryProbability(logits[flat_idx * 2], logits[flat_idx * 2 + 1]),
+                    .label = label,
+                    .position = flat_idx - base,
+                    .ordinal = @intCast(flat_idx),
+                };
+                active_count += 1;
+            }
+
+            if (active_count == 0 or gold_count == 0) continue;
+            self.sample_oracle_count_samples += 1;
+
+            const active_items = items[0..active_count];
+            std.mem.sort(SequenceRankItem, active_items, {}, sequenceRankItemGreaterThan);
+            const target_count: usize = @min(@as(usize, @intCast(gold_count)), active_count);
+
+            var topk_tp: u64 = 0;
+            for (active_items[0..target_count]) |item| {
+                if (item.label) topk_tp += 1;
+            }
+            self.sample_oracle_count_topk.tp += topk_tp;
+            self.sample_oracle_count_topk.fp += @as(u64, @intCast(target_count)) - topk_tp;
+            self.sample_oracle_count_topk.fn_ += gold_count - topk_tp;
+
+            var selected_positions = try allocator.alloc(usize, target_count);
+            defer allocator.free(selected_positions);
+            var selected_count: usize = 0;
+            var nms_tp: u64 = 0;
+            for (active_items) |item| {
+                if (selected_count >= target_count) break;
+                var suppressed = false;
+                for (selected_positions[0..selected_count]) |selected_position| {
+                    if (positionsWithinRadius(item.position, selected_position, self.sample_oracle_count_nms_radius)) {
+                        suppressed = true;
+                        break;
+                    }
+                }
+                if (suppressed) continue;
+                selected_positions[selected_count] = item.position;
+                selected_count += 1;
+                if (item.label) nms_tp += 1;
+            }
+            self.sample_oracle_count_nms.tp += nms_tp;
+            self.sample_oracle_count_nms.fp += @as(u64, @intCast(selected_count)) - nms_tp;
+            self.sample_oracle_count_nms.fn_ += gold_count - nms_tp;
+
+            var length_selected_positions = try allocator.alloc(usize, target_count);
+            defer allocator.free(length_selected_positions);
+            var length_selected_count: usize = 0;
+            var length_window_tp: u64 = 0;
+            const segment_len = @as(f32, @floatFromInt(active_count)) / @as(f32, @floatFromInt(gold_count + 1));
+            const dynamic_radius: u32 = @intFromFloat(@ceil(segment_len * self.sample_oracle_count_length_window_radius_fraction));
+            const window_radius = @max(self.sample_oracle_count_length_window_min_radius, dynamic_radius);
+            for (0..target_count) |slot_idx| {
+                const boundary_ordinal = slot_idx + 1;
+                const center_f = segment_len * @as(f32, @floatFromInt(boundary_ordinal));
+                const center_position = @min(@as(usize, @intFromFloat(@round(center_f))), seq_len - 1);
+
+                var chosen_index: ?usize = null;
+                for (active_items, 0..) |item, item_idx| {
+                    if (positionAlreadySelected(item.position, length_selected_positions[0..length_selected_count])) continue;
+                    if (!positionsWithinRadius(item.position, center_position, window_radius)) continue;
+                    chosen_index = item_idx;
+                    break;
+                }
+                if (chosen_index == null) {
+                    for (active_items, 0..) |item, item_idx| {
+                        if (positionAlreadySelected(item.position, length_selected_positions[0..length_selected_count])) continue;
+                        chosen_index = item_idx;
+                        break;
+                    }
+                }
+                if (chosen_index) |item_idx| {
+                    const item = active_items[item_idx];
+                    length_selected_positions[length_selected_count] = item.position;
+                    length_selected_count += 1;
+                    if (item.label) length_window_tp += 1;
+                }
+            }
+            self.sample_oracle_count_length_window.tp += length_window_tp;
+            self.sample_oracle_count_length_window.fp += @as(u64, @intCast(length_selected_count)) - length_window_tp;
+            self.sample_oracle_count_length_window.fn_ += gold_count - length_window_tp;
+        }
+    }
+
     pub fn addLogits(
         self: *BoundaryEvalAccumulator,
         allocator: std.mem.Allocator,
         logits: []const f32,
         labels: []const f32,
         mask: ?[]const f32,
+    ) !void {
+        try self.addLogitsInternal(allocator, logits, labels, mask, null);
+    }
+
+    pub fn addLogitsBySample(
+        self: *BoundaryEvalAccumulator,
+        allocator: std.mem.Allocator,
+        logits: []const f32,
+        labels: []const f32,
+        mask: ?[]const f32,
+        max_seq_len: usize,
+    ) !void {
+        try self.addLogitsInternal(allocator, logits, labels, mask, max_seq_len);
+    }
+
+    fn addLogitsInternal(
+        self: *BoundaryEvalAccumulator,
+        allocator: std.mem.Allocator,
+        logits: []const f32,
+        labels: []const f32,
+        mask: ?[]const f32,
+        max_seq_len: ?usize,
     ) !void {
         if (labels.len % 2 != 0) return error.InvalidBoundaryLabelShape;
         const total = labels.len / 2;
@@ -606,7 +1306,13 @@ pub const BoundaryEvalAccumulator = struct {
             const margin = logit1 - logit0;
             const prob = fused_chunker_loss.positiveBoundaryProbability(logit0, logit1);
             const bucket = probabilityBucket(prob);
-            if (scalar_labels[i] > 0.5) {
+            const is_positive = scalar_labels[i] > 0.5;
+            try self.rank_items.append(allocator, .{
+                .probability = prob,
+                .label = is_positive,
+                .ordinal = self.valid_tokens - 1,
+            });
+            if (is_positive) {
                 self.gold_positives += 1;
                 self.prob_sum_gold_positive += prob;
                 self.margin_sum_gold_positive += margin;
@@ -620,6 +1326,10 @@ pub const BoundaryEvalAccumulator = struct {
                 self.logit1_sum_gold_negative += logit1;
                 self.probability_histogram_gold_negative[bucket] += 1;
             }
+        }
+
+        if (max_seq_len) |seq_len| {
+            try self.addSampleOracleCountMetrics(allocator, logits, scalar_labels, mask, seq_len);
         }
 
         const metrics = fused_chunker_loss.computeBoundaryMetrics(logits, scalar_labels, mask);
@@ -637,7 +1347,7 @@ pub const BoundaryEvalAccumulator = struct {
         self.num_batches += 1;
     }
 
-    pub fn finish(self: BoundaryEvalAccumulator) EvalSummary {
+    pub fn finish(self: BoundaryEvalAccumulator, allocator: std.mem.Allocator) !EvalSummary {
         var best_idx: usize = 50;
         var best_metrics = self.sweep_metrics[best_idx];
         var best_f1 = best_metrics.f1();
@@ -714,6 +1424,19 @@ pub const BoundaryEvalAccumulator = struct {
                 .predicted_positive_rate = if (self.valid_tokens == 0) 0.0 else @as(f32, @floatFromInt(predicted)) / valid_f,
             };
         }
+        const rank_metrics = try self.computeRankMetrics(allocator);
+        const calibrated_threshold = self.calibrated_threshold orelse 0.0;
+        const calibrated_metrics = if (self.calibrated_threshold != null)
+            self.computeMetricsAtProbabilityThreshold(calibrated_threshold)
+        else
+            fused_chunker_loss.BoundaryMetrics{ .tp = 0, .fp = 0, .fn_ = 0 };
+        const calibrated_predicted = calibrated_metrics.tp + calibrated_metrics.fp;
+        const fitted_threshold = self.fitted_threshold orelse 0.0;
+        const fitted_metrics = if (self.fitted_threshold != null)
+            self.computeMetricsAtProbabilityThreshold(fitted_threshold)
+        else
+            fused_chunker_loss.BoundaryMetrics{ .tp = 0, .fp = 0, .fn_ = 0 };
+        const fitted_predicted = fitted_metrics.tp + fitted_metrics.fp;
 
         return EvalSummary{
             .boundary_f1 = self.agg.f1(),
@@ -729,6 +1452,76 @@ pub const BoundaryEvalAccumulator = struct {
             .best_boundary_tp = best_metrics.tp,
             .best_boundary_fp = best_metrics.fp,
             .best_boundary_fn = best_metrics.fn_,
+            .calibrated_threshold_available = self.calibrated_threshold != null,
+            .calibrated_boundary_threshold = calibrated_threshold,
+            .calibrated_boundary_f1 = calibrated_metrics.f1(),
+            .calibrated_boundary_precision = calibrated_metrics.precision(),
+            .calibrated_boundary_recall = calibrated_metrics.recall(),
+            .calibrated_boundary_tp = calibrated_metrics.tp,
+            .calibrated_boundary_fp = calibrated_metrics.fp,
+            .calibrated_boundary_fn = calibrated_metrics.fn_,
+            .calibrated_predicted_positive_rate = if (self.valid_tokens == 0) 0.0 else @as(f32, @floatFromInt(calibrated_predicted)) / valid_f,
+            .fitted_threshold_available = self.fitted_threshold != null,
+            .fitted_boundary_threshold = fitted_threshold,
+            .fitted_boundary_f1 = fitted_metrics.f1(),
+            .fitted_boundary_precision = fitted_metrics.precision(),
+            .fitted_boundary_recall = fitted_metrics.recall(),
+            .fitted_boundary_tp = fitted_metrics.tp,
+            .fitted_boundary_fp = fitted_metrics.fp,
+            .fitted_boundary_fn = fitted_metrics.fn_,
+            .fitted_predicted_positive_rate = if (self.valid_tokens == 0) 0.0 else @as(f32, @floatFromInt(fitted_predicted)) / valid_f,
+            .average_precision = rank_metrics.average_precision,
+            .precision_at_gold_count = rank_metrics.precision_at_gold_count,
+            .recall_at_gold_count = rank_metrics.recall_at_gold_count,
+            .f1_at_gold_count = rank_metrics.f1_at_gold_count,
+            .threshold_at_gold_count = rank_metrics.threshold_at_gold_count,
+            .predicted_positive_rate_at_gold_count = rank_metrics.predicted_positive_rate_at_gold_count,
+            .gold_count_tp = rank_metrics.gold_count_tp,
+            .gold_count_fp = rank_metrics.gold_count_fp,
+            .gold_count_fn = rank_metrics.gold_count_fn,
+            .max_rank_f1 = rank_metrics.max_rank_f1,
+            .max_rank_precision = rank_metrics.max_rank_precision,
+            .max_rank_recall = rank_metrics.max_rank_recall,
+            .max_rank_threshold = rank_metrics.max_rank_threshold,
+            .max_rank_predicted_positive_rate = rank_metrics.max_rank_predicted_positive_rate,
+            .max_rank_tp = rank_metrics.max_rank_tp,
+            .max_rank_fp = rank_metrics.max_rank_fp,
+            .max_rank_fn = rank_metrics.max_rank_fn,
+            .sample_oracle_count_samples = self.sample_oracle_count_samples,
+            .sample_oracle_count_topk_f1 = self.sample_oracle_count_topk.f1(),
+            .sample_oracle_count_topk_precision = self.sample_oracle_count_topk.precision(),
+            .sample_oracle_count_topk_recall = self.sample_oracle_count_topk.recall(),
+            .sample_oracle_count_topk_tp = self.sample_oracle_count_topk.tp,
+            .sample_oracle_count_topk_fp = self.sample_oracle_count_topk.fp,
+            .sample_oracle_count_topk_fn = self.sample_oracle_count_topk.fn_,
+            .sample_oracle_count_nms_f1 = self.sample_oracle_count_nms.f1(),
+            .sample_oracle_count_nms_precision = self.sample_oracle_count_nms.precision(),
+            .sample_oracle_count_nms_recall = self.sample_oracle_count_nms.recall(),
+            .sample_oracle_count_nms_tp = self.sample_oracle_count_nms.tp,
+            .sample_oracle_count_nms_fp = self.sample_oracle_count_nms.fp,
+            .sample_oracle_count_nms_fn = self.sample_oracle_count_nms.fn_,
+            .sample_oracle_count_nms_radius = self.sample_oracle_count_nms_radius,
+            .sample_oracle_count_length_window_f1 = self.sample_oracle_count_length_window.f1(),
+            .sample_oracle_count_length_window_precision = self.sample_oracle_count_length_window.precision(),
+            .sample_oracle_count_length_window_recall = self.sample_oracle_count_length_window.recall(),
+            .sample_oracle_count_length_window_tp = self.sample_oracle_count_length_window.tp,
+            .sample_oracle_count_length_window_fp = self.sample_oracle_count_length_window.fp,
+            .sample_oracle_count_length_window_fn = self.sample_oracle_count_length_window.fn_,
+            .sample_oracle_count_length_window_min_radius = self.sample_oracle_count_length_window_min_radius,
+            .sample_oracle_count_length_window_radius_fraction = self.sample_oracle_count_length_window_radius_fraction,
+            .gold_positive_mean_rank = rank_metrics.gold_positive_mean_rank,
+            .gold_positive_mean_rank_percentile = rank_metrics.gold_positive_mean_rank_percentile,
+            .gold_positive_median_rank = rank_metrics.gold_positive_median_rank,
+            .gold_positive_median_rank_percentile = rank_metrics.gold_positive_median_rank_percentile,
+            .gold_positive_p90_rank = rank_metrics.gold_positive_p90_rank,
+            .gold_positive_p90_rank_percentile = rank_metrics.gold_positive_p90_rank_percentile,
+            .gold_positive_p99_rank = rank_metrics.gold_positive_p99_rank,
+            .gold_positive_p99_rank_percentile = rank_metrics.gold_positive_p99_rank_percentile,
+            .gold_positive_worst_rank = rank_metrics.gold_positive_worst_rank,
+            .gold_positive_top_5x_count = rank_metrics.gold_positive_top_5x_count,
+            .gold_positive_top_5x_recall = rank_metrics.gold_positive_top_5x_recall,
+            .gold_positive_top_10x_count = rank_metrics.gold_positive_top_10x_count,
+            .gold_positive_top_10x_recall = rank_metrics.gold_positive_top_10x_recall,
             .valid_tokens = self.valid_tokens,
             .gold_positives = self.gold_positives,
             .gold_positive_rate = gold_positive_rate,
@@ -753,6 +1546,55 @@ pub const BoundaryEvalAccumulator = struct {
 };
 
 pub fn printBoundaryQualityDiagnostics(label: []const u8, summary: EvalSummary) void {
+    std.debug.print("{s} rank_metrics ap={d:.6} p_at_gold={d:.4} r_at_gold={d:.4} f1_at_gold={d:.4} threshold_at_gold={d:.6} pred_at_gold={d:.6} counts_at_gold tp={d} fp={d} fn={d} max_rank_f1={d:.4} max_rank_p={d:.4} max_rank_r={d:.4} max_rank_threshold={d:.6} max_rank_pred={d:.6} max_rank_counts tp={d} fp={d} fn={d}\n", .{
+        label,
+        summary.average_precision,
+        summary.precision_at_gold_count,
+        summary.recall_at_gold_count,
+        summary.f1_at_gold_count,
+        summary.threshold_at_gold_count,
+        summary.predicted_positive_rate_at_gold_count,
+        summary.gold_count_tp,
+        summary.gold_count_fp,
+        summary.gold_count_fn,
+        summary.max_rank_f1,
+        summary.max_rank_precision,
+        summary.max_rank_recall,
+        summary.max_rank_threshold,
+        summary.max_rank_predicted_positive_rate,
+        summary.max_rank_tp,
+        summary.max_rank_fp,
+        summary.max_rank_fn,
+    });
+
+    if (summary.sample_oracle_count_samples > 0) {
+        std.debug.print("{s} sample_oracle_count samples={d} topk_f1={d:.4} topk_p={d:.4} topk_r={d:.4} topk_counts tp={d} fp={d} fn={d} nms_f1={d:.4} nms_p={d:.4} nms_r={d:.4} nms_radius={d} nms_counts tp={d} fp={d} fn={d} length_window_f1={d:.4} length_window_p={d:.4} length_window_r={d:.4} length_window_min_radius={d} length_window_radius_fraction={d:.3} length_window_counts tp={d} fp={d} fn={d}\n", .{
+            label,
+            summary.sample_oracle_count_samples,
+            summary.sample_oracle_count_topk_f1,
+            summary.sample_oracle_count_topk_precision,
+            summary.sample_oracle_count_topk_recall,
+            summary.sample_oracle_count_topk_tp,
+            summary.sample_oracle_count_topk_fp,
+            summary.sample_oracle_count_topk_fn,
+            summary.sample_oracle_count_nms_f1,
+            summary.sample_oracle_count_nms_precision,
+            summary.sample_oracle_count_nms_recall,
+            summary.sample_oracle_count_nms_radius,
+            summary.sample_oracle_count_nms_tp,
+            summary.sample_oracle_count_nms_fp,
+            summary.sample_oracle_count_nms_fn,
+            summary.sample_oracle_count_length_window_f1,
+            summary.sample_oracle_count_length_window_precision,
+            summary.sample_oracle_count_length_window_recall,
+            summary.sample_oracle_count_length_window_min_radius,
+            summary.sample_oracle_count_length_window_radius_fraction,
+            summary.sample_oracle_count_length_window_tp,
+            summary.sample_oracle_count_length_window_fp,
+            summary.sample_oracle_count_length_window_fn,
+        });
+    }
+
     std.debug.print("{s} margin_means gold_pos={d:.6} gold_neg={d:.6} logit0_pos={d:.6} logit1_pos={d:.6} logit0_neg={d:.6} logit1_neg={d:.6}\n", .{
         label,
         summary.mean_boundary_margin_gold_positive,
@@ -761,6 +1603,51 @@ pub fn printBoundaryQualityDiagnostics(label: []const u8, summary: EvalSummary) 
         summary.mean_logit1_gold_positive,
         summary.mean_logit0_gold_negative,
         summary.mean_logit1_gold_negative,
+    });
+
+    if (summary.calibrated_threshold_available) {
+        std.debug.print("{s} calibrated_threshold threshold={d:.6} f1={d:.4} precision={d:.4} recall={d:.4} pred={d:.6} counts tp={d} fp={d} fn={d}\n", .{
+            label,
+            summary.calibrated_boundary_threshold,
+            summary.calibrated_boundary_f1,
+            summary.calibrated_boundary_precision,
+            summary.calibrated_boundary_recall,
+            summary.calibrated_predicted_positive_rate,
+            summary.calibrated_boundary_tp,
+            summary.calibrated_boundary_fp,
+            summary.calibrated_boundary_fn,
+        });
+    }
+
+    if (summary.fitted_threshold_available) {
+        std.debug.print("{s} fitted_threshold threshold={d:.6} f1={d:.4} precision={d:.4} recall={d:.4} pred={d:.6} counts tp={d} fp={d} fn={d}\n", .{
+            label,
+            summary.fitted_boundary_threshold,
+            summary.fitted_boundary_f1,
+            summary.fitted_boundary_precision,
+            summary.fitted_boundary_recall,
+            summary.fitted_predicted_positive_rate,
+            summary.fitted_boundary_tp,
+            summary.fitted_boundary_fp,
+            summary.fitted_boundary_fn,
+        });
+    }
+
+    std.debug.print("{s} gold_rank mean={d:.2}({d:.4}) median={d}({d:.4}) p90={d}({d:.4}) p99={d}({d:.4}) worst={d} top5x={d}/{d:.4} top10x={d}/{d:.4}\n", .{
+        label,
+        summary.gold_positive_mean_rank,
+        summary.gold_positive_mean_rank_percentile,
+        summary.gold_positive_median_rank,
+        summary.gold_positive_median_rank_percentile,
+        summary.gold_positive_p90_rank,
+        summary.gold_positive_p90_rank_percentile,
+        summary.gold_positive_p99_rank,
+        summary.gold_positive_p99_rank_percentile,
+        summary.gold_positive_worst_rank,
+        summary.gold_positive_top_5x_count,
+        summary.gold_positive_top_5x_recall,
+        summary.gold_positive_top_10x_count,
+        summary.gold_positive_top_10x_recall,
     });
 
     std.debug.print("{s} threshold_sweep", .{label});
@@ -873,6 +1760,21 @@ pub const FusedTrainer = struct {
             .contrastive_focal_alpha = config.contrastive_focal_alpha,
             .temperature = config.temperature,
             .pos_weight = config.pos_weight,
+            .boundary_rank_loss_weight = config.boundary_rank_loss_weight,
+            .boundary_rank_loss_margin = config.boundary_rank_loss_margin,
+            .boundary_rank_loss_top_k = config.boundary_rank_loss_top_k,
+            .boundary_same_token_rank_loss_weight = config.boundary_same_token_rank_loss_weight,
+            .boundary_same_token_rank_loss_top_k = config.boundary_same_token_rank_loss_top_k,
+            .boundary_same_token_negative_weight = config.boundary_same_token_negative_weight,
+            .boundary_same_token_negative_top_k = config.boundary_same_token_negative_top_k,
+            .boundary_candidate_rank_loss_weight = config.boundary_candidate_rank_loss_weight,
+            .boundary_candidate_rank_loss_top_k = config.boundary_candidate_rank_loss_top_k,
+            .boundary_candidate_negative_weight = config.boundary_candidate_negative_weight,
+            .boundary_gold_count_rank_loss_weight = config.boundary_gold_count_rank_loss_weight,
+            .boundary_gold_count_rank_loss_margin = config.boundary_gold_count_rank_loss_margin,
+            .boundary_gold_count_rank_loss_negative_multiplier = config.boundary_gold_count_rank_loss_negative_multiplier,
+            .boundary_local_window_loss_weight = config.boundary_local_window_loss_weight,
+            .boundary_local_window_radius = config.boundary_local_window_radius,
             .enable_splade = config.enable_splade,
             .lambda_splade = config.lambda_splade,
             .lambda_flops = config.lambda_flops,
@@ -882,9 +1784,10 @@ pub const FusedTrainer = struct {
             .mrl_weights = config.mrl_weights,
         };
 
+        const boundary_input_dim = boundaryFeatureDim(config.boundary_feature_mode, @intCast(config.hidden_size));
         var head = try BoundaryHead.initWithSeed(
             allocator,
-            @intCast(config.hidden_size),
+            boundary_input_dim,
             @intCast(config.boundary_mlp_dim),
             config.seed,
         );
@@ -1092,7 +1995,7 @@ pub const FusedTrainer = struct {
         var graph = try fused_chunker_loss.BoundaryHeadGraph.init(
             self.allocator,
             total_tokens,
-            self.config.hidden_size,
+            self.boundary_head.hidden_dim,
             self.config.boundary_mlp_dim,
             self.loss_config.pos_weight,
             self.loss_config.use_focal,
@@ -1134,6 +2037,9 @@ pub const FusedTrainer = struct {
 
     const BoundaryTrainStepResult = struct {
         boundary_loss: f32,
+        boundary_ce_loss: f32 = 0,
+        boundary_rank_loss: f32 = 0,
+        boundary_local_window_loss: f32 = 0,
         w1_grad: []f32,
         b1_grad: []f32,
         w2_grad: []f32,
@@ -1171,6 +2077,65 @@ pub const FusedTrainer = struct {
         features: []const f32,
         boundary_labels: []const f32,
         attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
+        total_tokens: usize,
+        want_features_grad: bool,
+    ) !BoundaryTrainStepResult {
+        const H: usize = @intCast(self.config.hidden_size);
+        const head_features_owned = try transformBoundaryFeaturesForHead(
+            allocator,
+            self.config.boundary_feature_mode,
+            features,
+            attention_mask,
+            total_tokens,
+            H,
+            @intCast(self.config.max_seq_len),
+        );
+        defer if (head_features_owned) |owned| allocator.free(owned);
+        const head_features = head_features_owned orelse features;
+
+        var result = try self.runBoundaryHeadTrainingRaw(
+            allocator,
+            head_features,
+            boundary_labels,
+            attention_mask,
+            input_ids,
+            boundary_candidate_mask,
+            total_tokens,
+            want_features_grad,
+        );
+        errdefer result.deinit(allocator);
+
+        if (head_features_owned != null) {
+            if (result.features_grad) |grad| {
+                const encoder_grad = try scatterBoundaryFeatureGradToEncoder(
+                    allocator,
+                    self.config.boundary_feature_mode,
+                    grad,
+                    attention_mask,
+                    total_tokens,
+                    H,
+                    @intCast(self.config.max_seq_len),
+                );
+                if (encoder_grad) |mapped| {
+                    allocator.free(grad);
+                    result.features_grad = mapped;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    fn runBoundaryHeadTrainingRaw(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        boundary_labels: []const f32,
+        attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
         total_tokens: usize,
         want_features_grad: bool,
     ) !BoundaryTrainStepResult {
@@ -1180,9 +2145,18 @@ pub const FusedTrainer = struct {
                 features,
                 boundary_labels,
                 attention_mask,
+                input_ids,
+                boundary_candidate_mask,
                 total_tokens,
                 want_features_grad,
             ) catch |err| {
+                if (self.loss_config.boundary_rank_loss_weight > 0.0 or
+                    self.loss_config.boundary_same_token_rank_loss_weight > 0.0 or
+                    self.loss_config.boundary_same_token_negative_weight > 1.0 or
+                    self.loss_config.boundary_candidate_rank_loss_weight > 0.0 or
+                    self.loss_config.boundary_candidate_negative_weight > 1.0 or
+                    self.loss_config.boundary_gold_count_rank_loss_weight > 0.0 or
+                    self.loss_config.boundary_local_window_loss_weight > 0.0) return err;
                 std.log.debug("fused_chunker boundary CE Metal fast path failed with {s}; falling back to graph", .{@errorName(err)});
                 return self.runBoundaryHeadGraphStep(
                     allocator,
@@ -1194,6 +2168,13 @@ pub const FusedTrainer = struct {
                 );
             };
         }
+        if (self.loss_config.boundary_rank_loss_weight > 0.0 or
+            self.loss_config.boundary_same_token_rank_loss_weight > 0.0 or
+            self.loss_config.boundary_same_token_negative_weight > 1.0 or
+            self.loss_config.boundary_candidate_rank_loss_weight > 0.0 or
+            self.loss_config.boundary_candidate_negative_weight > 1.0 or
+            self.loss_config.boundary_gold_count_rank_loss_weight > 0.0 or
+            self.loss_config.boundary_local_window_loss_weight > 0.0) return error.UnsupportedManualBoundaryLossGraphPath;
 
         return self.runBoundaryHeadGraphStep(
             allocator,
@@ -1221,9 +2202,11 @@ pub const FusedTrainer = struct {
         else
             try self.getHeadTrainSession(graph_entry);
 
+        const H = self.boundary_head.hidden_dim;
+        if (features.len != total_tokens * H) return error.UnexpectedOutputShape;
         const feature_dropout_mask = try allocInvertedDropoutMask(
             allocator,
-            total_tokens * @as(usize, @intCast(self.config.hidden_size)),
+            total_tokens * H,
             self.config.boundary_dropout,
             dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0001),
         );
@@ -1245,7 +2228,7 @@ pub const FusedTrainer = struct {
 
         try putRuntimeInput(allocator, self.cb, &rt, graph.feature_id, features, &.{
             @intCast(total_tokens),
-            @intCast(self.config.hidden_size),
+            @intCast(H),
         });
         try putRuntimeInput(allocator, self.cb, &rt, graph.target_id, boundary_labels, &.{
             @intCast(total_tokens),
@@ -1257,7 +2240,7 @@ pub const FusedTrainer = struct {
         });
         try putRuntimeInput(allocator, self.cb, &rt, graph.feature_dropout_mask_id, feature_dropout_mask, &.{
             @intCast(total_tokens),
-            @intCast(self.config.hidden_size),
+            @intCast(H),
         });
         try putRuntimeInput(allocator, self.cb, &rt, graph.hidden_dropout_mask_id, hidden_dropout_mask, &.{
             @intCast(total_tokens),
@@ -1265,7 +2248,7 @@ pub const FusedTrainer = struct {
         });
         try putRuntimeInput(allocator, self.cb, &rt, graph.w1_id, self.boundary_head.w1, &.{
             @intCast(self.config.boundary_mlp_dim),
-            @intCast(self.config.hidden_size),
+            @intCast(H),
         });
         try putRuntimeInput(allocator, self.cb, &rt, graph.b1_id, self.boundary_head.b1, &.{
             @intCast(self.config.boundary_mlp_dim),
@@ -1302,6 +2285,7 @@ pub const FusedTrainer = struct {
         }
         return .{
             .boundary_loss = step_result.loss,
+            .boundary_ce_loss = step_result.loss,
             .w1_grad = w1_grad,
             .b1_grad = b1_grad,
             .w2_grad = w2_grad,
@@ -1316,14 +2300,30 @@ pub const FusedTrainer = struct {
         features: []const f32,
         boundary_labels: []const f32,
         attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
         total_tokens: usize,
         want_features_grad: bool,
     ) !BoundaryTrainStepResult {
-        const H: usize = @intCast(self.config.hidden_size);
+        const H = self.boundary_head.hidden_dim;
         const M: usize = @intCast(self.config.boundary_mlp_dim);
         if (features.len != total_tokens * H) return error.UnexpectedOutputShape;
         if (boundary_labels.len != total_tokens * 2) return error.UnexpectedOutputShape;
         if (attention_mask.len != total_tokens) return error.UnexpectedOutputShape;
+        if (input_ids) |ids| {
+            if (ids.len != total_tokens) return error.UnexpectedOutputShape;
+        } else if (self.loss_config.boundary_same_token_rank_loss_weight > 0.0 or
+            self.loss_config.boundary_same_token_negative_weight > 1.0)
+        {
+            return error.MissingBoundarySameTokenIds;
+        }
+        if (boundary_candidate_mask) |candidates| {
+            if (candidates.len != total_tokens) return error.UnexpectedOutputShape;
+        } else if (self.loss_config.boundary_candidate_rank_loss_weight > 0.0 or
+            self.loss_config.boundary_candidate_negative_weight > 1.0)
+        {
+            return error.MissingBoundaryCandidateMask;
+        }
 
         const feature_dropout_mask = try allocInvertedDropoutMask(
             allocator,
@@ -1375,13 +2375,31 @@ pub const FusedTrainer = struct {
         const logits = forward_host[0];
         const dense = forward_host[1];
 
-        const ce = try computeBoundaryWeightedCeAndLogitGrad(
+        const ce = try computeBoundaryWeightedCeAndLogitGradWithCandidateMask(
             allocator,
             logits,
             boundary_labels,
             attention_mask,
             total_tokens,
             self.loss_config.pos_weight,
+            self.loss_config.boundary_rank_loss_weight,
+            self.loss_config.boundary_rank_loss_margin,
+            self.loss_config.boundary_rank_loss_top_k,
+            self.loss_config.boundary_same_token_rank_loss_weight,
+            self.loss_config.boundary_same_token_rank_loss_top_k,
+            self.loss_config.boundary_same_token_negative_weight,
+            self.loss_config.boundary_same_token_negative_top_k,
+            self.loss_config.boundary_candidate_rank_loss_weight,
+            self.loss_config.boundary_candidate_rank_loss_top_k,
+            self.loss_config.boundary_candidate_negative_weight,
+            boundary_candidate_mask,
+            input_ids,
+            @intCast(self.config.max_seq_len),
+            self.loss_config.boundary_gold_count_rank_loss_weight,
+            self.loss_config.boundary_gold_count_rank_loss_margin,
+            self.loss_config.boundary_gold_count_rank_loss_negative_multiplier,
+            self.loss_config.boundary_local_window_loss_weight,
+            self.loss_config.boundary_local_window_radius,
         );
         defer allocator.free(ce.logit_grad);
 
@@ -1474,6 +2492,9 @@ pub const FusedTrainer = struct {
 
         const out = BoundaryTrainStepResult{
             .boundary_loss = ce.loss,
+            .boundary_ce_loss = ce.ce_loss,
+            .boundary_rank_loss = ce.rank_loss,
+            .boundary_local_window_loss = ce.local_window_loss,
             .w1_grad = grad_host[0],
             .b1_grad = grad_host[1],
             .w2_grad = grad_host[2],
@@ -1634,6 +2655,8 @@ pub const FusedTrainer = struct {
     /// features:          [total_tokens * hidden_size] encoder hidden states
     /// boundary_labels:   [total_tokens * 2] one-hot
     /// attention_mask:    [total_tokens] 0 or 1
+    /// input_ids:         optional [total_tokens] token ids for same-token rank loss
+    /// candidate_mask:    optional [total_tokens] sentence-like negative mask
     /// chunk_embeddings:  [B*C*E] late-chunked embeddings
     /// chunk_mask:        [B*C] valid chunk mask
     /// doc_ids:           [B*C] document index per chunk
@@ -1643,6 +2666,8 @@ pub const FusedTrainer = struct {
         features: []const f32,
         boundary_labels: []const f32,
         attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
         chunk_embeddings: []const f32,
         chunk_mask: []const f32,
         doc_ids: []const u32,
@@ -1658,6 +2683,8 @@ pub const FusedTrainer = struct {
             features,
             boundary_labels,
             attention_mask,
+            input_ids,
+            boundary_candidate_mask,
             total_tokens,
             false,
         );
@@ -1665,6 +2692,9 @@ pub const FusedTrainer = struct {
         sanitizeBoundaryStepGradients(&boundary_step);
 
         const boundary_loss = boundary_step.boundary_loss;
+        const boundary_ce_loss = boundary_step.boundary_ce_loss;
+        const boundary_rank_loss = boundary_step.boundary_rank_loss;
+        const boundary_local_window_loss = boundary_step.boundary_local_window_loss;
         const boundary_grad_norm = boundary_step.gradNorm();
 
         // 4. Get current learning rate
@@ -1686,9 +2716,11 @@ pub const FusedTrainer = struct {
 
         // Apply optimizer step only when accumulation window is full
         var applied_lr: f32 = 0.0;
+        var applied_boundary_head_lr: f32 = 0.0;
         if (self.accum_count >= accum_steps) {
             applied_lr = lr;
-            try self.applyAccumulatedBoundaryHeadStep(lr);
+            applied_boundary_head_lr = self.config.boundaryHeadLearningRate(lr);
+            try self.applyAccumulatedBoundaryHeadStep(applied_boundary_head_lr);
         }
 
         // 6. CPU InfoNCE contrastive loss — with optional XBM expansion (Feature 1)
@@ -1806,11 +2838,14 @@ pub const FusedTrainer = struct {
         // 8. Increment step count
         self.step_count += 1;
         if (self.config.step_log_every > 0 and self.step_count % self.config.step_log_every == 0) {
-            std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr });
+            std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d} boundary_head_lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr, applied_boundary_head_lr });
         }
 
         return TrainStepSummary{
             .boundary_loss = boundary_loss,
+            .boundary_ce_loss = boundary_ce_loss,
+            .boundary_rank_loss = boundary_rank_loss,
+            .boundary_local_window_loss = boundary_local_window_loss,
             .contrastive_loss = contrastive_result.contrastive_loss,
             .total_loss = total_loss,
             .boundary_grad_norm = boundary_grad_norm,
@@ -1819,6 +2854,7 @@ pub const FusedTrainer = struct {
             .boundary_fn = 0,
             .step = self.step_count,
             .learning_rate = applied_lr,
+            .boundary_head_learning_rate = applied_boundary_head_lr,
         };
     }
 
@@ -1839,6 +2875,8 @@ pub const FusedTrainer = struct {
         features: []const f32,
         boundary_labels: []const f32,
         attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
         chunk_embeddings: []const f32,
         chunk_mask: []const f32,
         doc_ids: []const u32,
@@ -1860,6 +2898,8 @@ pub const FusedTrainer = struct {
             features,
             boundary_labels,
             attention_mask,
+            input_ids,
+            boundary_candidate_mask,
             total_tokens,
             true,
         );
@@ -1867,6 +2907,9 @@ pub const FusedTrainer = struct {
         sanitizeBoundaryStepGradients(&boundary_step);
 
         const boundary_loss = boundary_step.boundary_loss;
+        const boundary_ce_loss = boundary_step.boundary_ce_loss;
+        const boundary_rank_loss = boundary_step.boundary_rank_loss;
+        const boundary_local_window_loss = boundary_step.boundary_local_window_loss;
         const boundary_grad_norm = boundary_step.gradNorm();
 
         // 4. Get current learning rate
@@ -1898,9 +2941,11 @@ pub const FusedTrainer = struct {
         self.accum_count += 1;
 
         var applied_lr: f32 = 0.0;
+        var applied_boundary_head_lr: f32 = 0.0;
         if (self.accum_count >= accum_steps) {
             applied_lr = lr;
-            try self.applyAccumulatedBoundaryHeadStep(lr);
+            applied_boundary_head_lr = self.config.boundaryHeadLearningRate(lr);
+            try self.applyAccumulatedBoundaryHeadStep(applied_boundary_head_lr);
         }
 
         // 7. CPU InfoNCE contrastive loss — with optional XBM expansion (Feature 1)
@@ -2109,11 +3154,14 @@ pub const FusedTrainer = struct {
         // 9. Increment step count
         self.step_count += 1;
         if (self.config.step_log_every > 0 and self.step_count % self.config.step_log_every == 0) {
-            std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr });
+            std.log.info("fused_chunker step={d} boundary_loss={d:.4} total_loss={d:.4} lr={d} boundary_head_lr={d}", .{ self.step_count, boundary_loss, total_loss, applied_lr, applied_boundary_head_lr });
         }
 
         const summary = TrainStepSummary{
             .boundary_loss = boundary_loss,
+            .boundary_ce_loss = boundary_ce_loss,
+            .boundary_rank_loss = boundary_rank_loss,
+            .boundary_local_window_loss = boundary_local_window_loss,
             .contrastive_loss = contrastive_result.contrastive_loss,
             .total_loss = total_loss,
             .boundary_grad_norm = boundary_grad_norm,
@@ -2122,6 +3170,7 @@ pub const FusedTrainer = struct {
             .boundary_fn = 0,
             .step = self.step_count,
             .learning_rate = applied_lr,
+            .boundary_head_learning_rate = applied_boundary_head_lr,
         };
 
         return TrainStepWithGradSummary{
@@ -2147,13 +3196,16 @@ pub const FusedTrainer = struct {
         mask_list: []const []const f32,
         total_tokens_list: []const usize,
     ) !EvalSummary {
-        var acc = BoundaryEvalAccumulator{};
+        var acc = BoundaryEvalAccumulator{
+            .calibrated_threshold = fused_chunker_loss.weightedCePositiveThreshold(self.loss_config.pos_weight),
+        };
+        defer acc.deinit(allocator);
 
         for (features_list, labels_list, mask_list, total_tokens_list) |features, labels, mask, total| {
             try self.evaluateBatchInto(allocator, &acc, features, labels, mask, total);
         }
 
-        return acc.finish();
+        return try acc.finish(allocator);
     }
 
     pub fn evaluateBatchInto(
@@ -2165,18 +3217,52 @@ pub const FusedTrainer = struct {
         mask: []const f32,
         total: usize,
     ) !void {
-        const logits = if (self.legacy_dense_boundary_head) |*legacy_head|
-            try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, features, total)
+        const logits = try self.evaluateBoundaryLogitsOwnedWithMask(allocator, features, mask, total);
+        defer allocator.free(logits);
+
+        try acc.addLogitsBySample(allocator, logits, labels, mask, @intCast(self.config.max_seq_len));
+    }
+
+    pub fn evaluateBoundaryLogitsOwned(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        total: usize,
+    ) ![]f32 {
+        const synthetic_mask = try allocator.alloc(f32, total);
+        defer allocator.free(synthetic_mask);
+        @memset(synthetic_mask, 1.0);
+        return try self.evaluateBoundaryLogitsOwnedWithMask(allocator, features, synthetic_mask, total);
+    }
+
+    pub fn evaluateBoundaryLogitsOwnedWithMask(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        mask: []const f32,
+        total: usize,
+    ) ![]f32 {
+        const H: usize = @intCast(self.config.hidden_size);
+        const head_features_owned = try transformBoundaryFeaturesForHead(
+            allocator,
+            self.config.boundary_feature_mode,
+            features,
+            mask,
+            total,
+            H,
+            @intCast(self.config.max_seq_len),
+        );
+        defer if (head_features_owned) |owned| allocator.free(owned);
+        const head_features = head_features_owned orelse features;
+        return if (self.legacy_dense_boundary_head) |*legacy_head|
+            try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, head_features, total)
         else
             try evaluateBoundaryLogitsSimple(
                 allocator,
                 &self.boundary_head,
-                features,
+                head_features,
                 total,
             );
-        defer allocator.free(logits);
-
-        try acc.addLogits(allocator, logits, labels, mask);
     }
 
     /// Run the boundary-head training substep and probability diagnostics
@@ -2187,6 +3273,8 @@ pub const FusedTrainer = struct {
         features: []const f32,
         boundary_labels: []const f32,
         attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
         total_tokens: usize,
         want_features_grad: bool,
     ) !BoundaryStepDebugSummary {
@@ -2196,20 +3284,35 @@ pub const FusedTrainer = struct {
             features,
             boundary_labels,
             attention_mask,
+            input_ids,
+            boundary_candidate_mask,
             total_tokens,
             want_features_grad,
         );
         defer boundary_step.deinit(allocator);
         sanitizeBoundaryStepGradients(&boundary_step);
 
+        const H: usize = @intCast(self.config.hidden_size);
+        const head_features_owned = try transformBoundaryFeaturesForHead(
+            allocator,
+            self.config.boundary_feature_mode,
+            features,
+            attention_mask,
+            total_tokens,
+            H,
+            @intCast(self.config.max_seq_len),
+        );
+        defer if (head_features_owned) |owned| allocator.free(owned);
+        const head_features = head_features_owned orelse features;
+
         var forward_probe = BoundaryForwardProbe{};
         const logits = if (self.legacy_dense_boundary_head) |*legacy_head| blk: {
-            const legacy_logits = try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, features, total_tokens);
-            forward_probe.boundary_head_input = computeBoundaryProbeTensorStats(features);
+            const legacy_logits = try evaluateLegacyDenseBoundaryLogits(allocator, legacy_head, head_features, total_tokens);
+            forward_probe.boundary_head_input = computeBoundaryProbeTensorStats(head_features);
             forward_probe.logits = computeBoundaryProbeTensorStats(legacy_logits);
             break :blk legacy_logits;
         } else blk: {
-            const forward = try evaluateBoundaryForwardProbeSimple(allocator, &self.boundary_head, features, total_tokens);
+            const forward = try evaluateBoundaryForwardProbeSimple(allocator, &self.boundary_head, head_features, total_tokens);
             forward_probe = forward.probe;
             break :blk forward.logits;
         };
@@ -2866,7 +3969,15 @@ fn computeBoundaryCheckpointProbe(head: *const BoundaryHead) BoundaryCheckpointP
 
 const BoundaryCeGradResult = struct {
     loss: f32,
+    ce_loss: f32 = 0,
+    rank_loss: f32 = 0,
+    local_window_loss: f32 = 0,
     logit_grad: []f32,
+
+    fn deinit(self: *BoundaryCeGradResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.logit_grad);
+        self.* = undefined;
+    }
 };
 
 fn computeBoundaryWeightedCeAndLogitGrad(
@@ -2876,10 +3987,87 @@ fn computeBoundaryWeightedCeAndLogitGrad(
     mask: []const f32,
     total: usize,
     pos_weight: f32,
+    rank_loss_weight: f32,
+    rank_loss_margin: f32,
+    rank_loss_top_k: u32,
+    same_token_rank_loss_weight: f32,
+    same_token_rank_loss_top_k: u32,
+    same_token_negative_weight: f32,
+    same_token_negative_top_k: u32,
+    input_ids: ?[]const i32,
+    max_seq_len: usize,
+    gold_count_rank_loss_weight: f32,
+    gold_count_rank_loss_margin: f32,
+    gold_count_rank_loss_negative_multiplier: u32,
+    local_window_loss_weight: f32,
+    local_window_radius: u32,
+) !BoundaryCeGradResult {
+    return computeBoundaryWeightedCeAndLogitGradWithCandidateMask(
+        allocator,
+        logits,
+        targets,
+        mask,
+        total,
+        pos_weight,
+        rank_loss_weight,
+        rank_loss_margin,
+        rank_loss_top_k,
+        same_token_rank_loss_weight,
+        same_token_rank_loss_top_k,
+        same_token_negative_weight,
+        same_token_negative_top_k,
+        0.0,
+        8,
+        1.0,
+        null,
+        input_ids,
+        max_seq_len,
+        gold_count_rank_loss_weight,
+        gold_count_rank_loss_margin,
+        gold_count_rank_loss_negative_multiplier,
+        local_window_loss_weight,
+        local_window_radius,
+    );
+}
+
+fn computeBoundaryWeightedCeAndLogitGradWithCandidateMask(
+    allocator: std.mem.Allocator,
+    logits: []const f32,
+    targets: []const f32,
+    mask: []const f32,
+    total: usize,
+    pos_weight: f32,
+    rank_loss_weight: f32,
+    rank_loss_margin: f32,
+    rank_loss_top_k: u32,
+    same_token_rank_loss_weight: f32,
+    same_token_rank_loss_top_k: u32,
+    same_token_negative_weight: f32,
+    same_token_negative_top_k: u32,
+    candidate_rank_loss_weight: f32,
+    candidate_rank_loss_top_k: u32,
+    candidate_negative_weight: f32,
+    candidate_mask: ?[]const f32,
+    input_ids: ?[]const i32,
+    max_seq_len: usize,
+    gold_count_rank_loss_weight: f32,
+    gold_count_rank_loss_margin: f32,
+    gold_count_rank_loss_negative_multiplier: u32,
+    local_window_loss_weight: f32,
+    local_window_radius: u32,
 ) !BoundaryCeGradResult {
     if (logits.len != total * 2) return error.UnexpectedOutputShape;
     if (targets.len != total * 2) return error.UnexpectedOutputShape;
     if (mask.len != total) return error.UnexpectedOutputShape;
+    if (same_token_negative_weight > 1.0) {
+        const ids = input_ids orelse return error.MissingBoundarySameTokenIds;
+        if (ids.len != total) return error.UnexpectedOutputShape;
+    }
+    if (candidate_mask) |candidates| {
+        if (candidates.len != total) return error.UnexpectedOutputShape;
+    } else if (candidate_rank_loss_weight > 0.0 or candidate_negative_weight > 1.0) {
+        return error.MissingBoundaryCandidateMask;
+    }
 
     const grad = try allocator.alloc(f32, total * 2);
     errdefer allocator.free(grad);
@@ -2904,7 +4092,19 @@ fn computeBoundaryWeightedCeAndLogitGrad(
 
         const t0 = targets[i * 2];
         const t1 = targets[i * 2 + 1];
-        const wt0 = t0;
+        const same_token_negative_scale: f32 = if (same_token_negative_weight > 1.0 and
+            t0 > 0.5 and
+            isSameTokenBoundaryNegative(logits, targets, mask, input_ids.?, total, i, same_token_negative_top_k))
+            same_token_negative_weight
+        else
+            1.0;
+        const candidate_negative_scale: f32 = if (candidate_negative_weight > 1.0 and
+            t0 > 0.5 and
+            candidate_mask.?[i] > 0.5)
+            candidate_negative_weight
+        else
+            1.0;
+        const wt0 = t0 * @max(same_token_negative_scale, candidate_negative_scale);
         const wt1 = t1 * pos_weight;
         const wt_sum = wt0 + wt1;
         const m = mask[i];
@@ -2915,10 +4115,383 @@ fn computeBoundaryWeightedCeAndLogitGrad(
         grad[i * 2 + 1] = row_scale * (p1 * wt_sum - wt1);
     }
 
+    const ce_loss = numerator / @as(f64, denom);
+    const rank_loss = try addBoundaryPairwiseRankLossAndGrad(
+        allocator,
+        logits,
+        targets,
+        mask,
+        null,
+        false,
+        null,
+        false,
+        total,
+        rank_loss_weight,
+        rank_loss_margin,
+        rank_loss_top_k,
+        grad,
+    );
+    const same_token_rank_loss = try addBoundaryPairwiseRankLossAndGrad(
+        allocator,
+        logits,
+        targets,
+        mask,
+        input_ids,
+        true,
+        null,
+        false,
+        total,
+        same_token_rank_loss_weight,
+        rank_loss_margin,
+        same_token_rank_loss_top_k,
+        grad,
+    );
+    const candidate_rank_loss = try addBoundaryPairwiseRankLossAndGrad(
+        allocator,
+        logits,
+        targets,
+        mask,
+        null,
+        false,
+        candidate_mask,
+        true,
+        total,
+        candidate_rank_loss_weight,
+        rank_loss_margin,
+        candidate_rank_loss_top_k,
+        grad,
+    );
+    const gold_count_rank_loss = try addBoundaryGoldCountRankLossAndGrad(
+        allocator,
+        logits,
+        targets,
+        mask,
+        total,
+        max_seq_len,
+        gold_count_rank_loss_weight,
+        gold_count_rank_loss_margin,
+        gold_count_rank_loss_negative_multiplier,
+        grad,
+    );
+    const local_window_loss = addBoundaryLocalWindowLossAndGrad(
+        logits,
+        targets,
+        mask,
+        total,
+        max_seq_len,
+        local_window_loss_weight,
+        local_window_radius,
+        grad,
+    );
+    const total_rank_loss = rank_loss + same_token_rank_loss + candidate_rank_loss + gold_count_rank_loss;
+    const loss = ce_loss + total_rank_loss + local_window_loss;
+
     return .{
-        .loss = @floatCast(numerator / @as(f64, denom)),
+        .loss = @floatCast(loss),
+        .ce_loss = @floatCast(ce_loss),
+        .rank_loss = @floatCast(total_rank_loss),
+        .local_window_loss = @floatCast(local_window_loss),
         .logit_grad = grad,
     };
+}
+
+fn isSameTokenBoundaryNegative(
+    logits: []const f32,
+    targets: []const f32,
+    mask: []const f32,
+    token_ids: []const i32,
+    total: usize,
+    neg_i: usize,
+    top_k_u32: u32,
+) bool {
+    if (neg_i >= total) return false;
+    if (mask[neg_i] <= 0.5 or targets[neg_i * 2 + 1] > 0.5) return false;
+    const token_id = token_ids[neg_i];
+    const top_k: usize = @intCast(top_k_u32);
+    const neg_margin = logits[neg_i * 2 + 1] - logits[neg_i * 2];
+    for (0..total) |pos_i| {
+        if (pos_i == neg_i) continue;
+        if (mask[pos_i] <= 0.5 or targets[pos_i * 2 + 1] <= 0.5) continue;
+        if (token_ids[pos_i] != token_id) continue;
+        if (top_k == 0) return true;
+
+        var harder_same_token_negatives: usize = 0;
+        for (0..total) |other_i| {
+            if (other_i == neg_i) continue;
+            if (mask[other_i] <= 0.5 or targets[other_i * 2 + 1] > 0.5) continue;
+            if (token_ids[other_i] != token_id) continue;
+            const other_margin = logits[other_i * 2 + 1] - logits[other_i * 2];
+            if (other_margin > neg_margin) harder_same_token_negatives += 1;
+        }
+        if (harder_same_token_negatives < top_k) return true;
+    }
+    return false;
+}
+
+fn addBoundaryPairwiseRankLossAndGrad(
+    allocator: std.mem.Allocator,
+    logits: []const f32,
+    targets: []const f32,
+    mask: []const f32,
+    token_ids: ?[]const i32,
+    require_same_token: bool,
+    candidate_mask: ?[]const f32,
+    require_candidate_negative: bool,
+    total: usize,
+    rank_loss_weight: f32,
+    rank_loss_margin: f32,
+    rank_loss_top_k: u32,
+    grad: []f32,
+) !f64 {
+    if (rank_loss_weight <= 0.0) return 0.0;
+    if (rank_loss_margin <= 0.0) return 0.0;
+    if (require_same_token) {
+        const ids = token_ids orelse return error.MissingBoundarySameTokenIds;
+        if (ids.len != total) return error.UnexpectedOutputShape;
+    }
+    if (require_candidate_negative) {
+        const candidates = candidate_mask orelse return error.MissingBoundaryCandidateMask;
+        if (candidates.len != total) return error.UnexpectedOutputShape;
+    }
+
+    var positive_count: usize = 0;
+    var negative_count: usize = 0;
+    for (0..total) |i| {
+        if (mask[i] <= 0.5) continue;
+        if (targets[i * 2 + 1] > 0.5) {
+            positive_count += 1;
+        } else {
+            if (require_candidate_negative and candidate_mask.?[i] <= 0.5) continue;
+            negative_count += 1;
+        }
+    }
+    if (positive_count == 0) return 0.0;
+    if (negative_count == 0) return 0.0;
+
+    const requested_top_k = if (rank_loss_top_k == 0) 1 else @as(usize, @intCast(rank_loss_top_k));
+    const effective_top_k = @min(requested_top_k, negative_count);
+    const top_neg_indices = try allocator.alloc(usize, effective_top_k);
+    defer allocator.free(top_neg_indices);
+    const top_violations = try allocator.alloc(f32, effective_top_k);
+    defer allocator.free(top_violations);
+
+    const inv_positive_count = 1.0 / @as(f32, @floatFromInt(positive_count));
+    var loss: f64 = 0.0;
+
+    for (0..total) |pos_i| {
+        if (mask[pos_i] <= 0.5 or targets[pos_i * 2 + 1] <= 0.5) continue;
+        const pos_margin = logits[pos_i * 2 + 1] - logits[pos_i * 2];
+        var selected_count: usize = 0;
+
+        for (0..total) |neg_i| {
+            if (mask[neg_i] <= 0.5 or targets[neg_i * 2 + 1] > 0.5) continue;
+            if (require_same_token and token_ids.?[neg_i] != token_ids.?[pos_i]) continue;
+            if (require_candidate_negative and candidate_mask.?[neg_i] <= 0.5) continue;
+            const neg_margin = logits[neg_i * 2 + 1] - logits[neg_i * 2];
+            const violation = rank_loss_margin + neg_margin - pos_margin;
+            if (violation <= 0.0) continue;
+
+            if (selected_count < effective_top_k) {
+                var insert_at = selected_count;
+                selected_count += 1;
+                while (insert_at > 0 and violation > top_violations[insert_at - 1]) : (insert_at -= 1) {
+                    top_violations[insert_at] = top_violations[insert_at - 1];
+                    top_neg_indices[insert_at] = top_neg_indices[insert_at - 1];
+                }
+                top_violations[insert_at] = violation;
+                top_neg_indices[insert_at] = neg_i;
+            } else if (violation > top_violations[selected_count - 1]) {
+                var insert_at = selected_count - 1;
+                while (insert_at > 0 and violation > top_violations[insert_at - 1]) : (insert_at -= 1) {
+                    top_violations[insert_at] = top_violations[insert_at - 1];
+                    top_neg_indices[insert_at] = top_neg_indices[insert_at - 1];
+                }
+                top_violations[insert_at] = violation;
+                top_neg_indices[insert_at] = neg_i;
+            }
+        }
+
+        if (selected_count == 0) continue;
+        const grad_scale = rank_loss_weight * inv_positive_count / @as(f32, @floatFromInt(selected_count));
+
+        // L = margin + neg_margin - pos_margin, where margin_i = logit1 - logit0.
+        // Gradient descent therefore increases positive margins and decreases
+        // the selected hard-negative margins.
+        for (0..selected_count) |rank_i| {
+            const neg_i = top_neg_indices[rank_i];
+            loss += @as(f64, grad_scale * top_violations[rank_i]);
+            grad[pos_i * 2] += grad_scale;
+            grad[pos_i * 2 + 1] -= grad_scale;
+            grad[neg_i * 2] -= grad_scale;
+            grad[neg_i * 2 + 1] += grad_scale;
+        }
+    }
+
+    return loss;
+}
+
+fn addBoundaryGoldCountRankLossAndGrad(
+    allocator: std.mem.Allocator,
+    logits: []const f32,
+    targets: []const f32,
+    mask: []const f32,
+    total: usize,
+    max_seq_len: usize,
+    loss_weight: f32,
+    margin: f32,
+    negative_multiplier_u32: u32,
+    grad: []f32,
+) !f64 {
+    if (loss_weight <= 0.0) return 0.0;
+    if (margin <= 0.0) return 0.0;
+    if (max_seq_len == 0) return error.InvalidMaxSeqLen;
+    if (logits.len != total * 2 or targets.len != total * 2 or mask.len != total or grad.len != total * 2) return error.UnexpectedOutputShape;
+
+    var loss: f64 = 0.0;
+    var seq_start: usize = 0;
+    while (seq_start < total) : (seq_start += max_seq_len) {
+        const seq_end = @min(seq_start + max_seq_len, total);
+        var positive_count: usize = 0;
+        var negative_count: usize = 0;
+        for (seq_start..seq_end) |i| {
+            if (mask[i] <= 0.5) continue;
+            if (targets[i * 2 + 1] > 0.5) {
+                positive_count += 1;
+            } else {
+                negative_count += 1;
+            }
+        }
+        if (positive_count == 0 or negative_count == 0) continue;
+
+        const negative_multiplier = @max(@as(usize, @intCast(negative_multiplier_u32)), 1);
+        const requested_top_k = if (positive_count > std.math.maxInt(usize) / negative_multiplier)
+            negative_count
+        else
+            positive_count * negative_multiplier;
+        const effective_top_k = @min(requested_top_k, negative_count);
+        if (effective_top_k == 0) continue;
+
+        const top_neg_indices = try allocator.alloc(usize, effective_top_k);
+        defer allocator.free(top_neg_indices);
+        const top_neg_margins = try allocator.alloc(f32, effective_top_k);
+        defer allocator.free(top_neg_margins);
+
+        var selected_count: usize = 0;
+        for (seq_start..seq_end) |neg_i| {
+            if (mask[neg_i] <= 0.5 or targets[neg_i * 2 + 1] > 0.5) continue;
+            const neg_margin = logits[neg_i * 2 + 1] - logits[neg_i * 2];
+            if (selected_count < effective_top_k) {
+                var insert_at = selected_count;
+                selected_count += 1;
+                while (insert_at > 0 and neg_margin > top_neg_margins[insert_at - 1]) : (insert_at -= 1) {
+                    top_neg_margins[insert_at] = top_neg_margins[insert_at - 1];
+                    top_neg_indices[insert_at] = top_neg_indices[insert_at - 1];
+                }
+                top_neg_margins[insert_at] = neg_margin;
+                top_neg_indices[insert_at] = neg_i;
+            } else if (neg_margin > top_neg_margins[selected_count - 1]) {
+                var insert_at = selected_count - 1;
+                while (insert_at > 0 and neg_margin > top_neg_margins[insert_at - 1]) : (insert_at -= 1) {
+                    top_neg_margins[insert_at] = top_neg_margins[insert_at - 1];
+                    top_neg_indices[insert_at] = top_neg_indices[insert_at - 1];
+                }
+                top_neg_margins[insert_at] = neg_margin;
+                top_neg_indices[insert_at] = neg_i;
+            }
+        }
+        if (selected_count == 0) continue;
+
+        const pair_count = positive_count * selected_count;
+        const grad_scale = loss_weight / @as(f32, @floatFromInt(pair_count));
+        for (seq_start..seq_end) |pos_i| {
+            if (mask[pos_i] <= 0.5 or targets[pos_i * 2 + 1] <= 0.5) continue;
+            const pos_margin = logits[pos_i * 2 + 1] - logits[pos_i * 2];
+            for (0..selected_count) |rank_i| {
+                const neg_i = top_neg_indices[rank_i];
+                const violation = margin + top_neg_margins[rank_i] - pos_margin;
+                if (violation <= 0.0) continue;
+                loss += @as(f64, grad_scale * violation);
+                grad[pos_i * 2] += grad_scale;
+                grad[pos_i * 2 + 1] -= grad_scale;
+                grad[neg_i * 2] -= grad_scale;
+                grad[neg_i * 2 + 1] += grad_scale;
+            }
+        }
+    }
+
+    return loss;
+}
+
+fn addBoundaryLocalWindowLossAndGrad(
+    logits: []const f32,
+    targets: []const f32,
+    mask: []const f32,
+    total: usize,
+    max_seq_len: usize,
+    loss_weight: f32,
+    radius_u32: u32,
+    grad: []f32,
+) f64 {
+    if (loss_weight <= 0.0) return 0.0;
+    if (radius_u32 == 0 or max_seq_len == 0) return 0.0;
+
+    var positive_count: usize = 0;
+    for (0..total) |i| {
+        if (mask[i] <= 0.5) continue;
+        if (targets[i * 2 + 1] > 0.5) positive_count += 1;
+    }
+    if (positive_count == 0) return 0.0;
+
+    const radius: usize = @intCast(radius_u32);
+    const grad_scale = loss_weight / @as(f32, @floatFromInt(positive_count));
+    var loss: f64 = 0.0;
+
+    for (0..total) |pos_i| {
+        if (mask[pos_i] <= 0.5 or targets[pos_i * 2 + 1] <= 0.5) continue;
+
+        const sample_start = (pos_i / max_seq_len) * max_seq_len;
+        const sample_end = @min(sample_start + max_seq_len, total);
+        const window_start = if (pos_i > sample_start + radius) pos_i - radius else sample_start;
+        const window_end = @min(pos_i + radius + 1, sample_end);
+
+        var max_margin = -std.math.inf(f32);
+        var candidate_count: usize = 0;
+        for (window_start..window_end) |j| {
+            if (mask[j] <= 0.5) continue;
+            if (j != pos_i and targets[j * 2 + 1] > 0.5) continue;
+            const margin = logits[j * 2 + 1] - logits[j * 2];
+            max_margin = @max(max_margin, margin);
+            candidate_count += 1;
+        }
+        if (candidate_count <= 1) continue;
+
+        var denom: f64 = 0;
+        var pos_exp: f64 = 0;
+        for (window_start..window_end) |j| {
+            if (mask[j] <= 0.5) continue;
+            if (j != pos_i and targets[j * 2 + 1] > 0.5) continue;
+            const margin = logits[j * 2 + 1] - logits[j * 2];
+            const e = @exp(@as(f64, margin - max_margin));
+            denom += e;
+            if (j == pos_i) pos_exp = e;
+        }
+        if (denom <= 0.0 or pos_exp <= 0.0) continue;
+
+        loss += @as(f64, loss_weight) * -@log(pos_exp / denom) / @as(f64, @floatFromInt(positive_count));
+        const inv_denom = 1.0 / denom;
+        for (window_start..window_end) |j| {
+            if (mask[j] <= 0.5) continue;
+            if (j != pos_i and targets[j * 2 + 1] > 0.5) continue;
+            const margin = logits[j * 2 + 1] - logits[j * 2];
+            const prob: f32 = @floatCast(@exp(@as(f64, margin - max_margin)) * inv_denom);
+            const target: f32 = if (j == pos_i) 1.0 else 0.0;
+            const d_margin = grad_scale * (prob - target);
+            grad[j * 2] -= d_margin;
+            grad[j * 2 + 1] += d_margin;
+        }
+    }
+
+    return loss;
 }
 
 fn allocGeluExactDerivative(
@@ -3140,6 +4713,27 @@ fn expectApproxEqSlices(expected: []const f32, actual: []const f32, tolerance: f
     }
 }
 
+fn meanBoundaryProbabilityForLabel(
+    logits: []const f32,
+    labels: []const f32,
+    mask: []const f32,
+    want_positive: bool,
+) f32 {
+    std.debug.assert(labels.len * 2 == logits.len);
+    std.debug.assert(mask.len == labels.len);
+
+    var sum: f64 = 0.0;
+    var count: usize = 0;
+    for (labels, 0..) |label, i| {
+        if (mask[i] <= 0.5) continue;
+        if ((label > 0.5) != want_positive) continue;
+        sum += @floatCast(fused_chunker_loss.positiveBoundaryProbability(logits[i * 2], logits[i * 2 + 1]));
+        count += 1;
+    }
+    if (count == 0) return 0.0;
+    return @floatCast(sum / @as(f64, @floatFromInt(count)));
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
@@ -3172,6 +4766,216 @@ test "BoundaryHead init and deinit" {
     try std.testing.expect(any_nonzero);
 }
 
+test "boundary feature transforms use local previous-token context" {
+    const allocator = std.testing.allocator;
+    const features = [_]f32{ 1.0, 3.0, 10.0 };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+
+    try std.testing.expectEqual(@as(usize, 3), boundaryFeatureMultiplier(.prev_current_diff_concat));
+    try std.testing.expectEqual(@as(usize, 3), boundaryFeatureDim(.prev_current_diff_concat, 1));
+    try std.testing.expectEqual(@as(usize, 5), boundaryFeatureMultiplier(.prev_current_next_diff_concat));
+    try std.testing.expectEqual(@as(usize, 5), boundaryFeatureDim(.prev_current_next_diff_concat, 1));
+    try std.testing.expectEqual(@as(usize, 5), boundaryFeatureMultiplier(.window_context_diff));
+    try std.testing.expectEqual(@as(usize, 5), boundaryFeatureDim(.window_context_diff, 1));
+
+    const prev_diff = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .prev_diff,
+        &features,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_diff);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 7.0 }, prev_diff);
+
+    const prev_current_diff = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .prev_current_diff,
+        &features,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_current_diff);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 5.0, 17.0 }, prev_current_diff);
+
+    const prev_current_diff_concat = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .prev_current_diff_concat,
+        &features,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_current_diff_concat);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        0.0, 1.0,  1.0,
+        1.0, 3.0,  2.0,
+        3.0, 10.0, 7.0,
+    }, prev_current_diff_concat);
+
+    const prev_current_next_diff_concat = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .prev_current_next_diff_concat,
+        &features,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_current_next_diff_concat);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        0.0, 1.0,  3.0,  1.0, -2.0,
+        1.0, 3.0,  10.0, 2.0, -7.0,
+        3.0, 10.0, 0.0,  7.0, 10.0,
+    }, prev_current_next_diff_concat);
+
+    const window_context_diff = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .window_context_diff,
+        &features,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(window_context_diff);
+    try expectApproxEqSlices(&[_]f32{
+        0.0, 1.0,  6.5,  1.0, -5.5,
+        1.0, 3.0,  10.0, 2.0, -7.0,
+        2.0, 10.0, 0.0,  8.0, 10.0,
+    }, window_context_diff, 1e-6);
+}
+
+test "boundary feature gradient scatter maps local context back to encoder tokens" {
+    const allocator = std.testing.allocator;
+    const grad = [_]f32{ 1.0, 2.0, 3.0 };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+
+    const prev_diff = (try scatterBoundaryFeatureGradToEncoder(
+        allocator,
+        .prev_diff,
+        &grad,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_diff);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, -1.0, 3.0 }, prev_diff);
+
+    const prev_current_diff = (try scatterBoundaryFeatureGradToEncoder(
+        allocator,
+        .prev_current_diff,
+        &grad,
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_current_diff);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, 1.0, 6.0 }, prev_current_diff);
+
+    const prev_current_diff_concat = (try scatterBoundaryFeatureGradToEncoder(
+        allocator,
+        .prev_current_diff_concat,
+        &[_]f32{
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        },
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_current_diff_concat);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 3.0, 9.0, 17.0 }, prev_current_diff_concat);
+
+    const prev_current_next_diff_concat = (try scatterBoundaryFeatureGradToEncoder(
+        allocator,
+        .prev_current_next_diff_concat,
+        &[_]f32{
+            1.0,  2.0,  3.0,  4.0,  5.0,
+            6.0,  7.0,  8.0,  9.0,  10.0,
+            11.0, 12.0, 13.0, 14.0, 15.0,
+        },
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(prev_current_next_diff_concat);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 8.0, 21.0, 39.0 }, prev_current_next_diff_concat);
+
+    const window_context_diff = (try scatterBoundaryFeatureGradToEncoder(
+        allocator,
+        .window_context_diff,
+        &[_]f32{
+            1.0,  2.0,  3.0,  4.0,  5.0,
+            6.0,  7.0,  8.0,  9.0,  10.0,
+            11.0, 12.0, 13.0, 14.0, 15.0,
+        },
+        &mask,
+        3,
+        1,
+        3,
+    )).?;
+    defer allocator.free(window_context_diff);
+    try expectApproxEqSlices(&[_]f32{ 6.5, 23.5, 38.0 }, window_context_diff, 1e-6);
+}
+
+test "boundary feature transforms do not cross max sequence boundaries" {
+    const allocator = std.testing.allocator;
+    const features = [_]f32{ 1.0, 3.0, 10.0, 15.0 };
+    const mask = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+
+    const prev_diff = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .prev_diff,
+        &features,
+        &mask,
+        4,
+        1,
+        2,
+    )).?;
+    defer allocator.free(prev_diff);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 10.0, 5.0 }, prev_diff);
+
+    const scattered = (try scatterBoundaryFeatureGradToEncoder(
+        allocator,
+        .prev_diff,
+        &[_]f32{ 1.0, 2.0, 3.0, 4.0 },
+        &mask,
+        4,
+        1,
+        2,
+    )).?;
+    defer allocator.free(scattered);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ -1.0, 2.0, -1.0, 4.0 }, scattered);
+
+    const window_context_diff = (try transformBoundaryFeaturesForHead(
+        allocator,
+        .window_context_diff,
+        &features,
+        &mask,
+        4,
+        1,
+        2,
+    )).?;
+    defer allocator.free(window_context_diff);
+    try expectApproxEqSlices(&[_]f32{
+        0.0,  1.0,  3.0,  1.0,  -2.0,
+        1.0,  3.0,  0.0,  2.0,  3.0,
+        0.0,  10.0, 15.0, 10.0, -5.0,
+        10.0, 15.0, 0.0,  5.0,  15.0,
+    }, window_context_diff, 1e-6);
+}
+
 test "FusedTrainingConfig lrSchedule warmup" {
     const config = FusedTrainingConfig{
         .learning_rate = 1e-4,
@@ -3199,6 +5003,19 @@ test "FusedTrainingConfig lrSchedule warmup" {
 
     // The fused Go schedule decays to zero by the final configured step.
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), lr1000, 1e-8);
+}
+
+test "FusedTrainingConfig boundary head lr multiplier preserves base schedule" {
+    const config = FusedTrainingConfig{
+        .learning_rate = 2e-5,
+        .boundary_head_lr_multiplier = 25.0,
+        .warmup_steps = 20,
+        .total_steps = 1000,
+    };
+
+    const base_lr = config.lrSchedule().lr(20);
+    try std.testing.expectApproxEqAbs(@as(f32, 2e-5), base_lr, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f32, 5e-4), config.boundaryHeadLearningRate(base_lr), 1e-8);
 }
 
 test "boundary gradient sanitizer drops nonfinite values before clipping" {
@@ -3269,8 +5086,9 @@ test "BoundaryEvalAccumulator reports boundary rate and probability diagnostics"
     const mask = [_]f32{ 1.0, 1.0, 1.0 };
 
     var acc = BoundaryEvalAccumulator{};
+    defer acc.deinit(allocator);
     try acc.addLogits(allocator, &logits, &labels, &mask);
-    const summary = acc.finish();
+    const summary = try acc.finish(allocator);
 
     try std.testing.expectEqual(@as(u64, 3), summary.valid_tokens);
     try std.testing.expectEqual(@as(u64, 2), summary.gold_positives);
@@ -3279,6 +5097,8 @@ test "BoundaryEvalAccumulator reports boundary rate and probability diagnostics"
     try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.gold_positive_rate, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), summary.predicted_positive_rate, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.best_predicted_positive_rate, 1e-6);
+    try std.testing.expect(!summary.calibrated_threshold_available);
+    try std.testing.expect(!summary.fitted_threshold_available);
 
     const p0 = fused_chunker_loss.positiveBoundaryProbability(0.0, 1.0);
     const p1 = fused_chunker_loss.positiveBoundaryProbability(1.0, 0.0);
@@ -3292,10 +5112,161 @@ test "BoundaryEvalAccumulator reports boundary rate and probability diagnostics"
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.mean_logit0_gold_negative, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), summary.mean_logit1_gold_negative, 1e-6);
     try std.testing.expectEqual(@as(f32, 0.01), summary.threshold_points[0].threshold);
-    try std.testing.expectEqual(@as(f32, 0.5), summary.threshold_points[summary.threshold_points.len - 1].threshold);
+    try std.testing.expectEqual(@as(f32, 0.5), summary.threshold_points[8].threshold);
+    try std.testing.expectEqual(@as(f32, 0.99), summary.threshold_points[summary.threshold_points.len - 1].threshold);
     try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_positive[5]);
     try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_positive[7]);
     try std.testing.expectEqual(@as(u64, 1), summary.probability_histogram_gold_negative[2]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.average_precision, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.precision_at_gold_count, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.recall_at_gold_count, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.f1_at_gold_count, 1e-6);
+    try std.testing.expectApproxEqAbs(p2, summary.threshold_at_gold_count, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.predicted_positive_rate_at_gold_count, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_count_tp);
+    try std.testing.expectEqual(@as(u64, 0), summary.gold_count_fp);
+    try std.testing.expectEqual(@as(u64, 0), summary.gold_count_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.max_rank_f1, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.max_rank_precision, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.max_rank_recall, 1e-6);
+    try std.testing.expectApproxEqAbs(p2, summary.max_rank_threshold, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.max_rank_predicted_positive_rate, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.max_rank_tp);
+    try std.testing.expectEqual(@as(u64, 0), summary.max_rank_fp);
+    try std.testing.expectEqual(@as(u64, 0), summary.max_rank_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), summary.gold_positive_mean_rank, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), summary.gold_positive_mean_rank_percentile, 1e-6);
+    try std.testing.expectEqual(@as(u64, 1), summary.gold_positive_median_rank);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), summary.gold_positive_median_rank_percentile, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_positive_p90_rank);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.gold_positive_p90_rank_percentile, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_positive_p99_rank);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.gold_positive_p99_rank_percentile, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_positive_worst_rank);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_positive_top_5x_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.gold_positive_top_5x_recall, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.gold_positive_top_10x_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.gold_positive_top_10x_recall, 1e-6);
+    try std.testing.expectEqual(@as(u64, 0), summary.sample_oracle_count_samples);
+}
+
+test "BoundaryEvalAccumulator reports sample-local oracle-count decoder metrics" {
+    const allocator = std.testing.allocator;
+
+    const logits = [_]f32{
+        0.0, 3.0, // false positive cluster head
+        0.0, 2.0, // false positive suppressed by NMS radius 1
+        0.0, 0.0,
+        0.0, 0.0,
+        0.0, 0.0,
+        0.0, 0.5, // gold, below the false-positive cluster
+        0.0, 0.0,
+        0.0, 1.0, // gold, selected by NMS after suppressing token 1
+    };
+    const labels = [_]f32{
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        0.0, 1.0,
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
+
+    var acc = BoundaryEvalAccumulator{
+        .sample_oracle_count_nms_radius = 1,
+        .sample_oracle_count_length_window_min_radius = 1,
+        .sample_oracle_count_length_window_radius_fraction = 0.0,
+    };
+    defer acc.deinit(allocator);
+    try acc.addLogitsBySample(allocator, &logits, &labels, &mask, 8);
+    const summary = try acc.finish(allocator);
+
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_samples);
+    try std.testing.expectEqual(@as(u64, 0), summary.sample_oracle_count_topk_tp);
+    try std.testing.expectEqual(@as(u64, 2), summary.sample_oracle_count_topk_fp);
+    try std.testing.expectEqual(@as(u64, 2), summary.sample_oracle_count_topk_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), summary.sample_oracle_count_topk_f1, 1e-6);
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_nms_tp);
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_nms_fp);
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_nms_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), summary.sample_oracle_count_nms_f1, 1e-6);
+    try std.testing.expectEqual(@as(u32, 1), summary.sample_oracle_count_nms_radius);
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_length_window_tp);
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_length_window_fp);
+    try std.testing.expectEqual(@as(u64, 1), summary.sample_oracle_count_length_window_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), summary.sample_oracle_count_length_window_f1, 1e-6);
+    try std.testing.expectEqual(@as(u32, 1), summary.sample_oracle_count_length_window_min_radius);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), summary.sample_oracle_count_length_window_radius_fraction, 1e-6);
+}
+
+test "BoundaryEvalAccumulator reports calibrated threshold metrics" {
+    const allocator = std.testing.allocator;
+
+    const logits = [_]f32{
+        0.0, 2.0,
+        0.0, 1.0,
+        0.0, -1.0,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+
+    var acc = BoundaryEvalAccumulator{
+        .calibrated_threshold = 0.8,
+    };
+    defer acc.deinit(allocator);
+    try acc.addLogits(allocator, &logits, &labels, &mask);
+    const summary = try acc.finish(allocator);
+
+    try std.testing.expect(summary.calibrated_threshold_available);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), summary.calibrated_boundary_threshold, 1e-6);
+    try std.testing.expectEqual(@as(u64, 1), summary.calibrated_boundary_tp);
+    try std.testing.expectEqual(@as(u64, 0), summary.calibrated_boundary_fp);
+    try std.testing.expectEqual(@as(u64, 1), summary.calibrated_boundary_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.calibrated_boundary_precision, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), summary.calibrated_boundary_recall, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.calibrated_boundary_f1, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), summary.calibrated_predicted_positive_rate, 1e-6);
+}
+
+test "BoundaryEvalAccumulator reports fitted threshold metrics" {
+    const allocator = std.testing.allocator;
+
+    const logits = [_]f32{
+        0.0, 2.0,
+        0.0, 1.0,
+        0.0, -1.0,
+    };
+    const labels = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+
+    var acc = BoundaryEvalAccumulator{
+        .calibrated_threshold = 0.8,
+        .fitted_threshold = 0.3,
+    };
+    defer acc.deinit(allocator);
+    try acc.addLogits(allocator, &logits, &labels, &mask);
+    const summary = try acc.finish(allocator);
+
+    try std.testing.expect(summary.fitted_threshold_available);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), summary.fitted_boundary_threshold, 1e-6);
+    try std.testing.expectEqual(@as(u64, 2), summary.fitted_boundary_tp);
+    try std.testing.expectEqual(@as(u64, 1), summary.fitted_boundary_fp);
+    try std.testing.expectEqual(@as(u64, 0), summary.fitted_boundary_fn);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), summary.fitted_boundary_precision, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.fitted_boundary_recall, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), summary.fitted_boundary_f1, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), summary.fitted_predicted_positive_rate, 1e-6);
 }
 
 test "trainStep treats max_grad_norm zero as clipping disabled" {
@@ -3320,6 +5291,7 @@ test "trainStep treats max_grad_norm zero as clipping disabled" {
         .boundary_mlp_dim = 2,
         .max_chunks = 1,
         .learning_rate = 0.01,
+        .boundary_head_lr_multiplier = 3.0,
         .warmup_steps = 1,
         .weight_decay = 0.0,
         .max_grad_norm = 0.0,
@@ -3350,11 +5322,13 @@ test "trainStep treats max_grad_norm zero as clipping disabled" {
     const chunk_mask = [_]f32{0.0};
     const doc_ids = [_]u32{0};
 
-    _ = try trainer.trainStep(
+    const summary = try trainer.trainStep(
         allocator,
         &features,
         &labels,
         &attention_mask,
+        null,
+        null,
         &chunk_embeddings,
         &chunk_mask,
         &doc_ids,
@@ -3364,6 +5338,8 @@ test "trainStep treats max_grad_norm zero as clipping disabled" {
         2,
     );
 
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), summary.learning_rate, 1e-8);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), summary.boundary_head_learning_rate, 1e-8);
     try std.testing.expect(@abs(trainer.boundary_head.b2[0]) > 0.0);
     try std.testing.expect(@abs(trainer.boundary_head.b2[1]) > 0.0);
 }
@@ -3420,6 +5396,8 @@ test "trainStep applies boundary pos_weight and attention mask" {
         &features,
         &labels,
         &attention_mask,
+        null,
+        null,
         &chunk_embeddings,
         &chunk_mask,
         &doc_ids,
@@ -3430,6 +5408,766 @@ test "trainStep applies boundary pos_weight and attention mask" {
     );
 
     try std.testing.expectApproxEqAbs(@log(@as(f32, 2.0)) * config.pos_weight, summary.boundary_loss, 1e-5);
+}
+
+test "boundary rank loss pushes gold margins above hard negatives" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive margin 0
+        0.0, 2.0, // hard negative margin 2
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        2,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        2,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var ranked = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        2,
+        1.0,
+        0.5,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        2,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer ranked.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(base.loss, base.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), base.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), base.local_window_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.ce_loss, ranked.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), ranked.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ranked.local_window_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.loss + 1.5, ranked.loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0] + 0.5, ranked.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1] - 0.5, ranked.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[2] - 0.5, ranked.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[3] + 0.5, ranked.logit_grad[3], 1e-6);
+}
+
+test "boundary rank loss can average top-k hard negatives" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive margin 0
+        0.0, 2.0, // hard negative margin 2 -> violation 3
+        0.0, 1.0, // hard negative margin 1 -> violation 2
+        0.0, -1.0, // easy negative margin -1 -> violation 0
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        4,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        4,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var ranked = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        4,
+        1.0,
+        0.6,
+        1.0,
+        2,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        4,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer ranked.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(base.ce_loss, ranked.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), ranked.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.loss + 1.5, ranked.loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0] + 0.6, ranked.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1] - 0.6, ranked.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[2] - 0.3, ranked.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[3] + 0.3, ranked.logit_grad[3], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[4] - 0.3, ranked.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5] + 0.3, ranked.logit_grad[5], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[6], ranked.logit_grad[6], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[7], ranked.logit_grad[7], 1e-6);
+}
+
+test "boundary same-token rank loss targets surface-confusable negatives" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive token 380 margin 0
+        0.0, 2.0, // same-token hard negative margin 2 -> selected
+        0.0, 3.0, // different-token harder negative -> ignored by same-token term
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+    const token_ids = [_]i32{ 380, 380, 754 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var ranked = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.4,
+        1,
+        1.0,
+        0,
+        &token_ids,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer ranked.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(base.ce_loss, ranked.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), ranked.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0] + 0.4, ranked.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1] - 0.4, ranked.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[2] - 0.4, ranked.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[3] + 0.4, ranked.logit_grad[3], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[4], ranked.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5], ranked.logit_grad[5], 1e-6);
+}
+
+test "boundary same-token negative weight hardens CE for surface-confusable negatives" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive token 380
+        0.0, 0.0, // same-token negative should receive extra CE weight
+        0.0, 0.0, // different-token negative stays at baseline weight
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+    const token_ids = [_]i32{ 380, 380, 754 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var weighted = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        3.0,
+        0,
+        &token_ids,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer weighted.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 2.0)), base.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 2.0)) * @as(f32, 5.0 / 3.0), weighted.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weighted.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0], weighted.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1], weighted.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), weighted.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weighted.logit_grad[3], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[4], weighted.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5], weighted.logit_grad[5], 1e-6);
+}
+
+test "boundary candidate negative weight hardens CE for sentence-like candidates" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive
+        0.0, 0.0, // sentence-like negative should receive extra CE weight
+        0.0, 0.0, // ordinary negative stays at baseline weight
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+    const candidate_mask = [_]f32{ 1.0, 1.0, 0.0 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var weighted = try computeBoundaryWeightedCeAndLogitGradWithCandidateMask(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        0.0,
+        8,
+        3.0,
+        &candidate_mask,
+        null,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer weighted.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 2.0)), base.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 2.0)) * @as(f32, 5.0 / 3.0), weighted.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weighted.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0], weighted.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1], weighted.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), weighted.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weighted.logit_grad[3], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[4], weighted.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5], weighted.logit_grad[5], 1e-6);
+}
+
+test "boundary candidate rank loss targets sentence-like hard negatives" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive margin 0
+        0.0, 2.0, // sentence-like negative selected by candidate rank loss
+        0.0, 3.0, // harder non-candidate negative ignored by this term
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0 };
+    const candidate_mask = [_]f32{ 1.0, 1.0, 0.0 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var ranked = try computeBoundaryWeightedCeAndLogitGradWithCandidateMask(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        3,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        0.4,
+        1,
+        1.0,
+        &candidate_mask,
+        null,
+        3,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer ranked.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(base.ce_loss, ranked.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), ranked.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0] + 0.4, ranked.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1] - 0.4, ranked.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[2] - 0.4, ranked.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[3] + 0.4, ranked.logit_grad[3], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[4], ranked.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5], ranked.logit_grad[5], 1e-6);
+}
+
+test "boundary same-token negative top-k weights only hardest surface negatives" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive token 380
+        0.0, 2.0, // highest-margin same-token negative should be weighted
+        0.0, -1.0, // easier same-token negative should remain baseline
+        0.0, 3.0, // different-token negative should remain baseline
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    const token_ids = [_]i32{ 380, 380, 380, 754 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        4,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        4,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var weighted = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        4,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        3.0,
+        1,
+        &token_ids,
+        4,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer weighted.deinit(allocator);
+
+    try std.testing.expect(weighted.ce_loss > base.ce_loss);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), weighted.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0], weighted.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1], weighted.logit_grad[1], 1e-6);
+    try std.testing.expect(!std.math.approxEqAbs(f32, base.logit_grad[2], weighted.logit_grad[2], 1e-6));
+    try std.testing.expect(!std.math.approxEqAbs(f32, base.logit_grad[3], weighted.logit_grad[3], 1e-6));
+    try std.testing.expectApproxEqAbs(base.logit_grad[4], weighted.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5], weighted.logit_grad[5], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[6], weighted.logit_grad[6], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[7], weighted.logit_grad[7], 1e-6);
+}
+
+test "boundary gold-count rank loss selects hardest negatives per sample" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // gold positive margin 0
+        0.0, 1.0, // gold positive margin 1
+        0.0, 2.0, // hardest negative margin 2
+        0.0, 0.5, // second-hardest negative margin 0.5
+        0.0, -5.0, // easy negative outside gold-count selection
+    };
+    const targets = [_]f32{
+        0.0, 1.0,
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0, 1.0, 1.0 };
+
+    var base = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        5,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        5,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer base.deinit(allocator);
+
+    var ranked = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        5,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        5,
+        0.4,
+        1.0,
+        1,
+        0.0,
+        1,
+    );
+    defer ranked.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(base.ce_loss, ranked.ce_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), ranked.rank_loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.loss + 0.7, ranked.loss, 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[0] + 0.2, ranked.logit_grad[0], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[1] - 0.2, ranked.logit_grad[1], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[2] + 0.2, ranked.logit_grad[2], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[3] - 0.2, ranked.logit_grad[3], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[4] - 0.2, ranked.logit_grad[4], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[5] + 0.2, ranked.logit_grad[5], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[6] - 0.2, ranked.logit_grad[6], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[7] + 0.2, ranked.logit_grad[7], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[8], ranked.logit_grad[8], 1e-6);
+    try std.testing.expectApproxEqAbs(base.logit_grad[9], ranked.logit_grad[9], 1e-6);
+}
+
+test "boundary local window loss sharpens exact gold token" {
+    const allocator = std.testing.allocator;
+    const logits = [_]f32{
+        0.0, 0.0, // far negative outside window
+        0.0, 2.0, // near false positive
+        0.0, 0.0, // gold boundary
+        0.0, 1.0, // near false positive
+        0.0, 0.0, // far negative outside window
+    };
+    const targets = [_]f32{
+        1.0, 0.0,
+        1.0, 0.0,
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    const mask = [_]f32{ 1.0, 1.0, 1.0, 1.0, 1.0 };
+
+    var result = try computeBoundaryWeightedCeAndLogitGrad(
+        allocator,
+        &logits,
+        &targets,
+        &mask,
+        5,
+        1.0,
+        0.0,
+        1.0,
+        1,
+        0.0,
+        4,
+        1.0,
+        0,
+        null,
+        5,
+        0.0,
+        1.0,
+        1,
+        1.0,
+        1,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.ce_loss > 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), result.rank_loss, 1e-6);
+    try std.testing.expect(result.local_window_loss > 0.0);
+    try std.testing.expectApproxEqAbs(result.ce_loss + result.local_window_loss, result.loss, 1e-6);
+    try std.testing.expect(result.loss > 0.0);
+    try std.testing.expect(result.logit_grad[2 * 2] > 0.0);
+    try std.testing.expect(result.logit_grad[2 * 2 + 1] < 0.0);
+    try std.testing.expect(result.logit_grad[1 * 2] < 0.0);
+    try std.testing.expect(result.logit_grad[1 * 2 + 1] > 0.0);
+    try std.testing.expect(result.logit_grad[3 * 2] < 0.0);
+    try std.testing.expect(result.logit_grad[3 * 2 + 1] > 0.0);
+}
+
+test "trainStep learns positive class polarity on separable boundary features" {
+    const allocator = std.testing.allocator;
+
+    var weight_store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer {
+        native_compute.deinitPrefetchQueue(&weight_store);
+        weight_store.resident_weights.deinit(allocator);
+        weight_store.lazy_weights.deinit(allocator);
+    }
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const config = FusedTrainingConfig{
+        .hidden_size = 2,
+        .embedding_dim = 2,
+        .boundary_mlp_dim = 2,
+        .max_chunks = 1,
+        .learning_rate = 0.05,
+        .warmup_steps = 1,
+        .weight_decay = 0.0,
+        .lambda_embed = 0.0,
+        .pos_weight = 1.0,
+        .total_steps = 32,
+        .step_log_every = 0,
+    };
+    var trainer = try FusedTrainer.init(allocator, config, &cb);
+    defer trainer.deinit();
+
+    @memcpy(trainer.boundary_head.w1, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    });
+    @memset(trainer.boundary_head.b1, 0);
+    @memset(trainer.boundary_head.w2, 0);
+    @memset(trainer.boundary_head.b2, 0);
+
+    const features = [_]f32{
+        2.0, 0.0,
+        0.0, 2.0,
+        1.5, 0.0,
+        0.0, 1.5,
+    };
+    const labels_one_hot = [_]f32{
+        0.0, 1.0,
+        1.0, 0.0,
+        0.0, 1.0,
+        1.0, 0.0,
+    };
+    const scalar_labels = [_]f32{ 1.0, 0.0, 1.0, 0.0 };
+    const attention_mask = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    const chunk_embeddings = features;
+    const chunk_mask = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    const doc_ids = [_]u32{ 0, 1, 2, 3 };
+
+    const before_logits = try trainer.evaluateBoundaryLogitsOwned(allocator, &features, 4);
+    defer allocator.free(before_logits);
+    const before_pos = meanBoundaryProbabilityForLabel(before_logits, &scalar_labels, &attention_mask, true);
+    const before_neg = meanBoundaryProbabilityForLabel(before_logits, &scalar_labels, &attention_mask, false);
+
+    var final_loss: f32 = 0.0;
+    for (0..32) |_| {
+        const summary = try trainer.trainStep(
+            allocator,
+            &features,
+            &labels_one_hot,
+            &attention_mask,
+            null,
+            null,
+            &chunk_embeddings,
+            &chunk_mask,
+            &doc_ids,
+            4,
+            4,
+            1,
+            2,
+        );
+        final_loss = summary.boundary_loss;
+    }
+
+    const after_logits = try trainer.evaluateBoundaryLogitsOwned(allocator, &features, 4);
+    defer allocator.free(after_logits);
+    const after_pos = meanBoundaryProbabilityForLabel(after_logits, &scalar_labels, &attention_mask, true);
+    const after_neg = meanBoundaryProbabilityForLabel(after_logits, &scalar_labels, &attention_mask, false);
+
+    try std.testing.expect(final_loss < @log(@as(f32, 2.0)));
+    try std.testing.expect(after_pos > before_pos + 0.25);
+    try std.testing.expect(after_neg < before_neg - 0.25);
+    try std.testing.expect(after_pos > 0.75);
+    try std.testing.expect(after_neg < 0.25);
 }
 
 test "trainStep applies Go-compatible boundary focal loss when enabled" {
@@ -3486,6 +6224,8 @@ test "trainStep applies Go-compatible boundary focal loss when enabled" {
         &features,
         &labels,
         &attention_mask,
+        null,
+        null,
         &chunk_embeddings,
         &chunk_mask,
         &doc_ids,
@@ -3554,6 +6294,8 @@ test "trainStepWithEncoderGrad scatters contrastive gradients into features" {
         &features,
         &labels,
         &attention_mask,
+        null,
+        null,
         &chunk_embeddings,
         &chunk_mask,
         &doc_ids,
@@ -3688,6 +6430,8 @@ test "boundary CE ops step matches graph gradients" {
         &features,
         &labels,
         &attention_mask,
+        null,
+        null,
         2,
         true,
     );

@@ -121,6 +121,16 @@ const BoundaryLossType = enum {
     focal,
 };
 
+fn parseBoundaryFeatureMode(raw: []const u8) !fused_chunker_train.BoundaryFeatureMode {
+    if (std.mem.eql(u8, raw, "token")) return .token;
+    if (std.mem.eql(u8, raw, "prev-diff")) return .prev_diff;
+    if (std.mem.eql(u8, raw, "prev-current-diff")) return .prev_current_diff;
+    if (std.mem.eql(u8, raw, "prev-current-diff-concat")) return .prev_current_diff_concat;
+    if (std.mem.eql(u8, raw, "prev-current-next-diff-concat")) return .prev_current_next_diff_concat;
+    if (std.mem.eql(u8, raw, "window-context-diff")) return .window_context_diff;
+    return error.InvalidBoundaryFeatureMode;
+}
+
 const EncoderVJPMode = enum {
     direct,
     last_layer,
@@ -153,6 +163,7 @@ const Options = struct {
     epochs: u32 = 10,
     batch_size: u32 = 16,
     learning_rate: f32 = 1e-4,
+    boundary_head_lr_multiplier: f32 = 1.0,
     warmup_steps: u32 = 200,
     lr_total_steps: u32 = 0,
     weight_decay: f32 = 0.01,
@@ -169,6 +180,28 @@ const Options = struct {
     contrastive_focal_gamma: f32 = 0.0,
     contrastive_focal_alpha: f32 = 0.75,
     boundary_pos_weight: f32 = 5.0,
+    boundary_pos_weight_auto: bool = false,
+    boundary_pos_weight_auto_max_examples: usize = 2048,
+    boundary_pos_weight_auto_observed_examples: usize = 0,
+    boundary_pos_weight_auto_valid_tokens: u64 = 0,
+    boundary_pos_weight_auto_gold_tokens: u64 = 0,
+    boundary_pos_weight_auto_gold_rate: f32 = 0.0,
+    boundary_rank_loss_weight: f32 = 0.0,
+    boundary_rank_loss_margin: f32 = 1.0,
+    boundary_rank_loss_top_k: u32 = 1,
+    boundary_same_token_rank_loss_weight: f32 = 0.0,
+    boundary_same_token_rank_loss_top_k: u32 = 4,
+    boundary_same_token_negative_weight: f32 = 1.0,
+    boundary_same_token_negative_top_k: u32 = 0,
+    boundary_candidate_rank_loss_weight: f32 = 0.0,
+    boundary_candidate_rank_loss_top_k: u32 = 8,
+    boundary_candidate_negative_weight: f32 = 1.0,
+    boundary_gold_count_rank_loss_weight: f32 = 0.0,
+    boundary_gold_count_rank_loss_margin: f32 = 1.0,
+    boundary_gold_count_rank_loss_negative_multiplier: u32 = 1,
+    boundary_local_window_loss_weight: f32 = 0.0,
+    boundary_local_window_radius: u32 = 12,
+    boundary_feature_mode: fused_chunker_train.BoundaryFeatureMode = .token,
     boundary_dropout: f32 = 0.1,
     boundary_loss_type: BoundaryLossType = .ce,
     hidden_size: u32 = 768,
@@ -181,6 +214,9 @@ const Options = struct {
     eval_every: u32 = 1,
     eval_every_steps: u32 = 0,
     step_eval_max_examples: usize = 0,
+    step_train_eval_max_examples: usize = 0,
+    checkpoint_roundtrip_eval: bool = false,
+    checkpoint_roundtrip_max_examples: usize = 0,
     max_steps: u64 = 0,
     split: []const u8 = "train",
     val_split: []const u8 = "val",
@@ -228,6 +264,8 @@ const Options = struct {
     go_epoch_shuffle: bool = false,
     report_to: ?[]const u8 = null,
     manifest_path: ?[]const u8 = null,
+    boundary_alignment_dump_dir: ?[]const u8 = null,
+    boundary_alignment_dump_top_k: usize = 32,
     memory_sample_every: u32 = 1,
     memory_warn_rss_bytes: u64 = 0,
     memory_abort_rss_bytes: u64 = 0,
@@ -237,6 +275,15 @@ const Options = struct {
     debug_boundary_step_exit: bool = false,
     debug_update_step: u32 = 0,
     debug_update_step_exit: bool = false,
+    debug_boundary_head_overfit_steps: u32 = 0,
+    debug_boundary_head_overfit_lr: f32 = 1e-3,
+    debug_frozen_feature_probe: bool = false,
+    debug_frozen_feature_train_examples: usize = 64,
+    debug_frozen_feature_val_examples: usize = 64,
+    debug_frozen_feature_train_offset: usize = 0,
+    debug_frozen_feature_val_offset: usize = 0,
+    debug_frozen_feature_epochs: u32 = 3,
+    debug_frozen_feature_lr: f32 = 5e-3,
     debug_step_json_path: ?[]const u8 = null,
     debug_batch_offset: ?usize = null,
     debug_encoder_probe_layer: u32 = 0,
@@ -394,9 +441,13 @@ fn segmentVJPProfileRuntimeName(profile: segmented_encoder.SegmentVJPProfile) []
 
 fn isFiniteTrainStepSummary(summary: TrainStepSummary) bool {
     return isFiniteF32(summary.boundary_loss) and
+        isFiniteF32(summary.boundary_ce_loss) and
+        isFiniteF32(summary.boundary_rank_loss) and
+        isFiniteF32(summary.boundary_local_window_loss) and
         isFiniteF64(summary.contrastive_loss) and
         isFiniteF32(summary.total_loss) and
-        isFiniteF32(summary.learning_rate);
+        isFiniteF32(summary.learning_rate) and
+        isFiniteF32(summary.boundary_head_learning_rate);
 }
 
 fn sanitizeLoRAAdapterSet(adapters: *fused_chunker_lora.LoRAAdapterSet) usize {
@@ -4890,12 +4941,13 @@ fn printPhase20ParityReport(opts: Options) void {
     print("phase20_parity_contract source=\"gopeft Phase 20 best boundary run\" f1=0.786 scope=\"boundary+dense\" splade={s}\n", .{
         enabledName(opts.splade),
     });
-    print("phase20_parity_hparams epochs={d} batch_size={d} max_seq_len={d} max_chunks={d} lr={d} warmup_steps={d} lr_total_steps={d} weight_decay={d} max_grad_norm={d}\n", .{
+    print("phase20_parity_hparams epochs={d} batch_size={d} max_seq_len={d} max_chunks={d} lr={d} boundary_head_lr_multiplier={d} warmup_steps={d} lr_total_steps={d} weight_decay={d} max_grad_norm={d}\n", .{
         opts.epochs,
         opts.batch_size,
         opts.max_seq_len,
         opts.max_chunks,
         opts.learning_rate,
+        opts.boundary_head_lr_multiplier,
         opts.warmup_steps,
         opts.lr_total_steps,
         opts.weight_decay,
@@ -4912,7 +4964,7 @@ fn printPhase20ParityReport(opts: Options) void {
         opts.deterministic,
         opts.go_epoch_shuffle,
     });
-    print("phase20_parity_loss lambda_chunk={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} boundary_dropout={d} neftune_alpha={d} encoder_neftune_alpha={d} encoder_neftune={s} mrl={s} mrl_dims={s} loss_type={s} pos_weight={d} contrastive_focal_gamma={d} contrastive_focal_alpha={d}\n", .{
+    print("phase20_parity_loss lambda_chunk={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} boundary_dropout={d} neftune_alpha={d} encoder_neftune_alpha={d} encoder_neftune={s} mrl={s} mrl_dims={s} loss_type={s} pos_weight={d} pos_weight_auto={} boundary_rank_loss_weight={d} boundary_rank_loss_margin={d} boundary_rank_loss_top_k={d} boundary_same_token_rank_loss_weight={d} boundary_same_token_rank_loss_top_k={d} boundary_same_token_negative_weight={d} boundary_same_token_negative_top_k={d} boundary_candidate_rank_loss_weight={d} boundary_candidate_rank_loss_top_k={d} boundary_candidate_negative_weight={d} boundary_gold_count_rank_loss_weight={d} boundary_gold_count_rank_loss_margin={d} boundary_gold_count_rank_loss_negative_multiplier={d} boundary_local_window_loss_weight={d} boundary_local_window_radius={d} contrastive_focal_gamma={d} contrastive_focal_alpha={d}\n", .{
         opts.lambda_chunk,
         opts.lambda_embed,
         opts.boundary_focus_epochs,
@@ -4925,10 +4977,26 @@ fn printPhase20ParityReport(opts: Options) void {
         opts.mrl_dims_str,
         @tagName(opts.boundary_loss_type),
         opts.boundary_pos_weight,
+        opts.boundary_pos_weight_auto,
+        opts.boundary_rank_loss_weight,
+        opts.boundary_rank_loss_margin,
+        opts.boundary_rank_loss_top_k,
+        opts.boundary_same_token_rank_loss_weight,
+        opts.boundary_same_token_rank_loss_top_k,
+        opts.boundary_same_token_negative_weight,
+        opts.boundary_same_token_negative_top_k,
+        opts.boundary_candidate_rank_loss_weight,
+        opts.boundary_candidate_rank_loss_top_k,
+        opts.boundary_candidate_negative_weight,
+        opts.boundary_gold_count_rank_loss_weight,
+        opts.boundary_gold_count_rank_loss_margin,
+        opts.boundary_gold_count_rank_loss_negative_multiplier,
+        opts.boundary_local_window_loss_weight,
+        opts.boundary_local_window_radius,
         opts.contrastive_focal_gamma,
         opts.contrastive_focal_alpha,
     });
-    print("phase20_parity_note go_cli_default_pos_weight=5.0 phase20_best_pos_weight=1.0\n", .{});
+    print("phase20_parity_note token_level_ce_requires_pos_weight_matching_observed_boundary_rate; use --pos-weight auto for quality probes\n", .{});
     if (opts.model_dir) |mdir| {
         print("phase20_parity_artifacts model_dir={s} tokenizer_path={s}/tokenizer.json sha256=see_phase20_runner_if_available\n", .{ mdir, mdir });
     } else {
@@ -5086,8 +5154,12 @@ fn writeStepMetric(
         .ignored_token_count = supervision.ignoredTokens(total_tokens),
         .loss = summary.total_loss,
         .boundary_loss = summary.boundary_loss,
+        .boundary_ce_loss = summary.boundary_ce_loss,
+        .boundary_rank_loss = summary.boundary_rank_loss,
+        .boundary_local_window_loss = summary.boundary_local_window_loss,
         .contrastive_loss = summary.contrastive_loss,
         .learning_rate = summary.learning_rate,
+        .boundary_head_learning_rate = summary.boundary_head_learning_rate,
         .backend = if (use_metal) "metal" else "native",
         .step_wall_ms = nsToMs(timing.total_ns),
         .batch_ms = nsToMs(timing.batch_ns),
@@ -5147,6 +5219,76 @@ fn writeValidationMetric(
         .best_tp = summary.best_boundary_tp,
         .best_fp = summary.best_boundary_fp,
         .best_fn = summary.best_boundary_fn,
+        .calibrated_threshold_available = summary.calibrated_threshold_available,
+        .calibrated_boundary_threshold = summary.calibrated_boundary_threshold,
+        .calibrated_boundary_f1 = summary.calibrated_boundary_f1,
+        .calibrated_boundary_precision = summary.calibrated_boundary_precision,
+        .calibrated_boundary_recall = summary.calibrated_boundary_recall,
+        .calibrated_boundary_tp = summary.calibrated_boundary_tp,
+        .calibrated_boundary_fp = summary.calibrated_boundary_fp,
+        .calibrated_boundary_fn = summary.calibrated_boundary_fn,
+        .calibrated_predicted_positive_rate = summary.calibrated_predicted_positive_rate,
+        .fitted_threshold_available = summary.fitted_threshold_available,
+        .fitted_boundary_threshold = summary.fitted_boundary_threshold,
+        .fitted_boundary_f1 = summary.fitted_boundary_f1,
+        .fitted_boundary_precision = summary.fitted_boundary_precision,
+        .fitted_boundary_recall = summary.fitted_boundary_recall,
+        .fitted_boundary_tp = summary.fitted_boundary_tp,
+        .fitted_boundary_fp = summary.fitted_boundary_fp,
+        .fitted_boundary_fn = summary.fitted_boundary_fn,
+        .fitted_predicted_positive_rate = summary.fitted_predicted_positive_rate,
+        .average_precision = summary.average_precision,
+        .precision_at_gold_count = summary.precision_at_gold_count,
+        .recall_at_gold_count = summary.recall_at_gold_count,
+        .f1_at_gold_count = summary.f1_at_gold_count,
+        .threshold_at_gold_count = summary.threshold_at_gold_count,
+        .predicted_positive_rate_at_gold_count = summary.predicted_positive_rate_at_gold_count,
+        .gold_count_tp = summary.gold_count_tp,
+        .gold_count_fp = summary.gold_count_fp,
+        .gold_count_fn = summary.gold_count_fn,
+        .max_rank_f1 = summary.max_rank_f1,
+        .max_rank_precision = summary.max_rank_precision,
+        .max_rank_recall = summary.max_rank_recall,
+        .max_rank_threshold = summary.max_rank_threshold,
+        .max_rank_predicted_positive_rate = summary.max_rank_predicted_positive_rate,
+        .max_rank_tp = summary.max_rank_tp,
+        .max_rank_fp = summary.max_rank_fp,
+        .max_rank_fn = summary.max_rank_fn,
+        .sample_oracle_count_samples = summary.sample_oracle_count_samples,
+        .sample_oracle_count_topk_f1 = summary.sample_oracle_count_topk_f1,
+        .sample_oracle_count_topk_precision = summary.sample_oracle_count_topk_precision,
+        .sample_oracle_count_topk_recall = summary.sample_oracle_count_topk_recall,
+        .sample_oracle_count_topk_tp = summary.sample_oracle_count_topk_tp,
+        .sample_oracle_count_topk_fp = summary.sample_oracle_count_topk_fp,
+        .sample_oracle_count_topk_fn = summary.sample_oracle_count_topk_fn,
+        .sample_oracle_count_nms_f1 = summary.sample_oracle_count_nms_f1,
+        .sample_oracle_count_nms_precision = summary.sample_oracle_count_nms_precision,
+        .sample_oracle_count_nms_recall = summary.sample_oracle_count_nms_recall,
+        .sample_oracle_count_nms_tp = summary.sample_oracle_count_nms_tp,
+        .sample_oracle_count_nms_fp = summary.sample_oracle_count_nms_fp,
+        .sample_oracle_count_nms_fn = summary.sample_oracle_count_nms_fn,
+        .sample_oracle_count_nms_radius = summary.sample_oracle_count_nms_radius,
+        .sample_oracle_count_length_window_f1 = summary.sample_oracle_count_length_window_f1,
+        .sample_oracle_count_length_window_precision = summary.sample_oracle_count_length_window_precision,
+        .sample_oracle_count_length_window_recall = summary.sample_oracle_count_length_window_recall,
+        .sample_oracle_count_length_window_tp = summary.sample_oracle_count_length_window_tp,
+        .sample_oracle_count_length_window_fp = summary.sample_oracle_count_length_window_fp,
+        .sample_oracle_count_length_window_fn = summary.sample_oracle_count_length_window_fn,
+        .sample_oracle_count_length_window_min_radius = summary.sample_oracle_count_length_window_min_radius,
+        .sample_oracle_count_length_window_radius_fraction = summary.sample_oracle_count_length_window_radius_fraction,
+        .gold_positive_mean_rank = summary.gold_positive_mean_rank,
+        .gold_positive_mean_rank_percentile = summary.gold_positive_mean_rank_percentile,
+        .gold_positive_median_rank = summary.gold_positive_median_rank,
+        .gold_positive_median_rank_percentile = summary.gold_positive_median_rank_percentile,
+        .gold_positive_p90_rank = summary.gold_positive_p90_rank,
+        .gold_positive_p90_rank_percentile = summary.gold_positive_p90_rank_percentile,
+        .gold_positive_p99_rank = summary.gold_positive_p99_rank,
+        .gold_positive_p99_rank_percentile = summary.gold_positive_p99_rank_percentile,
+        .gold_positive_worst_rank = summary.gold_positive_worst_rank,
+        .gold_positive_top_5x_count = summary.gold_positive_top_5x_count,
+        .gold_positive_top_5x_recall = summary.gold_positive_top_5x_recall,
+        .gold_positive_top_10x_count = summary.gold_positive_top_10x_count,
+        .gold_positive_top_10x_recall = summary.gold_positive_top_10x_recall,
         .valid_tokens = summary.valid_tokens,
         .gold_positives = summary.gold_positives,
         .gold_positive_rate = summary.gold_positive_rate,
@@ -5163,6 +5305,293 @@ fn writeValidationMetric(
     }, .{}, &metrics_writer.interface);
     try metrics_writer.interface.writeByte('\n');
     try metrics_writer.interface.flush();
+}
+
+fn writeFrozenFeatureProbeCompleteMetric(
+    metrics_writer: anytype,
+    train_examples: usize,
+    val_examples: usize,
+    train_offset: usize,
+    val_offset: usize,
+    epochs: u32,
+    lr: f32,
+    final_step: u32,
+    final_boundary_loss: f32,
+    final_total_loss: f32,
+    train_after: fused_chunker_train.EvalSummary,
+    val_after: ?fused_chunker_train.EvalSummary,
+) !void {
+    try std.json.Stringify.value(.{
+        .event = "frozen_feature_probe",
+        .schema_version = 1,
+        .status = "complete",
+        .train_examples = train_examples,
+        .val_examples = val_examples,
+        .train_offset = train_offset,
+        .val_offset = val_offset,
+        .epochs = epochs,
+        .lr = lr,
+        .final_step = final_step,
+        .final_boundary_loss = final_boundary_loss,
+        .final_total_loss = final_total_loss,
+        .train_best_f1 = train_after.best_boundary_f1,
+        .train_fixed_f1 = train_after.boundary_f1,
+        .train_max_rank_f1 = train_after.max_rank_f1,
+        .train_average_precision = train_after.average_precision,
+        .train_probability_gap = train_after.mean_positive_probability_gold_positive - train_after.mean_positive_probability_gold_negative,
+        .val_best_f1 = if (val_after) |summary| summary.best_boundary_f1 else null,
+        .val_fixed_f1 = if (val_after) |summary| summary.boundary_f1 else null,
+        .val_max_rank_f1 = if (val_after) |summary| summary.max_rank_f1 else null,
+        .val_average_precision = if (val_after) |summary| summary.average_precision else null,
+        .val_probability_gap = if (val_after) |summary| summary.mean_positive_probability_gold_positive - summary.mean_positive_probability_gold_negative else null,
+    }, .{}, &metrics_writer.interface);
+    try metrics_writer.interface.writeByte('\n');
+    try metrics_writer.interface.flush();
+}
+
+const BoundaryAlignmentCandidate = struct {
+    probability: f32,
+    flat_index: usize,
+};
+
+const BoundaryAlignmentFeatureStats = struct {
+    mean: f32,
+    rms: f32,
+    l2: f32,
+    max_abs: f32,
+    first0: f32,
+    first1: f32,
+    first2: f32,
+    first3: f32,
+};
+
+const BoundaryAlignmentChunkMarkers = struct {
+    chunk_start_index: ?usize = null,
+    chunk_end_exclusive_index: ?usize = null,
+    previous_chunk_end_index: ?usize = null,
+};
+
+fn boundaryAlignmentCandidateGreaterThan(_: void, a: BoundaryAlignmentCandidate, b: BoundaryAlignmentCandidate) bool {
+    if (a.probability == b.probability) return a.flat_index < b.flat_index;
+    return a.probability > b.probability;
+}
+
+fn boundaryAlignmentDumpPath(
+    allocator: std.mem.Allocator,
+    dump_dir: []const u8,
+    eval_label: []const u8,
+    step: u64,
+) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}/boundary_alignment_{s}_step_{d}.jsonl", .{ dump_dir, eval_label, step });
+}
+
+fn boundaryAlignmentChunkMarkers(
+    batch: *const fused_chunker_data.FusedBatch,
+    local_sample_idx: usize,
+    token_idx: usize,
+) BoundaryAlignmentChunkMarkers {
+    const base = local_sample_idx * batch.max_chunks;
+    var markers = BoundaryAlignmentChunkMarkers{};
+    for (0..batch.max_chunks) |chunk_idx| {
+        if (batch.chunk_mask[base + chunk_idx] <= 0.5) continue;
+        const start = batch.chunk_starts[base + chunk_idx];
+        const end = batch.chunk_ends[base + chunk_idx];
+        if (start >= 0 and @as(usize, @intCast(start)) == token_idx) {
+            markers.chunk_start_index = chunk_idx;
+        }
+        if (end >= 0 and @as(usize, @intCast(end)) == token_idx) {
+            markers.chunk_end_exclusive_index = chunk_idx;
+        }
+        if (end > 0 and @as(usize, @intCast(end - 1)) == token_idx) {
+            markers.previous_chunk_end_index = chunk_idx;
+        }
+    }
+    return markers;
+}
+
+fn nearestBoundaryGoldDelta(
+    batch: *const fused_chunker_data.FusedBatch,
+    local_sample_idx: usize,
+    token_idx: usize,
+) ?i32 {
+    const base = local_sample_idx * batch.max_seq_len;
+    var best_delta: ?i32 = null;
+    var best_abs: u32 = std.math.maxInt(u32);
+    for (0..batch.max_seq_len) |candidate_idx| {
+        if (batch.boundary_labels[base + candidate_idx] <= 0.5) continue;
+        const delta = @as(i32, @intCast(candidate_idx)) - @as(i32, @intCast(token_idx));
+        const abs_delta: u32 = @intCast(if (delta < 0) -delta else delta);
+        if (abs_delta < best_abs) {
+            best_abs = abs_delta;
+            best_delta = delta;
+        }
+    }
+    return best_delta;
+}
+
+fn boundaryAlignmentFeatureStats(
+    features: []const f32,
+    flat_index: usize,
+    hidden_size: usize,
+) ?BoundaryAlignmentFeatureStats {
+    if (hidden_size == 0) return null;
+    const start = flat_index * hidden_size;
+    const end = start + hidden_size;
+    if (end > features.len) return null;
+
+    var sum: f64 = 0;
+    var sum_sq: f64 = 0;
+    var max_abs: f32 = 0;
+    for (features[start..end]) |value| {
+        sum += value;
+        sum_sq += @as(f64, value) * @as(f64, value);
+        const abs_value = @abs(value);
+        if (abs_value > max_abs) max_abs = abs_value;
+    }
+    const hidden_f64: f64 = @floatFromInt(hidden_size);
+    const row = features[start..end];
+    return .{
+        .mean = @floatCast(sum / hidden_f64),
+        .rms = @floatCast(@sqrt(sum_sq / hidden_f64)),
+        .l2 = @floatCast(@sqrt(sum_sq)),
+        .max_abs = max_abs,
+        .first0 = row[0],
+        .first1 = if (hidden_size > 1) row[1] else 0,
+        .first2 = if (hidden_size > 2) row[2] else 0,
+        .first3 = if (hidden_size > 3) row[3] else 0,
+    };
+}
+
+fn writeBoundaryAlignmentRecord(
+    writer: *std.Io.Writer,
+    eval_label: []const u8,
+    step: u64,
+    batch_idx: usize,
+    batch: *const fused_chunker_data.FusedBatch,
+    logits: []const f32,
+    features: []const f32,
+    hidden_size: usize,
+    flat_index: usize,
+    record_kind: []const u8,
+    top_probability_rank: ?usize,
+    probability_rank: ?usize,
+    valid_token_count: usize,
+) !void {
+    const local_sample_idx = flat_index / batch.max_seq_len;
+    const token_idx = flat_index % batch.max_seq_len;
+    const logit0 = logits[flat_index * 2 + 0];
+    const logit1 = logits[flat_index * 2 + 1];
+    const probability = fused_chunker_loss.positiveBoundaryProbability(logit0, logit1);
+    const markers = boundaryAlignmentChunkMarkers(batch, local_sample_idx, token_idx);
+    const probability_rank_percentile: ?f64 = if (probability_rank) |rank|
+        @as(f64, @floatFromInt(rank)) / @as(f64, @floatFromInt(valid_token_count))
+    else
+        null;
+    try std.json.Stringify.value(.{
+        .event = "boundary_alignment_token",
+        .schema_version = 2,
+        .eval = eval_label,
+        .step = step,
+        .batch = batch_idx,
+        .record_kind = record_kind,
+        .top_probability_rank = top_probability_rank,
+        .probability_rank = probability_rank,
+        .probability_rank_percentile = probability_rank_percentile,
+        .valid_token_count = valid_token_count,
+        .eval_sample_index = batch.sample_indices[local_sample_idx],
+        .local_sample_index = local_sample_idx,
+        .sample_token_index = token_idx,
+        .token_id = batch.input_ids[flat_index],
+        .attention = batch.attention_mask[flat_index],
+        .gold_boundary = batch.boundary_labels[flat_index] > 0.5,
+        .probability = probability,
+        .margin = logit1 - logit0,
+        .logit0 = logit0,
+        .logit1 = logit1,
+        .nearest_gold_delta = nearestBoundaryGoldDelta(batch, local_sample_idx, token_idx),
+        .chunk_start_index = markers.chunk_start_index,
+        .chunk_end_exclusive_index = markers.chunk_end_exclusive_index,
+        .previous_chunk_end_index = markers.previous_chunk_end_index,
+        .feature_stats = boundaryAlignmentFeatureStats(features, flat_index, hidden_size),
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeBoundaryAlignmentDumpBatch(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    eval_label: []const u8,
+    step: u64,
+    batch_idx: usize,
+    batch: *const fused_chunker_data.FusedBatch,
+    logits: []const f32,
+    features: []const f32,
+    hidden_size: usize,
+    top_k: usize,
+) !void {
+    const total_tokens = batch.batch_size * batch.max_seq_len;
+
+    var candidates = std.ArrayListUnmanaged(BoundaryAlignmentCandidate).empty;
+    defer candidates.deinit(allocator);
+    try candidates.ensureTotalCapacity(allocator, total_tokens);
+
+    for (0..total_tokens) |flat_index| {
+        if (batch.attention_mask[flat_index] == 0) continue;
+        const logit0 = logits[flat_index * 2 + 0];
+        const logit1 = logits[flat_index * 2 + 1];
+        try candidates.append(allocator, .{
+            .probability = fused_chunker_loss.positiveBoundaryProbability(logit0, logit1),
+            .flat_index = flat_index,
+        });
+    }
+
+    std.mem.sort(BoundaryAlignmentCandidate, candidates.items, {}, boundaryAlignmentCandidateGreaterThan);
+
+    const rank_by_flat_index = try allocator.alloc(usize, total_tokens);
+    defer allocator.free(rank_by_flat_index);
+    @memset(rank_by_flat_index, 0);
+    for (candidates.items, 0..) |candidate, rank| {
+        rank_by_flat_index[candidate.flat_index] = rank + 1;
+    }
+
+    for (0..total_tokens) |flat_index| {
+        if (batch.boundary_labels[flat_index] > 0.5) {
+            try writeBoundaryAlignmentRecord(
+                writer,
+                eval_label,
+                step,
+                batch_idx,
+                batch,
+                logits,
+                features,
+                hidden_size,
+                flat_index,
+                "gold_boundary",
+                null,
+                if (rank_by_flat_index[flat_index] == 0) null else rank_by_flat_index[flat_index],
+                candidates.items.len,
+            );
+        }
+    }
+
+    const limit = @min(top_k, candidates.items.len);
+    for (candidates.items[0..limit], 0..) |candidate, rank| {
+        try writeBoundaryAlignmentRecord(
+            writer,
+            eval_label,
+            step,
+            batch_idx,
+            batch,
+            logits,
+            features,
+            hidden_size,
+            candidate.flat_index,
+            "top_probability",
+            rank + 1,
+            rank + 1,
+            candidates.items.len,
+        );
+    }
 }
 
 fn writeEpochMetric(
@@ -5192,6 +5621,62 @@ fn writeEpochMetric(
     try metrics_writer.interface.flush();
 }
 
+const BoundaryThresholdRecommendation = struct {
+    available: bool = false,
+    threshold: f32 = 0.5,
+    validation_f1: f32 = 0,
+    fixed_f1: f32 = 0,
+    average_precision: f32 = 0,
+    max_rank_f1: f32 = 0,
+    source_event: []const u8 = "default",
+    step: u64 = 0,
+    epoch: u32 = 0,
+    samples: usize = 0,
+    total_samples: usize = 0,
+    full_validation: bool = false,
+};
+
+fn maybeUpdateBoundaryThresholdRecommendation(
+    recommendation: *BoundaryThresholdRecommendation,
+    summary: fused_chunker_train.EvalSummary,
+    source_event: []const u8,
+    step: u64,
+    epoch: u32,
+    samples: usize,
+    total_samples: usize,
+) void {
+    if (summary.valid_tokens == 0) return;
+    if (!std.math.isFinite(summary.best_boundary_threshold) or
+        summary.best_boundary_threshold < 0 or
+        summary.best_boundary_threshold > 1 or
+        !std.math.isFinite(summary.best_boundary_f1))
+    {
+        return;
+    }
+
+    const full_validation = total_samples > 0 and samples == total_samples;
+    const should_update = !recommendation.available or
+        (full_validation and !recommendation.full_validation) or
+        (full_validation == recommendation.full_validation and
+            summary.best_boundary_f1 > recommendation.validation_f1);
+    if (!should_update) return;
+
+    recommendation.* = .{
+        .available = true,
+        .threshold = summary.best_boundary_threshold,
+        .validation_f1 = summary.best_boundary_f1,
+        .fixed_f1 = summary.boundary_f1,
+        .average_precision = summary.average_precision,
+        .max_rank_f1 = summary.max_rank_f1,
+        .source_event = source_event,
+        .step = step,
+        .epoch = epoch,
+        .samples = samples,
+        .total_samples = total_samples,
+        .full_validation = full_validation,
+    };
+}
+
 fn writeFusedTrainingManifest(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -5207,6 +5692,7 @@ fn writeFusedTrainingManifest(
     best_val_step: u64,
     best_val_epoch: u32,
     best_val_f1: f32,
+    boundary_threshold_recommendation: BoundaryThresholdRecommendation,
     peak_resident_bytes: u64,
 ) !void {
     _ = allocator;
@@ -5228,6 +5714,7 @@ fn writeFusedTrainingManifest(
         .epochs = opts.epochs,
         .batch_size = opts.batch_size,
         .learning_rate = opts.learning_rate,
+        .boundary_head_lr_multiplier = opts.boundary_head_lr_multiplier,
         .warmup_steps = opts.warmup_steps,
         .lr_total_steps = opts.lr_total_steps,
         .weight_decay = opts.weight_decay,
@@ -5247,6 +5734,32 @@ fn writeFusedTrainingManifest(
         .mrl_dims = opts.mrl_dims_str,
         .boundary_loss_type = @tagName(opts.boundary_loss_type),
         .boundary_pos_weight = opts.boundary_pos_weight,
+        .boundary_pos_weight_auto = opts.boundary_pos_weight_auto,
+        .boundary_pos_weight_auto_max_examples = opts.boundary_pos_weight_auto_max_examples,
+        .boundary_pos_weight_auto_observed_examples = opts.boundary_pos_weight_auto_observed_examples,
+        .boundary_pos_weight_auto_valid_tokens = opts.boundary_pos_weight_auto_valid_tokens,
+        .boundary_pos_weight_auto_gold_tokens = opts.boundary_pos_weight_auto_gold_tokens,
+        .boundary_pos_weight_auto_gold_rate = opts.boundary_pos_weight_auto_gold_rate,
+        .boundary_rank_loss_weight = opts.boundary_rank_loss_weight,
+        .boundary_rank_loss_margin = opts.boundary_rank_loss_margin,
+        .boundary_rank_loss_top_k = opts.boundary_rank_loss_top_k,
+        .boundary_same_token_rank_loss_weight = opts.boundary_same_token_rank_loss_weight,
+        .boundary_same_token_rank_loss_top_k = opts.boundary_same_token_rank_loss_top_k,
+        .boundary_same_token_negative_weight = opts.boundary_same_token_negative_weight,
+        .boundary_same_token_negative_top_k = opts.boundary_same_token_negative_top_k,
+        .boundary_candidate_rank_loss_weight = opts.boundary_candidate_rank_loss_weight,
+        .boundary_candidate_rank_loss_top_k = opts.boundary_candidate_rank_loss_top_k,
+        .boundary_candidate_negative_weight = opts.boundary_candidate_negative_weight,
+        .boundary_gold_count_rank_loss_weight = opts.boundary_gold_count_rank_loss_weight,
+        .boundary_gold_count_rank_loss_margin = opts.boundary_gold_count_rank_loss_margin,
+        .boundary_gold_count_rank_loss_negative_multiplier = opts.boundary_gold_count_rank_loss_negative_multiplier,
+        .boundary_local_window_loss_weight = opts.boundary_local_window_loss_weight,
+        .boundary_local_window_radius = opts.boundary_local_window_radius,
+        .boundary_feature_mode = fused_chunker_train.boundaryFeatureModeName(opts.boundary_feature_mode),
+        .boundary_head_input_dim = fused_chunker_train.boundaryFeatureDim(
+            opts.boundary_feature_mode,
+            @intCast(opts.hidden_size),
+        ),
         .boundary_dropout = if (opts.deterministic) 0.0 else opts.boundary_dropout,
         .configured_neftune_alpha = if (opts.deterministic) 0.0 else opts.neftune_alpha,
         .encoder_neftune = opts.encoder_neftune and !opts.deterministic,
@@ -5259,6 +5772,13 @@ fn writeFusedTrainingManifest(
         .lambda_embed = opts.lambda_embed,
         .boundary_focus_epochs = opts.boundary_focus_epochs,
         .boundary_focus_lambda_embed = opts.boundary_focus_lambda_embed,
+        .debug_frozen_feature_probe = opts.debug_frozen_feature_probe,
+        .debug_frozen_feature_train_examples = opts.debug_frozen_feature_train_examples,
+        .debug_frozen_feature_val_examples = opts.debug_frozen_feature_val_examples,
+        .debug_frozen_feature_train_offset = opts.debug_frozen_feature_train_offset,
+        .debug_frozen_feature_val_offset = opts.debug_frozen_feature_val_offset,
+        .debug_frozen_feature_epochs = opts.debug_frozen_feature_epochs,
+        .debug_frozen_feature_lr = opts.debug_frozen_feature_lr,
         .train_dataset = train_stats,
         .validation_dataset = val_stats,
         .total_steps = total_steps,
@@ -5267,6 +5787,18 @@ fn writeFusedTrainingManifest(
         .best_val_step = best_val_step,
         .best_val_epoch = best_val_epoch,
         .best_val_f1 = best_val_f1,
+        .recommended_boundary_threshold_available = boundary_threshold_recommendation.available,
+        .recommended_boundary_threshold = boundary_threshold_recommendation.threshold,
+        .recommended_boundary_threshold_f1 = boundary_threshold_recommendation.validation_f1,
+        .recommended_boundary_threshold_fixed_f1 = boundary_threshold_recommendation.fixed_f1,
+        .recommended_boundary_threshold_average_precision = boundary_threshold_recommendation.average_precision,
+        .recommended_boundary_threshold_max_rank_f1 = boundary_threshold_recommendation.max_rank_f1,
+        .recommended_boundary_threshold_source = boundary_threshold_recommendation.source_event,
+        .recommended_boundary_threshold_step = boundary_threshold_recommendation.step,
+        .recommended_boundary_threshold_epoch = boundary_threshold_recommendation.epoch,
+        .recommended_boundary_threshold_samples = boundary_threshold_recommendation.samples,
+        .recommended_boundary_threshold_total_samples = boundary_threshold_recommendation.total_samples,
+        .recommended_boundary_threshold_full_validation = boundary_threshold_recommendation.full_validation,
         .peak_resident_bytes = peak_resident_bytes,
         .go_phase20_reference_f1 = 0.786,
         .go_phase20_parity_floor_f1 = 0.766,
@@ -5480,6 +6012,618 @@ fn computeBoundaryBatchDebugStats(
     return out;
 }
 
+fn runBoundaryHeadFrozenOverfitProbe(
+    allocator: std.mem.Allocator,
+    trainer: *fused_chunker_train.FusedTrainer,
+    features: []const f32,
+    boundary_labels: []const f32,
+    attention_mask: []const f32,
+    chunk_embeddings: []const f32,
+    chunk_mask: []const f32,
+    doc_ids: []const u32,
+    total_tokens: usize,
+    batch_size: usize,
+    max_chunks: usize,
+    hidden_size: usize,
+    steps: u32,
+    lr: f32,
+) !void {
+    const stats = computeBoundaryBatchDebugStats(features, boundary_labels, attention_mask, total_tokens, hidden_size);
+    const gold_rate = if (stats.valid_tokens > 0)
+        @as(f32, @floatFromInt(stats.gold_positives)) / @as(f32, @floatFromInt(stats.valid_tokens))
+    else
+        0.0;
+
+    const saved_loss_config = trainer.loss_config;
+    const saved_lr_schedule = trainer.lr_schedule;
+    const saved_config = trainer.config;
+    trainer.loss_config.lambda_embed = 0.0;
+    trainer.lr_schedule = .{ .constant = lr };
+    trainer.config.grad_accum_steps = 1;
+    defer {
+        trainer.loss_config = saved_loss_config;
+        trainer.lr_schedule = saved_lr_schedule;
+        trainer.config = saved_config;
+    }
+
+    const before = try trainer.debugBoundaryStep(
+        allocator,
+        features,
+        boundary_labels,
+        attention_mask,
+        null,
+        null,
+        total_tokens,
+        false,
+    );
+    const before_gap = before.eval_mean_prob_gold_positive - before.eval_mean_prob_gold_negative;
+
+    var final_boundary_loss: f32 = before.boundary_loss;
+    var final_total_loss: f32 = before.boundary_loss;
+    var final_step: u32 = trainer.step_count;
+    for (0..steps) |_| {
+        const summary = try trainer.trainStep(
+            allocator,
+            features,
+            boundary_labels,
+            attention_mask,
+            null,
+            null,
+            chunk_embeddings,
+            chunk_mask,
+            doc_ids,
+            total_tokens,
+            batch_size,
+            max_chunks,
+            hidden_size,
+        );
+        final_boundary_loss = summary.boundary_loss;
+        final_total_loss = summary.total_loss;
+        final_step = summary.step;
+    }
+
+    const after = try trainer.debugBoundaryStep(
+        allocator,
+        features,
+        boundary_labels,
+        attention_mask,
+        null,
+        null,
+        total_tokens,
+        false,
+    );
+    const after_gap = after.eval_mean_prob_gold_positive - after.eval_mean_prob_gold_negative;
+
+    print(
+        "boundary_head_frozen_overfit status=complete steps={d} lr={d:.8} final_step={d} total_tokens={d} valid={d} gold={d} gold_rate={d:.6} feature_mean={d:.6} feature_rms={d:.6} feature_max_abs={d:.6} before_loss={d:.6} before_f1={d:.6} before_tp={d} before_fp={d} before_fn={d} before_predicted_positives={d} before_prob_gold_pos={d:.6} before_prob_gold_neg={d:.6} before_prob_gap={d:.6} final_train_boundary_loss={d:.6} final_train_total_loss={d:.6} after_loss={d:.6} after_f1={d:.6} after_tp={d} after_fp={d} after_fn={d} after_predicted_positives={d} after_prob_gold_pos={d:.6} after_prob_gold_neg={d:.6} after_prob_gap={d:.6}\n",
+        .{
+            steps,
+            lr,
+            final_step,
+            total_tokens,
+            stats.valid_tokens,
+            stats.gold_positives,
+            gold_rate,
+            stats.feature_mean,
+            stats.feature_rms,
+            stats.feature_max_abs,
+            before.boundary_loss,
+            before.eval_f1,
+            before.eval_tp,
+            before.eval_fp,
+            before.eval_fn,
+            before.eval_predicted_positives,
+            before.eval_mean_prob_gold_positive,
+            before.eval_mean_prob_gold_negative,
+            before_gap,
+            final_boundary_loss,
+            final_total_loss,
+            after.boundary_loss,
+            after.eval_f1,
+            after.eval_tp,
+            after.eval_fp,
+            after.eval_fn,
+            after.eval_predicted_positives,
+            after.eval_mean_prob_gold_positive,
+            after.eval_mean_prob_gold_negative,
+            after_gap,
+        },
+    );
+}
+
+const FrozenFeatureProbeBatch = struct {
+    features: []f32,
+    boundary_labels: []f32,
+    attention_mask: []f32,
+    chunk_embeddings: []f32,
+    chunk_mask: []f32,
+    doc_ids: []u32,
+    total_tokens: usize,
+    batch_size: usize,
+    max_chunks: usize,
+    hidden_size: usize,
+    valid_tokens: u64,
+    gold_positives: u64,
+
+    fn deinit(self: *FrozenFeatureProbeBatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.features);
+        allocator.free(self.boundary_labels);
+        allocator.free(self.attention_mask);
+        allocator.free(self.chunk_embeddings);
+        allocator.free(self.chunk_mask);
+        allocator.free(self.doc_ids);
+        self.* = undefined;
+    }
+};
+
+const FrozenFeatureProbeCache = struct {
+    batches: std.ArrayListUnmanaged(FrozenFeatureProbeBatch) = .empty,
+    examples: usize = 0,
+    start_offset: usize = 0,
+    valid_tokens: u64 = 0,
+    gold_positives: u64 = 0,
+
+    fn deinit(self: *FrozenFeatureProbeCache, allocator: std.mem.Allocator) void {
+        for (self.batches.items) |*batch| batch.deinit(allocator);
+        self.batches.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn frozenProbeGoldRate(valid_tokens: u64, gold_positives: u64) f32 {
+    return if (valid_tokens == 0)
+        0.0
+    else
+        @as(f32, @floatFromInt(gold_positives)) / @as(f32, @floatFromInt(valid_tokens));
+}
+
+fn materializeFrozenFeatureProbeCache(
+    allocator: std.mem.Allocator,
+    opts: *const Options,
+    cb: *const ComputeBackend,
+    tokenizer: *TokenizerBatch,
+    samples: []const fused_chunker_data.FusedSample,
+    max_examples: usize,
+    start_offset: usize,
+    label: []const u8,
+) !FrozenFeatureProbeCache {
+    if (start_offset > samples.len) return error.DebugFrozenFeatureOffsetOutOfRange;
+
+    var cache = FrozenFeatureProbeCache{ .start_offset = start_offset };
+    errdefer cache.deinit(allocator);
+
+    const available_examples = samples.len - start_offset;
+    const capped_examples = @min(max_examples, available_examples);
+    if (capped_examples == 0) return cache;
+
+    const start_ns = nowNs();
+    const bs: usize = @max(@as(usize, 1), @as(usize, @intCast(opts.batch_size)));
+    const max_seq: usize = @intCast(opts.max_seq_len);
+    const max_chunks: usize = @intCast(opts.max_chunks);
+    const hidden_size: usize = @intCast(opts.hidden_size);
+    const total_batches = (capped_examples + bs - 1) / bs;
+
+    var sample_idx: usize = 0;
+    var batch_idx: usize = 0;
+    while (sample_idx < capped_examples) {
+        const end = @min(sample_idx + bs, capped_examples);
+        const count = end - sample_idx;
+
+        const indices = try allocator.alloc(usize, count);
+        defer allocator.free(indices);
+        for (0..count) |k| indices[k] = start_offset + sample_idx + k;
+
+        var tok_ctx = tokenizer.makeTokenFnCtx();
+        var batch = try fused_chunker_data.assembleTokenBatch(
+            allocator,
+            samples,
+            indices,
+            max_seq,
+            max_chunks,
+            &tok_ctx,
+            TokenFnCtx.call,
+        );
+        defer batch.deinit(allocator);
+
+        const actual_batch = batch.batch_size;
+        const total_tokens = actual_batch * max_seq;
+
+        const ids_i64 = try allocator.alloc(i64, total_tokens);
+        defer allocator.free(ids_i64);
+        for (batch.input_ids[0..total_tokens], ids_i64) |id32, *id64| id64.* = @intCast(id32);
+
+        const mask_i64 = try allocator.alloc(i64, total_tokens);
+        defer allocator.free(mask_i64);
+        for (batch.attention_mask[0..total_tokens], mask_i64) |m32, *m64| m64.* = @intCast(m32);
+
+        const bert_config = modern_bert.Config{
+            .hidden_size = opts.hidden_size,
+            .num_hidden_layers = opts.num_layers,
+            .intermediate_size = opts.intermediate_size,
+            .lora_rank = 0,
+            .lora_alpha = 0.0,
+            .neftune_alpha = 0.0,
+            .neftune_seed = 0,
+        };
+
+        var features_owned: ?[]f32 = try modern_bert.forward(
+            cb,
+            allocator,
+            bert_config,
+            ids_i64,
+            mask_i64,
+            actual_batch,
+            max_seq,
+        );
+        errdefer if (features_owned) |features| allocator.free(features);
+
+        var boundary_labels_owned: ?[]f32 = try allocator.alloc(f32, total_tokens * 2);
+        errdefer if (boundary_labels_owned) |labels| allocator.free(labels);
+        for (0..total_tokens) |t| {
+            const is_boundary = batch.boundary_labels[t] > 0.5;
+            boundary_labels_owned.?[t * 2 + 0] = if (is_boundary) 0.0 else 1.0;
+            boundary_labels_owned.?[t * 2 + 1] = if (is_boundary) 1.0 else 0.0;
+        }
+
+        var attention_mask_owned: ?[]f32 = try allocator.alloc(f32, total_tokens);
+        errdefer if (attention_mask_owned) |mask| allocator.free(mask);
+        for (batch.attention_mask[0..total_tokens], attention_mask_owned.?) |m, *out| {
+            out.* = @floatFromInt(m);
+        }
+
+        var chunk_embeddings_owned: ?[]f32 = try fused_chunker_data.meanPoolChunkEmbeddings(
+            allocator,
+            features_owned.?,
+            &batch,
+            hidden_size,
+        );
+        errdefer if (chunk_embeddings_owned) |embeddings| allocator.free(embeddings);
+
+        const chunk_count = actual_batch * max_chunks;
+        var chunk_mask_owned: ?[]f32 = try allocator.dupe(f32, batch.chunk_mask[0..chunk_count]);
+        errdefer if (chunk_mask_owned) |mask| allocator.free(mask);
+
+        var doc_ids_owned: ?[]u32 = try allocator.alloc(u32, chunk_count);
+        errdefer if (doc_ids_owned) |doc_ids| allocator.free(doc_ids);
+        for (0..actual_batch) |b_idx| {
+            for (0..max_chunks) |c_idx| {
+                doc_ids_owned.?[b_idx * max_chunks + c_idx] = @intCast(start_offset + sample_idx + b_idx);
+            }
+        }
+
+        const stats = computeBoundaryBatchDebugStats(
+            features_owned.?,
+            boundary_labels_owned.?,
+            attention_mask_owned.?,
+            total_tokens,
+            hidden_size,
+        );
+
+        try cache.batches.append(allocator, .{
+            .features = features_owned.?,
+            .boundary_labels = boundary_labels_owned.?,
+            .attention_mask = attention_mask_owned.?,
+            .chunk_embeddings = chunk_embeddings_owned.?,
+            .chunk_mask = chunk_mask_owned.?,
+            .doc_ids = doc_ids_owned.?,
+            .total_tokens = total_tokens,
+            .batch_size = actual_batch,
+            .max_chunks = max_chunks,
+            .hidden_size = hidden_size,
+            .valid_tokens = stats.valid_tokens,
+            .gold_positives = stats.gold_positives,
+        });
+        features_owned = null;
+        boundary_labels_owned = null;
+        attention_mask_owned = null;
+        chunk_embeddings_owned = null;
+        chunk_mask_owned = null;
+        doc_ids_owned = null;
+
+        cache.examples += count;
+        cache.valid_tokens += stats.valid_tokens;
+        cache.gold_positives += stats.gold_positives;
+
+        batch_idx += 1;
+        sample_idx = end;
+        print(
+            "frozen_feature_probe_cache split={s} offset={d} batch={d}/{d} examples={d}/{d} valid={d} gold={d} elapsed_ms={d:.2}\n",
+            .{
+                label,
+                start_offset,
+                batch_idx,
+                total_batches,
+                cache.examples,
+                capped_examples,
+                cache.valid_tokens,
+                cache.gold_positives,
+                nsToMs(elapsedNs(start_ns)),
+            },
+        );
+    }
+
+    print(
+        "frozen_feature_probe_cache split={s} status=complete offset={d} examples={d} batches={d} valid={d} gold={d} gold_rate={d:.8} elapsed_ms={d:.2}\n",
+        .{
+            label,
+            start_offset,
+            cache.examples,
+            cache.batches.items.len,
+            cache.valid_tokens,
+            cache.gold_positives,
+            frozenProbeGoldRate(cache.valid_tokens, cache.gold_positives),
+            nsToMs(elapsedNs(start_ns)),
+        },
+    );
+    return cache;
+}
+
+fn evaluateFrozenFeatureProbeCache(
+    allocator: std.mem.Allocator,
+    trainer: *fused_chunker_train.FusedTrainer,
+    cache: *const FrozenFeatureProbeCache,
+) !fused_chunker_train.EvalSummary {
+    var acc = fused_chunker_train.BoundaryEvalAccumulator{
+        .calibrated_threshold = fused_chunker_loss.weightedCePositiveThreshold(trainer.loss_config.pos_weight),
+    };
+    defer acc.deinit(allocator);
+
+    for (cache.batches.items) |*batch| {
+        try trainer.evaluateBatchInto(
+            allocator,
+            &acc,
+            batch.features,
+            batch.boundary_labels,
+            batch.attention_mask,
+            batch.total_tokens,
+        );
+    }
+
+    return try acc.finish(allocator);
+}
+
+fn printFrozenFeatureProbeEval(label: []const u8, summary: fused_chunker_train.EvalSummary) void {
+    const prob_gap = summary.mean_positive_probability_gold_positive - summary.mean_positive_probability_gold_negative;
+    print(
+        "{s} boundary_f1={d:.6} best_f1={d:.6} best_threshold={d:.6} max_rank_f1={d:.6} ap={d:.6} valid={d} gold={d} gold_rate={d:.8} pred_rate={d:.8} prob_pos={d:.6} prob_neg={d:.6} prob_gap={d:.6}\n",
+        .{
+            label,
+            summary.boundary_f1,
+            summary.best_boundary_f1,
+            summary.best_boundary_threshold,
+            summary.max_rank_f1,
+            summary.average_precision,
+            summary.valid_tokens,
+            summary.gold_positives,
+            summary.gold_positive_rate,
+            summary.predicted_positive_rate,
+            summary.mean_positive_probability_gold_positive,
+            summary.mean_positive_probability_gold_negative,
+            prob_gap,
+        },
+    );
+    fused_chunker_train.printBoundaryQualityDiagnostics(label, summary);
+}
+
+fn runFrozenFeatureProbe(
+    allocator: std.mem.Allocator,
+    opts: *const Options,
+    metrics_writer: anytype,
+    trainer: *fused_chunker_train.FusedTrainer,
+    cb: *const ComputeBackend,
+    tokenizer_opt: ?*TokenizerBatch,
+    samples: []const fused_chunker_data.FusedSample,
+    val_samples: []const fused_chunker_data.FusedSample,
+    encoder_loaded: bool,
+) !void {
+    if (!encoder_loaded) return error.DebugFrozenFeatureProbeRequiresEncoder;
+    const tokenizer = tokenizer_opt orelse return error.DebugFrozenFeatureProbeRequiresTokenizer;
+    if (opts.debug_frozen_feature_epochs == 0) return error.InvalidDebugFrozenFeatureEpochs;
+    if (opts.debug_frozen_feature_train_examples == 0) return error.InvalidDebugFrozenFeatureTrainExamples;
+    if (opts.lora_rank != 0) return error.DebugFrozenFeatureProbeRequiresNoLoRA;
+    if (opts.encoder_neftune and opts.neftune_alpha != 0.0 and !opts.deterministic) return error.DebugFrozenFeatureProbeRequiresNoEncoderNeftune;
+
+    const saved_loss_config = trainer.loss_config;
+    const saved_lr_schedule = trainer.lr_schedule;
+    const saved_config = trainer.config;
+    const saved_xbm = trainer.xbm;
+    trainer.loss_config.lambda_embed = 0.0;
+    trainer.loss_config.use_mrl = false;
+    trainer.loss_config.enable_splade = false;
+    trainer.lr_schedule = .{ .constant = opts.debug_frozen_feature_lr };
+    trainer.config.grad_accum_steps = 1;
+    trainer.config.xbm_capacity = 0;
+    trainer.xbm = null;
+    defer {
+        trainer.loss_config = saved_loss_config;
+        trainer.lr_schedule = saved_lr_schedule;
+        trainer.config = saved_config;
+        trainer.xbm = saved_xbm;
+    }
+
+    print(
+        "frozen_feature_probe status=starting train_examples={d} val_examples={d} train_offset={d} val_offset={d} epochs={d} lr={d:.8} batch_size={d} max_seq_len={d} max_chunks={d} hidden={d}\n",
+        .{
+            opts.debug_frozen_feature_train_examples,
+            opts.debug_frozen_feature_val_examples,
+            opts.debug_frozen_feature_train_offset,
+            opts.debug_frozen_feature_val_offset,
+            opts.debug_frozen_feature_epochs,
+            opts.debug_frozen_feature_lr,
+            opts.batch_size,
+            opts.max_seq_len,
+            opts.max_chunks,
+            opts.hidden_size,
+        },
+    );
+
+    var train_cache = try materializeFrozenFeatureProbeCache(
+        allocator,
+        opts,
+        cb,
+        tokenizer,
+        samples,
+        opts.debug_frozen_feature_train_examples,
+        opts.debug_frozen_feature_train_offset,
+        "train",
+    );
+    defer train_cache.deinit(allocator);
+    if (train_cache.examples == 0) return error.DebugFrozenFeatureProbeEmptyTrainCache;
+
+    var val_cache: ?FrozenFeatureProbeCache = null;
+    defer if (val_cache) |*cache| cache.deinit(allocator);
+    if (val_samples.len > 0 and opts.debug_frozen_feature_val_examples > 0) {
+        val_cache = try materializeFrozenFeatureProbeCache(
+            allocator,
+            opts,
+            cb,
+            tokenizer,
+            val_samples,
+            opts.debug_frozen_feature_val_examples,
+            opts.debug_frozen_feature_val_offset,
+            "val",
+        );
+    } else {
+        print("frozen_feature_probe_cache split=val status=skipped reason=no_validation_examples\n", .{});
+    }
+
+    const train_before = try evaluateFrozenFeatureProbeCache(allocator, trainer, &train_cache);
+    printFrozenFeatureProbeEval("frozen_feature_probe_train_before", train_before);
+    try writeValidationMetric(
+        metrics_writer,
+        "frozen_feature_probe_train_before",
+        0,
+        trainer.step_count,
+        train_cache.examples,
+        train_cache.examples,
+        0,
+        train_before,
+    );
+    if (val_cache) |*cache| {
+        const val_before = try evaluateFrozenFeatureProbeCache(allocator, trainer, cache);
+        printFrozenFeatureProbeEval("frozen_feature_probe_val_before", val_before);
+        try writeValidationMetric(
+            metrics_writer,
+            "frozen_feature_probe_val_before",
+            0,
+            trainer.step_count,
+            cache.examples,
+            cache.examples,
+            0,
+            val_before,
+        );
+    }
+
+    var final_boundary_loss: f32 = 0.0;
+    var final_total_loss: f32 = 0.0;
+    const train_start_ns = nowNs();
+    for (0..opts.debug_frozen_feature_epochs) |epoch_idx| {
+        var epoch_boundary_loss_sum: f64 = 0;
+        var epoch_total_loss_sum: f64 = 0;
+        var epoch_batches: u64 = 0;
+        for (train_cache.batches.items) |*batch| {
+            const summary = try trainer.trainStep(
+                allocator,
+                batch.features,
+                batch.boundary_labels,
+                batch.attention_mask,
+                null,
+                null,
+                batch.chunk_embeddings,
+                batch.chunk_mask,
+                batch.doc_ids,
+                batch.total_tokens,
+                batch.batch_size,
+                batch.max_chunks,
+                batch.hidden_size,
+            );
+            final_boundary_loss = summary.boundary_loss;
+            final_total_loss = summary.total_loss;
+            epoch_boundary_loss_sum += summary.boundary_loss;
+            epoch_total_loss_sum += summary.total_loss;
+            epoch_batches += 1;
+        }
+        const denom = @max(epoch_batches, 1);
+        print(
+            "frozen_feature_probe_epoch epoch={d}/{d} batches={d} avg_boundary_loss={d:.6} avg_total_loss={d:.6} final_step={d} elapsed_ms={d:.2}\n",
+            .{
+                epoch_idx + 1,
+                opts.debug_frozen_feature_epochs,
+                epoch_batches,
+                @as(f32, @floatCast(epoch_boundary_loss_sum / @as(f64, @floatFromInt(denom)))),
+                @as(f32, @floatCast(epoch_total_loss_sum / @as(f64, @floatFromInt(denom)))),
+                trainer.step_count,
+                nsToMs(elapsedNs(train_start_ns)),
+            },
+        );
+    }
+
+    const train_after = try evaluateFrozenFeatureProbeCache(allocator, trainer, &train_cache);
+    printFrozenFeatureProbeEval("frozen_feature_probe_train_after", train_after);
+    var val_after_opt: ?fused_chunker_train.EvalSummary = null;
+    try writeValidationMetric(
+        metrics_writer,
+        "frozen_feature_probe_train_after",
+        opts.debug_frozen_feature_epochs - 1,
+        trainer.step_count,
+        train_cache.examples,
+        train_cache.examples,
+        0,
+        train_after,
+    );
+    if (val_cache) |*cache| {
+        const val_after = try evaluateFrozenFeatureProbeCache(allocator, trainer, cache);
+        val_after_opt = val_after;
+        printFrozenFeatureProbeEval("frozen_feature_probe_val_after", val_after);
+        try writeValidationMetric(
+            metrics_writer,
+            "frozen_feature_probe_val_after",
+            opts.debug_frozen_feature_epochs - 1,
+            trainer.step_count,
+            cache.examples,
+            cache.examples,
+            0,
+            val_after,
+        );
+    }
+
+    const val_after_f1 = if (val_after_opt) |summary| summary.best_boundary_f1 else 0.0;
+    const val_after_rank_f1 = if (val_after_opt) |summary| summary.max_rank_f1 else 0.0;
+    const val_after_ap = if (val_after_opt) |summary| summary.average_precision else 0.0;
+    print(
+        "frozen_feature_probe status=complete train_offset={d} val_offset={d} epochs={d} lr={d:.8} final_step={d} final_boundary_loss={d:.6} final_total_loss={d:.6} train_best_f1={d:.6} train_max_rank_f1={d:.6} train_ap={d:.6} val_best_f1={d:.6} val_max_rank_f1={d:.6} val_ap={d:.6}\n",
+        .{
+            train_cache.start_offset,
+            if (val_cache) |cache| cache.start_offset else opts.debug_frozen_feature_val_offset,
+            opts.debug_frozen_feature_epochs,
+            opts.debug_frozen_feature_lr,
+            trainer.step_count,
+            final_boundary_loss,
+            final_total_loss,
+            train_after.best_boundary_f1,
+            train_after.max_rank_f1,
+            train_after.average_precision,
+            val_after_f1,
+            val_after_rank_f1,
+            val_after_ap,
+        },
+    );
+    try writeFrozenFeatureProbeCompleteMetric(
+        metrics_writer,
+        train_cache.examples,
+        if (val_cache) |cache| cache.examples else 0,
+        train_cache.start_offset,
+        if (val_cache) |cache| cache.start_offset else opts.debug_frozen_feature_val_offset,
+        opts.debug_frozen_feature_epochs,
+        opts.debug_frozen_feature_lr,
+        trainer.step_count,
+        final_boundary_loss,
+        final_total_loss,
+        train_after,
+        val_after_opt,
+    );
+}
+
 fn printIndexSlice(label: []const u8, values: []const usize) void {
     print("{s}=[", .{label});
     for (values, 0..) |value, i| {
@@ -5524,6 +6668,70 @@ fn printPerSampleBoundaryDebug(
     print("\n", .{});
 }
 
+const BoundaryPosWeightEstimate = struct {
+    examples: usize = 0,
+    batches: usize = 0,
+    valid_tokens: u64 = 0,
+    gold_tokens: u64 = 0,
+    gold_rate: f32 = 0.0,
+    balanced_pos_weight: f32 = 1.0,
+};
+
+fn estimateBoundaryPosWeight(
+    allocator: std.mem.Allocator,
+    samples: []const fused_chunker_data.FusedSample,
+    tokenizer: *TokenizerBatch,
+    max_examples: usize,
+    batch_size: usize,
+    max_seq: usize,
+    max_chunks: usize,
+) !BoundaryPosWeightEstimate {
+    const capped_examples = if (max_examples == 0) samples.len else @min(samples.len, max_examples);
+    if (capped_examples == 0) return error.EmptyBoundaryPosWeightEstimate;
+
+    const bs = @max(@as(usize, 1), batch_size);
+    var indices = try allocator.alloc(usize, bs);
+    defer allocator.free(indices);
+
+    var out = BoundaryPosWeightEstimate{ .examples = capped_examples };
+    var sample_idx: usize = 0;
+    while (sample_idx < capped_examples) {
+        const count = @min(bs, capped_examples - sample_idx);
+        for (0..count) |i| indices[i] = sample_idx + i;
+
+        var tok_ctx = tokenizer.makeTokenFnCtx();
+        var batch = try fused_chunker_data.assembleTokenBatch(
+            allocator,
+            samples,
+            indices[0..count],
+            max_seq,
+            max_chunks,
+            &tok_ctx,
+            TokenFnCtx.call,
+        );
+        defer batch.deinit(allocator);
+
+        const total_tokens = count * max_seq;
+        for (0..total_tokens) |t| {
+            if (batch.attention_mask[t] == 0) continue;
+            out.valid_tokens += 1;
+            if (batch.boundary_labels[t] > 0.5) out.gold_tokens += 1;
+        }
+
+        out.batches += 1;
+        sample_idx += count;
+    }
+
+    if (out.valid_tokens == 0) return error.EmptyBoundaryPosWeightEstimate;
+    if (out.gold_tokens == 0) return error.NoBoundaryTokensForPosWeightEstimate;
+
+    const gold_f: f32 = @floatFromInt(out.gold_tokens);
+    const valid_f: f32 = @floatFromInt(out.valid_tokens);
+    out.gold_rate = gold_f / valid_f;
+    out.balanced_pos_weight = @max(1.0, (valid_f - gold_f) / gold_f);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Dummy token function (placeholder until tokenizer is wired in)
 // ---------------------------------------------------------------------------
@@ -5557,6 +6765,7 @@ pub fn main(init: std.process.Init) !void {
     var epochs: u32 = 10;
     var batch_size: u32 = 16;
     var learning_rate: f32 = 1e-4;
+    var boundary_head_lr_multiplier: f32 = 1.0;
     var warmup_steps: u32 = 200;
     var lr_total_steps: u32 = 0;
     var weight_decay: f32 = 0.01;
@@ -5573,6 +6782,24 @@ pub fn main(init: std.process.Init) !void {
     var contrastive_focal_gamma: f32 = 0.0;
     var contrastive_focal_alpha: f32 = 0.75;
     var boundary_pos_weight: f32 = 5.0;
+    var boundary_pos_weight_auto: bool = false;
+    var boundary_pos_weight_auto_max_examples: usize = 2048;
+    var boundary_rank_loss_weight: f32 = 0.0;
+    var boundary_rank_loss_margin: f32 = 1.0;
+    var boundary_rank_loss_top_k: u32 = 1;
+    var boundary_same_token_rank_loss_weight: f32 = 0.0;
+    var boundary_same_token_rank_loss_top_k: u32 = 4;
+    var boundary_same_token_negative_weight: f32 = 1.0;
+    var boundary_same_token_negative_top_k: u32 = 0;
+    var boundary_candidate_rank_loss_weight: f32 = 0.0;
+    var boundary_candidate_rank_loss_top_k: u32 = 8;
+    var boundary_candidate_negative_weight: f32 = 1.0;
+    var boundary_gold_count_rank_loss_weight: f32 = 0.0;
+    var boundary_gold_count_rank_loss_margin: f32 = 1.0;
+    var boundary_gold_count_rank_loss_negative_multiplier: u32 = 1;
+    var boundary_local_window_loss_weight: f32 = 0.0;
+    var boundary_local_window_radius: u32 = 12;
+    var boundary_feature_mode: fused_chunker_train.BoundaryFeatureMode = .token;
     var boundary_dropout: f32 = 0.1;
     var boundary_loss_type: BoundaryLossType = .ce;
     var hidden_size: u32 = 768;
@@ -5585,6 +6812,9 @@ pub fn main(init: std.process.Init) !void {
     var eval_every: u32 = 1;
     var eval_every_steps: u32 = 0;
     var step_eval_max_examples: usize = 0;
+    var step_train_eval_max_examples: usize = 0;
+    var checkpoint_roundtrip_eval: bool = false;
+    var checkpoint_roundtrip_max_examples: usize = 0;
     var max_steps: u64 = 0;
     var split: []const u8 = "train";
     var val_split: []const u8 = "val";
@@ -5624,6 +6854,8 @@ pub fn main(init: std.process.Init) !void {
     var go_epoch_shuffle: bool = false;
     var report_to: ?[]const u8 = null;
     var manifest_path: ?[]const u8 = null;
+    var boundary_alignment_dump_dir: ?[]const u8 = null;
+    var boundary_alignment_dump_top_k: usize = 32;
     var memory_sample_every: u32 = 1;
     var memory_warn_rss_bytes: u64 = 0;
     var memory_abort_rss_bytes: u64 = 0;
@@ -5633,6 +6865,15 @@ pub fn main(init: std.process.Init) !void {
     var debug_boundary_step_exit: bool = false;
     var debug_update_step: u32 = 0;
     var debug_update_step_exit: bool = false;
+    var debug_boundary_head_overfit_steps: u32 = 0;
+    var debug_boundary_head_overfit_lr: f32 = 1e-3;
+    var debug_frozen_feature_probe: bool = false;
+    var debug_frozen_feature_train_examples: usize = 64;
+    var debug_frozen_feature_val_examples: usize = 64;
+    var debug_frozen_feature_train_offset: usize = 0;
+    var debug_frozen_feature_val_offset: usize = 0;
+    var debug_frozen_feature_epochs: u32 = 3;
+    var debug_frozen_feature_lr: f32 = 5e-3;
     var debug_step_json_path: ?[]const u8 = null;
     var debug_batch_offset: ?usize = null;
     var debug_encoder_probe_layer: u32 = 0;
@@ -5660,6 +6901,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--lr") or std.mem.eql(u8, arg, "--learning-rate")) {
             const val = args.next() orelse return error.MissingLr;
             learning_rate = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--boundary-head-lr-multiplier")) {
+            const val = args.next() orelse return error.MissingBoundaryHeadLrMultiplier;
+            boundary_head_lr_multiplier = try std.fmt.parseFloat(f32, val);
+            if (!std.math.isFinite(boundary_head_lr_multiplier) or boundary_head_lr_multiplier <= 0.0) return error.InvalidBoundaryHeadLrMultiplier;
         } else if (std.mem.eql(u8, arg, "--warmup-steps")) {
             const val = args.next() orelse return error.MissingWarmupSteps;
             warmup_steps = try std.fmt.parseUnsigned(u32, val, 10);
@@ -5707,7 +6952,73 @@ pub fn main(init: std.process.Init) !void {
             contrastive_focal_alpha = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--boundary-pos-weight") or std.mem.eql(u8, arg, "--pos-weight")) {
             const val = args.next() orelse return error.MissingBoundaryPosWeight;
-            boundary_pos_weight = try std.fmt.parseFloat(f32, val);
+            if (std.mem.eql(u8, val, "auto")) {
+                boundary_pos_weight_auto = true;
+            } else {
+                boundary_pos_weight = try std.fmt.parseFloat(f32, val);
+                boundary_pos_weight_auto = false;
+            }
+        } else if (std.mem.eql(u8, arg, "--boundary-pos-weight-auto")) {
+            boundary_pos_weight_auto = true;
+        } else if (std.mem.eql(u8, arg, "--boundary-pos-weight-auto-max-examples")) {
+            const val = args.next() orelse return error.MissingBoundaryPosWeightAutoMaxExamples;
+            boundary_pos_weight_auto_max_examples = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--boundary-rank-loss-weight")) {
+            const val = args.next() orelse return error.MissingBoundaryRankLossWeight;
+            boundary_rank_loss_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--boundary-rank-loss-margin")) {
+            const val = args.next() orelse return error.MissingBoundaryRankLossMargin;
+            boundary_rank_loss_margin = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--boundary-rank-loss-top-k")) {
+            const val = args.next() orelse return error.MissingBoundaryRankLossTopK;
+            boundary_rank_loss_top_k = try std.fmt.parseUnsigned(u32, val, 10);
+            if (boundary_rank_loss_top_k == 0) return error.InvalidBoundaryRankLossTopK;
+        } else if (std.mem.eql(u8, arg, "--boundary-same-token-rank-loss-weight")) {
+            const val = args.next() orelse return error.MissingBoundarySameTokenRankLossWeight;
+            boundary_same_token_rank_loss_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--boundary-same-token-rank-loss-top-k")) {
+            const val = args.next() orelse return error.MissingBoundarySameTokenRankLossTopK;
+            boundary_same_token_rank_loss_top_k = try std.fmt.parseUnsigned(u32, val, 10);
+            if (boundary_same_token_rank_loss_top_k == 0) return error.InvalidBoundarySameTokenRankLossTopK;
+        } else if (std.mem.eql(u8, arg, "--boundary-same-token-negative-weight")) {
+            const val = args.next() orelse return error.MissingBoundarySameTokenNegativeWeight;
+            boundary_same_token_negative_weight = try std.fmt.parseFloat(f32, val);
+            if (!std.math.isFinite(boundary_same_token_negative_weight) or boundary_same_token_negative_weight < 1.0) return error.InvalidBoundarySameTokenNegativeWeight;
+        } else if (std.mem.eql(u8, arg, "--boundary-same-token-negative-top-k")) {
+            const val = args.next() orelse return error.MissingBoundarySameTokenNegativeTopK;
+            boundary_same_token_negative_top_k = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--boundary-candidate-rank-loss-weight")) {
+            const val = args.next() orelse return error.MissingBoundaryCandidateRankLossWeight;
+            boundary_candidate_rank_loss_weight = try std.fmt.parseFloat(f32, val);
+            if (!std.math.isFinite(boundary_candidate_rank_loss_weight) or boundary_candidate_rank_loss_weight < 0.0) return error.InvalidBoundaryCandidateRankLossWeight;
+        } else if (std.mem.eql(u8, arg, "--boundary-candidate-rank-loss-top-k")) {
+            const val = args.next() orelse return error.MissingBoundaryCandidateRankLossTopK;
+            boundary_candidate_rank_loss_top_k = try std.fmt.parseUnsigned(u32, val, 10);
+            if (boundary_candidate_rank_loss_top_k == 0) return error.InvalidBoundaryCandidateRankLossTopK;
+        } else if (std.mem.eql(u8, arg, "--boundary-candidate-negative-weight")) {
+            const val = args.next() orelse return error.MissingBoundaryCandidateNegativeWeight;
+            boundary_candidate_negative_weight = try std.fmt.parseFloat(f32, val);
+            if (!std.math.isFinite(boundary_candidate_negative_weight) or boundary_candidate_negative_weight < 1.0) return error.InvalidBoundaryCandidateNegativeWeight;
+        } else if (std.mem.eql(u8, arg, "--boundary-gold-count-rank-loss-weight")) {
+            const val = args.next() orelse return error.MissingBoundaryGoldCountRankLossWeight;
+            boundary_gold_count_rank_loss_weight = try std.fmt.parseFloat(f32, val);
+            if (!std.math.isFinite(boundary_gold_count_rank_loss_weight) or boundary_gold_count_rank_loss_weight < 0.0) return error.InvalidBoundaryGoldCountRankLossWeight;
+        } else if (std.mem.eql(u8, arg, "--boundary-gold-count-rank-loss-margin")) {
+            const val = args.next() orelse return error.MissingBoundaryGoldCountRankLossMargin;
+            boundary_gold_count_rank_loss_margin = try std.fmt.parseFloat(f32, val);
+            if (!std.math.isFinite(boundary_gold_count_rank_loss_margin) or boundary_gold_count_rank_loss_margin <= 0.0) return error.InvalidBoundaryGoldCountRankLossMargin;
+        } else if (std.mem.eql(u8, arg, "--boundary-gold-count-rank-loss-negative-multiplier")) {
+            const val = args.next() orelse return error.MissingBoundaryGoldCountRankLossNegativeMultiplier;
+            boundary_gold_count_rank_loss_negative_multiplier = try std.fmt.parseUnsigned(u32, val, 10);
+            if (boundary_gold_count_rank_loss_negative_multiplier == 0) return error.InvalidBoundaryGoldCountRankLossNegativeMultiplier;
+        } else if (std.mem.eql(u8, arg, "--boundary-local-window-loss-weight")) {
+            const val = args.next() orelse return error.MissingBoundaryLocalWindowLossWeight;
+            boundary_local_window_loss_weight = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--boundary-local-window-radius")) {
+            const val = args.next() orelse return error.MissingBoundaryLocalWindowRadius;
+            boundary_local_window_radius = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--boundary-feature-mode")) {
+            boundary_feature_mode = try parseBoundaryFeatureMode(args.next() orelse return error.MissingBoundaryFeatureMode);
         } else if (std.mem.eql(u8, arg, "--boundary-dropout")) {
             const val = args.next() orelse return error.MissingBoundaryDropout;
             boundary_dropout = try std.fmt.parseFloat(f32, val);
@@ -5750,6 +7061,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--step-eval-max-examples")) {
             const val = args.next() orelse return error.MissingStepEvalMaxExamples;
             step_eval_max_examples = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--step-train-eval-max-examples")) {
+            const val = args.next() orelse return error.MissingStepTrainEvalMaxExamples;
+            step_train_eval_max_examples = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--checkpoint-roundtrip-eval")) {
+            checkpoint_roundtrip_eval = true;
+        } else if (std.mem.eql(u8, arg, "--checkpoint-roundtrip-max-examples")) {
+            const val = args.next() orelse return error.MissingCheckpointRoundtripMaxExamples;
+            checkpoint_roundtrip_max_examples = try std.fmt.parseUnsigned(usize, val, 10);
         } else if (std.mem.eql(u8, arg, "--max-steps")) {
             const val = args.next() orelse return error.MissingMaxSteps;
             max_steps = try std.fmt.parseUnsigned(u64, val, 10);
@@ -5874,6 +7193,11 @@ pub fn main(init: std.process.Init) !void {
             report_to = args.next() orelse return error.MissingReportTo;
         } else if (std.mem.eql(u8, arg, "--manifest")) {
             manifest_path = args.next() orelse return error.MissingManifestPath;
+        } else if (std.mem.eql(u8, arg, "--boundary-alignment-dump-dir")) {
+            boundary_alignment_dump_dir = args.next() orelse return error.MissingBoundaryAlignmentDumpDir;
+        } else if (std.mem.eql(u8, arg, "--boundary-alignment-dump-top-k")) {
+            const val = args.next() orelse return error.MissingBoundaryAlignmentDumpTopK;
+            boundary_alignment_dump_top_k = try std.fmt.parseUnsigned(usize, val, 10);
         } else if (std.mem.eql(u8, arg, "--memory-sample-every")) {
             const val = args.next() orelse return error.MissingMemorySampleEvery;
             memory_sample_every = try std.fmt.parseUnsigned(u32, val, 10);
@@ -5897,6 +7221,32 @@ pub fn main(init: std.process.Init) !void {
             debug_update_step = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--debug-update-step-exit")) {
             debug_update_step_exit = true;
+        } else if (std.mem.eql(u8, arg, "--debug-boundary-head-overfit-steps")) {
+            const val = args.next() orelse return error.MissingDebugBoundaryHeadOverfitSteps;
+            debug_boundary_head_overfit_steps = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-boundary-head-overfit-lr")) {
+            const val = args.next() orelse return error.MissingDebugBoundaryHeadOverfitLr;
+            debug_boundary_head_overfit_lr = try std.fmt.parseFloat(f32, val);
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-probe")) {
+            debug_frozen_feature_probe = true;
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-train-examples")) {
+            const val = args.next() orelse return error.MissingDebugFrozenFeatureTrainExamples;
+            debug_frozen_feature_train_examples = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-val-examples")) {
+            const val = args.next() orelse return error.MissingDebugFrozenFeatureValExamples;
+            debug_frozen_feature_val_examples = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-train-offset")) {
+            const val = args.next() orelse return error.MissingDebugFrozenFeatureTrainOffset;
+            debug_frozen_feature_train_offset = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-val-offset")) {
+            const val = args.next() orelse return error.MissingDebugFrozenFeatureValOffset;
+            debug_frozen_feature_val_offset = try std.fmt.parseUnsigned(usize, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-epochs")) {
+            const val = args.next() orelse return error.MissingDebugFrozenFeatureEpochs;
+            debug_frozen_feature_epochs = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--debug-frozen-feature-lr")) {
+            const val = args.next() orelse return error.MissingDebugFrozenFeatureLr;
+            debug_frozen_feature_lr = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, arg, "--debug-step-json")) {
             debug_step_json_path = args.next() orelse return error.MissingDebugStepJson;
         } else if (std.mem.eql(u8, arg, "--debug-batch-offset")) {
@@ -5942,6 +7292,7 @@ pub fn main(init: std.process.Init) !void {
         .epochs = epochs,
         .batch_size = batch_size,
         .learning_rate = learning_rate,
+        .boundary_head_lr_multiplier = boundary_head_lr_multiplier,
         .warmup_steps = warmup_steps,
         .lr_total_steps = lr_total_steps,
         .weight_decay = weight_decay,
@@ -5958,6 +7309,24 @@ pub fn main(init: std.process.Init) !void {
         .contrastive_focal_gamma = contrastive_focal_gamma,
         .contrastive_focal_alpha = contrastive_focal_alpha,
         .boundary_pos_weight = boundary_pos_weight,
+        .boundary_pos_weight_auto = boundary_pos_weight_auto,
+        .boundary_pos_weight_auto_max_examples = boundary_pos_weight_auto_max_examples,
+        .boundary_rank_loss_weight = boundary_rank_loss_weight,
+        .boundary_rank_loss_margin = boundary_rank_loss_margin,
+        .boundary_rank_loss_top_k = boundary_rank_loss_top_k,
+        .boundary_same_token_rank_loss_weight = boundary_same_token_rank_loss_weight,
+        .boundary_same_token_rank_loss_top_k = boundary_same_token_rank_loss_top_k,
+        .boundary_same_token_negative_weight = boundary_same_token_negative_weight,
+        .boundary_same_token_negative_top_k = boundary_same_token_negative_top_k,
+        .boundary_candidate_rank_loss_weight = boundary_candidate_rank_loss_weight,
+        .boundary_candidate_rank_loss_top_k = boundary_candidate_rank_loss_top_k,
+        .boundary_candidate_negative_weight = boundary_candidate_negative_weight,
+        .boundary_gold_count_rank_loss_weight = boundary_gold_count_rank_loss_weight,
+        .boundary_gold_count_rank_loss_margin = boundary_gold_count_rank_loss_margin,
+        .boundary_gold_count_rank_loss_negative_multiplier = boundary_gold_count_rank_loss_negative_multiplier,
+        .boundary_local_window_loss_weight = boundary_local_window_loss_weight,
+        .boundary_local_window_radius = boundary_local_window_radius,
+        .boundary_feature_mode = boundary_feature_mode,
         .boundary_dropout = boundary_dropout,
         .boundary_loss_type = boundary_loss_type,
         .hidden_size = hidden_size,
@@ -5970,6 +7339,9 @@ pub fn main(init: std.process.Init) !void {
         .eval_every = eval_every,
         .eval_every_steps = eval_every_steps,
         .step_eval_max_examples = step_eval_max_examples,
+        .step_train_eval_max_examples = step_train_eval_max_examples,
+        .checkpoint_roundtrip_eval = checkpoint_roundtrip_eval,
+        .checkpoint_roundtrip_max_examples = checkpoint_roundtrip_max_examples,
         .max_steps = max_steps,
         .split = split,
         .val_split = val_split,
@@ -6006,6 +7378,8 @@ pub fn main(init: std.process.Init) !void {
         .go_epoch_shuffle = go_epoch_shuffle,
         .report_to = report_to,
         .manifest_path = manifest_path,
+        .boundary_alignment_dump_dir = boundary_alignment_dump_dir,
+        .boundary_alignment_dump_top_k = boundary_alignment_dump_top_k,
         .memory_sample_every = memory_sample_every,
         .memory_warn_rss_bytes = memory_warn_rss_bytes,
         .memory_abort_rss_bytes = memory_abort_rss_bytes,
@@ -6015,6 +7389,15 @@ pub fn main(init: std.process.Init) !void {
         .debug_boundary_step_exit = debug_boundary_step_exit,
         .debug_update_step = debug_update_step,
         .debug_update_step_exit = debug_update_step_exit,
+        .debug_boundary_head_overfit_steps = debug_boundary_head_overfit_steps,
+        .debug_boundary_head_overfit_lr = debug_boundary_head_overfit_lr,
+        .debug_frozen_feature_probe = debug_frozen_feature_probe,
+        .debug_frozen_feature_train_examples = debug_frozen_feature_train_examples,
+        .debug_frozen_feature_val_examples = debug_frozen_feature_val_examples,
+        .debug_frozen_feature_train_offset = debug_frozen_feature_train_offset,
+        .debug_frozen_feature_val_offset = debug_frozen_feature_val_offset,
+        .debug_frozen_feature_epochs = debug_frozen_feature_epochs,
+        .debug_frozen_feature_lr = debug_frozen_feature_lr,
         .debug_step_json_path = debug_step_json_path,
         .debug_batch_offset = debug_batch_offset,
         .debug_encoder_probe_layer = debug_encoder_probe_layer,
@@ -6983,6 +8366,9 @@ fn evaluateBoundarySamplesStreaming(
     encoder_loaded: bool,
     use_metal: bool,
     lora_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    eval_label: []const u8,
+    eval_step: u64,
+    fitted_threshold: ?f32,
 ) !fused_chunker_train.EvalSummary {
     if (encoder_loaded) {
         if (lora_adapters) |la| {
@@ -6990,13 +8376,31 @@ fn evaluateBoundarySamplesStreaming(
         }
     }
 
-    var acc = fused_chunker_train.BoundaryEvalAccumulator{};
+    var acc = fused_chunker_train.BoundaryEvalAccumulator{
+        .calibrated_threshold = fused_chunker_loss.weightedCePositiveThreshold(trainer.loss_config.pos_weight),
+        .fitted_threshold = fitted_threshold,
+    };
+    defer acc.deinit(allocator);
     const eval_start_ns = nowNs();
     const bs: usize = @intCast(opts.batch_size);
     const max_seq: usize = @intCast(opts.max_seq_len);
     const max_chunks: usize = @intCast(opts.max_chunks);
     const hidden_size: usize = @intCast(opts.hidden_size);
     const total_batches = (samples.len + bs - 1) / bs;
+
+    var alignment_path: ?[]u8 = null;
+    defer if (alignment_path) |path| allocator.free(path);
+    var alignment_file: ?std.Io.File = null;
+    if (opts.boundary_alignment_dump_dir) |dump_dir| {
+        try compat.cwd().createDirPath(compat.io(), dump_dir);
+        const path = try boundaryAlignmentDumpPath(allocator, dump_dir, eval_label, eval_step);
+        alignment_path = path;
+        alignment_file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+    }
+    defer if (alignment_file) |*file| file.close(compat.io());
+    var alignment_buf: [8192]u8 = undefined;
+    var alignment_writer = if (alignment_file) |*file| file.writerStreaming(compat.io(), &alignment_buf) else null;
+    defer if (alignment_writer) |*writer| writer.interface.flush() catch {};
 
     var sample_idx: usize = 0;
     var batch_idx: usize = 0;
@@ -7082,7 +8486,24 @@ fn evaluateBoundarySamplesStreaming(
             mask[t] = if (batch.attention_mask[t] != 0) 1.0 else 0.0;
         }
 
-        try trainer.evaluateBatchInto(allocator, &acc, features, labels, mask, total_tokens);
+        const logits = try trainer.evaluateBoundaryLogitsOwned(allocator, features, total_tokens);
+        defer allocator.free(logits);
+
+        try acc.addLogitsBySample(allocator, logits, labels, mask, max_seq);
+        if (alignment_writer) |*writer| {
+            try writeBoundaryAlignmentDumpBatch(
+                allocator,
+                &writer.interface,
+                eval_label,
+                eval_step,
+                batch_idx + 1,
+                &batch,
+                logits,
+                features,
+                hidden_size,
+                opts.boundary_alignment_dump_top_k,
+            );
+        }
 
         batch_idx += 1;
         sample_idx = end;
@@ -7095,14 +8516,16 @@ fn evaluateBoundarySamplesStreaming(
         }
     }
 
-    return acc.finish();
+    return try acc.finish(allocator);
 }
 
 // ---------------------------------------------------------------------------
 // Core training routine
 // ---------------------------------------------------------------------------
 
-fn run(allocator: std.mem.Allocator, opts: Options) !void {
+fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
+    var opts = input_opts;
+
     // ------------------------------------------------------------------
     // 1. Create output directory
     // ------------------------------------------------------------------
@@ -7124,12 +8547,13 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     const effective_neftune_alpha: f32 = if (opts.deterministic) 0.0 else opts.neftune_alpha;
     const effective_encoder_neftune_alpha: f32 = if (opts.encoder_neftune) effective_neftune_alpha else 0.0;
 
-    print("train-fused-chunker data={s} output={s} epochs={d} batch_size={d} lr={d} warmup_steps={d} lr_total_steps={d} weight_decay={d} beta1={d} beta2={d} adam_epsilon={d} hidden={d} layers={d} max_seq_len={d} max_chunks={d} loss_type={s} pos_weight={d} boundary_dropout={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} optimizer={s} log_every={d} checkpoint_every_steps={d} eval_every_steps={d} seed={d} lisa_sample={d} lisa_top_k={d} lora_train_top_k={d} lora_start_epoch={d} encoder_vjp={s} layers_per_segment={d}\n", .{
+    print("train-fused-chunker data={s} output={s} epochs={d} batch_size={d} lr={d} boundary_head_lr_multiplier={d} warmup_steps={d} lr_total_steps={d} weight_decay={d} beta1={d} beta2={d} adam_epsilon={d} hidden={d} layers={d} max_seq_len={d} max_chunks={d}\n", .{
         opts.data_path,
         opts.output_dir,
         opts.epochs,
         opts.batch_size,
         opts.learning_rate,
+        opts.boundary_head_lr_multiplier,
         opts.warmup_steps,
         opts.lr_total_steps,
         opts.weight_decay,
@@ -7140,8 +8564,28 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         opts.num_layers,
         opts.max_seq_len,
         opts.max_chunks,
+    });
+    print("train-fused-chunker loss_knobs loss_type={s} pos_weight={d} pos_weight_auto={} boundary_rank_loss_weight={d} boundary_rank_loss_margin={d} boundary_rank_loss_top_k={d} boundary_same_token_rank_loss_weight={d} boundary_same_token_rank_loss_top_k={d} boundary_same_token_negative_weight={d} boundary_same_token_negative_top_k={d} boundary_candidate_rank_loss_weight={d} boundary_candidate_rank_loss_top_k={d} boundary_candidate_negative_weight={d} boundary_gold_count_rank_loss_weight={d} boundary_gold_count_rank_loss_margin={d} boundary_gold_count_rank_loss_negative_multiplier={d} boundary_local_window_loss_weight={d} boundary_local_window_radius={d}\n", .{
         @tagName(opts.boundary_loss_type),
         opts.boundary_pos_weight,
+        opts.boundary_pos_weight_auto,
+        opts.boundary_rank_loss_weight,
+        opts.boundary_rank_loss_margin,
+        opts.boundary_rank_loss_top_k,
+        opts.boundary_same_token_rank_loss_weight,
+        opts.boundary_same_token_rank_loss_top_k,
+        opts.boundary_same_token_negative_weight,
+        opts.boundary_same_token_negative_top_k,
+        opts.boundary_candidate_rank_loss_weight,
+        opts.boundary_candidate_rank_loss_top_k,
+        opts.boundary_candidate_negative_weight,
+        opts.boundary_gold_count_rank_loss_weight,
+        opts.boundary_gold_count_rank_loss_margin,
+        opts.boundary_gold_count_rank_loss_negative_multiplier,
+        opts.boundary_local_window_loss_weight,
+        opts.boundary_local_window_radius,
+    });
+    print("train-fused-chunker runtime_knobs boundary_dropout={d} lambda_embed={d} boundary_focus_epochs={d} boundary_focus_lambda_embed={d} optimizer={s} log_every={d} checkpoint_every_steps={d} eval_every_steps={d} seed={d} lisa_sample={d} lisa_top_k={d} lora_train_top_k={d} lora_start_epoch={d} encoder_vjp={s} layers_per_segment={d}\n", .{
         effective_boundary_dropout,
         opts.lambda_embed,
         opts.boundary_focus_epochs,
@@ -7169,6 +8613,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     });
     print("contrastive_grad_path={s}\n", .{fused_chunker_train.contrastive_gradient_path});
     print("step_eval_max_examples={d}\n", .{opts.step_eval_max_examples});
+    print("step_train_eval_max_examples={d}\n", .{opts.step_train_eval_max_examples});
     print("max_steps={d}\n", .{opts.max_steps});
     print("telemetry manifest={s} metrics={s} deterministic={} memory_sample_every={d} memory_warn_rss_bytes={d} memory_abort_rss_bytes={d}\n", .{
         manifest_path,
@@ -7483,6 +8928,32 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         train_stats.total_boundary_targets,
     });
 
+    if (opts.boundary_pos_weight_auto) {
+        const tokenizer = if (tokenizer_opt) |*tb| tb else return error.AutoBoundaryPosWeightRequiresTokenizer;
+        const estimate = try estimateBoundaryPosWeight(
+            allocator,
+            samples,
+            tokenizer,
+            opts.boundary_pos_weight_auto_max_examples,
+            @intCast(opts.batch_size),
+            @intCast(opts.max_seq_len),
+            @intCast(opts.max_chunks),
+        );
+        opts.boundary_pos_weight = estimate.balanced_pos_weight;
+        opts.boundary_pos_weight_auto_observed_examples = estimate.examples;
+        opts.boundary_pos_weight_auto_valid_tokens = estimate.valid_tokens;
+        opts.boundary_pos_weight_auto_gold_tokens = estimate.gold_tokens;
+        opts.boundary_pos_weight_auto_gold_rate = estimate.gold_rate;
+        print("auto_boundary_pos_weight examples={d} batches={d} valid_tokens={d} gold_tokens={d} gold_rate={d:.8} pos_weight={d:.6}\n", .{
+            estimate.examples,
+            estimate.batches,
+            estimate.valid_tokens,
+            estimate.gold_tokens,
+            estimate.gold_rate,
+            estimate.balanced_pos_weight,
+        });
+    }
+
     var val_loaded_opt: ?fused_chunker_data.LoadedSamples = null;
     defer if (val_loaded_opt) |*val_loaded| val_loaded.deinit();
     var val_samples: []const fused_chunker_data.FusedSample = &.{};
@@ -7569,6 +9040,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         .batch_size = opts.batch_size,
         .num_epochs = opts.epochs,
         .learning_rate = opts.learning_rate,
+        .boundary_head_lr_multiplier = opts.boundary_head_lr_multiplier,
         .max_grad_norm = opts.max_grad_norm,
         .weight_decay = opts.weight_decay,
         .beta1 = opts.beta1,
@@ -7583,6 +9055,22 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         .contrastive_focal_gamma = opts.contrastive_focal_gamma,
         .contrastive_focal_alpha = opts.contrastive_focal_alpha,
         .pos_weight = opts.boundary_pos_weight,
+        .boundary_rank_loss_weight = opts.boundary_rank_loss_weight,
+        .boundary_rank_loss_margin = opts.boundary_rank_loss_margin,
+        .boundary_rank_loss_top_k = opts.boundary_rank_loss_top_k,
+        .boundary_same_token_rank_loss_weight = opts.boundary_same_token_rank_loss_weight,
+        .boundary_same_token_rank_loss_top_k = opts.boundary_same_token_rank_loss_top_k,
+        .boundary_same_token_negative_weight = opts.boundary_same_token_negative_weight,
+        .boundary_same_token_negative_top_k = opts.boundary_same_token_negative_top_k,
+        .boundary_candidate_rank_loss_weight = opts.boundary_candidate_rank_loss_weight,
+        .boundary_candidate_rank_loss_top_k = opts.boundary_candidate_rank_loss_top_k,
+        .boundary_candidate_negative_weight = opts.boundary_candidate_negative_weight,
+        .boundary_gold_count_rank_loss_weight = opts.boundary_gold_count_rank_loss_weight,
+        .boundary_gold_count_rank_loss_margin = opts.boundary_gold_count_rank_loss_margin,
+        .boundary_gold_count_rank_loss_negative_multiplier = opts.boundary_gold_count_rank_loss_negative_multiplier,
+        .boundary_local_window_loss_weight = opts.boundary_local_window_loss_weight,
+        .boundary_local_window_radius = opts.boundary_local_window_radius,
+        .boundary_feature_mode = opts.boundary_feature_mode,
         .boundary_dropout = effective_boundary_dropout,
         .warmup_steps = warmup_steps,
         .total_steps = @max(1, total_steps),
@@ -7618,8 +9106,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     var trainer = try FusedTrainer.init(allocator, config, &cb);
     defer trainer.deinit();
 
-    print("trainer ready  boundary_head hidden={d} mlp_dim={d}\n", .{
+    print("trainer ready  encoder_hidden={d} boundary_head_input={d} boundary_feature_mode={s} mlp_dim={d}\n", .{
         config.hidden_size,
+        trainer.boundary_head.hidden_dim,
+        fused_chunker_train.boundaryFeatureModeName(config.boundary_feature_mode),
         config.boundary_mlp_dim,
     });
 
@@ -7669,6 +9159,63 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         }
     }
 
+    if (opts.debug_frozen_feature_probe) {
+        var frozen_probe_memory_tracker = MemoryTracker{};
+        _ = frozen_probe_memory_tracker.observe();
+        try writeFusedTrainingManifest(
+            allocator,
+            manifest_path,
+            &opts,
+            if (use_metal) "metal" else "native",
+            metrics_path,
+            train_stats,
+            validation_stats,
+            "frozen_feature_probe_running",
+            trainer.step_count,
+            null,
+            null,
+            0,
+            0,
+            0.0,
+            BoundaryThresholdRecommendation{},
+            frozen_probe_memory_tracker.peak_resident_bytes,
+        );
+
+        const tokenizer_ptr: ?*TokenizerBatch = if (tokenizer_opt) |*tb| tb else null;
+        try runFrozenFeatureProbe(
+            allocator,
+            &opts,
+            &metrics_writer,
+            &trainer,
+            &cb,
+            tokenizer_ptr,
+            samples,
+            val_samples,
+            encoder_loaded,
+        );
+
+        _ = frozen_probe_memory_tracker.observe();
+        try writeFusedTrainingManifest(
+            allocator,
+            manifest_path,
+            &opts,
+            if (use_metal) "metal" else "native",
+            metrics_path,
+            train_stats,
+            validation_stats,
+            "frozen_feature_probe_complete",
+            trainer.step_count,
+            null,
+            null,
+            0,
+            0,
+            0.0,
+            BoundaryThresholdRecommendation{},
+            frozen_probe_memory_tracker.peak_resident_bytes,
+        );
+        return;
+    }
+
     // ------------------------------------------------------------------
     // 5. Training loop
     // ------------------------------------------------------------------
@@ -7695,6 +9242,12 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     var best_val_f1: f32 = 0.0;
     var best_val_epoch: u32 = 0;
     var best_val_step: u32 = 0;
+    var boundary_threshold_recommendation = BoundaryThresholdRecommendation{};
+    var last_validation_summary: ?fused_chunker_train.EvalSummary = null;
+    var last_validation_event: []const u8 = "";
+    var last_validation_epoch_index: usize = 0;
+    var last_validation_step: u64 = 0;
+    var last_validation_samples: usize = 0;
     var last_step_loss: ?f32 = null;
     var memory_tracker = MemoryTracker{};
     _ = memory_tracker.observe();
@@ -7714,6 +9267,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         @intCast(best_val_step),
         best_val_epoch,
         best_val_f1,
+        boundary_threshold_recommendation,
         memory_tracker.peak_resident_bytes,
     );
 
@@ -7753,7 +9307,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     var stop_training = false;
     for (0..opts.epochs) |epoch| {
         const epoch_lambda_embed: f32 = if (epoch < opts.boundary_focus_epochs)
-            opts.boundary_focus_lambda_embed
+            @min(opts.lambda_embed, opts.boundary_focus_lambda_embed)
         else
             opts.lambda_embed;
         trainer.loss_config.lambda_embed = epoch_lambda_embed;
@@ -8132,6 +9686,8 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     features,
                     boundary_labels_2,
                     attn_mask_f32,
+                    batch.input_ids[0..total_tokens],
+                    batch.boundary_candidate_mask[0..total_tokens],
                     total_tokens,
                     true,
                 );
@@ -8535,6 +10091,26 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 }
             }
 
+            if (opts.debug_boundary_head_overfit_steps > 0) {
+                try runBoundaryHeadFrozenOverfitProbe(
+                    allocator,
+                    &trainer,
+                    features,
+                    boundary_labels_2,
+                    attn_mask_f32,
+                    chunk_embeddings,
+                    chunk_mask,
+                    doc_ids,
+                    total_tokens,
+                    actual_batch,
+                    C,
+                    E,
+                    opts.debug_boundary_head_overfit_steps,
+                    opts.debug_boundary_head_overfit_lr,
+                );
+                return;
+            }
+
             var contrastive_embeddings: []const f32 = chunk_embeddings;
             var contrastive_mask: []const f32 = chunk_mask;
             var contrastive_doc_ids: []const u32 = doc_ids;
@@ -8735,6 +10311,8 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         features,
                         boundary_labels_2,
                         attn_mask_f32,
+                        batch.input_ids[0..total_tokens],
+                        batch.boundary_candidate_mask[0..total_tokens],
                         contrastive_embeddings,
                         contrastive_mask,
                         contrastive_doc_ids,
@@ -8832,6 +10410,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 const top_k = @min(opts.lora_train_top_k, la.config.num_layers);
                                 break :blk la.config.num_layers - top_k;
                             } else null;
+                            const vjp_stop_layer = top_k_boundary orelse 0;
 
                             if (opts.debug_step_json_path != null and opts.debug_encoder_probe_layer < la.config.num_layers) {
                                 if (step_parity_upstream_grad_probe) |*probe| {
@@ -8856,7 +10435,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                             }
 
                             var layer_cursor: u32 = la.config.num_layers;
-                            while (layer_cursor > 0) {
+                            while (layer_cursor > vjp_stop_layer) {
                                 const segment_end = layer_cursor;
                                 var segment_start = if (segment_end > layers_per_segment)
                                     segment_end - layers_per_segment
@@ -8891,7 +10470,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                         break;
                                     }
                                 }
-                                const include_hidden_grad = segment_start > 0;
+                                const include_hidden_grad = segment_start > vjp_stop_layer;
                                 const include_adapter_grads = exact_adapter_grads and segment_has_active_lora;
                                 const needs_segment_vjp = include_hidden_grad or include_adapter_grads;
 
@@ -9409,6 +10988,8 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         features,
                         boundary_labels_2,
                         attn_mask_f32,
+                        batch.input_ids[0..total_tokens],
+                        batch.boundary_candidate_mask[0..total_tokens],
                         contrastive_embeddings,
                         contrastive_mask,
                         contrastive_doc_ids,
@@ -9426,6 +11007,8 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     features,
                     boundary_labels_2,
                     attn_mask_f32,
+                    batch.input_ids[0..total_tokens],
+                    batch.boundary_candidate_mask[0..total_tokens],
                     contrastive_embeddings,
                     contrastive_mask,
                     contrastive_doc_ids,
@@ -9678,6 +11261,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     @intCast(best_val_step),
                     best_val_epoch,
                     best_val_f1,
+                    boundary_threshold_recommendation,
                     memory_tracker.peak_resident_bytes,
                 );
                 print("memory_watchdog abort resident_bytes={d} abort_threshold={d} peak_resident_bytes={d} checkpoint={s}\n", .{
@@ -9691,7 +11275,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
 
             if (opts.log_every > 0 and (step == 1 or step % opts.log_every == 0)) {
                 print(
-                    "epoch {d}/{d} step {d} | loss {d:.4} | boundary {d:.4} | contrastive {d:.4} | lr {d} | step_ms {d:.2} | batch {d:.2} | refresh {d:.2} | enc {d:.2} | hn {d:.2} | train {d:.2} | lora {d:.2} | splade {d:.2} | ex/s {d:.1}\n",
+                    "epoch {d}/{d} step {d} | loss {d:.4} | boundary {d:.4} | contrastive {d:.4} | lr {d} | boundary_head_lr {d} | step_ms {d:.2} | batch {d:.2} | refresh {d:.2} | enc {d:.2} | hn {d:.2} | train {d:.2} | lora {d:.2} | splade {d:.2} | ex/s {d:.1}\n",
                     .{
                         epoch + 1,
                         opts.epochs,
@@ -9700,6 +11284,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         summary.boundary_loss,
                         summary.contrastive_loss,
                         summary.learning_rate,
+                        summary.boundary_head_learning_rate,
                         nsToMs(step_timing.total_ns),
                         nsToMs(step_timing.batch_ns),
                         nsToMs(step_timing.lora_refresh_ns),
@@ -9747,6 +11332,77 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             }
 
             if (val_samples.len > 0 and opts.eval_every_steps > 0 and summary.step > 0 and summary.step % opts.eval_every_steps == 0) {
+                var step_fitted_threshold: ?f32 = null;
+                if (opts.step_train_eval_max_examples > 0 and samples.len > 0) {
+                    const train_eval_start_ns = nowNs();
+                    const train_eval_count = @min(opts.step_train_eval_max_examples, samples.len);
+                    const train_eval_samples = samples[0..train_eval_count];
+                    const train_eval_summary = try evaluateBoundarySamplesStreaming(
+                        allocator,
+                        &opts,
+                        &trainer,
+                        &cb,
+                        &weight_store,
+                        &metal_weight_store,
+                        if (tokenizer_opt) |*tb| tb else null,
+                        train_eval_samples,
+                        encoder_loaded,
+                        use_metal,
+                        if (lora_adapters_opt) |*la| la else null,
+                        "train_validation",
+                        summary.step,
+                        null,
+                    );
+                    step_fitted_threshold = train_eval_summary.best_boundary_threshold;
+                    const train_eval_ms = nsToMs(elapsedNs(train_eval_start_ns));
+                    print(
+                        "train validation step {d} epoch {d}/{d} samples={d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | rank ap={d:.6} p_at_gold={d:.4} rank_f1={d:.4} rank_threshold={d:.6} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
+                        .{
+                            summary.step,
+                            epoch + 1,
+                            opts.epochs,
+                            train_eval_samples.len,
+                            samples.len,
+                            train_eval_summary.boundary_f1,
+                            train_eval_summary.boundary_precision,
+                            train_eval_summary.boundary_recall,
+                            train_eval_summary.boundary_tp,
+                            train_eval_summary.boundary_fp,
+                            train_eval_summary.boundary_fn,
+                            train_eval_summary.best_boundary_f1,
+                            train_eval_summary.best_boundary_threshold,
+                            train_eval_summary.best_boundary_tp,
+                            train_eval_summary.best_boundary_fp,
+                            train_eval_summary.best_boundary_fn,
+                            train_eval_summary.average_precision,
+                            train_eval_summary.precision_at_gold_count,
+                            train_eval_summary.max_rank_f1,
+                            train_eval_summary.max_rank_threshold,
+                            train_eval_summary.valid_tokens,
+                            train_eval_summary.gold_positives,
+                            train_eval_summary.gold_positive_rate,
+                            train_eval_summary.predicted_positive_rate,
+                            train_eval_summary.best_predicted_positive_rate,
+                            train_eval_summary.mean_positive_probability_gold_positive,
+                            train_eval_summary.mean_positive_probability_gold_negative,
+                            train_eval_summary.mean_boundary_margin_gold_positive,
+                            train_eval_summary.mean_boundary_margin_gold_negative,
+                            train_eval_ms,
+                        },
+                    );
+                    try writeValidationMetric(
+                        &metrics_writer,
+                        "train_validation_step",
+                        epoch,
+                        summary.step,
+                        train_eval_samples.len,
+                        samples.len,
+                        train_eval_ms,
+                        train_eval_summary,
+                    );
+                    fused_chunker_train.printBoundaryQualityDiagnostics("train_validation_step_quality", train_eval_summary);
+                }
+
                 const val_eval_start_ns = nowNs();
                 const step_eval_samples = if (opts.step_eval_max_examples > 0 and opts.step_eval_max_examples < val_samples.len)
                     val_samples[0..opts.step_eval_max_examples]
@@ -9765,10 +11421,13 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     encoder_loaded,
                     use_metal,
                     if (lora_adapters_opt) |*la| la else null,
+                    "validation",
+                    summary.step,
+                    step_fitted_threshold,
                 );
                 const eval_ms = nsToMs(elapsedNs(val_eval_start_ns));
                 print(
-                    "validation step {d} epoch {d}/{d} samples={d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
+                    "validation step {d} epoch {d}/{d} samples={d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | rank ap={d:.6} p_at_gold={d:.4} rank_f1={d:.4} rank_threshold={d:.6} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
                     .{
                         summary.step,
                         epoch + 1,
@@ -9786,6 +11445,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                         val_summary.best_boundary_tp,
                         val_summary.best_boundary_fp,
                         val_summary.best_boundary_fn,
+                        val_summary.average_precision,
+                        val_summary.precision_at_gold_count,
+                        val_summary.max_rank_f1,
+                        val_summary.max_rank_threshold,
                         val_summary.valid_tokens,
                         val_summary.gold_positives,
                         val_summary.gold_positive_rate,
@@ -9807,6 +11470,20 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     val_samples.len,
                     eval_ms,
                     val_summary,
+                );
+                last_validation_summary = val_summary;
+                last_validation_event = "validation_step";
+                last_validation_epoch_index = epoch;
+                last_validation_step = summary.step;
+                last_validation_samples = step_eval_samples.len;
+                maybeUpdateBoundaryThresholdRecommendation(
+                    &boundary_threshold_recommendation,
+                    val_summary,
+                    "validation_step",
+                    summary.step,
+                    @intCast(epoch + 1),
+                    step_eval_samples.len,
+                    val_samples.len,
                 );
                 fused_chunker_train.printBoundaryQualityDiagnostics("validation_step_quality", val_summary);
 
@@ -9888,10 +11565,13 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 encoder_loaded,
                 use_metal,
                 if (lora_adapters_opt) |*la| la else null,
+                "epoch_validation",
+                trainer.step_count,
+                null,
             );
             const eval_ms = nsToMs(elapsedNs(val_eval_start_ns));
             print(
-                "validation epoch {d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
+                "validation epoch {d}/{d} | f1 {d:.4} precision {d:.4} recall {d:.4} counts tp={d} fp={d} fn={d} | best_f1 {d:.4} threshold {d:.2} best_counts tp={d} fp={d} fn={d} | rank ap={d:.6} p_at_gold={d:.4} rank_f1={d:.4} rank_threshold={d:.6} | valid={d} gold_pos={d} gold_rate={d:.6} pred_rate={d:.6} best_pred_rate={d:.6} prob_pos={d:.4} prob_neg={d:.4} margin_pos={d:.4} margin_neg={d:.4} | eval_ms {d:.2}\n",
                 .{
                     epoch + 1,
                     opts.epochs,
@@ -9906,6 +11586,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                     val_summary.best_boundary_tp,
                     val_summary.best_boundary_fp,
                     val_summary.best_boundary_fn,
+                    val_summary.average_precision,
+                    val_summary.precision_at_gold_count,
+                    val_summary.max_rank_f1,
+                    val_summary.max_rank_threshold,
                     val_summary.valid_tokens,
                     val_summary.gold_positives,
                     val_summary.gold_positive_rate,
@@ -9927,6 +11611,20 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                 val_samples.len,
                 eval_ms,
                 val_summary,
+            );
+            last_validation_summary = val_summary;
+            last_validation_event = "validation_epoch";
+            last_validation_epoch_index = epoch;
+            last_validation_step = trainer.step_count;
+            last_validation_samples = val_samples.len;
+            maybeUpdateBoundaryThresholdRecommendation(
+                &boundary_threshold_recommendation,
+                val_summary,
+                "validation_epoch",
+                trainer.step_count,
+                @intCast(epoch + 1),
+                val_samples.len,
+                val_samples.len,
             );
             fused_chunker_train.printBoundaryQualityDiagnostics("validation_epoch_quality", val_summary);
 
@@ -9968,6 +11666,89 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         print("optimizer state saved to {s}\n", .{opt_final_path});
     }
 
+    if (opts.checkpoint_roundtrip_eval and val_samples.len > 0) {
+        const roundtrip_samples = if (opts.checkpoint_roundtrip_max_examples > 0 and opts.checkpoint_roundtrip_max_examples < val_samples.len)
+            val_samples[0..opts.checkpoint_roundtrip_max_examples]
+        else
+            val_samples;
+
+        var roundtrip_trainer = try FusedTrainer.init(allocator, config, &cb);
+        defer roundtrip_trainer.deinit();
+        try roundtrip_trainer.loadCheckpoint(allocator, final_path);
+
+        var roundtrip_lora_adapters_opt: ?fused_chunker_lora.LoRAAdapterSet = null;
+        defer if (roundtrip_lora_adapters_opt) |*la| la.deinit();
+        if (lora_adapters_opt) |*la| {
+            roundtrip_lora_adapters_opt = try fused_chunker_lora.LoRAAdapterSet.init(
+                allocator,
+                la.config,
+                @intCast(opts.hidden_size),
+                @intCast(opts.intermediate_size),
+            );
+            const loaded_lora = try loadLoRAAdaptersFromCheckpoint(allocator, final_path, &roundtrip_lora_adapters_opt.?);
+            print("checkpoint_same_process_roundtrip loaded_lora_tensors={d} checkpoint={s}\n", .{ loaded_lora, final_path });
+        }
+
+        const roundtrip_eval_start_ns = nowNs();
+        const roundtrip_summary = try evaluateBoundarySamplesStreaming(
+            allocator,
+            &opts,
+            &roundtrip_trainer,
+            &cb,
+            &weight_store,
+            &metal_weight_store,
+            if (tokenizer_opt) |*tb| tb else null,
+            roundtrip_samples,
+            encoder_loaded,
+            use_metal,
+            if (roundtrip_lora_adapters_opt) |*la| la else null,
+            "checkpoint_roundtrip",
+            trainer.step_count,
+            null,
+        );
+        const roundtrip_eval_ms = nsToMs(elapsedNs(roundtrip_eval_start_ns));
+        print(
+            "checkpoint_same_process_roundtrip_validation samples={d}/{d} | f1 {d:.4} best_f1 {d:.4} ap {d:.6} rank_f1 {d:.4} prob_pos={d:.4} prob_neg={d:.4} | eval_ms {d:.2}\n",
+            .{
+                roundtrip_samples.len,
+                val_samples.len,
+                roundtrip_summary.boundary_f1,
+                roundtrip_summary.best_boundary_f1,
+                roundtrip_summary.average_precision,
+                roundtrip_summary.max_rank_f1,
+                roundtrip_summary.mean_positive_probability_gold_positive,
+                roundtrip_summary.mean_positive_probability_gold_negative,
+                roundtrip_eval_ms,
+            },
+        );
+        if (last_validation_summary) |live| {
+            print(
+                "checkpoint_same_process_roundtrip_delta live_event={s} live_step={d} live_samples={d} delta_f1={d:.6} delta_best_f1={d:.6} delta_ap={d:.6} delta_prob_gap={d:.6}\n",
+                .{
+                    last_validation_event,
+                    last_validation_step,
+                    last_validation_samples,
+                    roundtrip_summary.boundary_f1 - live.boundary_f1,
+                    roundtrip_summary.best_boundary_f1 - live.best_boundary_f1,
+                    roundtrip_summary.average_precision - live.average_precision,
+                    (roundtrip_summary.mean_positive_probability_gold_positive - roundtrip_summary.mean_positive_probability_gold_negative) -
+                        (live.mean_positive_probability_gold_positive - live.mean_positive_probability_gold_negative),
+                },
+            );
+        }
+        try writeValidationMetric(
+            &metrics_writer,
+            "checkpoint_same_process_roundtrip_validation",
+            last_validation_epoch_index,
+            trainer.step_count,
+            roundtrip_samples.len,
+            val_samples.len,
+            roundtrip_eval_ms,
+            roundtrip_summary,
+        );
+        fused_chunker_train.printBoundaryQualityDiagnostics("checkpoint_same_process_roundtrip_quality", roundtrip_summary);
+    }
+
     // Save final SPLADE projection weight W.
     if (splade_w) |w| {
         const splade_final_path = try std.fmt.allocPrint(allocator, "{s}/splade_w_final.safetensors", .{opts.output_dir});
@@ -10003,6 +11784,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         @intCast(best_val_step),
         best_val_epoch,
         best_val_f1,
+        boundary_threshold_recommendation,
         memory_tracker.peak_resident_bytes,
     );
 
@@ -10025,6 +11807,7 @@ fn printUsage() void {
         \\  --batch-size <n>          Batch size (default: 16)
         \\  --lr <f>                  Learning rate (default: 1e-4)
         \\  --learning-rate <f>       Alias for --lr
+        \\  --boundary-head-lr-multiplier <f> Multiplier on base LR for boundary-head weights only (default: 1.0)
         \\  --warmup-steps <n>        Linear warmup steps (default: 200)
         \\  --lr-total-steps <n>      Override cosine LR schedule total steps (default: epochs * steps/epoch)
         \\  --weight-decay <f>        AdamW weight decay (default: 0.01)
@@ -10044,8 +11827,26 @@ fn printUsage() void {
         \\  --focal-alpha <f>         Alias for --boundary-focal-alpha
         \\  --contrastive-focal-gamma <f> Dense contrastive focal gamma (default: 0.0, disabled)
         \\  --contrastive-focal-alpha <f> Dense contrastive focal alpha (default: 0.75)
-        \\  --boundary-pos-weight <f> Positive class weight for CE loss (default: 5.0)
-        \\  --pos-weight <f>          Alias for --boundary-pos-weight
+        \\  --boundary-pos-weight <f|auto> Positive class weight for CE loss (default: 5.0)
+        \\  --pos-weight <f|auto>     Alias for --boundary-pos-weight
+        \\  --boundary-pos-weight-auto Estimate CE positive weight from tokenized train labels
+        \\  --boundary-pos-weight-auto-max-examples <n> Max train examples for auto estimate (default: 2048)
+        \\  --boundary-rank-loss-weight <f> Pairwise gold-vs-hard-negative boundary rank loss weight (default: 0.0, disabled)
+        \\  --boundary-rank-loss-margin <f> Boundary rank loss hinge margin (default: 1.0)
+        \\  --boundary-rank-loss-top-k <n> Average top-k violating negatives per gold boundary (default: 1)
+        \\  --boundary-same-token-rank-loss-weight <f> Extra rank loss against negatives with same token id as gold boundaries (default: 0.0, disabled)
+        \\  --boundary-same-token-rank-loss-top-k <n> Same-token hard negatives per gold boundary (default: 4)
+        \\  --boundary-same-token-negative-weight <f> CE negative-class multiplier for non-boundaries sharing a token id with a gold boundary in the batch (default: 1.0, disabled)
+        \\  --boundary-same-token-negative-top-k <n> Limit same-token CE multiplier to top-k highest-margin same-token negatives (default: 0, all)
+        \\  --boundary-candidate-rank-loss-weight <f> Extra rank loss against sentence-like non-boundary candidates from token offsets (default: 0.0, disabled)
+        \\  --boundary-candidate-rank-loss-top-k <n> Sentence-like hard negatives per gold boundary (default: 8)
+        \\  --boundary-candidate-negative-weight <f> CE negative-class multiplier for sentence-like non-boundary candidates from token offsets (default: 1.0, disabled)
+        \\  --boundary-gold-count-rank-loss-weight <f> Sample-local rank loss against gold-count-scaled hard-negative endpoints (default: 0.0, disabled)
+        \\  --boundary-gold-count-rank-loss-margin <f> Gold-count rank loss hinge margin (default: 1.0)
+        \\  --boundary-gold-count-rank-loss-negative-multiplier <n> Hard negatives per sequence = gold_count * n (default: 1)
+        \\  --boundary-local-window-loss-weight <f> Local softmax exact-boundary loss weight (default: 0.0, disabled)
+        \\  --boundary-local-window-radius <n> Tokens on each side for local boundary loss (default: 12)
+        \\  --boundary-feature-mode token|prev-diff|prev-current-diff|prev-current-diff-concat|prev-current-next-diff-concat|window-context-diff Boundary head input feature view (default: token)
         \\  --boundary-dropout <f>    Boundary head dropout rate (default: 0.1)
         \\  --hidden-size <n>         Encoder hidden size (default: 768)
         \\  --num-layers <n>          ModernBERT layer count (default: 22)
@@ -10058,6 +11859,9 @@ fn printUsage() void {
         \\  --eval-every <n>          Validate every N epochs when --val-data is set (default: 1, 0=disabled)
         \\  --eval-every-steps <n>    Validate every N global steps when --val-data is set (0=disabled)
         \\  --step-eval-max-examples <n> Cap step-triggered validation examples only (0=full validation)
+        \\  --step-train-eval-max-examples <n> Also evaluate first N train examples at each step validation gate (0=disabled)
+        \\  --checkpoint-roundtrip-eval Reload final checkpoint in-process and re-evaluate validation slice before exit
+        \\  --checkpoint-roundtrip-max-examples <n> Cap same-process roundtrip validation examples (0=full validation)
         \\  --max-steps <n>           Stop after global training step N (0=disabled)
         \\  --split <name>            Dataset split name filter (default: "train")
         \\  --val-split <name>        Validation split name filter (default: "val")
@@ -10096,6 +11900,8 @@ fn printUsage() void {
         \\  --go-epoch-shuffle        Reset to identity and reseed shuffle as seed+epoch+1 to match Go training epoch order
         \\  --report-to <path>        Write fused training metrics JSONL (default: <output>/fused_training_metrics.jsonl)
         \\  --manifest <path>         Write fused training manifest JSON (default: <output>/fused_training_manifest.json)
+        \\  --boundary-alignment-dump-dir <dir> Write per-eval JSONL token alignment dumps for gold and high-probability boundary tokens
+        \\  --boundary-alignment-dump-top-k <n>  High-probability tokens to dump per eval batch (default: 32)
         \\  --memory-sample-every <n> Sample process RSS every N steps (default: 1)
         \\  --memory-warn-rss-gb <f>  Print a memory watchdog warning above this RSS in GiB
         \\  --memory-abort-rss-gb <f> Save checkpoint and abort above this RSS in GiB
@@ -10105,6 +11911,15 @@ fn printUsage() void {
         \\  --debug-boundary-step-exit Exit after --debug-boundary-step diagnostics
         \\  --debug-update-step <n>   Print LoRA gradient clip, AdamW moment, and update-delta diagnostics after global training step N
         \\  --debug-update-step-exit  Exit after --debug-update-step diagnostics
+        \\  --debug-boundary-head-overfit-steps <n> Train only the boundary head on the first frozen encoded batch for N steps, then exit
+        \\  --debug-boundary-head-overfit-lr <f> Constant LR for --debug-boundary-head-overfit-steps (default: 1e-3)
+        \\  --debug-frozen-feature-probe Encode bounded train/val slices once, train only the boundary head on cached features, then exit
+        \\  --debug-frozen-feature-train-examples <n> Train examples to cache for --debug-frozen-feature-probe (default: 64)
+        \\  --debug-frozen-feature-val-examples <n> Validation examples to cache for --debug-frozen-feature-probe (default: 64)
+        \\  --debug-frozen-feature-train-offset <n> First train example index for cached feature probe (default: 0)
+        \\  --debug-frozen-feature-val-offset <n> First validation example index for cached feature probe (default: 0)
+        \\  --debug-frozen-feature-epochs <n> Boundary-head passes over cached train features (default: 3)
+        \\  --debug-frozen-feature-lr <f> Constant LR for cached boundary-head probe (default: 5e-3)
         \\  --debug-step-json <path>  Write machine-readable frozen-step parity diagnostics for the selected debug step
         \\  --debug-batch-offset <n>  Override resumed batch offset for frozen-step parity diagnostics
         \\  --debug-encoder-probe-layer <n> Capture target encoder layer internals in frozen-step parity JSON (default: 0)

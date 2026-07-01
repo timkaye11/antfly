@@ -35,6 +35,9 @@ pub const FusedSample = struct {
     positive_texts: []const []const u8,
     /// Optional per-sample hard negative texts (Feature 7).
     hard_negatives: []const []const u8 = &.{},
+    /// Benchmark metadata: true only for the prepared record that represents
+    /// the end of the original Chonky evaluation stream.
+    benchmark_include_final_boundary: bool = false,
 };
 
 /// Fixed-size batch for model training/inference.
@@ -51,6 +54,10 @@ pub const FusedBatch = struct {
     /// Boundary labels: [batch_size * max_seq_len] f32
     /// 1.0 at the first token of each chunk boundary after the first chunk.
     boundary_labels: []f32,
+    /// Sentence-like boundary candidate mask: [batch_size * max_seq_len] f32.
+    /// 1.0 for valid tokens that start after sentence punctuation and begin
+    /// with an uppercase byte. Gold boundaries are a sparse subset of these.
+    boundary_candidate_mask: []f32,
     /// Chunk start token indices: [batch_size * max_chunks] i32
     chunk_starts: []i32,
     /// Chunk end token indices (exclusive): [batch_size * max_chunks] i32
@@ -71,6 +78,7 @@ pub const FusedBatch = struct {
         allocator.free(self.input_ids);
         allocator.free(self.attention_mask);
         allocator.free(self.boundary_labels);
+        allocator.free(self.boundary_candidate_mask);
         allocator.free(self.chunk_starts);
         allocator.free(self.chunk_ends);
         allocator.free(self.chunk_mask);
@@ -121,6 +129,10 @@ const RawRecord = struct {
     text: []const u8,
     chunks: ?[]const RawChunk = null,
     chunk_boundaries: ?[]const RawChunk = null,
+    /// Prepared benchmark window marker. The Chonky-compatible final document
+    /// separator is counted only for the true final prepared window.
+    source_format: ?[]const u8 = null,
+    benchmark_include_final_boundary: ?bool = null,
     /// Legacy flat positive strings, or a permissive JSON value for compatibility.
     positives: ?std.json.Value = null,
     /// Go production schema: [{"chunk_idx": 0, "positive_text": "..."}].
@@ -203,34 +215,48 @@ fn flattenHardNegatives(
     return try texts.toOwnedSlice(allocator);
 }
 
+fn rawRecordBenchmarkIncludeFinalBoundary(rec: RawRecord) bool {
+    return rec.benchmark_include_final_boundary orelse
+        (if (rec.source_format) |source_format|
+            std.mem.eql(u8, source_format, "final")
+        else
+            false);
+}
+
+fn rawRecordHasUsableChunks(raw_chunks: []const RawChunk, benchmark_include_final_boundary: bool) bool {
+    return raw_chunks.len >= 2 or (benchmark_include_final_boundary and raw_chunks.len == 1);
+}
+
 // ---------------------------------------------------------------------------
 // File resolution (mirrors reranker_data.zig exactly)
 // ---------------------------------------------------------------------------
 
 const ResolvedFiles = struct {
-    arena: std.heap.ArenaAllocator,
+    allocator: std.mem.Allocator,
     base_dir: []const u8,
     paths: [][]const u8,
 
     fn deinit(self: *ResolvedFiles) void {
-        self.arena.deinit();
+        self.allocator.free(self.base_dir);
+        for (self.paths) |path| self.allocator.free(path);
+        self.allocator.free(self.paths);
         self.* = undefined;
     }
 };
 
 fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]const u8) !ResolvedFiles {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const arena_alloc = arena.allocator();
-
     if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.EmptyPath;
     const stat = try compat.cwd().statFile(compat.io(), path, .{});
     if (stat.kind == .file) {
-        const one = try arena_alloc.alloc([]const u8, 1);
-        one[0] = try arena_alloc.dupe(u8, path);
+        const one = try allocator.alloc([]const u8, 1);
+        errdefer allocator.free(one);
+        one[0] = try allocator.dupe(u8, path);
+        errdefer allocator.free(one[0]);
+        const base_dir = try allocator.dupe(u8, std.fs.path.dirname(path) orelse ".");
+        errdefer allocator.free(base_dir);
         return .{
-            .arena = arena,
-            .base_dir = try arena_alloc.dupe(u8, std.fs.path.dirname(path) orelse "."),
+            .allocator = allocator,
+            .base_dir = base_dir,
             .paths = one,
         };
     }
@@ -240,22 +266,35 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     defer dir.close(compat.io());
     var iter = dir.iterate();
     var paths = std.ArrayListUnmanaged([]const u8).empty;
-    defer paths.deinit(arena_alloc);
+    errdefer {
+        for (paths.items) |owned_path| allocator.free(owned_path);
+        paths.deinit(allocator);
+    }
     while (try iter.next(compat.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         if (split) |want_split| {
-            const prefix = try std.fmt.allocPrint(arena_alloc, "{s}-", .{want_split});
-            if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+            if (!std.mem.startsWith(u8, entry.name, want_split) or
+                entry.name.len <= want_split.len or
+                entry.name[want_split.len] != '-')
+            {
+                continue;
+            }
         }
-        try paths.append(arena_alloc, try std.fs.path.join(arena_alloc, &.{ path, entry.name }));
+        const joined = try std.fs.path.join(allocator, &.{ path, entry.name });
+        paths.append(allocator, joined) catch |err| {
+            allocator.free(joined);
+            return err;
+        };
     }
     if (paths.items.len == 0) return error.NoJsonlFilesForSplit;
     std.mem.sort([]const u8, paths.items, {}, lessThanString);
+    const base_dir = try allocator.dupe(u8, path);
+    errdefer allocator.free(base_dir);
     return .{
-        .arena = arena,
-        .base_dir = try arena_alloc.dupe(u8, path),
-        .paths = try paths.toOwnedSlice(arena_alloc),
+        .allocator = allocator,
+        .base_dir = base_dir,
+        .paths = try paths.toOwnedSlice(allocator),
     };
 }
 
@@ -288,9 +327,12 @@ fn loadSamplesFromFile(
 
         // Prefer `chunks`, fall back to `chunk_boundaries`.
         const raw_chunks: []const RawChunk = rec.chunks orelse rec.chunk_boundaries orelse &.{};
+        const benchmark_include_final_boundary = rawRecordBenchmarkIncludeFinalBoundary(rec);
 
-        // Skip records with fewer than 2 chunks.
-        if (raw_chunks.len < 2) continue;
+        // Training samples need at least one supervised boundary. Benchmark
+        // eval may keep a final one-chunk window to score Chonky's document-end
+        // separator exactly once.
+        if (!rawRecordHasUsableChunks(raw_chunks, benchmark_include_final_boundary)) continue;
 
         // Map raw chunks to canonical boundaries, supporting both field-name variants.
         const boundaries = try allocator.alloc(FusedChunkBoundary, raw_chunks.len);
@@ -316,6 +358,7 @@ fn loadSamplesFromFile(
             .chunk_boundaries = boundaries,
             .positive_texts = positives,
             .hard_negatives = hard_negs,
+            .benchmark_include_final_boundary = benchmark_include_final_boundary,
         });
     }
 }
@@ -393,7 +436,7 @@ pub fn computeStats(samples: []const FusedSample) FusedDatasetStats {
 pub fn charToTokenBoundary(
     start_char: u32,
     end_char: u32,
-    offsets: [][2]u32,
+    offsets: []const [2]u32,
 ) struct { start_token: u32, end_token: u32 } {
     if (offsets.len == 0) return .{ .start_token = 0, .end_token = 0 };
 
@@ -436,6 +479,47 @@ pub fn charToTokenBoundary(
     end_tok = @min(end_tok, max_tok);
 
     return .{ .start_token = start_tok, .end_token = end_tok };
+}
+
+fn previousNonWhitespaceByte(text: []const u8, start: usize) ?u8 {
+    var i = @min(start, text.len);
+    while (i > 0) {
+        i -= 1;
+        const c = text[i];
+        if (!std.ascii.isWhitespace(c)) return c;
+    }
+    return null;
+}
+
+fn firstNonWhitespaceByteAtOrAfter(text: []const u8, start: usize) ?u8 {
+    var i = @min(start, text.len);
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (!std.ascii.isWhitespace(c)) return c;
+    }
+    return null;
+}
+
+fn isSentencePunctuation(c: u8) bool {
+    return c == '.' or c == '?' or c == '!';
+}
+
+fn isSentenceLikeBoundaryCandidate(text: []const u8, token_offset: [2]u32) bool {
+    if (token_offset[0] == 0 and token_offset[1] == 0) return false;
+    if (token_offset[0] >= text.len) return false;
+    const start: usize = @intCast(token_offset[0]);
+    const prev = previousNonWhitespaceByte(text, start) orelse return false;
+    if (!isSentencePunctuation(prev)) return false;
+    const first = firstNonWhitespaceByteAtOrAfter(text, start) orelse return false;
+    return std.ascii.isUpper(first);
+}
+
+fn fillBoundaryCandidateMask(text: []const u8, offsets: []const [2]u32, out: []f32) void {
+    const n = @min(offsets.len, out.len);
+    for (0..n) |i| {
+        out[i] = if (isSentenceLikeBoundaryCandidate(text, offsets[i])) 1.0 else 0.0;
+    }
+    if (n < out.len) @memset(out[n..], 0.0);
 }
 
 fn useGoChunkEndCompat(ctx: anytype) bool {
@@ -483,6 +567,10 @@ pub fn assembleTokenBatch(
     errdefer allocator.free(boundary_labels);
     @memset(boundary_labels, 0);
 
+    const boundary_candidate_mask = try allocator.alloc(f32, seq_elems);
+    errdefer allocator.free(boundary_candidate_mask);
+    @memset(boundary_candidate_mask, 0);
+
     const chunk_starts = try allocator.alloc(i32, chunk_elems);
     errdefer allocator.free(chunk_starts);
     @memset(chunk_starts, 0);
@@ -510,11 +598,13 @@ pub fn assembleTokenBatch(
 
         const ids_slice = input_ids[i * max_seq_len .. (i + 1) * max_seq_len];
         const mask_slice = attention_mask[i * max_seq_len .. (i + 1) * max_seq_len];
+        const candidate_slice = boundary_candidate_mask[i * max_seq_len .. (i + 1) * max_seq_len];
 
         @memset(offsets_scratch, .{ 0, 0 });
 
         const n_tokens = token_fn(ctx, sample.text, ids_slice, mask_slice, offsets_scratch);
         const active_offsets = offsets_scratch[0..@min(n_tokens, max_seq_len)];
+        fillBoundaryCandidateMask(sample.text, active_offsets, candidate_slice);
 
         // Map character boundaries to valid token spans. Match the Go
         // builder's contract: skip unmapped/truncated spans entirely, label all
@@ -603,6 +693,7 @@ pub fn assembleTokenBatch(
         .input_ids = input_ids,
         .attention_mask = attention_mask,
         .boundary_labels = boundary_labels,
+        .boundary_candidate_mask = boundary_candidate_mask,
         .chunk_starts = chunk_starts,
         .chunk_ends = chunk_ends,
         .chunk_mask = chunk_mask,
@@ -967,11 +1058,52 @@ test "assembleTokenBatch honors provided token boundaries" {
     try std.testing.expectEqualSlices(f32, &.{ 0, 1, 0, 0 }, batch.boundary_labels);
 }
 
+test "assembleTokenBatch marks sentence-like boundary candidates" {
+    const allocator = std.testing.allocator;
+    var boundaries = [_]FusedChunkBoundary{
+        .{ .start_char = 0, .end_char = 4 },
+        .{ .start_char = 5, .end_char = 8 },
+    };
+    const samples = [_]FusedSample{.{
+        .text = "One. Two",
+        .chunk_boundaries = &boundaries,
+        .positive_texts = &.{},
+    }};
+    const indices = [_]usize{0};
+
+    const token_fn = struct {
+        fn call(_: void, _: []const u8, out_ids: []i32, out_mask: []i32, out_offsets: ?[][2]u32) usize {
+            @memset(out_ids, 0);
+            @memset(out_mask, 0);
+            out_ids[0] = 10;
+            out_ids[1] = 11;
+            out_ids[2] = 12;
+            out_mask[0] = 1;
+            out_mask[1] = 1;
+            out_mask[2] = 1;
+            if (out_offsets) |offsets| {
+                @memset(offsets, .{ 0, 0 });
+                offsets[0] = .{ 0, 3 };
+                offsets[1] = .{ 3, 4 };
+                offsets[2] = .{ 5, 8 };
+            }
+            return 3;
+        }
+    }.call;
+
+    var batch = try assembleTokenBatch(allocator, &samples, &indices, 4, 2, {}, token_fn);
+    defer batch.deinit(allocator);
+
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 1, 0 }, batch.boundary_candidate_mask);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 1, 0 }, batch.boundary_labels);
+}
+
 test "meanPoolChunkEmbeddings averages and normalizes chunk token ranges with attention mask" {
     const allocator = std.testing.allocator;
     var input_ids = [_]i32{ 1, 2, 3, 4 };
     var attention_mask = [_]i32{ 1, 1, 0, 1 };
     var boundary_labels = [_]f32{ 0, 1, 0, 0 };
+    var boundary_candidate_mask = [_]f32{ 0, 1, 0, 0 };
     var chunk_starts = [_]i32{ 0, 1, 2 };
     var chunk_ends = [_]i32{ 2, 4, 4 };
     var chunk_mask = [_]f32{ 1, 1, 0 };
@@ -983,6 +1115,7 @@ test "meanPoolChunkEmbeddings averages and normalizes chunk token ranges with at
         .input_ids = &input_ids,
         .attention_mask = &attention_mask,
         .boundary_labels = &boundary_labels,
+        .boundary_candidate_mask = &boundary_candidate_mask,
         .chunk_starts = &chunk_starts,
         .chunk_ends = &chunk_ends,
         .chunk_mask = &chunk_mask,
@@ -1148,6 +1281,41 @@ test "JSON parsing: both chunk field names and both coordinate field names" {
     const positives_b = try flattenPositiveTexts(aa, rec_b);
     try std.testing.expectEqual(@as(usize, 1), positives_b.len);
     try std.testing.expectEqualStrings("alt text", positives_b[0]);
+}
+
+test "JSON parsing: final benchmark one-chunk records remain usable" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const final_line =
+        \\{"text":"last paragraph","chunks":[{"start_char":0,"end_char":14}],"source_format":"final"}
+    ;
+    const final_rec = try std.json.parseFromSliceLeaky(RawRecord, aa, final_line, .{
+        .ignore_unknown_fields = true,
+    });
+    const final_chunks: []const RawChunk = final_rec.chunks orelse &.{};
+    try std.testing.expect(rawRecordBenchmarkIncludeFinalBoundary(final_rec));
+    try std.testing.expect(rawRecordHasUsableChunks(final_chunks, rawRecordBenchmarkIncludeFinalBoundary(final_rec)));
+
+    const middle_line =
+        \\{"text":"middle paragraph","chunks":[{"start_char":0,"end_char":16}],"source_format":"chonky-tokens"}
+    ;
+    const middle_rec = try std.json.parseFromSliceLeaky(RawRecord, aa, middle_line, .{
+        .ignore_unknown_fields = true,
+    });
+    const middle_chunks: []const RawChunk = middle_rec.chunks orelse &.{};
+    try std.testing.expect(!rawRecordBenchmarkIncludeFinalBoundary(middle_rec));
+    try std.testing.expect(!rawRecordHasUsableChunks(middle_chunks, rawRecordBenchmarkIncludeFinalBoundary(middle_rec)));
+
+    const explicit_false_line =
+        \\{"text":"override","chunks":[{"start_char":0,"end_char":8}],"source_format":"final","benchmark_include_final_boundary":false}
+    ;
+    const explicit_false_rec = try std.json.parseFromSliceLeaky(RawRecord, aa, explicit_false_line, .{
+        .ignore_unknown_fields = true,
+    });
+    try std.testing.expect(!rawRecordBenchmarkIncludeFinalBoundary(explicit_false_rec));
 }
 
 test "JSON parsing: Go production positive_pairs and hard_negatives flatten" {

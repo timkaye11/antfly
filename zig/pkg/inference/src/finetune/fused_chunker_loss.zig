@@ -35,6 +35,21 @@ pub const FusedLossConfig = struct {
     num_hard_negatives: u32 = 7,
     coherence_margin: f32 = 0.2,
     pos_weight: f32 = 5.0,
+    boundary_rank_loss_weight: f32 = 0.0,
+    boundary_rank_loss_margin: f32 = 1.0,
+    boundary_rank_loss_top_k: u32 = 1,
+    boundary_same_token_rank_loss_weight: f32 = 0.0,
+    boundary_same_token_rank_loss_top_k: u32 = 4,
+    boundary_same_token_negative_weight: f32 = 1.0,
+    boundary_same_token_negative_top_k: u32 = 0,
+    boundary_candidate_rank_loss_weight: f32 = 0.0,
+    boundary_candidate_rank_loss_top_k: u32 = 8,
+    boundary_candidate_negative_weight: f32 = 1.0,
+    boundary_gold_count_rank_loss_weight: f32 = 0.0,
+    boundary_gold_count_rank_loss_margin: f32 = 1.0,
+    boundary_gold_count_rank_loss_negative_multiplier: u32 = 1,
+    boundary_local_window_loss_weight: f32 = 0.0,
+    boundary_local_window_radius: u32 = 12,
     use_focal: bool = false,
     contrastive_focal_gamma: f32 = 0.0,
     contrastive_focal_alpha: f32 = 0.75,
@@ -346,6 +361,14 @@ pub fn positiveBoundaryProbability(logit_not_boundary: f32, logit_boundary: f32)
     return e / (1.0 + e);
 }
 
+/// Decision threshold corresponding to an unweighted posterior of 0.5 when a
+/// binary boundary head was trained with positive-class weighted CE.
+pub fn weightedCePositiveThreshold(pos_weight: f32) f32 {
+    if (pos_weight <= 0.0) return 0.5;
+    const threshold = pos_weight / (1.0 + pos_weight);
+    return @min(@max(threshold, 0.0), 1.0);
+}
+
 /// Compute boundary detection metrics from flat logits and labels.
 ///
 /// logits: flat [total * 2] f32, row-major — two class scores per token.
@@ -403,6 +426,19 @@ test "FusedLossConfig defaults" {
     try std.testing.expectEqual(cfg.num_hard_negatives, 7);
     try std.testing.expectApproxEqAbs(cfg.coherence_margin, 0.2, 1e-6);
     try std.testing.expectApproxEqAbs(cfg.pos_weight, 5.0, 1e-6);
+    try std.testing.expectApproxEqAbs(cfg.boundary_rank_loss_weight, 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(cfg.boundary_rank_loss_margin, 1.0, 1e-6);
+    try std.testing.expectEqual(@as(u32, 1), cfg.boundary_rank_loss_top_k);
+    try std.testing.expectApproxEqAbs(cfg.boundary_same_token_rank_loss_weight, 0.0, 1e-6);
+    try std.testing.expectEqual(@as(u32, 4), cfg.boundary_same_token_rank_loss_top_k);
+    try std.testing.expectApproxEqAbs(cfg.boundary_same_token_negative_weight, 1.0, 1e-6);
+    try std.testing.expectEqual(@as(u32, 0), cfg.boundary_same_token_negative_top_k);
+    try std.testing.expectApproxEqAbs(cfg.boundary_candidate_rank_loss_weight, 0.0, 1e-6);
+    try std.testing.expectEqual(@as(u32, 8), cfg.boundary_candidate_rank_loss_top_k);
+    try std.testing.expectApproxEqAbs(cfg.boundary_candidate_negative_weight, 1.0, 1e-6);
+    try std.testing.expectApproxEqAbs(cfg.boundary_gold_count_rank_loss_weight, 0.0, 1e-6);
+    try std.testing.expectApproxEqAbs(cfg.boundary_gold_count_rank_loss_margin, 1.0, 1e-6);
+    try std.testing.expectEqual(@as(u32, 1), cfg.boundary_gold_count_rank_loss_negative_multiplier);
     try std.testing.expect(!cfg.use_focal);
 }
 
@@ -482,6 +518,13 @@ test "computeBoundaryMetrics basic" {
     try std.testing.expectApproxEqAbs(m.recall(), 0.5, 1e-6);
     // f1 = 2*1*0.5/(1+0.5) = 1/1.5 ≈ 0.6667
     try std.testing.expectApproxEqAbs(m.f1(), 2.0 / 3.0, 1e-5);
+}
+
+test "weightedCePositiveThreshold maps positive class weight to posterior threshold" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weightedCePositiveThreshold(1.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0 / 6.0), weightedCePositiveThreshold(5.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weightedCePositiveThreshold(0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), weightedCePositiveThreshold(-3.0), 1e-6);
 }
 
 test "computeBoundaryMetricsWithThreshold exposes calibrated operating points" {
