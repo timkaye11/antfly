@@ -296,6 +296,7 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     inference_internal_mod.addImport("build_options", build_options_mod);
+    inference_internal_mod.addImport("inference_chunker", inference_chunker_mod);
     inference_internal_mod.addImport("jinja", jinja_mod);
     inference_internal_mod.addImport("inference_tokenizer", inference_tokenizer_mod);
     inference_internal_mod.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);

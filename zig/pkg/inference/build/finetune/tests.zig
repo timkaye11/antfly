@@ -192,10 +192,23 @@ const tests = [_]common.TestSpec{
         .imports = &.{.termite_io_compat},
     },
     .{
+        .step_name = "test-export-fused-chunker-model",
+        .root_source_file = "src/finetune/tools/export_fused_chunker_model.zig",
+        .description = "Run fused chunker model export tool tests",
+        .imports = &.{.inference_internal},
+    },
+    .{
         .step_name = "test-fused-chunker-lora",
         .root_source_file = "src/finetune/test/test_fused_chunker_lora.zig",
         .description = "Run fused chunker LoRA adapter tests",
         .imports = &.{.inference_internal},
+    },
+    .{
+        .step_name = "test-fused-chunker-pipeline",
+        .root_source_file = "src/finetune/test/test_fused_chunker_pipeline.zig",
+        .description = "Run fused chunker serving pipeline integration tests (skips without an exported model)",
+        .imports = &.{.inference_internal},
+        .native_link = .default,
     },
     .{
         .step_name = "test-tokenizer-batch",

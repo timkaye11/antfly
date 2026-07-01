@@ -29,8 +29,10 @@ pub const native_backend_guard = @import("native_backend_guard.zig");
 pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
+pub const chunker = @import("inference_chunker");
 pub const pipelines = struct {
     pub const embedding = @import("pipelines/embedding.zig");
+    pub const fused_chunking = @import("pipelines/fused_chunking.zig");
 };
 pub const finetune = struct {
     pub const colqwen2 = @import("finetune/colqwen2.zig");
@@ -66,6 +68,7 @@ pub const finetune = struct {
     pub const fused_chunker_train = @import("finetune/fused_chunker_train.zig");
     pub const fused_chunker_eval = @import("finetune/eval/eval_fused_chunker.zig");
     pub const fused_chunker_train_cli = @import("finetune_train_fused_chunker_root.zig");
+    pub const lora = @import("finetune/lora.zig");
     pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
     pub const peft = @import("finetune/peft.zig");
     pub const safetensors_checkpoint = @import("finetune/safetensors_checkpoint.zig");

@@ -38,6 +38,7 @@ const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
+const fused_chunking_mod = @import("../pipelines/fused_chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
@@ -489,6 +490,11 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
+    // Loaded fused chunker pipelines keyed by resolved model directory. Kept
+    // outside ModelManager.LoadedModel because fused chunkers run through a
+    // native/Metal weight store + ComputeBackend rather than a backends.Session.
+    fused_chunkers: std.StringHashMapUnmanaged(*fused_chunking_mod.FusedChunkerPipeline) = .{},
+    fused_chunkers_lock: std.atomic.Mutex = .unlocked,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
@@ -507,10 +513,33 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        var fused_it = self.fused_chunkers.iterator();
+        while (fused_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.fused_chunkers.deinit(self.allocator);
         self.model_manager.deinit();
         self.registry.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
+    }
+
+    /// Load (or return the cached) fused chunker pipeline for a resolved
+    /// model directory. Backend selection is automatic (Metal when built with
+    /// -Dmetal and a device is available, native CPU otherwise).
+    pub fn getFusedChunkerPipeline(self: *Node, model_dir: []const u8) !*fused_chunking_mod.FusedChunkerPipeline {
+        while (!self.fused_chunkers_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.fused_chunkers_lock.unlock();
+
+        if (self.fused_chunkers.get(model_dir)) |pipeline| return pipeline;
+
+        const pipeline = try fused_chunking_mod.FusedChunkerPipeline.loadFromDir(self.allocator, model_dir, .{});
+        errdefer pipeline.deinit();
+        const key = try self.allocator.dupe(u8, model_dir);
+        errdefer self.allocator.free(key);
+        try self.fused_chunkers.put(self.allocator, key, pipeline);
+        return pipeline;
     }
 
     pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
@@ -1577,36 +1606,73 @@ pub const Node = struct {
             }
         }
 
-        if (!isFixedChunkerModel(config.model)) {
-            const model_path = self.resolveModelPath(ctx.io, config.model, "chunkers") catch
-                return ctx.status(404).json(.{
-                    .@"error" = "MODEL_NOT_FOUND",
-                    .message = "chunker model not found; install it under models/chunkers or use model=fixed",
-                });
-            var manifest = manifest_mod.loadListingFromDir(ctx.allocator, model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-            defer manifest.deinit();
-            if (manifest.model_type != .chunker and !manifest.hasTask("chunk")) {
+        var served_by_fixed_fallback = false;
+        const chunks = blk: {
+            if (!isFixedChunkerModel(config.model)) {
+                const model_path = self.resolveModelPath(ctx.io, config.model, "chunkers") catch
+                    return ctx.status(404).json(.{
+                        .@"error" = "MODEL_NOT_FOUND",
+                        .message = "chunker model not found; install it under models/chunkers or use model=fixed",
+                    });
+                var manifest = manifest_mod.loadListingFromDir(ctx.allocator, model_path) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                defer manifest.deinit();
+                if (manifest.model_type != .chunker and !manifest.hasTask("chunk")) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "selected model is not a chunker",
+                    });
+                }
+
+                const text = switch (input) {
+                    .text => |t| t,
+                    .binary => return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "model-backed chunkers accept text input only; use model=fixed for media inputs",
+                    }),
+                };
+
+                const pipeline = self.getFusedChunkerPipeline(model_path) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+
+                if (config.include_sparse and !pipeline.has_splade) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "SPARSE_EMBEDDINGS_UNSUPPORTED",
+                        .message = "selected chunker model has no SPLADE head; disable include_sparse or choose a SPLADE-enabled chunker",
+                    });
+                }
+
+                break :blk pipeline.chunkText(ctx.allocator, text, .{
+                    .threshold = config.threshold,
+                    .max_chunks = config.max_chunks,
+                    .include_embeddings = config.include_embeddings,
+                    .include_sparse = config.include_sparse,
+                    .output_dimension = config.output_dimension,
+                    .sparse_top_k = config.sparse_top_k,
+                }) catch |err| {
+                    // Fall back to fixed chunking only when the request needs
+                    // no model-derived outputs (no embeddings, no SPLADE, no
+                    // boundary scores); otherwise surface the failure.
+                    if (fixedChunkerUnsupportedFeature(config) == null) {
+                        std.log.warn("fused chunker inference failed for {s}, falling back to fixed chunking: {s}", .{ config.model, @errorName(err) });
+                        served_by_fixed_fallback = true;
+                        break :blk lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |fixed_err|
+                            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = @errorName(fixed_err) });
+                    }
+                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                };
+            }
+
+            if (fixedChunkerUnsupportedFeature(config)) |message| {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
-                    .message = "selected model is not a chunker",
+                    .message = message,
                 });
             }
-            return ctx.status(501).json(.{
-                .@"error" = "CHUNKER_MODEL_NOT_IMPLEMENTED",
-                .message = "checkpoint-backed fused chunker inference is not wired yet; fixed chunking cannot synthesize model boundaries, dense embeddings, or SPLADE embeddings",
-            });
-        }
 
-        if (fixedChunkerUnsupportedFeature(config)) |message| {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = message,
-            });
-        }
-
-        const chunks = lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = @errorName(err) });
+            break :blk lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = @errorName(err) });
+        };
         defer lib_chunker.types.freeChunks(ctx.allocator, chunks);
 
         const api_chunks = try ctx.allocator.alloc(api.ChunkObject, chunks.len);
@@ -1674,7 +1740,11 @@ pub const Node = struct {
         return ctx.json(api.ChunkResponse{
             .object = "list",
             .data = api_chunks,
-            .model = if (config.model.len > 0) config.model else "fixed-bert-tokenizer",
+            // On fixed fallback the response model indicates which chunker
+            // actually produced the chunks.
+            .model = if (served_by_fixed_fallback)
+                "fixed-bert-tokenizer"
+            else if (config.model.len > 0) config.model else "fixed-bert-tokenizer",
             .usage = tokenUsage(prompt_tokens, 0),
             .cache_hit = false,
         });
@@ -5543,6 +5613,17 @@ test "node config accepts shared scraping config" {
     };
     try std.testing.expectEqual(@as(?bool, true), cfg.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.s3_credentials.?.endpoint.?);
+}
+
+test "getFusedChunkerPipeline surfaces load failures for missing model dirs" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        node.getFusedChunkerPipeline("/nonexistent/fused-chunker-model"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), node.fused_chunkers.count());
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {

@@ -23,6 +23,12 @@ pub const EmbeddingConfig = @import("embedding.zig").EmbeddingConfig;
 pub const ChunkingPipeline = @import("chunking.zig").ChunkingPipeline;
 pub const ChunkingConfig = @import("chunking.zig").ChunkingConfig;
 pub const Chunk = @import("chunking.zig").Chunk;
+pub const fused_chunking = @import("fused_chunking.zig");
+pub const FusedChunkerPipeline = fused_chunking.FusedChunkerPipeline;
+
+test {
+    _ = fused_chunking;
+}
 pub const RerankingPipeline = @import("reranking.zig").RerankingPipeline;
 pub const RerankingConfig = @import("reranking.zig").RerankingConfig;
 pub const RankedResult = @import("reranking.zig").RankedResult;

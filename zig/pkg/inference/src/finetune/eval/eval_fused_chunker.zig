@@ -59,7 +59,14 @@ const tensor_mod = @import("../../backends/tensor.zig");
 const compat = @import("../../io/compat.zig");
 const FusedTrainer = fused_chunker_train.FusedTrainer;
 const FusedTrainingConfig = fused_chunker_train.FusedTrainingConfig;
-const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
+const fused_chunker_weights = @import("../fused_chunker_weights.zig");
+const MetalWeightStore = fused_chunker_weights.MetalWeightStore;
+const deinitMetalWeightStore = fused_chunker_weights.deinitMetalWeightStore;
+const deinitNativeWeightStore = fused_chunker_weights.deinitNativeWeightStore;
+const stripEncoderPrefix = fused_chunker_weights.stripEncoderPrefix;
+const normalizeModernBertWeightName = fused_chunker_weights.normalizeModernBertWeightName;
+const loadSafetensorsIntoNativeStore = fused_chunker_weights.loadSafetensorsIntoNativeStore;
+const loadSafetensorsIntoMetalStore = fused_chunker_weights.loadSafetensorsIntoMetalStore;
 
 const print = std.debug.print;
 const chonky_boundary_metric = "chonky_character_separator_f1";
@@ -1361,177 +1368,9 @@ fn printUsage() void {
     , .{});
 }
 
-fn deinitMetalWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeightStore) void {
-    if (comptime !build_options.enable_metal) return;
-    metal_compute.deinitPrefetchQueue(weight_store);
-    var it = weight_store.lazy_weights.iterator();
-    while (it.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        if (entry.value_ptr.host_loaded) |*loaded| loaded.deinit();
-        if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
-    }
-    weight_store.lazy_weights.deinit(allocator);
-}
-
-fn deinitNativeWeightStore(allocator: std.mem.Allocator, weight_store: *native_compute.WeightStore) void {
-    native_compute.deinitPrefetchQueue(weight_store);
-    var it = weight_store.resident_weights.iterator();
-    while (it.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        entry.value_ptr.deinit();
-    }
-    weight_store.resident_weights.deinit(allocator);
-    weight_store.lazy_weights.deinit(allocator);
-}
-
-fn stripEncoderPrefix(name: []const u8) []const u8 {
-    const prefix = "encoder.";
-    if (std.mem.startsWith(u8, name, prefix)) return name[prefix.len..];
-    return name;
-}
-
-fn normalizeModernBertWeightName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    const stripped = stripEncoderPrefix(name);
-    if (std.mem.startsWith(u8, stripped, "layers.") or
-        std.mem.startsWith(u8, stripped, "embeddings.") or
-        std.mem.startsWith(u8, stripped, "final_norm."))
-    {
-        return std.fmt.allocPrint(allocator, "model.{s}", .{stripped});
-    }
-    return allocator.dupe(u8, stripped);
-}
-
-fn cloneLoadedWeight(allocator: std.mem.Allocator, loaded: LoadedWeight) !LoadedWeight {
-    if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedQuantizedEvalWeight;
-    const owned_data = try allocator.dupe(u8, loaded.tensor.data);
-    errdefer allocator.free(owned_data);
-    const owned_shape = try allocator.dupe(i64, loaded.tensor.shape);
-    errdefer allocator.free(owned_shape);
-    return .{
-        .tensor = .{
-            .data = owned_data,
-            .dtype = loaded.tensor.dtype,
-            .shape = owned_shape,
-            .name = "",
-            .allocator = allocator,
-            .owns_data = true,
-            .owns_shape = true,
-        },
-        .quantized = false,
-    };
-}
-
-fn isGoFusedEmbeddingWeightName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "model.embeddings.tok_embeddings.weight");
-}
-
-fn transposeLoadedEmbeddingWeightLikeGoFused(allocator: std.mem.Allocator, loaded: *LoadedWeight) !void {
-    if (loaded.tensor.dtype != .f32) return error.UnsupportedGoFusedEmbeddingTensor;
-    if (loaded.tensor.shape.len != 2) return error.InvalidGoFusedEmbeddingTensor;
-    if (loaded.tensor.shape[0] < 0 or loaded.tensor.shape[1] < 0) return error.InvalidGoFusedEmbeddingTensor;
-
-    const rows: usize = @intCast(loaded.tensor.shape[0]);
-    const cols: usize = @intCast(loaded.tensor.shape[1]);
-    const values = loaded.tensor.asFloat32();
-    if (values.len != rows * cols) return error.InvalidGoFusedEmbeddingTensor;
-
-    const transposed = try allocator.alloc(f32, values.len);
-    defer allocator.free(transposed);
-    for (0..cols) |r| {
-        for (0..rows) |c| {
-            transposed[c * cols + r] = values[r * rows + c];
-        }
-    }
-
-    var tensor = try tensor_mod.Tensor.initFloat32(allocator, loaded.tensor.name, loaded.tensor.shape, transposed);
-    errdefer tensor.deinit();
-    loaded.tensor.deinit();
-    loaded.tensor = tensor;
-}
-
-fn modernBertQkvLayer(name: []const u8) ?[]const u8 {
-    const prefix = "model.layers.";
-    const suffix = ".attn.Wqkv.weight";
-    if (!std.mem.startsWith(u8, name, prefix)) return null;
-    if (!std.mem.endsWith(u8, name, suffix)) return null;
-    return name[prefix.len .. name.len - suffix.len];
-}
-
-fn copyModernBertQkvPart(
-    allocator: std.mem.Allocator,
-    loaded: LoadedWeight,
-    part: usize,
-) !struct { data: []f32, hidden: usize } {
-    if (loaded.tensor.dtype != .f32) return error.UnsupportedModernBertQkvTensor;
-    if (loaded.tensor.shape.len != 2) return error.InvalidModernBertQkvTensor;
-    if (loaded.tensor.shape[0] < 0 or loaded.tensor.shape[1] < 0) return error.InvalidModernBertQkvTensor;
-    const rows: usize = @intCast(loaded.tensor.shape[0]);
-    const hidden: usize = @intCast(loaded.tensor.shape[1]);
-    if (rows != hidden * 3) return error.InvalidModernBertQkvTensor;
-
-    const elems = hidden * hidden;
-    const elem_start = part * elems;
-    const byte_start = elem_start * @sizeOf(f32);
-    const byte_end = byte_start + elems * @sizeOf(f32);
-    if (byte_end > loaded.tensor.data.len) return error.InvalidModernBertQkvTensor;
-
-    const data = try allocator.alloc(f32, elems);
-    errdefer allocator.free(data);
-    @memcpy(std.mem.sliceAsBytes(data), loaded.tensor.data[byte_start..byte_end]);
-    return .{ .data = data, .hidden = hidden };
-}
-
-fn insertModernBertQkvSplitsIntoNativeStore(
-    allocator: std.mem.Allocator,
-    weight_store: *native_compute.WeightStore,
-    normalized_name: []const u8,
-    loaded: LoadedWeight,
-) !usize {
-    const layer = modernBertQkvLayer(normalized_name) orelse return 0;
-    const projections = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
-    var inserted: usize = 0;
-    for (projections, 0..) |projection, part| {
-        const split = try copyModernBertQkvPart(allocator, loaded, part);
-        defer allocator.free(split.data);
-        const split_name = try std.fmt.allocPrint(allocator, "model.layers.{s}.attn.{s}.weight", .{ layer, projection });
-        errdefer allocator.free(split_name);
-        const shape = [_]i64{ @intCast(split.hidden), @intCast(split.hidden) };
-        var tensor = try tensor_mod.Tensor.initFloat32(allocator, split_name, &shape, split.data);
-        errdefer tensor.deinit();
-        try weight_store.resident_weights.put(allocator, split_name, weight_source_mod.LoadedWeight{ .tensor = tensor });
-        inserted += 1;
-    }
-    return inserted;
-}
-
-fn insertModernBertQkvSplitsIntoMetalStore(
-    allocator: std.mem.Allocator,
-    weight_store: *MetalWeightStore,
-    normalized_name: []const u8,
-    loaded: LoadedWeight,
-) !usize {
-    if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-    const layer = modernBertQkvLayer(normalized_name) orelse return 0;
-    const projections = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
-    var inserted: usize = 0;
-    for (projections, 0..) |projection, part| {
-        const split = try copyModernBertQkvPart(allocator, loaded, part);
-        defer allocator.free(split.data);
-        const split_name = try std.fmt.allocPrint(allocator, "model.layers.{s}.attn.{s}.weight", .{ layer, projection });
-        errdefer allocator.free(split_name);
-        const shape = [_]i64{ @intCast(split.hidden), @intCast(split.hidden) };
-        var tensor = try tensor_mod.Tensor.initFloat32(allocator, split_name, &shape, split.data);
-        errdefer tensor.deinit();
-        try weight_store.lazy_weights.put(allocator, split_name, .{
-            .tensor_ref = undefined,
-            .host_loaded = .{ .tensor = tensor },
-            .active_tier = .host,
-            .loaded_bytes = tensor.data.len,
-        });
-        inserted += 1;
-    }
-    return inserted;
-}
+// Weight-store loading helpers (normalizeModernBertWeightName, QKV splits,
+// safetensors loaders, store deinit) live in ../fused_chunker_weights.zig and
+// are shared with the serving pipeline (src/pipelines/fused_chunking.zig).
 
 const FusedLoRALoadResult = struct {
     count: usize = 0,
@@ -2102,72 +1941,6 @@ fn loadFusedLoRAFromCheckpoint(
     if (result.count == 0) return FusedLoRALoadResult{};
     if (result.rank == 0 or result.alpha == 0.0) return error.InvalidFusedLoRAScalar;
     return result;
-}
-
-fn loadSafetensorsIntoNativeStore(
-    allocator: std.mem.Allocator,
-    weight_store: *native_compute.WeightStore,
-    st_path: []const u8,
-) !usize {
-    var source = try SafetensorsSource.initAbsolute(allocator, st_path);
-    errdefer source.weightSource().deinit();
-    const ws = source.weightSource();
-    const names = try ws.listNames(allocator);
-    defer allocator.free(names);
-
-    var loaded_count: usize = 0;
-    for (names) |name| {
-        var loaded = ws.getTensor(name) catch continue;
-        defer loaded.deinit();
-        var owned_loaded = try cloneLoadedWeight(allocator, loaded);
-        errdefer owned_loaded.deinit();
-        const owned_name = try normalizeModernBertWeightName(allocator, name);
-        errdefer allocator.free(owned_name);
-        if (isGoFusedEmbeddingWeightName(owned_name)) {
-            try transposeLoadedEmbeddingWeightLikeGoFused(allocator, &owned_loaded);
-        }
-        try weight_store.resident_weights.put(allocator, owned_name, owned_loaded);
-        loaded_count += 1;
-        loaded_count += try insertModernBertQkvSplitsIntoNativeStore(allocator, weight_store, owned_name, loaded);
-    }
-    source.weightSource().deinit();
-    return loaded_count;
-}
-
-fn loadSafetensorsIntoMetalStore(
-    allocator: std.mem.Allocator,
-    weight_store: *MetalWeightStore,
-    st_path: []const u8,
-) !usize {
-    if (comptime !build_options.enable_metal) return error.MetalBackendUnavailable;
-    var source = try SafetensorsSource.initAbsolute(allocator, st_path);
-    errdefer source.weightSource().deinit();
-    const ws = source.weightSource();
-    const names = try ws.listNames(allocator);
-    defer allocator.free(names);
-
-    var loaded_count: usize = 0;
-    for (names) |name| {
-        var loaded = ws.getTensor(name) catch continue;
-        defer loaded.deinit();
-        var owned_loaded = try cloneLoadedWeight(allocator, loaded);
-        errdefer owned_loaded.deinit();
-        const owned_name = try normalizeModernBertWeightName(allocator, name);
-        errdefer allocator.free(owned_name);
-        if (isGoFusedEmbeddingWeightName(owned_name)) {
-            try transposeLoadedEmbeddingWeightLikeGoFused(allocator, &owned_loaded);
-        }
-        try weight_store.lazy_weights.put(allocator, owned_name, .{
-            .tensor_ref = undefined,
-            .host_loaded = owned_loaded,
-            .active_tier = .host,
-            .loaded_bytes = owned_loaded.tensor.data.len,
-        });
-        loaded_count += 1;
-        loaded_count += try insertModernBertQkvSplitsIntoMetalStore(allocator, weight_store, owned_name, loaded);
-    }
-    source.weightSource().deinit();
-    return loaded_count;
 }
 
 pub fn main(init: std.process.Init) !void {

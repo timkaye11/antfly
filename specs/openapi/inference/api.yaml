@@ -34,10 +34,14 @@ info:
     - **Response Shape**: Each `data[i].embedding` is either a dense float vector or a sparse `{indices, values}` object
 
     ### Text Chunking
-    - **Models**: Fixed-size chunking (always available) + ONNX models
+    - **Models**: Fixed-size chunking (always available) + native fused chunker models
     - **Model Discovery**: Auto-discovers models from `{models_dir}/chunkers/`
     - **Caching**: 2-minute TTL memory cache
-    - **Fallback**: Falls back to fixed chunking if model fails
+    - **Fallback**: Falls back to fixed chunking only when the model fails at
+      inference time AND the request needs no model-derived outputs
+      (`include_embeddings=false` and `include_sparse=false`); the response
+      `model` field then reports the fixed chunker. Otherwise failures surface
+      as 5xx errors.
 
     ### Reranking
     - **Model Discovery**: Auto-discovers ONNX models from `{models_dir}/rerankers/`
@@ -108,10 +112,18 @@ paths:
         - Use model="fixed"
         - Fast and deterministic
 
-        ### ONNX Models
-        - Semantic chunking based on content similarity
+        ### Fused Chunker Models (native)
+        - Learned semantic boundaries with optional late-chunking dense
+          embeddings and SPLADE sparse embeddings
         - Models auto-discovered from `models_dir/chunkers/`
-        - Falls back to fixed chunking if model fails
+        - Falls back to fixed chunking ONLY when model inference fails and the
+          request asks for no model-derived outputs (include_embeddings=false
+          and include_sparse=false). The response `model` field reports the
+          chunker that actually produced the chunks, so a fallback is visible
+          as `model: fixed-bert-tokenizer`. When embeddings or sparse
+          embeddings are requested, model failures return 5xx instead of
+          falling back; requesting include_sparse from a model without a
+          SPLADE head returns 400 SPARSE_EMBEDDINGS_UNSUPPORTED.
 
         ## Caching
 
