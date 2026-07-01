@@ -10,7 +10,10 @@ The boundary lane mirrors chonky's published evaluation:
 - Build paragraph-boundary datasets with the same sources and paragraph split
   semantics as chonky.
 - Evaluate the first 1,000,000 tokens per dataset.
-- Treat separator positions as sorted exact boundary offsets and report F1.
+- Treat separator positions as Chonky-compatible character offsets, including
+  the final document boundary, and report exact separator F1. When the first
+  1,000,000-token stream is split into model-sized windows, only the true final
+  prepared record contributes the final-boundary separator.
 - Report per-dataset scores for `bookcorpus`, `en_judgements`,
   `paul_graham`, and `20_newsgroups`.
 
@@ -50,8 +53,54 @@ scripts/run_fused_chunker_production_readiness.sh
 
 The candidate directory must contain `checkpoint_final.safetensors`,
 `fused_training_manifest.json`, `fused_training_metrics.jsonl`, `train.log`,
-and `readiness_summary.json`. Export the checkpoint for Go/runtime parity when
-needed:
+and `readiness_summary.json`. Full readiness gates both best validation quality
+and latest validation quality, so a run that peaks and then collapses cannot
+pass on an old best score. When validation fails, the wrapper writes
+`validation_failure_analysis.json` with a stop/continue recommendation and a
+failure class such as underconfident fixed threshold, inverted probability gap,
+overprediction, buried gold ranks, or train-loss-down/validation-rank-poor.
+You can also run the analyzer directly:
+
+```bash
+zig build -Dskip-openapi=true analyze-fused-chunker-validation-failure -- \
+  --out-dir /path/to/readiness-run \
+  --analysis-out /path/to/readiness-run/validation_failure_analysis.json
+```
+
+Step validation metrics include gold-boundary rank diagnostics
+(`gold_positive_*_rank_percentile`, `gold_positive_top_5x_recall`, and
+`gold_positive_top_10x_recall`) so a failed run can distinguish calibration
+problems from genuinely poor ranking. To compare train and validation ranking
+at the same step gate, set
+`ANTFLY_FUSED_CHUNKER_STEP_TRAIN_EVAL_MAX_EXAMPLES=<n>` on a bounded probe; the
+trainer will emit `train_validation_step` records alongside `validation_step`
+records, and the analyzer will classify train-good/validation-poor versus
+train-and-validation-poor failures. Export the checkpoint for Go/runtime parity
+when needed:
+
+Before launching a long candidate run after a boundary-quality failure, use the
+frozen-feature probe with non-overlapping offsets to separate same-split
+generalization from train/validation distribution shift:
+
+```bash
+zig build -Dskip-openapi=true -Dmetal=true train-fused-chunker -- \
+  --data /path/to/fused_train.jsonl \
+  --val-data /path/to/fused_train.jsonl \
+  --split train \
+  --val-split train \
+  --output /tmp/frozen-feature-same-split \
+  --model-dir /path/to/modernbert-model \
+  --backend metal \
+  --lora-rank 0 \
+  --lambda-embed 0 \
+  --deterministic \
+  --disable-encoder-neftune \
+  --debug-frozen-feature-probe \
+  --debug-frozen-feature-train-examples 16 \
+  --debug-frozen-feature-val-examples 16 \
+  --debug-frozen-feature-val-offset 1024 \
+  --debug-frozen-feature-epochs 30
+```
 
 ```bash
 zig build -Dskip-openapi=true convert-fused-chunker-checkpoint-for-go -- \
@@ -136,12 +185,15 @@ zig build -Dskip-openapi=true prepare-fused-chunker-boundary-eval -- \
 ```
 
 Benchmark runs must write a JSON result file with schema
-`fused_chunker_benchmark_results/v1`:
+`fused_chunker_benchmark_results/v1`. `dataset_results[].f1` in the boundary
+lane must use `chonky_character_separator_f1`; internal fixed/best threshold
+fields remain token-boundary quality diagnostics from the trained head:
 
 ```json
 {
   "schema_version": "fused_chunker_benchmark_results/v1",
   "boundary_f1": {
+    "dataset_metric": "chonky_character_separator_f1",
     "internal_phase20_best_f1": 0.80,
     "fixed_threshold_f1": 0.78,
     "best_threshold_f1": 0.80,
@@ -152,6 +204,10 @@ Benchmark runs must write a JSON result file with schema
   "retrieval_ndcg": {
     "output_dimension": 256,
     "overall_ndcg_at_10": 0.74,
+    "voyage_context_4_target_ndcg_at_10": 0.8054,
+    "distance_to_voyage_context_4_target": 0.0654,
+    "best_local_baseline_ndcg_at_10": 0.70,
+    "relative_gain_over_best_local_baseline": 0.0571,
     "baselines": [
       { "name": "fixed_500_50_same_encoder", "overall_ndcg_at_10": 0.68 }
     ]
