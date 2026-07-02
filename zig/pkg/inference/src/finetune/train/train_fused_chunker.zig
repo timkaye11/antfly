@@ -74,6 +74,7 @@ const tokenizer_batch_mod = @import("../tokenizer_batch.zig");
 const TokenizerBatch = tokenizer_batch_mod.TokenizerBatch;
 const TokenFnCtx = tokenizer_batch_mod.TokenFnCtx;
 const fused_chunker_lora = @import("../lora_adapter_set.zig");
+const fused_chunker_compiled_forward = @import("../fused_chunker_compiled_forward.zig");
 const tensor_mod = @import("../../backends/tensor.zig");
 const safetensors = @import("../../models/safetensors.zig");
 const lora = @import("../lora.zig");
@@ -511,6 +512,7 @@ fn runCompiledSegmentedEncoderForward(
                 segment_end,
                 lora_rank,
                 lora_alpha,
+                true, // training forward needs the activation captures
             );
         }
         const session = &(session_slot.* orelse return error.MissingCompiledForwardSessions);
@@ -8704,6 +8706,7 @@ fn evaluateBoundarySamplesStreaming(
     encoder_loaded: bool,
     use_metal: bool,
     lora_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    compiled_eval: ?*fused_chunker_compiled_forward.CompiledEvalForward,
     eval_label: []const u8,
     eval_step: u64,
     fitted_threshold: ?f32,
@@ -8794,6 +8797,30 @@ fn evaluateBoundarySamplesStreaming(
                 .lora_rank = lora_rank,
                 .lora_alpha = lora_alpha,
             };
+            // Opt-in compiled segmented eval forward (shares the flag with
+            // the training-step fast path). Eager fallback on any failure;
+            // partial trailing batches always run eager.
+            if (compiled_eval) |cef| {
+                if (lora_adapters != null and cef.shouldUse(count, bs)) {
+                    if (cef.forward(
+                        cb,
+                        bert_config,
+                        ids_i64,
+                        mask_i64,
+                        count,
+                        max_seq,
+                        lora_adapters.?.layers,
+                    )) |compiled_features| {
+                        break :blk compiled_features;
+                    } else |err| {
+                        cef.failed = true;
+                        print(
+                            "warning: compiled segment eval forward failed with {s} ({s} batch {d}); falling back to eager eval forward\n",
+                            .{ @errorName(err), eval_label, batch_idx + 1 },
+                        );
+                    }
+                }
+            }
             break :blk try modern_bert.forward(
                 cb,
                 allocator,
@@ -9218,6 +9245,35 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
         errdefer allocator.free(sessions);
         for (sessions) |*slot| slot.* = null;
         compiled_forward_sessions = sessions;
+    }
+
+    // When the compiled step forward is enabled, the trainer's validation
+    // loops also run through capture-free compiled segment sessions (kept in
+    // their own slots so validation batches never evict the training-shaped
+    // sessions). Eager fallback on any failure.
+    var compiled_eval_forward: ?fused_chunker_compiled_forward.CompiledEvalForward = null;
+    defer if (compiled_eval_forward) |*cef| cef.deinit();
+    if (opts.compiled_segment_forward and opts.lora_rank > 0) {
+        const eval_alpha: f32 = if (lora_adapters_opt) |*la| la.config.alpha else opts.lora_alpha;
+        if (fused_chunker_compiled_forward.graphConfigForEval(
+            opts.hidden_size,
+            opts.num_layers,
+            opts.intermediate_size,
+        )) |eval_graph_config| {
+            compiled_eval_forward = try fused_chunker_compiled_forward.CompiledEvalForward.init(
+                allocator,
+                eval_graph_config,
+                opts.layers_per_segment,
+                opts.lora_rank,
+                eval_alpha,
+            );
+            print("compiled_segment_forward: validation/eval forward will use capture-free compiled segment sessions\n", .{});
+        } else |err| {
+            print(
+                "warning: compiled segment eval forward disabled ({s}); validation uses the eager forward\n",
+                .{@errorName(err)},
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -11827,6 +11883,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                         encoder_loaded,
                         use_metal,
                         if (lora_adapters_opt) |*la| la else null,
+                        if (compiled_eval_forward) |*cef| cef else null,
                         "train_validation",
                         summary.step,
                         null,
@@ -11899,6 +11956,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                     encoder_loaded,
                     use_metal,
                     if (lora_adapters_opt) |*la| la else null,
+                    if (compiled_eval_forward) |*cef| cef else null,
                     "validation",
                     summary.step,
                     step_fitted_threshold,
@@ -12043,6 +12101,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                 encoder_loaded,
                 use_metal,
                 if (lora_adapters_opt) |*la| la else null,
+                if (compiled_eval_forward) |*cef| cef else null,
                 "epoch_validation",
                 trainer.step_count,
                 null,
@@ -12180,6 +12239,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
             encoder_loaded,
             use_metal,
             if (roundtrip_lora_adapters_opt) |*la| la else null,
+            if (compiled_eval_forward) |*cef| cef else null,
             "checkpoint_roundtrip",
             trainer.step_count,
             null,
@@ -12362,7 +12422,7 @@ fn printUsage() void {
         \\  --lora-train-top-k <n>    Train only the top N LoRA layers (default: 0=all/LISA)
         \\  --encoder-vjp direct|last-layer|full|full-hidden-direct Encoder LoRA backward mode (default: direct)
         \\  --layers-per-segment <n>  Full-VJP encoder layers per reverse segment (default: 1)
-        \\  --compiled-segment-forward Run the LoRA encoder forward through compiled MPSGraph segment sessions (default: off; env ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1)
+        \\  --compiled-segment-forward Run the LoRA encoder forward (training steps AND validation evals) through compiled MPSGraph segment sessions (default: off; env ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1)
         \\  --lora-plus-ratio <f>     LoRA+ B/A LR ratio (default: 1.0=disabled)
         \\  --length-bucketing        Enable length bucketing
         \\  --bucket-size <n>         Bucket window size (default: 256)

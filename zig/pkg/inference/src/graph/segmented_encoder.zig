@@ -1608,6 +1608,8 @@ pub const ModernBertSegmentVJPSession = struct {
 ///   attn_normed   — Q/K/V projection input ("query_proj"/"key_proj"/"value_proj")
 ///   attn_merged   — attention output before attn.Wo ("out_proj")
 ///   mlp_activated — GeGLU activation before mlp.Wo ("wo")
+/// Sessions built with `emit_captures = false` (eval-only forwards) leave the
+/// three capture slices empty and only populate `hidden_out`.
 pub const SegmentForwardLayerCapture = struct {
     layer_idx: u32,
     attn_normed: []f32,
@@ -1655,6 +1657,10 @@ pub const ModernBertSegmentForwardSession = struct {
     base_params: []ParamBinding,
     adapters: []AdapterBinding,
     compiled: mpsgraph_executor.CompiledGraph,
+    /// True when the graph also outputs the three per-layer activation
+    /// captures the training path needs. Eval-only sessions set this to
+    /// false and only download each layer's `hidden_out`.
+    emit_captures: bool,
     rope_cache: ?[]RopeTable = null,
     base_weight_cache: ?[]?[]f32 = null,
 
@@ -1667,6 +1673,7 @@ pub const ModernBertSegmentForwardSession = struct {
         end_layer: u32,
         lora_rank: u32,
         lora_alpha: f32,
+        emit_captures: bool,
     ) !ModernBertSegmentForwardSession {
         if (lora_rank == 0) return error.LoRARankRequired;
         if (start_layer >= end_layer or end_layer > config.num_hidden_layers) return error.InvalidLayerRange;
@@ -1747,11 +1754,14 @@ pub const ModernBertSegmentForwardSession = struct {
         );
 
         // Output order consumed by execute(): per layer
-        // [attn_normed, attn_merged, mlp_activated, hidden_out].
+        // [attn_normed, attn_merged, mlp_activated, hidden_out] with
+        // captures enabled, or just [hidden_out] without.
         for (layer_nodes) |nodes| {
-            try g.markOutput(nodes.attn_normed_node);
-            try g.markOutput(nodes.attn_merged_node);
-            try g.markOutput(nodes.mlp_activated_node);
+            if (emit_captures) {
+                try g.markOutput(nodes.attn_normed_node);
+                try g.markOutput(nodes.attn_merged_node);
+                try g.markOutput(nodes.mlp_activated_node);
+            }
             try g.markOutput(nodes.hidden_out_node);
         }
 
@@ -1833,6 +1843,7 @@ pub const ModernBertSegmentForwardSession = struct {
             .base_params = try base_params_list.toOwnedSlice(allocator),
             .adapters = try adapter_list.toOwnedSlice(allocator),
             .compiled = compiled,
+            .emit_captures = emit_captures,
         };
     }
 
@@ -1969,27 +1980,44 @@ pub const ModernBertSegmentForwardSession = struct {
         defer if (exec_owned) exec_result.deinit();
 
         const num_layers: usize = @intCast(self.end_layer - self.start_layer);
-        if (exec_result.outputs.len != num_layers * 4) return error.InvalidSegmentForwardOutputs;
+        const outputs_per_layer: usize = if (self.emit_captures) 4 else 1;
+        if (exec_result.outputs.len != num_layers * outputs_per_layer) return error.InvalidSegmentForwardOutputs;
         for (0..num_layers) |i| {
-            if (exec_result.outputs[i * 4 + 0].len != total * H or
-                exec_result.outputs[i * 4 + 1].len != total * H or
-                exec_result.outputs[i * 4 + 2].len != total * I or
-                exec_result.outputs[i * 4 + 3].len != total * H)
-            {
-                return error.InvalidSegmentForwardOutputs;
+            if (self.emit_captures) {
+                if (exec_result.outputs[i * 4 + 0].len != total * H or
+                    exec_result.outputs[i * 4 + 1].len != total * H or
+                    exec_result.outputs[i * 4 + 2].len != total * I or
+                    exec_result.outputs[i * 4 + 3].len != total * H)
+                {
+                    return error.InvalidSegmentForwardOutputs;
+                }
+            } else {
+                if (exec_result.outputs[i].len != total * H) return error.InvalidSegmentForwardOutputs;
             }
         }
 
         const layers = try self.allocator.alloc(SegmentForwardLayerCapture, num_layers);
         errdefer self.allocator.free(layers);
         for (layers, 0..) |*capture, i| {
-            capture.* = .{
-                .layer_idx = self.start_layer + @as(u32, @intCast(i)),
-                .attn_normed = exec_result.outputs[i * 4 + 0],
-                .attn_merged = exec_result.outputs[i * 4 + 1],
-                .mlp_activated = exec_result.outputs[i * 4 + 2],
-                .hidden_out = exec_result.outputs[i * 4 + 3],
-            };
+            if (self.emit_captures) {
+                capture.* = .{
+                    .layer_idx = self.start_layer + @as(u32, @intCast(i)),
+                    .attn_normed = exec_result.outputs[i * 4 + 0],
+                    .attn_merged = exec_result.outputs[i * 4 + 1],
+                    .mlp_activated = exec_result.outputs[i * 4 + 2],
+                    .hidden_out = exec_result.outputs[i * 4 + 3],
+                };
+            } else {
+                // Zero-length allocations are free (no backing memory) and
+                // keep SegmentForwardResult.deinit uniform.
+                capture.* = .{
+                    .layer_idx = self.start_layer + @as(u32, @intCast(i)),
+                    .attn_normed = try self.allocator.alloc(f32, 0),
+                    .attn_merged = try self.allocator.alloc(f32, 0),
+                    .mlp_activated = try self.allocator.alloc(f32, 0),
+                    .hidden_out = exec_result.outputs[i],
+                };
+            }
         }
 
         // Take ownership of the output slices; free only the container.

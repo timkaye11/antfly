@@ -30,6 +30,8 @@
 //   --boundary-alignment-dump-dir <dir>
 //   --boundary-alignment-dump-top-k <n>
 //   --backend native|metal|auto  Compute backend (default: auto)
+//   --compiled-segment-forward   Compiled MPSGraph encoder forward (default: off;
+//                                env ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1)
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -47,6 +49,7 @@ const fused_chunker_data = @import("../fused_chunker_data.zig");
 const fused_chunker_loss = @import("../fused_chunker_loss.zig");
 const fused_chunker_lora = @import("../lora_adapter_set.zig");
 const fused_chunker_train = @import("../fused_chunker_train.zig");
+const fused_chunker_compiled_forward = @import("../fused_chunker_compiled_forward.zig");
 const modern_bert = @import("../../architectures/modern_bert.zig");
 const tokenizer_batch_mod = @import("../tokenizer_batch.zig");
 const TokenizerBatch = tokenizer_batch_mod.TokenizerBatch;
@@ -1334,6 +1337,11 @@ const Options = struct {
     boundary_alignment_dump_dir: ?[]const u8 = null,
     boundary_alignment_dump_top_k: usize = 32,
     backend: FusedBackend = .auto,
+    /// Opt-in compiled MPSGraph segmented encoder forward (requires Metal,
+    /// encoder weights, and LoRA adapters in the checkpoint). Eager fallback
+    /// on any failure. Also settable via
+    /// ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1.
+    compiled_segment_forward: bool = false,
 };
 
 fn printUsage() void {
@@ -1364,6 +1372,9 @@ fn printUsage() void {
         \\  --boundary-alignment-dump-dir <dir> Write JSONL token alignment dump for gold and high-probability boundary tokens
         \\  --boundary-alignment-dump-top-k <n> High-probability tokens to dump per eval batch (default: 32)
         \\  --backend native|metal|auto  Compute backend (default: auto; auto prefers Metal)
+        \\  --compiled-segment-forward   Run the encoder forward through compiled MPSGraph segment sessions
+        \\                           (default: off; env ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1;
+        \\                           requires --model-dir and a LoRA checkpoint; eager fallback on failure)
         \\
     , .{});
 }
@@ -1973,6 +1984,7 @@ pub fn main(init: std.process.Init) !void {
         .data_path = "",
         .checkpoint_path = "",
     }).backend) = .auto;
+    var compiled_segment_forward: bool = fused_chunker_compiled_forward.envEnabled();
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--data")) {
@@ -2134,6 +2146,8 @@ pub fn main(init: std.process.Init) !void {
                 print("error: unknown backend '{s}': expected native, metal, or auto\n", .{value});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, arg, "--compiled-segment-forward")) {
+            compiled_segment_forward = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -2173,6 +2187,7 @@ pub fn main(init: std.process.Init) !void {
         .boundary_alignment_dump_dir = boundary_alignment_dump_dir,
         .boundary_alignment_dump_top_k = boundary_alignment_dump_top_k,
         .backend = backend,
+        .compiled_segment_forward = compiled_segment_forward,
     };
 
     const metal_available = if (comptime build_options.enable_metal) metal_runtime.metalDeviceAvailable() else false;
@@ -2321,6 +2336,37 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Opt-in compiled MPSGraph segmented encoder forward (capture-free).
+    // Sessions compile lazily on the first full batch; any failure latches
+    // the eager fallback for the rest of the run.
+    var compiled_eval_forward_opt: ?fused_chunker_compiled_forward.CompiledEvalForward = null;
+    defer if (compiled_eval_forward_opt) |*cef| cef.deinit();
+    if (opts.compiled_segment_forward) {
+        if (!encoder_loaded or tokenizer_opt == null) {
+            print("compiled_segment_forward requested but encoder weights/tokenizer are unavailable; using eager forward\n", .{});
+        } else if (eval_lora_adapters_opt == null or eval_lora_rank == 0) {
+            print("compiled_segment_forward requested but the checkpoint has no LoRA adapters; using eager forward\n", .{});
+        } else if (fused_chunker_compiled_forward.graphConfigForEval(
+            opts.hidden_size,
+            opts.num_layers,
+            opts.intermediate_size,
+        )) |eval_graph_config| {
+            compiled_eval_forward_opt = try fused_chunker_compiled_forward.CompiledEvalForward.init(
+                allocator,
+                eval_graph_config,
+                1,
+                eval_lora_rank,
+                eval_lora_alpha,
+            );
+            print("compiled_segment_forward=on rank={d} alpha={d:.3} (eager fallback on failure)\n", .{
+                eval_lora_rank,
+                eval_lora_alpha,
+            });
+        } else |err| {
+            print("compiled_segment_forward requested but unsupported for this config ({s}); using eager forward\n", .{@errorName(err)});
+        }
+    }
+
     // Load eval samples
     var loaded = fused_chunker_data.loadSamples(allocator, opts.data_path, opts.split) catch |err| {
         print("error: failed to load eval data from '{s}': {}\n", .{ opts.data_path, err });
@@ -2456,6 +2502,29 @@ pub fn main(init: std.process.Init) !void {
                 .lora_rank = eval_lora_rank,
                 .lora_alpha = eval_lora_alpha,
             };
+            // Opt-in compiled segmented forward; partial trailing batches
+            // and any compiled failure fall back to the eager forward.
+            if (compiled_eval_forward_opt) |*cef| {
+                if (cef.shouldUse(count, bs)) {
+                    if (cef.forward(
+                        &cb,
+                        bert_config,
+                        ids_i64,
+                        mask_i64,
+                        count,
+                        msl,
+                        eval_lora_adapters_opt.?.layers,
+                    )) |compiled_features| {
+                        break :blk compiled_features;
+                    } else |err| {
+                        cef.failed = true;
+                        print(
+                            "warning: compiled segment forward failed on eval batch starting at sample {d}: {s}; falling back to eager forward\n",
+                            .{ sample_idx, @errorName(err) },
+                        );
+                    }
+                }
+            }
             break :blk modern_bert.forward(
                 &cb,
                 allocator,

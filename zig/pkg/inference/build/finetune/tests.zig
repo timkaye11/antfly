@@ -156,6 +156,11 @@ const tests = [_]common.TestSpec{
         .native_link = .default,
     },
     .{
+        .step_name = "test-fused-chunker-compiled-forward",
+        .root_source_file = "src/finetune/fused_chunker_compiled_forward_policy.zig",
+        .description = "Run compiled segmented eval forward policy tests",
+    },
+    .{
         .step_name = "test-fused-chunker-retrieval-benchmark-score",
         .root_source_file = "src/finetune/tools/score_fused_chunker_retrieval_benchmark.zig",
         .description = "Run fused chunker retrieval benchmark scorer tests",
