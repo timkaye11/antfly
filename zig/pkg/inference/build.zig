@@ -539,6 +539,33 @@ pub fn build(b: *std.Build) void {
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
+    const fused_chunker_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-fused-chunker-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/fused_chunker_e2e.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    fused_chunker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    fused_chunker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, fused_chunker_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    configureOnnxRuntime(b, fused_chunker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_fused_chunker_e2e_bench = b.addRunArtifact(fused_chunker_e2e_bench_exe);
+    if (b.args) |args| {
+        run_fused_chunker_e2e_bench.addArgs(args);
+    }
+    const fused_chunker_e2e_bench_step = b.step("bench-fused-chunker-e2e", "Run fused chunker /chunk serving-path E2E benchmarks against a packaged model dir");
+    fused_chunker_e2e_bench_step.dependOn(&run_fused_chunker_e2e_bench.step);
+
     const audio_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-audio-bench",
         .root_module = b.createModule(.{

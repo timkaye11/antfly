@@ -98,6 +98,35 @@ fn spinLock(m: *std.atomic.Mutex) void {
     }
 }
 
+/// Per-phase wall-clock breakdown of one chunkText call, filled in by
+/// chunkTextTimed for benchmarking and metrics.
+pub const PhaseTimings = struct {
+    /// Whole-document tokenization (with char offsets).
+    tokenize_ns: u64 = 0,
+    /// All forward windows (boundary-only or full), including window setup.
+    forward_ns: u64 = 0,
+    /// Boundary decode + token-span → char-span mapping.
+    decode_ns: u64 = 0,
+    /// Late-chunking mean pool for dense chunk embeddings.
+    pool_ns: u64 = 0,
+    /// SPLADE weight materialization + sparse vector computation.
+    splade_ns: u64 = 0,
+    /// Number of max_seq_len forward windows processed.
+    windows: u64 = 0,
+    /// Valid (non-padding) tokens processed, including special tokens.
+    tokens: u64 = 0,
+    /// Chunks produced.
+    chunks: u64 = 0,
+};
+
+fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
 pub const FusedChunkerPipeline = struct {
     allocator: std.mem.Allocator,
     tok: *hf_tokenizer.HfTokenizer,
@@ -235,6 +264,22 @@ pub const FusedChunkerPipeline = struct {
         text: []const u8,
         opts: ChunkRequestOptions,
     ) ![]lib_chunker.Chunk {
+        return self.chunkTextTimed(allocator, text, opts, null);
+    }
+
+    /// chunkText with an optional per-phase wall-clock breakdown, used by the
+    /// fused-chunker e2e benchmark.
+    pub fn chunkTextTimed(
+        self: *FusedChunkerPipeline,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        opts: ChunkRequestOptions,
+        timings: ?*PhaseTimings,
+    ) ![]lib_chunker.Chunk {
+        var phase = PhaseTimings{};
+        defer if (timings) |out| {
+            out.* = phase;
+        };
         if (opts.include_sparse and !self.has_splade) return error.SparseEmbeddingsUnsupported;
         if (text.len == 0) return allocator.alloc(lib_chunker.Chunk, 0);
 
@@ -248,6 +293,7 @@ pub const FusedChunkerPipeline = struct {
         if (opts.include_sparse and emb_dim != hidden) return error.SparseEmbeddingsUnsupported;
 
         // 1. Tokenize the whole document once, with char offsets.
+        const tokenize_start = nowNs();
         const tok = self.tok.tokenizer();
         const token_cap = @max(@min(text.len + 2, max_serving_tokens), 16);
         var enc = try tok.encodeForModel(allocator, text, token_cap);
@@ -259,6 +305,8 @@ pub const FusedChunkerPipeline = struct {
             if (m == 0) break;
             valid_len += 1;
         }
+        phase.tokenize_ns = nowNs() - tokenize_start;
+        phase.tokens = @intCast(valid_len);
         if (valid_len == 0) return allocator.alloc(lib_chunker.Chunk, 0);
 
         const need_token_outputs = opts.include_embeddings or opts.include_sparse;
@@ -278,10 +326,16 @@ pub const FusedChunkerPipeline = struct {
             defer self.inference_lock.unlock();
             const cb = self.computeBackend();
 
-            if (opts.include_sparse) splade_weight = try self.ensureSpladeWeight(&cb);
+            if (opts.include_sparse) {
+                const splade_start = nowNs();
+                splade_weight = try self.ensureSpladeWeight(&cb);
+                phase.splade_ns += nowNs() - splade_start;
+            }
 
+            const forward_start = nowNs();
             const msl = self.max_seq_len;
             const windows = numWindows(valid_len, msl);
+            phase.windows = @intCast(windows);
             var w: usize = 0;
             while (w < windows) : (w += 1) {
                 const start = w * msl;
@@ -309,9 +363,11 @@ pub const FusedChunkerPipeline = struct {
                     @memcpy(boundary_logits[start * 2 .. end * 2], logits[0 .. n * 2]);
                 }
             }
+            phase.forward_ns = nowNs() - forward_start;
         }
 
         // 3. Decode boundary logits into token spans and map to char ranges.
+        const decode_start = nowNs();
         const all_spans = try decodeSpansWithFallback(allocator, cfg, boundary_logits, valid_len);
         defer allocator.free(all_spans);
 
@@ -326,6 +382,8 @@ pub const FusedChunkerPipeline = struct {
             const chars = charSpanFromTokens(offsets[0..valid_len], span.start_token, span.end_token) orelse continue;
             try kept.append(allocator, .{ .span = span, .chars = chars });
         }
+        phase.decode_ns = nowNs() - decode_start;
+        phase.chunks = @intCast(kept.items.len);
 
         // 4. Dense embeddings via late-chunking mean pool over real tokens.
         var chunk_embeddings: []f32 = &.{};
@@ -340,6 +398,7 @@ pub const FusedChunkerPipeline = struct {
             @memset(chunk_mask, 1.0);
 
             if (opts.include_embeddings) {
+                const pool_start = nowNs();
                 const starts = try allocator.alloc(u32, n_chunks);
                 defer allocator.free(starts);
                 const ends = try allocator.alloc(u32, n_chunks);
@@ -359,9 +418,11 @@ pub const FusedChunkerPipeline = struct {
                     valid_len,
                     n_chunks,
                 );
+                phase.pool_ns = nowNs() - pool_start;
             }
 
             if (opts.include_sparse) {
+                const splade_start = nowNs();
                 const starts_i32 = try allocator.alloc(i32, n_chunks);
                 defer allocator.free(starts_i32);
                 const ends_i32 = try allocator.alloc(i32, n_chunks);
@@ -382,6 +443,7 @@ pub const FusedChunkerPipeline = struct {
                     valid_len,
                     n_chunks,
                 );
+                phase.splade_ns += nowNs() - splade_start;
             }
         }
 

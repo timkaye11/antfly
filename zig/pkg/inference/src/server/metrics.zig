@@ -46,6 +46,12 @@ pub const Metrics = struct {
     embed_batch_max_duration_ns_value: u64 = 0,
     rerank_requests: prometheus.Counter(u64),
     chunk_requests: prometheus.Counter(u64),
+    chunk_requests_fixed_total: prometheus.Counter(u64),
+    chunk_requests_fused_total: prometheus.Counter(u64),
+    chunk_fixed_fallback_total: prometheus.Counter(u64),
+    chunk_duration_ns_total: prometheus.Counter(u64),
+    chunk_tokens_total: prometheus.Counter(u64),
+    chunk_model_load_failures_total: prometheus.Counter(u64),
     classify_requests: prometheus.Counter(u64),
     recognize_requests: prometheus.Counter(u64),
     extract_requests: prometheus.Counter(u64),
@@ -82,6 +88,12 @@ pub const Metrics = struct {
             .embed_batch_max_duration_ns = prometheus.Gauge(u64).init("antfly_inference_embed_batch_max_duration_ns", .{ .help = "Slowest completed embed inference batch in nanoseconds" }, .{}),
             .rerank_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_rerank", .{ .help = "Rerank endpoint requests" }, .{}),
             .chunk_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_chunk", .{ .help = "Chunk endpoint requests" }, .{}),
+            .chunk_requests_fixed_total = prometheus.Counter(u64).init("antfly_inference_chunk_requests_fixed_total", .{ .help = "Chunk requests served by the fixed chunker" }, .{}),
+            .chunk_requests_fused_total = prometheus.Counter(u64).init("antfly_inference_chunk_requests_fused_total", .{ .help = "Chunk requests served by a fused chunker model" }, .{}),
+            .chunk_fixed_fallback_total = prometheus.Counter(u64).init("antfly_inference_chunk_fixed_fallback_total", .{ .help = "Chunk requests that fell back from a fused chunker to fixed chunking" }, .{}),
+            .chunk_duration_ns_total = prometheus.Counter(u64).init("antfly_inference_chunk_duration_ns_total", .{ .help = "Total elapsed nanoseconds spent producing chunk responses" }, .{}),
+            .chunk_tokens_total = prometheus.Counter(u64).init("antfly_inference_chunk_tokens_total", .{ .help = "Total input tokens processed by chunk requests" }, .{}),
+            .chunk_model_load_failures_total = prometheus.Counter(u64).init("antfly_inference_chunk_model_load_failures_total", .{ .help = "Chunker model load failures" }, .{}),
             .classify_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_classify", .{ .help = "Classify endpoint requests" }, .{}),
             .recognize_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_recognize", .{ .help = "Recognize endpoint requests" }, .{}),
             .extract_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_extract", .{ .help = "Extract endpoint requests" }, .{}),
@@ -127,6 +139,25 @@ pub const Metrics = struct {
         } else if (std.mem.eql(u8, endpoint, "predict")) {
             self.predict_requests.incr();
         }
+    }
+
+    /// Which chunker implementation ultimately produced a /chunk response.
+    pub const ChunkServedBy = enum { fixed, fused, fixed_fallback };
+
+    /// Record a completed /chunk request: which chunker served it, how many
+    /// input tokens it covered, and how long producing the chunks took.
+    pub fn recordChunkRequest(self: *Metrics, served_by: ChunkServedBy, tokens: usize, duration_ns: u64) void {
+        switch (served_by) {
+            .fixed => self.chunk_requests_fixed_total.incr(),
+            .fused => self.chunk_requests_fused_total.incr(),
+            .fixed_fallback => self.chunk_fixed_fallback_total.incr(),
+        }
+        self.chunk_tokens_total.incrBy(@intCast(tokens));
+        self.chunk_duration_ns_total.incrBy(duration_ns);
+    }
+
+    pub fn incChunkModelLoadFailure(self: *Metrics) void {
+        self.chunk_model_load_failures_total.incr();
     }
 
     pub fn incPredictError(self: *Metrics) void {
@@ -210,4 +241,25 @@ test "metrics render" {
     try std.testing.expect(std.mem.indexOf(u8, embed_output, "antfly_inference_embed_batch_duration_ns_total 3000\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, embed_output, "antfly_inference_embed_batch_last_items 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, embed_output, "antfly_inference_embed_batch_max_items 3\n") != null);
+}
+
+test "chunk metrics render" {
+    var m = Metrics.default;
+    m.recordChunkRequest(.fixed, 100, 1_000);
+    m.recordChunkRequest(.fused, 250, 5_000);
+    m.recordChunkRequest(.fused, 300, 6_000);
+    m.recordChunkRequest(.fixed_fallback, 50, 2_000);
+    m.incChunkModelLoadFailure();
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try m.render(&writer.writer);
+    const output = writer.writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_chunk_requests_fixed_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_chunk_requests_fused_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_chunk_fixed_fallback_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_chunk_tokens_total 700\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_chunk_duration_ns_total 14000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_chunk_model_load_failures_total 1\n") != null);
 }

@@ -1518,6 +1518,7 @@ pub const Node = struct {
         defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
+        const chunk_start_ns = embedTimingNowNs();
 
         const input: lib_chunker.Input = blk: {
             if (body.input) |input_val| {
@@ -1607,6 +1608,7 @@ pub const Node = struct {
         }
 
         var served_by_fixed_fallback = false;
+        var served_by_fused = false;
         const chunks = blk: {
             if (!isFixedChunkerModel(config.model)) {
                 const model_path = self.resolveModelPath(ctx.io, config.model, "chunkers") catch
@@ -1614,8 +1616,10 @@ pub const Node = struct {
                         .@"error" = "MODEL_NOT_FOUND",
                         .message = "chunker model not found; install it under models/chunkers or use model=fixed",
                     });
-                var manifest = manifest_mod.loadListingFromDir(ctx.allocator, model_path) catch |err|
+                var manifest = manifest_mod.loadListingFromDir(ctx.allocator, model_path) catch |err| {
+                    self.metrics.incChunkModelLoadFailure();
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                };
                 defer manifest.deinit();
                 if (manifest.model_type != .chunker and !manifest.hasTask("chunk")) {
                     return ctx.status(400).json(.{
@@ -1632,8 +1636,10 @@ pub const Node = struct {
                     }),
                 };
 
-                const pipeline = self.getFusedChunkerPipeline(model_path) catch |err|
+                const pipeline = self.getFusedChunkerPipeline(model_path) catch |err| {
+                    self.metrics.incChunkModelLoadFailure();
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                };
 
                 if (config.include_sparse and !pipeline.has_splade) {
                     return ctx.status(400).json(.{
@@ -1642,6 +1648,7 @@ pub const Node = struct {
                     });
                 }
 
+                served_by_fused = true;
                 break :blk pipeline.chunkText(ctx.allocator, text, .{
                     .threshold = config.threshold,
                     .max_chunks = config.max_chunks,
@@ -1736,6 +1743,19 @@ pub const Node = struct {
             .text => |text| estimateTextTokens(text),
             .binary => 0,
         };
+
+        const served_by: metrics_mod.Metrics.ChunkServedBy = if (served_by_fixed_fallback)
+            .fixed_fallback
+        else if (served_by_fused)
+            .fused
+        else
+            .fixed;
+        const chunk_end_ns = embedTimingNowNs();
+        const chunk_duration_ns: u64 = if (chunk_end_ns > chunk_start_ns)
+            @intCast(chunk_end_ns - chunk_start_ns)
+        else
+            0;
+        self.metrics.recordChunkRequest(served_by, prompt_tokens, chunk_duration_ns);
 
         return ctx.json(api.ChunkResponse{
             .object = "list",
