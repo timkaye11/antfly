@@ -158,6 +158,7 @@ pub const KernelModule = struct {
     linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     rms_norm_f32: driver_mod.CUfunction = null,
     rms_norm_f32_bf16: driver_mod.CUfunction = null,
+    rms_norm_add_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32: driver_mod.CUfunction = null,
     rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null,
     rms_norm_add_output_scale_f32: driver_mod.CUfunction = null,
@@ -424,6 +425,7 @@ pub const KernelModule = struct {
         var rms_norm_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_f32, module, "termite_rms_norm_f32"));
         const rms_norm_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_f32_bf16");
+        const rms_norm_add_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_f32_bf16");
         var rms_norm_add_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_f32, module, "termite_rms_norm_add_f32"));
         var rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null;
@@ -727,6 +729,7 @@ pub const KernelModule = struct {
             .linear_triple_bias_f32_tile4_r2 = linear_triple_bias_f32_tile4_r2,
             .rms_norm_f32 = rms_norm_f32,
             .rms_norm_f32_bf16 = rms_norm_f32_bf16,
+            .rms_norm_add_f32_bf16 = rms_norm_add_f32_bf16,
             .rms_norm_add_f32 = rms_norm_add_f32,
             .rms_norm_add_mul_scalar_f32 = rms_norm_add_mul_scalar_f32,
             .rms_norm_add_output_scale_f32 = rms_norm_add_output_scale_f32,
@@ -973,6 +976,7 @@ pub const KernelModule = struct {
             self.linear_triple_bias_f32_tile4_r2 = null;
             self.rms_norm_f32 = null;
             self.rms_norm_f32_bf16 = null;
+            self.rms_norm_add_f32_bf16 = null;
             self.rms_norm_add_mul_scalar_f32 = null;
             self.rms_norm_add_output_scale_f32 = null;
             self.rms_norm_bare_f32 = null;
@@ -3625,6 +3629,48 @@ pub const KernelModule = struct {
         try launchRows(function, ctx, total_rows, &params);
     }
 
+    pub fn launchRmsNormAddF32Bf16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        dst_bf16: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        total_rows: usize,
+        dim: usize,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(total_rows, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(dst_bf16, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        try checkBytes(weight, dim);
+        try checkBytes(residual, count);
+        if (count == 0) return;
+
+        const function = self.rms_norm_add_f32_bf16 orelse return error.CudaKernelUnavailable;
+        var dst_ptr = dst.ptr;
+        var dst_bf16_ptr = dst_bf16.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var residual_ptr = residual.ptr;
+        var rows_u32 = try toU32(total_rows);
+        var dim_u32 = try toU32(dim);
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&dst_bf16_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&residual_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&eps_value),
+        };
+        try launchRows(function, ctx, total_rows, &params);
+    }
+
     pub fn launchRmsNormAddF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6195,11 +6241,11 @@ pub const KernelModule = struct {
         var grid_y: c_uint = 1;
         var shared_bytes: c_uint = 0;
         if (launch_kind == .prefill_tiled) {
-            // Tiled prefill: grid = (num_heads, ceil(q_seq_len / TILE_M)), TILE_M = 8.
+            // Tiled prefill: grid = (num_heads, ceil(q_seq_len / TILE_M)), TILE_M = 16.
             // Dynamic smem holds one K/V tile: tile_n * (head_dim + 1) floats.
             block = 256;
             grid_x = try toU32(num_heads);
-            grid_y = try toU32((q_seq_len + 7) / 8);
+            grid_y = try toU32((q_seq_len + 15) / 16);
             const tile_n: usize = if (head_dim <= 256) 32 else 16;
             shared_bytes = try toU32(tile_n * (head_dim + 1) * @sizeOf(f32));
         }

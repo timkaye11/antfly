@@ -163,6 +163,7 @@ required_symbols=(
   termite_linear_q8_0_bias_add_f32_tc_hmma
   termite_rms_norm_add_weighted_embedding_i32_q6_k_f32
   termite_rms_norm_f32_bf16
+  termite_rms_norm_add_f32_bf16
   termite_linear_q4_0_gated_down_f32_tile4_w4
   termite_linear_q4_0_activation_slice_last_dim_f32_tile4
   termite_linear_q4_0_activation_slice_last_dim_f32_tile4_w4

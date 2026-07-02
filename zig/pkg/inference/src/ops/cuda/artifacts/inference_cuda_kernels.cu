@@ -1459,6 +1459,41 @@ extern "C" __global__ void termite_rms_norm_add_f32(
     }
 }
 
+extern "C" __global__ void termite_rms_norm_add_f32_bf16(
+    float* dst,
+    unsigned short* dst_bf16,
+    const float* input,
+    const float* weight,
+    const float* residual,
+    unsigned int rows,
+    unsigned int dim,
+    float eps
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+    const unsigned int base = row * dim;
+    __shared__ float partial[256];
+    float sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float x = input[base + i];
+        sumsq += x * x;
+    }
+    partial[tid] = sumsq;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    float norm_scale = rsqrtf(partial[0] / (float)dim + eps);
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        unsigned int idx = base + i;
+        float value = input[idx] * norm_scale * weight[i] + residual[idx];
+        dst[idx] = value;
+        dst_bf16[idx] = termite_f32_to_bf16(value);
+    }
+}
+
 extern "C" __global__ void termite_rms_norm_add_mul_scalar_f32(
     float* dst,
     const float* input,
@@ -4054,13 +4089,14 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(
     }
 }
 
-// Tiled prefill attention over turboquant pages. One warp per query row
-// (TILE_M rows per block), keys staged through shared memory in TILE_N
-// chunks so each K/V row is decoded once per block instead of once per
-// query. Grid: (num_heads, ceil(q_seq_len / TILE_M)); blockDim.x = 256.
+// Tiled prefill attention over turboquant pages. Each warp owns TWO query
+// rows (TILE_M = 16 rows per block, 8 warps) so every K/V element staged
+// through shared memory feeds two FMAs, halving smem traffic. Keys are
+// staged in TILE_N chunks so each K/V row is decoded once per block.
+// Grid: (num_heads, ceil(q_seq_len / TILE_M)); blockDim.x = 256.
 // Dynamic shared memory: tile_n * (head_dim + 1) * 4 bytes, where
 // tile_n = 32 for head_dim <= 256 and 16 for head_dim <= 512.
-#define TERMITE_TQ_PREFILL_TILE_M 8u
+#define TERMITE_TQ_PREFILL_TILE_M 16u
 
 extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
     float* dst,
@@ -4128,28 +4164,44 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
     unsigned int lane = tid & 31u;
     unsigned int hd_chunks = head_dim >> 5;
 
-    unsigned int qi = tile_row_start + warp;
-    bool row_valid = qi < q_seq_len;
-    unsigned int qi_clamped = row_valid ? qi : (q_seq_len - 1u);
-    unsigned int query_pos = query_position_offset + qi_clamped;
+    // Each warp owns two adjacent query rows.
+    unsigned int qi0 = tile_row_start + warp * 2u;
+    unsigned int qi1 = qi0 + 1u;
+    bool row_valid0 = qi0 < q_seq_len;
+    bool row_valid1 = qi1 < q_seq_len;
+    unsigned int qi0_clamped = row_valid0 ? qi0 : (q_seq_len - 1u);
+    unsigned int qi1_clamped = row_valid1 ? qi1 : (q_seq_len - 1u);
 
-    unsigned int key_start = 0u;
-    unsigned int key_end = 0u;
-    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
+    unsigned int key_start0 = 0u, key_end0 = 0u;
+    unsigned int key_start1 = 0u, key_end1 = 0u;
+    {
+        unsigned int query_pos = query_position_offset + qi0_clamped;
+        if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+            unsigned int visible = query_pos - kv_position_offset + 1u;
+            key_end0 = visible < kv_seq_len ? visible : kv_seq_len;
+            if (sliding_window != 0u) {
+                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+                if (window_start_abs > kv_position_offset) {
+                    key_start0 = window_start_abs - kv_position_offset;
+                    if (key_start0 > key_end0) key_start0 = key_end0;
+                }
+            }
+        }
+        query_pos = query_position_offset + qi1_clamped;
+        if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+            unsigned int visible = query_pos - kv_position_offset + 1u;
+            key_end1 = visible < kv_seq_len ? visible : kv_seq_len;
+            if (sliding_window != 0u) {
+                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+                if (window_start_abs > kv_position_offset) {
+                    key_start1 = window_start_abs - kv_position_offset;
+                    if (key_start1 > key_end1) key_start1 = key_end1;
+                }
             }
         }
     }
-    if (!row_valid) {
-        key_start = 0u;
-        key_end = 0u;
-    }
+    if (!row_valid0) { key_start0 = 0u; key_end0 = 0u; }
+    if (!row_valid1) { key_start1 = 0u; key_end1 = 0u; }
 
     // Block-wide key range: causal end grows with qi and the sliding-window
     // start grows with qi, so the union is [start(first row), end(last row)].
@@ -4176,15 +4228,16 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
     unsigned int heads_per_group = num_heads / num_kv_heads;
     unsigned int kv_head = head / heads_per_group;
     unsigned int q_hidden = num_heads * head_dim;
-    unsigned int q_base = qi_clamped * q_hidden + head * head_dim;
     float scale = rsqrtf((float)head_dim);
 
-    const float* q_row = q + q_base;
+    const float* q_row0 = q + qi0_clamped * q_hidden + head * head_dim;
+    const float* q_row1 = q + qi1_clamped * q_hidden + head * head_dim;
 
-    float acc[16];
-    for (unsigned int e = 0u; e < hd_chunks; ++e) acc[e] = 0.0f;
-    float m_run = neg_inf;
-    float d_run = 0.0f;
+    float acc0[16];
+    float acc1[16];
+    for (unsigned int e = 0u; e < hd_chunks; ++e) { acc0[e] = 0.0f; acc1[e] = 0.0f; }
+    float m_run0 = neg_inf, d_run0 = 0.0f;
+    float m_run1 = neg_inf, d_run1 = 0.0f;
 
     for (unsigned int n0 = block_key_start; n0 < block_key_end; n0 += tile_n) {
         unsigned int n_count = block_key_end - n0;
@@ -4213,44 +4266,73 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
         }
         __syncthreads();
 
-        // Each lane owns one key of the tile and computes its full dot.
-        // q_row reads hit the same address warp-wide (L1 broadcast); lanes
-        // past the tile clamp to row 0 and mask their score afterward.
-        unsigned int ki = n0 + lane;
-        bool key_valid = lane < n_count &&
-            ki >= key_start && ki < key_end &&
-            tile_phys[lane] != 0xffffffffu;
+        // Each lane owns one key of the tile and computes its dot against
+        // both of the warp's query rows: every K element read from shared
+        // memory feeds two FMAs. q_row reads hit the same address warp-wide
+        // (L1 broadcast). When the tile holds only 16 keys (head_dim > 256)
+        // lane pairs split the dims of one key and combine via shfl_xor so
+        // no lanes idle. Scores are masked to the owning lane afterward.
+        unsigned int key_lane = tile_n < 32u ? (lane & (tile_n - 1u)) : lane;
+        unsigned int d_begin = (tile_n < 32u && lane >= tile_n) ? (head_dim >> 1) : 0u;
+        unsigned int d_count = tile_n < 32u ? (head_dim >> 1) : head_dim;
+        unsigned int ki = n0 + key_lane;
+        bool in_tile = key_lane < n_count && tile_phys[key_lane] != 0xffffffffu;
         float dot0 = 0.0f;
         float dot1 = 0.0f;
-        const float* k_vec = &kv_tile[(lane < tile_n ? lane : 0u) * row_pitch];
+        const float* k_vec = &kv_tile[key_lane * row_pitch] + d_begin;
+        const float* q_ptr0 = q_row0 + d_begin;
+        const float* q_ptr1 = q_row1 + d_begin;
         #pragma unroll 4
-        for (unsigned int d = 0u; d < head_dim; d += 2u) {
-            dot0 += q_row[d] * k_vec[d];
-            dot1 += q_row[d + 1u] * k_vec[d + 1u];
+        for (unsigned int d = 0u; d < d_count; ++d) {
+            float kd = k_vec[d];
+            dot0 += q_ptr0[d] * kd;
+            dot1 += q_ptr1[d] * kd;
         }
-        float score = key_valid ? (dot0 + dot1) * scale : neg_inf;
+        if (tile_n < 32u) {
+            dot0 += __shfl_xor_sync(0xffffffffu, dot0, 16u);
+            dot1 += __shfl_xor_sync(0xffffffffu, dot1, 16u);
+        }
+        bool own_key = in_tile && lane < tile_n;
+        bool key_valid0 = own_key && ki >= key_start0 && ki < key_end0;
+        bool key_valid1 = own_key && ki >= key_start1 && ki < key_end1;
+        float score0 = key_valid0 ? dot0 * scale : neg_inf;
+        float score1 = key_valid1 ? dot1 * scale : neg_inf;
 
-        float tile_max = score;
+        float tile_max0 = score0;
+        float tile_max1 = score1;
         for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
-            tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, offset));
+            tile_max0 = fmaxf(tile_max0, __shfl_down_sync(0xffffffffu, tile_max0, offset));
+            tile_max1 = fmaxf(tile_max1, __shfl_down_sync(0xffffffffu, tile_max1, offset));
         }
-        tile_max = __shfl_sync(0xffffffffu, tile_max, 0u);
+        tile_max0 = __shfl_sync(0xffffffffu, tile_max0, 0u);
+        tile_max1 = __shfl_sync(0xffffffffu, tile_max1, 0u);
 
-        float alpha = 1.0f;
-        float p = 0.0f;
-        if (tile_max > neg_inf) {
-            float new_max = fmaxf(m_run, tile_max);
-            alpha = m_run > neg_inf ? expf(m_run - new_max) : 0.0f;
-            p = key_valid ? expf(score - new_max) : 0.0f;
-            float sum_p = p;
-            for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
-                sum_p += __shfl_down_sync(0xffffffffu, sum_p, offset);
-            }
-            sum_p = __shfl_sync(0xffffffffu, sum_p, 0u);
-            d_run = d_run * alpha + sum_p;
-            m_run = new_max;
+        float alpha0 = 1.0f, p0 = 0.0f;
+        float alpha1 = 1.0f, p1 = 0.0f;
+        if (tile_max0 > neg_inf) {
+            float new_max = fmaxf(m_run0, tile_max0);
+            alpha0 = m_run0 > neg_inf ? expf(m_run0 - new_max) : 0.0f;
+            p0 = key_valid0 ? expf(score0 - new_max) : 0.0f;
+            m_run0 = new_max;
         }
-        p_tile[warp][lane] = p;
+        if (tile_max1 > neg_inf) {
+            float new_max = fmaxf(m_run1, tile_max1);
+            alpha1 = m_run1 > neg_inf ? expf(m_run1 - new_max) : 0.0f;
+            p1 = key_valid1 ? expf(score1 - new_max) : 0.0f;
+            m_run1 = new_max;
+        }
+        float sum_p0 = p0;
+        float sum_p1 = p1;
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
+            sum_p0 += __shfl_down_sync(0xffffffffu, sum_p0, offset);
+            sum_p1 += __shfl_down_sync(0xffffffffu, sum_p1, offset);
+        }
+        sum_p0 = __shfl_sync(0xffffffffu, sum_p0, 0u);
+        sum_p1 = __shfl_sync(0xffffffffu, sum_p1, 0u);
+        if (tile_max0 > neg_inf) d_run0 = d_run0 * alpha0 + sum_p0;
+        if (tile_max1 > neg_inf) d_run1 = d_run1 * alpha1 + sum_p1;
+        p_tile[warp * 2u][lane] = p0;
+        p_tile[warp * 2u + 1u][lane] = p1;
         __syncthreads();
 
         for (unsigned int idx = tid; idx < n_count * head_dim; idx += 256u) {
@@ -4266,24 +4348,34 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
         }
         __syncthreads();
 
-        for (unsigned int e = 0u; e < hd_chunks; ++e) acc[e] *= alpha;
+        for (unsigned int e = 0u; e < hd_chunks; ++e) { acc0[e] *= alpha0; acc1[e] *= alpha1; }
         for (unsigned int j = 0u; j < n_count; ++j) {
-            float pj = p_tile[warp][j];
-            if (pj != 0.0f) {
+            float pj0 = p_tile[warp * 2u][j];
+            float pj1 = p_tile[warp * 2u + 1u][j];
+            if (pj0 != 0.0f || pj1 != 0.0f) {
                 const float* v_vec = &kv_tile[j * row_pitch];
                 for (unsigned int e = 0u; e < hd_chunks; ++e) {
-                    acc[e] += pj * v_vec[lane + (e << 5)];
+                    float ve = v_vec[lane + (e << 5)];
+                    acc0[e] += pj0 * ve;
+                    acc1[e] += pj1 * ve;
                 }
             }
         }
         __syncthreads();
     }
 
-    if (row_valid) {
-        unsigned int out_base = qi * q_hidden + head * head_dim;
-        float inv_denom = d_run > 0.0f ? 1.0f / d_run : 0.0f;
+    if (row_valid0) {
+        unsigned int out_base = qi0 * q_hidden + head * head_dim;
+        float inv_denom = d_run0 > 0.0f ? 1.0f / d_run0 : 0.0f;
         for (unsigned int e = 0u; e < hd_chunks; ++e) {
-            dst[out_base + lane + (e << 5)] = acc[e] * inv_denom;
+            dst[out_base + lane + (e << 5)] = acc0[e] * inv_denom;
+        }
+    }
+    if (row_valid1) {
+        unsigned int out_base = qi1 * q_hidden + head * head_dim;
+        float inv_denom = d_run1 > 0.0f ? 1.0f / d_run1 : 0.0f;
+        for (unsigned int e = 0u; e < hd_chunks; ++e) {
+            dst[out_base + lane + (e << 5)] = acc1[e] * inv_denom;
         }
     }
 }

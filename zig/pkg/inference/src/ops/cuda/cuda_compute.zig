@@ -853,7 +853,10 @@ pub const CudaCompute = struct {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
         }
-        const cublaslt = initCublasLtIfAvailable(allocator, &ctx);
+        var cublaslt = initCublasLtIfAvailable(allocator, &ctx);
+        if (cublaslt != null and cudaCublasLtWarmupEnabled()) {
+            warmupCublasLtBf16(&cublaslt.?, &ctx);
+        }
         return .{
             .allocator = allocator,
             .ctx = ctx,
@@ -2129,6 +2132,28 @@ fn initCublasLtIfAvailable(allocator: std.mem.Allocator, ctx: *const context_mod
     if (!cudaCublasLtEnabled()) return null;
     if (ctx.info.compute_major < 8) return null;
     return cublaslt_mod.CublasLt.openWithAllocator(allocator) catch null;
+}
+
+fn cudaCublasLtWarmupEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT_WARMUP", true);
+}
+
+// cuBLASLt loads its kernel libraries lazily on the first BF16 matmul
+// (~100ms of cuLibraryLoadData on an L4), which otherwise lands inside the
+// first prefill. Run one tiny matmul at init so the cost moves to load time.
+fn warmupCublasLtBf16(cublaslt: *cublaslt_mod.CublasLt, ctx: *context_mod.CudaContext) void {
+    const rows: usize = 8;
+    const dim: usize = 32;
+    var input = buffer_mod.DeviceBuffer.alloc(ctx, rows * dim * @sizeOf(u16)) catch return;
+    defer input.free(ctx);
+    var weight = buffer_mod.DeviceBuffer.alloc(ctx, dim * dim * @sizeOf(u16)) catch return;
+    defer weight.free(ctx);
+    var dst = buffer_mod.DeviceBuffer.alloc(ctx, rows * dim * @sizeOf(f32)) catch return;
+    defer dst.free(ctx);
+    // Inputs stay uninitialized: the result is discarded, only the library
+    // load and heuristic init matter.
+    cublaslt.matmulBf16WeightF32Out(ctx, dst, input, weight, .{}, rows, dim, dim) catch return;
+    ctx.driver.check(ctx.driver.fns.cuStreamSynchronize(ctx.stream)) catch {};
 }
 
 fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
@@ -10235,6 +10260,29 @@ fn rmsNormAddTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: u
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+        var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
+        if (bf16_mirror.ptr != 0) {
+            const launched_mirror = blk: {
+                self.kernels.launchRmsNormAddF32Bf16(&self.ctx, device, bf16_mirror, input_tensor.buffer, weight_tensor.buffer, residual_tensor.buffer, input_tensor.elem_count / dim, dim, eps) catch |err| {
+                    bf16_mirror.free(&self.ctx);
+                    switch (err) {
+                        error.CudaKernelUnavailable => break :blk false,
+                        else => return err,
+                    }
+                };
+                break :blk true;
+            };
+            if (launched_mirror) {
+                self.stats.launch_norm += 1;
+                self.stats.launch_norm_rms_add += 1;
+                self.stats.rms_norm_add_fused += 1;
+                self.stats.rms_norm_bf16_mirror_hits += 1;
+                errdefer bf16_mirror.free(&self.ctx);
+                return createTensorWithDTypeAndBf16Mirror(self, device, bf16_mirror, shape, input_tensor.elem_count, .f32);
+            }
+        }
+    }
     try self.kernels.launchRmsNormAddF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, residual_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms_add += 1;
