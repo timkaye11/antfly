@@ -1435,6 +1435,19 @@ pub const CudaCompute = struct {
         var device = try allocDeviceBuffer(self, data.len * @sizeOf(f32));
         errdefer device.free(&self.ctx);
         try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
+        var bf16_mirror = buffer_mod.DeviceBuffer{};
+        errdefer bf16_mirror.free(&self.ctx);
+        if (cudaHybridQ4Bf16WeightsEnabled() and isPleModelProjectionWeightName(owned_key) and tensor.shape.len == 2) {
+            // Hybrid residency for the F32 PLE projection: keep F32 for the
+            // decode path (graph-capture friendly) and a BF16 copy for
+            // prefill cuBLASLt.
+            const bf16_data = try self.allocator.alloc(u16, data.len);
+            defer self.allocator.free(bf16_data);
+            for (data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
+            bf16_mirror = try allocDeviceBuffer(self, bf16_data.len * @sizeOf(u16));
+            try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
+            self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
+        }
         try synchronizeAndDrainDeferredDeviceFrees(self);
         self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
         errdefer self.allocator.free(owned_key);
@@ -1444,8 +1457,10 @@ pub const CudaCompute = struct {
             .shape = shape,
             .elem_count = data.len,
             .quant_type = null,
+            .bf16_mirror = bf16_mirror,
             .owns_buffer = false,
             .owns_shape = false,
+            .owns_bf16_mirror = false,
             .owned_by_tensor = false,
         });
     }
@@ -3718,13 +3733,13 @@ fn stageBf16ActivationForCublasLt(
     return scratch;
 }
 
-// Hybrid-residency dispatch: for a Q4-resident weight carrying a BF16
-// mirror, return the mirror when the matmul is prefill-shaped (rows > 1)
-// so cuBLASLt handles it; decode (rows == 1) stays on the Q4 kernels.
+// Hybrid-residency dispatch: for a Q4- or F32-resident weight carrying a
+// BF16 mirror, return the mirror when the matmul is prefill-shaped
+// (rows > 1) so cuBLASLt handles it; decode (rows == 1) stays on the
+// native Q4/F32 kernels.
 fn weightBf16MirrorForRows(weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
     if (rows <= 1) return null;
     if (weight.bf16_mirror.ptr == 0) return null;
-    if (weight.quant_type == null) return null;
     if (weight.bf16_mirror.len < weight.elem_count * @sizeOf(u16)) return null;
     return weight.bf16_mirror;
 }
