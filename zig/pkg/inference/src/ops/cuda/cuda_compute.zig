@@ -11763,9 +11763,14 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         (paged.format == cuda_kv_format_polar4 or paged.format == cuda_kv_format_f16) and
         paged.base_key_row_bytes == paged.key_row_bytes)
     split_attention_blk: {
-        const chunk_size = cudaTurboquantSplitAttentionChunkSize();
-        if (chunk_size == 0) break :split_attention_blk;
+        const configured_chunk_size = cudaTurboquantSplitAttentionChunkSize();
+        if (configured_chunk_size == 0) break :split_attention_blk;
         const split_capacity = @max(layer.capacity_tokens, attention.kv_sequence_len);
+        // Grow the chunk size as capacity grows instead of abandoning the
+        // split kernel: falling back to the serial per-key decode kernel is
+        // a multi-x cliff for long-generation runs with large forced KV
+        // capacities.
+        const chunk_size = @max(configured_chunk_size, (split_capacity + 127) / 128);
         const chunk_count = (split_capacity + chunk_size - 1) / chunk_size;
         if (chunk_count <= 1 or chunk_count > 128) break :split_attention_blk;
         const partial_acc_count = checkedMul(try checkedMul(num_heads, chunk_count), head_dim) catch break :split_attention_blk;
