@@ -198,6 +198,23 @@ pub fn forwardCT(
 // Embeddings block
 // ---------------------------------------------------------------------------
 
+/// Public wrapper around the embeddings block (token lookup + NEFTune noise +
+/// embedding LayerNorm) for callers that run the encoder layers through a
+/// compiled segment session. Behaves exactly like the eager forward's
+/// embedding stage, including the embedding captures when `captures` is set.
+/// Caller owns the returned tensor and must free it with `cb.free`.
+pub fn embeddingsForwardCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    total: usize,
+    seq_len: usize,
+    captures: ?*ActivationBuffer,
+) !CT {
+    return embeddingsBlock(cb, allocator, config, input_ids, total, seq_len, captures);
+}
+
 fn embeddingsBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,

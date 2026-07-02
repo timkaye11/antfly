@@ -37,6 +37,8 @@ const tensor_probe_hash_offset: u64 = 14695981039346656037;
 const tensor_probe_hash_prime: u64 = 1099511628211;
 const tensor_probe_top_abs_count: usize = 8;
 const training = @import("../graph/training.zig");
+const mpsgraph_executor = @import("../graph/mpsgraph_executor.zig");
+const platform = @import("antfly_platform");
 const compat = @import("../io/compat.zig");
 const native_compute = @import("../ops/native_compute.zig");
 const fused_chunker_data = @import("fused_chunker_data.zig");
@@ -1732,6 +1734,14 @@ pub const FusedTrainer = struct {
     // autodiff graph once avoids rebuilding/lowering it every step.
     boundary_graph_cache: std.AutoHashMapUnmanaged(usize, BoundaryGraphCacheEntry) = .{},
 
+    // Shape-keyed cache for the opt-in compiled boundary-head fast path
+    // (ANTFLY_FUSED_CHUNKER_COMPILED_BOUNDARY_HEAD=1): one compiled forward
+    // executable producing logits plus one compiled synthetic-VJP training
+    // session per gradient variant. The CE loss and its logits gradient stay
+    // on the CPU exactly like the eager ops path.
+    compiled_boundary_head_cache: std.AutoHashMapUnmanaged(usize, CompiledBoundaryHeadCacheEntry) = .{},
+    compiled_boundary_head_failed: bool = false,
+
     const BoundaryGraphCacheEntry = struct {
         graph: fused_chunker_loss.BoundaryHeadGraph,
         head_session: ?training.CompiledTrainSession = null,
@@ -1741,6 +1751,23 @@ pub const FusedTrainer = struct {
             if (self.head_session) |*session| session.deinit();
             if (self.encoder_grad_session) |*session| session.deinit();
             self.graph.deinit();
+            self.* = undefined;
+        }
+    };
+
+    const CompiledBoundaryHeadCacheEntry = struct {
+        forward_graph: fused_chunker_loss.BoundaryHeadForwardGraph,
+        forward_compiled: mpsgraph_executor.CompiledGraph,
+        vjp_graph: fused_chunker_loss.BoundaryHeadSyntheticVJPGraph,
+        head_session: ?training.CompiledTrainSession = null,
+        encoder_grad_session: ?training.CompiledTrainSession = null,
+
+        fn deinit(self: *CompiledBoundaryHeadCacheEntry) void {
+            if (self.head_session) |*session| session.deinit();
+            if (self.encoder_grad_session) |*session| session.deinit();
+            self.forward_compiled.deinit();
+            self.forward_graph.deinit();
+            self.vjp_graph.deinit();
             self.* = undefined;
         }
     };
@@ -1884,6 +1911,9 @@ pub const FusedTrainer = struct {
         var cache_it = self.boundary_graph_cache.iterator();
         while (cache_it.next()) |entry| entry.value_ptr.deinit();
         self.boundary_graph_cache.deinit(self.allocator);
+        var compiled_cache_it = self.compiled_boundary_head_cache.iterator();
+        while (compiled_cache_it.next()) |entry| entry.value_ptr.deinit();
+        self.compiled_boundary_head_cache.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -2033,6 +2063,202 @@ pub const FusedTrainer = struct {
             );
         }
         return &entry.encoder_grad_session.?;
+    }
+
+    fn compiledBoundaryHeadEnabled(self: *FusedTrainer) bool {
+        if (self.compiled_boundary_head_failed) return false;
+        return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_COMPILED_BOUNDARY_HEAD", false);
+    }
+
+    fn getCompiledBoundaryHeadEntry(self: *FusedTrainer, total_tokens: usize) !*CompiledBoundaryHeadCacheEntry {
+        if (self.compiled_boundary_head_cache.getPtr(total_tokens)) |entry| return entry;
+
+        const H = self.boundary_head.hidden_dim;
+        const M: usize = @intCast(self.config.boundary_mlp_dim);
+        var forward_graph = try fused_chunker_loss.BoundaryHeadForwardGraph.init(self.allocator, total_tokens, H, M);
+        errdefer forward_graph.deinit();
+        var forward_compiled = try mpsgraph_executor.CompiledGraph.compile(self.allocator, &forward_graph.graph);
+        errdefer forward_compiled.deinit();
+        var vjp_graph = try fused_chunker_loss.BoundaryHeadSyntheticVJPGraph.init(self.allocator, total_tokens, H, M);
+        errdefer vjp_graph.deinit();
+
+        try self.compiled_boundary_head_cache.put(self.allocator, total_tokens, .{
+            .forward_graph = forward_graph,
+            .forward_compiled = forward_compiled,
+            .vjp_graph = vjp_graph,
+        });
+        return self.compiled_boundary_head_cache.getPtr(total_tokens).?;
+    }
+
+    fn getCompiledBoundaryHeadSession(
+        self: *FusedTrainer,
+        entry: *CompiledBoundaryHeadCacheEntry,
+        want_features_grad: bool,
+    ) !*training.CompiledTrainSession {
+        if (want_features_grad) {
+            if (entry.encoder_grad_session == null) {
+                entry.encoder_grad_session = try training.CompiledTrainSession.init(
+                    self.allocator,
+                    &entry.vjp_graph.graph,
+                    entry.vjp_graph.loss_id,
+                    .{
+                        .trainable_params = &.{ "features", "w1", "b1", "w2", "b2" },
+                        .execution_strategy = .mpsgraph_preferred,
+                    },
+                );
+            }
+            return &entry.encoder_grad_session.?;
+        }
+        if (entry.head_session == null) {
+            entry.head_session = try training.CompiledTrainSession.init(
+                self.allocator,
+                &entry.vjp_graph.graph,
+                entry.vjp_graph.loss_id,
+                .{
+                    .trainable_params = &.{ "w1", "b1", "w2", "b2" },
+                    .execution_strategy = .mpsgraph_preferred,
+                },
+            );
+        }
+        return &entry.head_session.?;
+    }
+
+    /// Compiled variant of `runBoundaryHeadCeOpsStep`: the head forward runs
+    /// as one cached MPSGraph executable, the CE loss and its logits gradient
+    /// are computed on the CPU exactly as in the eager ops path (same host
+    /// RNG for the dropout masks), and the parameter gradients come from one
+    /// cached synthetic-VJP training session fed with those logits gradients.
+    fn runBoundaryHeadCeCompiledStep(
+        self: *FusedTrainer,
+        allocator: std.mem.Allocator,
+        features: []const f32,
+        boundary_labels: []const f32,
+        attention_mask: []const f32,
+        input_ids: ?[]const i32,
+        boundary_candidate_mask: ?[]const f32,
+        total_tokens: usize,
+        want_features_grad: bool,
+    ) !BoundaryTrainStepResult {
+        const H = self.boundary_head.hidden_dim;
+        const M: usize = @intCast(self.config.boundary_mlp_dim);
+        if (features.len != total_tokens * H) return error.UnexpectedOutputShape;
+        if (boundary_labels.len != total_tokens * 2) return error.UnexpectedOutputShape;
+        if (attention_mask.len != total_tokens) return error.UnexpectedOutputShape;
+
+        const entry = try self.getCompiledBoundaryHeadEntry(total_tokens);
+
+        const feature_dropout_mask = try allocInvertedDropoutMask(
+            allocator,
+            total_tokens * H,
+            self.config.boundary_dropout,
+            dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0001),
+        );
+        defer allocator.free(feature_dropout_mask);
+        const hidden_dropout_mask = try allocInvertedDropoutMask(
+            allocator,
+            total_tokens * M,
+            self.config.boundary_dropout,
+            dropoutSeed(self.config.seed, self.step_count, 0xB0A0_DF00_DF00_0002),
+        );
+        defer allocator.free(hidden_dropout_mask);
+
+        const forward_nodes = entry.forward_graph.nodes;
+        const forward_feeds = [_]mpsgraph_executor.HostInput{
+            .{ .node_id = forward_nodes.feature_id, .data = features },
+            .{ .node_id = forward_nodes.feature_dropout_mask_id, .data = feature_dropout_mask },
+            .{ .node_id = forward_nodes.hidden_dropout_mask_id, .data = hidden_dropout_mask },
+            .{ .node_id = forward_nodes.w1_id, .data = self.boundary_head.w1 },
+            .{ .node_id = forward_nodes.b1_id, .data = self.boundary_head.b1 },
+            .{ .node_id = forward_nodes.w2_id, .data = self.boundary_head.w2 },
+            .{ .node_id = forward_nodes.b2_id, .data = self.boundary_head.b2 },
+        };
+        var forward_result = try entry.forward_compiled.executeWithHostInputs(
+            allocator,
+            self.cb,
+            null,
+            &forward_feeds,
+        );
+        defer forward_result.deinit();
+        if (forward_result.outputs.len != 1 or forward_result.outputs[0].len != total_tokens * 2) {
+            return error.UnexpectedOutputShape;
+        }
+        const logits = forward_result.outputs[0];
+
+        const ce = try computeBoundaryWeightedCeAndLogitGradWithCandidateMask(
+            allocator,
+            logits,
+            boundary_labels,
+            attention_mask,
+            total_tokens,
+            self.loss_config.pos_weight,
+            self.loss_config.boundary_rank_loss_weight,
+            self.loss_config.boundary_rank_loss_margin,
+            self.loss_config.boundary_rank_loss_top_k,
+            self.loss_config.boundary_same_token_rank_loss_weight,
+            self.loss_config.boundary_same_token_rank_loss_top_k,
+            self.loss_config.boundary_same_token_negative_weight,
+            self.loss_config.boundary_same_token_negative_top_k,
+            self.loss_config.boundary_candidate_rank_loss_weight,
+            self.loss_config.boundary_candidate_rank_loss_top_k,
+            self.loss_config.boundary_candidate_negative_weight,
+            boundary_candidate_mask,
+            input_ids,
+            @intCast(self.config.max_seq_len),
+            self.loss_config.boundary_gold_count_rank_loss_weight,
+            self.loss_config.boundary_gold_count_rank_loss_margin,
+            self.loss_config.boundary_gold_count_rank_loss_negative_multiplier,
+            self.loss_config.boundary_local_window_loss_weight,
+            self.loss_config.boundary_local_window_radius,
+        );
+        defer allocator.free(ce.logit_grad);
+
+        const session = try self.getCompiledBoundaryHeadSession(entry, want_features_grad);
+        const vjp_nodes = entry.vjp_graph.nodes;
+        const vjp_feeds = [_]training.HostFeed{
+            .{ .node_id = vjp_nodes.feature_id, .data = features },
+            .{ .node_id = vjp_nodes.feature_dropout_mask_id, .data = feature_dropout_mask },
+            .{ .node_id = vjp_nodes.hidden_dropout_mask_id, .data = hidden_dropout_mask },
+            .{ .node_id = vjp_nodes.w1_id, .data = self.boundary_head.w1 },
+            .{ .node_id = vjp_nodes.b1_id, .data = self.boundary_head.b1 },
+            .{ .node_id = vjp_nodes.w2_id, .data = self.boundary_head.w2 },
+            .{ .node_id = vjp_nodes.b2_id, .data = self.boundary_head.b2 },
+            .{ .node_id = entry.vjp_graph.dlogits_id, .data = ce.logit_grad },
+        };
+        var step_result = try session.executeWithHostFeeds(self.cb, null, &vjp_feeds);
+        defer step_result.deinit();
+
+        const w1_src = step_result.gradients.get("w1") orelse return error.MissingGradient;
+        const b1_src = step_result.gradients.get("b1") orelse return error.MissingGradient;
+        const w2_src = step_result.gradients.get("w2") orelse return error.MissingGradient;
+        const b2_src = step_result.gradients.get("b2") orelse return error.MissingGradient;
+
+        const w1_grad = try allocator.dupe(f32, w1_src);
+        errdefer allocator.free(w1_grad);
+        const b1_grad = try allocator.dupe(f32, b1_src);
+        errdefer allocator.free(b1_grad);
+        const w2_grad = try allocator.dupe(f32, w2_src);
+        errdefer allocator.free(w2_grad);
+        const b2_grad = try allocator.dupe(f32, b2_src);
+        errdefer allocator.free(b2_grad);
+
+        var features_grad: ?[]f32 = null;
+        errdefer if (features_grad) |g| allocator.free(g);
+        if (want_features_grad) {
+            const features_src = step_result.gradients.get("features") orelse return error.MissingGradient;
+            features_grad = try allocator.dupe(f32, features_src);
+        }
+
+        return .{
+            .boundary_loss = ce.loss,
+            .boundary_ce_loss = ce.ce_loss,
+            .boundary_rank_loss = ce.rank_loss,
+            .boundary_local_window_loss = ce.local_window_loss,
+            .w1_grad = w1_grad,
+            .b1_grad = b1_grad,
+            .w2_grad = w2_grad,
+            .b2_grad = b2_grad,
+            .features_grad = features_grad,
+        };
     }
 
     const BoundaryTrainStepResult = struct {
@@ -2323,6 +2549,27 @@ pub const FusedTrainer = struct {
             self.loss_config.boundary_candidate_negative_weight > 1.0)
         {
             return error.MissingBoundaryCandidateMask;
+        }
+
+        if (self.compiledBoundaryHeadEnabled()) {
+            if (self.runBoundaryHeadCeCompiledStep(
+                allocator,
+                features,
+                boundary_labels,
+                attention_mask,
+                input_ids,
+                boundary_candidate_mask,
+                total_tokens,
+                want_features_grad,
+            )) |result| {
+                return result;
+            } else |err| {
+                self.compiled_boundary_head_failed = true;
+                std.log.warn(
+                    "fused_chunker compiled boundary head failed with {s}; falling back to eager ops path",
+                    .{@errorName(err)},
+                );
+            }
         }
 
         const feature_dropout_mask = try allocInvertedDropoutMask(

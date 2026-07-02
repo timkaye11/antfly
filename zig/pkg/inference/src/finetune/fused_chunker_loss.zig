@@ -126,39 +126,27 @@ pub const BoundaryHeadGraph = struct {
         errdefer graph.deinit();
         var b = Builder.init(&graph);
 
-        const features = try b.parameter("features", Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_dim)) }));
         const targets = try b.parameter("targets", Shape.init(.f32, &.{ @as(i64, @intCast(total)), 2 }));
         const mask = try b.parameter("mask", Shape.init(.f32, &.{ @as(i64, @intCast(total)), 1 }));
-        const feature_dropout_mask = try b.parameter("feature_dropout_mask", Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_dim)) }));
-        const hidden_dropout_mask = try b.parameter("hidden_dropout_mask", Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(mlp_dim)) }));
-        const w1 = try b.parameter("w1", Shape.init(.f32, &.{ @as(i64, @intCast(mlp_dim)), @as(i64, @intCast(hidden_dim)) }));
-        const b1 = try b.parameter("b1", Shape.init(.f32, &.{@as(i64, @intCast(mlp_dim))}));
-        const w2 = try b.parameter("w2", Shape.init(.f32, &.{ 2, @as(i64, @intCast(mlp_dim)) }));
-        const b2 = try b.parameter("b2", Shape.init(.f32, &.{2}));
-
-        const dropped_features = try b.mul(features, feature_dropout_mask);
-        const dense = try b.linear(dropped_features, w1, b1, @intCast(total), @intCast(hidden_dim), @intCast(mlp_dim));
-        const hidden = try b.geluExact(dense);
-        const dropped_hidden = try b.mul(hidden, hidden_dropout_mask);
-        const logits = try b.linear(dropped_hidden, w2, b2, @intCast(total), @intCast(mlp_dim), 2);
+        const forward = try buildBoundaryHeadForwardNodes(&b, total, hidden_dim, mlp_dim);
         const loss = if (use_focal)
-            try buildMaskedBoundaryFocalLoss(allocator, &b, logits, targets, mask, total, focal_gamma, focal_alpha)
+            try buildMaskedBoundaryFocalLoss(allocator, &b, forward.logits_id, targets, mask, total, focal_gamma, focal_alpha)
         else
-            try buildMaskedWeightedBoundaryCrossEntropyLoss(allocator, &b, logits, targets, mask, total, pos_weight);
+            try buildMaskedWeightedBoundaryCrossEntropyLoss(allocator, &b, forward.logits_id, targets, mask, total, pos_weight);
         try graph.markOutput(loss);
 
         return .{
             .graph = graph,
-            .feature_id = features,
+            .feature_id = forward.feature_id,
             .target_id = targets,
             .mask_id = mask,
-            .feature_dropout_mask_id = feature_dropout_mask,
-            .hidden_dropout_mask_id = hidden_dropout_mask,
-            .w1_id = w1,
-            .b1_id = b1,
-            .w2_id = w2,
-            .b2_id = b2,
-            .logits_id = logits,
+            .feature_dropout_mask_id = forward.feature_dropout_mask_id,
+            .hidden_dropout_mask_id = forward.hidden_dropout_mask_id,
+            .w1_id = forward.w1_id,
+            .b1_id = forward.b1_id,
+            .w2_id = forward.w2_id,
+            .b2_id = forward.b2_id,
+            .logits_id = forward.logits_id,
             .loss_id = loss,
             .total = total,
             .hidden_dim = hidden_dim,
@@ -172,6 +160,138 @@ pub const BoundaryHeadGraph = struct {
     }
 
     pub fn deinit(self: *BoundaryHeadGraph) void {
+        self.graph.deinit();
+        self.* = undefined;
+    }
+};
+
+/// The boundary-head MLP forward shared by the CE graph, the forward-only
+/// graph, and the synthetic-VJP graph:
+///   dropped_features = features * feature_dropout_mask
+///   dense            = dropped_features @ w1^T + b1
+///   hidden           = geluExact(dense)
+///   dropped_hidden   = hidden * hidden_dropout_mask
+///   logits           = dropped_hidden @ w2^T + b2
+const BoundaryHeadForwardNodes = struct {
+    feature_id: NodeId,
+    feature_dropout_mask_id: NodeId,
+    hidden_dropout_mask_id: NodeId,
+    w1_id: NodeId,
+    b1_id: NodeId,
+    w2_id: NodeId,
+    b2_id: NodeId,
+    logits_id: NodeId,
+};
+
+fn buildBoundaryHeadForwardNodes(
+    b: *Builder,
+    total: usize,
+    hidden_dim: usize,
+    mlp_dim: usize,
+) !BoundaryHeadForwardNodes {
+    const features = try b.parameter("features", Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_dim)) }));
+    const feature_dropout_mask = try b.parameter("feature_dropout_mask", Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(hidden_dim)) }));
+    const hidden_dropout_mask = try b.parameter("hidden_dropout_mask", Shape.init(.f32, &.{ @as(i64, @intCast(total)), @as(i64, @intCast(mlp_dim)) }));
+    const w1 = try b.parameter("w1", Shape.init(.f32, &.{ @as(i64, @intCast(mlp_dim)), @as(i64, @intCast(hidden_dim)) }));
+    const b1 = try b.parameter("b1", Shape.init(.f32, &.{@as(i64, @intCast(mlp_dim))}));
+    const w2 = try b.parameter("w2", Shape.init(.f32, &.{ 2, @as(i64, @intCast(mlp_dim)) }));
+    const b2 = try b.parameter("b2", Shape.init(.f32, &.{2}));
+
+    const dropped_features = try b.mul(features, feature_dropout_mask);
+    const dense = try b.linear(dropped_features, w1, b1, @intCast(total), @intCast(hidden_dim), @intCast(mlp_dim));
+    const hidden = try b.geluExact(dense);
+    const dropped_hidden = try b.mul(hidden, hidden_dropout_mask);
+    const logits = try b.linear(dropped_hidden, w2, b2, @intCast(total), @intCast(mlp_dim), 2);
+
+    return .{
+        .feature_id = features,
+        .feature_dropout_mask_id = feature_dropout_mask,
+        .hidden_dropout_mask_id = hidden_dropout_mask,
+        .w1_id = w1,
+        .b1_id = b1,
+        .w2_id = w2,
+        .b2_id = b2,
+        .logits_id = logits,
+    };
+}
+
+/// Forward-only boundary head graph with `logits` as the sole output. Used
+/// by the compiled boundary-head fast path: logits are computed on the graph
+/// runtime while the CE loss (and its logits gradient) stays on the CPU
+/// exactly as in the eager ops path.
+pub const BoundaryHeadForwardGraph = struct {
+    graph: Graph,
+    nodes: BoundaryHeadForwardNodes,
+    total: usize,
+    hidden_dim: usize,
+    mlp_dim: usize,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        total: usize,
+        hidden_dim: usize,
+        mlp_dim: usize,
+    ) !BoundaryHeadForwardGraph {
+        var graph = Graph.init(allocator);
+        errdefer graph.deinit();
+        var b = Builder.init(&graph);
+        const nodes = try buildBoundaryHeadForwardNodes(&b, total, hidden_dim, mlp_dim);
+        try graph.markOutput(nodes.logits_id);
+        return .{
+            .graph = graph,
+            .nodes = nodes,
+            .total = total,
+            .hidden_dim = hidden_dim,
+            .mlp_dim = mlp_dim,
+        };
+    }
+
+    pub fn deinit(self: *BoundaryHeadForwardGraph) void {
+        self.graph.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Boundary head forward plus the synthetic upstream loss
+/// `loss = sum(logits * dlogits)`, where `dlogits` is the CPU-computed CE
+/// logits gradient fed as an input. Differentiating this scalar wrt the head
+/// parameters (and optionally the features) reproduces the eager manual
+/// backward chain through the dropout masks, GELU, and both linears.
+pub const BoundaryHeadSyntheticVJPGraph = struct {
+    graph: Graph,
+    nodes: BoundaryHeadForwardNodes,
+    dlogits_id: NodeId,
+    loss_id: NodeId,
+    total: usize,
+    hidden_dim: usize,
+    mlp_dim: usize,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        total: usize,
+        hidden_dim: usize,
+        mlp_dim: usize,
+    ) !BoundaryHeadSyntheticVJPGraph {
+        var graph = Graph.init(allocator);
+        errdefer graph.deinit();
+        var b = Builder.init(&graph);
+        const nodes = try buildBoundaryHeadForwardNodes(&b, total, hidden_dim, mlp_dim);
+        const dlogits = try b.parameter("dlogits", Shape.init(.f32, &.{ @as(i64, @intCast(total)), 2 }));
+        const weighted = try b.mul(nodes.logits_id, dlogits);
+        const loss = try b.reduceSum(weighted, &.{ 0, 1 });
+        try graph.markOutput(loss);
+        return .{
+            .graph = graph,
+            .nodes = nodes,
+            .dlogits_id = dlogits,
+            .loss_id = loss,
+            .total = total,
+            .hidden_dim = hidden_dim,
+            .mlp_dim = mlp_dim,
+        };
+    }
+
+    pub fn deinit(self: *BoundaryHeadSyntheticVJPGraph) void {
         self.graph.deinit();
         self.* = undefined;
     }

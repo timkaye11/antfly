@@ -133,6 +133,18 @@ pub const SegmentLayerInputs = struct {
     rope_sin_node: NodeId,
 };
 
+/// Per-layer intermediate nodes exposed by the forward-only segment builder.
+/// These are the same tensors the eager capture path downloads for LoRA
+/// gradient accumulation: the pre-attention LayerNorm output (Q/K/V input),
+/// the merged attention output (Wo input), the GeGLU activation (mlp.Wo
+/// input), and the layer output (next layer's input).
+pub const SegmentForwardLayerNodes = struct {
+    attn_normed_node: NodeId,
+    attn_merged_node: NodeId,
+    mlp_activated_node: NodeId,
+    hidden_out_node: NodeId,
+};
+
 pub const LayerBackwardSubstage = enum {
     mlp_wo,
     mlp_gelu_input,
@@ -212,7 +224,7 @@ pub fn buildForwardGraph(
     // ── Encoder layers ─────────────────────────────────────────────────
     var layer: u32 = 0;
     while (layer < config.num_hidden_layers) : (layer += 1) {
-        hidden = try encoderLayer(
+        const layer_nodes = try encoderLayer(
             bld,
             config,
             hidden,
@@ -226,6 +238,7 @@ pub fn buildForwardGraph(
             num_heads,
             head_dim,
         );
+        hidden = layer_nodes.hidden_out_node;
     }
 
     // ── Final LayerNorm ────────────────────────────────────────────────
@@ -318,6 +331,60 @@ pub fn buildEncoderSegmentGraphWithLayerInputs(
     );
 }
 
+/// Construct a forward-only encoder segment over layers `[start_layer, end_layer)`
+/// using one attention-bias/RoPE input tuple per layer. Reuses the exact same
+/// `encoderLayer` body as the segment VJP builder so a compiled forward matches
+/// the forward recompute already performed inside the VJP graphs.
+///
+/// `layer_nodes_out` (len == end_layer - start_layer) receives the per-layer
+/// capture nodes; the caller decides which of them to mark as graph outputs.
+/// Returns the segment output hidden node.
+pub fn buildEncoderSegmentForwardGraph(
+    bld: *Builder,
+    config: Config,
+    hidden_in: NodeId,
+    layer_inputs: []const SegmentLayerInputs,
+    layer_nodes_out: []SegmentForwardLayerNodes,
+    batch: u32,
+    seq_len: u32,
+    start_layer: u32,
+    end_layer: u32,
+) !NodeId {
+    if (start_layer >= end_layer or end_layer > config.num_hidden_layers) return error.InvalidLayerRange;
+    const segment_len = end_layer - start_layer;
+    if (layer_inputs.len != @as(usize, @intCast(segment_len))) return error.InvalidSegmentLayerInputCount;
+    if (layer_nodes_out.len != @as(usize, @intCast(segment_len))) return error.InvalidSegmentLayerInputCount;
+
+    const H: u32 = config.hidden_size;
+    const num_heads: u32 = config.num_attention_heads;
+    const head_dim: u32 = config.head_dim;
+    if (num_heads * head_dim != H) return error.InvalidHeadDim;
+
+    var hidden = hidden_in;
+    var layer = start_layer;
+    while (layer < end_layer) : (layer += 1) {
+        const offset: usize = @intCast(layer - start_layer);
+        const layer_input = layer_inputs[offset];
+        const layer_nodes = try encoderLayer(
+            bld,
+            config,
+            hidden,
+            layer_input.attn_bias_node,
+            layer_input.rope_cos_node,
+            layer_input.rope_sin_node,
+            ropeThetaForLayer(config, layer),
+            batch,
+            seq_len,
+            layer,
+            num_heads,
+            head_dim,
+        );
+        layer_nodes_out[offset] = layer_nodes;
+        hidden = layer_nodes.hidden_out_node;
+    }
+    return hidden;
+}
+
 fn buildEncoderSegmentGraphInternal(
     bld: *Builder,
     config: Config,
@@ -346,7 +413,7 @@ fn buildEncoderSegmentGraphInternal(
         const input_offset: usize = if (repeat_single_input) 0 else @intCast(layer - start_layer);
         const layer_input = layer_inputs[input_offset];
         const rope_theta = ropeThetaForLayer(config, layer);
-        hidden = try encoderLayer(
+        const layer_nodes = try encoderLayer(
             bld,
             config,
             hidden,
@@ -360,6 +427,7 @@ fn buildEncoderSegmentGraphInternal(
             num_heads,
             head_dim,
         );
+        hidden = layer_nodes.hidden_out_node;
     }
 
     const weighted = try bld.elemMultiply(hidden, upstream_grad);
@@ -899,7 +967,7 @@ pub fn buildEncoderLayerBackwardSubstageGraph(
             out.attn_bias_node = attn_bias;
             out.rope_cos_node = rope_cos;
             out.rope_sin_node = rope_sin;
-            break :blk try encoderLayer(
+            const layer_nodes = try encoderLayer(
                 bld,
                 config,
                 hidden_in,
@@ -913,6 +981,7 @@ pub fn buildEncoderLayerBackwardSubstageGraph(
                 num_heads,
                 head_dim,
             );
+            break :blk layer_nodes.hidden_out_node;
         },
     };
 
@@ -977,7 +1046,7 @@ fn encoderLayer(
     layer: u32,
     num_heads: u32,
     head_dim: u32,
-) !NodeId {
+) !SegmentForwardLayerNodes {
     const H: u32 = config.hidden_size;
     const total: u32 = batch * seq_len;
 
@@ -1123,7 +1192,13 @@ fn encoderLayer(
     const mlp_out = try bld.linearNoBias(activated, down_w, total, I, H);
 
     // Pre-norm residual on the post-attention stream.
-    return bld.add(mlp_out, hidden_after_attn);
+    const hidden_out = try bld.add(mlp_out, hidden_after_attn);
+    return .{
+        .attn_normed_node = attn_normed,
+        .attn_merged_node = attn_merged,
+        .mlp_activated_node = activated,
+        .hidden_out_node = hidden_out,
+    };
 }
 
 fn encoderLayerTailFromMlpActivated(

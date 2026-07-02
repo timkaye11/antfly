@@ -108,6 +108,13 @@ pub const TrainStepOptions = struct {
     execution_strategy: CompiledExecutionStrategy = .interpreter,
 };
 
+/// A feed provided as a stable host f32 buffer, keyed by the caller's
+/// original (pre-lowering) graph NodeId. See `CompiledTrainSession.executeWithHostFeeds`.
+pub const HostFeed = struct {
+    node_id: NodeId,
+    data: []const f32,
+};
+
 pub const CompiledExecutionStrategy = enum {
     interpreter,
     partitioned_preferred,
@@ -245,7 +252,21 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
-        return self.executeInternal(cb, runtime_inputs, false);
+        return self.executeInternal(cb, runtime_inputs, null, false);
+    }
+
+    /// Like `execute`, but feeds listed in `host_feeds` (keyed by original,
+    /// pre-lowering NodeId) are provided as host f32 buffers. On the MPSGraph
+    /// runtime path these skip the per-step backend-tensor round trip; on the
+    /// partitioned/interpreter fallbacks they are materialized into backend
+    /// tensors so behavior stays identical.
+    pub fn executeWithHostFeeds(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+        host_feeds: ?[]const HostFeed,
+    ) !TrainStepResult {
+        return self.executeInternal(cb, runtime_inputs, host_feeds, false);
     }
 
     pub fn executeDeviceGradients(
@@ -253,13 +274,14 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
-        return self.executeInternal(cb, runtime_inputs, true);
+        return self.executeInternal(cb, runtime_inputs, null, true);
     }
 
     fn executeInternal(
         self: *CompiledTrainSession,
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+        host_feeds: ?[]const HostFeed,
         retain_device_gradients: bool,
     ) !TrainStepResult {
         const total_start = nowNs();
@@ -279,20 +301,38 @@ pub const CompiledTrainSession = struct {
             }
         }
 
-        const rt_slice: ?[]const RuntimeInput = if (rt_list.items.len > 0) rt_list.items else null;
+        var mapped_host = std.ArrayListUnmanaged(mpsgraph_executor.HostInput).empty;
+        defer mapped_host.deinit(self.allocator);
+        if (host_feeds) |feeds| {
+            for (feeds) |feed| {
+                if (feed.node_id >= self.id_map.len) continue;
+                const new_id = self.id_map[feed.node_id];
+                if (new_id == null_node) continue;
+                try mapped_host.append(self.allocator, .{ .node_id = new_id, .data = feed.data });
+            }
+        }
+
+        // Backend tensors materialized from host feeds for non-MPSGraph
+        // execution paths. Kept alive until output extraction completes.
+        var materialized_host_cts = std.ArrayListUnmanaged(CT).empty;
+        defer {
+            for (materialized_host_cts.items) |ct| cb.free(ct);
+            materialized_host_cts.deinit(self.allocator);
+        }
 
         const execute_start = nowNs();
         compiledDiag(
-            "execute begin nodes={} outputs={} runtime_inputs={} retain_device_gradients={} rss={}",
+            "execute begin nodes={} outputs={} runtime_inputs={} host_feeds={} retain_device_gradients={} rss={}",
             .{
                 self.graph.nodeCount(),
                 self.graph.outputs.items.len,
                 rt_list.items.len,
+                mapped_host.items.len,
                 retain_device_gradients,
                 currentResidentBytes(),
             },
         );
-        var exec_result = try self.executeGraph(cb, .{ .runtime_inputs = rt_slice });
+        var exec_result = try self.executeGraph(cb, &rt_list, mapped_host.items, &materialized_host_cts);
         profile.execute_ns = elapsedNs(execute_start);
         profile.partitioned_runtime = exec_result.isRuntime();
         profile.mpsgraph_runtime = exec_result.isMpsGraph();
@@ -393,25 +433,40 @@ pub const CompiledTrainSession = struct {
     fn executeGraph(
         self: *CompiledTrainSession,
         cb: *const ComputeBackend,
-        options: interpreter.ExecuteOptions,
+        rt_list: *std.ArrayListUnmanaged(RuntimeInput),
+        host_inputs: []const mpsgraph_executor.HostInput,
+        materialized_host_cts: *std.ArrayListUnmanaged(CT),
     ) !CompiledExecutionResult {
         switch (self.execution_strategy) {
-            .interpreter => return self.executeInterpreter(cb, options),
-            .partitioned_preferred, .partitioned_required => return self.executePartitioned(cb, options, self.execution_strategy),
+            .interpreter => {
+                try self.materializeHostInputs(cb, rt_list, host_inputs, materialized_host_cts);
+                return self.executeInterpreter(cb, runtimeOptions(rt_list));
+            },
+            .partitioned_preferred, .partitioned_required => {
+                try self.materializeHostInputs(cb, rt_list, host_inputs, materialized_host_cts);
+                return self.executePartitioned(cb, runtimeOptions(rt_list), self.execution_strategy);
+            },
             .mpsgraph_preferred, .mpsgraph_required => {
                 self.ensureMpsGraph() catch |err| switch (self.execution_strategy) {
                     .mpsgraph_preferred => {
                         compiledDiag("mpsgraph runtime init unavailable err={s}; falling back to partitioned runtime", .{@errorName(err)});
-                        return self.executePartitioned(cb, options, .partitioned_preferred);
+                        try self.materializeHostInputs(cb, rt_list, host_inputs, materialized_host_cts);
+                        return self.executePartitioned(cb, runtimeOptions(rt_list), .partitioned_preferred);
                     },
                     .mpsgraph_required => return err,
                     else => unreachable,
                 };
                 const rt = if (self.mpsgraph_runtime) |*runtime_value| runtime_value else return error.MissingMpsGraphRuntimePlan;
-                var result = rt.execute(self.allocator, cb, options.runtime_inputs) catch |err| switch (self.execution_strategy) {
+                var result = rt.executeWithHostInputs(
+                    self.allocator,
+                    cb,
+                    runtimeOptions(rt_list).runtime_inputs,
+                    if (host_inputs.len > 0) host_inputs else null,
+                ) catch |err| switch (self.execution_strategy) {
                     .mpsgraph_preferred => {
                         compiledDiag("mpsgraph runtime execute unavailable err={s}; falling back to partitioned runtime", .{@errorName(err)});
-                        return self.executePartitioned(cb, options, .partitioned_preferred);
+                        try self.materializeHostInputs(cb, rt_list, host_inputs, materialized_host_cts);
+                        return self.executePartitioned(cb, runtimeOptions(rt_list), .partitioned_preferred);
                     },
                     .mpsgraph_required => return err,
                     else => unreachable,
@@ -419,6 +474,36 @@ pub const CompiledTrainSession = struct {
                 errdefer result.deinit();
                 return .{ .mpsgraph = result };
             },
+        }
+    }
+
+    fn runtimeOptions(rt_list: *std.ArrayListUnmanaged(RuntimeInput)) interpreter.ExecuteOptions {
+        return .{ .runtime_inputs = if (rt_list.items.len > 0) rt_list.items else null };
+    }
+
+    /// Convert host-feed buffers into backend tensors and append them to the
+    /// runtime-input list so non-MPSGraph execution paths see the exact same
+    /// feeds as the fast path. Created tensors are tracked in `owned_cts` and
+    /// freed by the caller after output extraction.
+    fn materializeHostInputs(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        rt_list: *std.ArrayListUnmanaged(RuntimeInput),
+        host_inputs: []const mpsgraph_executor.HostInput,
+        owned_cts: *std.ArrayListUnmanaged(CT),
+    ) !void {
+        for (host_inputs) |host_input| {
+            const shape = self.graph.node(host_input.node_id).output_shape;
+            var dims: [8]i32 = undefined;
+            const rank = shape.rank();
+            if (rank > dims.len) return error.UnsupportedShape;
+            for (0..rank) |axis| {
+                dims[axis] = std.math.cast(i32, shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
+            }
+            const ct = try cb.fromFloat32Shape(host_input.data, dims[0..rank]);
+            errdefer cb.free(ct);
+            try owned_cts.append(self.allocator, ct);
+            try rt_list.append(self.allocator, .{ .node_id = host_input.node_id, .value = ct });
         }
     }
 
@@ -1352,6 +1437,66 @@ test "CompiledTrainSession can retain gradient tensors without host extraction" 
     defer allocator.free(w_data);
     try std.testing.expectEqual(@as(usize, 12), w_data.len);
     try std.testing.expect(result.device_gradients.get("bias") != null);
+}
+
+test "CompiledTrainSession executeWithHostFeeds matches backend-tensor feeds" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{ 3, 4 }));
+    const bias = try bld.parameter("bias", Shape.init(.f32, &.{3}));
+    const y = try bld.linear(x, w, bias, 2, 4, 3);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var session = try CompiledTrainSession.init(allocator, &g, loss, .{ .trainable_params = &.{ "w", "bias" } });
+    defer session.deinit();
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const w_data = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2 };
+    const bias_data = [_]f32{ 0.01, 0.02, 0.03 };
+
+    // Reference: classic backend-tensor feeds.
+    const x_ct = try cb_val.fromFloat32Shape(&x_data, &.{ 2, 4 });
+    defer cb_val.free(x_ct);
+    const w_ct = try cb_val.fromFloat32Shape(&w_data, &.{ 3, 4 });
+    defer cb_val.free(w_ct);
+    const bias_ct = try cb_val.fromFloat32Shape(&bias_data, &.{3});
+    defer cb_val.free(bias_ct);
+
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+    defer rt.deinit(allocator);
+    try rt.put(allocator, x, x_ct);
+    try rt.put(allocator, w, w_ct);
+    try rt.put(allocator, bias, bias_ct);
+
+    var reference = try session.execute(&cb_val, rt);
+    defer reference.deinit();
+
+    // Same feeds provided as host buffers (materialized on the interpreter path).
+    const host_feeds = [_]HostFeed{
+        .{ .node_id = x, .data = &x_data },
+        .{ .node_id = w, .data = &w_data },
+        .{ .node_id = bias, .data = &bias_data },
+    };
+    var host_result = try session.executeWithHostFeeds(&cb_val, null, &host_feeds);
+    defer host_result.deinit();
+
+    try std.testing.expectEqual(reference.loss, host_result.loss);
+    const ref_w_grad = reference.gradients.get("w") orelse return error.MissingGradient;
+    const host_w_grad = host_result.gradients.get("w") orelse return error.MissingGradient;
+    try std.testing.expectEqualSlices(f32, ref_w_grad, host_w_grad);
+    const ref_bias_grad = reference.gradients.get("bias") orelse return error.MissingGradient;
+    const host_bias_grad = host_result.gradients.get("bias") orelse return error.MissingGradient;
+    try std.testing.expectEqualSlices(f32, ref_bias_grad, host_bias_grad);
 }
 
 test "CompiledTrainSession preserves LoRA preprojection input gradient" {

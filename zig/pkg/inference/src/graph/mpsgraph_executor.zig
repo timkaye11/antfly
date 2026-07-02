@@ -74,6 +74,14 @@ const ReduceOp = enum(c_int) {
     max = 3,
 };
 
+/// A feed provided directly as a host f32 buffer. Skips the per-execute
+/// ComputeBackend tensor round-trip (`fromFloat32Shape` + `toFloat32`) for
+/// callers that already hold stable host data (e.g. cached frozen weights).
+pub const HostInput = struct {
+    node_id: NodeId,
+    data: []const f32,
+};
+
 pub const CompiledGraph = struct {
     allocator: std.mem.Allocator,
     executable: ?*anyopaque,
@@ -145,12 +153,31 @@ pub const CompiledGraph = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?[]const RuntimeInput,
     ) !ExecutionResult {
+        return self.executeWithHostInputs(allocator, cb, runtime_inputs, null);
+    }
+
+    /// Like `execute`, but feeds present in `host_inputs` are passed straight
+    /// from the caller's host f32 buffers without materializing a backend
+    /// tensor first. Byte-identical to the CT path (f32 in, f32 out); it only
+    /// removes redundant host copies.
+    pub fn executeWithHostInputs(
+        self: *CompiledGraph,
+        allocator: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?[]const RuntimeInput,
+        host_inputs: ?[]const HostInput,
+    ) !ExecutionResult {
         const n_inputs = self.feed_node_ids.len;
         var input_buffers = try allocator.alloc([]f32, n_inputs);
         defer allocator.free(input_buffers);
+        var input_owned = try allocator.alloc(bool, n_inputs);
+        defer allocator.free(input_owned);
+        @memset(input_owned, false);
         var materialized: usize = 0;
         errdefer {
-            for (input_buffers[0..materialized]) |buf| allocator.free(buf);
+            for (input_buffers[0..materialized], input_owned[0..materialized]) |buf, owned| {
+                if (owned) allocator.free(buf);
+            }
         }
 
         var input_ptrs = try allocator.alloc([*]const f32, n_inputs);
@@ -163,15 +190,25 @@ pub const CompiledGraph = struct {
         defer input_shape_flat.deinit(allocator);
 
         for (self.feed_node_ids, 0..) |node_id, i| {
-            const ct = findRuntimeInput(runtime_inputs, node_id) orelse return error.MpsGraphMissingRuntimeInput;
-            const data = try cb.toFloat32(ct, allocator);
-            errdefer allocator.free(data);
             const expected = try shapeElementCount(self.feed_shapes[i]);
-            if (data.len != expected) return error.MpsGraphInputShapeMismatch;
-            input_buffers[i] = data;
-            materialized += 1;
-            input_ptrs[i] = data.ptr;
-            input_elems[i] = @intCast(data.len);
+            if (findHostInput(host_inputs, node_id)) |host_data| {
+                if (host_data.len != expected) return error.MpsGraphInputShapeMismatch;
+                input_buffers[i] = @constCast(host_data);
+                input_owned[i] = false;
+                materialized += 1;
+                input_ptrs[i] = host_data.ptr;
+                input_elems[i] = @intCast(host_data.len);
+            } else {
+                const ct = findRuntimeInput(runtime_inputs, node_id) orelse return error.MpsGraphMissingRuntimeInput;
+                const data = try cb.toFloat32(ct, allocator);
+                errdefer allocator.free(data);
+                if (data.len != expected) return error.MpsGraphInputShapeMismatch;
+                input_buffers[i] = data;
+                input_owned[i] = true;
+                materialized += 1;
+                input_ptrs[i] = data.ptr;
+                input_elems[i] = @intCast(data.len);
+            }
             input_ranks[i] = @intCast(self.feed_shapes[i].rank());
             try appendShape(&input_shape_flat, allocator, self.feed_shapes[i]);
         }
@@ -221,7 +258,9 @@ pub const CompiledGraph = struct {
         );
         if (rc != 0) return failCError(&err);
 
-        for (input_buffers[0..materialized]) |buf| allocator.free(buf);
+        for (input_buffers[0..materialized], input_owned[0..materialized]) |buf, owned| {
+            if (owned) allocator.free(buf);
+        }
         materialized = 0;
 
         return .{
@@ -624,6 +663,14 @@ const Lowerer = struct {
         return rotated;
     }
 };
+
+fn findHostInput(host_inputs: ?[]const HostInput, node_id: NodeId) ?[]const f32 {
+    const inputs = host_inputs orelse return null;
+    for (inputs) |input| {
+        if (input.node_id == node_id) return input.data;
+    }
+    return null;
+}
 
 fn findRuntimeInput(runtime_inputs: ?[]const RuntimeInput, node_id: NodeId) ?CT {
     const inputs = runtime_inputs orelse return null;

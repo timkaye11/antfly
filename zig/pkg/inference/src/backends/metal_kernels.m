@@ -1893,6 +1893,19 @@ void termite_mpsgraph_executable_destroy(void *handle) {
     }
 }
 
+// Opt-in (default off): wrap MPSGraph execute inputs in no-copy NSData views
+// of the caller's buffers instead of copying them. Safe because
+// termite_mpsgraph_execute_f32 is fully synchronous (waitUntilCompleted before
+// returning) and the caller keeps every input buffer alive across the call.
+static bool termite_mpsgraph_execute_nocopy_inputs_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = getenv("TERMITE_MPSGRAPH_EXECUTE_NOCOPY_INPUTS");
+        cached = (raw != NULL && raw[0] != '\0' && strcmp(raw, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 int termite_mpsgraph_execute_f32(void *handle, const float **input_data, const int64_t *input_elems, const int64_t *input_shapes, const int *input_ranks, int num_inputs, float **output_data, const int64_t *output_elems, const int64_t *output_shapes, const int *output_ranks, int num_outputs, termite_mpsgraph_error *error) {
     @autoreleasepool {
         termite_mpsgraph_clear_error(error);
@@ -1917,7 +1930,14 @@ int termite_mpsgraph_execute_f32(void *handle, const float **input_data, const i
             int rank = input_ranks[i];
             NSArray<NSNumber *> *shape = termite_mpsgraph_shape_array(input_shapes + shape_offset, rank);
             shape_offset += rank;
-            NSData *data = [NSData dataWithBytes:input_data[i] length:(NSUInteger)input_elems[i] * sizeof(float)];
+            NSData *data;
+            if (termite_mpsgraph_execute_nocopy_inputs_enabled()) {
+                data = [NSData dataWithBytesNoCopy:(void *)input_data[i]
+                                            length:(NSUInteger)input_elems[i] * sizeof(float)
+                                      freeWhenDone:NO];
+            } else {
+                data = [NSData dataWithBytes:input_data[i] length:(NSUInteger)input_elems[i] * sizeof(float)];
+            }
             MPSGraphTensorData *tensor_data = [[MPSGraphTensorData alloc] initWithDevice:graph_device
                                                                                     data:data
                                                                                    shape:shape

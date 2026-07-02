@@ -134,6 +134,20 @@ debug_encoder_replay_upstream="${ANTFLY_FUSED_CHUNKER_DEBUG_ENCODER_REPLAY_UPSTR
 debug_layer_backward_decomp="${ANTFLY_FUSED_CHUNKER_DEBUG_LAYER_BACKWARD_DECOMP:-0}"
 debug_qkv_split_vjp="${ANTFLY_FUSED_CHUNKER_QKV_SPLIT_VJP:-0}"
 dense_device_forward="${TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD:-1}"
+# Opt-in step-time fast paths (all default OFF; validated baseline behavior is
+# unchanged until they pass the GPU validation gate):
+#   compiled_segment_forward — P1: run the LoRA encoder forward through
+#     compiled MPSGraph segment sessions instead of the eager capture forward.
+#   vjp_feed_cache — P2: cache rope tables / frozen base-weight feed buffers
+#     per VJP session and share the two attention-bias variants per step.
+#   compiled_boundary_head — P4: run the boundary-head forward/backward as
+#     cached MPSGraph executables (CE math and dropout RNG stay on CPU).
+#   compiled_forward_check — first-step eager-vs-compiled activation parity
+#     gate for P1 (errors loudly on divergence above the tolerance).
+compiled_segment_forward="${ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD:-0}"
+vjp_feed_cache="${ANTFLY_FUSED_CHUNKER_VJP_FEED_CACHE:-0}"
+compiled_boundary_head="${ANTFLY_FUSED_CHUNKER_COMPILED_BOUNDARY_HEAD:-0}"
+compiled_forward_check="${ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK:-0}"
 
 sha256_or_skip() {
   local path="$1"
@@ -177,6 +191,16 @@ cd "$pkg_root"
 export ANTFLY_FUSED_CHUNKER_ENCODER_VJP_EXECUTION="$segment_vjp_execution"
 export TERMITE_MPSGRAPH_SMOKE="$mpsgraph_smoke"
 export TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD="$dense_device_forward"
+export ANTFLY_FUSED_CHUNKER_VJP_FEED_CACHE="$vjp_feed_cache"
+export ANTFLY_FUSED_CHUNKER_COMPILED_BOUNDARY_HEAD="$compiled_boundary_head"
+export ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK="$compiled_forward_check"
+case "$vjp_feed_cache" in
+  1|true|TRUE|yes|YES)
+    # The feed-cache host buffers stay alive across the synchronous MPSGraph
+    # execute call, so the no-copy NSData input views are safe to enable.
+    export TERMITE_MPSGRAPH_EXECUTE_NOCOPY_INPUTS="${TERMITE_MPSGRAPH_EXECUTE_NOCOPY_INPUTS:-1}"
+    ;;
+esac
 
 echo "training Zig fused chunker Phase-20 Metal/MPSGraph parity run"
 echo "Phase 20 best-boundary parity contract"
@@ -245,6 +269,10 @@ echo "  deterministic=$deterministic"
 echo "  go_epoch_shuffle=$go_epoch_shuffle"
 echo "  mixed_precision=$mixed_precision"
 echo "  disable_device_dense_linear_forward=$dense_device_forward"
+echo "  compiled_segment_forward=$compiled_segment_forward"
+echo "  vjp_feed_cache=$vjp_feed_cache"
+echo "  compiled_boundary_head=$compiled_boundary_head"
+echo "  compiled_forward_check=$compiled_forward_check"
 echo "  memory_sample_every=$memory_sample_every"
 echo "  memory_warn_rss_gb=$memory_warn_rss_gb"
 echo "  memory_abort_rss_gb=$memory_abort_rss_gb"
@@ -387,6 +415,11 @@ esac
 case "$debug_qkv_split_vjp" in
   1|true|TRUE|yes|YES)
     extra_args+=(--debug-qkv-split-vjp)
+    ;;
+esac
+case "$compiled_segment_forward" in
+  1|true|TRUE|yes|YES)
+    extra_args+=(--compiled-segment-forward)
     ;;
 esac
 case "$encoder_neftune" in

@@ -243,6 +243,9 @@ const Options = struct {
     lora_train_top_k: u32 = 0,
     encoder_vjp: EncoderVJPMode = .direct,
     layers_per_segment: u32 = 1,
+    // Opt-in compiled segmented encoder forward (P1 fast path). Also settable
+    // via ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1.
+    compiled_segment_forward: bool = false,
     // Feature 4: LoRA+
     lora_plus_ratio: f32 = 1.0,
     // Feature 8: length bucketing
@@ -409,6 +412,302 @@ inline fn isFiniteF64(x: f64) bool {
 fn getenvU32OrNull(name: [*:0]const u8) ?u32 {
     const raw = platform.env.getenv(name) orelse return null;
     return std.fmt.parseUnsigned(u32, raw, 10) catch null;
+}
+
+fn shouldCaptureCompiledForwardLayer(active_layers: ?[]const bool, layer_idx: usize) bool {
+    const layers = active_layers orelse return true;
+    return layer_idx < layers.len and layers[layer_idx];
+}
+
+/// P1: run the ModernBERT encoder forward through compiled MPSGraph segment
+/// sessions, populating `act_buf` with the same capture set the eager
+/// `modern_bert.forwardCapturingActivations` produces (layer inputs, the
+/// Q/K/V / out_proj / mlp "wo" projection inputs for active LoRA layers, and
+/// the final-norm captures). Embeddings and the final LayerNorm run through
+/// the eager backend ops so their numerics (incl. NEFTune RNG) are unchanged.
+/// Returns the owned final feature buffer `[total * hidden]`.
+fn runCompiledSegmentedEncoderForward(
+    allocator: std.mem.Allocator,
+    cb: *const ops_mod.ComputeBackend,
+    bert_config: modern_bert.Config,
+    graph_config: modern_bert_graph.Config,
+    sessions: []?segmented_encoder.ModernBertSegmentForwardSession,
+    layers_per_segment: u32,
+    lora_rank: u32,
+    lora_alpha: f32,
+    ids_i64: []const i64,
+    mask_i64: []const i64,
+    actual_batch: usize,
+    max_seq: usize,
+    active_lora_layers: ?[]const bool,
+    capture_layer_inputs: bool,
+    capture_all_layer_inputs: bool,
+    lora_layers: []fused_chunker_lora.LoRALayer,
+    act_buf: *modern_bert.ActivationBuffer,
+) ![]f32 {
+    const total_tokens = actual_batch * max_seq;
+    const H: usize = @intCast(graph_config.hidden_size);
+    const num_layers = graph_config.num_hidden_layers;
+    if (sessions.len < num_layers) return error.MissingCompiledForwardSessions;
+
+    const attn_mask_f32 = try allocator.alloc(f32, total_tokens);
+    defer allocator.free(attn_mask_f32);
+    for (mask_i64[0..total_tokens], attn_mask_f32) |m, *out| out.* = @floatFromInt(m);
+
+    var shared_bias = segmented_encoder.SharedSegmentAttnBias.init(
+        allocator,
+        @intCast(actual_batch),
+        @intCast(max_seq),
+        graph_config.num_attention_heads,
+        graph_config.local_attention_window,
+        attn_mask_f32,
+    );
+    defer shared_bias.deinit();
+
+    // Embeddings stay on the eager path (token gather + NEFTune + LayerNorm).
+    const emb_ct = try modern_bert.embeddingsForwardCT(
+        cb,
+        allocator,
+        bert_config,
+        ids_i64,
+        total_tokens,
+        max_seq,
+        act_buf,
+    );
+    const embedding_host = blk: {
+        defer cb.free(emb_ct);
+        break :blk try cb.toFloat32(emb_ct, allocator);
+    };
+    var hidden_owned: []f32 = embedding_host;
+    defer allocator.free(hidden_owned);
+    if (hidden_owned.len != total_tokens * H) return error.UnexpectedOutputShape;
+
+    var segment_start: u32 = 0;
+    while (segment_start < num_layers) {
+        const segment_end = @min(segment_start + layers_per_segment, num_layers);
+
+        const session_slot = &sessions[@intCast(segment_start)];
+        var rebuild_session = session_slot.* == null;
+        if (session_slot.*) |*session| {
+            if (session.batch != actual_batch or
+                session.seq_len != max_seq or
+                session.start_layer != segment_start or
+                session.end_layer != segment_end or
+                session.config.hidden_size != graph_config.hidden_size or
+                session.config.intermediate_size != graph_config.intermediate_size)
+            {
+                session.deinit();
+                session_slot.* = null;
+                rebuild_session = true;
+            }
+        }
+        if (rebuild_session) {
+            session_slot.* = try segmented_encoder.ModernBertSegmentForwardSession.init(
+                allocator,
+                graph_config,
+                @intCast(actual_batch),
+                @intCast(max_seq),
+                segment_start,
+                segment_end,
+                lora_rank,
+                lora_alpha,
+            );
+        }
+        const session = &(session_slot.* orelse return error.MissingCompiledForwardSessions);
+
+        var result = try session.execute(cb, hidden_owned, attn_mask_f32, lora_layers, &shared_bias);
+        defer result.deinit();
+
+        for (result.layers, 0..) |capture, idx| {
+            const layer_idx: usize = @intCast(capture.layer_idx);
+            const capture_layer = shouldCaptureCompiledForwardLayer(active_lora_layers, layer_idx);
+            const capture_layer_input = capture_layer_inputs and
+                (capture_all_layer_inputs or capture_layer);
+            if (capture_layer_input) {
+                const layer_input: []const f32 = if (idx == 0)
+                    hidden_owned
+                else
+                    result.layers[idx - 1].hidden_out;
+                try act_buf.addLayerInput(capture.layer_idx, layer_input, total_tokens, H);
+            }
+            if (!capture_layer) continue;
+            // Same capture set as the eager path: normed_attn feeds Q/K/V,
+            // attn_merged feeds attn.Wo ("out_proj"), mlp_activated feeds
+            // mlp.Wo ("wo").
+            try act_buf.add(capture.layer_idx, "wo", capture.mlp_activated, @intCast(graph_config.intermediate_size), H, total_tokens);
+            try act_buf.add(capture.layer_idx, "query_proj", capture.attn_normed, H, H, total_tokens);
+            const shared_normed = act_buf.items.items[act_buf.items.items.len - 1].input;
+            try act_buf.addAlias(capture.layer_idx, "key_proj", shared_normed, H, H, total_tokens);
+            try act_buf.addAlias(capture.layer_idx, "value_proj", shared_normed, H, H, total_tokens);
+            try act_buf.add(capture.layer_idx, "out_proj", capture.attn_merged, H, H, total_tokens);
+        }
+
+        const next_hidden = try allocator.dupe(f32, result.layers[result.layers.len - 1].hidden_out);
+        allocator.free(hidden_owned);
+        hidden_owned = next_hidden;
+        segment_start = segment_end;
+    }
+
+    // Final LayerNorm through the same backend op as the eager forward.
+    const hidden_ct = try cb.fromFloat32Shape(hidden_owned, &.{ @intCast(total_tokens), @intCast(H) });
+    defer cb.free(hidden_ct);
+    const fn_w = try cb.getWeight("model.final_norm.weight");
+    defer cb.free(fn_w);
+    const fn_b = cb.getWeight("model.final_norm.bias") catch |err| blk: {
+        if (err != error.MissingWeight) return err;
+        const zeros = try allocator.alloc(f32, H);
+        defer allocator.free(zeros);
+        @memset(zeros, 0);
+        break :blk try cb.fromFloat32Shape(zeros, &.{@as(i32, @intCast(H))});
+    };
+    defer cb.free(fn_b);
+    const normed_ct = try cb.layerNorm(hidden_ct, fn_w, fn_b, H, bert_config.layer_norm_eps);
+    defer cb.free(normed_ct);
+    const features = try cb.toFloat32(normed_ct, allocator);
+    errdefer allocator.free(features);
+
+    const final_norm_input = try allocator.dupe(f32, hidden_owned);
+    var owns_final_norm_input = true;
+    errdefer if (owns_final_norm_input) allocator.free(final_norm_input);
+    const final_norm_weight = try cb.toFloat32(fn_w, allocator);
+    var owns_final_norm_weight = true;
+    errdefer if (owns_final_norm_weight) allocator.free(final_norm_weight);
+    try act_buf.setFinalNormOwned(final_norm_input, final_norm_weight, total_tokens, H);
+    owns_final_norm_input = false;
+    owns_final_norm_weight = false;
+
+    return features;
+}
+
+fn compiledForwardCheckTolerance() f32 {
+    const raw = platform.env.getenv("ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_TOL") orelse return 1e-6;
+    return std.fmt.parseFloat(f32, raw) catch 1e-6;
+}
+
+/// Elementwise comparison of a compiled-vs-eager tensor pair, restricted to
+/// rows whose token is unmasked (padded rows may legitimately diverge because
+/// the graph path uses a -1e9 additive bias where the eager path uses -inf).
+fn verifyCompiledForwardTensor(
+    name: []const u8,
+    layer_idx: u32,
+    compiled: []const f32,
+    eager: []const f32,
+    cols: usize,
+    mask_i64: []const i64,
+    tol: f32,
+) !void {
+    if (compiled.len != eager.len) {
+        print(
+            "compiled_forward_check mismatch tensor={s} layer={d} reason=length compiled={d} eager={d}\n",
+            .{ name, layer_idx, compiled.len, eager.len },
+        );
+        return error.CompiledForwardParityMismatch;
+    }
+    if (cols == 0 or compiled.len % cols != 0) return error.CompiledForwardParityMismatch;
+    const rows = compiled.len / cols;
+    var max_rel: f64 = 0.0;
+    var max_index: usize = 0;
+    for (0..rows) |row| {
+        if (row < mask_i64.len and mask_i64[row] == 0) continue;
+        for (0..cols) |col| {
+            const i = row * cols + col;
+            const a = compiled[i];
+            const b = eager[i];
+            const denom = @max(1.0, @max(@abs(a), @abs(b)));
+            const rel = @abs(a - b) / denom;
+            if (rel > max_rel) {
+                max_rel = rel;
+                max_index = i;
+            }
+        }
+    }
+    if (max_rel > tol) {
+        print(
+            "compiled_forward_check mismatch tensor={s} layer={d} max_rel={e:.6} tol={e:.6} index={d} compiled={e:.9} eager={e:.9}\n",
+            .{ name, layer_idx, max_rel, tol, max_index, compiled[max_index], eager[max_index] },
+        );
+        return error.CompiledForwardParityMismatch;
+    }
+}
+
+/// First-step validation gate (ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK=1):
+/// compare the compiled forward's features and captured activations against
+/// the eager capture forward and error loudly on any divergence above the
+/// tolerance (default 1e-6 relative; override with
+/// ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_TOL).
+fn verifyCompiledForwardParity(
+    compiled_features: []const f32,
+    eager_features: []const f32,
+    compiled_buf: *const modern_bert.ActivationBuffer,
+    eager_buf: *const modern_bert.ActivationBuffer,
+    mask_i64: []const i64,
+    hidden: usize,
+) !void {
+    const tol = compiledForwardCheckTolerance();
+    try verifyCompiledForwardTensor("features", 0, compiled_features, eager_features, hidden, mask_i64, tol);
+
+    if (compiled_buf.items.items.len != eager_buf.items.items.len) {
+        print(
+            "compiled_forward_check mismatch tensor=items reason=count compiled={d} eager={d}\n",
+            .{ compiled_buf.items.items.len, eager_buf.items.items.len },
+        );
+        return error.CompiledForwardParityMismatch;
+    }
+    for (compiled_buf.items.items) |*capture| {
+        const eager_capture = blk: {
+            for (eager_buf.items.items) |*candidate| {
+                if (candidate.layer_idx == capture.layer_idx and
+                    std.mem.eql(u8, candidate.module_name, capture.module_name))
+                {
+                    break :blk candidate;
+                }
+            }
+            print(
+                "compiled_forward_check mismatch tensor={s} layer={d} reason=missing_eager_capture\n",
+                .{ capture.module_name, capture.layer_idx },
+            );
+            return error.CompiledForwardParityMismatch;
+        };
+        try verifyCompiledForwardTensor(
+            capture.module_name,
+            capture.layer_idx,
+            capture.input,
+            eager_capture.input,
+            capture.in_features,
+            mask_i64,
+            tol,
+        );
+    }
+
+    if (compiled_buf.layer_inputs.items.len != eager_buf.layer_inputs.items.len) {
+        print(
+            "compiled_forward_check mismatch tensor=layer_inputs reason=count compiled={d} eager={d}\n",
+            .{ compiled_buf.layer_inputs.items.len, eager_buf.layer_inputs.items.len },
+        );
+        return error.CompiledForwardParityMismatch;
+    }
+    for (compiled_buf.layer_inputs.items) |*capture| {
+        const eager_capture = eager_buf.findLayerInput(capture.layer_idx) orelse {
+            print(
+                "compiled_forward_check mismatch tensor=layer_input layer={d} reason=missing_eager_capture\n",
+                .{capture.layer_idx},
+            );
+            return error.CompiledForwardParityMismatch;
+        };
+        try verifyCompiledForwardTensor(
+            "layer_input",
+            capture.layer_idx,
+            capture.input,
+            eager_capture.input,
+            capture.hidden,
+            mask_i64,
+            tol,
+        );
+    }
+
+    const compiled_final = compiled_buf.final_norm_input orelse return error.CompiledForwardParityMismatch;
+    const eager_final = eager_buf.final_norm_input orelse return error.CompiledForwardParityMismatch;
+    try verifyCompiledForwardTensor("final_norm_input", 0, compiled_final, eager_final, hidden, mask_i64, tol);
 }
 
 fn segmentVJPParityReferenceStrategy() graph_training.CompiledExecutionStrategy {
@@ -6838,6 +7137,8 @@ pub fn main(init: std.process.Init) !void {
     var lora_train_top_k: u32 = 0;
     var encoder_vjp: EncoderVJPMode = .direct;
     var layers_per_segment: u32 = 1;
+    var compiled_segment_forward: bool =
+        platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD", false);
     var lora_plus_ratio: f32 = 1.0;
     var length_bucketing: bool = false;
     var bucket_size: usize = 256;
@@ -7156,6 +7457,8 @@ pub fn main(init: std.process.Init) !void {
             const val = args.next() orelse return error.MissingLayersPerSegment;
             layers_per_segment = try std.fmt.parseUnsigned(u32, val, 10);
             if (layers_per_segment == 0) return error.InvalidLayersPerSegment;
+        } else if (std.mem.eql(u8, arg, "--compiled-segment-forward")) {
+            compiled_segment_forward = true;
         } else if (std.mem.eql(u8, arg, "--lora-plus-ratio")) {
             const val = args.next() orelse return error.MissingLoraPlusRatio;
             lora_plus_ratio = try std.fmt.parseFloat(f32, val);
@@ -7362,6 +7665,7 @@ pub fn main(init: std.process.Init) !void {
         .lora_train_top_k = lora_train_top_k,
         .encoder_vjp = encoder_vjp,
         .layers_per_segment = layers_per_segment,
+        .compiled_segment_forward = compiled_segment_forward,
         .lora_plus_ratio = lora_plus_ratio,
         .length_bucketing = length_bucketing,
         .bucket_size = bucket_size,
@@ -8860,6 +9164,28 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
         full_vjp_sessions = sessions;
     }
 
+    // Opt-in compiled segmented encoder forward (P1). Sessions are cached per
+    // segment start layer, like the full-VJP sessions above. A first-failure
+    // latch falls the step back to the eager capture forward.
+    var compiled_forward_sessions: ?[]?segmented_encoder.ModernBertSegmentForwardSession = null;
+    defer if (compiled_forward_sessions) |sessions| {
+        for (sessions) |*slot| {
+            if (slot.*) |*session| session.deinit();
+        }
+        allocator.free(sessions);
+    };
+    var compiled_forward_failed = false;
+    const compiled_forward_check = platform.env.getenvBoolDefault(
+        "ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK",
+        false,
+    );
+    if (opts.compiled_segment_forward and opts.lora_rank > 0) {
+        const sessions = try allocator.alloc(?segmented_encoder.ModernBertSegmentForwardSession, opts.num_layers);
+        errdefer allocator.free(sessions);
+        for (sessions) |*slot| slot.* = null;
+        compiled_forward_sessions = sessions;
+    }
+
     // ------------------------------------------------------------------
     // 2e. SPLADE projection weight W and Adam state
     // ------------------------------------------------------------------
@@ -9525,29 +9851,132 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
 
                 if (lora_training_active) {
                     var act_buf = modern_bert.ActivationBuffer.init(allocator);
-                    if (!opts.debug_encoder_layer_inputs_only and
+                    const debug_captures_requested = !opts.debug_encoder_layer_inputs_only and
                         ((opts.debug_first_boundary_step and epoch == 0 and step == 0) or
-                            (opts.debug_boundary_step > 0 and trainer.step_count + 1 == opts.debug_boundary_step)))
-                    {
+                            (opts.debug_boundary_step > 0 and trainer.step_count + 1 == opts.debug_boundary_step));
+                    if (debug_captures_requested) {
                         act_buf.capture_attention_internal_layer = opts.debug_encoder_probe_layer;
                         act_buf.capture_projection_decomposition_layer = opts.debug_encoder_probe_layer;
                         act_buf.capture_layer_state_layer = opts.debug_encoder_probe_layer;
                     }
-                    const fwd = try modern_bert.forwardCapturingActivations(
-                        &cb,
-                        allocator,
-                        bert_config,
-                        ids_i64,
-                        mask_i64,
-                        actual_batch,
-                        max_seq,
-                        if (active_lora_layers) |layers| layers else null,
-                        opts.encoder_vjp != .direct,
-                        usesFullEncoderVJP(opts.encoder_vjp),
-                        &act_buf,
-                    );
-                    features_owned = fwd;
-                    activations_opt = act_buf;
+
+                    // P1 opt-in fast path: run the encoder layers through
+                    // compiled MPSGraph segment sessions. Debug probe steps
+                    // (which need extra captures) always use the eager path.
+                    var compiled_features: ?[]f32 = null;
+                    if (compiled_forward_sessions != null and !compiled_forward_failed and
+                        lora_adapters_opt != null and !debug_captures_requested)
+                    {
+                        const la_forward = &lora_adapters_opt.?;
+                        const forward_layers_per_segment = if (opts.lisa_sample_layers == 0)
+                            opts.layers_per_segment
+                        else
+                            1;
+                        const eager_defaults = modern_bert.Config{};
+                        const forward_num_heads: u32 = 12;
+                        if (opts.hidden_size % forward_num_heads != 0) return error.InvalidHeadDim;
+                        const forward_graph_config = modern_bert_graph.Config{
+                            .vocab_size = 50368,
+                            .hidden_size = opts.hidden_size,
+                            .num_hidden_layers = opts.num_layers,
+                            .num_attention_heads = forward_num_heads,
+                            .head_dim = opts.hidden_size / forward_num_heads,
+                            .intermediate_size = opts.intermediate_size,
+                            .max_position_embeddings = eager_defaults.max_position_embeddings,
+                            .layer_norm_eps = eager_defaults.layer_norm_eps,
+                            .rope_theta = eager_defaults.global_rope_theta,
+                            .local_rope_theta = eager_defaults.local_rope_theta,
+                            .local_attention_window = eager_defaults.local_attention_window,
+                            .global_attn_every_n_layers = eager_defaults.global_attn_every_n_layers,
+                        };
+                        compiled_features = runCompiledSegmentedEncoderForward(
+                            allocator,
+                            &cb,
+                            bert_config,
+                            forward_graph_config,
+                            compiled_forward_sessions.?,
+                            forward_layers_per_segment,
+                            opts.lora_rank,
+                            la_forward.config.alpha,
+                            ids_i64,
+                            mask_i64,
+                            actual_batch,
+                            max_seq,
+                            if (active_lora_layers) |layers| layers else null,
+                            opts.encoder_vjp != .direct,
+                            usesFullEncoderVJP(opts.encoder_vjp),
+                            la_forward.layers,
+                            &act_buf,
+                        ) catch |err| blk: {
+                            compiled_forward_failed = true;
+                            print(
+                                "warning: compiled segment forward failed with {s}; falling back to eager capture forward\n",
+                                .{@errorName(err)},
+                            );
+                            break :blk null;
+                        };
+                        if (compiled_features == null) {
+                            // A partial compiled attempt may have populated
+                            // captures; restart with a fresh buffer. Debug
+                            // capture requests never take the compiled path,
+                            // so no capture settings need restoring.
+                            act_buf.deinit();
+                            act_buf = modern_bert.ActivationBuffer.init(allocator);
+                        }
+                    }
+
+                    if (compiled_features != null and compiled_forward_check and trainer.step_count == 0) {
+                        var check_owned_features = compiled_features;
+                        errdefer if (check_owned_features) |f| allocator.free(f);
+                        errdefer act_buf.deinit();
+                        var eager_buf = modern_bert.ActivationBuffer.init(allocator);
+                        defer eager_buf.deinit();
+                        const eager_fwd = try modern_bert.forwardCapturingActivations(
+                            &cb,
+                            allocator,
+                            bert_config,
+                            ids_i64,
+                            mask_i64,
+                            actual_batch,
+                            max_seq,
+                            if (active_lora_layers) |layers| layers else null,
+                            opts.encoder_vjp != .direct,
+                            usesFullEncoderVJP(opts.encoder_vjp),
+                            &eager_buf,
+                        );
+                        defer allocator.free(eager_fwd);
+                        try verifyCompiledForwardParity(
+                            compiled_features.?,
+                            eager_fwd,
+                            &act_buf,
+                            &eager_buf,
+                            mask_i64,
+                            @intCast(opts.hidden_size),
+                        );
+                        check_owned_features = null;
+                        print("compiled_forward_check step=1 status=ok\n", .{});
+                    }
+
+                    if (compiled_features) |fwd| {
+                        features_owned = fwd;
+                        activations_opt = act_buf;
+                    } else {
+                        const fwd = try modern_bert.forwardCapturingActivations(
+                            &cb,
+                            allocator,
+                            bert_config,
+                            ids_i64,
+                            mask_i64,
+                            actual_batch,
+                            max_seq,
+                            if (active_lora_layers) |layers| layers else null,
+                            opts.encoder_vjp != .direct,
+                            usesFullEncoderVJP(opts.encoder_vjp),
+                            &act_buf,
+                        );
+                        features_owned = fwd;
+                        activations_opt = act_buf;
+                    }
                 } else {
                     features_owned = try modern_bert.forward(
                         &cb,
@@ -10400,6 +10829,20 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                             var upstream_grad: []const f32 = lora_output_grad;
                             var upstream_owned: ?[]f32 = null;
                             defer if (upstream_owned) |buf| allocator.free(buf);
+                            // P2 opt-in: share the two attention-bias variants
+                            // across all segment VJP executions in this step.
+                            var vjp_shared_bias: ?segmented_encoder.SharedSegmentAttnBias = null;
+                            defer if (vjp_shared_bias) |*bias| bias.deinit();
+                            if (segmented_encoder.vjpFeedCacheEnabled()) {
+                                vjp_shared_bias = segmented_encoder.SharedSegmentAttnBias.init(
+                                    allocator,
+                                    @intCast(actual_batch),
+                                    @intCast(max_seq),
+                                    num_heads,
+                                    eager_defaults.local_attention_window,
+                                    attn_mask_f32,
+                                );
+                            }
                             var aggregate_profile = segmented_encoder.SegmentVJPProfile{};
                             const exact_adapter_grads = usesExactFullAdapterGrads(opts.encoder_vjp);
                             const layers_per_segment = if (opts.lisa_sample_layers == 0)
@@ -10557,13 +11000,14 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                                             la.layers,
                                         );
                                     }
-                                    var vjp_result = try session.executeWithOptions(
+                                    var vjp_result = try session.executeWithSharedBias(
                                         &cb,
                                         segment_input.input,
                                         upstream_grad,
                                         attn_mask_f32,
                                         la.layers,
                                         include_adapter_grads,
+                                        if (vjp_shared_bias) |*bias| bias else null,
                                     );
                                     aggregate_profile.add(vjp_result.profile);
                                     if (opts.debug_step_json_path != null and
@@ -11884,6 +12328,7 @@ fn printUsage() void {
         \\  --lora-train-top-k <n>    Train only the top N LoRA layers (default: 0=all/LISA)
         \\  --encoder-vjp direct|last-layer|full|full-hidden-direct Encoder LoRA backward mode (default: direct)
         \\  --layers-per-segment <n>  Full-VJP encoder layers per reverse segment (default: 1)
+        \\  --compiled-segment-forward Run the LoRA encoder forward through compiled MPSGraph segment sessions (default: off; env ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD=1)
         \\  --lora-plus-ratio <f>     LoRA+ B/A LR ratio (default: 1.0=disabled)
         \\  --length-bucketing        Enable length bucketing
         \\  --bucket-size <n>         Bucket window size (default: 256)
