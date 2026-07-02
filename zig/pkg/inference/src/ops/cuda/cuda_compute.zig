@@ -858,7 +858,15 @@ pub const CudaCompute = struct {
             kernels_mut.unload(&ctx);
         }
         var cublaslt = initCublasLtIfAvailable(allocator, &ctx);
-        if (cublaslt != null and cudaCublasLtWarmupEnabled()) {
+        // Warm up only when a BF16 matmul path is actually enabled: the
+        // ~100ms cuBLASLt library load should not tax every backend init
+        // (parity harnesses construct dozens of CudaCompute instances).
+        if (cublaslt != null and cudaCublasLtWarmupEnabled() and
+            (cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload() or
+                cudaHybridQ4Bf16WeightsEnabled() or
+                cudaRmsNormBf16MirrorEnabled() or
+                cudaPleModelProjectionBf16OnUpload()))
+        {
             warmupCublasLtBf16(&cublaslt.?, &ctx);
         }
         return .{
@@ -4522,12 +4530,13 @@ fn decoderRuntimeSlotPinsBuffer(self: *const CudaCompute, buffer: buffer_mod.Dev
 }
 
 fn cudaTensorDeviceBytes(tensor: *const CudaTensor) usize {
+    const mirror_bytes = tensor.bf16_mirror.len + tensor.q8_mirror.len;
     if (tensor.quant_type) |quant_type| {
-        const block_size = gguf_tensor_types.bytesPerBlock(quant_type) orelse return tensor.buffer.len;
-        const values_per_block = gguf_tensor_types.valuesPerBlock(quant_type) orelse return tensor.buffer.len;
-        return ((tensor.elem_count + values_per_block - 1) / values_per_block) * block_size;
+        const block_size = gguf_tensor_types.bytesPerBlock(quant_type) orelse return tensor.buffer.len + mirror_bytes;
+        const values_per_block = gguf_tensor_types.valuesPerBlock(quant_type) orelse return tensor.buffer.len + mirror_bytes;
+        return ((tensor.elem_count + values_per_block - 1) / values_per_block) * block_size + mirror_bytes;
     }
-    return tensor.elem_count * tensor.dtype.byteSize();
+    return tensor.elem_count * tensor.dtype.byteSize() + mirror_bytes;
 }
 
 fn noteLazyDeviceAccess(self: *CudaCompute, name: []const u8, bytes: usize) !void {
@@ -4582,6 +4591,8 @@ fn evictLazyDeviceWeightsToBudget(self: *CudaCompute, protected_name: []const u8
             var tensor = removed.value;
             tensor.owns_buffer = true;
             tensor.owns_shape = true;
+            tensor.owns_bf16_mirror = true;
+            tensor.owns_q8_mirror = true;
             const bytes = cudaTensorDeviceBytes(&tensor);
             freeCudaTensorStorageUncached(self, &tensor);
             self.lazy_device_bytes -|= bytes;
@@ -10342,7 +10353,11 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
             }
         }
     }
-    if (cudaRmsNormQ8MirrorEnabled() and dim % 32 == 0 and input_tensor.elem_count % 32 == 0) {
+    // rows == 1 only: the q8 mirror feeds the rows==1 DP4A decode GEMVs;
+    // prefill-shaped norms use the BF16 mirror path above, and multi-row
+    // per-head norms have no q8 consumer. Keeping the gate tight also
+    // avoids perturbing the graph-capture allocation sequence.
+    if (input_tensor.elem_count == dim and cudaRmsNormQ8MirrorEnabled() and dim % 32 == 0) {
         var q8_mirror = allocDeviceBuffer(self, (input_tensor.elem_count / 32) * 36) catch buffer_mod.DeviceBuffer{};
         if (q8_mirror.ptr != 0) {
             const launched_q8 = blk: {

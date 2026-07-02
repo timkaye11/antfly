@@ -660,12 +660,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var cuda_gemma_prefill_prewarm_ms: u64 = 0;
     if (cudaGemmaPrefillPrewarmEnabled()) {
         const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
-        const prewarmed = try prewarmCudaGemmaPrefillResidency(
+        // Prewarm is a pure residency optimization; a failure must not
+        // abort the generation the real prefill could still serve.
+        const prewarmed = prewarmCudaGemmaPrefillResidency(
             allocator,
             &cb,
             gpt_config,
             prompt_tokens,
-        );
+        ) catch |err| blk: {
+            std.log.warn("cuda_gemma_prefill_prewarm_failed: err={s}", .{@errorName(err)});
+            break :blk false;
+        };
         const prewarm_finished_at = std.Io.Timestamp.now(io, .awake);
         if (prewarmed) {
             cuda_gemma_prefill_prewarm_ms = durationMillis(prewarm_started_at, prewarm_finished_at);

@@ -54,9 +54,8 @@ fn fastGqaDecodeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_k
         head_dim % 32 == 0;
 }
 
-fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
-    return fastGqaPrefillEnabled() and
-        batch == 1 and
+fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return batch == 1 and
         q_seq_len > 1 and
         mask_len == 0 and
         bias_mode == 0 and
@@ -64,6 +63,11 @@ fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_
         num_heads % num_kv_heads == 0 and
         head_dim <= 512 and
         head_dim % 32 == 0;
+}
+
+fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return fastGqaPrefillEnabled() and
+        gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
 }
 
 pub const GqaAttentionLaunchKind = enum {
@@ -6221,11 +6225,14 @@ pub const KernelModule = struct {
         if ((format == 0 or format == 2) and
             base_key_row_bytes == key_row_bytes and
             decode_scalars.ptr == 0 and
-            fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+            (fastGqaPrefillEnabled() or tiledGqaPrefillEnabled()) and
+            gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
         {
-            if (self.gqa_attention_prefill_turboquant_fast_f32) |prefill_function| {
-                function = prefill_function;
-                launch_kind = .prefill_fast;
+            if (fastGqaPrefillEnabled()) {
+                if (self.gqa_attention_prefill_turboquant_fast_f32) |prefill_function| {
+                    function = prefill_function;
+                    launch_kind = .prefill_fast;
+                }
             }
             if (tiledGqaPrefillEnabled()) {
                 if (self.gqa_attention_prefill_turboquant_tiled_f32) |tiled_function| {

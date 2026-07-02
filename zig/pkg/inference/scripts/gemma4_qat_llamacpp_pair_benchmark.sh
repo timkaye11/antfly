@@ -99,7 +99,9 @@ llama_cache_type_k="${LLAMA_CACHE_TYPE_K:-q4_0}"
 llama_cache_type_v="${LLAMA_CACHE_TYPE_V:-q4_0}"
 antfly_q4_0_q8_1_prefill_rows="${ANTFLY_Q4_0_Q8_1_PREFILL_ROWS:-1}"
 antfly_gqa_prefill_fast="${ANTFLY_GQA_PREFILL_FAST:-1}"
-antfly_gqa_prefill_tiled="${ANTFLY_GQA_PREFILL_TILED:-0}"
+# Wrapper vars fall back to the raw production env name so callers that
+# export ANTFLY_INFERENCE_CUDA_* directly are honored rather than clobbered.
+antfly_gqa_prefill_tiled="${ANTFLY_GQA_PREFILL_TILED:-${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED:-0}}"
 antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim="${ANTFLY_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM:-2048}"
 antfly_q4_0_linear_q8_1_rows8_c4="${ANTFLY_Q4_0_LINEAR_Q8_1_ROWS8_C4:-1}"
 antfly_q4_0_pair_activation_q8_1_rows8_c2="${ANTFLY_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2:-1}"
@@ -108,11 +110,11 @@ antfly_cuda_gemma_prefill_prewarm="${ANTFLY_CUDA_GEMMA_PREFILL_PREWARM:-1}"
 antfly_cuda_prefill_first_token="${ANTFLY_CUDA_PREFILL_FIRST_TOKEN:-1}"
 antfly_cuda_prefill_first_token_coalesce_tokens="${ANTFLY_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS:-2048}"
 antfly_cuda_profile_prefill_ops="${ANTFLY_CUDA_PROFILE_PREFILL_OPS:-0}"
-antfly_rms_norm_bf16_mirror="${ANTFLY_RMS_NORM_BF16_MIRROR:-0}"
-antfly_rms_norm_q8_1_mirror="${ANTFLY_RMS_NORM_Q8_1_MIRROR:-0}"
-antfly_bf16_resident_weights="${ANTFLY_BF16_RESIDENT_WEIGHTS:-0}"
-antfly_hybrid_bf16_prefill="${ANTFLY_HYBRID_BF16_PREFILL:-0}"
-antfly_ple_model_proj_bf16="${ANTFLY_PLE_MODEL_PROJ_BF16:-$antfly_bf16_resident_weights}"
+antfly_rms_norm_bf16_mirror="${ANTFLY_RMS_NORM_BF16_MIRROR:-${ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR:-0}}"
+antfly_rms_norm_q8_1_mirror="${ANTFLY_RMS_NORM_Q8_1_MIRROR:-${ANTFLY_INFERENCE_CUDA_RMS_NORM_Q8_1_MIRROR:-0}}"
+antfly_bf16_resident_weights="${ANTFLY_BF16_RESIDENT_WEIGHTS:-${ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16:-0}}"
+antfly_hybrid_bf16_prefill="${ANTFLY_HYBRID_BF16_PREFILL:-${ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL:-0}}"
+antfly_ple_model_proj_bf16="${ANTFLY_PLE_MODEL_PROJ_BF16:-${ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16:-$antfly_bf16_resident_weights}}"
 command_timeout="${TIMEOUT:-360s}"
 require_antfly_win="${REQUIRE_ANTFLY_WIN:-0}"
 min_win_ms="${MIN_WIN_MS:-0}"
@@ -163,6 +165,15 @@ for ((prompt_index = 0; prompt_index < prompt_repeat; prompt_index++)); do
   fi
 done
 prompt_bytes="${#prompt}"
+
+# Decode graph replay stops silently once total sequence exceeds the forced
+# KV capture capacity, so default it to cover the estimated prompt plus all
+# generated tokens (rounded up to a page) instead of a fixed constant.
+prompt_token_estimate=$(((prompt_bytes + 3) / 4))
+capacity_estimate=$(((prompt_token_estimate + antfly_tokens + 64 + 31) / 32 * 32))
+if [[ "$capacity_estimate" -lt 544 ]]; then
+  capacity_estimate=544
+fi
 
 require_path() {
   local label="$1"
@@ -229,7 +240,7 @@ common_antfly_env=(
   ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1
   ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=863
   ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP=2500
-  ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="${ANTFLY_CAPTURE_FORCE_KV_CAPACITY:-544}"
+  ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="${ANTFLY_CAPTURE_FORCE_KV_CAPACITY:-$capacity_estimate}"
 )
 
 run_antfly_command() {
