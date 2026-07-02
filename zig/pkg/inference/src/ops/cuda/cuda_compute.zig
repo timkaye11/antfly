@@ -7742,6 +7742,16 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
             self.stats.bf16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
+    } else if (rows == 1 and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
+        weight_tensor.bf16_mirror.ptr != 0 and
+        weight_tensor.bf16_mirror.len >= weight_tensor.elem_count * @sizeOf(u16))
+    {
+        // Decode GEMV on an F32 weight carrying a BF16 mirror (hybrid PLE
+        // projection): the BF16 read halves the bandwidth of the dominant
+        // per-token eager matmul. Plain kernel launch, graph-capture safe.
+        try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.bf16_mirror, rows, in_dim, out_dim);
+        self.stats.bf16_scalar_linear_calls += 1;
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
     } else if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {

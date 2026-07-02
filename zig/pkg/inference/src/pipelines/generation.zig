@@ -7865,6 +7865,44 @@ test "native decode state paged kv grows in pages" {
     try std.testing.expectEqual(@as(u16, 3), view.tail_tokens);
 }
 
+test "native decode state sliding-window view stays block-aligned" {
+    // Regression: the paged kernels index the front-trimmed block table with
+    // view-relative positions, so the decode view offset must always equal
+    // the block-aligned dropped-token count. A token-granular offset
+    // (total - window) misaligns every KV read and write by offset % page.
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const page_size: usize = 4;
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = page_size,
+        .num_kv_heads = 8,
+        .head_dim = 128,
+        .sliding_window_size = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    try state.notePrefill(10);
+    var step: usize = 0;
+    while (step < 20) : (step += 1) {
+        try state.appendGeneratedToken();
+        const view = state.kvView().?;
+        // Offset must be page-aligned so view-relative kernel indexing maps
+        // exactly onto the compacted block table.
+        try std.testing.expectEqual(@as(usize, 0), view.position_offset % page_size);
+        // The view must cover exactly the retained suffix of the sequence.
+        try std.testing.expectEqual(state.total_tokens, view.position_offset + view.token_count);
+        try std.testing.expectEqual(manager.tokenCount(state.sequence_id.?).?, view.token_count);
+        // Trimming keeps at least the window and less than window + one page.
+        try std.testing.expect(view.token_count >= 8);
+        try std.testing.expect(view.token_count < 8 + page_size);
+    }
+}
+
 test "native decode state chunked prefill appends incrementally" {
     const allocator = std.testing.allocator;
     var manager = runtime.kv.manager.KvManager.init(allocator);

@@ -611,7 +611,12 @@ pub const NativeGenerateCoordinator = struct {
         const prompt_token_estimate = @max(prompt_bytes / 4, 1);
 
         var target = self.base_prefill_chunk_size;
-        if (state.decode_requests > 0) {
+        if (state.decode_requests == 0 and state.prefill_requests <= 1 and state.waiting_requests == 0) {
+            // Sole request on an idle scheduler: no fairness pressure, so run
+            // the whole prompt in one pass. Chunked prefill costs several
+            // full per-layer passes and starves large-GEMM efficiency.
+            target = prompt_token_estimate;
+        } else if (state.decode_requests > 0) {
             target = self.min_prefill_chunk_size;
         } else if (state.prefill_requests >= 3 or state.active_units >= 12) {
             target = self.min_prefill_chunk_size;
