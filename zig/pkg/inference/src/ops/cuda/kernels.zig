@@ -35,9 +35,29 @@ fn fastGqaDecodeDisabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FAST_GQA_DECODE", false);
 }
 
+fn fastGqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST", false);
+}
+
+fn tiledGqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED", false);
+}
+
 fn fastGqaDecodeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
     return batch == 1 and
         q_seq_len == 1 and
+        mask_len == 0 and
+        bias_mode == 0 and
+        num_kv_heads != 0 and
+        num_heads % num_kv_heads == 0 and
+        head_dim <= 512 and
+        head_dim % 32 == 0;
+}
+
+fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return fastGqaPrefillEnabled() and
+        batch == 1 and
+        q_seq_len > 1 and
         mask_len == 0 and
         bias_mode == 0 and
         num_kv_heads != 0 and
@@ -51,6 +71,8 @@ pub const GqaAttentionLaunchKind = enum {
     decode,
     decode_fast,
     decode_fast_fallback,
+    prefill_fast,
+    prefill_tiled,
     scalar,
 };
 
@@ -60,6 +82,20 @@ pub const QMatmulVariant = enum {
     fast_r2c8,
     fast_r4c4,
     tc_hmma,
+};
+
+pub const Q4_0Q8_1PrefillRowsVariant = enum {
+    none,
+    single,
+    generic_rows,
+    tile8_rows,
+    tile8_w8_rows,
+    rows2,
+    rows4,
+    rows8_c2,
+    rows8_c4,
+    rows16_c1,
+    e4b_down_rows,
 };
 
 pub const KernelModule = struct {
@@ -121,6 +157,7 @@ pub const KernelModule = struct {
     linear_pair_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     rms_norm_f32: driver_mod.CUfunction = null,
+    rms_norm_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32: driver_mod.CUfunction = null,
     rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null,
     rms_norm_add_output_scale_f32: driver_mod.CUfunction = null,
@@ -163,9 +200,12 @@ pub const KernelModule = struct {
     gqa_attention_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_scalars_fast_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_scalars_f32: driver_mod.CUfunction = null,
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_fast_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_tiled_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage1_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage2_f32: driver_mod.CUfunction = null,
@@ -202,7 +242,11 @@ pub const KernelModule = struct {
     linear_q4_0_q8_1_f32_tile4_e4b_attn_2048: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile4_e4b_attn_4096: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile4_w8: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_rows2: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_rows4: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_rows8_c4: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile4_w8_e4b_down: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile4_w10_e4b_down: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile8: driver_mod.CUfunction = null,
     linear_q4_0_f32_tile8: driver_mod.CUfunction = null,
@@ -268,6 +312,10 @@ pub const KernelModule = struct {
     linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn: driver_mod.CUfunction = null,
     linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn: driver_mod.CUfunction = null,
     linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2: driver_mod.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1: driver_mod.CUfunction = null,
     linear_q4_0_pair_activation_q8_1_f32_tile8: driver_mod.CUfunction = null,
     linear_q4_0_pair_nobias_f32_tile8: driver_mod.CUfunction = null,
     linear_q4_k_pair_nobias_f32_tile4: driver_mod.CUfunction = null,
@@ -278,6 +326,7 @@ pub const KernelModule = struct {
     linear_q4_0_qkv_nobias_f32_tile4_w4: driver_mod.CUfunction = null,
     linear_q4_0_qkv_nobias_q8_1_f32_tile4: driver_mod.CUfunction = null,
     linear_q4_0_qkv_nobias_q8_1_f32_tile8: driver_mod.CUfunction = null,
+    linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4: driver_mod.CUfunction = null,
     linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8: driver_mod.CUfunction = null,
     linear_q4_0_qkv_nobias_f32_tile8: driver_mod.CUfunction = null,
     linear_q4_k_qkv_nobias_f32_tiled: driver_mod.CUfunction = null,
@@ -374,6 +423,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_triple_bias_f32_tile4_r2, module, "termite_linear_triple_bias_f32_tile4_r2"));
         var rms_norm_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_f32, module, "termite_rms_norm_f32"));
+        const rms_norm_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_f32_bf16");
         var rms_norm_add_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_f32, module, "termite_rms_norm_add_f32"));
         var rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null;
@@ -434,9 +484,12 @@ pub const KernelModule = struct {
         const gqa_attention_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_f32");
         const gqa_attention_decode_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_f32");
         const gqa_attention_decode_scalars_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_fast_f32");
+        const gqa_attention_prefill_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_fast_f32");
         const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
         const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
         const gqa_attention_decode_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_fast_f32");
+        const gqa_attention_prefill_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_fast_f32");
+        const gqa_attention_prefill_turboquant_tiled_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_tiled_f32");
         const gqa_attention_decode_turboquant_split_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_f32");
         const gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32");
         const gqa_attention_decode_turboquant_split_stage2_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage2_f32");
@@ -487,7 +540,11 @@ pub const KernelModule = struct {
         const linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048");
         const linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_4096");
         const linear_q4_0_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8");
+        const linear_q4_0_q8_1_f32_tile4_w8_rows2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows2");
+        const linear_q4_0_q8_1_f32_tile4_w8_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows4");
+        const linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4");
         const linear_q4_0_q8_1_f32_tile4_w8_e4b_down = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down");
+        const linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows");
         const linear_q4_0_q8_1_f32_tile4_w10_e4b_down = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down");
         const linear_q4_0_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile8");
         const linear_q4_0_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile8");
@@ -569,6 +626,10 @@ pub const KernelModule = struct {
         const linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn");
         const linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn");
         const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2");
+        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1");
         const linear_q4_0_pair_activation_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile8");
         const linear_q4_0_pair_nobias_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile8");
         const linear_q4_k_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_pair_nobias_f32_tile4");
@@ -579,6 +640,7 @@ pub const KernelModule = struct {
         const linear_q4_0_qkv_nobias_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile4_w4");
         const linear_q4_0_qkv_nobias_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4");
         const linear_q4_0_qkv_nobias_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8");
+        const linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4");
         const linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8");
         const linear_q4_0_qkv_nobias_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile8");
         const linear_q4_k_qkv_nobias_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_qkv_nobias_f32_tiled");
@@ -664,6 +726,7 @@ pub const KernelModule = struct {
             .linear_pair_bias_f32_tile4_r2 = linear_pair_bias_f32_tile4_r2,
             .linear_triple_bias_f32_tile4_r2 = linear_triple_bias_f32_tile4_r2,
             .rms_norm_f32 = rms_norm_f32,
+            .rms_norm_f32_bf16 = rms_norm_f32_bf16,
             .rms_norm_add_f32 = rms_norm_add_f32,
             .rms_norm_add_mul_scalar_f32 = rms_norm_add_mul_scalar_f32,
             .rms_norm_add_output_scale_f32 = rms_norm_add_output_scale_f32,
@@ -706,9 +769,12 @@ pub const KernelModule = struct {
             .gqa_attention_f32 = gqa_attention_f32,
             .gqa_attention_decode_f32 = gqa_attention_decode_f32,
             .gqa_attention_decode_scalars_fast_f32 = gqa_attention_decode_scalars_fast_f32,
+            .gqa_attention_prefill_fast_f32 = gqa_attention_prefill_fast_f32,
             .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
             .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
             .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
+            .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
+            .gqa_attention_prefill_turboquant_tiled_f32 = gqa_attention_prefill_turboquant_tiled_f32,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
@@ -744,7 +810,11 @@ pub const KernelModule = struct {
             .linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = linear_q4_0_q8_1_f32_tile4_e4b_attn_2048,
             .linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = linear_q4_0_q8_1_f32_tile4_e4b_attn_4096,
             .linear_q4_0_q8_1_f32_tile4_w8 = linear_q4_0_q8_1_f32_tile4_w8,
+            .linear_q4_0_q8_1_f32_tile4_w8_rows2 = linear_q4_0_q8_1_f32_tile4_w8_rows2,
+            .linear_q4_0_q8_1_f32_tile4_w8_rows4 = linear_q4_0_q8_1_f32_tile4_w8_rows4,
+            .linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = linear_q4_0_q8_1_f32_tile4_w8_rows8_c4,
             .linear_q4_0_q8_1_f32_tile4_w8_e4b_down = linear_q4_0_q8_1_f32_tile4_w8_e4b_down,
+            .linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows,
             .linear_q4_0_q8_1_f32_tile4_w10_e4b_down = linear_q4_0_q8_1_f32_tile4_w10_e4b_down,
             .linear_q4_0_q8_1_f32_tile8 = linear_q4_0_q8_1_f32_tile8,
             .linear_q4_0_f32_tile8 = linear_q4_0_f32_tile8,
@@ -809,6 +879,10 @@ pub const KernelModule = struct {
             .linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn,
             .linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn,
             .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2,
+            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1,
             .linear_q4_0_pair_activation_q8_1_f32_tile8 = linear_q4_0_pair_activation_q8_1_f32_tile8,
             .linear_q4_0_pair_nobias_f32_tile8 = linear_q4_0_pair_nobias_f32_tile8,
             .linear_q4_k_pair_nobias_f32_tile4 = linear_q4_k_pair_nobias_f32_tile4,
@@ -819,6 +893,7 @@ pub const KernelModule = struct {
             .linear_q4_0_qkv_nobias_f32_tile4_w4 = linear_q4_0_qkv_nobias_f32_tile4_w4,
             .linear_q4_0_qkv_nobias_q8_1_f32_tile4 = linear_q4_0_qkv_nobias_q8_1_f32_tile4,
             .linear_q4_0_qkv_nobias_q8_1_f32_tile8 = linear_q4_0_qkv_nobias_q8_1_f32_tile8,
+            .linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4,
             .linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8,
             .linear_q4_0_qkv_nobias_f32_tile8 = linear_q4_0_qkv_nobias_f32_tile8,
             .linear_q4_k_qkv_nobias_f32_tiled = linear_q4_k_qkv_nobias_f32_tiled,
@@ -897,6 +972,7 @@ pub const KernelModule = struct {
             self.linear_pair_bias_f32_tile4_r2 = null;
             self.linear_triple_bias_f32_tile4_r2 = null;
             self.rms_norm_f32 = null;
+            self.rms_norm_f32_bf16 = null;
             self.rms_norm_add_mul_scalar_f32 = null;
             self.rms_norm_add_output_scale_f32 = null;
             self.rms_norm_bare_f32 = null;
@@ -937,9 +1013,12 @@ pub const KernelModule = struct {
             self.gqa_attention_f32 = null;
             self.gqa_attention_decode_f32 = null;
             self.gqa_attention_decode_scalars_fast_f32 = null;
+            self.gqa_attention_prefill_fast_f32 = null;
             self.gqa_attention_decode_scalars_f32 = null;
             self.kv_write_suffix_decode_scalars_f32 = null;
             self.gqa_attention_decode_turboquant_fast_f32 = null;
+            self.gqa_attention_prefill_turboquant_fast_f32 = null;
+            self.gqa_attention_prefill_turboquant_tiled_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage1_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage2_f32 = null;
@@ -975,7 +1054,11 @@ pub const KernelModule = struct {
             self.linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = null;
             self.linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = null;
             self.linear_q4_0_q8_1_f32_tile4_w8 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows2 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows4 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = null;
             self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = null;
             self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down = null;
             self.linear_q4_0_q8_1_f32_tile8 = null;
             self.linear_q4_0_f32_tile8 = null;
@@ -1040,6 +1123,10 @@ pub const KernelModule = struct {
             self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = null;
             self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = null;
             self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = null;
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = null;
             self.linear_q4_0_pair_activation_q8_1_f32_tile8 = null;
             self.linear_q4_0_pair_nobias_f32_tile8 = null;
             self.linear_q4_k_pair_nobias_f32_tile4 = null;
@@ -1050,6 +1137,7 @@ pub const KernelModule = struct {
             self.linear_q4_0_qkv_nobias_f32_tile4_w4 = null;
             self.linear_q4_0_qkv_nobias_q8_1_f32_tile4 = null;
             self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 = null;
+            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = null;
             self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = null;
             self.linear_q4_0_qkv_nobias_f32_tile8 = null;
             self.linear_q4_k_qkv_nobias_f32_tiled = null;
@@ -1170,6 +1258,36 @@ pub const KernelModule = struct {
             self.embedding_lookup_q4_k_f32 != null and
             self.embedding_lookup_q6_k_f32 != null and
             self.slice_last_dim_f32 != null;
+    }
+
+    pub fn q4_0Q8_1Tile4W8PrefillRowsVariant(self: *const KernelModule, rows: usize, in_dim: usize, out_dim: usize) Q4_0Q8_1PrefillRowsVariant {
+        if (rows <= 1) return .single;
+        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false) and
+            self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 != null) return .rows8_c4;
+        if (self.linear_q4_0_q8_1_f32_tile4_w8_rows4 != null) return .rows4;
+        if (self.linear_q4_0_q8_1_f32_tile4_w8_rows2 != null) return .rows2;
+        if (in_dim == 10240 and out_dim == 2560 and self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows != null) return .e4b_down_rows;
+        if (self.linear_q4_0_q8_1_f32_tile4_w8 != null) return .generic_rows;
+        return .none;
+    }
+
+    pub fn q4_0PairActivationQ8_1Tile32W5E4BPrefillRowsVariant(self: *const KernelModule, rows: usize) Q4_0Q8_1PrefillRowsVariant {
+        if (rows <= 1) return .single;
+        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1", false) and
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 != null) return .rows16_c1;
+        if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2", false) and
+            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 != null) return .rows8_c2;
+        if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 != null) return .rows4;
+        if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 != null) return .rows2;
+        if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn != null) return .generic_rows;
+        return .none;
+    }
+
+    pub fn q4_0QkvNoBiasQ8_1Tile8PrefillRowsVariant(self: *const KernelModule, rows: usize) Q4_0Q8_1PrefillRowsVariant {
+        if (rows <= 1) return .single;
+        if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 != null) return .rows4;
+        if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 != null) return .tile8_rows;
+        return .none;
     }
 
     pub fn requireGemma4DecoderPrimitives(self: *const KernelModule) driver_mod.Error!void {
@@ -3469,6 +3587,44 @@ pub const KernelModule = struct {
         try launchRows(self.rms_norm_f32, ctx, total_rows, &params);
     }
 
+    pub fn launchRmsNormF32Bf16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        dst_bf16: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        total_rows: usize,
+        dim: usize,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(total_rows, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(dst_bf16, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        try checkBytes(weight, dim);
+        if (count == 0) return;
+
+        const function = self.rms_norm_f32_bf16 orelse return error.CudaKernelUnavailable;
+        var dst_ptr = dst.ptr;
+        var dst_bf16_ptr = dst_bf16.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(total_rows);
+        var dim_u32 = try toU32(dim);
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&dst_bf16_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&eps_value),
+        };
+        try launchRows(function, ctx, total_rows, &params);
+    }
+
     pub fn launchRmsNormAddF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -5538,6 +5694,28 @@ pub const KernelModule = struct {
                 bias_mode_u32,
             });
         }
+        if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
+            if (fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+                const block: c_uint = if (head_dim <= 256) 256 else 512;
+                const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+                try ctx.makeCurrent();
+                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                    prefill_function,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    ctx.stream,
+                    &params,
+                    null,
+                ));
+                ctx.noteKernelLaunch();
+                return .prefill_fast;
+            }
+        }
         if (self.gqa_attention_decode_f32) |decode_function| {
             if (head_dim <= 512) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
@@ -5953,6 +6131,21 @@ pub const KernelModule = struct {
         var launch_kind: GqaAttentionLaunchKind = .decode;
         if ((format == 0 or format == 2) and
             base_key_row_bytes == key_row_bytes and
+            decode_scalars.ptr == 0 and
+            fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+        {
+            if (self.gqa_attention_prefill_turboquant_fast_f32) |prefill_function| {
+                function = prefill_function;
+                launch_kind = .prefill_fast;
+            }
+            if (tiledGqaPrefillEnabled()) {
+                if (self.gqa_attention_prefill_turboquant_tiled_f32) |tiled_function| {
+                    function = tiled_function;
+                    launch_kind = .prefill_tiled;
+                }
+            }
+        } else if ((format == 0 or format == 2) and
+            base_key_row_bytes == key_row_bytes and
             fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
         {
             launch_kind = .decode_fast_fallback;
@@ -5964,7 +6157,12 @@ pub const KernelModule = struct {
             }
         }
         if (captureParamTraceIndex(ctx)) |trace_index| {
-            const kernel_name = if (launch_kind == .decode_fast) "gqa_attention_decode_turboquant_fast" else "gqa_attention_decode_turboquant";
+            const kernel_name = switch (launch_kind) {
+                .decode_fast => "gqa_attention_decode_turboquant_fast",
+                .prefill_fast => "gqa_attention_prefill_turboquant_fast",
+                .prefill_tiled => "gqa_attention_prefill_turboquant_tiled",
+                else => "gqa_attention_decode_turboquant",
+            };
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} mask=0x{x} bias=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
@@ -5992,18 +6190,29 @@ pub const KernelModule = struct {
                 value_format_u32,
             });
         }
-        const block: c_uint = if (head_dim <= 256) 256 else 512;
-        const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        var block: c_uint = if (head_dim <= 256) 256 else 512;
+        var grid_x = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        var grid_y: c_uint = 1;
+        var shared_bytes: c_uint = 0;
+        if (launch_kind == .prefill_tiled) {
+            // Tiled prefill: grid = (num_heads, ceil(q_seq_len / TILE_M)), TILE_M = 8.
+            // Dynamic smem holds one K/V tile: tile_n * (head_dim + 1) floats.
+            block = 256;
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 7) / 8);
+            const tile_n: usize = if (head_dim <= 256) 32 else 16;
+            shared_bytes = try toU32(tile_n * (head_dim + 1) * @sizeOf(f32));
+        }
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
             function,
-            grid,
-            1,
+            grid_x,
+            grid_y,
             1,
             block,
             1,
             1,
-            0,
+            shared_bytes,
             ctx.stream,
             &params,
             null,
@@ -7063,8 +7272,57 @@ pub const KernelModule = struct {
         var dst_ptr = dst.ptr;
         var input_ptr = input_q8_1.ptr;
         var weight_ptr = weight_raw.ptr;
-        if (rows == 1 and in_dim == 10240 and out_dim == 2560) {
-            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
+        if (rows > 1) {
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4", false)) {
+                if (self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4) |function| {
+                    var rows_u32 = try toU32(rows);
+                    var in_dim_u32 = try toU32(in_dim);
+                    var out_dim_u32 = try toU32(out_dim);
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                        @ptrCast(&rows_u32),
+                        @ptrCast(&in_dim_u32),
+                        @ptrCast(&out_dim_u32),
+                    };
+                    try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 7) / 8, q4_0_tiled_threads, &params);
+                    return;
+                }
+            }
+            if (self.linear_q4_0_q8_1_f32_tile4_w8_rows4) |function| {
+                var rows_u32 = try toU32(rows);
+                var in_dim_u32 = try toU32(in_dim);
+                var out_dim_u32 = try toU32(out_dim);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&in_dim_u32),
+                    @ptrCast(&out_dim_u32),
+                };
+                try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 3) / 4, q4_0_tiled_threads, &params);
+                return;
+            }
+            if (self.linear_q4_0_q8_1_f32_tile4_w8_rows2) |function| {
+                var rows_u32 = try toU32(rows);
+                var in_dim_u32 = try toU32(in_dim);
+                var out_dim_u32 = try toU32(out_dim);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&in_dim_u32),
+                    @ptrCast(&out_dim_u32),
+                };
+                try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 1) / 2, q4_0_tiled_threads, &params);
+                return;
+            }
+        }
+        if (in_dim == 10240 and out_dim == 2560) {
+            if (rows == 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
                 if (self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down) |function| {
                     var params = [_]?*anyopaque{
                         @ptrCast(&dst_ptr),
@@ -7075,7 +7333,17 @@ pub const KernelModule = struct {
                     return;
                 }
             }
-            if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down) |function| {
+            if (rows > 1) {
+                if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows) |function| {
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_ptr),
+                    };
+                    try launch2d(function, ctx, out_dim / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+                    return;
+                }
+            } else if (self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down) |function| {
                 var params = [_]?*anyopaque{
                     @ptrCast(&dst_ptr),
                     @ptrCast(&input_ptr),
@@ -9054,7 +9322,6 @@ pub const KernelModule = struct {
         out_dim: usize,
         activation: u8,
     ) driver_mod.Error!void {
-        const function = self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn orelse return error.CudaKernelUnavailable;
         if (rows == 0 or in_dim != 2560 or out_dim != 10240) return error.InvalidCudaState;
         const input_row_blocks = in_dim / q8_1_values_per_block;
         const out_row_blocks = out_dim / q8_1_values_per_block;
@@ -9070,6 +9337,65 @@ pub const KernelModule = struct {
         var weight_gate_ptr = weight_gate.ptr;
         var weight_up_ptr = weight_up.ptr;
         var activation_u32: u32 = activation;
+        if (rows > 1) {
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1", false)) {
+                if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1) |function| {
+                    var rows_u32 = try toU32(rows);
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_gate_ptr),
+                        @ptrCast(&weight_up_ptr),
+                        @ptrCast(&rows_u32),
+                        @ptrCast(&activation_u32),
+                    };
+                    try launchBlocks(function, ctx, try checkedTensorElements((rows + 15) / 16, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_rows16_threads, &params);
+                    return;
+                }
+            }
+            if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2", false)) {
+                if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2) |function| {
+                    var rows_u32 = try toU32(rows);
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&dst_ptr),
+                        @ptrCast(&input_ptr),
+                        @ptrCast(&weight_gate_ptr),
+                        @ptrCast(&weight_up_ptr),
+                        @ptrCast(&rows_u32),
+                        @ptrCast(&activation_u32),
+                    };
+                    try launchBlocks(function, ctx, try checkedTensorElements((rows + 7) / 8, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+                    return;
+                }
+            }
+            if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4) |function| {
+                var rows_u32 = try toU32(rows);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_gate_ptr),
+                    @ptrCast(&weight_up_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&activation_u32),
+                };
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+                return;
+            }
+            if (self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2) |function| {
+                var rows_u32 = try toU32(rows);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_gate_ptr),
+                    @ptrCast(&weight_up_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&activation_u32),
+                };
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 1) / 2, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+                return;
+            }
+        }
+        const function = self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn orelse return error.CudaKernelUnavailable;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&input_ptr),
@@ -9632,11 +9958,30 @@ pub const KernelModule = struct {
         var weight_q_ptr = weight_q.ptr;
         var weight_k_ptr = weight_k.ptr;
         var weight_v_ptr = weight_v.ptr;
-        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var q_out_dim_u32 = try toU32(q_out_dim);
         var kv_out_dim_u32 = try toU32(kv_out_dim);
+        if (rows > 1) {
+            if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4) |function| {
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_q_ptr),
+                    @ptrCast(&dst_k_ptr),
+                    @ptrCast(&dst_v_ptr),
+                    @ptrCast(&input_ptr),
+                    @ptrCast(&weight_q_ptr),
+                    @ptrCast(&weight_k_ptr),
+                    @ptrCast(&weight_v_ptr),
+                    @ptrCast(&rows_u32),
+                    @ptrCast(&in_dim_u32),
+                    @ptrCast(&q_out_dim_u32),
+                    @ptrCast(&kv_out_dim_u32),
+                };
+                try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), q4_0_tiled_threads_w4, &params);
+                return;
+            }
+        }
+        const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
         var params = [_]?*anyopaque{
             @ptrCast(&dst_q_ptr),
             @ptrCast(&dst_k_ptr),
@@ -10217,6 +10562,7 @@ const q4_0_tiled_threads_w4: usize = 128;
 const q4_0_tiled_threads_w5: usize = 160;
 const q4_0_tiled_threads_w10: usize = 320;
 const q4_0_pair_activation_q8_1_tile32_w5_threads: usize = 640;
+const q4_0_pair_activation_q8_1_tile32_w5_rows16_threads: usize = 512;
 const q4_0_col_tile: usize = 4;
 const q4_0_col_tile8: usize = 8;
 const q4_0_col_tile16: usize = 16;

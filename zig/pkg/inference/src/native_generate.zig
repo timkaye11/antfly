@@ -657,6 +657,21 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer kv_storage.deinit();
     try cb.provisionKvDeviceWriteHook(&kv_storage);
 
+    var cuda_gemma_prefill_prewarm_ms: u64 = 0;
+    if (cudaGemmaPrefillPrewarmEnabled()) {
+        const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
+        const prewarmed = try prewarmCudaGemmaPrefillResidency(
+            allocator,
+            &cb,
+            gpt_config,
+            prompt_tokens,
+        );
+        const prewarm_finished_at = std.Io.Timestamp.now(io, .awake);
+        if (prewarmed) {
+            cuda_gemma_prefill_prewarm_ms = durationMillis(prewarm_started_at, prewarm_finished_at);
+        }
+    }
+
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
     decode_state.kv_storage = &kv_storage;
     const created_decode_state_at = std.Io.Timestamp.now(io, .awake);
@@ -888,6 +903,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(started_at, finished_generate_at),
             },
         );
+        if (cuda_gemma_prefill_prewarm_ms != 0) {
+            print("cuda_gemma_prefill_prewarm_ms: runtime_prepare={d}\n", .{cuda_gemma_prefill_prewarm_ms});
+        }
         const decode_ms = if (result.timing_ms) |timing| timing.decode else durationMillis(created_decode_state_at, finished_generate_at);
         print("decode_tok_per_s={d:.3}\n", .{tokensPerSecond(result.tokens_used, decode_ms)});
         if (build_options.enable_metal and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
@@ -1257,11 +1275,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_scalar={d}\n",
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_scalar={d}\n",
                         .{
                             generate_stats.launch_attention_gqa_decode,
                             generate_stats.launch_attention_gqa_decode_fast,
                             generate_stats.launch_attention_gqa_decode_fast_fallbacks,
+                            generate_stats.launch_attention_gqa_prefill_fast,
+                            generate_stats.launch_attention_gqa_prefill_tiled,
                             generate_stats.launch_attention_gqa_scalar,
                         },
                     );
@@ -1355,6 +1375,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.decode_profile_ffn_post_norm_us,
                             generate_stats.decode_profile_lm_head_argmax_us,
                             generate_stats.decode_profile_graph_replay_us,
+                        },
+                    );
+                    print(
+                        "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d}\n",
+                        .{
+                            generate_stats.prefill_profile_events,
+                            generate_stats.prefill_profile_q4_linear_us,
+                            generate_stats.prefill_profile_q4_qkv_us,
+                            generate_stats.prefill_profile_q4_pair_us,
+                            generate_stats.prefill_profile_q4_gated_down_us,
+                            generate_stats.prefill_profile_bf16_linear_us,
+                            generate_stats.prefill_profile_bf16_qkv_us,
+                            generate_stats.prefill_profile_bf16_pair_us,
+                            generate_stats.prefill_profile_attention_us,
+                            generate_stats.prefill_profile_ple_dense_us,
+                            generate_stats.prefill_profile_staging_us,
+                            generate_stats.prefill_profile_norm_us,
                         },
                     );
                 }
@@ -1498,11 +1535,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_scalar={d}\n",
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_scalar={d}\n",
                     .{
                         cuda_stats.launch_attention_gqa_decode,
                         cuda_stats.launch_attention_gqa_decode_fast,
                         cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
+                        cuda_stats.launch_attention_gqa_prefill_fast,
+                        cuda_stats.launch_attention_gqa_prefill_tiled,
                         cuda_stats.launch_attention_gqa_scalar,
                     },
                 );
@@ -1598,6 +1637,36 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_q4_0_q8_1_prefill_counts: linear={d} linear_rows2={d} linear_rows4={d} linear_rows8_c4={d} linear_e4b_down_rows={d} linear_generic_rows={d} linear_tile8_rows={d} qkv={d} qkv_rows4={d} qkv_tile8_rows={d} qkv_tile8_w8_rows={d} pair={d} pair_rows2={d} pair_rows4={d} pair_rows8_c2={d} pair_rows16_c1={d} pair_generic_rows={d} pair_tile8_rows={d} gated_down={d} gated_down_rows2={d} gated_down_rows4={d} gated_down_rows8_c4={d} gated_down_e4b_down_rows={d} gated_down_generic_rows={d} gated_down_tile8_rows={d}\n",
+                    .{
+                        cuda_stats.q4_0_q8_1_prefill_linear_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_rows2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_rows8_c4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_e4b_down_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_generic_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_linear_tile8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_tile8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_qkv_tile8_w8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows8_c2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_rows16_c1_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_generic_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_pair_tile8_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_rows2_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_rows4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_rows8_c4_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_e4b_down_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_generic_rows_hits,
+                        cuda_stats.q4_0_q8_1_prefill_gated_down_tile8_rows_hits,
+                    },
+                );
+                print(
                     "cuda_linear_pair_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_activation={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fallbacks={d}\n",
                     .{
                         cuda_stats.linear_pair_fused_q8,
@@ -1665,14 +1734,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d}\n",
+                    "cuda_bf16_counts: cublaslt_linear={d} cublaslt_qkv={d} cublaslt_activation_staging={d} cublaslt_activation_mirror={d} cublaslt_fallbacks={d} scalar_linear={d} scalar_qkv={d} rms_norm_bf16_mirror={d}\n",
                     .{
                         cuda_stats.bf16_cublaslt_linear_calls,
                         cuda_stats.bf16_cublaslt_qkv_calls,
                         cuda_stats.bf16_cublaslt_activation_staging_calls,
+                        cuda_stats.bf16_cublaslt_activation_mirror_hits,
                         cuda_stats.bf16_cublaslt_fallbacks,
                         cuda_stats.bf16_scalar_linear_calls,
                         cuda_stats.bf16_scalar_qkv_calls,
+                        cuda_stats.rms_norm_bf16_mirror_hits,
                     },
                 );
                 print(
@@ -2373,6 +2444,38 @@ fn cudaStatsCompactJson(
     try appendFmt(
         allocator,
         &out,
+        \\"prefill_profile_events":{d},
+        \\"prefill_profile_q4_linear_us":{d},
+        \\"prefill_profile_q4_qkv_us":{d},
+        \\"prefill_profile_q4_pair_us":{d},
+        \\"prefill_profile_q4_gated_down_us":{d},
+        \\"prefill_profile_bf16_linear_us":{d},
+        \\"prefill_profile_bf16_qkv_us":{d},
+        \\"prefill_profile_bf16_pair_us":{d},
+        \\"prefill_profile_attention_us":{d},
+        \\"prefill_profile_ple_dense_us":{d},
+        \\"prefill_profile_staging_us":{d},
+        \\"prefill_profile_norm_us":{d},
+        \\
+    ,
+        .{
+            stats.prefill_profile_events,
+            stats.prefill_profile_q4_linear_us,
+            stats.prefill_profile_q4_qkv_us,
+            stats.prefill_profile_q4_pair_us,
+            stats.prefill_profile_q4_gated_down_us,
+            stats.prefill_profile_bf16_linear_us,
+            stats.prefill_profile_bf16_qkv_us,
+            stats.prefill_profile_bf16_pair_us,
+            stats.prefill_profile_attention_us,
+            stats.prefill_profile_ple_dense_us,
+            stats.prefill_profile_staging_us,
+            stats.prefill_profile_norm_us,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
         \\"mtp_preproject_fused_hits":{d},
         \\"mtp_preproject_fused_f32_weight_hits":{d},
         \\"mtp_preproject_fused_bf16_weight_hits":{d},
@@ -2775,6 +2878,8 @@ fn writeJsonTiming(
                 \\"launch_attention_gqa_decode":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_fast":{d},
+                \\"launch_attention_gqa_prefill_tiled":{d},
                 \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
@@ -2791,6 +2896,8 @@ fn writeJsonTiming(
                     cuda_stats.launch_attention_gqa_decode,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_fast,
+                    cuda_stats.launch_attention_gqa_prefill_tiled,
                     cuda_stats.launch_attention_gqa_scalar,
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
@@ -2868,6 +2975,64 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_out,
+                \\"q4_0_q8_1_prefill_linear_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_rows2_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_rows8_c4_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_e4b_down_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_generic_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_linear_tile8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_tile8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_qkv_tile8_w8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows2_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows8_c2_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_rows16_c1_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_generic_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_pair_tile8_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_rows2_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_rows4_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_rows8_c4_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_e4b_down_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_generic_rows_hits":{d},
+                \\"q4_0_q8_1_prefill_gated_down_tile8_rows_hits":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.q4_0_q8_1_prefill_linear_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_rows2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_rows8_c4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_e4b_down_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_generic_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_linear_tile8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_tile8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_qkv_tile8_w8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows8_c2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_rows16_c1_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_generic_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_pair_tile8_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_rows2_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_rows4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_rows8_c4_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_e4b_down_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_generic_rows_hits,
+                    cuda_stats.q4_0_q8_1_prefill_gated_down_tile8_rows_hits,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"lm_head_argmax_fused_q8":{d},
                 \\"lm_head_argmax_fused_q4_0":{d},
                 \\"lm_head_argmax_fused_q4":{d},
@@ -2878,9 +3043,11 @@ fn writeJsonTiming(
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
+                \\"bf16_cublaslt_activation_mirror_hits":{d},
                 \\"bf16_cublaslt_fallbacks":{d},
                 \\"bf16_scalar_linear_calls":{d},
                 \\"bf16_scalar_qkv_calls":{d},
+                \\"rms_norm_bf16_mirror_hits":{d},
                 \\"mtp_verify_commit_device_hits":{d},
                 \\"mtp_verify_commit_device_fallbacks":{d},
                 \\"mtp_verify_commit_result_downloads":{d},
@@ -2898,9 +3065,11 @@ fn writeJsonTiming(
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,
+                    cuda_stats.bf16_cublaslt_activation_mirror_hits,
                     cuda_stats.bf16_cublaslt_fallbacks,
                     cuda_stats.bf16_scalar_linear_calls,
                     cuda_stats.bf16_scalar_qkv_calls,
+                    cuda_stats.rms_norm_bf16_mirror_hits,
                     cuda_stats.mtp_verify_commit_device_hits,
                     cuda_stats.mtp_verify_commit_device_fallbacks,
                     cuda_stats.mtp_verify_commit_result_downloads,
@@ -2967,6 +3136,38 @@ fn writeJsonTiming(
                     cuda_stats.decode_profile_ffn_post_norm_us,
                     cuda_stats.decode_profile_lm_head_argmax_us,
                     cuda_stats.decode_profile_graph_replay_us,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"prefill_profile_events":{d},
+                \\"prefill_profile_q4_linear_us":{d},
+                \\"prefill_profile_q4_qkv_us":{d},
+                \\"prefill_profile_q4_pair_us":{d},
+                \\"prefill_profile_q4_gated_down_us":{d},
+                \\"prefill_profile_bf16_linear_us":{d},
+                \\"prefill_profile_bf16_qkv_us":{d},
+                \\"prefill_profile_bf16_pair_us":{d},
+                \\"prefill_profile_attention_us":{d},
+                \\"prefill_profile_ple_dense_us":{d},
+                \\"prefill_profile_staging_us":{d},
+                \\"prefill_profile_norm_us":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.prefill_profile_events,
+                    cuda_stats.prefill_profile_q4_linear_us,
+                    cuda_stats.prefill_profile_q4_qkv_us,
+                    cuda_stats.prefill_profile_q4_pair_us,
+                    cuda_stats.prefill_profile_q4_gated_down_us,
+                    cuda_stats.prefill_profile_bf16_linear_us,
+                    cuda_stats.prefill_profile_bf16_qkv_us,
+                    cuda_stats.prefill_profile_bf16_pair_us,
+                    cuda_stats.prefill_profile_attention_us,
+                    cuda_stats.prefill_profile_ple_dense_us,
+                    cuda_stats.prefill_profile_staging_us,
+                    cuda_stats.prefill_profile_norm_us,
                 },
             );
             try appendFmt(
@@ -3258,6 +3459,38 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_generate_out,
+                \\"prefill_profile_events":{d},
+                \\"prefill_profile_q4_linear_us":{d},
+                \\"prefill_profile_q4_qkv_us":{d},
+                \\"prefill_profile_q4_pair_us":{d},
+                \\"prefill_profile_q4_gated_down_us":{d},
+                \\"prefill_profile_bf16_linear_us":{d},
+                \\"prefill_profile_bf16_qkv_us":{d},
+                \\"prefill_profile_bf16_pair_us":{d},
+                \\"prefill_profile_attention_us":{d},
+                \\"prefill_profile_ple_dense_us":{d},
+                \\"prefill_profile_staging_us":{d},
+                \\"prefill_profile_norm_us":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.prefill_profile_events,
+                    cuda_stats.prefill_profile_q4_linear_us,
+                    cuda_stats.prefill_profile_q4_qkv_us,
+                    cuda_stats.prefill_profile_q4_pair_us,
+                    cuda_stats.prefill_profile_q4_gated_down_us,
+                    cuda_stats.prefill_profile_bf16_linear_us,
+                    cuda_stats.prefill_profile_bf16_qkv_us,
+                    cuda_stats.prefill_profile_bf16_pair_us,
+                    cuda_stats.prefill_profile_attention_us,
+                    cuda_stats.prefill_profile_ple_dense_us,
+                    cuda_stats.prefill_profile_staging_us,
+                    cuda_stats.prefill_profile_norm_us,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
                 \\"launch_norm":{d},
                 \\"launch_norm_layer":{d},
                 \\"launch_norm_add_layer":{d},
@@ -3271,6 +3504,8 @@ fn writeJsonTiming(
                 \\"launch_attention_gqa_decode":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
+                \\"launch_attention_gqa_prefill_fast":{d},
+                \\"launch_attention_gqa_prefill_tiled":{d},
                 \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
@@ -3300,6 +3535,8 @@ fn writeJsonTiming(
                     cuda_stats.launch_attention_gqa_decode,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
+                    cuda_stats.launch_attention_gqa_prefill_fast,
+                    cuda_stats.launch_attention_gqa_prefill_tiled,
                     cuda_stats.launch_attention_gqa_scalar,
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
@@ -3532,6 +3769,43 @@ fn metalExecutorReuseProbeEnabled() bool {
 fn gemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
+}
+
+fn cudaGemmaPrefillPrewarmEnabled() bool {
+    if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    return envFlagEnabled("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM") or
+        envFlagEnabled("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM");
+}
+
+fn prewarmCudaGemmaPrefillResidency(
+    allocator: std.mem.Allocator,
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    prompt_tokens: usize,
+) !bool {
+    if (cb.kind() != .cuda or gpt_config.family != .gemma or gpt_config.usesMoe()) return false;
+    const configured_layer_count: usize = @intCast(gpt_config.num_hidden_layers);
+    const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+        allocator,
+        gpt_config,
+        prompt_tokens,
+        configured_layer_count,
+    );
+    if (!prepare.prepared) return false;
+
+    const embedding = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
+    defer cb.free(embedding);
+
+    const final_norm = gpt_arch.getModelWeight(cb, gpt_config, "model.norm.weight") catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => null,
+        else => return err,
+    };
+    defer if (final_norm) |weight| cb.free(weight);
+
+    const lm_head = try gpt_arch.getLmHeadWeight(cb, gpt_config);
+    defer cb.free(lm_head);
+    return true;
 }
 
 fn printLiveWholeModelExecutorDetails(runtime_opt: ?*const graph_mod.model_runtime.ModelRuntime) void {

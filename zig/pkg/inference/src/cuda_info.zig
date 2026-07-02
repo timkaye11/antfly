@@ -315,7 +315,7 @@ fn smokeCublasLtBf16(allocator: std.mem.Allocator) !bool {
     try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&input_data));
     try weight.copyFromHost(&ctx, std.mem.sliceAsBytes(&weight_data));
     try module.launchF32ToBf16(&ctx, input_bf16, input, input_data.len);
-    try blas.matmulBf16WeightF32Out(&ctx, output, input_bf16, weight, rows, in_dim, out_dim);
+    try blas.matmulBf16WeightF32Out(&ctx, output, input_bf16, weight, .{}, rows, in_dim, out_dim);
     try ctx.synchronize();
 
     const actual = try allocator.alloc(f32, rows * out_dim);

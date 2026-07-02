@@ -1107,6 +1107,12 @@ fn coalescedPrefillChunkSizeForFirstToken(
     return @max(current_chunk_size, seq_len);
 }
 
+fn schedulerChunkForPrefillIteration(scheduler_chunk: usize, current_chunk_size: usize, first_token_coalesced: bool) usize {
+    if (first_token_coalesced) return current_chunk_size;
+    if (scheduler_chunk > 0) return scheduler_chunk;
+    return current_chunk_size;
+}
+
 pub const DecoderRuntimeDebugStats = struct {
     forward_attempts: u64 = 0,
     flag_disabled: u64 = 0,
@@ -3155,7 +3161,8 @@ pub const NativeGenerationPipeline = struct {
                 current_chunk_size,
                 cudaPrefillFirstTokenCoalesceTokenLimit(),
             );
-            if (coalesced_chunk_size != current_chunk_size) {
+            const first_token_coalesced = coalesced_chunk_size > current_chunk_size;
+            if (first_token_coalesced) {
                 debugFirstToken(
                     "prefill_first_token coalesced_prefill_chunk_size from={d} to={d} seq_len={d}",
                     .{ current_chunk_size, coalesced_chunk_size, seq_len },
@@ -3165,7 +3172,8 @@ pub const NativeGenerationPipeline = struct {
             var processed: usize = 0;
             while (processed < seq_len) {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
-                const chunk_size = @max(@min(current_chunk_size, scheduler_chunk), 1);
+                const iteration_chunk = schedulerChunkForPrefillIteration(scheduler_chunk, current_chunk_size, first_token_coalesced);
+                const chunk_size = @max(@min(current_chunk_size, iteration_chunk), 1);
                 const chunk_end = @min(seq_len, processed + chunk_size);
                 const chunk = prompt_ids[processed..chunk_end];
                 debugGenerationStage(
@@ -8130,6 +8138,12 @@ test "cuda prefill first token coalesces only short eligible prompts" {
     try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 2, false, true, 2, 1, 8));
     try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, true, true, 2, 1, 8));
     try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.native, 1, false, true, 2, 1, 8));
+}
+
+test "cuda first-token coalesced prefill preserves chunk over scheduler lease" {
+    try std.testing.expectEqual(@as(usize, 128), schedulerChunkForPrefillIteration(128, 449, false));
+    try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(128, 449, true));
+    try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(0, 449, false));
 }
 
 test "native generation suppress token mask removes configured logits" {

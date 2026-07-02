@@ -5152,7 +5152,7 @@ fn decoderBlock(
     var qk_already_roped = false;
     var fused_q_rope: ?CT = null;
     var fused_k_rope: ?CT = null;
-    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and total == 1) fused_blk: {
+    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
         const rope_dim = config.layerRopeActiveDim(layer);
         const rope_theta = blk: {
             const base_theta = config.layerRopeTheta(layer);

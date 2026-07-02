@@ -76,6 +76,8 @@ Environment overrides:
   E4B_QAT_REQUIRE_FUSED         1 to require Q4_0 fused CUDA counters (default: 1)
   E4B_QAT_Q4_0_GATED_DOWN_TILE8 1 to enable Q4_0 gated-down tile8 for QAT (default: 0)
   E4B_QAT_REQUIRE_GATED_DOWN_TILE8 1 to require gated-down tile8 hits (default: follows enable)
+  E4B_QAT_Q4_0_LINEAR_Q8_1_ROWS8_C4 1 to enable rows8/c4 Q4_0 row-prefill linear kernels (default: 1)
+  E4B_QAT_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1 1 to enable rows16/c1 Q4_0 FFN pair prefill kernels (default: 1)
   E4B_QAT_Q4_0_PLE_GATE_FUSION 1 to enable Q4_0 fused PLE gate projection (default: 1)
   E4B_QAT_PLE_RMS_EMBED_FUSION 1 to enable fused PLE RMS/embed construction (default: 0)
   E4B_QAT_REQUIRE_FAST_GQA      1 to require fast f32 GQA decode counters (default: 1)
@@ -96,6 +98,7 @@ Environment overrides:
   E4B_QAT_CAPTURE_MIN_ALLOC_SEQ delayed capture warmup allocation sequence (default: 3363)
   E4B_QAT_FORCE_KV_CAPACITY     forced graph replay KV capacity tokens (default: 544)
   E4B_QAT_FAST_Q4_0_ENV         enable QAT CUDA DP4A/Q8_1 fast env bundle (default: 1)
+  E4B_QAT_CUDA_GEMMA_PREFILL_PREWARM move QAT CUDA residency before measured prefill (default: 1)
   GEMMA12B_Q4_MODEL             Gemma4 12B Q4 model path/directory
   LONG_CONTEXT_TOKENS           full-mode E2B polar4 stress tokens (default: 512)
   REQUIRE_SPEED_THRESHOLDS      1 to enforce tok/s floors (default: full only)
@@ -229,6 +232,8 @@ e4b_q4k_resident_decode_graph_replay="${E4B_Q4K_RESIDENT_DECODE_GRAPH_REPLAY:-re
 e4b_qat_require_fused="${E4B_QAT_REQUIRE_FUSED:-1}"
 e4b_qat_q4_0_gated_down_tile8="${E4B_QAT_Q4_0_GATED_DOWN_TILE8:-0}"
 e4b_qat_require_gated_down_tile8="${E4B_QAT_REQUIRE_GATED_DOWN_TILE8:-$e4b_qat_q4_0_gated_down_tile8}"
+e4b_qat_q4_0_linear_q8_1_rows8_c4="${E4B_QAT_Q4_0_LINEAR_Q8_1_ROWS8_C4:-1}"
+e4b_qat_q4_0_pair_activation_q8_1_rows16_c1="${E4B_QAT_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1:-1}"
 e4b_qat_q4_0_ple_gate_fusion="${E4B_QAT_Q4_0_PLE_GATE_FUSION:-1}"
 e4b_qat_ple_rms_embed_fusion="${E4B_QAT_PLE_RMS_EMBED_FUSION:-0}"
 e4b_qat_require_fast_gqa="${E4B_QAT_REQUIRE_FAST_GQA:-1}"
@@ -249,6 +254,7 @@ e4b_qat_capture_allow_unpinned="${E4B_QAT_CAPTURE_ALLOW_UNPINNED:-1}"
 e4b_qat_capture_min_alloc_seq="${E4B_QAT_CAPTURE_MIN_ALLOC_SEQ:-3363}"
 e4b_qat_force_kv_capacity="${E4B_QAT_FORCE_KV_CAPACITY:-544}"
 e4b_qat_fast_q4_0_env="${E4B_QAT_FAST_Q4_0_ENV:-1}"
+e4b_qat_cuda_gemma_prefill_prewarm="${E4B_QAT_CUDA_GEMMA_PREFILL_PREWARM:-1}"
 min_e4b_qat_tok_s="${MIN_E4B_QAT_TOK_S:-24.0}"
 min_e4b_qat_run_tok_s="${MIN_E4B_QAT_RUN_TOK_S:-24.0}"
 min_e4b_qat_long_tok_s="${MIN_E4B_QAT_LONG_TOK_S:-15.0}"
@@ -374,6 +380,7 @@ e4b_qat_cuda_env() {
     ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="$e4b_qat_pending_token_readback"
     ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION=1
     ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK=12
+    ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM="$e4b_qat_cuda_gemma_prefill_prewarm"
   )
   case "$e4b_qat_fast_q4_0_env" in
     0|false|False|off|OFF|no|NO)
@@ -383,6 +390,8 @@ e4b_qat_cuda_env() {
         ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1
         ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1
         ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM=2048
+        ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4="$e4b_qat_q4_0_linear_q8_1_rows8_c4"
         ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1
         ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1
         ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A=1
@@ -390,6 +399,8 @@ e4b_qat_cuda_env() {
         ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1
         ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1
         ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2=1
+        ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS16_C1="$e4b_qat_q4_0_pair_activation_q8_1_rows16_c1"
         ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1
         ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A=1
         ANTFLY_INFERENCE_CUDA_Q6_K_LM_HEAD_Q8_1=1
