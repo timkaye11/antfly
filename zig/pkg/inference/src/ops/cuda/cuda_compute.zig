@@ -4900,6 +4900,26 @@ fn debugCudaGraphPrepareDecodeScalars(
             }
         }
         const slot = &self.debug_cuda_graph_slots[slot_idx];
+        // Scalar jump (e.g. a sliding-window block trim shifted the KV view):
+        // resync by uploading the pre-advance values so the captured graph's
+        // advance node lands exactly on this token's scalars. Keeps the exec
+        // and auto-advance replay alive; costs one host upload per jump.
+        if (decodeScalarsCanPreAdvance(scalars, slot.decode_scalars_auto_advance_delta)) {
+            var pre_advance = scalars;
+            inline for (0..5) |idx| pre_advance[idx] -= slot.decode_scalars_auto_advance_delta[idx];
+            try uploadDecodeScalars(self, pre_advance);
+            self.debug_cuda_decode_scalars_host = scalars;
+            self.debug_cuda_decode_scalars_host_valid = true;
+            self.debug_cuda_decode_scalars_upload_deferred = true;
+            if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+                std.log.info("cuda_graph_capture_probe: auto_decode_scalars_resync slot={d} expected={any} actual={any}", .{
+                    slot_idx,
+                    expected_before_reset,
+                    scalars,
+                });
+            }
+            return true;
+        }
         const mode_transition_supported = if (self.debug_cuda_decode_scalars_device_valid)
             if (decodeScalarsAutoAdvanceDeltaBetween(self.debug_cuda_decode_scalars_device, scalars)) |delta|
                 decodeScalarsAutoAdvanceDeltaSupported(delta)

@@ -1355,8 +1355,19 @@ pub const NativeDecodeState = struct {
             self.setPagedKvView(current_kv_tokens, self.total_tokens - current_kv_tokens);
             return;
         }
-        const keep_tokens = self.kvSlidingWindowTokens() orelse self.total_tokens;
-        const kv_tokens = @min(self.total_tokens, keep_tokens);
+        // The sliding-window trim drops whole KV pages, so the view must
+        // track the tokens actually retained (block-aligned), not the exact
+        // window size. Kernels index the compacted block table with
+        // view-relative positions: a token-granular offset here would
+        // misalign every physical KV read and write by (offset % page_size).
+        // The attention kernels apply the exact sliding window themselves.
+        const retained_tokens = blk: {
+            if (self.kvSlidingWindowTokens() == null) break :blk self.total_tokens;
+            const manager = self.kv_manager orelse break :blk self.total_tokens;
+            const sequence_id = self.sequence_id orelse break :blk self.total_tokens;
+            break :blk manager.tokenCount(sequence_id) orelse self.total_tokens;
+        };
+        const kv_tokens = @min(self.total_tokens, retained_tokens);
         self.setPagedKvView(kv_tokens, self.total_tokens - kv_tokens);
     }
 
