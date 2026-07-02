@@ -6242,12 +6242,12 @@ pub const KernelModule = struct {
         var shared_bytes: c_uint = 0;
         if (launch_kind == .prefill_tiled) {
             // Tiled prefill: grid = (num_heads, ceil(q_seq_len / TILE_M)), TILE_M = 16.
-            // Dynamic smem holds one K/V tile: tile_n * (head_dim + 1) floats.
+            // Dynamic smem holds one BF16 K/V tile: tile_n * (head_dim + 2) * 2 bytes.
             block = 256;
             grid_x = try toU32(num_heads);
             grid_y = try toU32((q_seq_len + 15) / 16);
             const tile_n: usize = if (head_dim <= 256) 32 else 16;
-            shared_bytes = try toU32(tile_n * (head_dim + 1) * @sizeOf(f32));
+            shared_bytes = try toU32(tile_n * (head_dim + 2) * @sizeOf(u16));
         }
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(

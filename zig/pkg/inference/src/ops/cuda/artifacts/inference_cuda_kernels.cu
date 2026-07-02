@@ -4091,12 +4091,18 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(
 
 // Tiled prefill attention over turboquant pages. Each warp owns TWO query
 // rows (TILE_M = 16 rows per block, 8 warps) so every K/V element staged
-// through shared memory feeds two FMAs, halving smem traffic. Keys are
-// staged in TILE_N chunks so each K/V row is decoded once per block.
+// through shared memory feeds two FMAs. K/V tiles are staged as BF16
+// (bit-shift exact to read back), halving shared-memory footprint and
+// bank traffic versus F32 tiles. Keys are staged in TILE_N chunks so each
+// K/V row is decoded once per block.
 // Grid: (num_heads, ceil(q_seq_len / TILE_M)); blockDim.x = 256.
-// Dynamic shared memory: tile_n * (head_dim + 1) * 4 bytes, where
+// Dynamic shared memory: tile_n * (head_dim + 2) * 2 bytes, where
 // tile_n = 32 for head_dim <= 256 and 16 for head_dim <= 512.
 #define TERMITE_TQ_PREFILL_TILE_M 16u
+
+__device__ __forceinline__ float termite_bf16_bits_to_f32(unsigned short bits) {
+    return __uint_as_float(((unsigned int)bits) << 16);
+}
 
 extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
     float* dst,
@@ -4134,7 +4140,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
     (void)decode_scalars;
 
     const float neg_inf = -3.402823466e+38f;
-    extern __shared__ float kv_tile[];
+    extern __shared__ unsigned short kv_tile[];
     __shared__ float p_tile[TERMITE_TQ_PREFILL_TILE_M][32];
     __shared__ unsigned int tile_phys[32];
 
@@ -4153,7 +4159,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
         value_row_bytes == 0u) return;
 
     unsigned int tile_n = head_dim <= 256u ? 32u : 16u;
-    unsigned int row_pitch = head_dim + 1u;
+    unsigned int row_pitch = head_dim + 2u;
 
     unsigned int head = blockIdx.x;
     unsigned int tile_row_start = blockIdx.y * TERMITE_TQ_PREFILL_TILE_M;
@@ -4262,7 +4268,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
                     ? termite_tq_decode_polar4_at(k_row, value_index)
                     : termite_tq_f16_value(k_row, value_index);
             }
-            kv_tile[row * row_pitch + col] = key_value;
+            kv_tile[row * row_pitch + col] = termite_f32_to_bf16(key_value);
         }
         __syncthreads();
 
@@ -4279,12 +4285,12 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
         bool in_tile = key_lane < n_count && tile_phys[key_lane] != 0xffffffffu;
         float dot0 = 0.0f;
         float dot1 = 0.0f;
-        const float* k_vec = &kv_tile[key_lane * row_pitch] + d_begin;
+        const unsigned short* k_vec = &kv_tile[key_lane * row_pitch] + d_begin;
         const float* q_ptr0 = q_row0 + d_begin;
         const float* q_ptr1 = q_row1 + d_begin;
         #pragma unroll 4
         for (unsigned int d = 0u; d < d_count; ++d) {
-            float kd = k_vec[d];
+            float kd = termite_bf16_bits_to_f32(k_vec[d]);
             dot0 += q_ptr0[d] * kd;
             dot1 += q_ptr1[d] * kd;
         }
@@ -4344,7 +4350,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
                 const unsigned char* v_row = v + (size_t)phys * value_row_bytes;
                 value = termite_tq_value_at(v_row, kv_head, col, head_dim, value_format);
             }
-            kv_tile[row * row_pitch + col] = value;
+            kv_tile[row * row_pitch + col] = termite_f32_to_bf16(value);
         }
         __syncthreads();
 
@@ -4353,9 +4359,9 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(
             float pj0 = p_tile[warp * 2u][j];
             float pj1 = p_tile[warp * 2u + 1u][j];
             if (pj0 != 0.0f || pj1 != 0.0f) {
-                const float* v_vec = &kv_tile[j * row_pitch];
+                const unsigned short* v_vec = &kv_tile[j * row_pitch];
                 for (unsigned int e = 0u; e < hd_chunks; ++e) {
-                    float ve = v_vec[lane + (e << 5)];
+                    float ve = termite_bf16_bits_to_f32(v_vec[lane + (e << 5)]);
                     acc0[e] += pj0 * ve;
                     acc1[e] += pj1 * ve;
                 }
