@@ -45,6 +45,7 @@ const CT = ops.CT;
 pub const CudaTensor = struct {
     buffer: buffer_mod.DeviceBuffer,
     bf16_mirror: buffer_mod.DeviceBuffer = .{},
+    q8_mirror: buffer_mod.DeviceBuffer = .{},
     dtype: tensor_mod.DType,
     shape: []i64,
     elem_count: usize,
@@ -52,6 +53,7 @@ pub const CudaTensor = struct {
     tc_quant: ?CudaTensorCoreQuantBuffer = null,
     owns_buffer: bool = true,
     owns_bf16_mirror: bool = true,
+    owns_q8_mirror: bool = true,
     owns_shape: bool = true,
     owned_by_tensor: bool = true,
 };
@@ -576,6 +578,8 @@ pub const RuntimeStats = struct {
     bf16_scalar_linear_calls: usize = 0,
     bf16_scalar_qkv_calls: usize = 0,
     rms_norm_bf16_mirror_hits: usize = 0,
+    rms_norm_q8_mirror_hits: usize = 0,
+    q8_quantize_skips: usize = 0,
     qkv_fallback_unsupported: usize = 0,
     qkv_kernel_unavailable: usize = 0,
     q4k_decode_fast_hits: usize = 0,
@@ -888,6 +892,7 @@ pub const CudaCompute = struct {
             tensor.owns_buffer = true;
             tensor.owns_shape = true;
             tensor.owns_bf16_mirror = true;
+            tensor.owns_q8_mirror = true;
             freeCudaTensorStorage(self, &tensor);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -2626,6 +2631,7 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
         cuda_tensor.tc_quant = null;
     }
     if (cuda_tensor.owns_bf16_mirror) releaseDeviceBuffer(self, &cuda_tensor.bf16_mirror);
+    if (cuda_tensor.owns_q8_mirror) releaseDeviceBuffer(self, &cuda_tensor.q8_mirror);
     if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
 }
@@ -2641,6 +2647,10 @@ fn freeCudaTensorStorageUncached(self: *CudaCompute, cuda_tensor: *CudaTensor) v
     if (cuda_tensor.owns_bf16_mirror and cuda_tensor.bf16_mirror.ptr != 0) {
         self.stats.device_free_calls += 1;
         cuda_tensor.bf16_mirror.free(&self.ctx);
+    }
+    if (cuda_tensor.owns_q8_mirror and cuda_tensor.q8_mirror.ptr != 0) {
+        self.stats.device_free_calls += 1;
+        cuda_tensor.q8_mirror.free(&self.ctx);
     }
     if (cuda_tensor.owns_buffer and cuda_tensor.buffer.ptr != 0) {
         self.stats.device_free_calls += 1;
@@ -3733,6 +3743,23 @@ fn stageBf16ActivationForCublasLt(
     return scratch;
 }
 
+fn cudaRmsNormQ8MirrorEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RMS_NORM_Q8_1_MIRROR", false);
+}
+
+// Q8_1 activation mirror: a norm kernel pre-quantized its output row, so a
+// Q4/Q6 DP4A matmul can consume it directly instead of launching a separate
+// quantize kernel. Blocks are position-independent per 32 contiguous values,
+// so validity only needs the element count to match.
+fn tensorQ8MirrorForInput(input: *const CudaTensor, rows: usize, in_dim: usize) ?buffer_mod.DeviceBuffer {
+    if (input.q8_mirror.ptr == 0) return null;
+    if (input.dtype != .f32 or input.quant_type != null) return null;
+    const count = rows * in_dim;
+    if (input.elem_count != count or count % 32 != 0) return null;
+    if (input.q8_mirror.len < (count / 32) * 36) return null;
+    return input.q8_mirror;
+}
+
 // Hybrid-residency dispatch: for a Q4- or F32-resident weight carrying a
 // BF16 mirror, return the mirror when the matmul is prefill-shaped
 // (rows > 1) so cuBLASLt handles it; decode (rows == 1) stays on the
@@ -4457,6 +4484,7 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     var borrowed = tensor.*;
     borrowed.owns_buffer = false;
     borrowed.owns_bf16_mirror = false;
+    borrowed.owns_q8_mirror = false;
     borrowed.owns_shape = false;
     borrowed.owned_by_tensor = false;
     return borrowed;
@@ -5832,6 +5860,25 @@ fn createTensorWithDTypeAndBf16Mirror(
     tensor.* = .{
         .buffer = device,
         .bf16_mirror = bf16_mirror,
+        .dtype = dtype,
+        .shape = shape,
+        .elem_count = elem_count,
+    };
+    return tensor;
+}
+
+fn createTensorWithDTypeAndQ8Mirror(
+    self: *CudaCompute,
+    device: buffer_mod.DeviceBuffer,
+    q8_mirror: buffer_mod.DeviceBuffer,
+    shape: []i64,
+    elem_count: usize,
+    dtype: tensor_mod.DType,
+) !CT {
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = device,
+        .q8_mirror = q8_mirror,
         .dtype = dtype,
         .shape = shape,
         .elem_count = elem_count,
@@ -7448,6 +7495,7 @@ fn tryLaunchLinearQ4_0Q8_1Dp4a(
     self: *CudaCompute,
     device: buffer_mod.DeviceBuffer,
     input: buffer_mod.DeviceBuffer,
+    q8_pre: ?buffer_mod.DeviceBuffer,
     weight: buffer_mod.DeviceBuffer,
     rows: usize,
     in_dim: usize,
@@ -7460,15 +7508,21 @@ fn tryLaunchLinearQ4_0Q8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
-        else => return err,
-    };
-    defer releaseDeviceBuffer(self, &q8_input);
-
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
+    var q8_scratch = buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &q8_scratch);
+    const q8_input = if (q8_pre) |pre| blk: {
+        self.stats.q8_quantize_skips += 1;
+        break :blk pre;
+    } else blk: {
+        q8_scratch = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => return false,
+            else => return err,
+        };
+        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_scratch, input, rows, in_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+        break :blk q8_scratch;
     };
     var launched_tile8 = false;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
@@ -7505,6 +7559,7 @@ fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
     device_a: buffer_mod.DeviceBuffer,
     device_b: buffer_mod.DeviceBuffer,
     input: buffer_mod.DeviceBuffer,
+    q8_pre: ?buffer_mod.DeviceBuffer,
     weight_a: buffer_mod.DeviceBuffer,
     weight_b: buffer_mod.DeviceBuffer,
     rows: usize,
@@ -7518,15 +7573,21 @@ fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
-        else => return err,
-    };
-    defer releaseDeviceBuffer(self, &q8_input);
-
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
+    var q8_scratch = buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &q8_scratch);
+    const q8_input = if (q8_pre) |pre| blk: {
+        self.stats.q8_quantize_skips += 1;
+        break :blk pre;
+    } else blk: {
+        q8_scratch = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => return false,
+            else => return err,
+        };
+        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_scratch, input, rows, in_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+        break :blk q8_scratch;
     };
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0PairQ8_1Tile8Enabled()) {
@@ -7558,6 +7619,7 @@ fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
     k_device: buffer_mod.DeviceBuffer,
     v_device: buffer_mod.DeviceBuffer,
     input: buffer_mod.DeviceBuffer,
+    q8_pre: ?buffer_mod.DeviceBuffer,
     q_weight: buffer_mod.DeviceBuffer,
     k_weight: buffer_mod.DeviceBuffer,
     v_weight: buffer_mod.DeviceBuffer,
@@ -7573,15 +7635,21 @@ fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
-        else => return err,
-    };
-    defer releaseDeviceBuffer(self, &q8_input);
-
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
+    var q8_scratch = buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &q8_scratch);
+    const q8_input = if (q8_pre) |pre| blk: {
+        self.stats.q8_quantize_skips += 1;
+        break :blk pre;
+    } else blk: {
+        q8_scratch = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => return false,
+            else => return err,
+        };
+        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_scratch, input, rows, in_dim) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => return false,
+            else => return err,
+        };
+        break :blk q8_scratch;
     };
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0QkvQ8_1Tile8Enabled()) {
@@ -7774,7 +7842,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q8_0, .q8_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 .Q4_0 => {
-                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor.buffer, tensorQ8MirrorForInput(input_tensor, rows, in_dim), weight_tensor.buffer, rows, in_dim, out_dim)) {
                         // Prototype path is still reported as the Q4_0 SIMT backend until it proves out.
                     } else if (rows == 1 and cudaQ4_0LinearTile8Enabled()) {
                         self.kernels.launchLinearQ4_0Tile8F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile8_err| switch (tile8_err) {
@@ -9221,6 +9289,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             k_device,
             v_device,
             input_tensor.buffer,
+            tensorQ8MirrorForInput(input_tensor, rows, in_dim),
             q_weight_tensor.buffer,
             k_weight_tensor.buffer,
             v_weight_tensor.buffer,
@@ -9659,6 +9728,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             device_a,
             device_b,
             input_tensor.buffer,
+            tensorQ8MirrorForInput(input_tensor, rows, in_dim),
             weight_a_tensor.buffer,
             weight_b_tensor.buffer,
             rows,
@@ -10269,6 +10339,28 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
                 self.stats.rms_norm_bf16_mirror_hits += 1;
                 errdefer bf16_mirror.free(&self.ctx);
                 return createTensorWithDTypeAndBf16Mirror(self, device, bf16_mirror, shape, input_tensor.elem_count, .f32);
+            }
+        }
+    }
+    if (cudaRmsNormQ8MirrorEnabled() and dim % 32 == 0 and input_tensor.elem_count % 32 == 0) {
+        var q8_mirror = allocDeviceBuffer(self, (input_tensor.elem_count / 32) * 36) catch buffer_mod.DeviceBuffer{};
+        if (q8_mirror.ptr != 0) {
+            const launched_q8 = blk: {
+                self.kernels.launchRmsNormF32Q8_1(&self.ctx, device, q8_mirror, input_tensor.buffer, weight_tensor.buffer, input_tensor.elem_count / dim, dim, eps) catch |err| {
+                    q8_mirror.free(&self.ctx);
+                    switch (err) {
+                        error.CudaKernelUnavailable => break :blk false,
+                        else => return err,
+                    }
+                };
+                break :blk true;
+            };
+            if (launched_q8) {
+                self.stats.launch_norm += 1;
+                self.stats.launch_norm_rms += 1;
+                self.stats.rms_norm_q8_mirror_hits += 1;
+                errdefer q8_mirror.free(&self.ctx);
+                return createTensorWithDTypeAndQ8Mirror(self, device, q8_mirror, shape, input_tensor.elem_count, .f32);
             }
         }
     }
@@ -13059,17 +13151,23 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     var projected_owned = false;
     errdefer if (!projected_owned) projected_device.free(&self.ctx);
 
-    var q8_hidden = allocDeviceBuffer(self, hidden_q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => {
-            releaseDeviceBuffer(self, &projected_device);
-            projected_owned = true;
-            self.allocator.free(shape);
-            shape_owned = true;
-            return null;
-        },
-        else => return err,
-    };
-    defer releaseDeviceBuffer(self, &q8_hidden);
+    const q8_hidden_pre = tensorQ8MirrorForInput(input_tensor, rows, request.hidden_size);
+    var q8_hidden_scratch = buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &q8_hidden_scratch);
+    if (q8_hidden_pre == null) {
+        q8_hidden_scratch = allocDeviceBuffer(self, hidden_q8_bytes) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc => {
+                releaseDeviceBuffer(self, &projected_device);
+                projected_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => return err,
+        };
+    }
+    const q8_hidden = q8_hidden_pre orelse q8_hidden_scratch;
+    if (q8_hidden_pre != null) self.stats.q8_quantize_skips += 1;
 
     var q8_activated = allocDeviceBuffer(self, activated_q8_bytes) catch |err| switch (err) {
         error.CudaGraphCaptureUnsafeTempAlloc => {
@@ -13083,16 +13181,18 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     };
     defer releaseDeviceBuffer(self, &q8_activated);
 
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_hidden, input_tensor.buffer, rows, request.hidden_size) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => {
-            projected_device.free(&self.ctx);
-            projected_owned = true;
-            self.allocator.free(shape);
-            shape_owned = true;
-            return null;
-        },
-        else => return err,
-    };
+    if (q8_hidden_pre == null) {
+        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_hidden, input_tensor.buffer, rows, request.hidden_size) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                projected_device.free(&self.ctx);
+                projected_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => return err,
+        };
+    }
     const pair_prefill_variant = self.kernels.q4_0PairActivationQ8_1Tile32W5E4BPrefillRowsVariant(rows);
     var pair_profile_scope = beginPrefillProfile(self, .q4_pair, rows);
     self.kernels.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(

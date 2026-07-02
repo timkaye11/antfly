@@ -1427,6 +1427,62 @@ extern "C" __global__ void termite_rms_norm_f32_bf16(
     }
 }
 
+// RMSNorm that also emits the row pre-quantized as Q8_1 blocks (36 bytes:
+// f16 scale, 2 pad, 32 int8) so Q4/Q6 DP4A matmuls can skip the separate
+// termite_quantize_f32_q8_1_rows launch. Quantization math matches that
+// kernel exactly so results are bit-identical. Because threads stride the
+// row, each warp's 32 lanes hold exactly one Q8 block per iteration, so
+// quantization folds into the store loop with no staging or extra syncs.
+// Requires dim % 32 == 0 and blockDim.x % 32 == 0.
+extern "C" __global__ void termite_rms_norm_f32_q8_1(
+    float* dst,
+    unsigned char* dst_q8,
+    const float* input,
+    const float* weight,
+    unsigned int rows,
+    unsigned int dim,
+    float eps
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows || (dim & 31u) != 0u || (blockDim.x & 31u) != 0u) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    const unsigned int base = row * dim;
+    const unsigned int row_blocks = dim >> 5;
+    __shared__ float partial[256];
+    float sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        float x = input[base + i];
+        sumsq += x * x;
+    }
+    partial[tid] = sumsq;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)dim + eps);
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        unsigned int idx = base + i;
+        float value = input[idx] * scale * weight[i];
+        dst[idx] = value;
+        float amax = termite_warp_reduce_max_f32(fabsf(value));
+        float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        int q = 0;
+        if (d > 0.0f) {
+            q = __float2int_rn(value / d);
+            q = max(-127, min(127, q));
+        }
+        unsigned char* bp = dst_q8 + ((unsigned long long)row * row_blocks + (i >> 5)) * 36u;
+        bp[4u + lane] = (unsigned char)(signed char)q;
+        if (lane == 0u) {
+            termite_store_half_bytes(bp, d);
+            bp[2u] = 0u;
+            bp[3u] = 0u;
+        }
+    }
+}
+
 extern "C" __global__ void termite_rms_norm_add_f32(
     float* dst,
     const float* input,

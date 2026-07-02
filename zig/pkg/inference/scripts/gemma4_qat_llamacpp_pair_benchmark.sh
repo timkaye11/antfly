@@ -47,6 +47,8 @@ Environment overrides:
                           1 to let RMSNorm write a BF16 activation mirror for cuBLASLt staging reuse (default: 0)
   ANTFLY_GQA_PREFILL_TILED
                           1 to use the tiled turboquant prefill attention kernel (default: 0)
+  ANTFLY_RMS_NORM_Q8_1_MIRROR
+                          1 to let RMSNorm emit a pre-quantized Q8_1 copy consumed by DP4A matmuls (default: 0)
   ANTFLY_BF16_RESIDENT_WEIGHTS
                           1 to dequantize Q4_0 matrix weights to BF16 at upload (BF16-resident prefill path) (default: 0)
   ANTFLY_HYBRID_BF16_PREFILL
@@ -107,6 +109,7 @@ antfly_cuda_prefill_first_token="${ANTFLY_CUDA_PREFILL_FIRST_TOKEN:-1}"
 antfly_cuda_prefill_first_token_coalesce_tokens="${ANTFLY_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS:-2048}"
 antfly_cuda_profile_prefill_ops="${ANTFLY_CUDA_PROFILE_PREFILL_OPS:-0}"
 antfly_rms_norm_bf16_mirror="${ANTFLY_RMS_NORM_BF16_MIRROR:-0}"
+antfly_rms_norm_q8_1_mirror="${ANTFLY_RMS_NORM_Q8_1_MIRROR:-0}"
 antfly_bf16_resident_weights="${ANTFLY_BF16_RESIDENT_WEIGHTS:-0}"
 antfly_hybrid_bf16_prefill="${ANTFLY_HYBRID_BF16_PREFILL:-0}"
 antfly_ple_model_proj_bf16="${ANTFLY_PLE_MODEL_PROJ_BF16:-$antfly_bf16_resident_weights}"
@@ -202,6 +205,7 @@ common_antfly_env=(
   ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS="$antfly_cuda_prefill_first_token_coalesce_tokens"
   ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS="$antfly_cuda_profile_prefill_ops"
   ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR="$antfly_rms_norm_bf16_mirror"
+  ANTFLY_INFERENCE_CUDA_RMS_NORM_Q8_1_MIRROR="$antfly_rms_norm_q8_1_mirror"
   ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16="$antfly_bf16_resident_weights"
   ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL="$antfly_hybrid_bf16_prefill"
   ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16="$antfly_ple_model_proj_bf16"
