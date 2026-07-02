@@ -570,6 +570,7 @@ pub const GatedFrameLayerWindow = struct {
 pub const GatedFrameTailWindow = struct {
     start: usize,
     logits_end: usize,
+    end: usize,
 };
 
 pub const GatedFramePlanCursor = struct {
@@ -633,7 +634,7 @@ pub const GatedFramePlanCursor = struct {
         const logits_end = index;
         if (self.expectAt(index, .tail_argmax)) index += 1;
         self.next_index = index;
-        return .{ .start = start, .logits_end = logits_end };
+        return .{ .start = start, .logits_end = logits_end, .end = index };
     }
 
     pub fn complete(self: *const GatedFramePlanCursor) bool {
@@ -3251,8 +3252,10 @@ test "metal command planner builds quantized prefill graph command plan before e
     const tail_window = cursor.nextTailLogits() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 29), tail_window.start);
     try std.testing.expectEqual(@as(usize, 31), tail_window.logits_end);
+    try std.testing.expectEqual(@as(usize, 32), tail_window.end);
     try std.testing.expectEqual(OpKind.tail_final_norm, view.ops[tail_window.start].kind);
     try std.testing.expectEqual(OpKind.tail_lm_head, view.ops[tail_window.logits_end - 1].kind);
+    try std.testing.expectEqual(OpKind.tail_argmax, view.ops[tail_window.end - 1].kind);
     try std.testing.expect(cursor.complete());
     var found_logits = false;
     for (view.scratch_slots) |scratch| {

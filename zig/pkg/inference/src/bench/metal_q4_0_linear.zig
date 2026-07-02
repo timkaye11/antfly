@@ -62,6 +62,8 @@ const Mode = enum {
 
 const Config = struct {
     mode: Mode = .linear,
+    rows: usize = 1,
+    weight_slots: usize = 1,
     in_dim: usize = 2048,
     out_dim: usize = 2048,
     kv_out_dim: usize = 512,
@@ -98,6 +100,11 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         i += 1;
         if (std.mem.eql(u8, arg, "--mode")) {
             cfg.mode = try Mode.parse(value);
+        } else if (std.mem.eql(u8, arg, "--rows")) {
+            cfg.rows = try parsePositiveUsize(value);
+        } else if (std.mem.eql(u8, arg, "--weight-slots")) {
+            cfg.weight_slots = try parsePositiveUsize(value);
+            if (cfg.weight_slots > 64) return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--in")) {
             cfg.in_dim = try parsePositiveUsize(value);
         } else if (std.mem.eql(u8, arg, "--out")) {
@@ -119,6 +126,7 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if ((cfg.mode == .q6_linear or cfg.mode == .q6_argmax) and cfg.in_dim % 256 != 0) return error.InvalidArgument;
     if (cfg.mode == .head_rope and (cfg.out_dim == 0 or cfg.in_dim % cfg.out_dim != 0 or cfg.kv_out_dim > cfg.out_dim)) return error.InvalidArgument;
     if (cfg.mode != .linear and cfg.kv_out_dim == 0) return error.InvalidArgument;
+    if (cfg.rows != 1 and cfg.mode != .linear and cfg.mode != .q6_linear) return error.InvalidArgument;
     return cfg;
 }
 
@@ -319,6 +327,7 @@ fn applyOnce(
     input: MetalTensor,
     in_dim: usize,
     out_dim: usize,
+    weight_slots: usize,
     outputs: []MetalTensor,
 ) !u64 {
     const start = nowNanos();
@@ -327,7 +336,7 @@ fn applyOnce(
     errdefer for (outputs[0..produced]) |*output| output.deinit();
     while (produced < outputs.len) : (produced += 1) {
         outputs[produced] = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
-            .slot = 0,
+            .slot = produced % @max(weight_slots, 1),
             .input = input,
             .in_dim = in_dim,
             .out_dim = out_dim,
@@ -539,6 +548,7 @@ fn applyFfnOnce(
             .intermediate_size = cfg.out_dim,
             .activation = @as(ops.DecoderRuntimeActivationKind, .gelu),
             .eps = 1e-5,
+            .pre_gate_rms_norm_slot = @as(?usize, 0),
             .post_gate_rms_norm_slot = null,
             .post_down_rms_norm_slot = @as(?usize, 0),
         }, input, input, &stats)) orelse return error.LinearDispatchFailed;
@@ -605,6 +615,19 @@ pub fn main(init: std.process.Init) !void {
         else => try prepareQ4_0LinearSlot(allocator, &provider, 0, cfg.in_dim, cfg.out_dim, &stats),
     };
     defer slot0.deinit(allocator);
+    var extra_weight_slots: [64]?PreparedQuantSlot = @splat(null);
+    defer for (&extra_weight_slots) |*maybe_slot| {
+        if (maybe_slot.*) |*slot| slot.deinit(allocator);
+    };
+    if (cfg.weight_slots > 1 and (cfg.mode == .linear or cfg.mode == .q6_linear)) {
+        var slot_index: usize = 1;
+        while (slot_index < cfg.weight_slots) : (slot_index += 1) {
+            extra_weight_slots[slot_index] = switch (cfg.mode) {
+                .q6_linear => try prepareQ6_KLinearSlot(allocator, &provider, slot_index, cfg.in_dim, cfg.out_dim, &stats),
+                else => try prepareQ4_0LinearSlot(allocator, &provider, slot_index, cfg.in_dim, cfg.out_dim, &stats),
+            };
+        }
+    }
     var slot1: ?PreparedQuantSlot = null;
     defer if (slot1) |*slot| slot.deinit(allocator);
     var slot2: ?PreparedQuantSlot = null;
@@ -661,10 +684,10 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    const input_data = try allocator.alloc(f32, cfg.in_dim);
+    const input_data = try allocator.alloc(f32, cfg.rows * cfg.in_dim);
     defer allocator.free(input_data);
     fillInput(input_data);
-    var input = try deviceTensorFromSlice(runtime, input_data, &[_]i32{ 1, @intCast(cfg.in_dim) });
+    var input = try deviceTensorFromSlice(runtime, input_data, &[_]i32{ @intCast(cfg.rows), @intCast(cfg.in_dim) });
     defer input.deinit();
     var ple_input: ?MetalTensor = null;
     defer if (ple_input) |*tensor| tensor.deinit();
@@ -685,7 +708,7 @@ pub fn main(init: std.process.Init) !void {
     var warmup: usize = 0;
     while (warmup < cfg.warmup_iters) : (warmup += 1) {
         _ = switch (cfg.mode) {
-            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
+            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs),
             .q6_argmax => try applyLinearArgmaxOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
             .head_rope => try applyHeadRopeOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.kv_out_dim, frame_outputs),
             .pair => try applyPairOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, pair_outputs),
@@ -700,7 +723,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(samples);
     for (samples) |*sample| {
         sample.* = switch (cfg.mode) {
-            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
+            .linear, .q6_linear => try applyOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.weight_slots, frame_outputs),
             .q6_argmax => try applyLinearArgmaxOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, frame_outputs),
             .head_rope => try applyHeadRopeOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, cfg.kv_out_dim, frame_outputs),
             .pair => try applyPairOnce(&provider, runtime, input, cfg.in_dim, cfg.out_dim, pair_outputs),

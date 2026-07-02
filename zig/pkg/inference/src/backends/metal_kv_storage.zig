@@ -532,10 +532,7 @@ pub const MetalKvStorage = struct {
             .layer_index = @intCast(gather.layer_index),
         };
         const active_frame = metal_runtime.hasActiveFrame(self.runtime);
-        const slot = self.slot_map.get(key) orelse blk: {
-            if (!active_frame) return error.DeviceReadFallback;
-            break :blk try self.acquireSlot(key);
-        };
+        const slot = self.slot_map.get(key) orelse return error.DeviceReadFallback;
         const info_opt = self.slotInfo(slot) catch |err| blk: {
             if (!active_frame) return err;
             break :blk null;

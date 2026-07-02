@@ -54,6 +54,22 @@ ORACLE_EXPECTED="${ANTFLY_INFERENCE_GEMMA4_QAT_ORACLE_EXPECTED:-}"
 if [[ -z "$ORACLE_EXPECTED" ]]; then
   ORACLE_EXPECTED="Here's a thinking"
 fi
+SHORT_COMPARE="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT:-0}"
+SHORT_TOKENS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_TOKENS:-32}"
+SHORT_PROMPT="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_PROMPT:-$ORACLE_RENDERED_PROMPT}"
+SHORT_EXPECTED_TOKEN_IDS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_EXPECTED_TOKEN_IDS-}"
+SHORT_EXPECTED_TOKEN_IDS_PREFIX="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_EXPECTED_TOKEN_IDS_PREFIX-}"
+if [[ -z "${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_EXPECTED_TOKEN_IDS+x}" && "$SHORT_TOKENS" == "32" && "$SHORT_PROMPT" == "$ORACLE_RENDERED_PROMPT" ]]; then
+  SHORT_EXPECTED_TOKEN_IDS="8291 236789 236751 496 6972 1657 600 9025 531 506 10340 15649 236787 108 236770 236761 138 1018 115863 506 16499 53121 669 2430 8150 623 811 2822 15649 1003 2263 34711"
+fi
+if [[ -z "${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_EXPECTED_TOKEN_IDS_PREFIX+x}" && "$SHORT_TOKENS" =~ ^[0-9]+$ && "$SHORT_TOKENS" -ge 32 && "$SHORT_PROMPT" == "$ORACLE_RENDERED_PROMPT" ]]; then
+  SHORT_EXPECTED_TOKEN_IDS_PREFIX="8291 236789 236751 496 6972 1657 600 9025 531 506 10340 15649 236787 108 236770 236761 138 1018 115863 506 16499 53121 669 2430 8150 623 811 2822 15649 1003 2263 34711"
+fi
+SHORT_MIN_DECODE_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_MIN_DECODE_SPEEDUP:-1.0}"
+SHORT_MIN_GENERATE_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_MIN_GENERATE_SPEEDUP:-1.0}"
+SHORT_MIN_TOTAL_WITH_LOAD_SPEEDUP="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_MIN_TOTAL_WITH_LOAD_SPEEDUP:-0}"
+SHORT_DISABLE_PLANNED_COMPUTE_BARRIERS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_DISABLE_PLANNED_COMPUTE_BARRIERS-}"
+SHORT_LLAMA_FIRST="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_LLAMA_FIRST:-1}"
 DRAFT_MODEL="${ANTFLY_INFERENCE_GEMMA4_COMPARE_DRAFT_MODEL:-${ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL:-${ANTFLY_INFERENCE_GEMMA4_E4B_DRAFT_MODEL:-}}}"
 MTP_POLICY_DRAFT_MODEL="${ANTFLY_INFERENCE_GEMMA4_MTP_POLICY_DRAFT_MODEL:-$DRAFT_MODEL}"
 RUN_MTP_POLICY_CHECK="${ANTFLY_INFERENCE_GEMMA4_QAT_MTP_POLICY_CHECK:-1}"
@@ -420,6 +436,198 @@ run_llama_completion() {
   done
 }
 
+run_short_compare() {
+  local model="$1"
+  if ! command -v "$LLAMA_COMPLETION_BIN" >/dev/null 2>&1; then
+    echo "llama-completion not found: $LLAMA_COMPLETION_BIN" >&2
+    exit 2
+  fi
+  local gguf
+  gguf="$(resolve_text_gguf "$model")"
+  if [[ -z "$gguf" ]]; then
+    echo "short compare could not find text GGUF under: $model" >&2
+    exit 2
+  fi
+  local antfly_out="$ROOT_OUT_DIR/short-antfly.txt"
+  local antfly_json="$ROOT_OUT_DIR/short-antfly.json"
+  local llama_out="$ROOT_OUT_DIR/short-llama.txt"
+  run_short_antfly() {
+    (
+      if [[ -n "$SHORT_DISABLE_PLANNED_COMPUTE_BARRIERS" ]]; then
+        export TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS="$SHORT_DISABLE_PLANNED_COMPUTE_BARRIERS"
+      fi
+      run_antfly_inference generate "$model" "$SHORT_PROMPT" \
+        --backend metal \
+        --max-tokens "$SHORT_TOKENS" \
+        --temperature 0 \
+        --raw-prompt \
+        --print-token-count \
+        --print-finish-reason \
+        --print-token-ids \
+        --print-timing \
+        --json-timing "$antfly_json"
+    ) >"$antfly_out" 2>&1
+  }
+  run_short_llama() {
+    "$LLAMA_COMPLETION_BIN" -m "$gguf" \
+      --no-conversation \
+      --no-jinja \
+      --special \
+      -p "$SHORT_PROMPT" \
+      -n "$SHORT_TOKENS" \
+      --temp 0 \
+      --no-display-prompt \
+      >"$llama_out" 2>&1
+  }
+  local run_order="antfly_first"
+  if flag_enabled "$SHORT_LLAMA_FIRST"; then
+    run_order="llama_first"
+    run_short_llama
+    run_short_antfly
+  else
+    run_short_antfly
+    run_short_llama
+  fi
+  python3 - "$ROOT_OUT_DIR" "$SHORT_TOKENS" "$SHORT_EXPECTED_TOKEN_IDS" "$SHORT_EXPECTED_TOKEN_IDS_PREFIX" "$SHORT_MIN_DECODE_SPEEDUP" "$SHORT_MIN_GENERATE_SPEEDUP" "$SHORT_MIN_TOTAL_WITH_LOAD_SPEEDUP" "$run_order" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+requested_tokens = int(sys.argv[2])
+expected_ids = sys.argv[3].strip()
+expected_prefix = sys.argv[4].strip()
+min_decode_speedup = float(sys.argv[5])
+min_generate_speedup = float(sys.argv[6])
+min_total_with_load_speedup = float(sys.argv[7])
+run_order = sys.argv[8]
+antfly_text = (root / "short-antfly.txt").read_text(encoding="utf-8", errors="replace")
+llama_text = (root / "short-llama.txt").read_text(encoding="utf-8", errors="replace")
+antfly = json.loads((root / "short-antfly.json").read_text())
+
+ids_match = re.search(r"^token_ids:\s*(.*)$", antfly_text, re.MULTILINE)
+actual_ids = ids_match.group(1).strip() if ids_match else ""
+actual_id_parts = actual_ids.split() if actual_ids else []
+if not actual_id_parts:
+    raise SystemExit(f"short compare output missing token IDs: {root / 'short-antfly.txt'}")
+if expected_ids and actual_ids != expected_ids:
+    raise SystemExit(
+        "short compare token IDs changed\n"
+        f"expected: {expected_ids}\n"
+        f"actual:   {actual_ids or '<missing>'}\n"
+        f"antfly output: {root / 'short-antfly.txt'}"
+    )
+if expected_prefix:
+    expected_prefix_parts = expected_prefix.split()
+    actual_prefix = " ".join(actual_id_parts[: len(expected_prefix_parts)])
+    if actual_prefix != expected_prefix:
+        raise SystemExit(
+            "short compare token ID prefix changed\n"
+            f"expected prefix: {expected_prefix}\n"
+            f"actual prefix:   {actual_prefix or '<missing>'}\n"
+            f"antfly output:   {root / 'short-antfly.txt'}"
+        )
+if int(antfly.get("tokens", 0)) != requested_tokens:
+    raise SystemExit(f"short compare generated {antfly.get('tokens')} tokens, expected {requested_tokens}")
+if antfly.get("finish_reason") != "length":
+    raise SystemExit(f"short compare finish_reason={antfly.get('finish_reason')!r}, expected 'length'")
+planned_barriers_match = re.search(r"metal_runtime_encoders:.*\bplanned_barriers=(\d+)", antfly_text)
+planned_barriers = int(planned_barriers_match.group(1)) if planned_barriers_match else None
+
+eval_match = re.search(
+    r"eval time =\s*([0-9.]+) ms /\s*(\d+) runs\s*\([^)]*?([0-9.]+) tokens per second\)",
+    llama_text,
+)
+if not eval_match:
+    raise SystemExit(f"llama-completion output missing eval timing: {root / 'short-llama.txt'}")
+total_match = re.search(r"total time =\s*([0-9.]+) ms(?:\s*/\s*(\d+) tokens)?", llama_text)
+if not total_match:
+    raise SystemExit(f"llama-completion output missing total timing: {root / 'short-llama.txt'}")
+prompt_match = re.search(r"prompt eval time =\s*([0-9.]+) ms /\s*(\d+) tokens", llama_text)
+
+timing = antfly.get("timing_ms", {})
+antfly_decode = float(antfly.get("decode_tok_per_s", 0.0))
+antfly_generate_ms = float(timing.get("generate", 0.0))
+antfly_total_ms = float(timing.get("total", 0.0))
+antfly_prefill_ms = float(timing.get("prefill_inner", 0.0))
+antfly_decode_inner_ms = float(timing.get("decode_inner", 0.0))
+antfly_total_inner_ms = float(timing.get("total_inner", 0.0))
+llama_prompt_eval_ms = float(prompt_match.group(1)) if prompt_match else None
+llama_prompt_tokens = int(prompt_match.group(2)) if prompt_match else None
+llama_eval_ms = float(eval_match.group(1))
+llama_eval_runs = int(eval_match.group(2))
+llama_eval_tok_s = float(eval_match.group(3))
+llama_total_ms = float(total_match.group(1))
+llama_total_tokens = int(total_match.group(2)) if total_match.group(2) else None
+llama_min_eval_runs = max(0, requested_tokens - 1)
+if llama_eval_runs < llama_min_eval_runs:
+    raise SystemExit(f"short compare llama eval runs {llama_eval_runs} below expected {llama_min_eval_runs}")
+decode_speedup = antfly_decode / llama_eval_tok_s if llama_eval_tok_s else 0.0
+generate_speedup = llama_total_ms / antfly_generate_ms if antfly_generate_ms else 0.0
+total_with_load_speedup = llama_total_ms / antfly_total_ms if antfly_total_ms else 0.0
+prefill_gap_ms = antfly_prefill_ms - llama_prompt_eval_ms if llama_prompt_eval_ms is not None else None
+decode_gap_ms = antfly_decode_inner_ms - llama_eval_ms
+
+summary = {
+    "antfly_decode_tok_s": antfly_decode,
+    "antfly_prefill_ms": antfly_prefill_ms,
+    "antfly_decode_inner_ms": antfly_decode_inner_ms,
+    "antfly_total_inner_ms": antfly_total_inner_ms,
+    "antfly_generate_ms": antfly_generate_ms,
+    "antfly_total_with_load_ms": antfly_total_ms,
+    "llama_prompt_eval_ms": llama_prompt_eval_ms,
+    "llama_prompt_tokens": llama_prompt_tokens,
+    "llama_eval_tok_s": llama_eval_tok_s,
+    "llama_eval_ms": llama_eval_ms,
+    "llama_eval_runs": llama_eval_runs,
+    "llama_min_eval_runs": llama_min_eval_runs,
+    "llama_total_ms": llama_total_ms,
+    "llama_total_tokens": llama_total_tokens,
+    "decode_speedup": decode_speedup,
+    "generate_speedup": generate_speedup,
+    "total_with_load_speedup": total_with_load_speedup,
+    "prefill_gap_ms": prefill_gap_ms,
+    "decode_gap_ms": decode_gap_ms,
+    "min_decode_speedup": min_decode_speedup,
+    "min_generate_speedup": min_generate_speedup,
+    "min_total_with_load_speedup": min_total_with_load_speedup,
+    "run_order": run_order,
+    "token_ids": actual_ids,
+    "antfly_planned_barriers": planned_barriers,
+    "antfly_output": str(root / "short-antfly.txt"),
+    "llama_output": str(root / "short-llama.txt"),
+}
+(root / "short-compare-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+print(f"short compare summary: {root / 'short-compare-summary.json'}")
+print(
+    f"antfly_decode_tok_s={antfly_decode:.3f} llama_eval_tok_s={llama_eval_tok_s:.3f} "
+    f"decode_speedup={decode_speedup:.3f} min_decode_speedup={min_decode_speedup:.3f}"
+)
+print(
+    f"antfly_generate_ms={antfly_generate_ms:.1f} llama_total_ms={llama_total_ms:.1f} "
+    f"generate_speedup={generate_speedup:.3f} min_generate_speedup={min_generate_speedup:.3f}"
+)
+if llama_prompt_eval_ms is not None:
+    print(
+        f"prefill_gap_ms={prefill_gap_ms:.1f} "
+        f"decode_gap_ms={decode_gap_ms:.1f}"
+    )
+print(
+    f"antfly_total_with_load_ms={antfly_total_ms:.1f} llama_total_ms={llama_total_ms:.1f} "
+    f"total_with_load_speedup={total_with_load_speedup:.3f} min_total_with_load_speedup={min_total_with_load_speedup:.3f}"
+)
+if min_decode_speedup > 0 and decode_speedup < min_decode_speedup:
+    raise SystemExit(f"short decode speedup {decode_speedup:.3f} below gate {min_decode_speedup:.3f}")
+if min_generate_speedup > 0 and generate_speedup < min_generate_speedup:
+    raise SystemExit(f"short generate speedup {generate_speedup:.3f} below gate {min_generate_speedup:.3f}")
+if min_total_with_load_speedup > 0 and total_with_load_speedup < min_total_with_load_speedup:
+    raise SystemExit(
+        f"short total-with-load speedup {total_with_load_speedup:.3f} below gate {min_total_with_load_speedup:.3f}"
+    )
+PY
+}
+
 run_mlx_generate() {
   if ! flag_enabled "$RUN_MLX"; then
     return
@@ -448,6 +656,12 @@ Q4K_MODEL="${ANTFLY_INFERENCE_GEMMA4_Q4K_MODEL:-$Q4K_MODEL_DEFAULT}"
 if [[ -z "$MTP_POLICY_DRAFT_MODEL" ]]; then
   candidate="${QAT_MODEL%-gguf}-unquantized-assistant"
   [[ -e "$candidate" ]] && MTP_POLICY_DRAFT_MODEL="$candidate"
+fi
+
+if flag_enabled "$SHORT_COMPARE"; then
+  run_short_compare "$QAT_MODEL"
+  echo "raw output: $ROOT_OUT_DIR"
+  exit 0
 fi
 
 capture_host_load before-oracle

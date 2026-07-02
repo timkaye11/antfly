@@ -906,6 +906,10 @@ fn gemma4MetalDirectGreedyDefault() bool {
     return true;
 }
 
+fn pipelinedMetalDecodeEnabled() bool {
+    return !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
+}
+
 fn gemma4MetalDirectGreedyEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_DIRECT_GREEDY", gemma4MetalDirectGreedyDefault());
 }
@@ -3429,6 +3433,23 @@ pub const NativeGenerationPipeline = struct {
                 "standardDecode iter={d} seq_len={d} device_token_handoff={}",
                 .{ tokens_generated, seq_len.*, device_token_tensor != null },
             );
+            if (tokens_generated > 0 and self.pipelinedGreedyEligible(config, token_table, json_grammar, gbnf_grammar, decode_state)) {
+                if (try self.runPipelinedGreedyTail(
+                    token_ids,
+                    seq_len,
+                    decode_state,
+                    penalty_state,
+                    max_tokens,
+                    prompt_token_count,
+                    on_token_fn,
+                    on_token_ctx,
+                    emitted_text,
+                    &tokens_generated,
+                    &finish_reason,
+                )) {
+                    break;
+                }
+            }
             const outcome: SampleOutcome = blk: {
                 if (tokens_generated == 0) {
                     if (prefill_greedy_token.*) |token| {
@@ -3585,6 +3606,142 @@ pub const NativeGenerationPipeline = struct {
             .{ tokens_generated, finish_reason },
         );
         return .{ .tokens_generated = tokens_generated, .finish_reason = finish_reason };
+    }
+
+    fn pipelinedGreedyEligible(
+        self: *NativeGenerationPipeline,
+        config: GenerationConfig,
+        token_table: ?*const grammar_mod.TokenByteTable,
+        json_grammar: *const ?grammar_mod.JsonGrammar,
+        gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
+        decode_state: *NativeDecodeState,
+    ) bool {
+        if (!pipelinedMetalDecodeEnabled()) return false;
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (self.cb.kind() != .metal) return false;
+        if (self.scheduler != null) return false;
+        if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
+        if (decode_runtime.kvView() == null) return false;
+        if (!isPureGreedyConfig(config)) return false;
+        if (token_table != null or json_grammar.* != null or gbnf_grammar != null) return false;
+        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return false;
+        if (!gemma4MetalDirectGreedyEnabled()) return false;
+        return true;
+    }
+
+    fn runPipelinedGreedyTail(
+        self: *NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: *usize,
+        decode_state: *NativeDecodeState,
+        penalty_state: *SamplingPenaltyState,
+        max_tokens: usize,
+        prompt_token_count: usize,
+        on_token_fn: ?TokenCallback,
+        on_token_ctx: ?*anyopaque,
+        emitted_text: ?*[]u8,
+        tokens_generated: *usize,
+        finish_reason: *[]const u8,
+    ) !bool {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (tokens_generated.* >= max_tokens) return false;
+        if (seq_len.* == 0) return false;
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+        {
+            const arm_ctx = decode_runtime.makeDecodeContext(seq_len.*, 1);
+            const armed = decoder_gated_runtime.forwardGreedyTokenPipelinedArm(
+                &self.cb,
+                self.allocator,
+                self.gpt_config,
+                self.gpt_config.num_hidden_layers,
+                token_ids[seq_len.* - 1],
+                seq_len.*,
+                &arm_ctx,
+            ) catch false;
+            if (!armed) return false;
+        }
+        errdefer {
+            _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
+            _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
+        }
+        while (tokens_generated.* < max_tokens) {
+            const remaining = max_tokens - tokens_generated.*;
+            var next_token: i64 = -1;
+            var speculative_appended = false;
+            var stepped = false;
+            if (remaining > 1) {
+                _ = try decode_runtime.appendGeneratedToken();
+                speculative_appended = true;
+                self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+                const step_ctx = decode_runtime.makeDecodeContext(seq_len.* + 1, 1);
+                if (try decoder_gated_runtime.forwardGreedyTokenPipelinedStep(
+                    &self.cb,
+                    self.allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    seq_len.* + 1,
+                    &step_ctx,
+                )) |tok| {
+                    next_token = tok;
+                    stepped = true;
+                } else {
+                    next_token = (try decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only)) orelse return error.InvalidModelOutput;
+                }
+            } else {
+                next_token = (try decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only)) orelse return error.InvalidModelOutput;
+            }
+            if (next_token < 0) return error.InvalidModelOutput;
+            const token: usize = @intCast(next_token);
+            if (self.gpt_config.isEosToken(token)) {
+                if (stepped) {
+                    _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
+                }
+                finish_reason.* = "stop";
+                return true;
+            }
+            if (stepped) {
+                const submit_ok = ((decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .submit_pending) catch null) != null);
+                if (!submit_ok) {
+                    _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
+                    stepped = false;
+                }
+            }
+            token_ids[seq_len.*] = @intCast(token);
+            seq_len.* += 1;
+            tokens_generated.* += 1;
+            if (!speculative_appended) {
+                _ = try decode_runtime.appendGeneratedToken();
+            }
+            try penalty_state.noteToken(self.allocator, @intCast(token));
+            if (on_token_fn != null and on_token_ctx != null and emitted_text != null) {
+                const keep_streaming = try self.emitDecodedDelta(
+                    token_ids[prompt_token_count..seq_len.*],
+                    emitted_text.?,
+                    on_token_fn.?,
+                    on_token_ctx.?,
+                );
+                if (!keep_streaming) {
+                    _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
+                    finish_reason.* = "stop";
+                    return true;
+                }
+            }
+            if (!stepped) {
+                if (tokens_generated.* >= max_tokens) break;
+                const rearm_ctx = decode_runtime.makeDecodeContext(seq_len.*, 1);
+                const rearmed = decoder_gated_runtime.forwardGreedyTokenPipelinedArm(
+                    &self.cb,
+                    self.allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    token_ids[seq_len.* - 1],
+                    seq_len.*,
+                    &rearm_ctx,
+                ) catch false;
+                if (!rearmed) return true;
+            }
+        }
+        return true;
     }
 
     fn forwardGreedyDeviceDecodeToken(

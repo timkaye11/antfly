@@ -2892,6 +2892,51 @@ fn gemmaPrefillPrewarmEnabled() bool {
     return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
 }
 
+fn prefillGreedyTokenEnabled() bool {
+    return !envFlagEnabled("TERMITE_METAL_DISABLE_PREFILL_GREEDY_TOKEN");
+}
+
+fn runtimeTokenDecodeEnabled() bool {
+    return !envFlagEnabled("TERMITE_METAL_DISABLE_RUNTIME_TOKEN_DECODE");
+}
+
+fn forcePrefillHostLogits() bool {
+    return envFlagEnabled("TERMITE_METAL_FORCE_PREFILL_HOST_LOGITS");
+}
+
+fn traceGenerateTopLogitsEnabled() bool {
+    return envFlagEnabled("TERMITE_METAL_TRACE_GENERATE_TOP_LOGITS");
+}
+
+fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) void {
+    if (!traceGenerateTopLogitsEnabled()) return;
+    var top_ids = [_]usize{0} ** 8;
+    var top_vals = [_]f32{-std.math.inf(f32)} ** 8;
+    for (logits, 0..) |logit, idx| {
+        var insert_at: ?usize = null;
+        for (top_vals, 0..) |current, slot| {
+            if (logit > current) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at) |slot| {
+            var i: usize = top_vals.len - 1;
+            while (i > slot) : (i -= 1) {
+                top_vals[i] = top_vals[i - 1];
+                top_ids[i] = top_ids[i - 1];
+            }
+            top_vals[slot] = logit;
+            top_ids[slot] = idx;
+        }
+    }
+    std.debug.print("generate_top_logits step={d} label={s}:", .{ step, label });
+    for (top_ids, top_vals) |id, value| {
+        std.debug.print(" {d}:{d:.6}", .{ id, value });
+    }
+    std.debug.print("\n", .{});
+}
+
 fn printLiveWholeModelExecutorDetails(runtime_opt: ?*const graph_mod.model_runtime.ModelRuntime) void {
     if (runtime_opt) |runtime_model| {
         runtime_model.printDebugTiming();
@@ -2919,6 +2964,7 @@ fn liveWholeModelDeclineError(err: anyerror) bool {
 }
 
 fn liveWholeModelExecutorRequested(opts: *const Options) bool {
+    if (envFlagEnabled("TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR")) return false;
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
     if (explicit_whole_model) return false;
@@ -2961,6 +3007,8 @@ fn runLiveWholeModelExecutorReuseProbe(
             .seq_len = chunk_end,
             .query_seq_len = chunk_end - processed,
             .attention_mode = .paged_prefill,
+            .force_host_logits = forcePrefillHostLogits(),
+            .prefer_greedy_token = prefillGreedyTokenEnabled() and chunk_end == prompt_ids.len,
         });
         processed = chunk_end;
     }
@@ -3089,8 +3137,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
         .frequency_penalty = config.frequency_penalty,
         .presence_penalty = config.presence_penalty,
     };
-    const use_greedy_decode = runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
-    const use_sample_decode = runtime_caps.supports_sample_decode and !use_greedy_decode;
+    const use_runtime_token_decode = runtimeTokenDecodeEnabled();
+    const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
+    const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
+    const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
@@ -3107,6 +3157,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
+                .force_host_logits = forcePrefillHostLogits(),
+                .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
             }) catch |err| {
                 debugGenerateSetup("live whole-model prefill unavailable err={s}", .{@errorName(err)});
                 if (liveWholeModelDeclineError(err)) return false;
@@ -3127,6 +3179,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
             }
             const output_logits = try output.hostLogits(allocator);
+            traceGenerateTopLogits("prefill", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -3153,6 +3206,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             break :blk @intCast(sampled.token_id);
         } else blk: {
             const output_logits = try output.hostLogits(allocator);
+            traceGenerateTopLogits("decode", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,

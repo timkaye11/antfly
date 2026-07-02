@@ -824,9 +824,30 @@ pub const DecoderRuntimeDecodeItem = struct {
     attention: AttentionContext,
 };
 
+pub const DecoderRuntimeDecodePhase = enum {
+    /// Encode, submit, wait, and read the token in one call (default).
+    full,
+    /// Encode this request's frame from the host token id and submit it
+    /// without waiting. Arms the pipelined decode sequence.
+    submit_only,
+    /// Encode this request's frame using the device-resident token id
+    /// (previous frame's argmax output), then wait the previously submitted
+    /// frame and write ITS token to output_token_ids[0]. The new frame stays
+    /// active and unsubmitted.
+    step,
+    /// Submit the active frame encoded by a previous `.step` call.
+    submit_pending,
+    /// Cancel the active frame encoded by a previous `.step` call.
+    cancel_pending,
+    /// Wait the previously submitted frame and write its token to
+    /// output_token_ids[0] without encoding a new frame.
+    await_only,
+};
+
 pub const DecoderRuntimeDecodeRequest = struct {
     contract: DecoderRuntimeDecodeContract,
     mode: DecoderRuntimeDecodeMode = .greedy_argmax,
+    phase: DecoderRuntimeDecodePhase = .full,
     configured_layer_count: usize,
     layer_count: usize,
     hidden_size: usize,
