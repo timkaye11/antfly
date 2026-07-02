@@ -887,6 +887,7 @@ pub const CudaCompute = struct {
             var tensor = entry.value_ptr.*;
             tensor.owns_buffer = true;
             tensor.owns_shape = true;
+            tensor.owns_bf16_mirror = true;
             freeCudaTensorStorage(self, &tensor);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -1174,6 +1175,19 @@ pub const CudaCompute = struct {
                 }
             }
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
+            var bf16_mirror = buffer_mod.DeviceBuffer{};
+            errdefer bf16_mirror.free(&self.ctx);
+            if (cudaShouldAttachBf16MirrorToQ4Weight(owned_key, storage)) {
+                const f32_data = try self.allocator.alloc(f32, elem_count);
+                defer self.allocator.free(f32_data);
+                try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, f32_data);
+                const bf16_data = try self.allocator.alloc(u16, elem_count);
+                defer self.allocator.free(bf16_data);
+                for (f32_data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
+                bf16_mirror = try allocDeviceBuffer(self, bf16_data.len * @sizeOf(u16));
+                try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
+                self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
+            }
             try synchronizeAndDrainDeferredDeviceFrees(self);
             self.stats.resident_weight_bytes += storage.raw_bytes.len;
             errdefer self.allocator.free(owned_key);
@@ -1184,8 +1198,10 @@ pub const CudaCompute = struct {
                 .elem_count = elem_count,
                 .quant_type = storage.tensor_type,
                 .tc_quant = tc_quant,
+                .bf16_mirror = bf16_mirror,
                 .owns_buffer = false,
                 .owns_shape = false,
+                .owns_bf16_mirror = false,
                 .owned_by_tensor = false,
             });
             return;
@@ -2172,6 +2188,26 @@ fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_m
 
 fn cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
     if (!cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload()) return false;
+    if (!isKnownQuantStorage(storage, .Q4_0)) return false;
+    if (cudaShouldDequantizeWeightOnUpload(name, storage)) return false;
+    if (storage.shape.len != 2) return false;
+    if (storage.shape[0] <= 0 or storage.shape[1] <= 0) return false;
+    if (isLmHeadOrTiedTokenEmbeddingWeightName(name)) return false;
+    if (std.mem.indexOf(u8, name, "token_embd") != null) return false;
+    if (std.mem.indexOf(u8, name, "embed_tokens") != null) return false;
+    return true;
+}
+
+// Hybrid residency: keep Q4_0 matrix weights resident for the decode DP4A
+// kernels AND attach a dequantized BF16 copy consumed by cuBLASLt when
+// rows > 1 (prefill). Costs ~2 bytes/param extra device memory.
+fn cudaHybridQ4Bf16WeightsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL", false);
+}
+
+fn cudaShouldAttachBf16MirrorToQ4Weight(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+    if (!cudaHybridQ4Bf16WeightsEnabled()) return false;
+    if (cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload()) return false;
     if (!isKnownQuantStorage(storage, .Q4_0)) return false;
     if (cudaShouldDequantizeWeightOnUpload(name, storage)) return false;
     if (storage.shape.len != 2) return false;
@@ -3682,6 +3718,17 @@ fn stageBf16ActivationForCublasLt(
     return scratch;
 }
 
+// Hybrid-residency dispatch: for a Q4-resident weight carrying a BF16
+// mirror, return the mirror when the matmul is prefill-shaped (rows > 1)
+// so cuBLASLt handles it; decode (rows == 1) stays on the Q4 kernels.
+fn weightBf16MirrorForRows(weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
+    if (rows <= 1) return null;
+    if (weight.bf16_mirror.ptr == 0) return null;
+    if (weight.quant_type == null) return null;
+    if (weight.bf16_mirror.len < weight.elem_count * @sizeOf(u16)) return null;
+    return weight.bf16_mirror;
+}
+
 fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
     const bytes = cudaCublasLtWorkspaceBytes();
     if (bytes == 0) return .{};
@@ -4003,7 +4050,7 @@ fn notePrefillProfileUs(self: *CudaCompute, category: CudaPrefillProfileCategory
 
 fn prefillProfileCategoryForLinearNoBias(weight: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) ?CudaPrefillProfileCategory {
     if (rows <= 1) return null;
-    if (isKnownQuant(weight, .Q4_0)) return .q4_linear;
+    if (isKnownQuant(weight, .Q4_0)) return if (weight.bf16_mirror.ptr != 0) .bf16_linear else .q4_linear;
     if (isBf16Weight(weight)) return .bf16_linear;
     if (weight.quant_type == null and weight.dtype == .f32 and in_dim == 2560 and out_dim == 10752) return .ple_dense;
     return null;
@@ -7651,7 +7698,16 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    if (weight_tensor.quant_type) |quant_type| {
+    if (weightBf16MirrorForRows(weight_tensor, rows)) |mirror_buffer| {
+        if (try tryCublasLtBf16Linear(self, device, input_tensor, mirror_buffer, rows, in_dim, out_dim)) {
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+        } else {
+            self.stats.bf16_cublaslt_fallbacks += 1;
+            try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, mirror_buffer, rows, in_dim, out_dim);
+            self.stats.bf16_scalar_linear_calls += 1;
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
+        }
+    } else if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {
                 .Q8_0 => if (mxbaiQ8Variant(rows, in_dim, out_dim)) |variant| {
@@ -9030,15 +9086,22 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const k_weight_tensor = tensorFromCt(k_weight);
     const v_weight_tensor = tensorFromCt(v_weight);
     try ensureF32(input_tensor);
-    const use_q8 = isKnownQuant(q_weight_tensor, .Q8_0) and isKnownQuant(k_weight_tensor, .Q8_0) and isKnownQuant(v_weight_tensor, .Q8_0);
-    const use_q4_0 = isKnownQuant(q_weight_tensor, .Q4_0) and isKnownQuant(k_weight_tensor, .Q4_0) and isKnownQuant(v_weight_tensor, .Q4_0);
-    const use_q4 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and isKnownQuant(v_weight_tensor, .Q4_K);
-    const use_q4_q4_f32 = isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and
+    const q_mirror = weightBf16MirrorForRows(q_weight_tensor, rows);
+    const k_mirror = weightBf16MirrorForRows(k_weight_tensor, rows);
+    const v_mirror = weightBf16MirrorForRows(v_weight_tensor, rows);
+    const use_hybrid_bf16 = q_mirror != null and k_mirror != null and v_mirror != null;
+    const q_weight_bf16 = if (use_hybrid_bf16) q_mirror.? else q_weight_tensor.buffer;
+    const k_weight_bf16 = if (use_hybrid_bf16) k_mirror.? else k_weight_tensor.buffer;
+    const v_weight_bf16 = if (use_hybrid_bf16) v_mirror.? else v_weight_tensor.buffer;
+    const use_q8 = !use_hybrid_bf16 and isKnownQuant(q_weight_tensor, .Q8_0) and isKnownQuant(k_weight_tensor, .Q8_0) and isKnownQuant(v_weight_tensor, .Q8_0);
+    const use_q4_0 = !use_hybrid_bf16 and isKnownQuant(q_weight_tensor, .Q4_0) and isKnownQuant(k_weight_tensor, .Q4_0) and isKnownQuant(v_weight_tensor, .Q4_0);
+    const use_q4 = !use_hybrid_bf16 and isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and isKnownQuant(v_weight_tensor, .Q4_K);
+    const use_q4_q4_f32 = !use_hybrid_bf16 and isKnownQuant(q_weight_tensor, .Q4_K) and isKnownQuant(k_weight_tensor, .Q4_K) and
         v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
     const use_f32 = q_weight_tensor.dtype == .f32 and q_weight_tensor.quant_type == null and
         k_weight_tensor.dtype == .f32 and k_weight_tensor.quant_type == null and
         v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
-    const use_bf16 = isBf16Weight(q_weight_tensor) and isBf16Weight(k_weight_tensor) and isBf16Weight(v_weight_tensor);
+    const use_bf16 = use_hybrid_bf16 or (isBf16Weight(q_weight_tensor) and isBf16Weight(k_weight_tensor) and isBf16Weight(v_weight_tensor));
     if (!use_q8 and !use_q4_0 and !use_q4 and !use_q4_q4_f32 and !use_f32 and !use_bf16) {
         self.stats.qkv_fallback_unsupported += 1;
         return null;
@@ -9251,9 +9314,9 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             k_device,
             v_device,
             input_tensor,
-            q_weight_tensor.buffer,
-            k_weight_tensor.buffer,
-            v_weight_tensor.buffer,
+            q_weight_bf16,
+            k_weight_bf16,
+            v_weight_bf16,
             rows,
             in_dim,
             q_out_dim,
@@ -9268,9 +9331,9 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
                 k_device,
                 v_device,
                 input_tensor.buffer,
-                q_weight_tensor.buffer,
-                k_weight_tensor.buffer,
-                v_weight_tensor.buffer,
+                q_weight_bf16,
+                k_weight_bf16,
+                v_weight_bf16,
                 rows,
                 in_dim,
                 q_out_dim,
@@ -9458,10 +9521,15 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     try ensureCount(weight_a_tensor, try checkedMul(out_dim, in_dim));
     try ensureCount(weight_b_tensor, try checkedMul(out_dim, in_dim));
 
-    const use_q8 = isKnownQuant(weight_a_tensor, .Q8_0) and isKnownQuant(weight_b_tensor, .Q8_0);
-    const use_q4_0 = isKnownQuant(weight_a_tensor, .Q4_0) and isKnownQuant(weight_b_tensor, .Q4_0);
-    const use_q4 = isKnownQuant(weight_a_tensor, .Q4_K) and isKnownQuant(weight_b_tensor, .Q4_K);
-    const use_bf16 = isBf16Weight(weight_a_tensor) and isBf16Weight(weight_b_tensor);
+    const mirror_a = weightBf16MirrorForRows(weight_a_tensor, rows);
+    const mirror_b = weightBf16MirrorForRows(weight_b_tensor, rows);
+    const use_hybrid_bf16 = mirror_a != null and mirror_b != null;
+    const weight_a_bf16 = if (use_hybrid_bf16) mirror_a.? else weight_a_tensor.buffer;
+    const weight_b_bf16 = if (use_hybrid_bf16) mirror_b.? else weight_b_tensor.buffer;
+    const use_q8 = !use_hybrid_bf16 and isKnownQuant(weight_a_tensor, .Q8_0) and isKnownQuant(weight_b_tensor, .Q8_0);
+    const use_q4_0 = !use_hybrid_bf16 and isKnownQuant(weight_a_tensor, .Q4_0) and isKnownQuant(weight_b_tensor, .Q4_0);
+    const use_q4 = !use_hybrid_bf16 and isKnownQuant(weight_a_tensor, .Q4_K) and isKnownQuant(weight_b_tensor, .Q4_K);
+    const use_bf16 = use_hybrid_bf16 or (isBf16Weight(weight_a_tensor) and isBf16Weight(weight_b_tensor));
     if (!use_q8 and !use_q4_0 and !use_q4 and !use_bf16) {
         self.stats.linear_pair_fallbacks += 1;
         const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
@@ -9496,8 +9564,8 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             device_a,
             device_b,
             input_tensor,
-            weight_a_tensor.buffer,
-            weight_b_tensor.buffer,
+            weight_a_bf16,
+            weight_b_bf16,
             rows,
             in_dim,
             out_dim,
@@ -9506,8 +9574,8 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         } else {
             self.stats.linear_pair_fallbacks += 1;
             self.stats.bf16_cublaslt_fallbacks += 1;
-            try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device_a, input_tensor.buffer, weight_a_tensor.buffer, rows, in_dim, out_dim);
-            try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device_b, input_tensor.buffer, weight_b_tensor.buffer, rows, in_dim, out_dim);
+            try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device_a, input_tensor.buffer, weight_a_bf16, rows, in_dim, out_dim);
+            try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device_b, input_tensor.buffer, weight_b_bf16, rows, in_dim, out_dim);
             self.stats.bf16_scalar_linear_calls += 2;
         }
     } else if (use_q8) {
@@ -10137,7 +10205,7 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
-    if (cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+    if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
@@ -10260,7 +10328,7 @@ fn rmsNormAddTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: u
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
-    if (cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+    if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
@@ -10720,6 +10788,12 @@ fn linearNoBiasGatedDown(
     const use_q4 = isKnownQuant(weight_tensor, .Q4_K);
     const use_q6 = isKnownQuant(weight_tensor, .Q6_K);
     if (!use_q8 and !use_q4_0 and !use_q4 and !use_q6) {
+        self.stats.gated_down_fallbacks += 1;
+        return null;
+    }
+    // Hybrid residency: prefill-shaped gated-down goes through the caller's
+    // activation-multiply + BF16-mirror linear fallback instead of Q8_1 kernels.
+    if (weightBf16MirrorForRows(weight_tensor, rows) != null) {
         self.stats.gated_down_fallbacks += 1;
         return null;
     }
@@ -12922,6 +12996,11 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     try ensureF32(input_tensor);
     if (input_tensor.elem_count != rows * request.hidden_size) return error.InvalidShape;
     if (!isKnownQuant(&gate_slot.weight, .Q4_0) or !isKnownQuant(&up_slot.weight, .Q4_0) or !isKnownQuant(&down_slot.weight, .Q4_0)) return null;
+    // Hybrid residency: prefill-shaped FFN runs go through the BF16 mirror
+    // pair+linear path instead of the Q8_1 fused kernels.
+    if (weightBf16MirrorForRows(&gate_slot.weight, rows) != null and
+        weightBf16MirrorForRows(&up_slot.weight, rows) != null and
+        weightBf16MirrorForRows(&down_slot.weight, rows) != null) return null;
 
     const hidden_q8_blocks = request.hidden_size / 32;
     const hidden_q8_bytes = try checkedMul(try checkedMul(rows, hidden_q8_blocks), 36);

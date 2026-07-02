@@ -49,6 +49,8 @@ Environment overrides:
                           1 to use the tiled turboquant prefill attention kernel (default: 0)
   ANTFLY_BF16_RESIDENT_WEIGHTS
                           1 to dequantize Q4_0 matrix weights to BF16 at upload (BF16-resident prefill path) (default: 0)
+  ANTFLY_HYBRID_BF16_PREFILL
+                          1 to keep Q4_0 weights for decode and attach BF16 copies used by prefill matmuls (default: 0)
   ANTFLY_PLE_MODEL_PROJ_BF16
                           1 to convert F32 PLE model projections to BF16 at upload (default: same as ANTFLY_BF16_RESIDENT_WEIGHTS)
   TIMEOUT                 per-command timeout, or off (default: 360s)
@@ -106,6 +108,7 @@ antfly_cuda_prefill_first_token_coalesce_tokens="${ANTFLY_CUDA_PREFILL_FIRST_TOK
 antfly_cuda_profile_prefill_ops="${ANTFLY_CUDA_PROFILE_PREFILL_OPS:-0}"
 antfly_rms_norm_bf16_mirror="${ANTFLY_RMS_NORM_BF16_MIRROR:-0}"
 antfly_bf16_resident_weights="${ANTFLY_BF16_RESIDENT_WEIGHTS:-0}"
+antfly_hybrid_bf16_prefill="${ANTFLY_HYBRID_BF16_PREFILL:-0}"
 antfly_ple_model_proj_bf16="${ANTFLY_PLE_MODEL_PROJ_BF16:-$antfly_bf16_resident_weights}"
 command_timeout="${TIMEOUT:-360s}"
 require_antfly_win="${REQUIRE_ANTFLY_WIN:-0}"
@@ -200,6 +203,7 @@ common_antfly_env=(
   ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS="$antfly_cuda_profile_prefill_ops"
   ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR="$antfly_rms_norm_bf16_mirror"
   ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16="$antfly_bf16_resident_weights"
+  ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL="$antfly_hybrid_bf16_prefill"
   ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16="$antfly_ple_model_proj_bf16"
   ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN=1
   ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_TILE4_W8=1
@@ -221,7 +225,7 @@ common_antfly_env=(
   ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN=1
   ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD=863
   ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP=2500
-  ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=544
+  ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY="${ANTFLY_CAPTURE_FORCE_KV_CAPACITY:-544}"
 )
 
 run_antfly_command() {
