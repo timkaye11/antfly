@@ -579,9 +579,32 @@ fn runCompiledSegmentedEncoderForward(
     return features;
 }
 
+/// Default parity tolerance for the compiled-vs-eager forward check.
+///
+/// The two paths intentionally run DIFFERENT f32 implementations of the same
+/// math (eager: host sgemm + fused Metal SDPA/LayerNorm/RoPE kernels;
+/// compiled: MPSGraph kernels), so they cannot agree to f32 ulp precision.
+/// Measured noise floor with kernel-exact RoPE tables (deterministic probe,
+/// batch 8 x seq 384): ~1e-5 max-rel at layer 0 growing to ~1.4e-2 at layer
+/// 21 through 22 layers of residual-stream amplification. The default is set
+/// a small margin above that floor; genuine implementation bugs (wrong rope
+/// convention, mask, weight wiring, ...) produce O(0.1..1) divergence and
+/// still fail loudly. Override with
+/// ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_TOL for tighter probes on
+/// shallow segments.
+const compiled_forward_check_default_tol: f32 = 5e-2;
+
 fn compiledForwardCheckTolerance() f32 {
-    const raw = platform.env.getenv("ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_TOL") orelse return 1e-6;
-    return std.fmt.parseFloat(f32, raw) catch 1e-6;
+    const raw = platform.env.getenv("ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_TOL") orelse
+        return compiled_forward_check_default_tol;
+    return std.fmt.parseFloat(f32, raw) catch compiled_forward_check_default_tol;
+}
+
+/// ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_DEBUG=1: print every tensor's
+/// max_rel and keep going past mismatches so a single run localizes where the
+/// compiled forward first diverges from the eager forward.
+fn compiledForwardCheckDebug() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_DEBUG", false);
 }
 
 /// Elementwise comparison of a compiled-vs-eager tensor pair, restricted to
@@ -621,11 +644,18 @@ fn verifyCompiledForwardTensor(
             }
         }
     }
+    if (compiledForwardCheckDebug()) {
+        print(
+            "compiled_forward_check detail tensor={s} layer={d} max_rel={e:.6}\n",
+            .{ name, layer_idx, max_rel },
+        );
+    }
     if (max_rel > tol) {
         print(
             "compiled_forward_check mismatch tensor={s} layer={d} max_rel={e:.6} tol={e:.6} index={d} compiled={e:.9} eager={e:.9}\n",
             .{ name, layer_idx, max_rel, tol, max_index, compiled[max_index], eager[max_index] },
         );
+        if (compiledForwardCheckDebug()) return;
         return error.CompiledForwardParityMismatch;
     }
 }
@@ -633,7 +663,7 @@ fn verifyCompiledForwardTensor(
 /// First-step validation gate (ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK=1):
 /// compare the compiled forward's features and captured activations against
 /// the eager capture forward and error loudly on any divergence above the
-/// tolerance (default 1e-6 relative; override with
+/// tolerance (see `compiled_forward_check_default_tol`; override with
 /// ANTFLY_FUSED_CHUNKER_COMPILED_FORWARD_CHECK_TOL).
 fn verifyCompiledForwardParity(
     compiled_features: []const f32,
@@ -644,7 +674,6 @@ fn verifyCompiledForwardParity(
     hidden: usize,
 ) !void {
     const tol = compiledForwardCheckTolerance();
-    try verifyCompiledForwardTensor("features", 0, compiled_features, eager_features, hidden, mask_i64, tol);
 
     if (compiled_buf.items.items.len != eager_buf.items.items.len) {
         print(
@@ -708,6 +737,11 @@ fn verifyCompiledForwardParity(
     const compiled_final = compiled_buf.final_norm_input orelse return error.CompiledForwardParityMismatch;
     const eager_final = eager_buf.final_norm_input orelse return error.CompiledForwardParityMismatch;
     try verifyCompiledForwardTensor("final_norm_input", 0, compiled_final, eager_final, hidden, mask_i64, tol);
+
+    // Checked last (it is the deepest tensor): a mismatch in any earlier
+    // capture localizes the divergence to a specific layer/module instead
+    // of only reporting the accumulated error at the network output.
+    try verifyCompiledForwardTensor("features", 0, compiled_features, eager_features, hidden, mask_i64, tol);
 }
 
 fn segmentVJPParityReferenceStrategy() graph_training.CompiledExecutionStrategy {

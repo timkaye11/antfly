@@ -1471,7 +1471,7 @@ pub const ModernBertSegmentVJPSession = struct {
         try host_feeds.append(self.allocator, .{ .node_id = self.hidden_in_id, .data = hidden_in });
         try host_feeds.append(self.allocator, .{ .node_id = self.upstream_grad_id, .data = upstream_grad });
 
-        try self.ensureRopeCache();
+        try self.ensureRopeCache(cb);
         const rope_tables = self.rope_cache.?;
         for (self.layer_inputs, rope_tables) |binding, table| {
             const attn_bias: []const f32 = if (shared_bias) |bias_cache| blk: {
@@ -1546,10 +1546,11 @@ pub const ModernBertSegmentVJPSession = struct {
         }
     }
 
-    fn ensureRopeCache(self: *ModernBertSegmentVJPSession) !void {
+    fn ensureRopeCache(self: *ModernBertSegmentVJPSession, cb: *const ComputeBackend) !void {
         if (self.rope_cache != null) return;
         self.rope_cache = try buildRopeTables(
             self.allocator,
+            cb,
             self.layer_inputs,
             self.seq_len,
             self.config.head_dim,
@@ -1885,6 +1886,7 @@ pub const ModernBertSegmentForwardSession = struct {
         if (self.rope_cache == null) {
             self.rope_cache = try buildRopeTables(
                 self.allocator,
+                cb,
                 self.layer_inputs,
                 self.seq_len,
                 self.config.head_dim,
@@ -2016,6 +2018,7 @@ fn elapsedNs(start_ns: u64) u64 {
 /// and safe to cache for the lifetime of the session.
 fn buildRopeTables(
     allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
     layer_inputs: []const SegmentLayerInputBinding,
     seq_len: u32,
     head_dim: u32,
@@ -2030,16 +2033,100 @@ fn buildRopeTables(
         allocator.free(tables);
     }
     for (layer_inputs, tables) |binding, *table| {
-        const rope = try graph_input_binder.QwenPlaceholderPrep.buildRopeCosSin(
-            allocator,
-            seq_len,
-            head_dim,
-            binding.rope_theta,
-        );
-        table.* = .{ .cos = rope.cos, .sin = rope.sin };
+        // Reuse an already-built table when this layer shares its theta with
+        // an earlier layer (ModernBERT alternates between exactly two thetas).
+        var reused = false;
+        for (layer_inputs[0..filled], tables[0..filled]) |prev_binding, prev_table| {
+            if (prev_binding.rope_theta == binding.rope_theta) {
+                const cos = try allocator.dupe(f32, prev_table.cos);
+                errdefer allocator.free(cos);
+                const sin = try allocator.dupe(f32, prev_table.sin);
+                table.* = .{ .cos = cos, .sin = sin };
+                reused = true;
+                break;
+            }
+        }
+        if (reused) {
+            filled += 1;
+            continue;
+        }
+        table.* = try buildBackendRopeTable(allocator, cb, seq_len, head_dim, binding.rope_theta) orelse blk: {
+            const rope = try graph_input_binder.QwenPlaceholderPrep.buildRopeCosSin(
+                allocator,
+                seq_len,
+                head_dim,
+                binding.rope_theta,
+            );
+            break :blk .{ .cos = rope.cos, .sin = rope.sin };
+        };
         filled += 1;
     }
     return tables;
+}
+
+/// Capture the backend's own RoPE cos/sin values so the graph-side rotation
+/// multiplies by EXACTLY the factors the eager `cb.rope` kernel applies.
+///
+/// The eager Metal kernel computes `angle = pos * pow(theta, -2j/dim)` in f32
+/// per element; a host `math.pow` differs from the kernel's `pow` by ~1 ulp,
+/// and at positions of a few hundred that 1-ulp frequency difference becomes
+/// a ~3e-5 absolute cos/sin difference — a systematic per-layer forward error
+/// that compounds across the encoder stack.
+///
+/// Rotating the basis pattern (x0=1, x1=0) per pair returns
+/// `out0 = cos, out1 = sin` with the kernel's exact rounding.
+/// Returns null when the backend cannot run the rope op (caller falls back to
+/// the host-computed table).
+fn buildBackendRopeTable(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    seq_len: u32,
+    head_dim: u32,
+    theta: f32,
+) !?RopeTable {
+    const sl: usize = @intCast(seq_len);
+    const hd: usize = @intCast(head_dim);
+    const half = hd / 2;
+    if (half == 0) return null;
+    const total = sl * hd;
+
+    const basis = try allocator.alloc(f32, total);
+    defer allocator.free(basis);
+    for (0..sl) |pos| {
+        for (0..half) |j| {
+            basis[pos * hd + 2 * j] = 1.0;
+            basis[pos * hd + 2 * j + 1] = 0.0;
+        }
+    }
+
+    const basis_ct = cb.fromFloat32Shape(basis, &.{ @intCast(sl), @intCast(hd) }) catch return null;
+    defer cb.free(basis_ct);
+    // consecutive_pairs=true matches the eager ModernBERT forward
+    // (`cb.rope(..., true)` in modern_bert.zig).
+    const roped_ct = cb.rope(basis_ct, sl, hd, hd, theta, 1.0, 0, true) catch return null;
+    defer cb.free(roped_ct);
+    const roped = cb.toFloat32(roped_ct, allocator) catch return null;
+    defer allocator.free(roped);
+    if (roped.len != total) return null;
+
+    const cos_buf = try allocator.alloc(f32, total);
+    errdefer allocator.free(cos_buf);
+    const sin_buf = try allocator.alloc(f32, total);
+    errdefer allocator.free(sin_buf);
+    for (0..sl) |pos| {
+        for (0..half) |j| {
+            const c = roped[pos * hd + 2 * j];
+            const s = roped[pos * hd + 2 * j + 1];
+            // Split-convention layout consumed by the graph rope lowering:
+            // pair j reads column j of the [seq, head_dim] table (the second
+            // half duplicates the first, mirroring buildRopeCosSin).
+            cos_buf[pos * hd + j] = c;
+            sin_buf[pos * hd + j] = s;
+            cos_buf[pos * hd + half + j] = c;
+            sin_buf[pos * hd + half + j] = s;
+        }
+    }
+    return .{ .cos = cos_buf, .sin = sin_buf };
 }
 
 /// Download one frozen base weight as an owned host f32 buffer, with the

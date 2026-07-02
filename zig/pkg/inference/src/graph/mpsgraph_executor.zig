@@ -91,7 +91,18 @@ pub const CompiledGraph = struct {
 
     pub fn compile(allocator: std.mem.Allocator, graph: *const Graph) !CompiledGraph {
         const support = supportSummary(graph);
-        if (!support.allSupported()) return error.MpsGraphUnsupportedGraph;
+        if (!support.allSupported()) {
+            std.log.warn(
+                "mpsgraph unsupported graph: {d}/{d} nodes unsupported, first op={s} node={d}",
+                .{
+                    support.unsupported,
+                    support.nodes,
+                    support.first_unsupported_op orelse "<unknown>",
+                    support.first_unsupported_node orelse 0,
+                },
+            );
+            return error.MpsGraphUnsupportedGraph;
+        }
 
         var err: CError = .{};
         const ctx = termite_mpsgraph_context_create(&err) orelse return failCError(&err);
@@ -313,9 +324,39 @@ const Lowerer = struct {
     fn lower(self: *Lowerer) !void {
         self.values = try self.allocator.alloc(?*anyopaque, self.graph.nodeCount());
         @memset(self.values, null);
+        // Lower dependencies-first rather than in raw id order: graph
+        // rewrites (e.g. LoRA injection redirecting consumers to the
+        // combined output) can leave a node whose input has a HIGHER id
+        // than itself, so a plain ascending-id pass would read a value
+        // that has not been lowered yet (MpsGraphMissingInput).
+        var stack: std.ArrayListUnmanaged(NodeId) = .empty;
+        defer stack.deinit(self.allocator);
         for (0..self.graph.nodeCount()) |raw_id| {
-            const node_id: NodeId = @intCast(raw_id);
-            self.values[raw_id] = try self.lowerNode(node_id);
+            try self.lowerSubgraph(@intCast(raw_id), &stack);
+        }
+    }
+
+    fn lowerSubgraph(self: *Lowerer, root: NodeId, stack: *std.ArrayListUnmanaged(NodeId)) !void {
+        if (self.values[root] != null) return;
+        try stack.append(self.allocator, root);
+        while (stack.items.len > 0) {
+            const node_id = stack.items[stack.items.len - 1];
+            if (self.values[node_id] != null) {
+                _ = stack.pop();
+                continue;
+            }
+            const node = self.graph.node(node_id);
+            var pending = false;
+            for (node.inputs[0..node.num_inputs]) |in_id| {
+                if (in_id == null_node) continue;
+                if (self.values[in_id] == null) {
+                    try stack.append(self.allocator, in_id);
+                    pending = true;
+                }
+            }
+            if (pending) continue;
+            _ = stack.pop();
+            self.values[node_id] = try self.lowerNode(node_id);
         }
     }
 
@@ -364,6 +405,10 @@ const Lowerer = struct {
             .erf => return self.unary(.erf, try self.input(node_id, 0)),
             .add => return self.binary(.add, try self.input(node_id, 0), try self.input(node_id, 1)),
             .mul => return self.binary(.mul, try self.input(node_id, 0), try self.input(node_id, 1)),
+            // Same equivalence the Metal partition executor uses:
+            // fused_elem_multiply is exactly an element-wise mul of its two
+            // inputs (the fused form only exists to carry a vjp_alternate).
+            .fused_elem_multiply => return self.binary(.mul, try self.input(node_id, 0), try self.input(node_id, 1)),
             .sub => return self.binary(.sub, try self.input(node_id, 0), try self.input(node_id, 1)),
             .div => return self.binary(.div, try self.input(node_id, 0), try self.input(node_id, 1)),
             .less_than => return self.binary(.less_than, try self.input(node_id, 0), try self.input(node_id, 1)),
@@ -781,6 +826,7 @@ pub fn opSupported(op: OpCode) bool {
         .fused_gelu,
         .fused_softmax,
         .fused_rope,
+        .fused_elem_multiply,
         => true,
 
         // Keep everything else fail-closed until there is a concrete lowering
@@ -799,6 +845,7 @@ test "mpsgraph support classifier accepts current segment vjp op surface" {
         .{ .where_select = {} },
         .{ .concat_prim = .{ .axis = 0 } },
         .{ .fused_gelu = {} },
+        .{ .fused_elem_multiply = {} },
     };
     for (supported_ops) |op| {
         try std.testing.expect(opSupported(op));
