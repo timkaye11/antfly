@@ -678,6 +678,54 @@ pub fn forwardHiddenTensorWithCudaReplay(
     return hidden_result.hidden;
 }
 
+/// Last-row logits through the decoder-runtime forward (CUDA graph replay
+/// capable). Same result shape as the interpreter's last-row logits, but the
+/// layer stack runs through the fused decoder-runtime path — this is what
+/// lets sampled (non-greedy) decoding reuse the fast machinery the greedy
+/// loop gets from forwardGreedyLastToken.
+pub fn forwardLastLogitsWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) ![]f32 {
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total_rows = batch * query_seq_len;
+    const hidden = try forwardHiddenTensorWithCudaReplay(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        replay_label,
+    );
+    defer cb.free(hidden);
+
+    const last_hidden = if (total_rows == 1)
+        hidden
+    else
+        try cb.sliceRows2D(allocator, hidden, total_rows - 1, 1, config.hidden_size);
+    defer if (last_hidden != hidden) cb.free(last_hidden);
+
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+
+    const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+    defer cb.free(logits);
+    try maybeDebugTensor(cb, allocator, "lm_head", logits);
+
+    const result = try cb.toFloat32(logits, allocator);
+    applyFinalLogitSoftcap(config, result);
+    maybeDebugTopLogits(result, config.vocab_size);
+    return result;
+}
+
 pub fn forwardHiddenOnlyWithCudaReplay(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,

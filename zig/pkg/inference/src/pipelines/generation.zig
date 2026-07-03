@@ -529,6 +529,10 @@ fn enableCudaGatedTokenTensorDecode() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GATED_TOKEN_TENSOR_DECODE", false);
 }
 
+fn cudaReplayLastLogitsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS", true);
+}
+
 fn enableCudaGreedyPendingTokenReadback() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK", false);
 }
@@ -1144,6 +1148,7 @@ pub const DecoderRuntimeDebugStats = struct {
     input_model_blocked: u64 = 0,
     input_seq_empty: u64 = 0,
     input_successes: u64 = 0,
+    replay_last_logits_fallbacks: u64 = 0,
 };
 
 var decoder_runtime_debug_stats = DecoderRuntimeDebugStats{};
@@ -4235,6 +4240,33 @@ pub const NativeGenerationPipeline = struct {
         }
         if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
 
+        // CUDA fast path: route the layer stack through the decoder-runtime
+        // forward (graph-replay capable, fused kernels, paged attention).
+        // This is what keeps sampled (non-greedy) decoding near greedy
+        // throughput; the interpreter below runs one op at a time with heavy
+        // per-op host overhead. Escape hatch:
+        // ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS=0.
+        if (self.cb.kind() == .cuda and cudaReplayLastLogitsEnabled()) {
+            if (gpt_arch.forwardLastLogitsWithCudaReplay(
+                &self.cb,
+                self.allocator,
+                self.gpt_config,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+                "gpt.standard_last_logits",
+            )) |logits| {
+                return logits;
+            } else |err| {
+                decoder_runtime_debug_stats.replay_last_logits_fallbacks += 1;
+                debugGenerationStage(
+                    "forwardLastLogits replay path failed err={s}; falling back to interpreter",
+                    .{@errorName(err)},
+                );
+            }
+        }
+
         const logits = try gpt_arch.forward(&self.cb, self.allocator, self.gpt_config, input_ids, batch, seq_len, decode_context);
         defer self.allocator.free(logits);
         const last_pos_offset = (query_seq_len - 1) * @as(usize, @intCast(self.gpt_config.vocab_size));
@@ -4291,6 +4323,32 @@ pub const NativeGenerationPipeline = struct {
             return graph_mod.execution.graphForwardAll(self, cache, input_ids, batch, seq_len, decode_context);
         }
         if (self.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
+
+        // Single-item single-token step: "all logits" is exactly one row, so
+        // the decoder-runtime replay path applies (see forwardLastLogits).
+        // This is the hot path for sampled decoding under the scheduler.
+        if (self.cb.kind() == .cuda and batch == 1 and
+            decode_context.query_sequence_len == 1 and cudaReplayLastLogitsEnabled())
+        {
+            if (gpt_arch.forwardLastLogitsWithCudaReplay(
+                &self.cb,
+                self.allocator,
+                self.gpt_config,
+                input_ids,
+                batch,
+                seq_len,
+                decode_context,
+                "gpt.standard_last_logits",
+            )) |logits| {
+                return logits;
+            } else |err| {
+                decoder_runtime_debug_stats.replay_last_logits_fallbacks += 1;
+                debugGenerationStage(
+                    "forwardAllLogits replay path failed err={s}; falling back to interpreter",
+                    .{@errorName(err)},
+                );
+            }
+        }
         return gpt_arch.forward(&self.cb, self.allocator, self.gpt_config, input_ids, batch, seq_len, decode_context);
     }
 

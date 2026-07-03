@@ -580,6 +580,7 @@ pub const RuntimeStats = struct {
     rms_norm_bf16_mirror_hits: usize = 0,
     rms_norm_q8_mirror_hits: usize = 0,
     q8_quantize_skips: usize = 0,
+    pinned_bulk_downloads: usize = 0,
     qkv_fallback_unsupported: usize = 0,
     qkv_kernel_unavailable: usize = 0,
     q4k_decode_fast_hits: usize = 0,
@@ -840,6 +841,7 @@ pub const CudaCompute = struct {
     decode_profile_gqa_attention_active: bool = false,
     pinned_scalar_upload_ring: PinnedScalarUploadRing = .{},
     pinned_scalar_download_buffer: PinnedScalarDownloadBuffer = .{},
+    pinned_bulk_download_buffer: buffer_mod.HostBuffer = .{},
     async_i32_scalar_download: AsyncI32ScalarDownload = .{},
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
@@ -915,6 +917,7 @@ pub const CudaCompute = struct {
         self.debug_cuda_decode_scalars.free(&self.ctx);
         self.pinned_scalar_upload_ring.host.free(&self.ctx);
         self.pinned_scalar_download_buffer.host.free(&self.ctx);
+        self.pinned_bulk_download_buffer.free(&self.ctx);
         if (self.async_i32_scalar_download.in_use and self.async_i32_scalar_download.event != null) {
             self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(self.async_i32_scalar_download.event)) catch {};
             self.async_i32_scalar_download.in_use = false;
@@ -3601,9 +3604,34 @@ fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer,
     const tried_pinned_scalar_download = pinnedScalarDownloadEligible(self, bytes);
     if (try copyToPinnedScalarDownloadAndSync(self, device, bytes)) return;
     if (tried_pinned_scalar_download) self.stats.pinned_scalar_download_fallbacks += 1;
+    if (try copyToPinnedBulkDownloadAndSync(self, device, bytes)) return;
     try copyToHostTracked(self, device, bytes);
     try synchronizeAndDrainDeferredDeviceFrees(self);
     self.stats.download_syncs += 1;
+}
+
+// Large synchronous downloads into pageable memory run at a fraction of PCIe
+// bandwidth (~180MB/s observed for the per-token 1MB logits row). Stage
+// through a reusable pinned buffer instead: pinned DMA + host memcpy is
+// ~10-20x faster for the sampled-decode logits path.
+const pinned_bulk_download_min_bytes: usize = 64 * 1024;
+const pinned_bulk_download_max_bytes: usize = 4 * 1024 * 1024;
+
+fn copyToPinnedBulkDownloadAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !bool {
+    if (bytes.len < pinned_bulk_download_min_bytes or bytes.len > pinned_bulk_download_max_bytes) return false;
+    if (self.debug_cuda_graph_capture_active) return false;
+    if (self.pinned_bulk_download_buffer.ptr == null) {
+        self.pinned_bulk_download_buffer = buffer_mod.HostBuffer.alloc(&self.ctx, pinned_bulk_download_max_bytes) catch return false;
+    }
+    const staging = self.pinned_bulk_download_buffer.bytes()[0..bytes.len];
+    const logical = buffer_mod.DeviceBuffer{ .ptr = device.ptr, .len = bytes.len };
+    try logical.copyToHost(&self.ctx, staging);
+    try synchronizeAndDrainDeferredDeviceFrees(self);
+    @memcpy(bytes, staging);
+    self.stats.d2h_bytes += bytes.len;
+    self.stats.download_syncs += 1;
+    self.stats.pinned_bulk_downloads += 1;
+    return true;
 }
 
 fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI32ScalarDownload {
