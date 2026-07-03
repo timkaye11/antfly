@@ -228,9 +228,18 @@ pub const MetalKvStorage = struct {
     }
 
     fn traceKvGather() bool {
-        const value = std.c.getenv("TERMITE_METAL_TRACE_KV_GATHER") orelse return false;
-        const span = std.mem.span(value);
-        return span.len > 0 and !std.mem.eql(u8, span, "0");
+        // Cached: this runs per KV write/read in the decode inner loop.
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |value| return value;
+        const enabled = blk: {
+            const value = std.c.getenv("TERMITE_METAL_TRACE_KV_GATHER") orelse break :blk false;
+            const span = std.mem.span(value);
+            break :blk span.len > 0 and !std.mem.eql(u8, span, "0");
+        };
+        S.cached = enabled;
+        return enabled;
     }
 
     fn writeLayerKvSuffix(

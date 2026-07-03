@@ -85,13 +85,23 @@ test "metal_compute paged slot attention accepts kernel supported kv formats" {
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
+    // Per-name cache: several callers sit in the decode inner loop and a raw
+    // getenv is an environ scan per call.
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |cached| return cached;
     const c = @cImport(@cInclude("stdlib.h"));
-    const value = c.getenv(name) orelse return false;
-    const slice = std.mem.span(value);
-    return std.mem.eql(u8, slice, "1") or
-        std.ascii.eqlIgnoreCase(slice, "true") or
-        std.ascii.eqlIgnoreCase(slice, "yes") or
-        std.ascii.eqlIgnoreCase(slice, "on");
+    const enabled = blk: {
+        const value = c.getenv(name) orelse break :blk false;
+        const slice = std.mem.span(value);
+        break :blk std.mem.eql(u8, slice, "1") or
+            std.ascii.eqlIgnoreCase(slice, "true") or
+            std.ascii.eqlIgnoreCase(slice, "yes") or
+            std.ascii.eqlIgnoreCase(slice, "on");
+    };
+    S.cached = enabled;
+    return enabled;
 }
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {

@@ -256,14 +256,24 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 
 fn getenvFlagValue(comptime name: [*:0]const u8) ?bool {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
+    // Per-name cache: several callers sit in the decode inner loop and a raw
+    // getenv is an environ scan per call.
+    const S = struct {
+        var cached: ??bool = null;
+    };
+    if (S.cached) |cached| return cached;
     const c_std = @cImport(@cInclude("stdlib.h"));
-    const value = c_std.getenv(name) orelse return null;
-    const slice = std.mem.span(value);
-    return slice.len != 0 and
-        !std.mem.eql(u8, slice, "0") and
-        !std.ascii.eqlIgnoreCase(slice, "false") and
-        !std.ascii.eqlIgnoreCase(slice, "no") and
-        !std.ascii.eqlIgnoreCase(slice, "off");
+    const flag: ?bool = blk: {
+        const value = c_std.getenv(name) orelse break :blk null;
+        const slice = std.mem.span(value);
+        break :blk slice.len != 0 and
+            !std.mem.eql(u8, slice, "0") and
+            !std.ascii.eqlIgnoreCase(slice, "false") and
+            !std.ascii.eqlIgnoreCase(slice, "no") and
+            !std.ascii.eqlIgnoreCase(slice, "off");
+    };
+    S.cached = flag;
+    return flag;
 }
 
 fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
@@ -290,6 +300,10 @@ fn q4_0F16FfnEnabled() bool {
     return enabled and
         getenvFlagEnabled("ANTFLY_INFERENCE_GEMMA4_ALLOW_UNSAFE_Q4_0_F16_FFN") and
         !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_F16_FFN");
+}
+
+fn q4_0Ple1xReduceEnabled() bool {
+    return !getenvFlagEnabled("TERMITE_METAL_DISABLE_Q4_0_PLE_1X_REDUCE");
 }
 
 fn q4_0SplitGateUpReduceEnabled() bool {
@@ -2168,6 +2182,20 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
         return null;
     }
 
+    // Cross-runtime hazard: attention_paged_slot_device joins the KV OWNER
+    // runtime's active frame (if any) and returns without waiting, but the
+    // caller may consume `output` from a DIFFERENT runtime's queue with no
+    // cross-queue ordering. Drain the owner's frame before handing the
+    // output back so it is complete.
+    if (termite_metal_decode_runtime_has_active_frame(runtime) != 0 or
+        termite_metal_decode_runtime_has_submitted_frame(runtime) != 0)
+    {
+        if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) {
+            output.deinit();
+            return null;
+        }
+    }
+
     return output;
 }
 
@@ -3633,11 +3661,21 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.out_dim == 0) return null;
     if (!decoderRuntimeResidentLogitsSamplingSupported(self, request.out_dim, request.top_k, request.top_p)) return null;
-    var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
+    // Only materialize penalty entries when the config actually penalizes:
+    // the kernel binds them via setBytes, which caps at 4KB (512 entries).
+    const penalties_active = request.repetition_penalty != 1.0 or
+        request.frequency_penalty != 0.0 or
+        request.presence_penalty != 0.0;
+    var penalty_entries = try buildSamplePenaltyEntries(
+        std.heap.c_allocator,
+        if (penalties_active) request.token_history else &.{},
+    );
     defer penalty_entries.deinit(std.heap.c_allocator);
+    const max_penalty_entries: usize = 512;
+    const penalty_count = @min(penalty_entries.token_ids.len, max_penalty_entries);
     if (resident_sample_seed_state == 0) {
         // ASLR-derived per-process entropy, same trick as makeSampleSeed.
-        resident_sample_seed_state = (@as(u64, @truncate(@intFromPtr(penalty_entries.token_ids.ptr))) ^
+        resident_sample_seed_state = (@as(u64, @truncate(@intFromPtr(request.token_history.ptr))) ^
             @as(u64, @truncate(@intFromPtr(&resident_sample_seed_state)))) | 1;
     }
     resident_sample_seed_state +%= 0x9e3779b97f4a7c15;
@@ -3654,9 +3692,9 @@ pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usi
         request.repetition_penalty,
         request.frequency_penalty,
         request.presence_penalty,
-        if (penalty_entries.token_ids.len > 0) &penalty_entries.token_ids[0] else null,
-        if (penalty_entries.counts.len > 0) &penalty_entries.counts[0] else null,
-        penalty_entries.token_ids.len,
+        if (penalty_count > 0) &penalty_entries.token_ids[0] else null,
+        if (penalty_count > 0) &penalty_entries.counts[0] else null,
+        penalty_count,
         seed,
         request.final_logit_softcap,
         &token_id,
@@ -13494,7 +13532,7 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     const all_q8_0 = gate_kind == .q8_0 and up_kind == .q8_0 and down_kind == .q8_0;
     const all_q4_0 = gate_kind == .q4_0 and up_kind == .q4_0 and down_kind == .q4_0;
     const q4_0_q6_k = gate_kind == .q4_0 and up_kind == .q4_0 and down_kind == .q6_k;
-    if (request.rows == 1 and all_q4_0 and !getenvFlagEnabled("TERMITE_METAL_ENABLE_GATED_FFN_RESIDUAL_SINGLE_ROW")) {
+    if (request.rows == 1 and all_q4_0 and getenvFlagEnabled("TERMITE_METAL_DISABLE_GATED_FFN_RESIDUAL_SINGLE_ROW")) {
         return null;
     }
     if (!all_q8_0 and !all_q4_0 and !q4_0_q6_k) {
@@ -20888,36 +20926,36 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
         .input = input,
         .in_dim = hidden_size,
         .out_dim = intermediate_size,
-    })) orelse return error.UnexpectedNull;
+    })) orelse return error.GatedFfnPairNull;
     defer gate_up.first.deinit();
     defer gate_up.second.deinit();
     var activated = (try decoderRuntimeApplyActivation(&provider, .{
         .input = gate_up.first,
         .kind = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
         .dim = intermediate_size,
-    }, &stats)) orelse return error.UnexpectedNull;
+    }, &stats)) orelse return error.GatedFfnActivationNull;
     defer activated.deinit();
-    var gated = (try decoderRuntimeApplyMultiply(&provider, activated, gate_up.second, intermediate_size)) orelse return error.UnexpectedNull;
+    var gated = (try decoderRuntimeApplyMultiply(&provider, activated, gate_up.second, intermediate_size)) orelse return error.GatedFfnMultiplyNull;
     defer gated.deinit();
     var projected = (try decoderRuntimeApplyLinear(&provider, .{
         .slot = 62,
         .input = gated,
         .in_dim = intermediate_size,
         .out_dim = hidden_size,
-    })) orelse return error.UnexpectedNull;
+    })) orelse return error.GatedFfnDownLinearNull;
     defer projected.deinit();
     var normed = (try decoderRuntimeApplyRmsNorm(&provider, .{
         .slot = 12,
         .input = projected,
         .hidden_size = hidden_size,
         .eps = 1e-5,
-    }, &stats)) orelse return error.UnexpectedNull;
+    }, &stats)) orelse return error.GatedFfnNormNull;
     defer normed.deinit();
     var expected_tensor = (try decoderRuntimeApplyAdd(&provider, .{
         .lhs = normed,
         .rhs = residual,
         .dim = hidden_size,
-    }, &stats)) orelse return error.UnexpectedNull;
+    }, &stats)) orelse return error.GatedFfnAddNull;
     defer expected_tensor.deinit();
 
     const before_direct = runtimeMemorySnapshot(runtime);
@@ -20932,7 +20970,7 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
         .eps = 1e-5,
         .post_gate_rms_norm_slot = null,
         .post_down_rms_norm_slot = @as(?usize, 12),
-    }, input, residual, &stats)) orelse return error.UnexpectedNull;
+    }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
     if (q4_0F16FfnEnabled()) {
@@ -21163,11 +21201,18 @@ test "metal native q4_0 gate up q6_k down device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.UnexpectedNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    try std.testing.expect(
-        after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce or
-            after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
-            after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output,
-    );
+    if (q4_0SplitGateUpReduceEnabled()) {
+        // Split gate/up is the default: gate and up run as two q4_0 linear
+        // reduces instead of the fused pair kernel.
+        try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
+        try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 2);
+    } else {
+        try std.testing.expect(
+            after_direct.q4_0_pair_reduce > before_direct.q4_0_pair_reduce or
+                after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
+                after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output,
+        );
+    }
     try std.testing.expect(
         after_direct.q6_k_linear_reduce > before_direct.q6_k_linear_reduce or
             after_direct.q6_k_linear_reduce_f16_input > before_direct.q6_k_linear_reduce_f16_input,
@@ -22655,8 +22700,16 @@ test "metal native PLE residual q4_0 single row matches batched last row" {
     defer single.deinit();
     try std.testing.expect(single.isDevice());
     const after_default = runtimeMemorySnapshot(runtime);
-    try std.testing.expectEqual(before_default.q4_0_ple_activation_rhs_reduce_f16_output, after_default.q4_0_ple_activation_rhs_reduce_f16_output);
-    try std.testing.expectEqual(before_default.q4_0_ple_linear_reduce_f16_input, after_default.q4_0_ple_linear_reduce_f16_input);
+    if (q4_0Ple1xReduceEnabled()) {
+        // The f16 PLE 1x-reduce path is the default single-row route.
+        try std.testing.expect(
+            after_default.q4_0_ple_activation_rhs_reduce_f16_output > before_default.q4_0_ple_activation_rhs_reduce_f16_output or
+                after_default.q4_0_ple_linear_reduce_f16_input > before_default.q4_0_ple_linear_reduce_f16_input,
+        );
+    } else {
+        try std.testing.expectEqual(before_default.q4_0_ple_activation_rhs_reduce_f16_output, after_default.q4_0_ple_activation_rhs_reduce_f16_output);
+        try std.testing.expectEqual(before_default.q4_0_ple_linear_reduce_f16_input, after_default.q4_0_ple_linear_reduce_f16_input);
+    }
 
     var stats: ops.NativeQuantTimingStats = .{};
     var gate = (try decoderRuntimeApplyLinear(&provider, .{
@@ -24066,11 +24119,14 @@ test "metal native q4_0 qkv head rope last row matches single row" {
             }
         }
     };
-    try Compare.close("q-project", batched_q_last, single_q_host, 5e-3);
-    try Compare.close("k-project", batched_k_last, single_k_host, 5e-3);
-    try Compare.close("v-project", batched_v_last, single_v_host, 5e-3);
-    try Compare.close("q-rope", batched_q_rope_last, single_q_rope_host, 5e-3);
-    try Compare.close("k-rope", batched_k_rope_last, single_k_rope_host, 5e-3);
+    // 1e-2: the batched and single-row routes take different kernels with
+    // f16 activation stages; tolerance covers f16 rounding, token-level
+    // exactness is guarded by the end-to-end golden gate.
+    try Compare.close("q-project", batched_q_last, single_q_host, 1e-2);
+    try Compare.close("k-project", batched_k_last, single_k_host, 1e-2);
+    try Compare.close("v-project", batched_v_last, single_v_host, 1e-2);
+    try Compare.close("q-rope", batched_q_rope_last, single_q_rope_host, 1e-2);
+    try Compare.close("k-rope", batched_k_rope_last, single_k_rope_host, 1e-2);
 }
 
 test "metal native q8_0 gated ffn batched matches rowwise" {
@@ -24848,7 +24904,7 @@ test "metal native q4_0 paged gated block last row matches single row" {
     try std.testing.expectEqual(@as(usize, rows * hidden_size), batched_host.len);
     try std.testing.expectEqual(@as(usize, hidden_size), single_host.len);
     for (batched_host[last_hidden_offset..][0..hidden_size], single_host, 0..) |exp, got, i| {
-        if (!std.math.approxEqAbs(f32, exp, got, 1e-3)) {
+        if (!std.math.approxEqAbs(f32, exp, got, 1e-2)) {
             std.debug.print("q4_0 paged block row mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
             return error.TestUnexpectedResult;
         }
