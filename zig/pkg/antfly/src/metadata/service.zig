@@ -114,9 +114,12 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     );
     const persist = ready.persist_ready_detail;
     std.log.warn(
-        "metadata raft ready persist detail group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
         .{
             ready.group_id,
+            persist.skipped_no_durable_state,
+            persist.used_batch,
+            persist.used_group_storage,
             @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
@@ -413,40 +416,8 @@ pub const MetadataServiceConfig = struct {
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
-    metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
     secret_store: ?*common_secrets.FileStore = null,
 };
-
-pub const MetadataOrchestrationUrl = struct {
-    node_id: u64,
-    url: []const u8,
-};
-
-fn cloneMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    urls: []const MetadataOrchestrationUrl,
-) ![]MetadataOrchestrationUrl {
-    if (urls.len == 0) return &.{};
-    const out = try alloc.alloc(MetadataOrchestrationUrl, urls.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |entry| alloc.free(entry.url);
-        alloc.free(out);
-    }
-    for (urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .url = try alloc.dupe(u8, entry.url),
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeMetadataOrchestrationUrls(alloc: std.mem.Allocator, urls: []MetadataOrchestrationUrl) void {
-    for (urls) |entry| alloc.free(entry.url);
-    if (urls.len > 0) alloc.free(urls);
-}
 
 pub const MetadataServiceDeps = struct {
     host: raft_managed_host.ManagedHostDeps = .{},
@@ -2350,7 +2321,6 @@ pub const MetadataHttpService = struct {
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
-    metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
     linearizable_read_tracker: *LinearizableMetadataReadTracker,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
@@ -2403,7 +2373,6 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
-            .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -2419,7 +2388,6 @@ pub const MetadataHttpService = struct {
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
-        freeMetadataOrchestrationUrls(self.alloc, self.metadata_orchestration_urls);
         self.raft.deinit();
         self.linearizable_read_tracker.deinit();
         self.alloc.destroy(self.linearizable_read_tracker);
@@ -2577,54 +2545,6 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         defer self.unlockRuntime();
         try self.raft.host.http_host.campaignGroup(self.metadata_group_id);
-    }
-
-    pub fn forwardMetadataLeaderRequest(
-        self: *MetadataHttpService,
-        alloc: std.mem.Allocator,
-        req: http_common.HttpRequest,
-    ) !?http_common.HttpResponse {
-        self.lockRuntime();
-        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const leader_id = self.raft.host.http_host.leaderId(self.metadata_group_id);
-        self.unlockRuntime();
-        const target_node_id = leader_id orelse return null;
-        if (target_node_id == local_node_id) return null;
-        const base_uri = self.metadataOrchestrationUrlForNode(target_node_id) orelse return null;
-        const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, req.uri });
-        defer alloc.free(uri);
-        const headers = try filteredForwardHeaders(alloc, req.headers);
-        defer if (headers.len > 0) alloc.free(headers);
-        return try self.raft.host.http_host.request_executor.execute(alloc, .{
-            .method = req.method,
-            .uri = uri,
-            .headers = headers,
-            .source_node_id = local_node_id,
-            .authorization = req.authorization,
-            .content_type = req.content_type,
-            .body = req.body,
-        });
-    }
-
-    fn filteredForwardHeaders(alloc: std.mem.Allocator, headers: []const http_common.RequestHeader) ![]http_common.RequestHeader {
-        if (headers.len == 0) return &.{};
-        var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
-        errdefer out.deinit(alloc);
-        for (headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
-            try out.append(alloc, header);
-        }
-        return try out.toOwnedSlice(alloc);
-    }
-
-    fn metadataOrchestrationUrlForNode(self: *const MetadataHttpService, node_id: u64) ?[]const u8 {
-        for (self.metadata_orchestration_urls) |entry| {
-            if (entry.node_id == node_id) return entry.url;
-        }
-        return null;
     }
 
     pub fn proposeTransitionCommand(self: *MetadataHttpService, command: metadata_storage.TransitionCommand) !void {
@@ -3266,10 +3186,13 @@ pub const MetadataHttpService = struct {
         );
         const persist = ready.persist_ready_detail;
         std.log.warn(
-            "metadata linearizable read timeout persist detail request_id={d} group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
             .{
                 request_id,
                 ready.group_id,
+                persist.skipped_no_durable_state,
+                persist.used_batch,
+                persist.used_group_storage,
                 @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),

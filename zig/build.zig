@@ -2697,6 +2697,18 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
+    const lib_common_secrets_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"file secret store"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_common_secrets_tests = b.addRunArtifact(lib_common_secrets_tests);
+    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
+    lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
+
     const lib_casbin_tests = b.addTest(.{
         .root_module = casbin_mod,
     });
@@ -2771,6 +2783,7 @@ pub fn build(b: *std.Build) void {
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
+        "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
@@ -3026,6 +3039,8 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
         "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
+        "data runtime runRound backs off retryable provision metadata failures",
+        "data runtime provisioned root refresh worker backs off retryable metadata failures",
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
@@ -3033,6 +3048,8 @@ pub fn build(b: *std.Build) void {
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "data runtime treats metadata leadership churn as retryable bootstrap failure",
+        "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime live writer source follows raft apply ownership",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime split apply store seeding reuses cached source writer",
@@ -3524,7 +3541,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
-        "api http server forwards cluster backup mutations to metadata leader",
+        "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "public API request body limit matches Go linear merge contract",
@@ -3562,6 +3579,10 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
+            "api http server returns retryable not leader for local public metadata mutation",
+            "api http server returns retryable not leader when metadata proposal is dropped",
+            "api http server returns retryable not leader through public table adapter mutation",
+            "api http server returns retryable not leader through public cluster adapter mutation",
             "api http server dispatches HA admin and internal executors",
             "api http server protects HA admin routes while exempting HA internal routes",
             "api http server forbids non-admin secret access when auth is enabled",
@@ -3998,7 +4019,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_metadata_sim_forward_tests = b.addRunArtifact(lib_metadata_sim_forward_tests);
-    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run metadata HTTP forwarding simulation tests only");
+    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run public table IO forwarding simulation tests only");
     lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
 
     const lib_metadata_service_tests = b.addTest(.{
@@ -4347,6 +4368,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
