@@ -7957,6 +7957,35 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_k, .q4_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 .Q6_K => {
+                    // Full-logits lm-head fast path: Q8_1 activations + DP4A,
+                    // same math as the greedy argmax kernels. Feeds sampled
+                    // decoding, which needs the whole distribution.
+                    if (rows == 1 and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled()) q6_q8_blk: {
+                        const q8_pre = tensorQ8MirrorForInput(input_tensor, rows, in_dim);
+                        var q8_scratch = buffer_mod.DeviceBuffer{};
+                        defer releaseDeviceBuffer(self, &q8_scratch);
+                        const q8_input = if (q8_pre) |pre| blk: {
+                            self.stats.q8_quantize_skips += 1;
+                            break :blk pre;
+                        } else blk: {
+                            q8_scratch = allocDeviceBuffer(self, (in_dim / 32) * 36) catch |err| switch (err) {
+                                error.CudaGraphCaptureUnsafeTempAlloc => break :q6_q8_blk,
+                                else => return err,
+                            };
+                            self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_scratch, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
+                                error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
+                                else => return err,
+                            };
+                            break :blk q8_scratch;
+                        };
+                        self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, device, q8_input, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
+                            error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
+                            else => return err,
+                        };
+                        self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
+                        self.stats.launch_linear += 1;
+                        return createTensor(self, device, shape, out_count);
+                    }
                     try self.kernels.launchLinearQ6KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },

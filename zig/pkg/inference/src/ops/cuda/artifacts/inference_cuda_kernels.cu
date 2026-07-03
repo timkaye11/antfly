@@ -11191,6 +11191,74 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4
     }
 }
 
+// Full-logits variant of the Q6_K x Q8_1 lm-head GEMV (same DP4A core as
+// termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b, but emits the 8
+// column logits instead of argmax-reducing them). Sampled decoding needs the
+// whole distribution; the F32-activation tile4 kernel it replaces runs ~2.4x
+// slower for the 262k-vocab head. Hardcoded for in_dim == 2560 (10 Q6_K
+// blocks per column); blockDim.x = 160, grid.x = out_dim / 8.
+extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
+    float* dst,
+    const unsigned char* input_q8_1,
+    const unsigned char* weight,
+    unsigned int out_dim
+) {
+    const unsigned int row_blocks = 10u;
+    const unsigned int cols = 8u;
+    unsigned int global_tile = blockIdx.x;
+    unsigned int col_tile = global_tile * cols;
+    if (col_tile >= out_dim) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    unsigned int warp = tid >> 5;
+    __shared__ float warp_partial[8][5];
+    float acc[8];
+    #pragma unroll
+    for (unsigned int c = 0; c < 8u; ++c) acc[c] = 0.0f;
+
+    if (tid < 160u) {
+        unsigned int block = tid >> 4u;
+        unsigned int sub = tid & 15u;
+        unsigned int q8_sub_block = sub >> 1u;
+        unsigned int q8_lane_base = (sub & 1u) * 16u;
+        const unsigned char* q8_bp = input_q8_1 + (block * 8u + q8_sub_block) * 36u;
+        unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+        float q8_d = termite_half_to_float(q8_d_h);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        int q8_pack0 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 0u);
+        int q8_pack1 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 4u);
+        int q8_pack2 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 8u);
+        int q8_pack3 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 12u);
+        #pragma unroll
+        for (unsigned int c = 0; c < 8u; ++c) {
+            const unsigned char* bp = weight + ((col_tile + c) * row_blocks + block) * 210u;
+            int sumi = 0;
+            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 0u), q8_pack0, sumi);
+            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 4u), q8_pack1, sumi);
+            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 8u), q8_pack2, sumi);
+            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 12u), q8_pack3, sumi);
+            acc[c] = (q8_d * termite_q6k_sub_scale_f32(bp, sub)) * (float)sumi;
+        }
+    }
+    #pragma unroll
+    for (unsigned int c = 0; c < 8u; ++c) {
+        float sum = termite_warp_reduce_sum(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid < 8u) {
+        unsigned int col = col_tile + tid;
+        if (col < out_dim) {
+            dst[col] =
+                warp_partial[tid][0] +
+                warp_partial[tid][1] +
+                warp_partial[tid][2] +
+                warp_partial[tid][3] +
+                warp_partial[tid][4];
+        }
+    }
+}
+
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4(
     float* partial_values,
     unsigned int* partial_indices,

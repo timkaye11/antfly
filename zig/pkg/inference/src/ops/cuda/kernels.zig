@@ -136,6 +136,7 @@ pub const KernelModule = struct {
     linear_q6_k_panel32_q8_1_argmax_rows_stage1_tile32: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_f32_tile8_e4b: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile16: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4b: driver_mod.CUfunction = null,
@@ -395,6 +396,7 @@ pub const KernelModule = struct {
         const linear_q6_k_panel32_q8_1_argmax_rows_stage1_tile32 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_panel32_q8_1_argmax_rows_stage1_tile32");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b");
+        const linear_q6_k_q8_1_f32_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_f32_tile8_e4b");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile16");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4b");
@@ -709,6 +711,7 @@ pub const KernelModule = struct {
             .linear_q6_k_panel32_q8_1_argmax_rows_stage1_tile32 = linear_q6_k_panel32_q8_1_argmax_rows_stage1_tile32,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8 = linear_q6_k_q8_1_argmax_rows_stage1_tile8,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
+            .linear_q6_k_q8_1_f32_tile8_e4b = linear_q6_k_q8_1_f32_tile8_e4b,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4 = linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile16 = linear_q6_k_q8_1_argmax_rows_stage1_tile16,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4b,
@@ -957,6 +960,7 @@ pub const KernelModule = struct {
             self.linear_q6_k_panel32_q8_1_argmax_rows_stage1_tile32 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = null;
+            self.linear_q6_k_q8_1_f32_tile8_e4b = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_w4 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile16 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile16_e4b = null;
@@ -2670,6 +2674,34 @@ pub const KernelModule = struct {
             @ptrCast(&col_tiles_u32),
         };
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
+    }
+
+    pub fn launchLinearQ6KQ8_1F32Tile8E4B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q6_k_q8_1_f32_tile8_e4b orelse return error.CudaKernelUnavailable;
+        // The kernel body hardcodes 10 Q6_K blocks per column (in_dim 2560).
+        if (in_dim != 2560 or out_dim == 0 or out_dim % 8 != 0) return error.CudaKernelUnavailable;
+        try checkBytes(dst, out_dim);
+        try checkRawBytes(input_q8_1, (in_dim / 32) * 36);
+        try checkRawBytes(weight_raw, try checkedTensorElements(out_dim, (in_dim / 256) * 210));
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_dim / 8, 160, &params);
     }
 
     pub fn launchLinearQ6KQ8_1ArgmaxRowsTile8F32(

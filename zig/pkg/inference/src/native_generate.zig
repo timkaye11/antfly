@@ -629,6 +629,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
         null
+    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
+        // Mixed attention (iSWA-style models like Gemma): global layers need
+        // the full KV history, and the pool packs every layer's KV into
+        // shared blocks, so window-trimming the pool silently truncates the
+        // global layers' context. Retain everything; sliding-window layers
+        // still apply their exact window inside the attention kernels, so
+        // their compute stays bounded — only KV memory grows with context.
+        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
+        // trim-to-window behavior (lower memory, truncated global context).
+        null
     else if (gpt_config.sliding_window > 0)
         gpt_config.sliding_window
     else if (gpt_config.max_position_embeddings > 0)
@@ -3780,6 +3790,10 @@ fn gemmaPrefillPrewarmEnabled() bool {
     return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
 }
 
+fn kvSlidingTrimForced() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
+}
+
 fn cudaGemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
@@ -4485,6 +4499,16 @@ fn runOnnxWholeModelGraphGenerate(
     defer cb.deinit();
 
     const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
+        null
+    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
+        // Mixed attention (iSWA-style models like Gemma): global layers need
+        // the full KV history, and the pool packs every layer's KV into
+        // shared blocks, so window-trimming the pool silently truncates the
+        // global layers' context. Retain everything; sliding-window layers
+        // still apply their exact window inside the attention kernels, so
+        // their compute stays bounded — only KV memory grows with context.
+        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
+        // trim-to-window behavior (lower memory, truncated global context).
         null
     else if (gpt_config.sliding_window > 0)
         gpt_config.sliding_window
