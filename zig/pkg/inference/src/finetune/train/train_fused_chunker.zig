@@ -61,6 +61,7 @@ const fused_chunker_train = @import("../fused_chunker_train.zig");
 const fused_chunker_data = @import("../fused_chunker_data.zig");
 const fused_chunker_mod = @import("../fused_chunker.zig");
 const fused_chunker_splade = @import("../fused_chunker_splade.zig");
+const splade_stage = @import("../fused_chunker_splade_stage.zig");
 const fused_chunker_loss = @import("../fused_chunker_loss.zig");
 const infonce_cpu = @import("../infonce_cpu.zig");
 const safetensors_checkpoint = @import("../safetensors_checkpoint.zig");
@@ -259,6 +260,11 @@ const Options = struct {
     lambda_splade: f32 = 0.15,
     lambda_flops: f32 = 3e-5,
     splade_focus_epoch: u32 = 4,
+    // Phase 32 late-SPLADE-stage machinery (Go parity; only active with --splade)
+    splade_training_mode: splade_stage.SpladeTrainingMode = .head_only,
+    separate_splade_adapter: bool = true,
+    restore_best_for_splade_stage: bool = true,
+    reset_optimizer_on_splade_stage: bool = true,
     // Matryoshka Representation Learning
     mrl: bool = false,
     mrl_dims_str: []const u8 = "768,256,128",
@@ -297,6 +303,17 @@ const Options = struct {
     debug_encoder_replay_upstream_path: ?[]const u8 = null,
     debug_layer_backward_decomp: bool = false,
     debug_qkv_split_vjp: bool = false,
+
+    pub fn spladeStageConfig(self: Options) splade_stage.StageConfig {
+        return .{
+            .enable_splade = self.splade,
+            .mode = self.splade_training_mode,
+            .splade_focus_epoch = self.splade_focus_epoch,
+            .restore_best_for_splade_stage = self.restore_best_for_splade_stage,
+            .reset_optimizer_on_splade_stage = self.reset_optimizer_on_splade_stage,
+            .separate_splade_adapter = self.separate_splade_adapter,
+        };
+    }
 };
 
 const StepTiming = struct {
@@ -6066,6 +6083,13 @@ fn writeFusedTrainingManifest(
         .deterministic = opts.deterministic,
         .go_epoch_shuffle = opts.go_epoch_shuffle,
         .splade = opts.splade,
+        .lambda_splade = opts.lambda_splade,
+        .lambda_flops = opts.lambda_flops,
+        .splade_focus_epoch = opts.splade_focus_epoch,
+        .splade_training_mode = opts.splade_training_mode.name(),
+        .separate_splade_adapter = opts.separate_splade_adapter,
+        .restore_best_for_splade_stage = opts.restore_best_for_splade_stage,
+        .reset_optimizer_on_splade_stage = opts.reset_optimizer_on_splade_stage,
         .mrl = opts.mrl,
         .mrl_dims = opts.mrl_dims_str,
         .boundary_loss_type = @tagName(opts.boundary_loss_type),
@@ -7184,6 +7208,10 @@ pub fn main(init: std.process.Init) !void {
     var lambda_splade: f32 = 0.15;
     var lambda_flops: f32 = 3e-5;
     var splade_focus_epoch: u32 = 4;
+    var splade_training_mode: splade_stage.SpladeTrainingMode = .head_only;
+    var separate_splade_adapter: bool = true;
+    var restore_best_for_splade_stage: bool = true;
+    var reset_optimizer_on_splade_stage: bool = true;
     var mrl: bool = false;
     var mrl_dims_str: []const u8 = "768,256,128";
     var resume_from: []const u8 = "";
@@ -7517,6 +7545,24 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--splade-focus-epoch")) {
             const val = args.next() orelse return error.MissingSPLADEFocusEpoch;
             splade_focus_epoch = try std.fmt.parseUnsigned(u32, val, 10);
+        } else if (std.mem.eql(u8, arg, "--splade-training-mode")) {
+            const val = args.next() orelse return error.MissingSpladeTrainingMode;
+            splade_training_mode = splade_stage.SpladeTrainingMode.parse(val) orelse {
+                print("error: --splade-training-mode must be 'joint' or 'head-only', got \"{s}\"\n", .{val});
+                return error.InvalidSpladeTrainingMode;
+            };
+        } else if (std.mem.eql(u8, arg, "--separate-splade-adapter")) {
+            separate_splade_adapter = true;
+        } else if (std.mem.eql(u8, arg, "--no-separate-splade-adapter")) {
+            separate_splade_adapter = false;
+        } else if (std.mem.eql(u8, arg, "--restore-best-for-splade-stage")) {
+            restore_best_for_splade_stage = true;
+        } else if (std.mem.eql(u8, arg, "--no-restore-best-for-splade-stage")) {
+            restore_best_for_splade_stage = false;
+        } else if (std.mem.eql(u8, arg, "--reset-optimizer-on-splade-stage")) {
+            reset_optimizer_on_splade_stage = true;
+        } else if (std.mem.eql(u8, arg, "--no-reset-optimizer-on-splade-stage")) {
+            reset_optimizer_on_splade_stage = false;
         } else if (std.mem.eql(u8, arg, "--mrl")) {
             mrl = true;
         } else if (std.mem.eql(u8, arg, "--mrl-dims")) {
@@ -7711,6 +7757,10 @@ pub fn main(init: std.process.Init) !void {
         .lambda_splade = lambda_splade,
         .lambda_flops = lambda_flops,
         .splade_focus_epoch = splade_focus_epoch,
+        .splade_training_mode = splade_training_mode,
+        .separate_splade_adapter = separate_splade_adapter,
+        .restore_best_for_splade_stage = restore_best_for_splade_stage,
+        .reset_optimizer_on_splade_stage = reset_optimizer_on_splade_stage,
         .mrl = mrl,
         .mrl_dims_str = mrl_dims_str,
         .resume_from = resume_from,
@@ -7997,6 +8047,9 @@ fn saveFusedCheckpoint(
     path: []const u8,
     trainer: *FusedTrainer,
     lora_adapters: ?*const fused_chunker_lora.LoRAAdapterSet,
+    splade_w: ?[]const f32,
+    splade_vocab_size: usize,
+    hidden_size: usize,
 ) !void {
     var tensor_list = std.ArrayListUnmanaged(safetensors_checkpoint.NamedTensor).empty;
     defer tensor_list.deinit(allocator);
@@ -8052,6 +8105,21 @@ fn saveFusedCheckpoint(
             const shape_b = [_]usize{ ll.out_features, rank };
             try appendCheckpointTensor(allocator, &tensor_list, &shape_storage, name_b, ll.B, &shape_b);
         }
+    }
+
+    // SPLADE projection W under its serving name so downstream consumers
+    // (export-fused-chunker-model passthroughServingName, eval) pick it up
+    // directly from the training checkpoint.
+    if (splade_w) |w| {
+        const splade_shape = [_]usize{ splade_vocab_size, hidden_size };
+        try appendCheckpointTensor(
+            allocator,
+            &tensor_list,
+            &shape_storage,
+            fused_chunker_splade.SPLADE_WEIGHT_KEY,
+            w,
+            &splade_shape,
+        );
     }
 
     try safetensors_checkpoint.save(allocator, path, tensor_list.items);
@@ -8287,7 +8355,15 @@ fn savePeriodicTrainingCheckpoint(
         label,
         value,
     });
-    try saveFusedCheckpoint(allocator, ckpt_path, trainer, lora_adapters);
+    try saveFusedCheckpoint(
+        allocator,
+        ckpt_path,
+        trainer,
+        lora_adapters,
+        splade_w,
+        splade_vocab_size,
+        @intCast(opts.hidden_size),
+    );
     print("checkpoint saved to {s}\n", .{ckpt_path});
 
     if (opts.save_optimizer_state) {
@@ -8680,6 +8756,38 @@ fn loadLoRATensorFromCheckpoint(
         return true;
     }
 
+    return false;
+}
+
+/// Load the SPLADE projection W from a training checkpoint if present.
+/// Accepts the serving-style name written by saveFusedCheckpoint and the
+/// legacy standalone splade_w_*.safetensors name. Returns true when loaded.
+fn loadSpladeWeightFromCheckpoint(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+    dest: []f32,
+) !bool {
+    const file_bytes = try compat.cwd().readFileAlloc(compat.io(), checkpoint_path, allocator, .unlimited);
+    var reader = safetensors.MMapReader.fromBytes(allocator, file_bytes) catch |err| {
+        allocator.free(file_bytes);
+        return err;
+    };
+    defer reader.deinit();
+
+    const names = [_][]const u8{
+        fused_chunker_splade.SPLADE_WEIGHT_KEY,
+        "splade_proj_weight",
+    };
+    for (names) |name| {
+        if (!reader.header.tensors.contains(name)) continue;
+        var tensor = try reader.readTensor(name);
+        defer tensor.deinit();
+        if (tensor.dtype != .f32) return error.InvalidCheckpoint;
+        const src = tensor.asFloat32();
+        if (src.len != dest.len) return error.CheckpointSizeMismatch;
+        @memcpy(dest, src);
+        return true;
+    }
     return false;
 }
 
@@ -9326,6 +9434,31 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
         print("SPLADE weight W initialized: vocab={d} hidden={d} init_std={d}\n", .{ splade_vocab_size, opts.hidden_size, init_std });
     }
 
+    if (opts.splade) {
+        print(
+            "splade_stage_config mode={s} focus_epoch={d} separate_adapter={} restore_best={} reset_optimizer={} lambda_splade={d} lambda_flops={d}\n",
+            .{
+                opts.splade_training_mode.name(),
+                opts.splade_focus_epoch,
+                opts.separate_splade_adapter,
+                opts.restore_best_for_splade_stage,
+                opts.reset_optimizer_on_splade_stage,
+                opts.lambda_splade,
+                opts.lambda_flops,
+            },
+        );
+        if (@as(usize, opts.splade_focus_epoch) >= @as(usize, opts.epochs)) {
+            print(
+                "WARNING: splade_focus_epoch ({d}) >= epochs ({d}) — SPLADE will never activate! Reduce --splade-focus-epoch or increase --epochs.\n",
+                .{ opts.splade_focus_epoch, opts.epochs },
+            );
+        }
+        if (opts.splade_training_mode == .head_only and opts.val_data_path == null) {
+            print("WARNING: head-only SPLADE stage is enabled without validation data.\n", .{});
+            print("  Training still runs, but restore-best-for-splade-stage has no best boundary checkpoint to reload.\n", .{});
+        }
+    }
+
     defer if (splade_w) |w| allocator.free(w);
     defer if (splade_adam_m) |m| allocator.free(m);
     defer if (splade_adam_v) |v| allocator.free(v);
@@ -9669,6 +9802,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
     var best_val_f1: f32 = 0.0;
     var best_val_epoch: u32 = 0;
     var best_val_step: u32 = 0;
+    const stage_cfg = opts.spladeStageConfig();
     var boundary_threshold_recommendation = BoundaryThresholdRecommendation{};
     var last_validation_summary: ?fused_chunker_train.EvalSummary = null;
     var last_validation_event: []const u8 = "";
@@ -9797,6 +9931,61 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
             continue;
         }
 
+        // ------------------------------------------------------------------
+        // Phase 32 (Go parity): late SPLADE head-only stage transition.
+        // At the focus epoch, optionally restore the best boundary checkpoint
+        // and reset optimizer moments; for the remaining epochs only the
+        // SPLADE head trains (boundary/dense/LoRA frozen by construction).
+        // ------------------------------------------------------------------
+        const splade_head_only_epoch = splade_stage.isHeadOnlyPhase(stage_cfg, epoch);
+        if (splade_stage.isStageEntryEpoch(stage_cfg, epoch)) {
+            print("entering SPLADE head-only stage at epoch {d}/{d}\n", .{ epoch + 1, opts.epochs });
+            if (splade_stage.shouldRestoreBest(stage_cfg, epoch, best_val_epoch)) {
+                var best_restore_buf: [512]u8 = undefined;
+                const best_restore_path = try std.fmt.bufPrint(
+                    &best_restore_buf,
+                    "{s}/best_model.safetensors",
+                    .{opts.output_dir},
+                );
+                print(
+                    "restoring best boundary checkpoint before SPLADE stage: {s} (epoch={d} step={d} f1={d:.4})\n",
+                    .{ best_restore_path, best_val_epoch, best_val_step, best_val_f1 },
+                );
+                try trainer.loadCheckpoint(allocator, best_restore_path);
+                if (lora_adapters_opt) |*la| {
+                    const restored_lora = try loadLoRAAdaptersFromCheckpoint(allocator, best_restore_path, la);
+                    print("restored {d} LoRA tensors from {s}\n", .{ restored_lora, best_restore_path });
+                }
+                if (splade_w) |w| {
+                    const restored_splade = loadSpladeWeightFromCheckpoint(allocator, best_restore_path, w) catch |err| blk: {
+                        print("warning: could not restore SPLADE W from {s}: {}\n", .{ best_restore_path, err });
+                        break :blk false;
+                    };
+                    if (restored_splade) {
+                        print("restored SPLADE W from {s}\n", .{best_restore_path});
+                    }
+                }
+            } else if (stage_cfg.restore_best_for_splade_stage) {
+                print("splade_stage restore-best requested but no best checkpoint recorded; keeping current weights\n", .{});
+            }
+            if (splade_stage.shouldResetOptimizer(stage_cfg, epoch)) {
+                print("resetting optimizer state for SPLADE stage\n", .{});
+                trainer.resetOptimizerStateForStage();
+                lora_opt_state.deinit();
+                lora_opt_state = optimizers.OptimizerState.init(allocator);
+                if (lora_adapters_opt) |*la| la.zeroGrads();
+                if (splade_adam_m) |m| @memset(m, 0);
+                if (splade_adam_v) |v| @memset(v, 0);
+                splade_adam_step = 0;
+            }
+        }
+        if (splade_head_only_epoch) {
+            print(
+                "splade_stage epoch={d}/{d} head_only=true boundary_updates=frozen dense_updates=frozen lora_updates=frozen splade_updates=active\n",
+                .{ epoch + 1, opts.epochs },
+            );
+        }
+
         var step: u32 = if (epoch == resume_epoch) resume_step_in_epoch else 0;
         var batch_start: usize = if (epoch == resume_epoch) effective_resume_batch_offset else 0;
         if (resume_step_count > 0 and epoch == resume_epoch and batch_start > 0) {
@@ -9809,7 +9998,15 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
         while (batch_start < active_indices.len) {
             const step_start_ns = nowNs();
             var step_timing = StepTiming{};
-            const lora_training_active = lora_adapters_opt != null and epoch >= @as(usize, opts.lora_start_epoch);
+            // In the head-only SPLADE stage the encoder runs forward-only:
+            // no activation captures, no VJP, no LoRA/boundary updates.
+            const lora_training_active = lora_adapters_opt != null and
+                epoch >= @as(usize, opts.lora_start_epoch) and
+                !splade_head_only_epoch;
+            // No NEFTune noise during the head-only stage — the frozen paths
+            // receive no gradients and SPLADE calibration wants clean features
+            // (Go's SPLADE stage runs its branch with training-mode dropout off).
+            const step_encoder_neftune_alpha: f32 = if (splade_head_only_epoch) 0.0 else effective_encoder_neftune_alpha;
 
             const batch_end = @min(batch_start + batch_sz, active_indices.len);
             const batch_indices = active_indices[batch_start..batch_end];
@@ -9935,7 +10132,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                 for (batch.attention_mask[0..total_tokens], mask_i64) |m32, *m64| m64.* = @intCast(m32);
 
                 const lora_alpha_for_config: f32 = if (lora_adapters_opt) |la| la.config.alpha else 0.0;
-                const neftune_seed = if (effective_encoder_neftune_alpha > 0.0) blk: {
+                const neftune_seed = if (step_encoder_neftune_alpha > 0.0) blk: {
                     const seed = opts.seed ^ global_neft_step;
                     global_neft_step += 1;
                     break :blk seed;
@@ -9946,7 +10143,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                     .intermediate_size = opts.intermediate_size,
                     .lora_rank = if (lora_adapters_opt != null) opts.lora_rank else 0,
                     .lora_alpha = lora_alpha_for_config,
-                    .neftune_alpha = effective_encoder_neftune_alpha,
+                    .neftune_alpha = step_encoder_neftune_alpha,
                     .neftune_seed = neftune_seed,
                 };
 
@@ -10079,15 +10276,45 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                         activations_opt = act_buf;
                     }
                 } else {
-                    features_owned = try modern_bert.forward(
-                        &cb,
-                        allocator,
-                        bert_config,
-                        ids_i64,
-                        mask_i64,
-                        actual_batch,
-                        max_seq,
-                    );
+                    // Forward-only encoder (no captures, no VJP). In the
+                    // head-only SPLADE stage, reuse the capture-free compiled
+                    // segmented eval forward when available — the frozen paths
+                    // need no encoder gradients, so the eval-style fast path is
+                    // exactly sufficient. Eager fallback on any failure.
+                    if (splade_head_only_epoch) {
+                        if (compiled_eval_forward) |*cef| {
+                            if (lora_adapters_opt != null and cef.shouldUse(actual_batch, batch_sz)) {
+                                if (cef.forward(
+                                    &cb,
+                                    bert_config,
+                                    ids_i64,
+                                    mask_i64,
+                                    actual_batch,
+                                    max_seq,
+                                    lora_adapters_opt.?.layers,
+                                )) |compiled_features| {
+                                    features_owned = compiled_features;
+                                } else |err| {
+                                    cef.failed = true;
+                                    print(
+                                        "warning: compiled segment forward failed with {s} (SPLADE head-only step); falling back to eager forward\n",
+                                        .{@errorName(err)},
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if (features_owned == null) {
+                        features_owned = try modern_bert.forward(
+                            &cb,
+                            allocator,
+                            bert_config,
+                            ids_i64,
+                            mask_i64,
+                            actual_batch,
+                            max_seq,
+                        );
+                    }
                 }
             }
 
@@ -10664,7 +10891,10 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
             defer if (contrastive_doc_ids_owned) |buf| allocator.free(buf);
 
             const hard_neg_start_ns = nowNs();
-            if (encoder_loaded and batch.hard_neg_ids != null and batch.hard_neg_mask != null) {
+            // Hard negatives only feed the dense contrastive loss, which is
+            // frozen during the head-only SPLADE stage — skip the extra
+            // encoder forward entirely.
+            if (!splade_head_only_epoch and encoder_loaded and batch.hard_neg_ids != null and batch.hard_neg_mask != null) {
                 const hn_ids = batch.hard_neg_ids.?;
                 const hn_mask = batch.hard_neg_mask.?;
                 const denom = actual_batch * max_seq;
@@ -10832,7 +11062,19 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
             var summary: TrainStepSummary = undefined;
             var last_vjp_profile: ?segmented_encoder.SegmentVJPProfile = null;
 
-            if (lora_adapters_opt) |*la| {
+            if (splade_head_only_epoch) {
+                // Late SPLADE head-only stage: the boundary head, dense path,
+                // and encoder LoRA are frozen. frozenStepSummary only advances
+                // the global step counter — no gradients are computed and no
+                // optimizer state is touched for the frozen groups, so
+                // boundary F1 is structurally incapable of changing here.
+                // (Guarded by splade_stage.updateAllowed semantics: only
+                // .splade_head updates are permitted in this phase.)
+                std.debug.assert(!splade_stage.updateAllowed(stage_cfg, .boundary_head, epoch));
+                std.debug.assert(!splade_stage.updateAllowed(stage_cfg, .encoder_lora, epoch));
+                std.debug.assert(splade_stage.updateAllowed(stage_cfg, .splade_head, epoch));
+                summary = trainer.frozenStepSummary();
+            } else if (lora_adapters_opt) |*la| {
                 if (activations_opt) |*act_buf| {
                     // Use the gradient-returning variant so we can backprop into LoRA.
                     const train_step_start_ns = nowNs();
@@ -11568,9 +11810,18 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
             // ------------------------------------------------------------------
             // SPLADE training: forward + backward + AdamW update for W.
             // Activates only after splade_focus_epoch so boundary training
-            // stabilises first.
+            // stabilises first. Loss weights follow the Go GetSpladeLambdas
+            // schedule (half λ_splade ramp-in, quadratic FLOPS ramp).
             // ------------------------------------------------------------------
-            const splade_active = opts.splade and encoder_loaded and epoch >= @as(usize, opts.splade_focus_epoch);
+            const splade_lambdas = splade_stage.lambdasForEpoch(
+                stage_cfg,
+                epoch,
+                @intCast(opts.epochs),
+                opts.lambda_splade,
+                opts.lambda_flops,
+            );
+            const splade_active = splade_stage.spladeActive(stage_cfg, epoch) and encoder_loaded and
+                (splade_lambdas.splade > 0 or splade_lambdas.flops > 0);
             const splade_start_ns = nowNs();
             if (splade_active) {
                 if (splade_w) |w| {
@@ -11636,7 +11887,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                         );
                         defer splade_contrastive.deinit(allocator);
 
-                        // FLOPS regularization loss + gradient.
+                        // FLOPS regularization loss + gradient (epoch-ramped weight).
                         const flops_grad = try allocator.alloc(f32, num_valid_chunks * splade_vocab_size);
                         defer allocator.free(flops_grad);
                         const flops_loss = fused_chunker_splade.computeSpladeFlopsLoss(
@@ -11644,15 +11895,25 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                             flops_grad,
                             num_valid_chunks,
                             @intCast(splade_vocab_size),
-                            opts.lambda_flops,
+                            splade_lambdas.flops,
                         );
-                        _ = flops_loss;
+
+                        // Sparsity: fraction of exactly-zero activations across
+                        // valid chunk SPLADE vectors (Go parity metric).
+                        var splade_zero_count: usize = 0;
+                        for (splade_vecs) |v| {
+                            if (v == 0) splade_zero_count += 1;
+                        }
+                        const splade_sparsity_pct: f64 = if (splade_vecs.len > 0)
+                            @as(f64, @floatFromInt(splade_zero_count)) / @as(f64, @floatFromInt(splade_vecs.len)) * 100.0
+                        else
+                            0.0;
 
                         // Combined gradient: lambda_splade * contrastive_grad + flops_grad.
                         const combined_grad = try allocator.alloc(f32, num_valid_chunks * splade_vocab_size);
                         defer allocator.free(combined_grad);
                         for (combined_grad, splade_contrastive.grad, flops_grad) |*cg, sg, fg| {
-                            cg.* = opts.lambda_splade * sg + fg;
+                            cg.* = splade_lambdas.splade * sg + fg;
                         }
 
                         // Backprop through SPLADE to get dL/dW.
@@ -11718,7 +11979,24 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                             }
                         }
 
-                        print("  splade_loss: {d:.4}\n", .{splade_contrastive.loss});
+                        const splade_objective: f32 =
+                            @as(f32, @floatCast(@as(f64, splade_lambdas.splade) * splade_contrastive.loss)) + flops_loss;
+                        print(
+                            "  splade_loss: {d:.4} flops_loss: {d:.6} sparsity_pct: {d:.2} lambda_splade: {d:.4} lambda_flops: {d:.6} stage: {s}\n",
+                            .{
+                                splade_contrastive.loss,
+                                flops_loss,
+                                splade_sparsity_pct,
+                                splade_lambdas.splade,
+                                splade_lambdas.flops,
+                                if (splade_head_only_epoch) "head-only" else "joint",
+                            },
+                        );
+                        if (splade_head_only_epoch) {
+                            // Frozen paths report zero loss; surface the SPLADE
+                            // objective as the step total (Go fast-path parity).
+                            summary.total_loss = splade_objective;
+                        }
                     }
                 }
             }
@@ -12040,7 +12318,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                     best_val_step = summary.step;
                     var best_path_buf: [512]u8 = undefined;
                     const best_path = try std.fmt.bufPrint(&best_path_buf, "{s}/best_model.safetensors", .{opts.output_dir});
-                    try saveFusedCheckpoint(allocator, best_path, &trainer, if (lora_adapters_opt) |*la| la else null);
+                    try saveFusedCheckpoint(allocator, best_path, &trainer, if (lora_adapters_opt) |*la| la else null, splade_w, splade_vocab_size, @intCast(opts.hidden_size));
                     print("best checkpoint saved to {s} (step={d} epoch={d} f1={d:.4})\n", .{
                         best_path,
                         best_val_step,
@@ -12182,7 +12460,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
                 best_val_step = trainer.step_count;
                 var best_path_buf: [512]u8 = undefined;
                 const best_path = try std.fmt.bufPrint(&best_path_buf, "{s}/best_model.safetensors", .{opts.output_dir});
-                try saveFusedCheckpoint(allocator, best_path, &trainer, if (lora_adapters_opt) |*la| la else null);
+                try saveFusedCheckpoint(allocator, best_path, &trainer, if (lora_adapters_opt) |*la| la else null, splade_w, splade_vocab_size, @intCast(opts.hidden_size));
                 print("best checkpoint saved to {s} (step={d} epoch={d} f1={d:.4})\n", .{
                     best_path,
                     best_val_step,
@@ -12198,7 +12476,7 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
     // ------------------------------------------------------------------
     var final_buf: [512]u8 = undefined;
     const final_path = try std.fmt.bufPrint(&final_buf, "{s}/checkpoint_final.safetensors", .{opts.output_dir});
-    try saveFusedCheckpoint(allocator, final_path, &trainer, if (lora_adapters_opt) |*la| la else null);
+    try saveFusedCheckpoint(allocator, final_path, &trainer, if (lora_adapters_opt) |*la| la else null, splade_w, splade_vocab_size, @intCast(opts.hidden_size));
     print("final checkpoint saved to {s}\n", .{final_path});
 
     if (opts.save_optimizer_state) {
@@ -12441,7 +12719,14 @@ fn printUsage() void {
         \\  --splade                  Enable SPLADE sparse embedding head
         \\  --lambda-splade <f>       SPLADE contrastive loss weight (default: 0.15)
         \\  --lambda-flops <f>        SPLADE FLOPS regularization weight (default: 3e-5)
-        \\  --splade-focus-epoch <n>  Epoch when SPLADE activates (default: 4)
+        \\  --splade-focus-epoch <n>  Epoch when SPLADE activates; with head-only mode this starts the late SPLADE-only stage (default: 4)
+        \\  --splade-training-mode joint|head-only SPLADE stage mode (default: head-only; head-only freezes boundary/dense/LoRA after the focus epoch)
+        \\  --separate-splade-adapter Keep SPLADE gradients isolated from the primary chunking/dense path (default; Zig SPLADE W never backprops into the encoder)
+        \\  --no-separate-splade-adapter Accepted for Go CLI parity; recorded in the manifest only
+        \\  --restore-best-for-splade-stage Restore best boundary checkpoint when entering the late SPLADE stage (default)
+        \\  --no-restore-best-for-splade-stage Keep current weights when entering the late SPLADE stage
+        \\  --reset-optimizer-on-splade-stage Reset optimizer moments when entering the late SPLADE stage (default)
+        \\  --no-reset-optimizer-on-splade-stage Keep optimizer moments across the SPLADE stage transition
         \\  --mrl                     Enable Matryoshka Representation Learning
         \\  --mrl-dims <s>            Comma-separated MRL dims (default: "768,256,128")
         \\  --resume-from <path>      Resume training from a checkpoint file

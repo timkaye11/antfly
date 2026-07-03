@@ -112,6 +112,10 @@ enable_splade="${ANTFLY_FUSED_CHUNKER_SPLADE:-0}"
 lambda_splade="${ANTFLY_FUSED_CHUNKER_LAMBDA_SPLADE:-0.15}"
 lambda_flops="${ANTFLY_FUSED_CHUNKER_LAMBDA_FLOPS:-3e-5}"
 splade_focus_epoch="${ANTFLY_FUSED_CHUNKER_SPLADE_FOCUS_EPOCH:-4}"
+splade_training_mode="${ANTFLY_FUSED_CHUNKER_SPLADE_TRAINING_MODE:-head-only}"
+separate_splade_adapter="${ANTFLY_FUSED_CHUNKER_SEPARATE_SPLADE_ADAPTER:-1}"
+restore_best_for_splade_stage="${ANTFLY_FUSED_CHUNKER_RESTORE_BEST_FOR_SPLADE_STAGE:-1}"
+reset_optimizer_on_splade_stage="${ANTFLY_FUSED_CHUNKER_RESET_OPTIMIZER_ON_SPLADE_STAGE:-1}"
 hash_model_artifacts="${ANTFLY_FUSED_CHUNKER_HASH_MODEL_ARTIFACTS:-1}"
 deterministic="${ANTFLY_FUSED_CHUNKER_DETERMINISTIC:-0}"
 go_epoch_shuffle="${ANTFLY_FUSED_CHUNKER_GO_EPOCH_SHUFFLE:-1}"
@@ -265,6 +269,10 @@ echo "  max_steps=$max_steps"
 echo "  save_optimizer_state=$save_optimizer_state"
 echo "  resume_from=$resume_from"
 echo "  splade=$enable_splade"
+echo "  splade_training_mode=$splade_training_mode"
+echo "  separate_splade_adapter=$separate_splade_adapter"
+echo "  restore_best_for_splade_stage=$restore_best_for_splade_stage"
+echo "  reset_optimizer_on_splade_stage=$reset_optimizer_on_splade_stage"
 echo "  deterministic=$deterministic"
 echo "  go_epoch_shuffle=$go_epoch_shuffle"
 echo "  mixed_precision=$mixed_precision"
@@ -433,6 +441,31 @@ esac
 case "$enable_splade" in
   1|true|TRUE|yes|YES)
     extra_args+=(--splade --lambda-splade "$lambda_splade" --lambda-flops "$lambda_flops" --splade-focus-epoch "$splade_focus_epoch")
+    extra_args+=(--splade-training-mode "$splade_training_mode")
+    case "$separate_splade_adapter" in
+      1|true|TRUE|yes|YES)
+        extra_args+=(--separate-splade-adapter)
+        ;;
+      *)
+        extra_args+=(--no-separate-splade-adapter)
+        ;;
+    esac
+    case "$restore_best_for_splade_stage" in
+      1|true|TRUE|yes|YES)
+        extra_args+=(--restore-best-for-splade-stage)
+        ;;
+      *)
+        extra_args+=(--no-restore-best-for-splade-stage)
+        ;;
+    esac
+    case "$reset_optimizer_on_splade_stage" in
+      1|true|TRUE|yes|YES)
+        extra_args+=(--reset-optimizer-on-splade-stage)
+        ;;
+      *)
+        extra_args+=(--no-reset-optimizer-on-splade-stage)
+        ;;
+    esac
     ;;
 esac
 

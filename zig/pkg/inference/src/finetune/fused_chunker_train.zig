@@ -3633,6 +3633,58 @@ pub const FusedTrainer = struct {
         try self.applyAccumulatedBoundaryHeadStep(lr);
     }
 
+    /// Advance the global step counter WITHOUT computing gradients or touching
+    /// any trainable parameter or optimizer moment. Used by the late SPLADE
+    /// head-only stage (Go Phase 32 parity), where the boundary head, dense
+    /// path, and encoder LoRA adapters are frozen: because this function is the
+    /// only trainer entry point the stage calls, boundary weights are
+    /// structurally incapable of changing during head-only epochs.
+    ///
+    /// The returned summary carries the schedule learning rate for the step so
+    /// downstream consumers (SPLADE AdamW, step metrics) see the same LR a
+    /// normal step would have applied.
+    pub fn frozenStepSummary(self: *FusedTrainer) TrainStepSummary {
+        const lr = self.lr_schedule.lr(self.step_count);
+        self.step_count += 1;
+        self.optimizer_state.step_count = self.step_count;
+        return TrainStepSummary{
+            .step = self.step_count,
+            .learning_rate = lr,
+            .boundary_head_learning_rate = 0,
+        };
+    }
+
+    /// Reset optimizer moments while keeping the current model weights
+    /// unchanged. Mirrors Go FusedTrainer.ResetOptimizerState for the late
+    /// SPLADE stage transition:
+    ///   - AdamW: first/second moments zeroed (state map reinitialized; fresh
+    ///     zeroed states are lazily recreated on the next update).
+    ///   - Schedule-Free: z is reset to the current parameters and v/step are
+    ///     zeroed so the stage restarts from the restored checkpoint.
+    ///   - Pending gradient accumulation is discarded.
+    /// The global step counter is intentionally preserved (Go keeps
+    /// currentStep for the LR schedule).
+    pub fn resetOptimizerStateForStage(self: *FusedTrainer) void {
+        const saved_step_count = self.optimizer_state.step_count;
+        self.optimizer_state.deinit();
+        self.optimizer_state = optimizers.OptimizerState.init(self.allocator);
+        self.optimizer_state.step_count = saved_step_count;
+
+        if (self.sf_state_w1) |*state| resetScheduleFreeStateToWeights(state, self.boundary_head.w1);
+        if (self.sf_state_b1) |*state| resetScheduleFreeStateToWeights(state, self.boundary_head.b1);
+        if (self.sf_state_w2) |*state| resetScheduleFreeStateToWeights(state, self.boundary_head.w2);
+        if (self.sf_state_b2) |*state| resetScheduleFreeStateToWeights(state, self.boundary_head.b2);
+
+        self.resetBoundaryGradientAccum();
+        self.accum_count = 0;
+    }
+
+    fn resetScheduleFreeStateToWeights(state: *ScheduleFreeAdamWState, weights: []const f32) void {
+        @memcpy(state.z, weights);
+        @memset(state.v, 0);
+        state.step = 0;
+    }
+
     /// Save boundary head weights to a SafeTensors checkpoint.
     ///
     /// The file is written using the SafeTensors format (see
