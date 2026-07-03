@@ -487,6 +487,7 @@ pub const RuntimeStats = struct {
     launch_attention_gqa_prefill_fast: usize = 0,
     launch_attention_gqa_prefill_tiled: usize = 0,
     launch_attention_gqa_prefill_mma: usize = 0,
+    launch_attention_gqa_prefill_mma_m32: usize = 0,
     launch_attention_gqa_scalar: usize = 0,
     launch_elementwise: usize = 0,
     launch_scalar: usize = 0,
@@ -1195,15 +1196,27 @@ pub const CudaCompute = struct {
             var bf16_mirror = buffer_mod.DeviceBuffer{};
             errdefer bf16_mirror.free(&self.ctx);
             if (cudaShouldAttachBf16MirrorToQ4Weight(owned_key, storage)) {
-                const f32_data = try self.allocator.alloc(f32, elem_count);
-                defer self.allocator.free(f32_data);
-                try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, f32_data);
-                const bf16_data = try self.allocator.alloc(u16, elem_count);
-                defer self.allocator.free(bf16_data);
-                for (f32_data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
-                bf16_mirror = try allocDeviceBuffer(self, bf16_data.len * @sizeOf(u16));
-                try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
-                self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
+                bf16_mirror = try allocDeviceBuffer(self, elem_count * @sizeOf(u16));
+                // Dequantize on device from the raw Q4_0 bytes already
+                // uploaded above — bit-identical to the host path and skips
+                // both the single-threaded host dequant and a second PCIe
+                // upload twice the size of the Q4 data.
+                var device_dequantized = false;
+                if (cudaDeviceMirrorDequantEnabled() and elem_count % 32 == 0) {
+                    if (self.kernels.launchDequantQ4_0Bf16(&self.ctx, bf16_mirror, device, elem_count / 32)) {
+                        device_dequantized = true;
+                    } else |_| {}
+                }
+                if (!device_dequantized) {
+                    const f32_data = try self.allocator.alloc(f32, elem_count);
+                    defer self.allocator.free(f32_data);
+                    try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, f32_data);
+                    const bf16_data = try self.allocator.alloc(u16, elem_count);
+                    defer self.allocator.free(bf16_data);
+                    for (f32_data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
+                    try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
+                }
+                self.stats.resident_weight_bytes += elem_count * @sizeOf(u16);
             }
             try synchronizeAndDrainDeferredDeviceFrees(self);
             self.stats.resident_weight_bytes += storage.raw_bytes.len;
@@ -1457,13 +1470,22 @@ pub const CudaCompute = struct {
         if (cudaHybridQ4Bf16WeightsEnabled() and isPleModelProjectionWeightName(owned_key) and tensor.shape.len == 2) {
             // Hybrid residency for the F32 PLE projection: keep F32 for the
             // decode path (graph-capture friendly) and a BF16 copy for
-            // prefill cuBLASLt.
-            const bf16_data = try self.allocator.alloc(u16, data.len);
-            defer self.allocator.free(bf16_data);
-            for (data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
-            bf16_mirror = try allocDeviceBuffer(self, bf16_data.len * @sizeOf(u16));
-            try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
-            self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
+            // prefill cuBLASLt. Converted on device from the F32 weight
+            // uploaded above (bit-identical RNE); host fallback below.
+            bf16_mirror = try allocDeviceBuffer(self, data.len * @sizeOf(u16));
+            var device_converted = false;
+            if (cudaDeviceMirrorDequantEnabled()) {
+                if (self.kernels.launchF32ToBf16(&self.ctx, bf16_mirror, device, data.len)) {
+                    device_converted = true;
+                } else |_| {}
+            }
+            if (!device_converted) {
+                const bf16_data = try self.allocator.alloc(u16, data.len);
+                defer self.allocator.free(bf16_data);
+                for (data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
+                try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
+            }
+            self.stats.resident_weight_bytes += data.len * @sizeOf(u16);
         }
         try synchronizeAndDrainDeferredDeviceFrees(self);
         self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
@@ -2064,6 +2086,10 @@ fn cudaPleModelProjectionBf16OnUpload() bool {
 
 fn cudaCublasLtEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT", true);
+}
+
+fn cudaDeviceMirrorDequantEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DEVICE_MIRROR_DEQUANT", true);
 }
 
 fn cudaRmsNormBf16MirrorEnabled() bool {
@@ -11632,6 +11658,10 @@ fn gqaDenseAttention(
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_prefill_mma += 1;
         },
+        .prefill_mma_m32 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
+        },
         .scalar => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_scalar += 1;
@@ -11947,6 +11977,10 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         .prefill_mma => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_prefill_mma += 1;
+        },
+        .prefill_mma_m32 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
         },
         .scalar => {
             self.stats.launch_attention += 1;

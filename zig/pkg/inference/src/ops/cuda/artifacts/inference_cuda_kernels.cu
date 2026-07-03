@@ -4489,7 +4489,9 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(
     (void)decode_scalars;
 
     const float neg_inf = -3.402823466e+38f;
-    const unsigned int tile_n = 64u;
+    // 64-key tiles for head_dim <= 256; 32-key tiles for the 512-dim global
+    // layers keep the f32 output tile within the sm80+ shared-memory budget.
+    const unsigned int tile_n = head_dim <= 256u ? 64u : 32u;
     extern __shared__ __align__(32) unsigned char mma_prefill_smem[];
     __shared__ unsigned int tile_phys[64];
     __shared__ float alpha_sh[TERMITE_TQ_PREFILL_TILE_M];
@@ -4500,7 +4502,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(
         bias_mode != 0u ||
         (format != 0u && format != 2u) ||
         base_key_row_bytes != key_row_bytes ||
-        head_dim > 256u ||
+        head_dim > 512u ||
         (head_dim & 31u) != 0u ||
         blockDim.x != 256u ||
         num_kv_heads == 0u ||
@@ -4634,10 +4636,10 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(
         }
         __syncthreads();
 
-        // S = Q * K^T on tensor cores: warp w in [0,4) owns keys
-        // [w*16, w*16+16). K is stored [key][dim], which is exactly the
-        // col-major B fragment for k=dims, n=keys.
-        if (warp < 4u) {
+        // S = Q * K^T on tensor cores: warp w owns keys [w*16, w*16+16).
+        // K is stored [key][dim], which is exactly the col-major B fragment
+        // for k=dims, n=keys.
+        if (warp < (tile_n >> 4)) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_acc;
             wmma::fill_fragment(s_acc, 0.0f);
             for (unsigned int kb = 0u; kb < head_dim; kb += 16u) {
@@ -4715,12 +4717,12 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(
         }
         __syncthreads();
 
-        // O += P * V on tensor cores. Keys past n_count carry p == 0, so the
-        // full 4 k-chunks are always safe.
+        // O += P * V on tensor cores. Keys past n_count carry p == 0, so all
+        // tile_n/16 k-chunks are always safe.
         for (unsigned int nc = warp; nc < (head_dim >> 4); nc += 8u) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc;
             wmma::load_matrix_sync(o_acc, o_tile + nc * 16u, head_dim, wmma::mem_row_major);
-            for (unsigned int kb = 0u; kb < 4u; ++kb) {
+            for (unsigned int kb = 0u; kb < (tile_n >> 4); ++kb) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
                 wmma::load_matrix_sync(p_frag, p_tile + kb * 16u, sp_pitch);
@@ -4744,6 +4746,282 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_f32(
         float inv_denom = d_run1 > 0.0f ? 1.0f / d_run1 : 0.0f;
         for (unsigned int col = lane; col < head_dim; col += 32u) {
             dst[out_base + col] = o_tile[(warp * 2u + 1u) * head_dim + col] * inv_denom;
+        }
+    }
+}
+
+// TILE_M=32 variant of the tensor-core prefill kernel (head_dim <= 256,
+// sm80+ shared-memory budget: 320*head_dim + 14848 bytes, 96768 at 256).
+// Doubling the query tile amortizes the K/V dequant + shared-memory staging
+// over twice as many scores: each warp owns one 16x16 wmma tile of the
+// 32x64 score matrix (m-chunk = warp/4, n-chunk = warp%4), then four query
+// rows for the online softmax, then 2*(head_dim/16) output tiles round-robin
+// for O += P*V.
+extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_m32_f32(
+    float* dst,
+    const float* q,
+    const unsigned char* k,
+    const unsigned char* v,
+    const unsigned int* block_table,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int key_row_bytes,
+    unsigned int base_key_row_bytes,
+    unsigned int value_row_bytes,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int format,
+    unsigned int value_format,
+    unsigned int physical_token_capacity,
+    const unsigned int* decode_scalars
+) {
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
+    (void)decode_scalars;
+
+    const float neg_inf = -3.402823466e+38f;
+    const unsigned int tile_m = 32u;
+    const unsigned int tile_n = 64u;
+    extern __shared__ __align__(32) unsigned char mma_m32_prefill_smem[];
+    __shared__ unsigned int tile_phys[64];
+    __shared__ float alpha_sh[32];
+
+    if (batch != 1u ||
+        q_seq_len <= 1u ||
+        mask_len != 0u ||
+        bias_mode != 0u ||
+        (format != 0u && format != 2u) ||
+        base_key_row_bytes != key_row_bytes ||
+        head_dim > 256u ||
+        (head_dim & 31u) != 0u ||
+        blockDim.x != 256u ||
+        num_kv_heads == 0u ||
+        (num_heads % num_kv_heads) != 0u ||
+        key_row_bytes == 0u ||
+        value_row_bytes == 0u) return;
+
+    unsigned int head = blockIdx.x;
+    unsigned int tile_row_start = blockIdx.y * tile_m;
+    if (head >= num_heads || tile_row_start >= q_seq_len) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int warp = tid >> 5;
+    unsigned int lane = tid & 31u;
+
+    const unsigned int kv_pitch = head_dim + 8u;
+    const unsigned int sp_pitch = 72u;
+    half* q_tile = reinterpret_cast<half*>(mma_m32_prefill_smem);
+    half* kv_tile = q_tile + tile_m * head_dim;
+    float* s_tile = reinterpret_cast<float*>(kv_tile + tile_n * kv_pitch);
+    half* p_tile = reinterpret_cast<half*>(s_tile + tile_m * sp_pitch);
+    float* o_tile = reinterpret_cast<float*>(p_tile + tile_m * sp_pitch);
+
+    // Each warp owns four adjacent query rows for softmax state and output.
+    unsigned int qi_base = tile_row_start + warp * 4u;
+    bool row_valid[4];
+    unsigned int key_start_r[4];
+    unsigned int key_end_r[4];
+    float m_run[4];
+    float d_run[4];
+    for (unsigned int r = 0u; r < 4u; ++r) {
+        unsigned int qi = qi_base + r;
+        row_valid[r] = qi < q_seq_len;
+        unsigned int qi_clamped = row_valid[r] ? qi : (q_seq_len - 1u);
+        unsigned int key_start = 0u, key_end = 0u;
+        unsigned int query_pos = query_position_offset + qi_clamped;
+        if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+            unsigned int visible = query_pos - kv_position_offset + 1u;
+            key_end = visible < kv_seq_len ? visible : kv_seq_len;
+            if (sliding_window != 0u) {
+                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+                if (window_start_abs > kv_position_offset) {
+                    key_start = window_start_abs - kv_position_offset;
+                    if (key_start > key_end) key_start = key_end;
+                }
+            }
+        }
+        if (!row_valid[r]) { key_start = 0u; key_end = 0u; }
+        key_start_r[r] = key_start;
+        key_end_r[r] = key_end;
+        m_run[r] = neg_inf;
+        d_run[r] = 0.0f;
+    }
+
+    // Block-wide key range: causal end grows with qi and the sliding-window
+    // start grows with qi, so the union is [start(first row), end(last row)].
+    unsigned int qi_last = tile_row_start + tile_m - 1u;
+    if (qi_last >= q_seq_len) qi_last = q_seq_len - 1u;
+    unsigned int block_key_start = 0u;
+    unsigned int block_key_end = 0u;
+    {
+        unsigned int first_pos = query_position_offset + tile_row_start;
+        unsigned int last_pos = query_position_offset + qi_last;
+        if (kv_seq_len != 0u && last_pos >= kv_position_offset) {
+            unsigned int visible = last_pos - kv_position_offset + 1u;
+            block_key_end = visible < kv_seq_len ? visible : kv_seq_len;
+            if (sliding_window != 0u && first_pos >= kv_position_offset) {
+                unsigned int window_start_abs = (first_pos + 1u > sliding_window) ? (first_pos + 1u - sliding_window) : 0u;
+                if (window_start_abs > kv_position_offset) {
+                    block_key_start = window_start_abs - kv_position_offset;
+                    if (block_key_start > block_key_end) block_key_start = block_key_end;
+                }
+            }
+        }
+    }
+
+    unsigned int heads_per_group = num_heads / num_kv_heads;
+    unsigned int kv_head = head / heads_per_group;
+    unsigned int q_hidden = num_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+
+    for (unsigned int idx = tid; idx < tile_m * head_dim; idx += 256u) {
+        unsigned int row = idx / head_dim;
+        unsigned int col = idx - row * head_dim;
+        unsigned int qi = tile_row_start + row;
+        unsigned int qi_clamped = qi < q_seq_len ? qi : (q_seq_len - 1u);
+        q_tile[idx] = __float2half(q[qi_clamped * q_hidden + head * head_dim + col]);
+        o_tile[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int n0 = block_key_start; n0 < block_key_end; n0 += tile_n) {
+        unsigned int n_count = block_key_end - n0;
+        if (n_count > tile_n) n_count = tile_n;
+
+        if (tid < tile_n) {
+            tile_phys[tid] = tid < n_count
+                ? termite_tq_physical_token(n0 + tid, block_table, block_count, page_size_tokens, physical_token_capacity)
+                : 0xffffffffu;
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tid; idx < tile_n * head_dim; idx += 256u) {
+            unsigned int row = idx / head_dim;
+            unsigned int col = idx - row * head_dim;
+            unsigned int phys = tile_phys[row];
+            float key_value = 0.0f;
+            if (phys != 0xffffffffu) {
+                const unsigned char* k_row = k + (size_t)phys * key_row_bytes;
+                unsigned int value_index = kv_head * head_dim + col;
+                key_value = format == 0u
+                    ? termite_tq_decode_polar4_at(k_row, value_index)
+                    : termite_tq_f16_value(k_row, value_index);
+            }
+            kv_tile[row * kv_pitch + col] = __float2half(key_value);
+        }
+        __syncthreads();
+
+        // S = Q * K^T: warp w owns score tile (m-chunk w/4, n-chunk w%4).
+        {
+            unsigned int m_chunk = warp >> 2;
+            unsigned int n_chunk = warp & 3u;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_acc;
+            wmma::fill_fragment(s_acc, 0.0f);
+            for (unsigned int kb = 0u; kb < head_dim; kb += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+                wmma::load_matrix_sync(a_frag, q_tile + (m_chunk * 16u) * head_dim + kb, head_dim);
+                wmma::load_matrix_sync(b_frag, kv_tile + (n_chunk * 16u) * kv_pitch + kb, kv_pitch);
+                wmma::mma_sync(s_acc, a_frag, b_frag, s_acc);
+            }
+            wmma::store_matrix_sync(s_tile + (m_chunk * 16u) * sp_pitch + n_chunk * 16u, s_acc, sp_pitch, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Online softmax per query row; lanes cover keys {lane, lane+32}.
+        for (unsigned int sub = 0u; sub < 4u; ++sub) {
+            unsigned int row = warp * 4u + sub;
+            unsigned int ja = lane;
+            unsigned int jb = lane + 32u;
+            unsigned int kia = n0 + ja;
+            unsigned int kib = n0 + jb;
+            bool valid_a = ja < n_count && tile_phys[ja] != 0xffffffffu && kia >= key_start_r[sub] && kia < key_end_r[sub];
+            bool valid_b = jb < n_count && tile_phys[jb] != 0xffffffffu && kib >= key_start_r[sub] && kib < key_end_r[sub];
+            float score_a = valid_a ? s_tile[row * sp_pitch + ja] * scale : neg_inf;
+            float score_b = valid_b ? s_tile[row * sp_pitch + jb] * scale : neg_inf;
+
+            float tile_max = fmaxf(score_a, score_b);
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, offset));
+            }
+            tile_max = __shfl_sync(0xffffffffu, tile_max, 0u);
+
+            float alpha = 1.0f;
+            float p_a = 0.0f, p_b = 0.0f;
+            if (tile_max > neg_inf) {
+                float new_max = fmaxf(m_run[sub], tile_max);
+                alpha = m_run[sub] > neg_inf ? expf(m_run[sub] - new_max) : 0.0f;
+                p_a = valid_a ? expf(score_a - new_max) : 0.0f;
+                p_b = valid_b ? expf(score_b - new_max) : 0.0f;
+                m_run[sub] = new_max;
+            }
+            float sum_p = p_a + p_b;
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
+                sum_p += __shfl_down_sync(0xffffffffu, sum_p, offset);
+            }
+            sum_p = __shfl_sync(0xffffffffu, sum_p, 0u);
+            if (tile_max > neg_inf) d_run[sub] = d_run[sub] * alpha + sum_p;
+
+            p_tile[row * sp_pitch + ja] = __float2half(p_a);
+            p_tile[row * sp_pitch + jb] = __float2half(p_b);
+            if (lane == 0u) alpha_sh[row] = alpha;
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tid; idx < tile_m * head_dim; idx += 256u) {
+            unsigned int row = idx / head_dim;
+            o_tile[idx] *= alpha_sh[row];
+        }
+        for (unsigned int idx = tid; idx < tile_n * head_dim; idx += 256u) {
+            unsigned int row = idx / head_dim;
+            unsigned int col = idx - row * head_dim;
+            unsigned int phys = tile_phys[row];
+            float value = 0.0f;
+            if (phys != 0xffffffffu) {
+                const unsigned char* v_row = v + (size_t)phys * value_row_bytes;
+                value = termite_tq_value_at(v_row, kv_head, col, head_dim, value_format);
+            }
+            kv_tile[row * kv_pitch + col] = __float2half(value);
+        }
+        __syncthreads();
+
+        // O += P * V: 2*(head_dim/16) output tiles round-robin over 8 warps.
+        for (unsigned int wt = warp; wt < 2u * (head_dim >> 4); wt += 8u) {
+            unsigned int m_chunk = wt / (head_dim >> 4);
+            unsigned int n_chunk = wt - m_chunk * (head_dim >> 4);
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc;
+            wmma::load_matrix_sync(o_acc, o_tile + (m_chunk * 16u) * head_dim + n_chunk * 16u, head_dim, wmma::mem_row_major);
+            for (unsigned int kb = 0u; kb < 4u; ++kb) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+                wmma::load_matrix_sync(p_frag, p_tile + (m_chunk * 16u) * sp_pitch + kb * 16u, sp_pitch);
+                wmma::load_matrix_sync(v_frag, kv_tile + (kb * 16u) * kv_pitch + n_chunk * 16u, kv_pitch);
+                wmma::mma_sync(o_acc, p_frag, v_frag, o_acc);
+            }
+            wmma::store_matrix_sync(o_tile + (m_chunk * 16u) * head_dim + n_chunk * 16u, o_acc, head_dim, wmma::mem_row_major);
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int r = 0u; r < 4u; ++r) {
+        if (!row_valid[r]) continue;
+        unsigned int out_base = (qi_base + r) * q_hidden + head * head_dim;
+        float inv_denom = d_run[r] > 0.0f ? 1.0f / d_run[r] : 0.0f;
+        for (unsigned int col = lane; col < head_dim; col += 32u) {
+            dst[out_base + col] = o_tile[(warp * 4u + r) * head_dim + col] * inv_denom;
         }
     }
 }
@@ -5631,6 +5909,32 @@ __device__ __forceinline__ float termite_q4_0_value(const unsigned char* bp, uns
         q = (int)(packed >> 4);
     }
     return (float)(q - 8) * d;
+}
+
+// Dequantizes Q4_0 blocks (18 bytes: f16 scale + 32 packed nibbles) straight
+// to BF16 on device, one thread per block. Bit-identical to the host path
+// (dequantizeToFloat32 + round-to-nearest-even): both compute (q-8)*d in f32
+// and share the same RNE bias trick. Used to build BF16 weight mirrors at
+// load time without host dequant or a second PCIe upload.
+extern "C" __global__ void termite_dequant_q4_0_bf16(
+    unsigned short* dst,
+    const unsigned char* src,
+    unsigned int block_count
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = gridDim.x * blockDim.x;
+    for (unsigned int blk = idx; blk < block_count; blk += stride) {
+        const unsigned char* bp = src + (size_t)blk * 18u;
+        unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        float d = termite_half_to_float(h);
+        unsigned short* out = dst + (size_t)blk * 32u;
+        #pragma unroll
+        for (unsigned int i = 0u; i < 16u; ++i) {
+            unsigned char packed = bp[2u + i];
+            out[i] = termite_f32_to_bf16((float)((int)(packed & 0x0fu) - 8) * d);
+            out[i + 16u] = termite_f32_to_bf16((float)((int)(packed >> 4) - 8) * d);
+        }
+    }
 }
 
 __device__ __forceinline__ float termite_q4_0_value_nibble(

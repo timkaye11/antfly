@@ -125,6 +125,8 @@ required_symbols=(
   termite_gqa_attention_prefill_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_tiled_f32
   termite_gqa_attention_prefill_turboquant_mma_f32
+  termite_gqa_attention_prefill_turboquant_mma_m32_f32
+  termite_dequant_q4_0_bf16
   termite_linear_q6_k_q8_1_f32_tile8_e4b
   termite_gqa_attention_decode_turboquant_split_stage1_f32
   termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32
