@@ -327,6 +327,7 @@ pub const DecoderRuntimeApplyRmsNormLinearArgmaxRequest = backend_contracts.Deco
 pub const DecoderRuntimeApplyRmsNormLinearRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearRequest;
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyLayerNormLinearSampleRequest;
 pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearSampleRequest;
+pub const DecoderRuntimeSampleResidentLogitsRequest = backend_contracts.DecoderRuntimeSampleResidentLogitsRequest;
 pub const DecoderRuntimePrepareLinearRequest = backend_contracts.DecoderRuntimePrepareLinearRequest;
 pub const DecoderRuntimeEnsureLinearSlotRequest = backend_contracts.DecoderRuntimeEnsureLinearSlotRequest;
 pub const DecoderRuntimeApplyLinearRequest = backend_contracts.DecoderRuntimeApplyLinearRequest;
@@ -1716,6 +1717,11 @@ pub const ComputeBackend = struct {
         /// token from the resulting last-row logits using a penalty-free
         /// sampling config.
         decoderRuntimeApplyRmsNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize = null,
+
+        /// Sample a token from the full logits left resident in the backend's
+        /// sample-logits buffer by the most recent decode frame's fused
+        /// lm-head tail.
+        decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
 
         /// Upload dense linear parameters into a backend-owned whole-token
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
@@ -3363,6 +3369,13 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyRmsNormLinearSample(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) !?usize {
         if (self.vtable.decoderRuntimeApplyRmsNormLinearSample) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeSampleResidentLogits(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) !?usize {
+        if (self.vtable.decoderRuntimeSampleResidentLogits) |op| {
             return op(self.ptr, request);
         }
         return null;

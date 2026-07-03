@@ -2064,6 +2064,10 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
 
 pub fn decoderRuntimeApplyPagedKvAttentionSlot(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
+    return decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime, request);
+}
+
+pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecodeRuntime, request: anytype) !?MetalTensor {
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!request.q.isDevice()) return null;
     if (request.q.ndim() != 2) return null;
@@ -3610,6 +3614,55 @@ pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !
     );
     if (rc != 0) return null;
     return sampleLogits(logits_host, request);
+}
+
+var resident_sample_seed_state: u64 = 0;
+
+/// True when the fused-sampling kernels can honor this sampling config
+/// on-device (mirrors the bounded-top-p gate in the fused sample tail).
+pub fn decoderRuntimeResidentLogitsSamplingSupported(self: anytype, out_dim: usize, top_k: usize, top_p: f32) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    const bounded_top_p = top_p <= 0.0 or top_p >= 1.0 or top_k > 0 or out_dim <= 256;
+    if (!bounded_top_p) return false;
+    return decoderRuntimeReserveSampleTailScratch(self, out_dim, top_k);
+}
+
+pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usize {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.out_dim == 0) return null;
+    if (!decoderRuntimeResidentLogitsSamplingSupported(self, request.out_dim, request.top_k, request.top_p)) return null;
+    var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
+    defer penalty_entries.deinit(std.heap.c_allocator);
+    if (resident_sample_seed_state == 0) {
+        // ASLR-derived per-process entropy, same trick as makeSampleSeed.
+        resident_sample_seed_state = (@as(u64, @truncate(@intFromPtr(penalty_entries.token_ids.ptr))) ^
+            @as(u64, @truncate(@intFromPtr(&resident_sample_seed_state)))) | 1;
+    }
+    resident_sample_seed_state +%= 0x9e3779b97f4a7c15;
+    var prng = std.Random.DefaultPrng.init(resident_sample_seed_state);
+    const seed = prng.random().int(u32);
+    var token_id: u32 = 0;
+    const rc = termite_metal_decode_runtime_sample_from_resident_logits(
+        runtime,
+        request.out_dim,
+        request.temperature,
+        request.top_k,
+        request.top_p,
+        request.min_p,
+        request.repetition_penalty,
+        request.frequency_penalty,
+        request.presence_penalty,
+        if (penalty_entries.token_ids.len > 0) &penalty_entries.token_ids[0] else null,
+        if (penalty_entries.counts.len > 0) &penalty_entries.counts[0] else null,
+        penalty_entries.token_ids.len,
+        seed,
+        request.final_logit_softcap,
+        &token_id,
+    );
+    if (rc != 0) return null;
+    return token_id;
 }
 
 pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -8305,6 +8358,23 @@ pub extern fn termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
     seed: u32,
     output_token_id: [*c]u32,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_sample_from_resident_logits(
+    runtime: ?*RawMetalDecodeRuntime,
+    out_dim: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    penalty_token_ids: ?*const u32,
+    penalty_counts: ?*const u32,
+    penalty_count: usize,
+    seed: u32,
+    final_logit_softcap: f32,
+    output_token_id: [*c]u32,
+) c_int;
 pub extern fn termite_metal_decode_runtime_sample_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
     logits_handle: ?*anyopaque,
@@ -12006,7 +12076,11 @@ pub fn tryApplyDenseRuntimeLinear(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
-    if (self.raw_linear_slot_kinds[slot] != .dense) return null;
+    const trace_dense = getenvFlagEnabled("TERMITE_METAL_TRACE_DENSE_LINEAR");
+    if (self.raw_linear_slot_kinds[slot] != .dense) {
+        if (trace_dense) std.debug.print("dense-linear-null: slot={d} kind={s} rows={d} in={d} out={d}\n", .{ slot, @tagName(self.raw_linear_slot_kinds[slot]), rows, in_dim, out_dim });
+        return null;
+    }
 
     if (rows == 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
@@ -12023,7 +12097,10 @@ pub fn tryApplyDenseRuntimeLinear(
             output_device.deviceByteOffset(),
         );
         if (device_rc == 0) return output_device;
+        if (trace_dense) std.debug.print("dense-linear-rc: slot={d} rc={d} rows=1 in={d} out={d}\n", .{ slot, device_rc, in_dim, out_dim });
         output_device.deinit();
+    } else if (rows == 1) {
+        if (trace_dense) std.debug.print("dense-linear-null: slot={d} input_not_device in={d} out={d}\n", .{ slot, in_dim, out_dim });
     }
     if (rows != 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };

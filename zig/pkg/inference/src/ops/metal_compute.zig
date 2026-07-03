@@ -8657,9 +8657,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         num_kv_heads: usize,
         head_dim: usize,
     ) !?GatheredFullKv {
-        const kv = attention.kv_cache orelse return null;
-        const storage = attention.kv_storage orelse return null;
-        const hook = storage.device_write_hook orelse return null;
+        const trace_gather = getenvBool("TERMITE_METAL_TRACE_KV_GATHER");
+        const kv = attention.kv_cache orelse {
+            if (trace_gather) std.debug.print("kv-gather-null: no kv_cache layer={d}\n", .{attention.layer_index});
+            return null;
+        };
+        const storage = attention.kv_storage orelse {
+            if (trace_gather) std.debug.print("kv-gather-null: no kv_storage layer={d}\n", .{attention.layer_index});
+            return null;
+        };
+        const hook = storage.device_write_hook orelse {
+            if (trace_gather) std.debug.print("kv-gather-null: no device_write_hook layer={d}\n", .{attention.layer_index});
+            return null;
+        };
         const gather = runtime_root.kv.storage_runtime.KvLayerGather{
             .sequence_id = kv.sequence_id,
             .layer_index = attention.layer_index,
@@ -8669,6 +8679,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         const layer = hook.gatherLayerKvDevice(gather) catch |err| switch (err) {
             error.DeviceReadUnsupported, error.DeviceReadFallback => {
+                if (getenvBool("TERMITE_METAL_TRACE_KV_GATHER")) std.debug.print(
+                    "kv-gather-fallback: err={s} seq={d} layer={d} tokens={d}\n",
+                    .{ @errorName(err), kv.sequence_id, attention.layer_index, attention.kv_sequence_len },
+                );
                 const row_width = num_kv_heads * head_dim;
                 const elem_count = attention.kv_sequence_len * row_width;
                 const k_rows = try storage.allocator.alloc(f32, elem_count);
@@ -8688,8 +8702,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => return err,
         };
         const row_width = num_kv_heads * head_dim;
-        if (layer.token_count < attention.kv_sequence_len or layer.row_width != row_width or layer.value_element_bytes != @sizeOf(f32)) return null;
-        const runtime = layer.runtime orelse return null;
+        if (layer.token_count < attention.kv_sequence_len or layer.row_width != row_width or layer.value_element_bytes != @sizeOf(f32)) {
+            if (getenvBool("TERMITE_METAL_TRACE_KV_GATHER")) std.debug.print(
+                "kv-gather-null: shape seq={d} layer={d} want_tokens={d} got_tokens={d} want_rw={d} got_rw={d} elem_bytes={d}\n",
+                .{ kv.sequence_id, attention.layer_index, attention.kv_sequence_len, layer.token_count, row_width, layer.row_width, layer.value_element_bytes },
+            );
+            return null;
+        }
+        const runtime = layer.runtime orelse {
+            if (getenvBool("TERMITE_METAL_TRACE_KV_GATHER")) std.debug.print("kv-gather-null: no runtime layer={d}\n", .{attention.layer_index});
+            return null;
+        };
         const shape = [_]i32{ @intCast(attention.kv_sequence_len), @intCast(row_width) };
         const byte_len = attention.kv_sequence_len * row_width * @sizeOf(f32);
         if (layer.k.byte_len < byte_len or layer.v.byte_len < byte_len) return null;
@@ -9912,6 +9935,49 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 attention.kv_cache != null and
                 (attention.kv_manager != null or attention.kv_storage != null))
             blk: {
+                // Donated-KV read path (e.g. MTP assistant attending target KV):
+                // prefer the paged slot device attention on the KV owner's
+                // runtime; it supports f16 KV natively where the full gather
+                // only handles raw_f32.
+                if (attention.attn_or_mask == null and q_mt.isDevice() and !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION")) {
+                    if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
+                        if (pagedSlotAttentionSupported(paged_layer)) {
+                            if (paged_layer.runtime) |layer_runtime_ptr| {
+                                const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+                                defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+                                if (block_offsets_opt) |block_offsets| {
+                                    // Q may still be pending in this backend's active
+                                    // frame while the slot attention runs inline on the
+                                    // KV owner's runtime — drain our frame first.
+                                    if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+                                        if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(self.provider_impl.raw_decode_runtime) != 0) {
+                                            return error.MetalFrameSyncFailed;
+                                        }
+                                    }
+                                    if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(@as(*metal_runtime.RawMetalDecodeRuntime, @ptrCast(@alignCast(layer_runtime_ptr))), .{
+                                        .q = q_mt,
+                                        .slot = paged_layer.slot,
+                                        .format = paged_layer.format,
+                                        .block_token_offsets = block_offsets,
+                                        .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
+                                        .kv_tokens = attention.kv_sequence_len,
+                                        .num_heads = num_heads,
+                                        .num_kv_heads = num_kv_heads,
+                                        .head_dim = head_dim,
+                                        .key_row_bytes = paged_layer.key_row_bytes,
+                                        .base_key_row_bytes = paged_layer.base_key_row_bytes,
+                                        .query_position = attention.total_sequence_len - 1,
+                                        .query_position_offset = query_position_offset,
+                                        .kv_position_offset = attention.kv_position_offset,
+                                        .sliding_window = attention.sliding_window,
+                                    })) |tensor| {
+                                        return self.ctFromOwnedMetalTensor(tensor);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 gathered_full = (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) orelse
                     (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, false)) orelse
                     break :device_attention;
@@ -16958,16 +17024,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 0,
             );
             if (request.output_hidden != null) {
-                const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
-                    .slot = request.final_norm_slot,
-                    .input = hidden,
-                    .hidden_size = request.hidden_size,
-                    .eps = request.norm_eps,
-                })) orelse break :final_tail_blk;
-                defer freeOp(ctx, final_hidden);
-                const final_hidden_mt = self.borrowedMetalTensorFromCt(final_hidden) catch break :final_tail_blk;
-                if (!final_hidden_mt.isDevice()) break :final_tail_blk;
-                queued_output_hidden.* = try final_hidden_mt.retainedCopy();
+                if (request.output_hidden_pre_norm) {
+                    // Copy (not view) the pre-norm row: `hidden` may live in a
+                    // ping-pong scratch slot the next decode frame overwrites.
+                    const hidden_shape = [_]i32{ 1, @intCast(request.hidden_size) };
+                    queued_output_hidden.* = final_input.copiedView(
+                        0,
+                        request.hidden_size * @sizeOf(f32),
+                        &hidden_shape,
+                    ) catch break :final_tail_blk;
+                } else {
+                    const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+                        .slot = request.final_norm_slot,
+                        .input = hidden,
+                        .hidden_size = request.hidden_size,
+                        .eps = request.norm_eps,
+                    })) orelse break :final_tail_blk;
+                    defer freeOp(ctx, final_hidden);
+                    const final_hidden_mt = self.borrowedMetalTensorFromCt(final_hidden) catch break :final_tail_blk;
+                    if (!final_hidden_mt.isDevice()) break :final_tail_blk;
+                    queued_output_hidden.* = try final_hidden_mt.retainedCopy();
+                }
             }
             if (!try metal_runtime.decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self.provider_impl, .{
                 .input = final_input,
@@ -18753,6 +18830,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             null;
     }
 
+    fn linearNoBiasArgmaxLastRowOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!?u32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (rows != 1 or in_dim == 0 or out_dim == 0) return null;
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const weight_buf = toBuf(weight);
+        if (weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null) return null;
+        const zero_bias = try self.cachedZeroBiasBuf(out_dim);
+        defer freeOp(ctx, zero_bias);
+        const slot = (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) orelse return null;
+        var input_mt = try self.ownedMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        var linear_input = try retainedLinearInputView(&input_mt, in_dim);
+        defer linear_input.deinit();
+        const token = try metal_runtime.decoderRuntimeApplyLinearArgmax(self.provider_impl, .{
+            .slot = slot,
+            .input = linear_input,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+        });
+        return if (token) |token_id| @intCast(token_id) else null;
+    }
+
     fn argmaxLastRowOp(ctx: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!?u32 {
         if (rows == 0 or dim == 0) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -19198,6 +19304,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         });
     }
 
+    fn decoderRuntimeSampleResidentLogitsOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimeSampleResidentLogits(self.provider_impl, .{
+            .out_dim = request.out_dim,
+            .final_logit_softcap = request.final_logit_softcap,
+            .temperature = request.temperature,
+            .top_k = request.top_k,
+            .top_p = request.top_p,
+            .min_p = request.min_p,
+            .repetition_penalty = request.repetition_penalty,
+            .frequency_penalty = request.frequency_penalty,
+            .presence_penalty = request.presence_penalty,
+            .token_history = request.token_history,
+        });
+    }
+
     fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearPairRequest) anyerror!?ops.LinearNoBiasPairResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
@@ -19460,6 +19582,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.sliceLastDim = sliceLastDimOp;
         vt.evalTensor = evalTensorOp;
         vt.argmaxLastRow = argmaxLastRowOp;
+        vt.linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp;
         vt.argmaxRows = argmaxRowsOp;
         vt.argmaxRowsSuppress = argmaxRowsSuppressOp;
         vt.argmaxLastRowSuppressTensor = argmaxLastRowSuppressTensorOp;
@@ -19593,6 +19716,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeApplyRmsNormLinearArgmax = decoderRuntimeApplyRmsNormLinearArgmaxOp;
         vt.decoderRuntimeApplyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp;
         vt.decoderRuntimeApplyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp;
+        vt.decoderRuntimeSampleResidentLogits = decoderRuntimeSampleResidentLogitsOp;
         vt.decoderRuntimeApplyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp;
         vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
         vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;

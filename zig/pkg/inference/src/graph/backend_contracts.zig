@@ -367,6 +367,23 @@ pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = struct {
     token_history: []const i64,
 };
 
+/// Sample from the full logits left resident in the backend's sample-logits
+/// buffer by the most recent decode frame's fused lm-head tail.
+pub const DecoderRuntimeSampleResidentLogitsRequest = struct {
+    out_dim: usize,
+    /// Gemma-style final-logit softcap applied on-device before sampling
+    /// (0 = disabled).
+    final_logit_softcap: f32 = 0,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    token_history: []const i64,
+};
+
 pub const DecoderRuntimePrepareLinearRequest = struct {
     slot: usize,
     weight: CT,
@@ -884,6 +901,10 @@ pub const DecoderRuntimeDecodeRequest = struct {
     /// Optional backend-owned final hidden output for single-token decode.
     /// When set, successful calls populate it with the row after final norm.
     output_hidden: ?*?CT = null,
+    /// When true, `output_hidden` receives the backbone row BEFORE the final
+    /// norm instead — for tails that apply the final norm themselves (fused
+    /// norm+lm-head sampling).
+    output_hidden_pre_norm: bool = false,
     /// Host-visible token writeback for each item. Backends may keep token ids
     /// device-owned internally, but successful calls must populate this slice.
     output_token_ids: []i64,

@@ -1437,7 +1437,7 @@ fn tryBackendOwnedGreedyTokenResult(
     decode_context: *const gpt_arch.DecodeContext,
     capture_final_hidden: bool,
 ) !?BackendOwnedGreedyTokenResult {
-    return tryBackendOwnedGreedyTokenResultPhase(
+    return tryBackendOwnedGreedyTokenResultPhaseHidden(
         cb,
         allocator,
         gpt_config,
@@ -1446,6 +1446,7 @@ fn tryBackendOwnedGreedyTokenResult(
         seq_len,
         decode_context,
         capture_final_hidden,
+        false,
         .full,
     );
 }
@@ -1459,6 +1460,32 @@ fn tryBackendOwnedGreedyTokenResultPhase(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
     capture_final_hidden: bool,
+    phase: contracts.DecoderRuntimeDecodePhase,
+) !?BackendOwnedGreedyTokenResult {
+    return tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        capture_final_hidden,
+        false,
+        phase,
+    );
+}
+
+fn tryBackendOwnedGreedyTokenResultPhaseHidden(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    capture_final_hidden: bool,
+    capture_pre_norm_hidden: bool,
     phase: contracts.DecoderRuntimeDecodePhase,
 ) !?BackendOwnedGreedyTokenResult {
     if (gatedFamilyCompareRequested()) return null;
@@ -1532,6 +1559,7 @@ fn tryBackendOwnedGreedyTokenResultPhase(
         .ple_token_embedding_weight = ple_token_embedding_weight,
         .suppress_token_ids = gpt_config.suppressTokenIds(),
         .output_hidden = if (capture_final_hidden) &output_hidden else null,
+        .output_hidden_pre_norm = capture_pre_norm_hidden,
         .output_token_ids = output_token_ids[0..],
     };
     if (try cb.decoderRuntimeDecodeBatch(&request)) {
@@ -1548,6 +1576,100 @@ fn tryBackendOwnedGreedyTokenResultPhase(
         output_hidden = null;
     }
     return null;
+}
+
+/// Backend-owned sampled decode: run the whole forward through the planned
+/// decode frame (same as greedy), capture the PRE-norm backbone row, and
+/// sample from it via the fused norm+lm-head tail. The frame's argmax token
+/// is discarded — KV commits do not depend on the sampled token id.
+fn tryBackendOwnedSampledToken(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    sampling: model_runtime.SamplingConfig,
+    token_history: []const i64,
+) !?i64 {
+    // Fastest path: the frame's fused lm-head tail leaves full logits
+    // resident in the backend sample-logits buffer — sample from them
+    // directly, skipping a second lm-head pass. Gate upfront so unsupported
+    // configs don't pay for a wasted frame: unbounded top-p over a large
+    // vocab has no device sampler, and final-logit softcap is only applied
+    // on-device by the Gumbel (pure-temperature) kernel.
+    const device_sampler_bounded = sampling.top_p <= 0.0 or sampling.top_p >= 1.0 or
+        sampling.top_k > 0 or gpt_config.vocab_size <= 256;
+    const gumbel_shape = sampling.top_k <= 0 and
+        (sampling.top_p <= 0.0 or sampling.top_p >= 1.0) and
+        sampling.min_p <= 0.0 and
+        sampling.temperature > 0.0;
+    const softcap_ok = gpt_config.final_logit_softcapping <= 0.0 or gumbel_shape;
+    if (device_sampler_bounded and softcap_ok) {
+        if (try tryBackendOwnedGreedyToken(
+            cb,
+            allocator,
+            gpt_config,
+            configured_layer_count,
+            token_id,
+            seq_len,
+            decode_context,
+        )) |_| {
+            if (try cb.decoderRuntimeSampleResidentLogits(&.{
+                .out_dim = gpt_config.vocab_size,
+                .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
+                .temperature = sampling.temperature,
+                .top_k = if (sampling.top_k > 0) @intCast(sampling.top_k) else 0,
+                .top_p = sampling.top_p,
+                .min_p = sampling.min_p,
+                .repetition_penalty = sampling.repetition_penalty,
+                .frequency_penalty = sampling.frequency_penalty,
+                .presence_penalty = sampling.presence_penalty,
+                .token_history = token_history,
+            })) |sampled_token| {
+                return @intCast(sampled_token);
+            }
+            // Resident sampling unavailable: re-run the forward capturing the
+            // pre-norm hidden (KV writes are idempotent for the same position).
+        }
+    }
+    var result = (try tryBackendOwnedGreedyTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        true,
+        true,
+        .full,
+    )) orelse return null;
+    defer result.deinit(cb);
+    const pre_norm_hidden = result.final_hidden orelse return null;
+    if (try decoder_tail_runtime.forwardPreparedSampledFromFinalHidden(
+        cb,
+        gpt_config,
+        pre_norm_hidden,
+        .rms,
+        finalNormSlot(configured_layer_count),
+        finalLmHeadSlot(configured_layer_count),
+        sampling,
+        token_history,
+    )) |sampled_token| {
+        return sampled_token;
+    }
+    return try decoder_tail_runtime.forwardSampledFromFinalHidden(
+        cb,
+        allocator,
+        gpt_config,
+        pre_norm_hidden,
+        .rms,
+        finalNormSlot(configured_layer_count),
+        sampling,
+        token_history,
+    );
 }
 
 fn tryBackendOwnedGreedyToken(
@@ -5908,6 +6030,18 @@ pub fn forwardSampledToken(
     if (decode_context.query_sequence_len != 1) return null;
     if (decode_context.attention_mode != .paged_decode) return null;
     timing_stats.sampled_calls += 1;
+
+    if (try tryBackendOwnedSampledToken(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        sampling,
+        token_history,
+    )) |token| return token;
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedToken(cb, allocator, gpt_config, token_id);
