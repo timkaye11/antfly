@@ -1017,6 +1017,7 @@ run_e4b_qat_gate_once() {
     --temperature 0 \
     --raw-prompt \
     --no-chat-template \
+    --ignore-eos \
     --print-token-count \
     --print-token-ids \
     --print-timing \
