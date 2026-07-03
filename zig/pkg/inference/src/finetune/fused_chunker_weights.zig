@@ -43,6 +43,36 @@ const LoadedWeight = weight_source_mod.LoadedWeight;
 /// call sites free of `void` special-casing.
 pub const MetalWeightStore = gpu_hosted_store.WeightStore;
 
+/// Name of the Metal runtime escape hatch that routes dense linear forwards
+/// through decoder-runtime device slots / direct device dot kernels.
+pub const metal_dense_linear_forward_env = "TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD";
+
+/// Force the Metal eager forward onto the host dense-linear path unless the
+/// caller explicitly opted into the device fast path.
+///
+/// The fused-chunker training scripts (run_fused_chunker_phase20_metal.sh,
+/// run_fused_chunker_production_readiness.sh) export
+/// TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD=1 because the
+/// decoder-runtime device dense-linear fast path diverges numerically from
+/// the host path for encoder-shaped workloads. Every fused-chunker
+/// checkpoint is trained and validated against the host path, so any
+/// consumer (eval harness, serving pipeline) that runs the eager Metal
+/// forward with the device path enabled scores those checkpoints near zero
+/// (observed: in-loop val F1 0.79 vs external eval F1 0.009 on the same
+/// checkpoint). Defaulting the escape hatch here makes checkpoint scoring
+/// independent of the launching script. Set the variable to "0" explicitly
+/// to probe the device fast path.
+pub fn ensureMetalDenseLinearForwardParityDefault() bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (comptime @import("builtin").os.tag == .freestanding) return false;
+    const c = @cImport(@cInclude("stdlib.h"));
+    if (c.getenv(metal_dense_linear_forward_env) == null) {
+        _ = c.setenv(metal_dense_linear_forward_env, "1", 1);
+        return true;
+    }
+    return false;
+}
+
 pub fn stripEncoderPrefix(name: []const u8) []const u8 {
     const prefix = "encoder.";
     if (std.mem.startsWith(u8, name, prefix)) return name[prefix.len..];

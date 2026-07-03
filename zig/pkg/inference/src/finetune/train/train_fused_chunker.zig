@@ -74,6 +74,7 @@ const tokenizer_batch_mod = @import("../tokenizer_batch.zig");
 const TokenizerBatch = tokenizer_batch_mod.TokenizerBatch;
 const TokenFnCtx = tokenizer_batch_mod.TokenFnCtx;
 const fused_chunker_lora = @import("../lora_adapter_set.zig");
+const fused_chunker_weights_mod = @import("../fused_chunker_weights.zig");
 const fused_chunker_compiled_forward = @import("../fused_chunker_compiled_forward.zig");
 const tensor_mod = @import("../../backends/tensor.zig");
 const safetensors = @import("../../models/safetensors.zig");
@@ -9041,6 +9042,16 @@ fn run(allocator: std.mem.Allocator, input_opts: Options) !void {
         .native => .native,
     };
     const use_metal = selected_backend == .metal;
+
+    // Match the training scripts' default: run the eager Metal forward on
+    // the host dense-linear path (see fused_chunker_weights.zig for why the
+    // device fast path must stay off unless explicitly requested).
+    if (use_metal and fused_chunker_weights_mod.ensureMetalDenseLinearForwardParityDefault()) {
+        print(
+            "metal dense-linear device forward disabled for training/eval parity (set {s}=0 to probe the device path)\n",
+            .{fused_chunker_weights_mod.metal_dense_linear_forward_env},
+        );
+    }
 
     if (opts.mixed_precision) {
         std.debug.print("Warning: --mixed-precision is not supported by the direct Metal fused-chunker trainer yet, ignoring.\n", .{});

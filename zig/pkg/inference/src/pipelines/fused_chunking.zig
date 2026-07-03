@@ -162,6 +162,16 @@ pub const FusedChunkerPipeline = struct {
             .native => false,
         };
 
+        // Fused-chunker checkpoints are trained/validated with the Metal
+        // device dense-linear fast path disabled; serve them with the same
+        // forward unless the operator explicitly overrode the escape hatch.
+        if (use_metal and fused_chunker_weights.ensureMetalDenseLinearForwardParityDefault()) {
+            std.log.info(
+                "fused chunker: metal dense-linear device forward disabled for checkpoint parity (set {s}=0 to probe the device path)",
+                .{fused_chunker_weights.metal_dense_linear_forward_env},
+            );
+        }
+
         const manifest = try parseServingManifest(allocator, model_dir);
         errdefer allocator.free(manifest.model_version);
 

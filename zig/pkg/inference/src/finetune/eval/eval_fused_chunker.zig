@@ -2204,6 +2204,16 @@ pub fn main(init: std.process.Init) !void {
     };
     const use_metal = selected_backend == .metal;
 
+    // Checkpoints are trained/validated with the Metal device dense-linear
+    // fast path disabled; score them under the same forward unless the
+    // caller explicitly overrode the escape hatch.
+    if (use_metal and fused_chunker_weights.ensureMetalDenseLinearForwardParityDefault()) {
+        print(
+            "metal dense-linear device forward disabled for checkpoint parity (set {s}=0 to probe the device path)\n",
+            .{fused_chunker_weights.metal_dense_linear_forward_env},
+        );
+    }
+
     // Set up compute backend for optional encoder forward and boundary-head eval.
     var weight_store = native_compute.WeightStore{
         .allocator = allocator,
