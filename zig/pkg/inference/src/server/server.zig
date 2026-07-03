@@ -251,6 +251,14 @@ fn elapsedMs(from_ns: u128, to_ns: u128) u64 {
     return @intCast(@divTrunc(to_ns - from_ns, std.time.ns_per_ms));
 }
 
+fn denseEmbeddingCacheKey(allocator: std.mem.Allocator, model_path: []const u8, text: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, model_path.len + 1 + text.len);
+    @memcpy(out[0..model_path.len], model_path);
+    out[model_path.len] = 0;
+    @memcpy(out[model_path.len + 1 ..], text);
+    return out;
+}
+
 fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
     var bytes: [8]u8 = undefined;
     try fillRandomBytes(&bytes);
@@ -450,6 +458,8 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         }
     }
 
+    node.model_manager.lockLoadedModels();
+    defer node.model_manager.unlockLoadedModels();
     var it = node.model_manager.loaded.iterator();
     while (it.next()) |entry| {
         var already_listed = false;
@@ -523,21 +533,23 @@ pub const Node = struct {
     model_manager: model_manager_mod.ModelManager,
     registry: registry_mod.ModelRegistry,
     tabular_registry: tabular_mod.registry.Registry,
-    embed_cache: cache_mod.ResultCache([]const f32),
+    embed_cache: cache_mod.ResultCache([]f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
+        var model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+        model_manager.configureCachePolicy(config.keep_alive_ms, config.max_loaded_models);
         return .{
             .config = config,
             .allocator = allocator,
             .session_manager = backends_mod.SessionManager.init(allocator),
-            .model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator)),
+            .model_manager = model_manager,
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
-            .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
+            .embed_cache = cache_mod.ResultCache([]f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
         };
@@ -557,21 +569,36 @@ pub const Node = struct {
         texts: []const []const u8,
     ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const cache_key: ?[]u8 = if (texts.len == 1)
+            try denseEmbeddingCacheKey(allocator, model_path, texts[0])
+        else
+            null;
+        defer if (cache_key) |key| allocator.free(key);
+        if (cache_key) |key| {
+            if (try self.embed_cache.getAlloc(allocator, key)) |cached| {
+                const out = try allocator.alloc([]f32, 1);
+                out[0] = cached;
+                return out;
+            }
+        }
+
         try self.request_queue.acquire();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
         const model = try self.model_manager.loadFromDir(model_path);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssets(true, false, false);
 
         var pipeline = model.embeddingPipeline(allocator);
-        return try pipeline.embed(texts);
+        const embeddings = try pipeline.embed(texts);
+        if (cache_key) |key| if (embeddings.len == 1) try self.embed_cache.putCopy(key, embeddings[0]);
+        return embeddings;
     }
 
     pub fn embedSparseTextsDirect(
@@ -839,6 +866,7 @@ pub const Node = struct {
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
         for (self.config.preload) |model| try self.warmModel(allocator, model);
+        self.enforceModelCachePolicyIfIdle();
     }
 
     pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
@@ -892,11 +920,17 @@ pub const Node = struct {
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
+        const resolve_start_ns = embedTimingNowNs();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
+        const resolve_ms = elapsedMs(resolve_start_ns, embedTimingNowNs());
+        const load_start_ns = embedTimingNowNs();
         const model = if (backend) |value|
             try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
         else
             try self.model_manager.loadFromDir(model_path);
+        const load_ms = elapsedMs(load_start_ns, embedTimingNowNs());
+        var assets_ms: u64 = 0;
+        var embed_ms: u64 = 0;
 
         if (model.manifest.hasCapability("sparse")) {
             var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
@@ -905,21 +939,34 @@ pub const Node = struct {
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
             };
+            const embed_start_ns = embedTimingNowNs();
             const sparse = try pipeline.embed(&texts);
+            embed_ms = elapsedMs(embed_start_ns, embedTimingNowNs());
             defer {
                 for (sparse) |*item| item.deinit(allocator);
                 allocator.free(sparse);
             }
         } else {
-            try model.ensureEmbeddingAssets(true, false, false);
+            const assets_start_ns = embedTimingNowNs();
+            try model.ensureEmbeddingAssets(
+                true,
+                model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+            );
+            assets_ms = elapsedMs(assets_start_ns, embedTimingNowNs());
             var pipeline = model.embeddingPipeline(allocator);
+            const embed_start_ns = embedTimingNowNs();
             const embeddings = try pipeline.embed(&texts);
+            embed_ms = elapsedMs(embed_start_ns, embedTimingNowNs());
             defer {
                 for (embeddings) |embedding| allocator.free(embedding);
                 allocator.free(embeddings);
             }
         }
-        std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
+        std.log.info(
+            "warmed inference embedder model={s} elapsed_ms={d} resolve_ms={d} load_ms={d} assets_ms={d} embed_ms={d}",
+            .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()), resolve_ms, load_ms, assets_ms, embed_ms },
+        );
     }
 
     fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
@@ -1342,6 +1389,13 @@ pub const Node = struct {
     fn releaseSlotUnits(self: *Node, units: usize) void {
         self.request_queue.releaseUnits(units);
         self.metrics.setQueueDepth(self.request_queue.depth());
+        self.enforceModelCachePolicyIfIdle();
+    }
+
+    fn enforceModelCachePolicyIfIdle(self: *Node) void {
+        if (!self.request_queue.tryLockIdle()) return;
+        defer self.request_queue.unlockIdle();
+        self.model_manager.enforceCachePolicy();
     }
 
     fn estimateHttpRequestQueueUnits(self: *Node, ctx: *httpx.Context) usize {
@@ -4580,40 +4634,44 @@ pub const Node = struct {
             }
 
             // Add loaded models not yet listed (loaded by path, not discovered by name)
-            var it = self.model_manager.loaded.iterator();
-            while (it.next()) |entry| {
-                const model = entry.value_ptr.*;
-                const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+            {
+                self.model_manager.lockLoadedModels();
+                defer self.model_manager.unlockLoadedModels();
+                var it = self.model_manager.loaded.iterator();
+                while (it.next()) |entry| {
+                    const model = entry.value_ptr.*;
+                    const model_task = @tagName(model.manifest.model_type);
+                    if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
 
-                // Skip if already listed from discovery
-                var already_listed = false;
-                for (discovered) |d| {
-                    if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                        already_listed = true;
-                        break;
+                    // Skip if already listed from discovery
+                    var already_listed = false;
+                    for (discovered) |d| {
+                        if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
+                            already_listed = true;
+                            break;
+                        }
                     }
-                }
-                if (!already_listed) {
-                    if (model_count > 0) try body.append(a, ',');
-                    try jsonEncodeString(&body, a, entry.key_ptr.*);
-                    try body.append(a, ':');
-                    try appendModelInfo(
-                        &body,
-                        a,
-                        model_task,
-                        model.manifest.gliner_model_type,
-                        model.manifest.capabilities,
-                        model.manifest.inputs,
-                        model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                        model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                    );
-                    if (isOpenAiListTask(task)) {
-                        if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                        openai_data_count += 1;
+                    if (!already_listed) {
+                        if (model_count > 0) try body.append(a, ',');
+                        try jsonEncodeString(&body, a, entry.key_ptr.*);
+                        try body.append(a, ':');
+                        try appendModelInfo(
+                            &body,
+                            a,
+                            model_task,
+                            model.manifest.gliner_model_type,
+                            model.manifest.capabilities,
+                            model.manifest.inputs,
+                            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                        );
+                        if (isOpenAiListTask(task)) {
+                            if (openai_data_count > 0) try openai_data.append(a, ',');
+                            try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
+                            openai_data_count += 1;
+                        }
+                        model_count += 1;
                     }
-                    model_count += 1;
                 }
             }
 
@@ -4761,19 +4819,23 @@ pub const Node = struct {
         try @constCast(&node.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
-        const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
-        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
+        {
+            node.model_manager.lockLoadedModels();
+            defer node.model_manager.unlockLoadedModels();
+            const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
+            try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
+        }
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");

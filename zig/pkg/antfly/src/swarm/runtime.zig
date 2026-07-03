@@ -38,6 +38,9 @@ const antfarm_asset_roots = [_][]const u8{
     "/usr/share/antfly/antfarm",
     "antfarm",
 };
+const c_env = struct {
+    extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+};
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
@@ -879,6 +882,7 @@ pub fn runFromIterator(
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
     try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    configureEmbeddedInferenceMetalArchiveDir(alloc, data_dir);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
@@ -1125,6 +1129,17 @@ pub fn runFromIterator(
             else => return std.posix.unexpectedErrno(err),
         }
     }
+}
+
+fn configureEmbeddedInferenceMetalArchiveDir(alloc: std.mem.Allocator, data_dir: []const u8) void {
+    if (std.c.getenv("ANTFLY_METAL_BINARY_ARCHIVE_DIR") != null) return;
+    if (std.c.getenv("TERMITE_METAL_BINARY_ARCHIVE_DIR") != null) return;
+
+    const archive_dir = std.fs.path.join(alloc, &.{ data_dir, "inference", "metal-cache" }) catch return;
+    defer alloc.free(archive_dir);
+    const archive_dir_z = alloc.dupeZ(u8, archive_dir) catch return;
+    defer alloc.free(archive_dir_z);
+    _ = c_env.setenv("ANTFLY_METAL_BINARY_ARCHIVE_DIR", archive_dir_z.ptr, 0);
 }
 
 fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {

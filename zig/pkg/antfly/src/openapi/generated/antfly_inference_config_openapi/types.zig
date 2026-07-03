@@ -745,7 +745,7 @@ pub const Config = struct {
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    /// How long to keep models loaded in memory after last use. Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour). Set to "0" to disable idle-time eviction; use preload to warm models at startup.
     keep_alive: ?[]const u8 = null,
     /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
     max_loaded_models: ?i64 = null,
@@ -763,7 +763,7 @@ pub const Config = struct {
     preload: ?[]const ModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides. Reserved for API compatibility; current runtime startup warming is controlled by preload, and loaded-model eviction is controlled by keep_alive and max_loaded_models.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,

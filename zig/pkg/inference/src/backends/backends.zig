@@ -119,8 +119,29 @@ pub const SessionManager = struct {
     ) !Session {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
+        return self.loadModelWithImportedOnnxContextAndManifest(
+            model_path,
+            shared_backend_ctx,
+            if (manifest) |*m| m else null,
+        );
+    }
+
+    pub fn loadModelWithManifest(
+        self: *SessionManager,
+        model_path: []const u8,
+        manifest: *const manifest_mod.ModelManifest,
+    ) !Session {
+        return self.loadModelWithImportedOnnxContextAndManifest(model_path, null, manifest);
+    }
+
+    pub fn loadModelWithImportedOnnxContextAndManifest(
+        self: *SessionManager,
+        model_path: []const u8,
+        shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
+        manifest: ?*const manifest_mod.ModelManifest,
+    ) !Session {
         var effective_buf: [backend_order_capacity]BackendType = undefined;
-        const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
+        const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m.* else null);
 
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
@@ -151,7 +172,10 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSession(self.allocator, model_path) catch |err| {
+                    (if (manifest) |m|
+                        session_factory.createMetalSessionWithManifest(self.allocator, model_path, m.*)
+                    else
+                        session_factory.createMetalSession(self.allocator, model_path)) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         continue;
                     }

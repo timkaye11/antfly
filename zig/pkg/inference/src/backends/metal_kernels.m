@@ -1273,6 +1273,18 @@ static uint64_t termite_metal_clock_monotonic_nanos(void) {
     return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
 }
 
+static BOOL termite_metal_boot_timing_enabled(void) {
+    const char *value = getenv("TERMITE_METAL_BOOT_TIMING");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void termite_metal_log_boot_timing(const char *phase, uint64_t start_ns) {
+    if (!termite_metal_boot_timing_enabled() || start_ns == 0) return;
+    uint64_t end_ns = termite_metal_clock_monotonic_nanos();
+    if (end_ns < start_ns) return;
+    fprintf(stderr, "metal-boot-timing phase=%s elapsed_ms=%llu\n", phase, (unsigned long long)((end_ns - start_ns) / 1000000ull));
+}
+
 static bool termite_metal_debug_q80_block_finite(size_t layer_index) {
     const char *enabled = getenv("TERMITE_METAL_DEBUG_QUANT_BLOCK_FINITE");
     if (enabled == NULL) enabled = getenv("TERMITE_METAL_DEBUG_Q80_BLOCK_FINITE");
@@ -5523,6 +5535,42 @@ static void termite_metal_record_active_frame_blit_source(id<MTLCommandBuffer> c
     runtime->active_frame_blit_source_counts[source] += 1;
 }
 
+static NSURL *termite_metal_binary_archive_url(BOOL precise_math);
+static id<MTLBinaryArchive> termite_metal_make_binary_archive(id<MTLDevice> device, NSURL *archive_url);
+
+static id<MTLBinaryArchive> termite_metal_pipeline_binary_archive(id<MTLDevice> device, NSURL **archive_url_out) {
+    static id<MTLDevice> cached_device = nil;
+    static NSURL *cached_archive_url = nil;
+    static id<MTLBinaryArchive> cached_archive = nil;
+    static BOOL cached_archive_initialized = NO;
+    if (!cached_archive_initialized || cached_device != device) {
+        cached_archive_url = termite_metal_binary_archive_url(NO);
+        cached_archive = termite_metal_make_binary_archive(device, cached_archive_url);
+        cached_device = device;
+        cached_archive_initialized = YES;
+    }
+    if (archive_url_out != NULL) *archive_url_out = cached_archive_url;
+    return cached_archive;
+}
+
+static void termite_metal_serialize_binary_archive(id<MTLBinaryArchive> archive, NSURL *archive_url) {
+    if (archive == nil || archive_url == nil) return;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        uint64_t start_ns = termite_metal_clock_monotonic_nanos();
+        NSError *archive_error = nil;
+        if (![archive serializeToURL:archive_url error:&archive_error] && archive_error != nil) {
+            fprintf(stderr, "metal-binary-archive serialize error=%s\n", archive_error.localizedDescription.UTF8String);
+        }
+        termite_metal_log_boot_timing("binary_archive.serialize", start_ns);
+    }
+}
+
+static void termite_metal_flush_pipeline_binary_archive(id<MTLDevice> device) {
+    NSURL *archive_url = nil;
+    id<MTLBinaryArchive> archive = termite_metal_pipeline_binary_archive(device, &archive_url);
+    termite_metal_serialize_binary_archive(archive, archive_url);
+}
+
 static id<MTLComputePipelineState> termite_metal_make_pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString *name) {
     NSError *error = nil;
     id<MTLFunction> function = [library newFunctionWithName:name];
@@ -5530,7 +5578,28 @@ static id<MTLComputePipelineState> termite_metal_make_pipeline(id<MTLDevice> dev
         fprintf(stderr, "metal-make-pipeline missing-function name=%s\n", name.UTF8String);
         return nil;
     }
-    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    id<MTLBinaryArchive> archive = termite_metal_pipeline_binary_archive(device, NULL);
+    id<MTLComputePipelineState> pipeline = nil;
+    if (archive != nil) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            MTLComputePipelineDescriptor *descriptor = [MTLComputePipelineDescriptor new];
+            descriptor.computeFunction = function;
+            descriptor.label = name;
+            descriptor.binaryArchives = @[ archive ];
+            NSError *archive_error = nil;
+            if (![archive addComputePipelineFunctionsWithDescriptor:descriptor error:&archive_error] && archive_error != nil) {
+                fprintf(stderr, "metal-binary-archive add-pipeline name=%s error=%s\n", name.UTF8String, archive_error.localizedDescription.UTF8String);
+            }
+            pipeline = [device newComputePipelineStateWithDescriptor:descriptor options:0 reflection:nil error:&error];
+            if (pipeline == nil) {
+                NSError *fallback_error = nil;
+                pipeline = [device newComputePipelineStateWithFunction:function error:&fallback_error];
+                if (pipeline == nil && fallback_error != nil && error == nil) error = fallback_error;
+            }
+        }
+    } else {
+        pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    }
     if (pipeline == nil && error != nil) {
         fprintf(stderr, "metal-make-pipeline name=%s error=%s\n", name.UTF8String, error.localizedDescription.UTF8String);
     }
@@ -5785,7 +5854,54 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
     return 0;
 }
 
+static NSURL *termite_metal_binary_archive_url(BOOL precise_math) {
+    const char *dir = getenv("ANTFLY_METAL_BINARY_ARCHIVE_DIR");
+    if (dir == NULL || dir[0] == '\0') dir = getenv("TERMITE_METAL_BINARY_ARCHIVE_DIR");
+    NSString *dir_path = nil;
+    if (dir != NULL && dir[0] != '\0') {
+        dir_path = [NSString stringWithUTF8String:dir];
+    } else {
+        NSString *home = NSHomeDirectory();
+        if (home != nil && home.length > 0) {
+            dir_path = [home stringByAppendingPathComponent:@".antfly/inference/metal-cache"];
+        }
+    }
+    if (dir_path.length == 0) return nil;
+    NSError *mkdir_error = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir_path withIntermediateDirectories:YES attributes:nil error:&mkdir_error]) {
+        if (mkdir_error != nil) {
+            fprintf(stderr, "metal-binary-archive mkdir error=%s\n", mkdir_error.localizedDescription.UTF8String);
+        }
+        return nil;
+    }
+    NSString *file_name = precise_math ? @"termite-metal-precise.metallibar" : @"termite-metal.metallibar";
+    return [NSURL fileURLWithPath:[dir_path stringByAppendingPathComponent:file_name]];
+}
+
+static id<MTLBinaryArchive> termite_metal_make_binary_archive(id<MTLDevice> device, NSURL *archive_url) {
+    if (archive_url == nil) return nil;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        uint64_t start_ns = termite_metal_clock_monotonic_nanos();
+        MTLBinaryArchiveDescriptor *descriptor = [MTLBinaryArchiveDescriptor new];
+        descriptor.url = [[NSFileManager defaultManager] fileExistsAtPath:archive_url.path] ? archive_url : nil;
+        NSError *archive_error = nil;
+        id<MTLBinaryArchive> archive = [device newBinaryArchiveWithDescriptor:descriptor error:&archive_error];
+        if (archive == nil && descriptor.url != nil) {
+            descriptor.url = nil;
+            archive_error = nil;
+            archive = [device newBinaryArchiveWithDescriptor:descriptor error:&archive_error];
+        }
+        if (archive == nil && archive_error != nil) {
+            fprintf(stderr, "metal-binary-archive open error=%s\n", archive_error.localizedDescription.UTF8String);
+        }
+        termite_metal_log_boot_timing(descriptor.url == nil ? "binary_archive.create" : "binary_archive.open", start_ns);
+        return archive;
+    }
+    return nil;
+}
+
 static id<MTLLibrary> termite_metal_make_library(id<MTLDevice> device, BOOL precise_math) {
+    uint64_t start_ns = termite_metal_clock_monotonic_nanos();
     NSError *error = nil;
     MTLCompileOptions *options = [MTLCompileOptions new];
     if (precise_math) {
@@ -5797,6 +5913,7 @@ static id<MTLLibrary> termite_metal_make_library(id<MTLDevice> device, BOOL prec
     if (library == nil && error != nil) {
         fprintf(stderr, "metal-make-library precise=%d error=%s\n", precise_math ? 1 : 0, error.localizedDescription.UTF8String);
     }
+    termite_metal_log_boot_timing(precise_math ? "library.source.precise" : "library.source.fast", start_ns);
     return library;
 }
 
@@ -11779,6 +11896,7 @@ termite_metal_provider *termite_metal_provider_create(void) {
         if (provider == NULL) return NULL;
         provider->device = device;
         provider->queue = queue;
+        uint64_t pipelines_start_ns = termite_metal_clock_monotonic_nanos();
         provider->q4_0_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_linear");
         provider->q4_1_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_1_linear");
         provider->q5_0_pipeline = termite_metal_make_pipeline(device, library, @"termite_q5_0_linear");
@@ -11806,10 +11924,12 @@ termite_metal_provider *termite_metal_provider_create(void) {
         provider->tl2_pipeline = termite_metal_make_pipeline(device, library, @"termite_tl2_linear");
         provider->polar4_key_scores_pipeline = termite_metal_make_pipeline(device, library, @"termite_polar4_key_scores");
         provider->turbo3_key_scores_pipeline = termite_metal_make_pipeline(device, library, @"termite_turbo3_key_scores");
+        termite_metal_log_boot_timing("provider.pipelines", pipelines_start_ns);
         if (provider->q4_0_pipeline == nil || provider->q4_1_pipeline == nil || provider->q5_0_pipeline == nil || provider->q5_1_pipeline == nil || provider->q8_0_pipeline == nil || provider->q8_1_pipeline == nil || provider->q8_0_mmv_pipeline == nil || provider->q8_0_small_batch_r2_pipeline == nil || provider->q8_0_small_batch_r3_pipeline == nil || provider->q8_0_small_batch_r4_pipeline == nil || provider->q8_0_small_batch_pipeline == nil || provider->q8_0_mm_pipeline == nil || provider->q2_k_pipeline == nil || provider->q3_k_pipeline == nil || provider->q4_k_pipeline == nil || provider->q5_k_pipeline == nil || provider->q6_k_pipeline == nil || provider->q8_k_pipeline == nil || provider->iq4_nl_pipeline == nil || provider->iq4_xs_pipeline == nil || provider->mxfp4_pipeline == nil || provider->i2_s_pipeline == nil || provider->i2_s_pair_pipeline == nil || provider->tl1_pipeline == nil || provider->tl2_pipeline == nil || provider->polar4_key_scores_pipeline == nil || provider->turbo3_key_scores_pipeline == nil) {
             free(provider);
             return NULL;
         }
+        termite_metal_flush_pipeline_binary_archive(device);
         return provider;
     }
 }
@@ -11870,6 +11990,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->queue = queue;
         runtime->library = library;
         runtime->precise_library = precise_library;
+        uint64_t pipelines_start_ns = termite_metal_clock_monotonic_nanos();
         runtime->embed_absolute_position_pipeline = termite_metal_make_pipeline(device, library, @"termite_embed_absolute_position");
         runtime->embedding_lookup_pipeline = termite_metal_make_pipeline(device, library, @"termite_embedding_lookup");
         runtime->embedding_lookup_bf16_pipeline = termite_metal_make_pipeline(device, library, @"termite_embedding_lookup_bf16");
@@ -12094,6 +12215,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->encode_int8_per_head_pipeline = termite_metal_make_pipeline(device, library, @"termite_encode_int8_per_head");
         runtime->polar4_attention_span_pipeline = termite_metal_make_pipeline(device, library, @"termite_polar4_attention_span");
         runtime->turbo3_attention_span_pipeline = termite_metal_make_pipeline(device, library, @"termite_turbo3_attention_span");
+        termite_metal_log_boot_timing("decode_runtime.pipelines", pipelines_start_ns);
         BOOL missing_quant_reduce_pipeline = runtime->q4_1_reduce_pipeline == nil || runtime->q5_1_reduce_pipeline == nil || runtime->q8_1_reduce_pipeline == nil || runtime->q8_k_reduce_pipeline == nil || runtime->iq4_nl_reduce_pipeline == nil || runtime->iq4_xs_reduce_pipeline == nil || runtime->mxfp4_reduce_pipeline == nil;
         BOOL missing_dense_multi_row_reduce_pipeline = runtime->linear_bf16_multi_row_reduce_pipeline == nil || runtime->linear_multi_row_reduce_pipeline == nil;
         if (missing_quant_reduce_pipeline || missing_dense_multi_row_reduce_pipeline || runtime->embed_absolute_position_pipeline == nil || runtime->embedding_lookup_pipeline == nil || runtime->q4_0_get_rows_pipeline == nil || runtime->q4_0_set_rows_pipeline == nil || runtime->q4_0_cpy_q_to_f32_pipeline == nil || runtime->q4_0_cpy_f32_to_q_pipeline == nil || runtime->q4_1_get_rows_pipeline == nil || runtime->q4_1_set_rows_pipeline == nil || runtime->q4_1_cpy_q_to_f32_pipeline == nil || runtime->q4_1_cpy_f32_to_q_pipeline == nil || runtime->q5_0_get_rows_pipeline == nil || runtime->q5_0_set_rows_pipeline == nil || runtime->q5_0_cpy_q_to_f32_pipeline == nil || runtime->q5_0_cpy_f32_to_q_pipeline == nil || runtime->q5_1_get_rows_pipeline == nil || runtime->q5_1_set_rows_pipeline == nil || runtime->q5_1_cpy_q_to_f32_pipeline == nil || runtime->q5_1_cpy_f32_to_q_pipeline == nil || runtime->q4_k_get_rows_pipeline == nil || runtime->q4_k_set_rows_pipeline == nil || runtime->q4_k_cpy_q_to_f32_pipeline == nil || runtime->q4_k_cpy_f32_to_q_pipeline == nil || runtime->q5_k_get_rows_pipeline == nil || runtime->q5_k_set_rows_pipeline == nil || runtime->q5_k_cpy_q_to_f32_pipeline == nil || runtime->q5_k_cpy_f32_to_q_pipeline == nil || runtime->q6_k_get_rows_pipeline == nil || runtime->q6_k_set_rows_pipeline == nil || runtime->q6_k_cpy_q_to_f32_pipeline == nil || runtime->q6_k_cpy_f32_to_q_pipeline == nil || runtime->q8_0_get_rows_pipeline == nil || runtime->q8_0_set_rows_pipeline == nil || runtime->q8_0_cpy_q_to_f32_pipeline == nil || runtime->q8_0_cpy_f32_to_q_pipeline == nil || runtime->q8_1_get_rows_pipeline == nil || runtime->q8_1_set_rows_pipeline == nil || runtime->q8_1_cpy_q_to_f32_pipeline == nil || runtime->q8_1_cpy_f32_to_q_pipeline == nil || runtime->rope_pipeline == nil || runtime->head_rms_rope_pipeline == nil || runtime->attention_f32_pipeline == nil || runtime->attention_f32_prefill_pipeline == nil || runtime->attention_paged_pipeline == nil || runtime->paged_f32_kv_seed_pipeline == nil || runtime->paged_f16_kv_seed_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil || runtime->slice_last_dim_f32_2d_pipeline == nil || runtime->transpose_f32_pipeline == nil || runtime->dot_general_2d_f32_pipeline == nil || runtime->dot_general_batched_f32_pipeline == nil || runtime->conv1d_f32_pipeline == nil || runtime->conv2d_f32_pipeline == nil || runtime->layer_norm_pipeline == nil || runtime->rms_norm_pipeline == nil || runtime->rms_norm_reduce_pipeline == nil || runtime->rms_norm_rows_pipeline == nil || runtime->rms_norm_add_pipeline == nil || runtime->rms_norm_add_scale_pipeline == nil || runtime->rms_norm_add_scale_rows_pipeline == nil || runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_pair_reduce_pipeline == nil || runtime->linear_multi_row_pipeline == nil || runtime->linear_bias_pipeline == nil || runtime->argmax_logits_pipeline == nil || runtime->argmax_logits_partials_pipeline == nil || runtime->argmax_logits_suppress_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil || runtime->sample_logits_pipeline == nil || runtime->sample_topk_partials_pipeline == nil || runtime->sample_topk_reduce_pipeline == nil || runtime->activation_pipeline == nil || runtime->activation_multiply_pipeline == nil || runtime->softmax_pipeline == nil || runtime->reduce_last_dim_pipeline == nil || runtime->reduce_axis_f32_pipeline == nil || runtime->multiply_reduce_last_dim_pipeline == nil || runtime->broadcast_last_dim_pipeline == nil || runtime->broadcast_f32_pipeline == nil || runtime->multiply_pipeline == nil || runtime->scale_pipeline == nil || runtime->add_pipeline == nil || runtime->add_scale_pipeline == nil || runtime->subtract_pipeline == nil || runtime->divide_pipeline == nil || runtime->less_than_pipeline == nil || runtime->where_select_pipeline == nil || runtime->i2_s_quantize_pipeline == nil || runtime->q1_0_pipeline == nil || runtime->i8_s_pipeline == nil || runtime->q2_k_pipeline == nil || runtime->q3_k_pipeline == nil || runtime->q4_k_pipeline == nil || runtime->q4_k_reduce_pipeline == nil || runtime->q4_k_pair_pipeline == nil || runtime->q4_k_pair_activation_reduce_pipeline == nil || runtime->q4_k_pair_activation_reduce_f16_output_pipeline == nil || runtime->q4_k_activation_rhs_reduce_pipeline == nil || runtime->q4_0_pipeline == nil || runtime->q4_0_pair_pipeline == nil || runtime->q4_0_reduce_pipeline == nil || runtime->q4_1_pipeline == nil || runtime->q5_0_pipeline == nil || runtime->q5_0_reduce_pipeline == nil || runtime->q5_1_pipeline == nil || runtime->q8_0_pipeline == nil || runtime->q8_0_pair_pipeline == nil || runtime->q8_0_mmv_pipeline == nil || runtime->q8_0_rms_scale_mmv_pipeline == nil || runtime->q8_0_small_batch_pipeline == nil || (runtime->q8_0_mm_pipeline == nil && runtime->q8_0_mm_sg_pipeline == nil) || runtime->q8_0_pair_mmv_pipeline == nil || runtime->q8_0_pair_small_batch_pipeline == nil || runtime->q8_0_qkv_mmv_pipeline == nil || runtime->q8_0_pair_activation_reduce_pipeline == nil || runtime->q8_0_pair_activation_mmv_pipeline == nil || runtime->q8_0_pair_activation_small_batch_pipeline == nil || runtime->q8_0_activation_multiply_reduce_pipeline == nil || runtime->q8_0_activation_multiply_mmv_pipeline == nil || runtime->q8_1_pipeline == nil || runtime->q5_k_pipeline == nil || runtime->q5_k_reduce_pipeline == nil || runtime->q6_k_pipeline == nil || runtime->q6_k_reduce_pipeline == nil || runtime->q6_k_pair_pipeline == nil || runtime->q8_k_pipeline == nil || runtime->iq4_nl_pipeline == nil || runtime->iq4_xs_pipeline == nil || runtime->mxfp4_pipeline == nil || runtime->nvfp4_pipeline == nil || runtime->iq2_xs_pipeline == nil || runtime->i2_s_pipeline == nil || runtime->i2_s_pair_pipeline == nil || runtime->i2_s_linear_i8_pipeline == nil || runtime->i2_s_pair_i8_pipeline == nil || runtime->tl1_pipeline == nil || runtime->tl2_pipeline == nil || runtime->encode_polar4_key_pipeline == nil || runtime->encode_turbo3_key_pipeline == nil || runtime->polar4_attention_span_pipeline == nil || runtime->turbo3_attention_span_pipeline == nil) {
@@ -12267,6 +12389,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             free(runtime);
             return NULL;
         }
+        termite_metal_flush_pipeline_binary_archive(device);
         return runtime;
     }
 }

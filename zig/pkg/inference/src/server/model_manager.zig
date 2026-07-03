@@ -276,7 +276,11 @@ fn appendAddedToken(
     try buf.appendSlice(allocator, ",\"special\":true}");
 }
 
-fn loadLegacyWordPieceTokenizerFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !*hf_tokenizer.HfTokenizer {
+fn loadLegacyWordPieceTokenizerFromDir(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    options: hf_tokenizer.HfTokenizer.LoadOptions,
+) !*hf_tokenizer.HfTokenizer {
     const vocab_path = try std.fmt.allocPrint(allocator, "{s}/vocab.txt", .{model_dir});
     defer allocator.free(vocab_path);
     const vocab_bytes = try c_file.readFile(allocator, vocab_path);
@@ -369,7 +373,7 @@ fn loadLegacyWordPieceTokenizerFromDir(allocator: std.mem.Allocator, model_dir: 
     try buf.append(allocator, '}');
     const tokenizer_json = try buf.toOwnedSlice(allocator);
     defer allocator.free(tokenizer_json);
-    return hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    return hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, tokenizer_json, options);
 }
 
 pub fn loadHuggingFaceTokenizerFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !*hf_tokenizer.HfTokenizer {
@@ -381,25 +385,38 @@ pub fn loadHuggingFaceTokenizerFromDirOrGguf(
     model_dir: []const u8,
     gguf_path: ?[]const u8,
 ) !*hf_tokenizer.HfTokenizer {
+    return loadHuggingFaceTokenizerFromDirOrGgufWithOptions(allocator, model_dir, gguf_path, .{});
+}
+
+fn loadHuggingFaceTokenizerFromDirOrGgufWithOptions(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    gguf_path: ?[]const u8,
+    options: hf_tokenizer.HfTokenizer.LoadOptions,
+) !*hf_tokenizer.HfTokenizer {
     const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
     defer allocator.free(tok_path);
     if (c_file.readFile(allocator, tok_path)) |tok_bytes| {
         defer allocator.free(tok_bytes);
-        return hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
+        return hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, tok_bytes, options);
     } else |_| {}
 
     if (c_file.fileExistsInDir(allocator, model_dir, "vocab.txt")) {
-        return loadLegacyWordPieceTokenizerFromDir(allocator, model_dir);
+        return loadLegacyWordPieceTokenizerFromDir(allocator, model_dir, options);
     }
 
     if (gguf_path) |path| {
-        return loadHuggingFaceTokenizerFromGguf(allocator, path);
+        return loadHuggingFaceTokenizerFromGguf(allocator, path, options);
     }
 
     return error.NoTokenizerFound;
 }
 
-fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !*hf_tokenizer.HfTokenizer {
+fn loadHuggingFaceTokenizerFromGguf(
+    allocator: std.mem.Allocator,
+    gguf_path: []const u8,
+    options: hf_tokenizer.HfTokenizer.LoadOptions,
+) !*hf_tokenizer.HfTokenizer {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
 
@@ -420,7 +437,7 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     const tokenizer_bytes = try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
     defer allocator.free(tokenizer_bytes);
 
-    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, tokenizer_bytes, options);
     tok.applySpecialTokenIds(
         metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
         metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
@@ -739,11 +756,16 @@ pub const LoadedModel = struct {
     resident_projection_stats: embedding_mod.AtomicResidentProjectionStats = .{},
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
+    last_used_ns: u64 = 0,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
         if (self.sp_tok) |sp| return sp.tokenizer();
         unreachable;
+    }
+
+    pub fn touch(self: *LoadedModel) void {
+        self.last_used_ns = modelManagerNowNs();
     }
 
     pub fn lockNativeGeneration(self: *LoadedModel) void {
@@ -1010,6 +1032,10 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    // ponytail: one manager lock; move to per-model locks if concurrent cold loads become a bottleneck.
+    mutex: std.atomic.Mutex = .unlocked,
+    keep_alive_ns: u64 = 0,
+    max_loaded_models: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return .{
@@ -1018,6 +1044,19 @@ pub const ModelManager = struct {
             .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
             .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
         };
+    }
+
+    pub fn configureCachePolicy(self: *ModelManager, keep_alive_ms: u64, max_loaded_models: usize) void {
+        self.keep_alive_ns = keep_alive_ms * std.time.ns_per_ms;
+        self.max_loaded_models = max_loaded_models;
+    }
+
+    pub fn lockLoadedModels(self: *ModelManager) void {
+        modelManagerLock(&self.mutex);
+    }
+
+    pub fn unlockLoadedModels(self: *ModelManager) void {
+        self.mutex.unlock();
     }
 
     pub fn deinit(self: *ModelManager) void {
@@ -1037,12 +1076,31 @@ pub const ModelManager = struct {
 
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
-        if (self.loaded.get(model_dir)) |model| return model;
-        if (self.loaded_aliases.get(model_dir)) |model| return model;
-        return self.loadFromDirWithPreferredBackends(model_dir, self.session_manager.preferred_backends, true);
+        modelManagerLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.loaded.get(model_dir)) |model| {
+            model.touch();
+            return model;
+        }
+        if (self.loaded_aliases.get(model_dir)) |model| {
+            model.touch();
+            return model;
+        }
+        return self.loadFromDirWithPreferredBackendsLocked(model_dir, self.session_manager.preferred_backends, true);
     }
 
     pub fn loadFromDirWithPreferredBackends(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        modelManagerLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.loadFromDirWithPreferredBackendsLocked(model_dir, preferred_backends, cache_default_alias);
+    }
+
+    fn loadFromDirWithPreferredBackendsLocked(
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
@@ -1052,8 +1110,14 @@ pub const ModelManager = struct {
             if (!backend.supportsDirectSessionLoad()) continue;
             const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
             defer self.allocator.free(variant_key);
-            if (self.loaded.get(variant_key)) |model| return model;
-            if (self.loaded_aliases.get(variant_key)) |model| return model;
+            if (self.loaded.get(variant_key)) |model| {
+                model.touch();
+                return model;
+            }
+            if (self.loaded_aliases.get(variant_key)) |model| {
+                model.touch();
+                return model;
+            }
         }
 
         var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
@@ -1066,16 +1130,20 @@ pub const ModelManager = struct {
         sm: *backends.SessionManager,
         cache_default_alias: bool,
     ) !*LoadedModel {
+        const load_start_ns = modelManagerNowNs();
 
         // Load manifest
+        const manifest_start_ns = modelManagerNowNs();
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
         if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
+        const manifest_ms = modelManagerElapsedMs(manifest_start_ns, modelManagerNowNs());
 
         // Load tokenizer
+        const tokenizer_start_ns = modelManagerNowNs();
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
         errdefer if (hf_tok) |ht| ht.deinitSelf();
         var sp_tok: ?*sentencepiece.Processor = null;
@@ -1091,22 +1159,34 @@ pub const ModelManager = struct {
             break :blk man.tokenizer_type orelse return error.NoTokenizerFound;
         };
 
-        switch (tokenizer_type) {
-            .huggingface => {
-                hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+        var tokenizer_ms: u64 = 0;
+        var session_ms: u64 = 0;
+        const session = switch (tokenizer_type) {
+            .huggingface => blk: {
+                const tokenizer_options = hf_tokenizer.HfTokenizer.LoadOptions{
+                    .decode = man.model_type != .embedder,
+                };
+                hf_tok = try loadHuggingFaceTokenizerFromDirOrGgufWithOptions(self.allocator, model_dir, man.gguf_path, tokenizer_options);
+                tokenizer_ms = modelManagerElapsedMs(tokenizer_start_ns, modelManagerNowNs());
+                const session_start_ns = modelManagerNowNs();
+                const loaded_session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
+                session_ms = modelManagerElapsedMs(session_start_ns, modelManagerNowNs());
+                break :blk loaded_session;
             },
-            .sentencepiece => {
+            .sentencepiece => blk: {
                 const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
                 if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) {
                     sp.setPreserveInlineSpecialsAfterLiteralBos(true);
                 }
                 try loadSentencePieceAddedTokens(model_dir, self.allocator, sp);
                 sp_tok = sp;
+                tokenizer_ms = modelManagerElapsedMs(tokenizer_start_ns, modelManagerNowNs());
+                const session_start_ns = modelManagerNowNs();
+                const loaded_session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
+                session_ms = modelManagerElapsedMs(session_start_ns, modelManagerNowNs());
+                break :blk loaded_session;
             },
-        }
-
-        // Load session.
-        const session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
+        };
 
         // Load chat template if available (for generator models)
         const chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
@@ -1176,6 +1256,7 @@ pub const ModelManager = struct {
             .text_projection = null,
             .visual_projection = null,
             .audio_projection = null,
+            .last_used_ns = modelManagerNowNs(),
         };
 
         if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(session)) {
@@ -1196,9 +1277,96 @@ pub const ModelManager = struct {
             try self.loaded_aliases.put(self.allocator, alias_key, model);
         }
 
+        modelManagerLogTiming(
+            "load model={s} elapsed_ms={d} manifest_ms={d} tokenizer_ms={d} session_ms={d}",
+            .{ model_dir, modelManagerElapsedMs(load_start_ns, modelManagerNowNs()), manifest_ms, tokenizer_ms, session_ms },
+        );
         return model;
     }
+
+    pub fn enforceCachePolicy(self: *ModelManager) void {
+        modelManagerLock(&self.mutex);
+        defer self.mutex.unlock();
+        const now = modelManagerNowNs();
+        if (self.keep_alive_ns > 0) {
+            while (self.findExpiredModelKey(now)) |key| self.evictModelByKey(key);
+        }
+        if (self.max_loaded_models > 0) {
+            while (self.loaded.count() > self.max_loaded_models) {
+                const key = self.findLeastRecentlyUsedModelKey() orelse break;
+                self.evictModelByKey(key);
+            }
+        }
+    }
+
+    fn findExpiredModelKey(self: *ModelManager, now_ns: u64) ?[]const u8 {
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            if (now_ns -| entry.value_ptr.*.last_used_ns >= self.keep_alive_ns) return entry.key_ptr.*;
+        }
+        return null;
+    }
+
+    fn findLeastRecentlyUsedModelKey(self: *ModelManager) ?[]const u8 {
+        var victim_key: ?[]const u8 = null;
+        var victim_last_used: u64 = std.math.maxInt(u64);
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const last_used = entry.value_ptr.*.last_used_ns;
+            if (last_used < victim_last_used) {
+                victim_last_used = last_used;
+                victim_key = entry.key_ptr.*;
+            }
+        }
+        return victim_key;
+    }
+
+    fn evictModelByKey(self: *ModelManager, key: []const u8) void {
+        const removed = self.loaded.fetchRemove(key) orelse return;
+        const model = removed.value;
+        self.allocator.free(removed.key);
+        self.removeAliasesForModel(model);
+        model.deinit();
+        self.allocator.destroy(model);
+    }
+
+    fn removeAliasesForModel(self: *ModelManager, model: *LoadedModel) void {
+        while (true) {
+            var found: ?[]const u8 = null;
+            var it = self.loaded_aliases.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == model) {
+                    found = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const key = found orelse return;
+            if (self.loaded_aliases.fetchRemove(key)) |removed| self.allocator.free(removed.key);
+        }
+    }
 };
+
+fn modelManagerLock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn modelManagerLogTiming(comptime fmt: []const u8, args: anytype) void {
+    if (!platform.env.getenvBoolDefault("TERMITE_MODEL_LOAD_TIMING", false)) return;
+    std.log.info("model-load-timing " ++ fmt, args);
+}
+
+fn modelManagerElapsedMs(from_ns: u64, to_ns: u64) u64 {
+    if (from_ns == 0 or to_ns <= from_ns) return 0;
+    return @intCast(@divTrunc(to_ns - from_ns, std.time.ns_per_ms));
+}
+
+fn modelManagerNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => 0,
+    };
+}
 
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
@@ -1272,7 +1440,7 @@ fn loadSessionForPreferredBackends(
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
-        if (backend_session_manager.loadModel(candidate_path)) |session| {
+        if (backend_session_manager.loadModelWithManifest(candidate_path, &man)) |session| {
             return session;
         } else |_| {}
     }

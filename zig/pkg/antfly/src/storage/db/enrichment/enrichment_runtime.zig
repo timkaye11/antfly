@@ -374,6 +374,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         error.SendFailed,
         error.RecvFailed,
         error.ResourceBudgetExceeded,
+        error.QueueFull,
         => true,
         else => false,
     };
@@ -381,6 +382,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
 
 test "enrichment treats missing local model as retryable" {
     try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(isRetryableEnrichmentError(error.QueueFull));
 }
 
 fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
@@ -1388,13 +1390,27 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 };
 
-fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
+fn transientWorkerRetrySleepNs(attempt: u32) u64 {
+    const shift: u6 = @intCast(@min(attempt, 6));
+    return @min(transient_worker_retry_sleep_ns << shift, transient_embed_retry_max_sleep_ns);
+}
+
+test "enrichment worker retry backoff is capped" {
+    try std.testing.expectEqual(transient_worker_retry_sleep_ns, transientWorkerRetrySleepNs(0));
+    try std.testing.expectEqual(transient_worker_retry_sleep_ns * 4, transientWorkerRetrySleepNs(2));
+    try std.testing.expectEqual(transient_embed_retry_max_sleep_ns, transientWorkerRetrySleepNs(20));
+}
+
+fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror, worker_retry_attempt: *u32) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
     if (isRetryableEnrichmentError(err)) {
         runtime.recordRetryableError(io, err);
-        io.sleep(Io.Duration.fromMilliseconds(@intCast(transient_worker_retry_sleep_ns / std.time.ns_per_ms)), .awake) catch {};
+        const sleep_ns = transientWorkerRetrySleepNs(worker_retry_attempt.*);
+        worker_retry_attempt.* = @min(worker_retry_attempt.* + 1, 20);
+        io.sleep(Io.Duration.fromMilliseconds(@intCast(sleep_ns / std.time.ns_per_ms)), .awake) catch {};
         return;
     }
+    worker_retry_attempt.* = 0;
     runtime.recordError(io, err);
 }
 
@@ -1458,6 +1474,7 @@ test "isolated enrichment request error does not mark worker failed" {
 fn workerMain(runtime: *EnrichmentRuntime) void {
     const io_impl = runtime.io_impl orelse return;
     const io = io_impl.io();
+    var worker_retry_attempt: u32 = 0;
 
     worker_loop: while (true) {
         runtime.mutex.lockUncancelable(io);
@@ -1486,7 +1503,7 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
         }
 
         const pending = enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence) catch |err| {
-            handleWorkerLoopError(runtime, io, err);
+            handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
             continue :worker_loop;
         };
         defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
@@ -1513,32 +1530,32 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
             for (pending) |group| {
                 max_seen = @max(max_seen, group.sequence);
                 processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &window, &processed_request_count) catch |err| {
-                    handleWorkerLoopError(runtime, io, err);
+                    handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
                     if (isRetryableEnrichmentError(err)) continue :retry_pending;
                     continue :worker_loop;
                 };
                 flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
-                    handleWorkerLoopError(runtime, io, err);
+                    handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
                     if (isRetryableEnrichmentError(err)) continue :retry_pending;
                     continue :worker_loop;
                 };
             }
             processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
+                handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
                 if (isRetryableEnrichmentError(err)) continue :retry_pending;
                 continue :worker_loop;
             };
             processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
+                handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
                 if (isRetryableEnrichmentError(err)) continue :retry_pending;
                 continue :worker_loop;
             };
             flushGeneratedReplayWindow(runtime, &window) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
+                handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
                 if (isRetryableEnrichmentError(err)) continue :retry_pending;
                 continue :worker_loop;
@@ -1551,7 +1568,7 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
 
         if (max_seen > runtime.applied_sequence) {
             saveAppliedSequenceWithRetry(runtime, scope_name, max_seen) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
+                handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                 continue :worker_loop;
             };
             var status: enrichment_state.RuntimeStatus = .{};
@@ -1560,12 +1577,13 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
             runtime.processed_requests += processed_request_count;
             runtime.retrying = false;
             runtime.worker_failed = false;
+            worker_retry_attempt = 0;
             clearPublishedGeneratedArtifacts(runtime);
             status = runtimeStatusSnapshot(runtime);
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
             saveRuntimeStatusWithRetry(runtime, scope_name, status) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
+                handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                 continue :worker_loop;
             };
             runtime.notifyStatusHook();
@@ -1574,11 +1592,12 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
             runtime.mutex.lockUncancelable(io);
             runtime.retrying = false;
             runtime.worker_failed = false;
+            worker_retry_attempt = 0;
             status = runtimeStatusSnapshot(runtime);
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
             saveRuntimeStatusWithRetry(runtime, scope_name, status) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
+                handleWorkerLoopError(runtime, io, err, &worker_retry_attempt);
                 continue :worker_loop;
             };
             runtime.notifyStatusHook();

@@ -948,7 +948,17 @@ pub fn createMetalSession(allocator: std.mem.Allocator, model_path: []const u8) 
 }
 
 pub fn createMetalSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal);
+    var mf = try manifest_mod.loadFromDir(allocator, model_path);
+    defer mf.deinit();
+    return createGpuHostedSessionWithManifest(allocator, model_path, override, .metal, mf);
+}
+
+pub fn createMetalSessionWithManifest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: manifest_mod.ModelManifest,
+) !Session {
+    return createGpuHostedSessionWithManifest(allocator, model_path, null, .metal, manifest);
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -1137,24 +1147,27 @@ fn createGpuHostedSessionWithTaskOverride(
     override: ?TaskOverride,
     backend_type: BackendType,
 ) !Session {
+    var mf = try manifest_mod.loadFromDir(allocator, model_path);
+    defer mf.deinit();
+    return createGpuHostedSessionWithManifest(allocator, model_path, override, backend_type, mf);
+}
+
+fn createGpuHostedSessionWithManifest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    backend_type: BackendType,
+    mf: manifest_mod.ModelManifest,
+) !Session {
     try ensureGpuHostedSessionAvailable(backend_type);
     const direct_quant_enabled = directQuantEnabled();
     const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
 
-    var mf = try manifest_mod.loadFromDir(allocator, model_path);
-    defer mf.deinit();
     var gpu_jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null;
     errdefer if (gpu_jina_lora_adapter) |adapter| adapter.destroy();
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
-    if (mf.gguf_path) |_| {
-        var report_opt = try inspectGgufModel(allocator, model_path);
-        defer if (report_opt) |*report| report.deinit();
-        if (report_opt) |report| {
-            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
-        }
-    }
 
     var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
     var tensor_store: ?tensor_store_mod.TensorStore = null;
@@ -1180,6 +1193,13 @@ fn createGpuHostedSessionWithTaskOverride(
 
     const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
         tensor_store = try tensor_store_mod.openFromManifest(allocator, mf);
+        if (try buildGgufInspectionReport(allocator, arch_config, tensor_store.?)) |report| {
+            defer {
+                var r = report;
+                r.deinit();
+            }
+            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
+        }
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
         defer allocator.free(all_names);

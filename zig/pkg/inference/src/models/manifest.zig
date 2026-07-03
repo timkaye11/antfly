@@ -505,18 +505,21 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
         }
     } else |_| {}
 
-    // Load special tokens from tokenizer_config.json
-    if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer.json")) |tok_bytes| {
-        defer allocator.free(tok_bytes);
-        parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes) catch {};
-    } else |_| {}
     if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer_config.json")) |tc_bytes| {
         defer allocator.free(tc_bytes);
         parseTokenizerConfig(&manifest, allocator, tc_bytes) catch {};
     } else |_| {}
+    if (shouldParseTokenizerJsonSpecialTokens(&manifest, model_dir_path)) {
+        if (c_file.readFileFromDir(allocator, model_dir_path, "tokenizer.json")) |tok_bytes| {
+            defer allocator.free(tok_bytes);
+            parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes) catch {};
+        } else |_| {}
+    }
 
     if (manifest.gguf_path) |gguf_path| {
-        applyGgufTokenizerMetadata(&manifest, allocator, model_dir_path, gguf_path) catch {};
+        if (shouldApplyGgufTokenizerMetadata(&manifest)) {
+            applyGgufTokenizerMetadata(&manifest, allocator, model_dir_path, gguf_path) catch {};
+        }
     }
 
     applyImplicitSparseOutputLayout(&manifest, model_dir_path);
@@ -622,6 +625,20 @@ fn listingSpecialTokensMapHasGlinerMarkers(json_bytes: []const u8) bool {
         std.mem.indexOf(u8, json_bytes, "\"[E]\"") != null and
         std.mem.indexOf(u8, json_bytes, "\"[R]\"") != null and
         std.mem.indexOf(u8, json_bytes, "\"[SEP_TEXT]\"") != null;
+}
+
+fn shouldParseTokenizerJsonSpecialTokens(manifest: *const ModelManifest, model_dir_path: []const u8) bool {
+    return manifest.gliner_model_type.len > 0 or
+        std.mem.eql(u8, manifest.config_model_arch, "extractor") or
+        hasGlinerPathHint(model_dir_path);
+}
+
+fn shouldApplyGgufTokenizerMetadata(manifest: *const ModelManifest) bool {
+    return manifest.tokenizer_type == null or
+        manifest.bos_token.len == 0 or
+        manifest.eos_token.len == 0 or
+        manifest.unk_token.len == 0 or
+        manifest.pad_token.len == 0;
 }
 
 fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, model_dir_path: []const u8) void {

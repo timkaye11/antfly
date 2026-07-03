@@ -45,6 +45,7 @@ pub const HfTokenizer = struct {
     model_type: ModelType,
     vocab: std.StringHashMapUnmanaged(i32),
     id_to_token: std.AutoHashMapUnmanaged(i32, []const u8),
+    decode_enabled: bool,
     added_tokens: std.StringHashMapUnmanaged(i32),
     /// Trie of added-token byte sequences for fast longest-match-at-cursor and
     /// next-occurrence lookups. Built lazily after `parseAddedTokens`.
@@ -84,6 +85,10 @@ pub const HfTokenizer = struct {
         token: []const u8,
         score: f32,
         id: i32,
+    };
+
+    pub const LoadOptions = struct {
+        decode: bool = true,
     };
 
     /// Byte-indexed trie used for added-token matching. Each node stores its
@@ -260,10 +265,14 @@ pub const HfTokenizer = struct {
 
     /// Parse tokenizer.json content from memory.
     pub fn loadFromBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
-        defer parsed.deinit();
+        return loadFromBytesWithOptions(allocator, json_bytes, .{});
+    }
 
-        const root = parsed.value;
+    pub fn loadFromBytesWithOptions(allocator: std.mem.Allocator, json_bytes: []const u8, options: LoadOptions) !*HfTokenizer {
+        var parse_arena = std.heap.ArenaAllocator.init(allocator);
+        defer parse_arena.deinit();
+
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, parse_arena.allocator(), json_bytes, .{});
         if (root != .object) return error.InvalidTokenizerJson;
 
         const self = try allocator.create(HfTokenizer);
@@ -274,6 +283,7 @@ pub const HfTokenizer = struct {
             .model_type = .word_piece,
             .vocab = .{},
             .id_to_token = .{},
+            .decode_enabled = options.decode,
             .added_tokens = .{},
             .added_trie = try AddedTokenTrie.init(allocator),
             .special = .{},
@@ -552,7 +562,7 @@ pub const HfTokenizer = struct {
                                 .id = id,
                             });
                             try self.vocab.put(self.allocator, token, id);
-                            try self.id_to_token.put(self.allocator, id, token);
+                            if (self.decode_enabled) try self.id_to_token.put(self.allocator, id, token);
                             try self.unigram_trie.insert(self.allocator, token, id);
                         }
                     }
@@ -587,7 +597,7 @@ pub const HfTokenizer = struct {
                         const key = try self.allocator.dupe(u8, entry.key_ptr.*);
                         try self.arena_strings.append(self.allocator, key);
                         try self.vocab.put(self.allocator, key, id);
-                        try self.id_to_token.put(self.allocator, id, key);
+                        if (self.decode_enabled) try self.id_to_token.put(self.allocator, id, key);
                     }
                 }
             }
@@ -676,7 +686,7 @@ pub const HfTokenizer = struct {
             // Also add to vocab/id_to_token if not present
             if (!self.vocab.contains(key)) {
                 try self.vocab.put(self.allocator, key, id);
-                try self.id_to_token.put(self.allocator, id, key);
+                if (self.decode_enabled) try self.id_to_token.put(self.allocator, id, key);
             }
 
             // Detect common special tokens by content
@@ -1904,6 +1914,7 @@ pub const HfTokenizer = struct {
     // =====================================================================
 
     fn decode(self: *HfTokenizer, allocator: std.mem.Allocator, token_ids: []const i32) ![]u8 {
+        if (!self.decode_enabled) return error.DecodeUnavailable;
         var result = std.ArrayListUnmanaged(u8).empty;
 
         for (token_ids) |id| {
@@ -2501,6 +2512,29 @@ test "wordpiece encode basic" {
     defer allocator.free(ids4);
     try std.testing.expectEqual(@as(usize, 1), ids4.len);
     try std.testing.expectEqual(@as(i32, 100), ids4[0]);
+}
+
+test "encoding-only load skips reverse decode map" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "WordPiece",
+        \\    "unk_token": "[UNK]",
+        \\    "vocab": {"[UNK]": 100, "hi": 1}
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytesWithOptions(allocator, json_str, .{ .decode = false });
+    defer tok.deinitSelf();
+
+    const ids = try tok.encode(allocator, "hi");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{1}, ids);
+    try std.testing.expectEqual(@as(usize, 0), tok.id_to_token.count());
+    try std.testing.expectError(error.DecodeUnavailable, tok.tokenizer().decode(allocator, ids));
 }
 
 test "special tokens" {

@@ -14,12 +14,14 @@
 
 // Request queue: limits concurrent inference requests with backpressure.
 //
-// httpx uses fiber-based concurrency on a single OS thread,
-// so a simple counter suffices (no mutex needed).
-
 const std = @import("std");
 
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
 pub const RequestQueue = struct {
+    mutex: std.atomic.Mutex = .unlocked,
     active_requests: usize = 0,
     active_units: usize = 0,
     max_concurrent: usize,
@@ -35,6 +37,8 @@ pub const RequestQueue = struct {
 
     /// Acquire weighted capacity units. Single-slot callers should continue using acquire().
     pub fn acquireUnits(self: *RequestQueue, units: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         const requested = @min(@max(units, 1), self.max_concurrent);
         if (self.active_units + requested > self.max_concurrent) {
             return error.QueueFull;
@@ -49,6 +53,8 @@ pub const RequestQueue = struct {
     }
 
     pub fn releaseUnits(self: *RequestQueue, units: usize) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         const requested = @min(@max(units, 1), self.max_concurrent);
         if (self.active_requests > 0) self.active_requests -= 1;
         if (self.active_units > requested) {
@@ -58,16 +64,33 @@ pub const RequestQueue = struct {
         }
     }
 
-    pub fn depth(self: *const RequestQueue) usize {
+    pub fn depth(self: *RequestQueue) usize {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         return self.active_units;
     }
 
-    pub fn requests(self: *const RequestQueue) usize {
+    pub fn requests(self: *RequestQueue) usize {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         return self.active_requests;
     }
 
-    pub fn available(self: *const RequestQueue) usize {
+    pub fn available(self: *RequestQueue) usize {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         return self.max_concurrent - self.active_units;
+    }
+
+    pub fn tryLockIdle(self: *RequestQueue) bool {
+        lockAtomic(&self.mutex);
+        if (self.active_requests == 0) return true;
+        self.mutex.unlock();
+        return false;
+    }
+
+    pub fn unlockIdle(self: *RequestQueue) void {
+        self.mutex.unlock();
     }
 };
 
@@ -107,4 +130,18 @@ test "request queue weighted capacity" {
     q.releaseUnits(3);
     try std.testing.expectEqual(@as(usize, 1), q.depth());
     try std.testing.expectEqual(@as(usize, 1), q.requests());
+}
+
+test "request queue idle lock only succeeds with no active requests" {
+    var q = RequestQueue.init(2);
+
+    try std.testing.expect(q.tryLockIdle());
+    q.unlockIdle();
+
+    try q.acquire();
+    try std.testing.expect(!q.tryLockIdle());
+
+    q.release();
+    try std.testing.expect(q.tryLockIdle());
+    q.unlockIdle();
 }

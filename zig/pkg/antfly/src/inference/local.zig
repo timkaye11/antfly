@@ -118,7 +118,7 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .timeout_ms = 300_000 });
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -248,7 +248,7 @@ pub const Provider = struct {
             .input = input,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .timeout_ms = 300_000 });
         defer resp.deinit();
 
         if (!resp.ok()) {

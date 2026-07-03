@@ -377,9 +377,13 @@ pub const ManagedEmbeddingEntry = struct {
     burst: u32 = default_pacing_burst,
     pacer: ?*RequestPacer = null,
     antfly_provider: ?AntflyProvider = null,
+    // ponytail: one keep-alive client per remote Antfly entry; add a pool if this lock becomes hot.
+    antfly_http_mutex: std.atomic.Mutex = .unlocked,
+    antfly_http: ?*RemoteAntflyHttp = null,
 
     fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
+        if (self.antfly_http) |http| http.destroy(alloc);
         alloc.free(self.index_name);
         alloc.free(self.model);
         alloc.free(self.base_url);
@@ -396,6 +400,36 @@ pub const ManagedEmbeddingEntry = struct {
 const RequestPacerScopeEntry = struct {
     key: []u8,
     pacer: *RequestPacer,
+};
+
+const RemoteAntflyHttp = struct {
+    io_impl: std.Io.Threaded,
+    http: httpx.Client,
+
+    fn create(alloc: std.mem.Allocator) !*RemoteAntflyHttp {
+        const out = try alloc.create(RemoteAntflyHttp);
+        errdefer alloc.destroy(out);
+        out.io_impl = std.Io.Threaded.init(alloc, .{});
+        errdefer out.io_impl.deinit();
+        out.http = httpx.Client.initWithConfig(alloc, out.io_impl.io(), .{ .keep_alive = true });
+        return out;
+    }
+
+    fn destroy(self: *RemoteAntflyHttp, alloc: std.mem.Allocator) void {
+        self.http.deinit();
+        self.io_impl.deinit();
+        alloc.destroy(self);
+    }
+};
+
+const RemoteAntflyProviderLease = struct {
+    entry: *ManagedEmbeddingEntry,
+    provider: antfly_provider_mod.Provider,
+
+    fn deinit(self: *RemoteAntflyProviderLease) void {
+        self.provider.deinit();
+        self.entry.antfly_http_mutex.unlock();
+    }
 };
 
 fn attachRequestPacers(
@@ -463,6 +497,26 @@ fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbe
         entry.requests_per_minute,
         entry.burst,
     });
+}
+
+fn remoteAntflyProviderLease(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) !RemoteAntflyProviderLease {
+    const mutable = @constCast(entry);
+    lockAtomic(&mutable.antfly_http_mutex);
+    errdefer mutable.antfly_http_mutex.unlock();
+
+    if (mutable.antfly_http == null) {
+        mutable.antfly_http = try RemoteAntflyHttp.create(entry.alloc);
+    }
+
+    var provider = antfly_provider_mod.Provider.init(alloc, &mutable.antfly_http.?.http, entry.base_url);
+    errdefer provider.deinit();
+    if (entry.api_key) |*api_key_ref| {
+        if (try optionalBearerAuthHeaderOwned(mutable, alloc, api_key_ref)) |auth_header| {
+            defer alloc.free(auth_header);
+            try provider.setAuthorizationHeader(auth_header);
+        }
+    }
+    return .{ .entry = mutable, .provider = provider };
 }
 
 pub const ManagedEmbedder = struct {
@@ -1629,22 +1683,10 @@ fn embedWithEntryParts(
             return error.UnsupportedEmbeddingProvider;
         }
         waitForEntryPacer(entry);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
+        var lease = try remoteAntflyProviderLease(alloc, entry);
+        defer lease.deinit();
 
-        var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
-        defer http.deinit();
-
-        var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
-        defer provider.deinit();
-        if (entry.api_key) |*api_key_ref| {
-            if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
-                defer alloc.free(auth_header);
-                try provider.setAuthorizationHeader(auth_header);
-            }
-        }
-
-        var result = try provider.embedParts(alloc, entry.model, parts);
+        var result = try lease.provider.embedParts(alloc, entry.model, parts);
         defer result.deinit();
         if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
         if (dims > 0 and result.vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
@@ -1687,22 +1729,10 @@ fn embedSparseBatchWithEntry(
                 return embeddings;
             }
             waitForEntryPacer(entry);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
+            var lease = try remoteAntflyProviderLease(alloc, entry);
+            defer lease.deinit();
 
-            var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
-            defer http.deinit();
-
-            var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
-            defer provider.deinit();
-            if (entry.api_key) |*api_key_ref| {
-                if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
-                }
-            }
-
-            var result = try provider.embedSparse(alloc, entry.model, texts);
+            var result = try lease.provider.embedSparse(alloc, entry.model, texts);
             defer result.deinit();
             if (result.indices.len == 0) return error.EmptyEmbeddingResponse;
 
@@ -1891,22 +1921,10 @@ fn embedBatchWithEntry(
                 return vectors;
             }
             waitForEntryPacer(entry);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
+            var lease = try remoteAntflyProviderLease(alloc, entry);
+            defer lease.deinit();
 
-            var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
-            defer http.deinit();
-
-            var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
-            defer provider.deinit();
-            if (entry.api_key) |*api_key_ref| {
-                if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
-                }
-            }
-
-            var result = try provider.embedder().embed(alloc, entry.model, texts);
+            var result = try lease.provider.embedder().embed(alloc, entry.model, texts);
             errdefer result.deinit();
             if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
             for (result.vectors) |vector| {
