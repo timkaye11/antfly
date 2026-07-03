@@ -47,6 +47,8 @@ Environment overrides:
                           1 to let RMSNorm write a BF16 activation mirror for cuBLASLt staging reuse (default: 0)
   ANTFLY_GQA_PREFILL_TILED
                           1 to use the tiled turboquant prefill attention kernel (default: 0)
+  ANTFLY_GQA_PREFILL_MMA
+                          1 to use the tensor-core (wmma) turboquant prefill attention kernel for head_dim <= 256 (default: 0)
   ANTFLY_RMS_NORM_Q8_1_MIRROR
                           1 to let RMSNorm emit a pre-quantized Q8_1 copy consumed by DP4A matmuls (default: 0)
   ANTFLY_BF16_RESIDENT_WEIGHTS
@@ -102,6 +104,7 @@ antfly_gqa_prefill_fast="${ANTFLY_GQA_PREFILL_FAST:-1}"
 # Wrapper vars fall back to the raw production env name so callers that
 # export ANTFLY_INFERENCE_CUDA_* directly are honored rather than clobbered.
 antfly_gqa_prefill_tiled="${ANTFLY_GQA_PREFILL_TILED:-${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED:-0}}"
+antfly_gqa_prefill_mma="${ANTFLY_GQA_PREFILL_MMA:-${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA:-0}}"
 antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim="${ANTFLY_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM:-2048}"
 antfly_q4_0_linear_q8_1_rows8_c4="${ANTFLY_Q4_0_LINEAR_Q8_1_ROWS8_C4:-1}"
 antfly_q4_0_pair_activation_q8_1_rows8_c2="${ANTFLY_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2:-1}"
@@ -206,6 +209,7 @@ common_antfly_env=(
   ANTFLY_INFERENCE_CUDA_Q4_0_Q8_1_PREFILL_ROWS="$antfly_q4_0_q8_1_prefill_rows"
   ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST="$antfly_gqa_prefill_fast"
   ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED="$antfly_gqa_prefill_tiled"
+  ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA="$antfly_gqa_prefill_mma"
   ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
   ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM="$antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim"
   ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_ROWS8_C4="$antfly_q4_0_linear_q8_1_rows8_c4"

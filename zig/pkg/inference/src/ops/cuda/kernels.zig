@@ -43,6 +43,10 @@ fn tiledGqaPrefillEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED", false);
 }
 
+fn mmaGqaPrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA", false);
+}
+
 fn fastGqaDecodeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
     return batch == 1 and
         q_seq_len == 1 and
@@ -77,6 +81,7 @@ pub const GqaAttentionLaunchKind = enum {
     decode_fast_fallback,
     prefill_fast,
     prefill_tiled,
+    prefill_mma,
     scalar,
 };
 
@@ -213,6 +218,11 @@ pub const KernelModule = struct {
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_tiled_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_turboquant_mma_f32: driver_mod.CUfunction = null,
+    /// The mma prefill kernel needs ~64KB dynamic smem, above the 48KB
+    /// default; CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES is raised
+    /// once per module load.
+    gqa_prefill_mma_smem_opted_in: bool = false,
     gqa_attention_decode_turboquant_split_stage1_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_split_stage2_f32: driver_mod.CUfunction = null,
@@ -500,6 +510,7 @@ pub const KernelModule = struct {
         const gqa_attention_decode_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_fast_f32");
         const gqa_attention_prefill_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_fast_f32");
         const gqa_attention_prefill_turboquant_tiled_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_tiled_f32");
+        const gqa_attention_prefill_turboquant_mma_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_f32");
         const gqa_attention_decode_turboquant_split_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_f32");
         const gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32");
         const gqa_attention_decode_turboquant_split_stage2_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage2_f32");
@@ -788,6 +799,7 @@ pub const KernelModule = struct {
             .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
             .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
             .gqa_attention_prefill_turboquant_tiled_f32 = gqa_attention_prefill_turboquant_tiled_f32,
+            .gqa_attention_prefill_turboquant_mma_f32 = gqa_attention_prefill_turboquant_mma_f32,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
@@ -1035,6 +1047,8 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_turboquant_fast_f32 = null;
             self.gqa_attention_prefill_turboquant_fast_f32 = null;
             self.gqa_attention_prefill_turboquant_tiled_f32 = null;
+            self.gqa_attention_prefill_turboquant_mma_f32 = null;
+            self.gqa_prefill_mma_smem_opted_in = false;
             self.gqa_attention_decode_turboquant_split_stage1_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = null;
             self.gqa_attention_decode_turboquant_split_stage2_f32 = null;
@@ -6257,7 +6271,7 @@ pub const KernelModule = struct {
         if ((format == 0 or format == 2) and
             base_key_row_bytes == key_row_bytes and
             decode_scalars.ptr == 0 and
-            (fastGqaPrefillEnabled() or tiledGqaPrefillEnabled()) and
+            (fastGqaPrefillEnabled() or tiledGqaPrefillEnabled() or mmaGqaPrefillEnabled()) and
             gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
         {
             if (fastGqaPrefillEnabled()) {
@@ -6270,6 +6284,15 @@ pub const KernelModule = struct {
                 if (self.gqa_attention_prefill_turboquant_tiled_f32) |tiled_function| {
                     function = tiled_function;
                     launch_kind = .prefill_tiled;
+                }
+            }
+            // Tensor-core prefill handles head_dim <= 256 only (Gemma4 SWA
+            // layers); head_dim 512 global layers keep the tiled kernel. The
+            // >48KB dynamic-smem opt-in needs cuFuncSetAttribute.
+            if (mmaGqaPrefillEnabled() and head_dim <= 256 and ctx.driver.fns.cuFuncSetAttribute != null) {
+                if (self.gqa_attention_prefill_turboquant_mma_f32) |mma_function| {
+                    function = mma_function;
+                    launch_kind = .prefill_mma;
                 }
             }
         } else if ((format == 0 or format == 2) and
@@ -6289,6 +6312,7 @@ pub const KernelModule = struct {
                 .decode_fast => "gqa_attention_decode_turboquant_fast",
                 .prefill_fast => "gqa_attention_prefill_turboquant_fast",
                 .prefill_tiled => "gqa_attention_prefill_turboquant_tiled",
+                .prefill_mma => "gqa_attention_prefill_turboquant_mma",
                 else => "gqa_attention_decode_turboquant",
             };
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} mask=0x{x} bias=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d}", .{
@@ -6330,8 +6354,24 @@ pub const KernelModule = struct {
             grid_y = try toU32((q_seq_len + 15) / 16);
             const tile_n: usize = if (head_dim <= 256) 32 else 16;
             shared_bytes = try toU32(tile_n * (head_dim + 2) * @sizeOf(u16));
+        } else if (launch_kind == .prefill_mma) {
+            // MMA prefill: same grid shape as tiled. Dynamic smem holds the
+            // f16 Q tile (16*hd), one 64-key f16 K/V tile (64*(hd+8)), the
+            // f32 score tile (16*72), the f16 P tile (16*72), and the f32
+            // output tile (16*hd): 224*hd + 7936 bytes.
+            block = 256;
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 15) / 16);
+            shared_bytes = try toU32(224 * head_dim + 7936);
         }
         try ctx.makeCurrent();
+        if (launch_kind == .prefill_mma and !self.gqa_prefill_mma_smem_opted_in) {
+            // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8; 65280 is
+            // the head_dim-256 requirement and fits Turing's 64KB opt-in cap.
+            const set_attr = ctx.driver.fns.cuFuncSetAttribute.?;
+            try ctx.driver.check(set_attr(function, 8, 65280));
+            self.gqa_prefill_mma_smem_opted_in = true;
+        }
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
             function,
             grid_x,

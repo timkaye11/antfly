@@ -486,6 +486,7 @@ pub const RuntimeStats = struct {
     launch_attention_gqa_decode_fast_fallbacks: usize = 0,
     launch_attention_gqa_prefill_fast: usize = 0,
     launch_attention_gqa_prefill_tiled: usize = 0,
+    launch_attention_gqa_prefill_mma: usize = 0,
     launch_attention_gqa_scalar: usize = 0,
     launch_elementwise: usize = 0,
     launch_scalar: usize = 0,
@@ -11627,6 +11628,10 @@ fn gqaDenseAttention(
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_prefill_tiled += 1;
         },
+        .prefill_mma => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_mma += 1;
+        },
         .scalar => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_scalar += 1;
@@ -11938,6 +11943,10 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         .prefill_tiled => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_prefill_tiled += 1;
+        },
+        .prefill_mma => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_mma += 1;
         },
         .scalar => {
             self.stats.launch_attention += 1;

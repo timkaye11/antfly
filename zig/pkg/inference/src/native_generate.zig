@@ -1290,13 +1290,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_scalar={d}\n",
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_scalar={d}\n",
                         .{
                             generate_stats.launch_attention_gqa_decode,
                             generate_stats.launch_attention_gqa_decode_fast,
                             generate_stats.launch_attention_gqa_decode_fast_fallbacks,
                             generate_stats.launch_attention_gqa_prefill_fast,
                             generate_stats.launch_attention_gqa_prefill_tiled,
+                            generate_stats.launch_attention_gqa_prefill_mma,
                             generate_stats.launch_attention_gqa_scalar,
                         },
                     );
@@ -1550,13 +1551,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_scalar={d}\n",
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_scalar={d}\n",
                     .{
                         cuda_stats.launch_attention_gqa_decode,
                         cuda_stats.launch_attention_gqa_decode_fast,
                         cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                         cuda_stats.launch_attention_gqa_prefill_fast,
                         cuda_stats.launch_attention_gqa_prefill_tiled,
+                        cuda_stats.launch_attention_gqa_prefill_mma,
                         cuda_stats.launch_attention_gqa_scalar,
                     },
                 );
@@ -2895,6 +2897,7 @@ fn writeJsonTiming(
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
                 \\"launch_attention_gqa_prefill_tiled":{d},
+                \\"launch_attention_gqa_prefill_mma":{d},
                 \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
@@ -2913,6 +2916,7 @@ fn writeJsonTiming(
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
                     cuda_stats.launch_attention_gqa_prefill_tiled,
+                    cuda_stats.launch_attention_gqa_prefill_mma,
                     cuda_stats.launch_attention_gqa_scalar,
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
@@ -3525,6 +3529,7 @@ fn writeJsonTiming(
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
                 \\"launch_attention_gqa_prefill_tiled":{d},
+                \\"launch_attention_gqa_prefill_mma":{d},
                 \\"launch_attention_gqa_scalar":{d},
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
@@ -3556,6 +3561,7 @@ fn writeJsonTiming(
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
                     cuda_stats.launch_attention_gqa_prefill_tiled,
+                    cuda_stats.launch_attention_gqa_prefill_mma,
                     cuda_stats.launch_attention_gqa_scalar,
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
