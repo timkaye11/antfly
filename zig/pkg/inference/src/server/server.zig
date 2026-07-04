@@ -40,6 +40,7 @@ const gpt_model_mod = @import("../models/gpt.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const fused_chunking_mod = @import("../pipelines/fused_chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const multimodal_chunk_embedding_mod = @import("../pipelines/multimodal_chunk_embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
@@ -270,9 +271,13 @@ fn isFixedChunkerModel(model: []const u8) bool {
         std.mem.eql(u8, model, "fixed-bert-tokenizer");
 }
 
-fn fixedChunkerUnsupportedFeature(config: lib_chunker.FixedChunkConfig) ?[]const u8 {
-    if (config.include_embeddings) {
-        return "fixed chunking cannot return contextual dense embeddings; select a model-backed chunker";
+fn fixedChunkerUnsupportedFeature(config: lib_chunker.FixedChunkConfig, has_embedding_model: bool) ?[]const u8 {
+    // Route A: when a shared-space embedding_model is supplied, fixed chunking
+    // may return DENSE embeddings (and honor output_dimension truncation) by
+    // routing each chunk to the modality's tower. Sparse/boundary outputs are
+    // still unsupported for the fixed path.
+    if (config.include_embeddings and !has_embedding_model) {
+        return "fixed chunking cannot return contextual dense embeddings; set config.embedding_model to a CLIP/CLAP embedder or select a model-backed chunker";
     }
     if (config.include_sparse) {
         return "fixed chunking cannot return SPLADE sparse embeddings; select a model-backed chunker";
@@ -280,8 +285,8 @@ fn fixedChunkerUnsupportedFeature(config: lib_chunker.FixedChunkConfig) ?[]const
     if (config.include_boundary_scores) {
         return "fixed chunking cannot return learned boundary scores; select a model-backed chunker";
     }
-    if (config.output_dimension != null) {
-        return "output_dimension requires contextual dense embeddings from a model-backed chunker";
+    if (config.output_dimension != null and !has_embedding_model) {
+        return "output_dimension requires contextual dense embeddings from a model-backed chunker or a config.embedding_model";
     }
     if (config.sparse_top_k != null) {
         return "sparse_top_k requires SPLADE sparse embeddings from a model-backed chunker";
@@ -540,6 +545,92 @@ pub const Node = struct {
         errdefer self.allocator.free(key);
         try self.fused_chunkers.put(self.allocator, key, pipeline);
         return pipeline;
+    }
+
+    /// Route A: embed fixed-multimodal chunks in place through a request-named
+    /// shared-space embedder (CLIP/CLAP), routing each chunk to the tower
+    /// matching its modality. Returns null on success or an HTTP error response
+    /// to propagate. Only DENSE embeddings are produced (sparse/boundary are
+    /// rejected upstream). The caller owns `chunks` and frees them.
+    fn embedFixedChunksMultimodal(
+        self: *Node,
+        ctx: *httpx.Context,
+        embedding_model: []const u8,
+        chunks: []lib_chunker.types.Chunk,
+        config: lib_chunker.FixedChunkConfig,
+    ) !?httpx.Response {
+        if (chunks.len == 0) return null;
+
+        const model_path = self.resolveModelPath(ctx.io, embedding_model, "embedders") catch
+            return try ctx.status(404).json(.{
+                .@"error" = "MODEL_NOT_FOUND",
+                .message = "embedding_model not found; install it under models/embedders",
+            });
+
+        const model = self.model_manager.loadFromDir(model_path) catch |err|
+            return try ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+
+        if (model.manifest.model_type != .embedder) {
+            return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "embedding_model must be an embedder model",
+            });
+        }
+
+        const caps = multimodal_chunk_embedding_mod.ModalityCaps.fromManifest(&model.manifest);
+        if (!caps.isMultimodal()) {
+            return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "embedding_model is not a multimodal (CLIP/CLAP) embedder; Route A requires a shared-space image/audio model",
+            });
+        }
+
+        // Determine which towers are needed and validate every chunk's modality
+        // up front so we fail before loading sessions.
+        var need_text = false;
+        var need_image = false;
+        var need_audio = false;
+        for (chunks) |chunk| {
+            const modality = multimodal_chunk_embedding_mod.classifyChunk(chunk) catch
+                return try ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "chunk modality has no embedding tower; only text/image/audio chunks can be embedded",
+                });
+            if (!caps.supports(modality)) {
+                return try ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "chunk modality is not supported by the selected embedding_model (CLIP has text+image, CLAP has text+audio)",
+                });
+            }
+            switch (modality) {
+                .text => need_text = true,
+                .image => need_image = true,
+                .audio => need_audio = true,
+            }
+        }
+
+        model.ensureEmbeddingAssets(need_text, need_image, need_audio) catch |err|
+            return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+
+        var pipeline = model.embeddingPipeline(ctx.allocator);
+        multimodal_chunk_embedding_mod.embedChunks(
+            ctx.allocator,
+            &pipeline,
+            chunks,
+            caps,
+            .{ .output_dimension = config.output_dimension },
+        ) catch |err| switch (err) {
+            error.UnsupportedModality, error.UnknownModality, error.MissingChunkPayload => return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "chunk modality is not supported by the selected embedding_model",
+            }),
+            error.InvalidOutputDimension => return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "output_dimension exceeds the embedding_model embedding size",
+            }),
+            else => return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+        };
+        return null;
     }
 
     pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
@@ -1607,6 +1698,19 @@ pub const Node = struct {
             }
         }
 
+        // Route A: an optional shared-space embedder (CLIP/CLAP) that embeds
+        // each fixed-multimodal chunk via the tower matching its modality, so a
+        // text query can retrieve image/audio chunks. Only applies to the
+        // fixed (non-fused) path with include_embeddings set.
+        const embedding_model: ?[]const u8 = em: {
+            if (body.config) |cfg| {
+                if (cfg.embedding_model) |em| {
+                    if (em.len > 0) break :em em;
+                }
+            }
+            break :em null;
+        };
+
         var served_by_fixed_fallback = false;
         var served_by_fused = false;
         const chunks = blk: {
@@ -1660,7 +1764,7 @@ pub const Node = struct {
                     // Fall back to fixed chunking only when the request needs
                     // no model-derived outputs (no embeddings, no SPLADE, no
                     // boundary scores); otherwise surface the failure.
-                    if (fixedChunkerUnsupportedFeature(config) == null) {
+                    if (fixedChunkerUnsupportedFeature(config, false) == null) {
                         std.log.warn("fused chunker inference failed for {s}, falling back to fixed chunking: {s}", .{ config.model, @errorName(err) });
                         served_by_fixed_fallback = true;
                         break :blk lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |fixed_err|
@@ -1670,15 +1774,29 @@ pub const Node = struct {
                 };
             }
 
-            if (fixedChunkerUnsupportedFeature(config)) |message| {
+            if (fixedChunkerUnsupportedFeature(config, embedding_model != null)) |message| {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = message,
                 });
             }
 
-            break :blk lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
+            const fixed_chunks = lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = @errorName(err) });
+
+            // Route A: embed each chunk through the request-selected shared-space
+            // model, routing by modality (text/vision/audio tower). Chunks are
+            // freed on failure since the outer defer is not yet armed.
+            if (embedding_model) |em| {
+                if (config.include_embeddings) {
+                    if (try self.embedFixedChunksMultimodal(ctx, em, fixed_chunks, config)) |err_response| {
+                        lib_chunker.types.freeChunks(ctx.allocator, fixed_chunks);
+                        return err_response;
+                    }
+                }
+            }
+
+            break :blk fixed_chunks;
         };
         defer lib_chunker.types.freeChunks(ctx.allocator, chunks);
 
@@ -6540,12 +6658,20 @@ test "fixed chunker request guard rejects model-generated fields" {
     try std.testing.expect(isFixedChunkerModel("fixed-bert-tokenizer"));
     try std.testing.expect(!isFixedChunkerModel("fused-context-chunker"));
 
-    try std.testing.expect(fixedChunkerUnsupportedFeature(.{}) == null);
-    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true }) != null);
-    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_sparse = true }) != null);
-    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_boundary_scores = true }) != null);
-    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .output_dimension = 256 }) != null);
-    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .sparse_top_k = 128 }) != null);
+    // Without an embedding_model, the fixed path rejects all model-derived knobs.
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{}, false) == null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true }, false) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_sparse = true }, false) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_boundary_scores = true }, false) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .output_dimension = 256 }, false) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .sparse_top_k = 128 }, false) != null);
+
+    // Route A: an embedding_model unlocks DENSE embeddings + output_dimension,
+    // but sparse/boundary outputs remain unsupported on the fixed path.
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true }, true) == null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true, .output_dimension = 256 }, true) == null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, true) != null);
+    try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true, .include_boundary_scores = true }, true) != null);
 }
 
 test "Antfly inference embeddings dense response supports truncation" {

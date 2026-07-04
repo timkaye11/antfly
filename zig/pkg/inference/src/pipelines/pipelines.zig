@@ -25,9 +25,11 @@ pub const ChunkingConfig = @import("chunking.zig").ChunkingConfig;
 pub const Chunk = @import("chunking.zig").Chunk;
 pub const fused_chunking = @import("fused_chunking.zig");
 pub const FusedChunkerPipeline = fused_chunking.FusedChunkerPipeline;
+pub const multimodal_chunk_embedding = @import("multimodal_chunk_embedding.zig");
 
 test {
     _ = fused_chunking;
+    _ = multimodal_chunk_embedding;
 }
 pub const RerankingPipeline = @import("reranking.zig").RerankingPipeline;
 pub const RerankingConfig = @import("reranking.zig").RerankingConfig;

@@ -861,6 +861,8 @@ pub const ChunkConfig = struct {
     threshold: ?f32 = null,
     /// Return contextual dense embeddings for each chunk when the selected chunker supports them.
     include_embeddings: ?bool = null,
+    /// Optional shared-space multimodal embedder (CLIP for text+image, CLAP for text+audio) applied to the deterministic multimodal ('fixed') chunker. When set together with include_embeddings, every chunk is embedded through the tower matching its modality so all chunk vectors share one space. Dense embeddings only. Resolved from models/embedders/{name}/.
+    embedding_model: ?[]const u8 = null,
     /// Return SPLADE sparse embeddings for each chunk when the selected chunker supports them.
     include_sparse: ?bool = null,
     /// Requested dense embedding dimension for Matryoshka-capable chunker models.
