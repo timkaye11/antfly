@@ -149,7 +149,7 @@ SH
     echo "missing Metal quant evidence contract in bench self-test summary" >&2
     exit 1
   fi
-  if ! grep -q '"schema": "antfly.quant_kernel_metal_bench_summary.v2"' "$tmp_dir/pass/summary.json"; then
+  if ! grep -q '"schema": "antfly.quant_kernel_metal_bench_summary.v3"' "$tmp_dir/pass/summary.json"; then
     cat "$tmp_dir/pass/summary.json" >&2
     echo "missing Metal quant bench summary schema in bench self-test summary" >&2
     exit 1
@@ -157,6 +157,11 @@ SH
   if ! grep -q '"quant_plan_totals": {' "$tmp_dir/pass/summary.json"; then
     cat "$tmp_dir/pass/summary.json" >&2
     echo "missing quant plan totals in bench self-test summary" >&2
+    exit 1
+  fi
+  if ! grep -q '"runtime_fallback_totals": {' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass/summary.json" >&2
+    echo "missing runtime fallback totals in bench self-test summary" >&2
     exit 1
   fi
   if ! grep -q '"quant_plan_planned": 14' "$tmp_dir/pass/summary.json"; then
@@ -982,10 +987,21 @@ for reason, key in fallback_fields:
     if quant_plan_totals[key] > quant_plan_totals["quant_plan_top_fallback_count"]:
         quant_plan_totals["quant_plan_top_fallback_reason"] = reason
         quant_plan_totals["quant_plan_top_fallback_count"] = quant_plan_totals[key]
+runtime_fallback_totals = {
+    "measured_rows": len(measured),
+    "backend_metal_rows": sum(1 for r in measured if r["backend"] == "metal"),
+    "non_metal_rows": sum(1 for r in measured if r["backend"] != "metal"),
+    "timing_invalid_rows": sum(1 for r in measured if not r["timing_valid"]),
+    "decode_fallbacks": sum(r["decode_fallback"] for r in measured),
+    "command_operator_fallbacks": sum(r["command_operator_fallback"] for r in measured),
+    "prefill_execute_failures": sum(r["prefill_execute_fail"] for r in measured),
+    "quant_mapped_failures": sum(r["quant_mapped_failures"] for r in measured),
+}
 summary = {
     "evidence_contract": "antfly.quant_kernel_metal_evidence.v1",
-    "schema": "antfly.quant_kernel_metal_bench_summary.v2",
+    "schema": "antfly.quant_kernel_metal_bench_summary.v3",
     "quant_plan_totals": quant_plan_totals,
+    "runtime_fallback_totals": runtime_fallback_totals,
     "median_decode_tok_s": median_decode,
     "mean_decode_tok_s": mean_decode,
     "median_e2e_tok_s": median_e2e,

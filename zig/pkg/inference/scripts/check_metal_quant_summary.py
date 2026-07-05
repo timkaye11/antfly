@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 EVIDENCE_CONTRACT = "antfly.quant_kernel_metal_evidence.v1"
-SUMMARY_SCHEMA = "antfly.quant_kernel_metal_bench_summary.v2"
+SUMMARY_SCHEMA = "antfly.quant_kernel_metal_bench_summary.v3"
 
 LINEAR_REDUCE_BUCKETS = {
     "q4_0_linear_reduce": (
@@ -76,6 +76,13 @@ QUANT_PLAN_TOTAL_FIELDS = (
     "quant_mapped_failures",
 )
 
+RUNTIME_FALLBACK_TOTAL_FIELDS = (
+    ("decode_fallbacks", "decode_fallback"),
+    ("command_operator_fallbacks", "command_operator_fallback"),
+    ("prefill_execute_failures", "prefill_execute_fail"),
+    ("quant_mapped_failures", "quant_mapped_failures"),
+)
+
 
 def fail(message):
     raise SystemExit(message)
@@ -96,6 +103,15 @@ def string_field(row, key, path, label):
     value = row[key]
     if not isinstance(value, str):
         fail(f"{path}: row {label}: {key} must be a string, got {value!r}")
+    return value
+
+
+def bool_field(row, key, path, label):
+    if key not in row:
+        fail(f"{path}: row {label}: missing {key}")
+    value = row[key]
+    if not isinstance(value, bool):
+        fail(f"{path}: row {label}: {key} must be a boolean, got {value!r}")
     return value
 
 
@@ -208,6 +224,41 @@ def check_quant_plan_totals(summary, measured, path):
     return expected
 
 
+def runtime_fallback_totals(rows, path):
+    totals = {
+        "measured_rows": len(rows),
+        "backend_metal_rows": 0,
+        "non_metal_rows": 0,
+        "timing_invalid_rows": 0,
+    }
+    for total_key, _ in RUNTIME_FALLBACK_TOTAL_FIELDS:
+        totals[total_key] = 0
+
+    for row in rows:
+        label = row.get("label", "<unknown>")
+        if string_field(row, "backend", path, label) == "metal":
+            totals["backend_metal_rows"] += 1
+        else:
+            totals["non_metal_rows"] += 1
+        if not bool_field(row, "timing_valid", path, label):
+            totals["timing_invalid_rows"] += 1
+        for total_key, row_key in RUNTIME_FALLBACK_TOTAL_FIELDS:
+            totals[total_key] += int_field(row, row_key, path, label)
+    return totals
+
+
+def check_runtime_fallback_totals(summary, measured, path):
+    actual = summary.get("runtime_fallback_totals")
+    if not isinstance(actual, dict):
+        fail(f"{path}: missing runtime_fallback_totals")
+    expected = runtime_fallback_totals(measured, path)
+    for key, want in expected.items():
+        got = actual.get(key)
+        if got != want:
+            fail(f"{path}: runtime_fallback_totals.{key}={got!r} does not match {want!r}")
+    return expected
+
+
 def check_summary(path):
     try:
         summary = json.loads(path.read_text(encoding="utf-8"))
@@ -218,6 +269,7 @@ def check_summary(path):
     checked_rows = 0
     measured = measured_rows(summary, path)
     totals = check_quant_plan_totals(summary, measured, path)
+    runtime_totals = check_runtime_fallback_totals(summary, measured, path)
     for row in measured:
         label = row.get("label", "<unknown>")
         checked_rows += 1
@@ -251,7 +303,7 @@ def check_summary(path):
         check_plan_counters(row, path, label)
         total_bucket_dispatches += row_bucket_dispatches
 
-    return checked_rows, total_bucket_dispatches, totals
+    return checked_rows, total_bucket_dispatches, totals, runtime_totals
 
 
 def write_summary(path, rows):
@@ -261,6 +313,7 @@ def write_summary(path, rows):
                 "evidence_contract": EVIDENCE_CONTRACT,
                 "schema": SUMMARY_SCHEMA,
                 "quant_plan_totals": quant_plan_totals(rows, path),
+                "runtime_fallback_totals": runtime_fallback_totals(rows, path),
                 "rows": rows,
             },
             indent=2,
@@ -307,6 +360,11 @@ def self_test():
         "quant_plan_top_fallback_reason": "none",
         "quant_plan_top_fallback_count": 0,
         "quant_mapped_failures": 0,
+        "backend": "metal",
+        "decode_fallback": 0,
+        "command_operator_fallback": 0,
+        "prefill_execute_fail": 0,
+        "timing_valid": True,
     }
     with tempfile.TemporaryDirectory(prefix="antfly-metal-quant-summary-check.") as tmp:
         tmp_path = Path(tmp)
@@ -407,6 +465,7 @@ def self_test():
                         **quant_plan_totals([good_row], bad_totals),
                         "quant_plan_planned": 11,
                     },
+                    "runtime_fallback_totals": runtime_fallback_totals([good_row], bad_totals),
                     "rows": [good_row],
                 }
             )
@@ -421,6 +480,31 @@ def self_test():
         else:
             fail("self-test expected quant plan totals failure")
 
+        bad_runtime_totals = tmp_path / "bad-runtime-totals.json"
+        bad_runtime_totals.write_text(
+            json.dumps(
+                {
+                    "evidence_contract": EVIDENCE_CONTRACT,
+                    "schema": SUMMARY_SCHEMA,
+                    "quant_plan_totals": quant_plan_totals([good_row], bad_runtime_totals),
+                    "runtime_fallback_totals": {
+                        **runtime_fallback_totals([good_row], bad_runtime_totals),
+                        "decode_fallbacks": 1,
+                    },
+                    "rows": [good_row],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            check_summary(bad_runtime_totals)
+        except SystemExit as err:
+            if "runtime_fallback_totals.decode_fallbacks" not in str(err):
+                raise
+        else:
+            fail("self-test expected runtime fallback totals failure")
+
     print("metal quant summary checker self-test passed")
 
 
@@ -433,7 +517,7 @@ def main(argv):
         return 2
     for arg in argv[1:]:
         path = Path(arg)
-        checked_rows, bucket_dispatches, totals = check_summary(path)
+        checked_rows, bucket_dispatches, totals, runtime_totals = check_summary(path)
         print(
             f"metal quant summary check ok path={path} "
             f"measured_rows={checked_rows} "
@@ -443,7 +527,8 @@ def main(argv):
             f"unsupported_routes={totals['quant_plan_unsupported_routes']} "
             f"row_bucket_dispatches={bucket_dispatches} "
             f"top_fallback={totals['quant_plan_top_fallback_reason']}/{totals['quant_plan_top_fallback_count']} "
-            f"residency_misses={totals['quant_mapped_failures']}"
+            f"runtime_fallbacks={runtime_totals['decode_fallbacks'] + runtime_totals['command_operator_fallbacks'] + runtime_totals['prefill_execute_failures']} "
+            f"residency_misses={runtime_totals['quant_mapped_failures']}"
         )
     return 0
 
