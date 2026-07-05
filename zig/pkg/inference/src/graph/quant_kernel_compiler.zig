@@ -1470,8 +1470,11 @@ pub const first_general_metal_q5_1_air_path = "/tmp/antfly_q5_1_small_batch_msl_
 pub const first_general_metal_q5_1_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_1_small_batch.metal -o /tmp/antfly_q5_1_small_batch_msl_v1.air";
 pub const first_general_metal_q2_kernel_id = "antfly_q2_k_small_batch_msl_v1";
 pub const first_general_metal_q2_source_path = "src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal";
+pub const first_general_metal_q2_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q2_k_small_batch.metal";
 pub const first_general_metal_q2_air_path = "/tmp/antfly_q2_k_small_batch_msl_v1.air";
+pub const first_general_metal_q2_artifact_air_path = "/tmp/antfly_q2_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q2_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1.air";
+pub const first_general_metal_q2_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q2_bias_kernel_id = "antfly_q2_k_small_batch_bias_msl_v1";
 pub const first_general_metal_q2_bias_source_path = "src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias.metal";
 pub const first_general_metal_q2_bias_air_path = "/tmp/antfly_q2_k_small_batch_bias_msl_v1.air";
@@ -1765,8 +1768,10 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q2_kernel_id,
-        .source_path = first_general_metal_q2_source_path,
-        .check_command = first_general_metal_q2_check_command,
+        .source_path = first_general_metal_q2_artifact_source_path,
+        .check_command = first_general_metal_q2_artifact_check_command,
+        .generated_source_path = first_general_metal_q2_source_path,
+        .generated_check_command = first_general_metal_q2_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q2_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q2_promotion_check_command,
@@ -6057,6 +6062,7 @@ pub fn metalArtifactSourcePathForKernel(kernel_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, kernel_id, first_general_metal_q6_kernel_id)) return first_general_metal_q6_artifact_source_path;
     if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_kernel_id)) return first_general_metal_q6_bias_artifact_source_path;
     if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_gelu_kernel_id)) return first_general_metal_q6_bias_gelu_artifact_source_path;
+    if (std.mem.eql(u8, kernel_id, first_general_metal_q2_kernel_id)) return first_general_metal_q2_artifact_source_path;
     return null;
 }
 
@@ -6074,6 +6080,7 @@ fn metalArtifactAirPathForKernel(kernel_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, kernel_id, first_general_metal_q6_kernel_id)) return first_general_metal_q6_artifact_air_path;
     if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_kernel_id)) return first_general_metal_q6_bias_artifact_air_path;
     if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_gelu_kernel_id)) return first_general_metal_q6_bias_gelu_artifact_air_path;
+    if (std.mem.eql(u8, kernel_id, first_general_metal_q2_kernel_id)) return first_general_metal_q2_artifact_air_path;
     return metalAirPathForKernel(kernel_id);
 }
 
@@ -7011,7 +7018,7 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_relu_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_relu_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_artifact_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_gelu_kernel_id));
@@ -8335,7 +8342,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, metal_q2.candidate_route);
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q2.fallback_reason);
     try std.testing.expectEqualStrings(first_general_metal_q2_kernel_id, metal_q2.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q2_source_path, metal_q2.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q2_artifact_source_path, metal_q2.candidate_source_path);
 
     const metal_q2_bias = registryLoweringFor(.metal, .q2_k, .rows_2_8, .bias, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q2_bias.production_route);
