@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q5_k/rows_2_8/bias/small_batch
 // kernel_id=antfly_q5_k_small_batch_bias_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=true
+// production_enabled=false
 // General MSL lowering smoke for descriptor-driven K-quant matmul epilogues.
-// Production Metal dispatch uses this checked-in artifact after
-// correctness and benchmark gates.
+// Promotion is blocked until repeat benchmark timing is stable.
 
 #include <metal_stdlib>
 using namespace metal;

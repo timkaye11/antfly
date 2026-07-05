@@ -3833,19 +3833,19 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const bad = try replaceOnce(
         std.testing.allocator,
         actual,
-        quant_kernel_compiler.first_general_metal_q5_artifact_source_path,
-        "src/ops/metal/generated/missing_q5_k_small_batch.metal",
+        quant_kernel_compiler.first_general_metal_q4_artifact_source_path,
+        "src/ops/metal/generated/missing_q4_k_small_batch.metal",
     );
     defer std.testing.allocator.free(bad);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, bad, false, false, null));
 
-    const q5_fingerprint = try std.fmt.allocPrint(
+    const q4_fingerprint = try std.fmt.allocPrint(
         std.testing.allocator,
         "{d}",
-        .{std.hash.Wyhash.hash(0, quant_kernel_compiler.firstGeneralMetalQ5Source())},
+        .{std.hash.Wyhash.hash(0, quant_kernel_compiler.firstGeneralMetalQ4Source())},
     );
-    defer std.testing.allocator.free(q5_fingerprint);
-    const stale = try replaceOnce(std.testing.allocator, actual, q5_fingerprint, "0");
+    defer std.testing.allocator.free(q4_fingerprint);
+    const stale = try replaceOnce(std.testing.allocator, actual, q4_fingerprint, "0");
     defer std.testing.allocator.free(stale);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale, false, false, null));
 
