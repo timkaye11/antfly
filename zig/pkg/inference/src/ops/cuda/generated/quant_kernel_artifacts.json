@@ -5,6 +5,8 @@
   "metal_promotion_blocker_evidence_count": 21,
   "metal_promotion_blocker_evidence_path_count": 16,
   "metal_promotion_blocker_check_command_count": 16,
+  "metal_promotion_blocker_skipped_no_path_count": 5,
+  "metal_promotion_blocker_cleared_requires_checked_in_evidence": true,
   "metal_promotion_blocker_speedup_gate_missing_count": 8,
   "metal_promotion_blocker_unstable_benchmark_timing_count": 8,
   "metal_promotion_blocker_unsupported_handwritten_count": 5,

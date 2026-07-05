@@ -348,6 +348,8 @@ const ArtifactManifest = struct {
     metal_promotion_blocker_evidence_count: usize,
     metal_promotion_blocker_evidence_path_count: usize,
     metal_promotion_blocker_check_command_count: usize,
+    metal_promotion_blocker_skipped_no_path_count: usize,
+    metal_promotion_blocker_cleared_requires_checked_in_evidence: bool,
     metal_promotion_blocker_speedup_gate_missing_count: usize,
     metal_promotion_blocker_unstable_benchmark_timing_count: usize,
     metal_promotion_blocker_unsupported_handwritten_count: usize,
@@ -4925,6 +4927,8 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         .metal_promotion_blocker_evidence_count = first_metal_promotion_blocker_evidence_count,
         .metal_promotion_blocker_evidence_path_count = metalPromotionBlockerEvidencePathCount(),
         .metal_promotion_blocker_check_command_count = metalPromotionBlockerEvidencePathCount(),
+        .metal_promotion_blocker_skipped_no_path_count = metalPromotionBlockerSkippedNoPathCount(),
+        .metal_promotion_blocker_cleared_requires_checked_in_evidence = true,
         .metal_promotion_blocker_speedup_gate_missing_count = metalPromotionBlockerEvidenceCount(metal_blocker_speedup_gate_missing),
         .metal_promotion_blocker_unstable_benchmark_timing_count = metalPromotionBlockerEvidenceCount(metal_blocker_unstable_benchmark_timing),
         .metal_promotion_blocker_unsupported_handwritten_count = metalPromotionBlockerEvidenceCount(metal_blocker_unsupported_handwritten),
@@ -5137,6 +5141,10 @@ fn metalRuntimeRouteAllExpectedProviderRouteCount() usize {
         if (artifactHasMetalProviderRouteEvidence(artifact)) count += 2;
     }
     return count;
+}
+
+fn metalPromotionBlockerSkippedNoPathCount() usize {
+    return first_metal_promotion_blocker_evidence_count - metalPromotionBlockerEvidencePathCount();
 }
 
 fn metalProductionRegressionExpectedKernelCount() usize {
@@ -6938,6 +6946,11 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     const blocker_check_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_check_command_count\": {d}", .{metalPromotionBlockerEvidencePathCount()});
     defer std.testing.allocator.free(blocker_check_count_field);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_check_count_field));
+    const blocker_skipped_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_skipped_no_path_count\": {d}", .{metalPromotionBlockerSkippedNoPathCount()});
+    defer std.testing.allocator.free(blocker_skipped_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_skipped_count_field));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_promotion_blocker_cleared_requires_checked_in_evidence\": true"));
+    try std.testing.expectEqual(metalPromotionBlockerSkippedNoPathCount(), metalPromotionBlockerEvidenceCount(metal_blocker_unsupported_handwritten));
     const blocker_speedup_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_speedup_gate_missing_count\": {d}", .{metalPromotionBlockerEvidenceCount(metal_blocker_speedup_gate_missing)});
     defer std.testing.allocator.free(blocker_speedup_count_field);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_speedup_count_field));
