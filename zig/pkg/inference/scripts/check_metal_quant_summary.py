@@ -205,6 +205,7 @@ def check_quant_plan_totals(summary, measured, path):
         got = actual.get(key)
         if got != want:
             fail(f"{path}: quant_plan_totals.{key}={got!r} does not match {want!r}")
+    return expected
 
 
 def check_summary(path):
@@ -216,7 +217,7 @@ def check_summary(path):
     total_bucket_dispatches = 0
     checked_rows = 0
     measured = measured_rows(summary, path)
-    check_quant_plan_totals(summary, measured, path)
+    totals = check_quant_plan_totals(summary, measured, path)
     for row in measured:
         label = row.get("label", "<unknown>")
         checked_rows += 1
@@ -250,7 +251,7 @@ def check_summary(path):
         check_plan_counters(row, path, label)
         total_bucket_dispatches += row_bucket_dispatches
 
-    return checked_rows, total_bucket_dispatches
+    return checked_rows, total_bucket_dispatches, totals
 
 
 def write_summary(path, rows):
@@ -432,10 +433,17 @@ def main(argv):
         return 2
     for arg in argv[1:]:
         path = Path(arg)
-        checked_rows, bucket_dispatches = check_summary(path)
+        checked_rows, bucket_dispatches, totals = check_summary(path)
         print(
             f"metal quant summary check ok path={path} "
-            f"measured_rows={checked_rows} row_bucket_dispatches={bucket_dispatches}"
+            f"measured_rows={checked_rows} "
+            f"planned_ops={totals['quant_plan_planned']} "
+            f"handwritten={totals['quant_plan_handwritten_production']} "
+            f"generated={totals['quant_plan_generated_production']} "
+            f"unsupported_routes={totals['quant_plan_unsupported_routes']} "
+            f"row_bucket_dispatches={bucket_dispatches} "
+            f"top_fallback={totals['quant_plan_top_fallback_reason']}/{totals['quant_plan_top_fallback_count']} "
+            f"residency_misses={totals['quant_mapped_failures']}"
         )
     return 0
 
