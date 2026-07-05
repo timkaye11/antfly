@@ -362,6 +362,8 @@ const ArtifactManifest = struct {
     metal_runtime_route_all_check_command: []const u8,
     metal_runtime_route_all_expected_case_count: usize,
     metal_runtime_route_all_expected_provider_route_count: usize,
+    metal_production_regression_expected_kernel_count: usize,
+    metal_production_regression_expected_case_count: usize,
     metal_production_regression_build_command: []const u8,
     metal_production_regression_evidence_command: []const u8,
     artifacts: []const ArtifactManifestRecord,
@@ -4937,6 +4939,8 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         .metal_runtime_route_all_check_command = first_metal_runtime_route_all_check_command,
         .metal_runtime_route_all_expected_case_count = first_metal_runtime_route_all_expected_case_count,
         .metal_runtime_route_all_expected_provider_route_count = first_metal_runtime_route_all_expected_provider_route_count,
+        .metal_production_regression_expected_kernel_count = metalProductionRegressionExpectedKernelCount(),
+        .metal_production_regression_expected_case_count = metalProductionRegressionExpectedCaseCount(),
         .metal_production_regression_build_command = first_metal_production_regression_build_command,
         .metal_production_regression_evidence_command = first_metal_production_regression_evidence_command,
         .artifacts = &records,
@@ -5133,6 +5137,18 @@ fn metalRuntimeRouteAllExpectedProviderRouteCount() usize {
         if (artifactHasMetalProviderRouteEvidence(artifact)) count += 2;
     }
     return count;
+}
+
+fn metalProductionRegressionExpectedKernelCount() usize {
+    var count: usize = 0;
+    for (first_generated_artifacts) |artifact| {
+        if (artifactProductionRegressionChecked(artifact)) count += 1;
+    }
+    return count;
+}
+
+fn metalProductionRegressionExpectedCaseCount() usize {
+    return metalProductionRegressionExpectedKernelCount() * 2;
 }
 
 fn artifactRuntimeGateEnvText(artifact: GeneratedArtifact) []const u8 {
@@ -6938,6 +6954,13 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     defer std.testing.allocator.free(route_all_provider_count_field);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, route_all_provider_count_field));
     try std.testing.expect(first_metal_runtime_route_all_expected_case_count > first_metal_runtime_route_all_expected_provider_route_count);
+    const production_regression_kernel_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_production_regression_expected_kernel_count\": {d}", .{metalProductionRegressionExpectedKernelCount()});
+    defer std.testing.allocator.free(production_regression_kernel_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, production_regression_kernel_count_field));
+    const production_regression_case_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_production_regression_expected_case_count\": {d}", .{metalProductionRegressionExpectedCaseCount()});
+    defer std.testing.allocator.free(production_regression_case_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, production_regression_case_count_field));
+    try std.testing.expectEqual(first_metal_runtime_evidence_count, metalProductionRegressionExpectedKernelCount());
     try expectManifestArrayCount(manifest, "artifact_count", "artifacts", first_generated_artifacts.len);
     try expectManifestArrayCount(manifest, "checked_in_metal_evidence_count", "metal_evidence_records", first_metal_runtime_evidence.len);
     var runtime_evidence_count: usize = 0;

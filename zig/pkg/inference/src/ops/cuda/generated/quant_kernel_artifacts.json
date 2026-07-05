@@ -19,6 +19,8 @@
   "metal_runtime_route_all_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-runtime-route-all-evidence.json --require-runtime-route-all",
   "metal_runtime_route_all_expected_case_count": 50,
   "metal_runtime_route_all_expected_provider_route_count": 36,
+  "metal_production_regression_expected_kernel_count": 4,
+  "metal_production_regression_expected_case_count": 8,
   "metal_production_regression_build_command": "zig build quant-kernel-metal-production-regression-check -Dmetal=true -Dcuda=false",
   "metal_production_regression_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check",
   "artifacts": [
