@@ -8474,7 +8474,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
         family == TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        getenv("TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH") != NULL &&
+        getenv("TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH") == NULL &&
         runtime->antfly_q8_0_small_batch_pipeline != nil);
     const BOOL use_mmv = (!use_mm_sg &&
         !use_mm &&
@@ -9523,7 +9523,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        getenv("TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH") != NULL &&
+        getenv("TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH") == NULL &&
         runtime->antfly_q8_0_small_batch_pipeline != nil);
     const BOOL use_antfly_q4_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_K &&
         f32_activation_buffers &&
@@ -21706,7 +21706,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q8_0_bias_slot_device(
     return termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_slot_device(
         runtime,
         TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        NULL,
+        "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS",
         runtime != NULL ? runtime->antfly_q8_0_small_batch_bias_pipeline : nil,
         runtime != NULL ? &runtime->antfly_q8_0_small_batch_bias_dispatches : NULL,
         TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS,
@@ -21738,7 +21738,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q8_0_bias_gelu_slot_devi
     return termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_slot_device(
         runtime,
         TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        NULL,
+        "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU",
         runtime != NULL ? runtime->antfly_q8_0_small_batch_bias_gelu_pipeline : nil,
         runtime != NULL ? &runtime->antfly_q8_0_small_batch_bias_gelu_dispatches : NULL,
         TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU,

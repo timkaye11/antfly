@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q8_0/rows_2_8/bias_gelu/small_batch
 // kernel_id=antfly_q8_0_small_batch_bias_gelu_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=true
-// Promoted after Metal runtime correctness and sequential speedup gates.
+// production_enabled=false
+// Promotion is blocked until repeat benchmark timing clears the speedup gate.
 
 #include <metal_stdlib>
 using namespace metal;

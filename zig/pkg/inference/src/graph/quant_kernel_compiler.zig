@@ -1340,38 +1340,20 @@ pub const first_benchmarks = [_]BenchmarkCase{first_lazy_benchmark};
 const first_benchmark_evidence = [_]BenchmarkEvidence{};
 const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
-        .kernel_id = first_general_metal_q8_bias_kernel_id,
-        .source_path = first_general_metal_q8_bias_source_path,
-        .artifact_source_path = first_general_metal_q8_bias_artifact_source_path,
-        .source_fingerprint = sourceFingerprint(first_general_metal_q8_bias_source),
-        .check_command = first_general_metal_q8_bias_check_command,
-        .runtime_evidence_command = first_general_metal_q8_bias_promotion_evidence_command,
-        .promotion_check_command = first_general_metal_q8_bias_promotion_check_command,
+        .kernel_id = first_general_metal_q8_kernel_id,
+        .source_path = first_general_metal_q8_source_path,
+        .artifact_source_path = first_general_metal_q8_artifact_source_path,
+        .source_fingerprint = sourceFingerprint(first_general_metal_q8_source),
+        .check_command = first_general_metal_q8_check_command,
+        .runtime_evidence_command = first_general_metal_q8_promotion_evidence_command,
+        .promotion_check_command = first_general_metal_q8_promotion_check_command,
         .repeat_runs = metal_promotion_repeat_runs,
         .correctness_passed = true,
         .generated_route_checked = true,
         .provider_route_checked = true,
         .benchmark_passed = true,
-        .measured_speedup = 1.287827,
-        .minimum_repeat_speedup = 1.273328,
-        .production_enabled = true,
-        .promotion_ready = true,
-    },
-    .{
-        .kernel_id = first_general_metal_q8_bias_gelu_kernel_id,
-        .source_path = first_general_metal_q8_bias_gelu_source_path,
-        .artifact_source_path = first_general_metal_q8_bias_gelu_artifact_source_path,
-        .source_fingerprint = sourceFingerprint(first_general_metal_q8_bias_gelu_source),
-        .check_command = first_general_metal_q8_bias_gelu_check_command,
-        .runtime_evidence_command = first_general_metal_q8_bias_gelu_promotion_evidence_command,
-        .promotion_check_command = first_general_metal_q8_bias_gelu_promotion_check_command,
-        .repeat_runs = metal_promotion_repeat_runs,
-        .correctness_passed = true,
-        .generated_route_checked = true,
-        .provider_route_checked = true,
-        .benchmark_passed = true,
-        .measured_speedup = 1.258658,
-        .minimum_repeat_speedup = 1.219908,
+        .measured_speedup = 1.157466,
+        .minimum_repeat_speedup = 1.111670,
         .production_enabled = true,
         .promotion_ready = true,
     },
@@ -1435,7 +1417,8 @@ pub const first_metal_runtime_evidence_count = first_metal_runtime_evidence.len;
 // requires checked-in runtime evidence plus a passing production-regression run.
 pub const first_metal_promotion_blocker_evidence = [_]MetalPromotionBlockerEvidence{
     .{ .kernel_id = first_general_metal_q5_0_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q5_0_promotion_evidence_path },
-    .{ .kernel_id = first_general_metal_q8_kernel_id, .blocker = "unstable_benchmark_timing", .evidence_path = first_general_metal_q8_promotion_evidence_path },
+    .{ .kernel_id = first_general_metal_q8_bias_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q8_bias_promotion_evidence_path },
+    .{ .kernel_id = first_general_metal_q8_bias_gelu_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q8_bias_gelu_promotion_evidence_path },
     .{ .kernel_id = first_general_metal_q3_kernel_id, .blocker = "unstable_benchmark_timing", .evidence_path = first_general_metal_q3_promotion_evidence_path },
     .{ .kernel_id = first_general_metal_q5_bias_gelu_kernel_id, .blocker = "unstable_benchmark_timing", .evidence_path = first_general_metal_q5_bias_gelu_promotion_evidence_path },
     .{ .kernel_id = first_general_metal_q8_k_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q8_k_promotion_evidence_path },
@@ -1899,7 +1882,7 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_promotion_check_command,
-        .production_enabled = false,
+        .production_enabled = true,
     },
     .{
         .backend = .metal,
@@ -1914,7 +1897,7 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_bias_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_bias_promotion_check_command,
-        .production_enabled = true,
+        .production_enabled = false,
     },
     .{
         .backend = .metal,
@@ -1929,7 +1912,7 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_bias_gelu_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_bias_gelu_promotion_check_command,
-        .production_enabled = true,
+        .production_enabled = false,
     },
     .{
         .backend = .metal,
@@ -2229,9 +2212,9 @@ const first_route_expectations = [_]RouteExpectation{
         .row_bucket = .rows_2_8,
         .epilogue = .bias,
         .dispatch = .small_batch,
-        .production_route = .generated_production,
-        .candidate_route = .unsupported,
-        .fallback_reason = .none,
+        .production_route = .handwritten_production,
+        .candidate_route = .generated_dev_candidate,
+        .fallback_reason = .generated_artifact_missing,
     },
     .{
         .backend = .metal,
@@ -2239,9 +2222,9 @@ const first_route_expectations = [_]RouteExpectation{
         .row_bucket = .rows_2_8,
         .epilogue = .bias_gelu,
         .dispatch = .small_batch,
-        .production_route = .generated_production,
-        .candidate_route = .unsupported,
-        .fallback_reason = .none,
+        .production_route = .handwritten_production,
+        .candidate_route = .generated_dev_candidate,
+        .fallback_reason = .generated_artifact_missing,
     },
     .{
         .backend = .metal,
@@ -3067,14 +3050,12 @@ const first_general_metal_q8_source =
     \\// See the License for the specific language governing permissions and
     \\// limitations under the License.
     \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
+    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
     \\// plan_id=metal/q8_0/rows_2_8/none/small_batch
     \\// kernel_id=antfly_q8_0_small_batch_msl_v1
     \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
+    \\// production_enabled=true
+    \\// Promoted after repeat correctness, provider-route, and benchmark gates.
     \\
     \\#include <metal_stdlib>
     \\using namespace metal;
@@ -3136,12 +3117,12 @@ const first_general_metal_q8_bias_source =
     \\// See the License for the specific language governing permissions and
     \\// limitations under the License.
     \\
-    \\// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
     \\// plan_id=metal/q8_0/rows_2_8/bias/small_batch
     \\// kernel_id=antfly_q8_0_small_batch_bias_msl_v1
     \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after Metal runtime correctness and sequential speedup gates.
+    \\// production_enabled=false
+    \\// Promotion is blocked until repeat benchmark timing clears the speedup gate.
     \\
     \\#include <metal_stdlib>
     \\using namespace metal;
@@ -3204,12 +3185,12 @@ const first_general_metal_q8_bias_gelu_source =
     \\// See the License for the specific language governing permissions and
     \\// limitations under the License.
     \\
-    \\// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
     \\// plan_id=metal/q8_0/rows_2_8/bias_gelu/small_batch
     \\// kernel_id=antfly_q8_0_small_batch_bias_gelu_msl_v1
     \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after Metal runtime correctness and sequential speedup gates.
+    \\// production_enabled=false
+    \\// Promotion is blocked until repeat benchmark timing clears the speedup gate.
     \\
     \\#include <metal_stdlib>
     \\using namespace metal;
@@ -7135,14 +7116,14 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, runtime_wired_artifacts, "\"runtime_wired\": true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts, "\"runtime_wired\": false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts, "\"runtime_gate_env\": \"\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH\""));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH\""));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_RELU\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS_GELU\""));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS\""));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH\""));
     try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q3_K_SMALL_BATCH\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS\""));
@@ -7175,7 +7156,7 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
 }
 
 test "quant kernel compiler checked-in Metal evidence matches generated source" {
-    try std.testing.expectEqual(@as(usize, 5), first_metal_runtime_evidence_count);
+    try std.testing.expectEqual(@as(usize, 4), first_metal_runtime_evidence_count);
     for (first_metal_runtime_evidence) |evidence| {
         try std.testing.expectEqual(metal_promotion_repeat_runs, evidence.repeat_runs);
         try std.testing.expect(evidence.correctness_passed);
@@ -7200,11 +7181,11 @@ test "quant kernel compiler checked-in Metal evidence matches generated source" 
 }
 
 test "quant kernel compiler checked-in Metal blocker evidence matches generated candidates" {
-    try std.testing.expectEqual(@as(usize, 20), first_metal_promotion_blocker_evidence_count);
-    try std.testing.expectEqual(@as(usize, 7), metalPromotionBlockerEvidenceCount("speedup_gate_missing"));
+    try std.testing.expectEqual(@as(usize, 21), first_metal_promotion_blocker_evidence_count);
+    try std.testing.expectEqual(@as(usize, 9), metalPromotionBlockerEvidenceCount("speedup_gate_missing"));
     try std.testing.expectEqual(@as(usize, 5), metalPromotionBlockerEvidenceCount("unsupported_handwritten_baseline"));
-    try std.testing.expectEqual(@as(usize, 8), metalPromotionBlockerEvidenceCount("unstable_benchmark_timing"));
-    try std.testing.expectEqual(@as(usize, 15), metalPromotionBlockerEvidencePathCount());
+    try std.testing.expectEqual(@as(usize, 7), metalPromotionBlockerEvidenceCount("unstable_benchmark_timing"));
+    try std.testing.expectEqual(@as(usize, 16), metalPromotionBlockerEvidencePathCount());
     for (first_metal_promotion_blocker_evidence) |evidence| {
         const artifact = generatedArtifactForKernel(.metal, evidence.kernel_id) orelse return error.MissingMetalBlockerArtifact;
         try std.testing.expectEqual(Backend.metal, artifact.backend);
@@ -7430,9 +7411,10 @@ test "quant kernel compiler Metal runtime route summary maps counters to route m
     const q8_bias = routes.get("q8_0_small_batch_bias").?.object;
     try std.testing.expectEqualStrings("metal/q8_0/rows_2_8/bias/small_batch", q8_bias.get("plan_id").?.string);
     try std.testing.expectEqualStrings(first_general_metal_q8_bias_kernel_id, q8_bias.get("kernel_id").?.string);
-    try std.testing.expectEqualStrings("generated_production", q8_bias.get("production_route").?.string);
-    try std.testing.expectEqualStrings("none", q8_bias.get("fallback_reason").?.string);
-    try std.testing.expectEqual(true, q8_bias.get("promotion_ready").?.bool);
+    try std.testing.expectEqualStrings("handwritten_production", q8_bias.get("production_route").?.string);
+    try std.testing.expectEqualStrings("generated_dev_candidate", q8_bias.get("candidate_route").?.string);
+    try std.testing.expectEqualStrings("generated_artifact_missing", q8_bias.get("fallback_reason").?.string);
+    try std.testing.expectEqual(false, q8_bias.get("promotion_ready").?.bool);
 
     const q4_bias_gelu = routes.get("q4_k_small_batch_bias_gelu").?.object;
     try std.testing.expectEqualStrings(first_lazy_metal_kernel_id, q4_bias_gelu.get("kernel_id").?.string);
@@ -7615,10 +7597,10 @@ test "quant kernel compiler registry route summary is golden" {
 
     const metal = by_backend[@intFromEnum(@as(Backend, .metal))];
     try std.testing.expectEqual(@as(usize, 1008), metal.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(usize, 107), metal.quant_kernel_handwritten_production);
-    try std.testing.expectEqual(@as(usize, 5), metal.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(usize, 108), metal.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 4), metal.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(usize, 896), metal.quant_kernel_unsupported_routes);
-    try std.testing.expectEqual(@as(usize, 20), metal.quant_kernel_generated_candidates);
+    try std.testing.expectEqual(@as(usize, 21), metal.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_generated_artifact_missing);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_generated_runtime_not_wired);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_unsupported_format);
@@ -7704,8 +7686,8 @@ test "quant kernel compiler conformance manifest serializes the route matrix" {
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_unsupported_epilogue", 100);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_planned_ops", 1008);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_production", 5);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_candidates", 20);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_production", 4);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_candidates", 21);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_artifact_missing", 0);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_unsupported_epilogue", 356);
@@ -7747,7 +7729,7 @@ test "quant kernel compiler conformance manifest serializes the route matrix" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_fallback_reason\": \"generated_artifact_missing\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_production_kernel_id\": \"antfly_q4_k_small_batch_bias_gelu_msl_v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_candidate_kernel_id\": \"antfly_q4_k_small_batch_msl_v1\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_production_kernel_id\": \"antfly_q8_0_small_batch_bias_gelu_msl_v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_production_kernel_id\": \"antfly_q8_0_small_batch_msl_v1\""));
 }
 
 test "quant kernel compiler conformance fingerprints match generated artifacts" {
@@ -7776,7 +7758,7 @@ test "quant kernel compiler conformance fingerprints match generated artifacts" 
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cuda_candidates);
-    try std.testing.expectEqual(@as(usize, 20), metal_candidates);
+    try std.testing.expectEqual(@as(usize, 21), metal_candidates);
 }
 
 test "quant kernel compiler benchmark promotion evidence is complete" {
@@ -7987,19 +7969,19 @@ test "quant kernel compiler production artifacts require promotion evidence" {
     try std.testing.expect(!artifactHasPromotionEvidence(blocked_general_metal));
     try std.testing.expectEqualStrings("TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH", std.mem.span(artifactRuntimeGateEnv(blocked_general_metal).?));
 
-    var metal_artifact = generatedArtifactForKernel(.metal, first_general_metal_q8_bias_kernel_id).?;
+    var metal_artifact = generatedArtifactForKernel(.metal, first_general_metal_q8_kernel_id).?;
     metal_artifact.production_enabled = true;
     try std.testing.expect(benchmarkForArtifact(metal_artifact) == null);
     try std.testing.expect(artifactHasPromotionEvidence(metal_artifact));
-    try std.testing.expect(artifactRuntimeGateEnv(metal_artifact) == null);
+    try std.testing.expectEqualStrings("TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH", std.mem.span(artifactRuntimeGateEnv(metal_artifact).?));
     try std.testing.expectEqualStrings("missing_metal_runtime_evidence", metalArtifactPromotionBlockerWithEvidence(metal_artifact, &.{}));
 
     const metal_evidence = [_]MetalRuntimeEvidence{.{
         .kernel_id = metal_artifact.kernel_id,
-        .source_path = first_general_metal_q8_bias_source_path,
-        .artifact_source_path = first_general_metal_q8_bias_artifact_source_path,
+        .source_path = first_general_metal_q8_source_path,
+        .artifact_source_path = first_general_metal_q8_artifact_source_path,
         .source_fingerprint = artifactSourceFingerprint(metal_artifact),
-        .check_command = first_general_metal_q8_bias_check_command,
+        .check_command = first_general_metal_q8_check_command,
         .runtime_evidence_command = metal_artifact.promotion_evidence_command,
         .promotion_check_command = metal_artifact.promotion_check_command,
         .repeat_runs = metal_promotion_repeat_runs,
@@ -8054,7 +8036,7 @@ test "quant kernel compiler production artifacts require promotion evidence" {
     missing_promotion_command.promotion_evidence_command = "";
     try std.testing.expectEqualStrings("metal_promotion_evidence_command_mismatch", metalArtifactPromotionBlockerWithEvidence(missing_promotion_command, &metal_evidence));
 
-    const wrong_promotion_kernel_command = first_metal_promotion_evidence_command ++ first_general_metal_q8_bias_promotion_evidence_path ++ metal_promotion_args ++ "wrong_kernel";
+    const wrong_promotion_kernel_command = first_metal_promotion_evidence_command ++ first_general_metal_q8_promotion_evidence_path ++ metal_promotion_args ++ "wrong_kernel";
     var wrong_promotion_kernel = metal_artifact;
     wrong_promotion_kernel.promotion_evidence_command = wrong_promotion_kernel_command;
     try std.testing.expectEqualStrings("wrong_metal_promotion_ready_kernel", metalArtifactPromotionBlockerWithEvidence(wrong_promotion_kernel, &metal_evidence));
@@ -8320,27 +8302,26 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings(first_general_metal_q4_bias_artifact_source_path, metal_q4_bias.candidate_source_path);
 
     const metal_q8 = registryLoweringFor(.metal, .q8_0, .rows_2_8, .none, .small_batch);
-    try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q8.production_route);
-    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, metal_q8.candidate_route);
-    try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q8.fallback_reason);
-    try std.testing.expectEqualStrings(first_general_metal_q8_kernel_id, metal_q8.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q8_artifact_source_path, metal_q8.candidate_source_path);
+    try std.testing.expectEqual(LoweringRoute.generated_production, metal_q8.production_route);
+    try std.testing.expectEqual(LoweringRoute.unsupported, metal_q8.candidate_route);
+    try std.testing.expectEqual(FallbackReason.none, metal_q8.fallback_reason);
+    try std.testing.expectEqualStrings(first_general_metal_q8_kernel_id, metal_q8.production_kernel_id);
+    try std.testing.expectEqualStrings("", metal_q8.kernel_id);
+    try std.testing.expectEqualStrings("", metal_q8.candidate_source_path);
 
     const metal_q8_bias = registryLoweringFor(.metal, .q8_0, .rows_2_8, .bias, .small_batch);
-    try std.testing.expectEqual(LoweringRoute.generated_production, metal_q8_bias.production_route);
-    try std.testing.expectEqual(LoweringRoute.unsupported, metal_q8_bias.candidate_route);
-    try std.testing.expectEqual(FallbackReason.none, metal_q8_bias.fallback_reason);
-    try std.testing.expectEqualStrings(first_general_metal_q8_bias_kernel_id, metal_q8_bias.production_kernel_id);
-    try std.testing.expectEqualStrings("", metal_q8_bias.kernel_id);
-    try std.testing.expectEqualStrings("", metal_q8_bias.candidate_source_path);
+    try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q8_bias.production_route);
+    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, metal_q8_bias.candidate_route);
+    try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q8_bias.fallback_reason);
+    try std.testing.expectEqualStrings(first_general_metal_q8_bias_kernel_id, metal_q8_bias.kernel_id);
+    try std.testing.expectEqualStrings(first_general_metal_q8_bias_artifact_source_path, metal_q8_bias.candidate_source_path);
 
     const metal_q8_bias_gelu = registryLoweringFor(.metal, .q8_0, .rows_2_8, .bias_gelu, .small_batch);
-    try std.testing.expectEqual(LoweringRoute.generated_production, metal_q8_bias_gelu.production_route);
-    try std.testing.expectEqual(LoweringRoute.unsupported, metal_q8_bias_gelu.candidate_route);
-    try std.testing.expectEqual(FallbackReason.none, metal_q8_bias_gelu.fallback_reason);
-    try std.testing.expectEqualStrings(first_general_metal_q8_bias_gelu_kernel_id, metal_q8_bias_gelu.production_kernel_id);
-    try std.testing.expectEqualStrings("", metal_q8_bias_gelu.kernel_id);
-    try std.testing.expectEqualStrings("", metal_q8_bias_gelu.candidate_source_path);
+    try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q8_bias_gelu.production_route);
+    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, metal_q8_bias_gelu.candidate_route);
+    try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q8_bias_gelu.fallback_reason);
+    try std.testing.expectEqualStrings(first_general_metal_q8_bias_gelu_kernel_id, metal_q8_bias_gelu.kernel_id);
+    try std.testing.expectEqualStrings(first_general_metal_q8_bias_gelu_artifact_source_path, metal_q8_bias_gelu.candidate_source_path);
 
     const metal_q8_relu = registryLoweringFor(.metal, .q8_0, .rows_2_8, .relu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q8_relu.production_route);
@@ -8608,7 +8589,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, first_general_metal_q6_bias_gelu_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, first_general_metal_q6_bias_gelu_kernel_id));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q3_K_SMALL_BATCH"));
@@ -8634,14 +8615,14 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1,
         \\TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        \\        NULL,
+        \\        "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS",
         \\        runtime != NULL ? runtime->antfly_q8_0_small_batch_bias_pipeline : nil,
         \\        runtime != NULL ? &runtime->antfly_q8_0_small_batch_bias_dispatches : NULL,
         \\        TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS,
     ));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1,
         \\TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        \\        NULL,
+        \\        "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU",
         \\        runtime != NULL ? runtime->antfly_q8_0_small_batch_bias_gelu_pipeline : nil,
         \\        runtime != NULL ? &runtime->antfly_q8_0_small_batch_bias_gelu_dispatches : NULL,
         \\        TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU,
@@ -8686,7 +8667,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     ));
     const none_encoder = std.mem.indexOf(u8, contents, "static int termite_metal_encode_quant_matmul_generic_none_on_encoder") orelse return error.MissingMetalNoneEncoder;
     const q8_encoder = std.mem.indexOfPos(u8, contents, none_encoder, "static int termite_metal_encode_q8_0_linear(") orelse return error.MissingMetalQ8Encoder;
-    const q8_enable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH\")") orelse return error.MissingMetalQ8Enable;
+    const q8_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH\")") orelse return error.MissingMetalQ8Disable;
     const q2_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH") orelse return error.MissingMetalQ2Enable;
     const q4_0_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH") orelse return error.MissingMetalQ4_0Enable;
     const q4_1_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH") orelse return error.MissingMetalQ4_1Enable;
@@ -8698,7 +8679,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     const q4_enable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH\")") orelse return error.MissingMetalQ4Enable;
     const q5_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH\")") orelse return error.MissingMetalQ5Disable;
     const q6_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH\")") orelse return error.MissingMetalQ6Disable;
-    try std.testing.expect(q8_enable > none_encoder and q8_enable < q8_encoder);
+    try std.testing.expect(q8_disable > none_encoder and q8_disable < q8_encoder);
     try std.testing.expect(q2_enable > none_encoder and q2_enable < q8_encoder);
     try std.testing.expect(q3_enable > none_encoder and q3_enable < q8_encoder);
     try std.testing.expect(q4_0_enable > none_encoder and q4_0_enable < q8_encoder);
@@ -8889,10 +8870,10 @@ test "quant kernel compiler counters classify route lowerings" {
 
     const q8_ready = countersForLowering(loweringFor(.metal, .q8_0, .rows_2_8, .none));
     try std.testing.expectEqual(@as(usize, 1), q8_ready.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(usize, 1), q8_ready.quant_kernel_handwritten_production);
-    try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 1), q8_ready.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_unsupported_routes);
-    try std.testing.expectEqual(@as(usize, 1), q8_ready.quant_kernel_generated_candidates);
+    try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_fallback_generated_artifact_missing);
     try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_fallback_generated_runtime_not_wired);
     try std.testing.expectEqual(@as(usize, 0), q8_ready.quant_kernel_fallback_unsupported);
