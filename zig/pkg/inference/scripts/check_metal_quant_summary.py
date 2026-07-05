@@ -49,6 +49,16 @@ STORED_TOTALS = {
     "q6_linear_reduce": "q6_linear_reduce_row_total",
 }
 
+FALLBACK_FIELDS = (
+    ("generated_artifact_missing", "quant_plan_generated_artifact_missing"),
+    ("generated_runtime_not_wired", "quant_plan_generated_runtime_not_wired"),
+    ("unsupported_format", "quant_plan_unsupported_format"),
+    ("unsupported_shape", "quant_plan_unsupported_shape"),
+    ("unsupported_epilogue", "quant_plan_unsupported_epilogue"),
+    ("unsupported_backend", "quant_plan_unsupported_backend"),
+    ("tensor_core_repack_required", "quant_plan_tensor_core_repack_required"),
+)
+
 
 def fail(message):
     raise SystemExit(message)
@@ -60,6 +70,15 @@ def int_field(row, key, path, label):
     value = row[key]
     if isinstance(value, bool) or not isinstance(value, int):
         fail(f"{path}: row {label}: {key} must be an integer, got {value!r}")
+    return value
+
+
+def string_field(row, key, path, label):
+    if key not in row:
+        fail(f"{path}: row {label}: missing {key}")
+    value = row[key]
+    if not isinstance(value, str):
+        fail(f"{path}: row {label}: {key} must be a string, got {value!r}")
     return value
 
 
@@ -81,6 +100,57 @@ def measured_rows(summary, path):
     if not measured:
         fail(f"{path}: summary has no measured run-* rows")
     return measured
+
+
+def check_plan_counters(row, path, label):
+    planned = int_field(row, "quant_plan_planned", path, label)
+    handwritten = int_field(row, "quant_plan_handwritten_production", path, label)
+    generated = int_field(row, "quant_plan_generated_production", path, label)
+    unsupported_routes = int_field(row, "quant_plan_unsupported_routes", path, label)
+    route_total = handwritten + generated + unsupported_routes
+    if planned != route_total:
+        fail(
+            f"{path}: row {label}: quant_plan_planned={planned} "
+            f"does not match route total {route_total}"
+        )
+
+    generated_candidates = int_field(row, "quant_plan_generated_candidates", path, label)
+    if generated_candidates > planned:
+        fail(
+            f"{path}: row {label}: generated candidates {generated_candidates} "
+            f"exceed planned ops {planned}"
+        )
+
+    unsupported = int_field(row, "quant_plan_unsupported", path, label)
+    unsupported_subtotal = sum(
+        int_field(row, key, path, label)
+        for key in (
+            "quant_plan_unsupported_format",
+            "quant_plan_unsupported_shape",
+            "quant_plan_unsupported_epilogue",
+            "quant_plan_unsupported_backend",
+        )
+    )
+    if unsupported != unsupported_subtotal:
+        fail(
+            f"{path}: row {label}: quant_plan_unsupported={unsupported} "
+            f"does not match unsupported reason total {unsupported_subtotal}"
+        )
+
+    top_reason = string_field(row, "quant_plan_top_fallback_reason", path, label)
+    top_count = int_field(row, "quant_plan_top_fallback_count", path, label)
+    expected_reason = "none"
+    expected_count = 0
+    for reason, key in FALLBACK_FIELDS:
+        count = int_field(row, key, path, label)
+        if count > expected_count:
+            expected_reason = reason
+            expected_count = count
+    if top_reason != expected_reason or top_count != expected_count:
+        fail(
+            f"{path}: row {label}: top fallback {top_reason}/{top_count} "
+            f"does not match {expected_reason}/{expected_count}"
+        )
 
 
 def check_summary(path):
@@ -121,6 +191,7 @@ def check_summary(path):
                     f"{row_bucket_dispatches} exceed plan counters "
                     f"planned={planned} handwritten_production={handwritten}"
                 )
+        check_plan_counters(row, path, label)
         total_bucket_dispatches += row_bucket_dispatches
 
     return checked_rows, total_bucket_dispatches
@@ -164,6 +235,19 @@ def self_test():
         "q6_linear_reduce_row_total": 5,
         "quant_plan_planned": 12,
         "quant_plan_handwritten_production": 12,
+        "quant_plan_generated_production": 0,
+        "quant_plan_unsupported_routes": 0,
+        "quant_plan_generated_candidates": 0,
+        "quant_plan_generated_artifact_missing": 0,
+        "quant_plan_generated_runtime_not_wired": 0,
+        "quant_plan_unsupported": 0,
+        "quant_plan_unsupported_format": 0,
+        "quant_plan_unsupported_shape": 0,
+        "quant_plan_unsupported_epilogue": 0,
+        "quant_plan_unsupported_backend": 0,
+        "quant_plan_tensor_core_repack_required": 0,
+        "quant_plan_top_fallback_reason": "none",
+        "quant_plan_top_fallback_count": 0,
     }
     with tempfile.TemporaryDirectory(prefix="antfly-metal-quant-summary-check.") as tmp:
         tmp_path = Path(tmp)
@@ -217,6 +301,42 @@ def self_test():
                 raise
         else:
             fail("self-test expected plan counter failure")
+
+        bad_route_total = dict(good_row)
+        bad_route_total["quant_plan_generated_production"] = 1
+        bad_route_total_path = tmp_path / "bad-route-total.json"
+        write_summary(bad_route_total_path, [bad_route_total])
+        try:
+            check_summary(bad_route_total_path)
+        except SystemExit as err:
+            if "route total" not in str(err):
+                raise
+        else:
+            fail("self-test expected route total failure")
+
+        bad_unsupported_total = dict(good_row)
+        bad_unsupported_total["quant_plan_unsupported_shape"] = 1
+        bad_unsupported_total_path = tmp_path / "bad-unsupported-total.json"
+        write_summary(bad_unsupported_total_path, [bad_unsupported_total])
+        try:
+            check_summary(bad_unsupported_total_path)
+        except SystemExit as err:
+            if "unsupported reason total" not in str(err):
+                raise
+        else:
+            fail("self-test expected unsupported subtotal failure")
+
+        bad_top_fallback = dict(good_row)
+        bad_top_fallback["quant_plan_top_fallback_reason"] = "unsupported_shape"
+        bad_top_fallback_path = tmp_path / "bad-top-fallback.json"
+        write_summary(bad_top_fallback_path, [bad_top_fallback])
+        try:
+            check_summary(bad_top_fallback_path)
+        except SystemExit as err:
+            if "top fallback" not in str(err):
+                raise
+        else:
+            fail("self-test expected top fallback failure")
 
     print("metal quant summary checker self-test passed")
 
