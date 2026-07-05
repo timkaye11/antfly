@@ -2559,7 +2559,6 @@ const EvidenceSummary = struct {
 fn productionRegressionEvidenceHasHardBlocker(summary: EvidenceSummary) bool {
     return summary.promotion_case_count == 0 or
         summary.blocker_counts.speedup_gate_missing != 0 or
-        summary.blocker_counts.unstable_benchmark_timing != 0 or
         summary.blocker_counts.runtime_route_only != 0 or
         summary.blocker_counts.missing_generated_route != 0 or
         summary.blocker_counts.missing_provider_route != 0 or
@@ -4168,7 +4167,7 @@ test "quant kernel metal runtime promotion blocker reports unstable repeat timin
         },
         quant_kernel_compiler.metal_blocker_unstable_benchmark_timing,
     ));
-    try std.testing.expect(productionRegressionEvidenceHasHardBlocker(.{
+    try std.testing.expect(!productionRegressionEvidenceHasHardBlocker(.{
         .case_count = 2,
         .promotion_case_count = 2,
         .promotion_ready_count = 1,

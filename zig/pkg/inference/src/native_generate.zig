@@ -2634,6 +2634,7 @@ fn cudaStatsCompactJson(
 fn metalStatsCompactJson(
     allocator: std.mem.Allocator,
     stats_opt: ?ops.BackendDebugTimingSnapshot,
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
 ) ![]u8 {
     const stats = stats_opt orelse return allocator.dupe(u8, "null");
     const provider = stats.provider;
@@ -2641,6 +2642,7 @@ fn metalStatsCompactJson(
     const command_dispatch = provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts;
     const generated_route_json = try graph_mod.quant_kernel_compiler.metalRuntimeRouteSummaryJson(allocator);
     defer allocator.free(generated_route_json);
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(graph_stats);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try appendFmt(
@@ -2795,6 +2797,46 @@ fn metalStatsCompactJson(
             provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
             provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
             generated_route_json,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"quant_kernel_plan":{{
+        \\"planned":{d},
+        \\"handwritten_production":{d},
+        \\"generated_production":{d},
+        \\"unsupported_routes":{d},
+        \\"generated_candidates":{d},
+        \\"generated_artifact_missing":{d},
+        \\"generated_runtime_not_wired":{d},
+        \\"unsupported":{d},
+        \\"unsupported_format":{d},
+        \\"unsupported_shape":{d},
+        \\"unsupported_epilogue":{d},
+        \\"unsupported_backend":{d},
+        \\"tensor_core_repack_required":{d},
+        \\"top_fallback_reason":{f},
+        \\"top_fallback_count":{d}
+        \\}}
+    ,
+        .{
+            graph_stats.quant_kernel_planned_ops,
+            graph_stats.quant_kernel_handwritten_production,
+            graph_stats.quant_kernel_generated_production,
+            graph_stats.quant_kernel_unsupported_routes,
+            graph_stats.quant_kernel_generated_candidates,
+            graph_stats.quant_kernel_fallback_generated_artifact_missing,
+            graph_stats.quant_kernel_fallback_generated_runtime_not_wired,
+            graph_stats.quant_kernel_fallback_unsupported,
+            graph_stats.quant_kernel_fallback_unsupported_format,
+            graph_stats.quant_kernel_fallback_unsupported_shape,
+            graph_stats.quant_kernel_fallback_unsupported_epilogue,
+            graph_stats.quant_kernel_fallback_unsupported_backend,
+            graph_stats.quant_kernel_fallback_tensor_core_repack_required,
+            std.json.fmt(top_fallback.name, .{}),
+            top_fallback.count,
         },
     );
     try appendFmt(
@@ -3083,7 +3125,7 @@ fn writeJsonTiming(
         );
     } else try allocator.dupe(u8, "null");
     defer allocator.free(speculative_json);
-    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt);
+    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt, graph_mod.executor_stats.snapshot());
     defer allocator.free(metal_json);
     const cuda_json = if (comptime build_options.enable_cuda) blk: {
         if (cuda_stats_opt) |cuda_stats| {
@@ -4151,6 +4193,28 @@ fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
 }
 
 fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot) void {
+    const plan_stats = graph_mod.executor_stats.snapshot();
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
+    print(
+        "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
+        .{
+            plan_stats.quant_kernel_planned_ops,
+            plan_stats.quant_kernel_handwritten_production,
+            plan_stats.quant_kernel_generated_production,
+            plan_stats.quant_kernel_unsupported_routes,
+            plan_stats.quant_kernel_generated_candidates,
+            plan_stats.quant_kernel_fallback_generated_artifact_missing,
+            plan_stats.quant_kernel_fallback_generated_runtime_not_wired,
+            plan_stats.quant_kernel_fallback_unsupported,
+            plan_stats.quant_kernel_fallback_unsupported_format,
+            plan_stats.quant_kernel_fallback_unsupported_shape,
+            plan_stats.quant_kernel_fallback_unsupported_epilogue,
+            plan_stats.quant_kernel_fallback_unsupported_backend,
+            plan_stats.quant_kernel_fallback_tensor_core_repack_required,
+            top_fallback.name,
+            top_fallback.count,
+        },
+    );
     print(
         "metal_q8_0_dispatch: scalar={d} mmv={d} small_batch={d} mm={d} rows_1={d} rows_2_8={d} rows_9_64={d} rows_65_plus={d} pair_act_mm_out_f16={d} linear_mm_in_f16={d} pair_act_rms_mmv_out_f16={d} linear_mmv_in_f16={d}\n",
         .{
@@ -6236,7 +6300,23 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
     snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
 
-    const json = try metalStatsCompactJson(std.testing.allocator, snapshot);
+    const graph_stats = graph_mod.executor_stats.ExecutionStats{
+        .quant_kernel_planned_ops = 12,
+        .quant_kernel_handwritten_production = 13,
+        .quant_kernel_generated_production = 14,
+        .quant_kernel_unsupported_routes = 15,
+        .quant_kernel_generated_candidates = 16,
+        .quant_kernel_fallback_generated_artifact_missing = 17,
+        .quant_kernel_fallback_generated_runtime_not_wired = 18,
+        .quant_kernel_fallback_unsupported_format = 19,
+        .quant_kernel_fallback_unsupported_shape = 27,
+        .quant_kernel_fallback_unsupported_epilogue = 20,
+        .quant_kernel_fallback_unsupported_backend = 21,
+        .quant_kernel_fallback_tensor_core_repack_required = 22,
+        .quant_kernel_fallback_unsupported = 23,
+    };
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, graph_stats);
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
@@ -6252,13 +6332,28 @@ test "metal stats compact json exposes generated quant and fallback counters" {
         "antfly_q8_0_small_batch_bias_msl_v1",
         root.get("generated_quant_routes").?.object.get("q8_0_small_batch_bias").?.object.get("kernel_id").?.string,
     );
+    try std.testing.expectEqual(@as(i64, 12), root.get("quant_kernel_plan").?.object.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 13), root.get("quant_kernel_plan").?.object.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 14), root.get("quant_kernel_plan").?.object.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 15), root.get("quant_kernel_plan").?.object.get("unsupported_routes").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), root.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), root.get("quant_kernel_plan").?.object.get("generated_artifact_missing").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), root.get("quant_kernel_plan").?.object.get("generated_runtime_not_wired").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), root.get("quant_kernel_plan").?.object.get("unsupported_format").?.integer);
+    try std.testing.expectEqual(@as(i64, 27), root.get("quant_kernel_plan").?.object.get("unsupported_shape").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), root.get("quant_kernel_plan").?.object.get("unsupported_epilogue").?.integer);
+    try std.testing.expectEqual(@as(i64, 21), root.get("quant_kernel_plan").?.object.get("unsupported_backend").?.integer);
+    try std.testing.expectEqual(@as(i64, 22), root.get("quant_kernel_plan").?.object.get("tensor_core_repack_required").?.integer);
+    try std.testing.expectEqual(@as(i64, 23), root.get("quant_kernel_plan").?.object.get("unsupported").?.integer);
+    try std.testing.expectEqualStrings("unsupported_shape", root.get("quant_kernel_plan").?.object.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 27), root.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);
     try std.testing.expectEqual(@as(i64, 7), root.get("frame_fallbacks").?.object.get("decode_fallback").?.integer);
     try std.testing.expectEqual(@as(i64, 8), root.get("frame_fallbacks").?.object.get("prefill_execute").?.integer);
     try std.testing.expectEqual(@as(i64, 9), root.get("frame_fallbacks").?.object.get("prefill_execute_attempts").?.integer);
     try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
 
-    const null_json = try metalStatsCompactJson(std.testing.allocator, null);
+    const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
     defer std.testing.allocator.free(null_json);
     try std.testing.expectEqualStrings("null", null_json);
 }
