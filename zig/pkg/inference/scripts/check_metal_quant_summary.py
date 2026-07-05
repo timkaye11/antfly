@@ -19,6 +19,9 @@ import tempfile
 from pathlib import Path
 
 
+EVIDENCE_CONTRACT = "antfly.quant_kernel_metal_evidence.v1"
+SUMMARY_SCHEMA = "antfly.quant_kernel_metal_bench_summary.v1"
+
 LINEAR_REDUCE_BUCKETS = {
     "q4_0_linear_reduce": (
         "q4_0_linear_reduce_rows_1",
@@ -61,6 +64,10 @@ def int_field(row, key, path, label):
 
 
 def measured_rows(summary, path):
+    if summary.get("evidence_contract") != EVIDENCE_CONTRACT:
+        fail(f"{path}: missing or unsupported evidence_contract")
+    if summary.get("schema") != SUMMARY_SCHEMA:
+        fail(f"{path}: missing or unsupported schema")
     rows = summary.get("rows")
     if not isinstance(rows, list):
         fail(f"{path}: summary rows must be a list")
@@ -120,7 +127,18 @@ def check_summary(path):
 
 
 def write_summary(path, rows):
-    path.write_text(json.dumps({"rows": rows}, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "evidence_contract": EVIDENCE_CONTRACT,
+                "schema": SUMMARY_SCHEMA,
+                "rows": rows,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def self_test():
@@ -152,6 +170,29 @@ def self_test():
         good = tmp_path / "good.json"
         write_summary(good, [good_row])
         check_summary(good)
+
+        missing_contract = tmp_path / "missing-contract.json"
+        missing_contract.write_text(json.dumps({"rows": [good_row]}) + "\n", encoding="utf-8")
+        try:
+            check_summary(missing_contract)
+        except SystemExit as err:
+            if "evidence_contract" not in str(err):
+                raise
+        else:
+            fail("self-test expected evidence contract failure")
+
+        missing_schema = tmp_path / "missing-schema.json"
+        missing_schema.write_text(
+            json.dumps({"evidence_contract": EVIDENCE_CONTRACT, "rows": [good_row]}) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            check_summary(missing_schema)
+        except SystemExit as err:
+            if "schema" not in str(err):
+                raise
+        else:
+            fail("self-test expected schema failure")
 
         mismatch = dict(good_row)
         mismatch["q4_linear_reduce_rows_2_8"] = 3

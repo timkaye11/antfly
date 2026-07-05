@@ -34,6 +34,8 @@ const metal_quant_format_q8_0: u32 = 13;
 const metal_quant_format_q8_1: u32 = 14;
 const metal_quant_format_q8_k: u32 = 15;
 const metal_storage_private: c_int = 1;
+const metal_quant_evidence_contract = "antfly.quant_kernel_metal_evidence.v1";
+const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v1";
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
@@ -2093,7 +2095,8 @@ fn writeEvidence(
     defer out.deinit(allocator);
     try appendJsonFmt(allocator, &out,
         \\{{
-        \\"schema":"antfly.quant_kernel_metal_runtime_evidence.v1",
+        \\"evidence_contract":"{s}",
+        \\"schema":"{s}",
         \\"benchmark_command":{f},
         \\"benchmark_mode":"sequential",
         \\"repeat_runs":{d},
@@ -2109,6 +2112,8 @@ fn writeEvidence(
         \\"cases":[
         \\
     , .{
+        metal_quant_evidence_contract,
+        metal_runtime_evidence_schema,
         std.json.fmt(benchmark_command, .{}),
         repeat_runs,
         warmup_repeat_runs,
@@ -2808,8 +2813,10 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     const root = parsed.value;
     if (root != .object) return error.InvalidMetalEvidence;
 
+    const contract = jsonString(root.object.get("evidence_contract")) orelse return error.InvalidMetalEvidence;
+    if (!std.mem.eql(u8, contract, metal_quant_evidence_contract)) return error.InvalidMetalEvidence;
     const schema = jsonString(root.object.get("schema")) orelse return error.InvalidMetalEvidence;
-    if (!std.mem.eql(u8, schema, "antfly.quant_kernel_metal_runtime_evidence.v1")) return error.InvalidMetalEvidence;
+    if (!std.mem.eql(u8, schema, metal_runtime_evidence_schema)) return error.InvalidMetalEvidence;
     const benchmark_command = jsonString(root.object.get("benchmark_command")) orelse return error.InvalidMetalEvidence;
     if (!std.mem.startsWith(u8, benchmark_command, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out ")) return error.InvalidMetalEvidence;
     const benchmark_mode = jsonString(root.object.get("benchmark_mode")) orelse return error.InvalidMetalEvidence;
@@ -3593,6 +3600,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
     defer parsed.deinit();
 
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"evidence_contract\":\"antfly.quant_kernel_metal_evidence.v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"production_enabled\":false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_case_count\":0"));

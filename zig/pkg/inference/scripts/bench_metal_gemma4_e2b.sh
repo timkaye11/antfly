@@ -144,6 +144,16 @@ SH
     echo "missing generated counter gate in bench self-test summary" >&2
     exit 1
   fi
+  if ! grep -q '"evidence_contract": "antfly.quant_kernel_metal_evidence.v1"' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass/summary.json" >&2
+    echo "missing Metal quant evidence contract in bench self-test summary" >&2
+    exit 1
+  fi
+  if ! grep -q '"schema": "antfly.quant_kernel_metal_bench_summary.v1"' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass/summary.json" >&2
+    echo "missing Metal quant bench summary schema in bench self-test summary" >&2
+    exit 1
+  fi
   if ! grep -q '"quant_plan_planned": 14' "$tmp_dir/pass/summary.json"; then
     cat "$tmp_dir/pass.out" >&2
     cat "$tmp_dir/pass.err" >&2
@@ -931,6 +941,8 @@ median_e2e = statistics.median(r["e2e_tok_s"] for r in valid_measured)
 median_hot_decode = statistics.median(r["hot_decode_tok_s"] for r in valid_measured)
 mean_hot_decode = statistics.mean(r["hot_decode_tok_s"] for r in valid_measured)
 summary = {
+    "evidence_contract": "antfly.quant_kernel_metal_evidence.v1",
+    "schema": "antfly.quant_kernel_metal_bench_summary.v1",
     "median_decode_tok_s": median_decode,
     "mean_decode_tok_s": mean_decode,
     "median_e2e_tok_s": median_e2e,
