@@ -659,9 +659,13 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
@@ -686,14 +690,22 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
         .{
             provider_stats.metal_runtime_q4_k_linear_reduce,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q4_k_pair_reduce,
             provider_stats.metal_runtime_q4_k_pair_activation_reduce,
             provider_stats.metal_runtime_q4_k_pair_activation_reduce_f16_output,
             provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );

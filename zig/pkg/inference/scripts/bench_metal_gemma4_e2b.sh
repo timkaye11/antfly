@@ -118,7 +118,8 @@ metal_decoder_frame: begins=1 submits=1 wait_ms=1 gpu_ms=1
 metal_runtime_command_ops: total=447 attention_pre_norm=0 qkv_linear=0
 metal_runtime_command_operators: fallback=0 mul_mv=1 mul_mv_ext=0 mul_mm=0 get_rows=0 set_rows=0 cpy_q_to_f32=0 cpy_f32_to_q=0 attention_flash=0 attention_paged=1 attention_quantized_kv=0 dispatch_scalar=0 dispatch_mmv=1 dispatch_small_batch=0 dispatch_mm=0
 metal_q8_0_dispatch: scalar=0 mmv=1 small_batch=1 mm=0 rows_1=1 rows_2_8=1 rows_9_64=0 rows_65_plus=0 pair_act_mm_out_f16=0 linear_mm_in_f16=0 pair_act_rms_mmv_out_f16=0 linear_mmv_in_f16=0
-metal_q4_q6_k_dispatch: q4_linear_reduce=0 q4_pair_reduce=0 q4_pair_act_reduce=0 q4_pair_act_reduce_out_f16=0 q4_activation_rhs_reduce=0 q6_linear_reduce=0 q6_linear_reduce_in_f16=0
+metal_q4_0_dispatch: linear_reduce=3 linear_reduce_rows=1/2/0/0 linear_reduce_in_f16=0 linear_reduce_out_f16=0 linear_reduce_in_f16_out_f16=0 linear_reduce_sumsq=0 pair_act_reduce=0 pair_act_reduce_out_f16=0 pair_act_rms_scale_reduce_out_f16=0 activation_rhs_reduce=0 activation_rhs_reduce_out_f16=0 rms_norm_add_sumsq=0 pair_reduce=0 pair=0
+metal_q4_q6_k_dispatch: q4_linear_reduce=4 q4_linear_reduce_rows=0/4/0/0 q4_pair_reduce=0 q4_pair_act_reduce=0 q4_pair_act_reduce_out_f16=0 q4_activation_rhs_reduce=0 q6_linear_reduce=5 q6_linear_reduce_rows=5/0/0/0 q6_linear_reduce_in_f16=0
 metal_generated_quant_dispatch: q8_0_small_batch=1 q8_0_small_batch_bias=0 q8_0_small_batch_bias_gelu=0 q8_0_small_batch_relu=0 q8_1_small_batch=0 q8_k_small_batch=0 q2_k_small_batch=0 q2_k_small_batch_bias=0 q2_k_small_batch_bias_gelu=0 q3_k_small_batch=0 q3_k_small_batch_bias=0 q3_k_small_batch_bias_gelu=0 q4_0_small_batch=0 q4_1_small_batch=0 q5_0_small_batch=0 q5_1_small_batch=0 q4_k_small_batch=0 q4_k_small_batch_bias=0 q4_k_small_batch_bias_gelu=0 q5_k_small_batch=0 q5_k_small_batch_bias=0 q5_k_small_batch_bias_gelu=0 q6_k_small_batch=0 q6_k_small_batch_bias=0 q6_k_small_batch_bias_gelu=0
 metal_generated_quant_dispatch: q8_0_small_batch=2 q8_0_small_batch_bias=0 q8_0_small_batch_bias_gelu=0 q8_0_small_batch_relu=0 q8_1_small_batch=0 q8_k_small_batch=0 q2_k_small_batch=0 q2_k_small_batch_bias=0 q2_k_small_batch_bias_gelu=0 q3_k_small_batch=0 q3_k_small_batch_bias=0 q3_k_small_batch_bias_gelu=0 q4_0_small_batch=0 q4_1_small_batch=0 q5_0_small_batch=0 q5_1_small_batch=0 q4_k_small_batch=0 q4_k_small_batch_bias=0 q4_k_small_batch_bias_gelu=0 q5_k_small_batch=0 q5_k_small_batch_bias=0 q5_k_small_batch_bias_gelu=0 q6_k_small_batch=0 q6_k_small_batch_bias=0 q6_k_small_batch_bias_gelu=0
 metal_quant_kernel_plan: planned=2 handwritten_production=2 generated_production=0 unsupported_routes=0 generated_candidates=2 generated_artifact_missing=0 generated_runtime_not_wired=0 unsupported=0 unsupported_format=0 unsupported_shape=0 unsupported_epilogue=0 unsupported_backend=0 tensor_core_repack_required=0 top_fallback_reason=none top_fallback_count=0
@@ -149,14 +150,34 @@ SH
     echo "missing quant plan counters in bench self-test summary" >&2
     exit 1
   fi
+  if ! grep -q '"q4_0_linear_reduce_rows_2_8": 2' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass/summary.json" >&2
+    echo "missing Q4_0 row bucket counters in bench self-test summary" >&2
+    exit 1
+  fi
+  if ! grep -q '"q6_linear_reduce_rows_1": 5' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass/summary.json" >&2
+    echo "missing Q6 row bucket counters in bench self-test summary" >&2
+    exit 1
+  fi
   if ! grep -q $'gen_q6_small_batch\tquant_plan_planned\tquant_plan_handwritten_production' "$tmp_dir/pass/summary.tsv"; then
     cat "$tmp_dir/pass/summary.tsv" >&2
     echo "missing quant plan columns in bench self-test TSV" >&2
     exit 1
   fi
+  if ! grep -q $'q4_0_linear_reduce\tq4_0_linear_reduce_rows_1\tq4_0_linear_reduce_rows_2_8' "$tmp_dir/pass/summary.tsv"; then
+    cat "$tmp_dir/pass/summary.tsv" >&2
+    echo "missing row bucket columns in bench self-test TSV" >&2
+    exit 1
+  fi
   if ! awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) h[$i] = i } NR == 2 { found = ($(h["quant_plan_planned"]) == 2 && $(h["quant_plan_handwritten_production"]) == 2) } END { exit found ? 0 : 1 }' "$tmp_dir/pass/summary.tsv"; then
     cat "$tmp_dir/pass/summary.tsv" >&2
     echo "missing quant plan row values in bench self-test TSV" >&2
+    exit 1
+  fi
+  if ! awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) h[$i] = i } NR == 2 { found = ($(h["q4_0_linear_reduce_rows_1"]) == 1 && $(h["q4_0_linear_reduce_rows_2_8"]) == 2 && $(h["q6_linear_reduce_rows_1"]) == 5) } END { exit found ? 0 : 1 }' "$tmp_dir/pass/summary.tsv"; then
+    cat "$tmp_dir/pass/summary.tsv" >&2
+    echo "missing row bucket row values in bench self-test TSV" >&2
     exit 1
   fi
 
@@ -562,6 +583,12 @@ def grab(pattern, text, default=None, cast=int):
         return default
     return cast(m.group(1))
 
+def grab_buckets(pattern, text):
+    m = re.search(pattern, text)
+    if not m:
+        return (0, 0, 0, 0)
+    return tuple(int(m.group(i)) for i in range(1, 5))
+
 def generated_counters_from(text, path):
     matches = re.findall(r"^metal_generated_quant_dispatch:\s*(.*)$", text, re.MULTILINE)
     if not matches:
@@ -607,6 +634,7 @@ for path in sorted(out_dir.glob("*.txt")):
     q8_mmv = grab(r"metal_q8_0_dispatch:.*\bmmv=(\d+)", text, default=0)
     q8_mm = grab(r"metal_q8_0_dispatch:.*\bmm=(\d+)", text, default=0)
     q4_0_linear_reduce = grab(r"metal_q4_0_dispatch:.*\blinear_reduce=(\d+)", text, default=0)
+    q4_0_linear_reduce_rows_1, q4_0_linear_reduce_rows_2_8, q4_0_linear_reduce_rows_9_64, q4_0_linear_reduce_rows_65_plus = grab_buckets(r"metal_q4_0_dispatch:.*\blinear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)", text)
     q4_0_linear_reduce_in_f16 = grab(r"metal_q4_0_dispatch:.*\blinear_reduce_in_f16=(\d+)", text, default=0)
     q4_0_linear_reduce_out_f16 = grab(r"metal_q4_0_dispatch:.*\blinear_reduce_out_f16=(\d+)", text, default=0)
     q4_0_linear_reduce_in_f16_out_f16 = grab(r"metal_q4_0_dispatch:.*\blinear_reduce_in_f16_out_f16=(\d+)", text, default=0)
@@ -627,11 +655,13 @@ for path in sorted(out_dir.glob("*.txt")):
     q4_0_pair_act_reduce_encode_us = grab(r"metal_q4_0_encode_us:.*\bpair_act_reduce=(\d+)", text, default=0)
     q4_0_activation_rhs_reduce_encode_us = grab(r"metal_q4_0_encode_us:.*\bactivation_rhs_reduce=(\d+)", text, default=0)
     q4_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_linear_reduce=(\d+)", text, default=0)
+    q4_linear_reduce_rows_1, q4_linear_reduce_rows_2_8, q4_linear_reduce_rows_9_64, q4_linear_reduce_rows_65_plus = grab_buckets(r"metal_q4_q6_k_dispatch:.*\bq4_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)", text)
     q4_pair_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_reduce=(\d+)", text, default=0)
     q4_pair_act_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_act_reduce=(\d+)", text, default=0)
     q4_pair_act_reduce_out_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_act_reduce_out_f16=(\d+)", text, default=0)
     q4_activation_rhs_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_activation_rhs_reduce=(\d+)", text, default=0)
     q6_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce=(\d+)", text, default=0)
+    q6_linear_reduce_rows_1, q6_linear_reduce_rows_2_8, q6_linear_reduce_rows_9_64, q6_linear_reduce_rows_65_plus = grab_buckets(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)", text)
     q6_linear_reduce_in_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_in_f16=(\d+)", text, default=0)
     generated_counters = generated_counters_from(text, path)
     gen_q8_small_batch = generated_counters.get("q8_0_small_batch")
@@ -759,6 +789,10 @@ for path in sorted(out_dir.glob("*.txt")):
         "q8_mmv": q8_mmv,
         "q8_mm": q8_mm,
         "q4_0_linear_reduce": q4_0_linear_reduce,
+        "q4_0_linear_reduce_rows_1": q4_0_linear_reduce_rows_1,
+        "q4_0_linear_reduce_rows_2_8": q4_0_linear_reduce_rows_2_8,
+        "q4_0_linear_reduce_rows_9_64": q4_0_linear_reduce_rows_9_64,
+        "q4_0_linear_reduce_rows_65_plus": q4_0_linear_reduce_rows_65_plus,
         "q4_0_linear_reduce_in_f16": q4_0_linear_reduce_in_f16,
         "q4_0_linear_reduce_out_f16": q4_0_linear_reduce_out_f16,
         "q4_0_linear_reduce_in_f16_out_f16": q4_0_linear_reduce_in_f16_out_f16,
@@ -779,11 +813,19 @@ for path in sorted(out_dir.glob("*.txt")):
         "q4_0_pair_act_reduce_encode_us": q4_0_pair_act_reduce_encode_us,
         "q4_0_activation_rhs_reduce_encode_us": q4_0_activation_rhs_reduce_encode_us,
         "q4_linear_reduce": q4_linear_reduce,
+        "q4_linear_reduce_rows_1": q4_linear_reduce_rows_1,
+        "q4_linear_reduce_rows_2_8": q4_linear_reduce_rows_2_8,
+        "q4_linear_reduce_rows_9_64": q4_linear_reduce_rows_9_64,
+        "q4_linear_reduce_rows_65_plus": q4_linear_reduce_rows_65_plus,
         "q4_pair_reduce": q4_pair_reduce,
         "q4_pair_act_reduce": q4_pair_act_reduce,
         "q4_pair_act_reduce_out_f16": q4_pair_act_reduce_out_f16,
         "q4_activation_rhs_reduce": q4_activation_rhs_reduce,
         "q6_linear_reduce": q6_linear_reduce,
+        "q6_linear_reduce_rows_1": q6_linear_reduce_rows_1,
+        "q6_linear_reduce_rows_2_8": q6_linear_reduce_rows_2_8,
+        "q6_linear_reduce_rows_9_64": q6_linear_reduce_rows_9_64,
+        "q6_linear_reduce_rows_65_plus": q6_linear_reduce_rows_65_plus,
         "q6_linear_reduce_in_f16": q6_linear_reduce_in_f16,
         "gen_q8_small_batch": gen_q8_small_batch,
         "gen_q4_small_batch": gen_q4_small_batch,
@@ -936,7 +978,7 @@ summary = {
 }
 (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
-    f.write("label\ttokens\tfinish_reason\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tprefill_execute\tprefill_execute_fail\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tlast_compute_encoders\tlast_blit_encoders\tplanned_scopes\tplanned_barriers\tq8_mmv\tq8_mm\tq4_0_linear_reduce\tq4_0_linear_reduce_in_f16\tq4_0_linear_reduce_out_f16\tq4_0_linear_reduce_in_f16_out_f16\tq4_0_linear_reduce_sumsq\tq4_0_pair_act_reduce\tq4_0_pair_act_reduce_out_f16\tq4_0_pair_act_rms_scale_reduce_out_f16\tq4_0_activation_rhs_reduce\tq4_0_activation_rhs_reduce_out_f16\tq4_0_ple_activation_rhs_reduce_out_f16\tq4_0_ple_linear_reduce_in_f16\trms_norm_add_sumsq\tpaged_attention_1x\tq4_0_pair_reduce\tq4_0_pair\tq4_0_linear_reduce_encode_us\tq4_0_pair_reduce_encode_us\tq4_0_pair_act_reduce_encode_us\tq4_0_activation_rhs_reduce_encode_us\tq4_linear_reduce\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_in_f16\tgen_q8_small_batch\tgen_q4_small_batch\tgen_q5_small_batch\tgen_q6_small_batch\tquant_plan_planned\tquant_plan_handwritten_production\tquant_plan_generated_production\tquant_plan_unsupported_routes\tquant_plan_generated_candidates\tquant_plan_generated_artifact_missing\tquant_plan_generated_runtime_not_wired\tquant_plan_unsupported\tquant_plan_unsupported_format\tquant_plan_unsupported_shape\tquant_plan_unsupported_epilogue\tquant_plan_unsupported_backend\tquant_plan_tensor_core_repack_required\tquant_plan_top_fallback_reason\tquant_plan_top_fallback_count\tactive_decode_layers\tactive_decode_final_fused_argmax\tactive_decode_final_split_argmax\tactive_decode_frame_attempts\tactive_decode_frame_success\tcommand_ops\tcommand_operator_fallback\tcommand_op_attention\tcommand_op_ffn_pre_norm_scale\tcommand_op_ffn_gate_up_activation\tcommand_op_ple_projection\tcommand_op_ple_post_norm_residual\tcommand_op_tail_lm_head\tcommand_operator_mul_mv\tcommand_operator_mul_mm\tcommand_operator_attention_paged\truntime_region_attention_project\truntime_region_ffn\truntime_region_ple\truntime_region_embedding\truntime_region_layer\tquant_block_apply_ms\tquant_block_attention_span_ms\tquant_block_attention_prefix_ms\tquant_block_gated_ffn_ms\tquant_block_command_wait_ms\tquant_block_gpu_ms\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tspeculative_policy\tspeculative_decision\tspeculative_rounds\tspeculative_drafted\tspeculative_matched\tspeculative_accepted\tspeculative_mtp_enabled\tspeculative_acceptance_permille\tmtp_draft_steps\tmtp_resident_draft_steps\tmtp_host_draft_steps\tmtp_target_verify_calls\tmtp_dedicated_runtime_hits\tmtp_dedicated_runtime_fallbacks\tmtp_device_verify_commit_hits\tmtp_commit_forwards_required\tmtp_commit_forwards_avoided\tmtp_materializations\tmtp_draft_ms\tmtp_verify_ms\tmtp_materialization_ms\ttiming_valid\ttiming_invalid_reason\tfile\n")
+    f.write("label\ttokens\tfinish_reason\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tprefill_execute\tprefill_execute_fail\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tlast_compute_encoders\tlast_blit_encoders\tplanned_scopes\tplanned_barriers\tq8_mmv\tq8_mm\tq4_0_linear_reduce\tq4_0_linear_reduce_rows_1\tq4_0_linear_reduce_rows_2_8\tq4_0_linear_reduce_rows_9_64\tq4_0_linear_reduce_rows_65_plus\tq4_0_linear_reduce_in_f16\tq4_0_linear_reduce_out_f16\tq4_0_linear_reduce_in_f16_out_f16\tq4_0_linear_reduce_sumsq\tq4_0_pair_act_reduce\tq4_0_pair_act_reduce_out_f16\tq4_0_pair_act_rms_scale_reduce_out_f16\tq4_0_activation_rhs_reduce\tq4_0_activation_rhs_reduce_out_f16\tq4_0_ple_activation_rhs_reduce_out_f16\tq4_0_ple_linear_reduce_in_f16\trms_norm_add_sumsq\tpaged_attention_1x\tq4_0_pair_reduce\tq4_0_pair\tq4_0_linear_reduce_encode_us\tq4_0_pair_reduce_encode_us\tq4_0_pair_act_reduce_encode_us\tq4_0_activation_rhs_reduce_encode_us\tq4_linear_reduce\tq4_linear_reduce_rows_1\tq4_linear_reduce_rows_2_8\tq4_linear_reduce_rows_9_64\tq4_linear_reduce_rows_65_plus\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_rows_1\tq6_linear_reduce_rows_2_8\tq6_linear_reduce_rows_9_64\tq6_linear_reduce_rows_65_plus\tq6_linear_reduce_in_f16\tgen_q8_small_batch\tgen_q4_small_batch\tgen_q5_small_batch\tgen_q6_small_batch\tquant_plan_planned\tquant_plan_handwritten_production\tquant_plan_generated_production\tquant_plan_unsupported_routes\tquant_plan_generated_candidates\tquant_plan_generated_artifact_missing\tquant_plan_generated_runtime_not_wired\tquant_plan_unsupported\tquant_plan_unsupported_format\tquant_plan_unsupported_shape\tquant_plan_unsupported_epilogue\tquant_plan_unsupported_backend\tquant_plan_tensor_core_repack_required\tquant_plan_top_fallback_reason\tquant_plan_top_fallback_count\tactive_decode_layers\tactive_decode_final_fused_argmax\tactive_decode_final_split_argmax\tactive_decode_frame_attempts\tactive_decode_frame_success\tcommand_ops\tcommand_operator_fallback\tcommand_op_attention\tcommand_op_ffn_pre_norm_scale\tcommand_op_ffn_gate_up_activation\tcommand_op_ple_projection\tcommand_op_ple_post_norm_residual\tcommand_op_tail_lm_head\tcommand_operator_mul_mv\tcommand_operator_mul_mm\tcommand_operator_attention_paged\truntime_region_attention_project\truntime_region_ffn\truntime_region_ple\truntime_region_embedding\truntime_region_layer\tquant_block_apply_ms\tquant_block_attention_span_ms\tquant_block_attention_prefix_ms\tquant_block_gated_ffn_ms\tquant_block_command_wait_ms\tquant_block_gpu_ms\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tspeculative_policy\tspeculative_decision\tspeculative_rounds\tspeculative_drafted\tspeculative_matched\tspeculative_accepted\tspeculative_mtp_enabled\tspeculative_acceptance_permille\tmtp_draft_steps\tmtp_resident_draft_steps\tmtp_host_draft_steps\tmtp_target_verify_calls\tmtp_dedicated_runtime_hits\tmtp_dedicated_runtime_fallbacks\tmtp_device_verify_commit_hits\tmtp_commit_forwards_required\tmtp_commit_forwards_avoided\tmtp_materializations\tmtp_draft_ms\tmtp_verify_ms\tmtp_materialization_ms\ttiming_valid\ttiming_invalid_reason\tfile\n")
     for r in rows:
         f.write(
             f"{r['label']}\t{r['tokens']}\t{r['finish_reason']}\t{r['generate_ms']}\t{r['total_ms']}\t{r['runtime_prewarm_ms']}\t"
@@ -948,11 +990,11 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
             f"{r['decode_fallback']}\t{r['prefill_execute']}\t{r['prefill_execute_fail']}\t"
             f"{r['frame_begins']}\t{r['frame_wait_ms']}\t"
             f"{r['frame_gpu_ms']}\t{r['last_compute_encoders']}\t{r['last_blit_encoders']}\t{r['planned_scopes']}\t{r['planned_barriers']}\t{r['q8_mmv']}\t{r['q8_mm']}\t"
-            f"{r['q4_0_linear_reduce']}\t{r['q4_0_linear_reduce_in_f16']}\t{r['q4_0_linear_reduce_out_f16']}\t{r['q4_0_linear_reduce_in_f16_out_f16']}\t{r['q4_0_linear_reduce_sumsq']}\t{r['q4_0_pair_act_reduce']}\t{r['q4_0_pair_act_reduce_out_f16']}\t{r['q4_0_pair_act_rms_scale_reduce_out_f16']}\t{r['q4_0_activation_rhs_reduce']}\t{r['q4_0_activation_rhs_reduce_out_f16']}\t{r['q4_0_ple_activation_rhs_reduce_out_f16']}\t{r['q4_0_ple_linear_reduce_in_f16']}\t{r['rms_norm_add_sumsq']}\t{r['paged_attention_1x']}\t{r['q4_0_pair_reduce']}\t{r['q4_0_pair']}\t"
+            f"{r['q4_0_linear_reduce']}\t{r['q4_0_linear_reduce_rows_1']}\t{r['q4_0_linear_reduce_rows_2_8']}\t{r['q4_0_linear_reduce_rows_9_64']}\t{r['q4_0_linear_reduce_rows_65_plus']}\t{r['q4_0_linear_reduce_in_f16']}\t{r['q4_0_linear_reduce_out_f16']}\t{r['q4_0_linear_reduce_in_f16_out_f16']}\t{r['q4_0_linear_reduce_sumsq']}\t{r['q4_0_pair_act_reduce']}\t{r['q4_0_pair_act_reduce_out_f16']}\t{r['q4_0_pair_act_rms_scale_reduce_out_f16']}\t{r['q4_0_activation_rhs_reduce']}\t{r['q4_0_activation_rhs_reduce_out_f16']}\t{r['q4_0_ple_activation_rhs_reduce_out_f16']}\t{r['q4_0_ple_linear_reduce_in_f16']}\t{r['rms_norm_add_sumsq']}\t{r['paged_attention_1x']}\t{r['q4_0_pair_reduce']}\t{r['q4_0_pair']}\t"
             f"{r['q4_0_linear_reduce_encode_us']}\t{r['q4_0_pair_reduce_encode_us']}\t{r['q4_0_pair_act_reduce_encode_us']}\t{r['q4_0_activation_rhs_reduce_encode_us']}\t"
-            f"{r['q4_linear_reduce']}\t{r['q4_pair_reduce']}\t"
+            f"{r['q4_linear_reduce']}\t{r['q4_linear_reduce_rows_1']}\t{r['q4_linear_reduce_rows_2_8']}\t{r['q4_linear_reduce_rows_9_64']}\t{r['q4_linear_reduce_rows_65_plus']}\t{r['q4_pair_reduce']}\t"
             f"{r['q4_pair_act_reduce']}\t{r['q4_pair_act_reduce_out_f16']}\t"
-            f"{r['q4_activation_rhs_reduce']}\t{r['q6_linear_reduce']}\t"
+            f"{r['q4_activation_rhs_reduce']}\t{r['q6_linear_reduce']}\t{r['q6_linear_reduce_rows_1']}\t{r['q6_linear_reduce_rows_2_8']}\t{r['q6_linear_reduce_rows_9_64']}\t{r['q6_linear_reduce_rows_65_plus']}\t"
             f"{r['q6_linear_reduce_in_f16']}\t{r['gen_q8_small_batch']}\t"
             f"{r['gen_q4_small_batch']}\t{r['gen_q5_small_batch']}\t"
             f"{r['gen_q6_small_batch']}\t{r['quant_plan_planned']}\t"
