@@ -847,6 +847,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 null
         else
             null;
+        const graph_generate_stats = graph_mod.executor_stats.delta(graph_mod.executor_stats.snapshot(), graph_stats_before_generate);
+        const metal_stats_after_generate: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
+            if (cb.kind() == .metal) break :blk cb.debugTimingSnapshot();
+            break :blk null;
+        } else null;
 
         if (opts.print_token_count) print("tokens={d}\n", .{bench_result.tokens});
         if (opts.print_timing) {
@@ -882,6 +887,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(acquired_scheduler_at, created_backend_at),
                 durationMillis(created_backend_at, created_decode_state_at),
                 durationMillis(started_at, finished_generate_at),
+                metal_stats_after_generate,
+                graph_generate_stats,
                 cuda_stats_after_generate,
                 cuda_generate_stats,
             );
@@ -2255,9 +2262,14 @@ fn writeRawDecodeBenchJson(
     backend_setup_ms: u64,
     decode_setup_ms: u64,
     total_ms: u64,
+    metal_stats_opt: ?ops.BackendDebugTimingSnapshot,
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
     cuda_stats_opt: ?session_factory.CudaRuntimeStats,
     cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
 ) !void {
+    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt, graph_stats);
+    defer allocator.free(metal_json);
+
     const cuda_json = if (comptime build_options.enable_cuda)
         try cudaStatsCompactJson(allocator, cuda_stats_opt, result.tokens)
     else
@@ -2293,6 +2305,7 @@ fn writeRawDecodeBenchJson(
         \\"decode":{d},
         \\"total":{d}
         \\}},
+        \\"metal":{s},
         \\"cuda":{s},
         \\"cuda_generate":{s}
         \\}}
@@ -2316,6 +2329,7 @@ fn writeRawDecodeBenchJson(
             result.warmup_ms,
             result.decode_ms,
             total_ms,
+            metal_json,
             cuda_json,
             cuda_generate_json,
         },
@@ -6362,6 +6376,63 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
     defer std.testing.allocator.free(null_json);
     try std.testing.expectEqualStrings("null", null_json);
+}
+
+test "raw decode bench json includes metal compact stats" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "raw_decode_timing.json" });
+    defer std.testing.allocator.free(path);
+
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 7;
+
+    const graph_stats = graph_mod.executor_stats.ExecutionStats{
+        .quant_kernel_planned_ops = 5,
+        .quant_kernel_generated_candidates = 3,
+        .quant_kernel_fallback_unsupported_shape = 2,
+    };
+
+    try writeRawDecodeBenchJson(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        "test-model",
+        "metal",
+        .{
+            .tokens = 4,
+            .warmup_tokens = 1,
+            .prompt_tokens = 2,
+            .scope = "hidden_decode_no_lm_head_sampler",
+            .device_warmup_ms = 3,
+            .prefill_ms = 4,
+            .warmup_ms = 5,
+            .decode_ms = 6,
+        },
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        snapshot,
+        graph_stats,
+        null,
+        null,
+    );
+
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(128 * 1024));
+    defer std.testing.allocator.free(actual);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
+    defer parsed.deinit();
+
+    const metal = parsed.value.object.get("metal").?.object;
+    try std.testing.expectEqual(@as(i64, 7), metal.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), metal.get("quant_kernel_plan").?.object.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), metal.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
+    try std.testing.expectEqualStrings("unsupported_shape", metal.get("quant_kernel_plan").?.object.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);
 }
 
 test "parseArgs accepts artifact dir" {
