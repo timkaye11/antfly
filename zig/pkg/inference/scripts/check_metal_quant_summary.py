@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+
+LINEAR_REDUCE_BUCKETS = {
+    "q4_0_linear_reduce": (
+        "q4_0_linear_reduce_rows_1",
+        "q4_0_linear_reduce_rows_2_8",
+        "q4_0_linear_reduce_rows_9_64",
+        "q4_0_linear_reduce_rows_65_plus",
+    ),
+    "q4_linear_reduce": (
+        "q4_linear_reduce_rows_1",
+        "q4_linear_reduce_rows_2_8",
+        "q4_linear_reduce_rows_9_64",
+        "q4_linear_reduce_rows_65_plus",
+    ),
+    "q6_linear_reduce": (
+        "q6_linear_reduce_rows_1",
+        "q6_linear_reduce_rows_2_8",
+        "q6_linear_reduce_rows_9_64",
+        "q6_linear_reduce_rows_65_plus",
+    ),
+}
+
+STORED_TOTALS = {
+    "q4_0_linear_reduce": "q4_0_linear_reduce_row_total",
+    "q4_linear_reduce": "q4_linear_reduce_row_total",
+    "q6_linear_reduce": "q6_linear_reduce_row_total",
+}
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def int_field(row, key, path, label):
+    if key not in row:
+        fail(f"{path}: row {label}: missing {key}")
+    value = row[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(f"{path}: row {label}: {key} must be an integer, got {value!r}")
+    return value
+
+
+def measured_rows(summary, path):
+    rows = summary.get("rows")
+    if not isinstance(rows, list):
+        fail(f"{path}: summary rows must be a list")
+    measured = []
+    for row in rows:
+        if not isinstance(row, dict):
+            fail(f"{path}: summary row must be an object")
+        label = row.get("label", "")
+        if isinstance(label, str) and label.startswith("run-"):
+            measured.append(row)
+    if not measured:
+        fail(f"{path}: summary has no measured run-* rows")
+    return measured
+
+
+def check_summary(path):
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        fail(f"{path}: invalid JSON: {err}")
+
+    total_bucket_dispatches = 0
+    checked_rows = 0
+    for row in measured_rows(summary, path):
+        label = row.get("label", "<unknown>")
+        checked_rows += 1
+        row_bucket_dispatches = 0
+        for aggregate_key, bucket_keys in LINEAR_REDUCE_BUCKETS.items():
+            aggregate = int_field(row, aggregate_key, path, label)
+            bucket_total = sum(int_field(row, key, path, label) for key in bucket_keys)
+            if aggregate != bucket_total:
+                fail(
+                    f"{path}: row {label}: {aggregate_key}={aggregate} "
+                    f"does not match bucket total {bucket_total}"
+                )
+            stored_total_key = STORED_TOTALS[aggregate_key]
+            stored_total = int_field(row, stored_total_key, path, label)
+            if stored_total != bucket_total:
+                fail(
+                    f"{path}: row {label}: {stored_total_key}={stored_total} "
+                    f"does not match bucket total {bucket_total}"
+                )
+            row_bucket_dispatches += bucket_total
+
+        if row_bucket_dispatches:
+            planned = int_field(row, "quant_plan_planned", path, label)
+            handwritten = int_field(row, "quant_plan_handwritten_production", path, label)
+            if planned < row_bucket_dispatches or handwritten < row_bucket_dispatches:
+                fail(
+                    f"{path}: row {label}: quant row bucket dispatches "
+                    f"{row_bucket_dispatches} exceed plan counters "
+                    f"planned={planned} handwritten_production={handwritten}"
+                )
+        total_bucket_dispatches += row_bucket_dispatches
+
+    return checked_rows, total_bucket_dispatches
+
+
+def write_summary(path, rows):
+    path.write_text(json.dumps({"rows": rows}, indent=2) + "\n", encoding="utf-8")
+
+
+def self_test():
+    good_row = {
+        "label": "run-1",
+        "q4_0_linear_reduce": 3,
+        "q4_0_linear_reduce_rows_1": 1,
+        "q4_0_linear_reduce_rows_2_8": 2,
+        "q4_0_linear_reduce_rows_9_64": 0,
+        "q4_0_linear_reduce_rows_65_plus": 0,
+        "q4_0_linear_reduce_row_total": 3,
+        "q4_linear_reduce": 4,
+        "q4_linear_reduce_rows_1": 0,
+        "q4_linear_reduce_rows_2_8": 4,
+        "q4_linear_reduce_rows_9_64": 0,
+        "q4_linear_reduce_rows_65_plus": 0,
+        "q4_linear_reduce_row_total": 4,
+        "q6_linear_reduce": 5,
+        "q6_linear_reduce_rows_1": 5,
+        "q6_linear_reduce_rows_2_8": 0,
+        "q6_linear_reduce_rows_9_64": 0,
+        "q6_linear_reduce_rows_65_plus": 0,
+        "q6_linear_reduce_row_total": 5,
+        "quant_plan_planned": 12,
+        "quant_plan_handwritten_production": 12,
+    }
+    with tempfile.TemporaryDirectory(prefix="antfly-metal-quant-summary-check.") as tmp:
+        tmp_path = Path(tmp)
+        good = tmp_path / "good.json"
+        write_summary(good, [good_row])
+        check_summary(good)
+
+        mismatch = dict(good_row)
+        mismatch["q4_linear_reduce_rows_2_8"] = 3
+        mismatch_path = tmp_path / "mismatch.json"
+        write_summary(mismatch_path, [mismatch])
+        try:
+            check_summary(mismatch_path)
+        except SystemExit as err:
+            if "does not match bucket total" not in str(err):
+                raise
+        else:
+            fail("self-test expected bucket mismatch failure")
+
+        missing_plan = dict(good_row)
+        missing_plan["quant_plan_planned"] = 11
+        missing_plan_path = tmp_path / "missing-plan.json"
+        write_summary(missing_plan_path, [missing_plan])
+        try:
+            check_summary(missing_plan_path)
+        except SystemExit as err:
+            if "exceed plan counters" not in str(err):
+                raise
+        else:
+            fail("self-test expected plan counter failure")
+
+    print("metal quant summary checker self-test passed")
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "--self-test":
+        self_test()
+        return 0
+    if len(argv) < 2:
+        print(f"usage: {argv[0]} [--self-test] summary.json [...]", file=sys.stderr)
+        return 2
+    for arg in argv[1:]:
+        path = Path(arg)
+        checked_rows, bucket_dispatches = check_summary(path)
+        print(
+            f"metal quant summary check ok path={path} "
+            f"measured_rows={checked_rows} row_bucket_dispatches={bucket_dispatches}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

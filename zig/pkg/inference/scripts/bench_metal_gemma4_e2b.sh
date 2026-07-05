@@ -1069,32 +1069,6 @@ missing_q6_f16 = [r for r in measured if r["q6_linear_reduce_in_f16"] < min_q6_f
 missing_generated_q4 = [r for r in measured if r["gen_q4_small_batch"] < min_generated_q4_small_batch]
 missing_generated_q6 = [r for r in measured if r["gen_q6_small_batch"] < min_generated_q6_small_batch]
 missing_quant_plan = [r for r in measured if sum(r["generated_counters"].values()) > 0 and r["quant_plan_planned"] == 0]
-row_bucket_mismatches = [
-    (
-        r["label"],
-        r["q4_0_linear_reduce"], r["q4_0_linear_reduce_row_total"],
-        r["q4_linear_reduce"], r["q4_linear_reduce_row_total"],
-        r["q6_linear_reduce"], r["q6_linear_reduce_row_total"],
-    )
-    for r in measured
-    if r["q4_0_linear_reduce"] != r["q4_0_linear_reduce_row_total"]
-    or r["q4_linear_reduce"] != r["q4_linear_reduce_row_total"]
-    or r["q6_linear_reduce"] != r["q6_linear_reduce_row_total"]
-]
-missing_row_bucket_plan = [
-    (
-        r["label"],
-        r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"],
-        r["quant_plan_planned"],
-        r["quant_plan_handwritten_production"],
-    )
-    for r in measured
-    if r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"] > 0
-    and (
-        r["quant_plan_planned"] < r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"]
-        or r["quant_plan_handwritten_production"] < r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"]
-    )
-]
 missing_generated_counters = {
     key: [r["label"] for r in measured if r["generated_counters"].get(key, -1) < minimum]
     for key, minimum in min_generated_counter_gates.items()
@@ -1190,10 +1164,6 @@ if min_generated_q6_small_batch and missing_generated_q6:
     raise SystemExit(f"generated Q6_K small-batch dispatch below gate in measured runs: {[r['label'] for r in missing_generated_q6]}")
 if missing_quant_plan:
     raise SystemExit(f"quant kernel plan counters missing despite generated dispatches: {[r['label'] for r in missing_quant_plan]}")
-if row_bucket_mismatches:
-    raise SystemExit(f"Metal quant row bucket totals disagree with aggregate counters: {row_bucket_mismatches}")
-if missing_row_bucket_plan:
-    raise SystemExit(f"Metal quant row bucket dispatches missing from plan counters: {missing_row_bucket_plan}")
 for key, labels in missing_generated_counters.items():
     if labels:
         raise SystemExit(f"generated {key} dispatch below gate in measured runs: {labels}")
@@ -1224,5 +1194,7 @@ if median_decode < min_decode:
 if median_hot_decode < min_hot_decode:
     raise SystemExit(f"median hot decode tok/s {median_hot_decode:.3f} below gate {min_hot_decode:.3f}")
 PY
+
+python3 "$SCRIPT_DIR/check_metal_quant_summary.py" "$OUT_DIR/summary.json"
 
 echo "raw output: $OUT_DIR"

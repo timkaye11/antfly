@@ -441,6 +441,19 @@ pub fn build(b: *std.Build) void {
     quant_kernel_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
     quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
 
+    const metal_quant_summary_check_self_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/check_metal_quant_summary.py",
+        "--self-test",
+    });
+    const metal_quant_summary_check_self_test_step = b.step(
+        "test-metal-quant-summary-check",
+        "Run the Metal quant summary checker self-test",
+    );
+    metal_quant_summary_check_self_test_step.dependOn(&metal_quant_summary_check_self_test.step);
+    quant_kernel_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
+    quant_kernel_metal_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
+
     const metal_gemma4_bench_script_self_test = b.addSystemCommand(&.{
         "bash",
         "scripts/bench_metal_gemma4_e2b.sh",
