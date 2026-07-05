@@ -347,6 +347,9 @@ const ArtifactManifest = struct {
     checked_in_metal_evidence_count: usize,
     metal_local_check_command: []const u8,
     metal_model_local_check_command: []const u8,
+    metal_model_generated_route_check_command: []const u8,
+    metal_model_generated_q8_0_small_batch_min: usize,
+    metal_model_generated_q4_0_small_batch_min: usize,
     metal_industry_local_check_command: []const u8,
     metal_runtime_route_all_build_command: []const u8,
     metal_runtime_route_all_evidence_command: []const u8,
@@ -1574,6 +1577,9 @@ pub const first_metal_runtime_evidence_path = "/private/tmp/antfly-quant-metal-e
 pub const first_metal_runtime_evidence_command = "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out " ++ first_metal_runtime_evidence_path ++ " --repeat-runs " ++ metal_promotion_repeat_runs_text;
 pub const first_metal_local_check_command = "zig build quant-kernel-metal-local-check -Dmetal=true -Dcuda=false";
 pub const first_metal_model_local_check_command = "zig build quant-kernel-metal-model-local-check -Dmetal=true -Dcuda=false";
+pub const first_metal_model_generated_route_check_command = "zig build test-metal-gemma4-prefill-frame-e4b-generated-q8-q4-0 -Dmetal=true -Dcuda=false";
+pub const first_metal_model_generated_q8_0_small_batch_min: usize = 1;
+pub const first_metal_model_generated_q4_0_small_batch_min: usize = 1;
 pub const first_metal_industry_local_check_command = "zig build quant-kernel-metal-industry-local-check -Dmetal=true -Dcuda=false";
 pub const first_metal_runtime_route_all_evidence_path = "/private/tmp/antfly-quant-metal-runtime-route-all-evidence.json";
 pub const first_metal_runtime_route_all_build_command = "zig build quant-kernel-metal-runtime-route-all -Dmetal=true -Dcuda=false";
@@ -4904,6 +4910,9 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         .checked_in_metal_evidence_count = first_metal_runtime_evidence_count,
         .metal_local_check_command = first_metal_local_check_command,
         .metal_model_local_check_command = first_metal_model_local_check_command,
+        .metal_model_generated_route_check_command = first_metal_model_generated_route_check_command,
+        .metal_model_generated_q8_0_small_batch_min = first_metal_model_generated_q8_0_small_batch_min,
+        .metal_model_generated_q4_0_small_batch_min = first_metal_model_generated_q4_0_small_batch_min,
         .metal_industry_local_check_command = first_metal_industry_local_check_command,
         .metal_runtime_route_all_build_command = first_metal_runtime_route_all_build_command,
         .metal_runtime_route_all_evidence_command = first_metal_runtime_route_all_evidence_command,
@@ -7057,6 +7066,9 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, metal_evidence_count, "\"metal_promotion_min_speedup\": 1.1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, metal_evidence_count, "\"metal_promotion_repeat_runs\": 5"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_metal_model_local_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_metal_model_generated_route_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_model_generated_q8_0_small_batch_min\": 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_model_generated_q4_0_small_batch_min\": 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_metal_industry_local_check_command));
 }
 
