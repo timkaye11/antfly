@@ -149,9 +149,14 @@ SH
     echo "missing Metal quant evidence contract in bench self-test summary" >&2
     exit 1
   fi
-  if ! grep -q '"schema": "antfly.quant_kernel_metal_bench_summary.v1"' "$tmp_dir/pass/summary.json"; then
+  if ! grep -q '"schema": "antfly.quant_kernel_metal_bench_summary.v2"' "$tmp_dir/pass/summary.json"; then
     cat "$tmp_dir/pass/summary.json" >&2
     echo "missing Metal quant bench summary schema in bench self-test summary" >&2
+    exit 1
+  fi
+  if ! grep -q '"quant_plan_totals": {' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass/summary.json" >&2
+    echo "missing quant plan totals in bench self-test summary" >&2
     exit 1
   fi
   if ! grep -q '"quant_plan_planned": 14' "$tmp_dir/pass/summary.json"; then
@@ -940,9 +945,47 @@ mean_decode = statistics.mean(r["decode_tok_s"] for r in valid_measured)
 median_e2e = statistics.median(r["e2e_tok_s"] for r in valid_measured)
 median_hot_decode = statistics.median(r["hot_decode_tok_s"] for r in valid_measured)
 mean_hot_decode = statistics.mean(r["hot_decode_tok_s"] for r in valid_measured)
+quant_plan_total_keys = (
+    "quant_plan_planned",
+    "quant_plan_handwritten_production",
+    "quant_plan_generated_production",
+    "quant_plan_unsupported_routes",
+    "quant_plan_generated_candidates",
+    "quant_plan_generated_artifact_missing",
+    "quant_plan_generated_runtime_not_wired",
+    "quant_plan_unsupported",
+    "quant_plan_unsupported_format",
+    "quant_plan_unsupported_shape",
+    "quant_plan_unsupported_epilogue",
+    "quant_plan_unsupported_backend",
+    "quant_plan_tensor_core_repack_required",
+    "quant_mapped_failures",
+)
+fallback_fields = (
+    ("generated_artifact_missing", "quant_plan_generated_artifact_missing"),
+    ("generated_runtime_not_wired", "quant_plan_generated_runtime_not_wired"),
+    ("unsupported_format", "quant_plan_unsupported_format"),
+    ("unsupported_shape", "quant_plan_unsupported_shape"),
+    ("unsupported_epilogue", "quant_plan_unsupported_epilogue"),
+    ("unsupported_backend", "quant_plan_unsupported_backend"),
+    ("tensor_core_repack_required", "quant_plan_tensor_core_repack_required"),
+)
+quant_plan_totals = {key: sum(r[key] for r in measured) for key in quant_plan_total_keys}
+quant_plan_totals["measured_rows"] = len(measured)
+quant_plan_totals["row_bucket_dispatches"] = sum(
+    r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"]
+    for r in measured
+)
+quant_plan_totals["quant_plan_top_fallback_reason"] = "none"
+quant_plan_totals["quant_plan_top_fallback_count"] = 0
+for reason, key in fallback_fields:
+    if quant_plan_totals[key] > quant_plan_totals["quant_plan_top_fallback_count"]:
+        quant_plan_totals["quant_plan_top_fallback_reason"] = reason
+        quant_plan_totals["quant_plan_top_fallback_count"] = quant_plan_totals[key]
 summary = {
     "evidence_contract": "antfly.quant_kernel_metal_evidence.v1",
-    "schema": "antfly.quant_kernel_metal_bench_summary.v1",
+    "schema": "antfly.quant_kernel_metal_bench_summary.v2",
+    "quant_plan_totals": quant_plan_totals,
     "median_decode_tok_s": median_decode,
     "mean_decode_tok_s": mean_decode,
     "median_e2e_tok_s": median_e2e,

@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 EVIDENCE_CONTRACT = "antfly.quant_kernel_metal_evidence.v1"
-SUMMARY_SCHEMA = "antfly.quant_kernel_metal_bench_summary.v1"
+SUMMARY_SCHEMA = "antfly.quant_kernel_metal_bench_summary.v2"
 
 LINEAR_REDUCE_BUCKETS = {
     "q4_0_linear_reduce": (
@@ -57,6 +57,23 @@ FALLBACK_FIELDS = (
     ("unsupported_epilogue", "quant_plan_unsupported_epilogue"),
     ("unsupported_backend", "quant_plan_unsupported_backend"),
     ("tensor_core_repack_required", "quant_plan_tensor_core_repack_required"),
+)
+
+QUANT_PLAN_TOTAL_FIELDS = (
+    "quant_plan_planned",
+    "quant_plan_handwritten_production",
+    "quant_plan_generated_production",
+    "quant_plan_unsupported_routes",
+    "quant_plan_generated_candidates",
+    "quant_plan_generated_artifact_missing",
+    "quant_plan_generated_runtime_not_wired",
+    "quant_plan_unsupported",
+    "quant_plan_unsupported_format",
+    "quant_plan_unsupported_shape",
+    "quant_plan_unsupported_epilogue",
+    "quant_plan_unsupported_backend",
+    "quant_plan_tensor_core_repack_required",
+    "quant_mapped_failures",
 )
 
 
@@ -153,6 +170,43 @@ def check_plan_counters(row, path, label):
         )
 
 
+def row_bucket_dispatches(row, path, label):
+    return sum(int_field(row, STORED_TOTALS[key], path, label) for key in LINEAR_REDUCE_BUCKETS)
+
+
+def quant_plan_totals(rows, path):
+    totals = {key: 0 for key in QUANT_PLAN_TOTAL_FIELDS}
+    totals["measured_rows"] = len(rows)
+    totals["row_bucket_dispatches"] = 0
+    for row in rows:
+        label = row.get("label", "<unknown>")
+        for key in QUANT_PLAN_TOTAL_FIELDS:
+            totals[key] += int_field(row, key, path, label)
+        totals["row_bucket_dispatches"] += row_bucket_dispatches(row, path, label)
+
+    expected_reason = "none"
+    expected_count = 0
+    for reason, key in FALLBACK_FIELDS:
+        count = totals[key]
+        if count > expected_count:
+            expected_reason = reason
+            expected_count = count
+    totals["quant_plan_top_fallback_reason"] = expected_reason
+    totals["quant_plan_top_fallback_count"] = expected_count
+    return totals
+
+
+def check_quant_plan_totals(summary, measured, path):
+    actual = summary.get("quant_plan_totals")
+    if not isinstance(actual, dict):
+        fail(f"{path}: missing quant_plan_totals")
+    expected = quant_plan_totals(measured, path)
+    for key, want in expected.items():
+        got = actual.get(key)
+        if got != want:
+            fail(f"{path}: quant_plan_totals.{key}={got!r} does not match {want!r}")
+
+
 def check_summary(path):
     try:
         summary = json.loads(path.read_text(encoding="utf-8"))
@@ -161,7 +215,9 @@ def check_summary(path):
 
     total_bucket_dispatches = 0
     checked_rows = 0
-    for row in measured_rows(summary, path):
+    measured = measured_rows(summary, path)
+    check_quant_plan_totals(summary, measured, path)
+    for row in measured:
         label = row.get("label", "<unknown>")
         checked_rows += 1
         row_bucket_dispatches = 0
@@ -203,6 +259,7 @@ def write_summary(path, rows):
             {
                 "evidence_contract": EVIDENCE_CONTRACT,
                 "schema": SUMMARY_SCHEMA,
+                "quant_plan_totals": quant_plan_totals(rows, path),
                 "rows": rows,
             },
             indent=2,
@@ -248,6 +305,7 @@ def self_test():
         "quant_plan_tensor_core_repack_required": 0,
         "quant_plan_top_fallback_reason": "none",
         "quant_plan_top_fallback_count": 0,
+        "quant_mapped_failures": 0,
     }
     with tempfile.TemporaryDirectory(prefix="antfly-metal-quant-summary-check.") as tmp:
         tmp_path = Path(tmp)
@@ -337,6 +395,30 @@ def self_test():
                 raise
         else:
             fail("self-test expected top fallback failure")
+
+        bad_totals = tmp_path / "bad-totals.json"
+        bad_totals.write_text(
+            json.dumps(
+                {
+                    "evidence_contract": EVIDENCE_CONTRACT,
+                    "schema": SUMMARY_SCHEMA,
+                    "quant_plan_totals": {
+                        **quant_plan_totals([good_row], bad_totals),
+                        "quant_plan_planned": 11,
+                    },
+                    "rows": [good_row],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            check_summary(bad_totals)
+        except SystemExit as err:
+            if "quant_plan_totals.quant_plan_planned" not in str(err):
+                raise
+        else:
+            fail("self-test expected quant plan totals failure")
 
     print("metal quant summary checker self-test passed")
 
