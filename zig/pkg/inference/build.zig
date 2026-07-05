@@ -523,11 +523,27 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_frame_e4b_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_test.step);
 
+    const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q4_0_SMALL_BATCH=1",
+        "bash",
+        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "--e4b-smoke",
+        "--generated-q8-smoke",
+        "--antfly-bin",
+    });
+    metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.addFileArg(exe.getEmittedBin());
+    const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step = b.step(
+        "test-metal-gemma4-prefill-frame-e4b-generated-q8-q4-0",
+        "Run the local Metal Gemma4 E4B generated-Q8_0/Q4_0 route smoke test",
+    );
+    metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
+
     const quant_kernel_metal_model_local_check_step = b.step(
         "quant-kernel-metal-model-local-check",
         "Run local model-level Metal quant kernel smoke checks",
     );
-    quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_test.step);
+    quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
 
     const quant_kernel_metal_industry_local_check_step = b.step(
         "quant-kernel-metal-industry-local-check",
