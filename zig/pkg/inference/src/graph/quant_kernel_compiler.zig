@@ -386,6 +386,7 @@ const ArtifactManifestRecord = struct {
     promotion_ready: bool,
     promotion_blocker: []const u8,
     promotion_blocker_evidence_path: []const u8,
+    promotion_blocker_check_command: []const u8,
 };
 
 const SpecManifest = struct {
@@ -4897,12 +4898,17 @@ pub fn benchmarkManifestJson(allocator: std.mem.Allocator) ![]u8 {
 pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
     var records: [first_generated_artifacts.len]ArtifactManifestRecord = undefined;
     var owned_route_commands = [_][]const u8{""} ** first_generated_artifacts.len;
+    var owned_blocker_check_commands = [_][]const u8{""} ** first_generated_artifacts.len;
     defer for (owned_route_commands) |command| {
+        if (command.len != 0) allocator.free(command);
+    };
+    defer for (owned_blocker_check_commands) |command| {
         if (command.len != 0) allocator.free(command);
     };
     for (first_generated_artifacts, 0..) |artifact, index| {
         owned_route_commands[index] = try artifactRuntimeRouteEvidenceCommand(allocator, artifact);
-        records[index] = artifactManifestRecord(artifact, owned_route_commands[index]);
+        owned_blocker_check_commands[index] = try artifactPromotionBlockerCheckCommand(allocator, artifact);
+        records[index] = artifactManifestRecord(artifact, owned_route_commands[index], owned_blocker_check_commands[index]);
     }
     return std.json.Stringify.valueAlloc(allocator, ArtifactManifest{
         .schema = "antfly.quant_kernel_artifacts.v1",
@@ -5029,7 +5035,7 @@ fn benchmarkManifestRecord(bench: BenchmarkCase) BenchmarkManifestRecord {
     };
 }
 
-fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_command: []const u8) ArtifactManifestRecord {
+fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_command: []const u8, promotion_blocker_check_command: []const u8) ArtifactManifestRecord {
     return .{
         .backend = @tagName(artifact.backend),
         .format = @tagName(artifact.format),
@@ -5054,6 +5060,7 @@ fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_co
         .promotion_ready = artifactHasPromotionEvidence(artifact),
         .promotion_blocker = artifactPromotionBlocker(artifact),
         .promotion_blocker_evidence_path = artifactPromotionBlockerEvidencePath(artifact),
+        .promotion_blocker_check_command = promotion_blocker_check_command,
     };
 }
 
@@ -5068,6 +5075,16 @@ fn artifactRuntimeRouteEvidenceCommand(allocator: std.mem.Allocator, artifact: G
 
 pub fn artifactNeedsRuntimeRouteEvidence(artifact: GeneratedArtifact) bool {
     return artifact.backend == .metal and artifactRuntimeWired(artifact) and !artifactHasPromotionEvidence(artifact);
+}
+
+fn artifactPromotionBlockerCheckCommand(allocator: std.mem.Allocator, artifact: GeneratedArtifact) ![]const u8 {
+    const path = artifactPromotionBlockerEvidencePath(artifact);
+    if (path.len == 0) return "";
+    return std.fmt.allocPrint(
+        allocator,
+        "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence {s} --require-evidence-kernel {s}",
+        .{ path, artifact.kernel_id },
+    );
 }
 
 pub fn artifactRuntimeWired(artifact: GeneratedArtifact) bool {
@@ -7030,6 +7047,11 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\":"));
     try std.testing.expectEqual(blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\": \"/private/tmp/antfly-quant-metal-"));
     try std.testing.expectEqual(first_generated_artifacts.len - blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\": \"\""));
+    try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\":"));
+    try std.testing.expectEqual(blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\": \"zig build quant-kernel-metal-runtime-check"));
+    try std.testing.expectEqual(blocked_evidence_path_count, std.mem.count(u8, manifest, "--require-evidence-kernel"));
+    try std.testing.expectEqual(first_generated_artifacts.len - blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\": \"\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "--require-evidence-kernel " ++ first_general_metal_q4_0_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, runtime_wired_artifacts, "\"runtime_wired\": true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts, "\"runtime_wired\": false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts, "\"runtime_gate_env\": \"\""));

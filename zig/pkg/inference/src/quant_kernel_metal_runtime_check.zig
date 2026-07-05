@@ -741,6 +741,7 @@ const Config = struct {
     require_promotion_ready: bool = false,
     require_runtime_route_all: bool = false,
     require_kernel: ?[]const u8 = null,
+    require_evidence_kernel: ?[]const u8 = null,
     check_blocker_evidence: bool = false,
     refresh_blocker_evidence: bool = false,
     promotion_ready_kernel: ?[]const u8 = null,
@@ -766,9 +767,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cfg.check_evidence_path) |path| {
-        const summary = checkEvidenceFileWithSummary(allocator, path, cfg.require_promotion_ready, cfg.require_runtime_route_all, cfg.require_kernel) catch |err| {
+        const required_evidence_kernel = cfg.require_kernel orelse cfg.require_evidence_kernel;
+        const summary = checkEvidenceFileWithSummary(allocator, path, cfg.require_promotion_ready, cfg.require_runtime_route_all, required_evidence_kernel) catch |err| {
             if (err == error.MetalEvidencePromotionNotReady) {
-                if (checkEvidenceFileWithSummary(allocator, path, false, cfg.require_runtime_route_all, cfg.require_kernel)) |summary| {
+                if (checkEvidenceFileWithSummary(allocator, path, false, cfg.require_runtime_route_all, required_evidence_kernel)) |summary| {
                     printEvidenceSummary(path, "not_ready", summary);
                 } else |_| {}
             }
@@ -899,6 +901,11 @@ fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingRequireKernel;
             cfg.require_kernel = args[i];
+        } else if (std.mem.eql(u8, arg, "--require-evidence-kernel")) {
+            if (cfg.require_evidence_kernel != null) return error.DuplicateRequireEvidenceKernel;
+            i += 1;
+            if (i >= args.len) return error.MissingRequireEvidenceKernel;
+            cfg.require_evidence_kernel = args[i];
         } else if (std.mem.eql(u8, arg, "--check-blocker-evidence")) {
             if (cfg.check_blocker_evidence) return error.DuplicateCheckBlockerEvidence;
             cfg.check_blocker_evidence = true;
@@ -943,17 +950,19 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.check_blocker_evidence and cfg.check_evidence_path != null) return error.CheckBlockerEvidenceConflictsWithCheckEvidence;
     if (cfg.check_blocker_evidence and cfg.repeat_runs != 1) return error.CheckBlockerEvidenceConflictsWithRepeatRuns;
     if (cfg.check_blocker_evidence and cfg.measure_iters != null) return error.CheckBlockerEvidenceConflictsWithMeasureIters;
-    if (cfg.check_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.CheckBlockerEvidenceConflictsWithRuntimeMode;
+    if (cfg.check_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.require_evidence_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.CheckBlockerEvidenceConflictsWithRuntimeMode;
     if (cfg.refresh_blocker_evidence and cfg.evidence_out_path != null) return error.RefreshBlockerEvidenceConflictsWithEvidenceOut;
     if (cfg.refresh_blocker_evidence and cfg.check_evidence_path != null) return error.RefreshBlockerEvidenceConflictsWithCheckEvidence;
     if (cfg.refresh_blocker_evidence and cfg.check_blocker_evidence) return error.RefreshBlockerEvidenceConflictsWithCheckBlockerEvidence;
     if (cfg.refresh_blocker_evidence and cfg.repeat_runs != 1) return error.RefreshBlockerEvidenceConflictsWithRepeatRuns;
     if (cfg.refresh_blocker_evidence and cfg.measure_iters != null) return error.RefreshBlockerEvidenceConflictsWithMeasureIters;
-    if (cfg.refresh_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.RefreshBlockerEvidenceConflictsWithRuntimeMode;
+    if (cfg.refresh_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.require_evidence_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.RefreshBlockerEvidenceConflictsWithRuntimeMode;
     if (cfg.require_promotion_ready and cfg.check_evidence_path == null) return error.PromotionReadyRequiresCheckEvidence;
     if (cfg.require_runtime_route_all and cfg.check_evidence_path == null) return error.RuntimeRouteAllRequiresCheckEvidence;
     if (cfg.require_runtime_route_all and cfg.require_promotion_ready) return error.RequireRuntimeRouteAllConflictsWithPromotionReady;
     if (cfg.require_kernel != null and !cfg.require_promotion_ready) return error.RequireKernelRequiresPromotionReady;
+    if (cfg.require_evidence_kernel != null and cfg.check_evidence_path == null) return error.RequireEvidenceKernelRequiresCheckEvidence;
+    if (cfg.require_kernel != null and cfg.require_evidence_kernel != null) return error.RequireKernelConflictsWithRequireEvidenceKernel;
     if (cfg.promotion_ready_kernel != null and cfg.evidence_out_path == null) return error.PromotionReadyKernelRequiresEvidenceOut;
     if (cfg.promotion_ready_kernel != null and !hasPromotionRepeatRuns(cfg.repeat_runs)) return error.PromotionReadyKernelRequiresRepeatRuns;
     if (cfg.promotion_ready_kernel != null and cfg.measure_iters != quant_kernel_compiler.metal_promotion_measure_iters) return error.PromotionReadyKernelRequiresMeasureIters;
@@ -977,13 +986,19 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectEqualStrings("/tmp/evidence.json", check_cfg.check_evidence_path.?);
     try std.testing.expect(check_cfg.require_promotion_ready);
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_general_metal_q4_kernel_id, check_cfg.require_kernel.?);
+    const evidence_kernel_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-evidence-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id });
+    try std.testing.expectEqualStrings("/tmp/evidence.json", evidence_kernel_cfg.check_evidence_path.?);
+    try std.testing.expectEqualStrings(quant_kernel_compiler.first_general_metal_q4_kernel_id, evidence_kernel_cfg.require_evidence_kernel.?);
     const promotion_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "500", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id });
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_general_metal_q4_kernel_id, promotion_cfg.promotion_ready_kernel.?);
     try std.testing.expectError(error.MissingCheckEvidencePath, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence" }));
     try std.testing.expectError(error.MissingRequireKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--require-kernel" }));
+    try std.testing.expectError(error.MissingRequireEvidenceKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--require-evidence-kernel" }));
     try std.testing.expectError(error.MissingPromotionReadyKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--promotion-ready-kernel" }));
     try std.testing.expectError(error.PromotionReadyRequiresCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--require-promotion-ready" }));
     try std.testing.expectError(error.RequireKernelRequiresPromotionReady, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
+    try std.testing.expectError(error.RequireEvidenceKernelRequiresCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--require-evidence-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
+    try std.testing.expectError(error.RequireKernelConflictsWithRequireEvidenceKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-promotion-ready", "--require-kernel", "a", "--require-evidence-kernel", "a" }));
     try std.testing.expectError(error.PromotionReadyKernelRequiresEvidenceOut, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id, "--repeat-runs", "3" }));
     try std.testing.expectError(error.PromotionReadyKernelRequiresRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "3", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
     try std.testing.expectError(error.PromotionReadyKernelRequiresRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
@@ -994,6 +1009,7 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.DuplicateCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/a.json", "--check-evidence", "/tmp/b.json" }));
     try std.testing.expectError(error.DuplicateRequirePromotionReady, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/a.json", "--require-promotion-ready", "--require-promotion-ready" }));
     try std.testing.expectError(error.DuplicateRequireKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/a.json", "--require-promotion-ready", "--require-kernel", "a", "--require-kernel", "b" }));
+    try std.testing.expectError(error.DuplicateRequireEvidenceKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/a.json", "--require-evidence-kernel", "a", "--require-evidence-kernel", "b" }));
     try std.testing.expectError(error.DuplicatePromotionReadyKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "3", "--promotion-ready-kernel", "a", "--promotion-ready-kernel", "b" }));
 
     const repeat_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "3" });
@@ -3790,6 +3806,8 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(found_promoted_artifact_case);
 
     try checkEvidenceFile(std.testing.allocator, path, false, false, null);
+    try checkEvidenceFile(std.testing.allocator, path, false, false, quant_kernel_compiler.first_general_metal_q4_0_kernel_id);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFile(std.testing.allocator, path, false, false, "missing_kernel"));
     try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceFile(std.testing.allocator, path, true, false, null));
 
     const copied_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "copied-evidence.json" });
