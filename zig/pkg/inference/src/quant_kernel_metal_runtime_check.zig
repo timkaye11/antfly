@@ -744,6 +744,7 @@ const Config = struct {
     require_evidence_kernel: ?[]const u8 = null,
     check_blocker_evidence: bool = false,
     refresh_blocker_evidence: bool = false,
+    fail_on_cleared_blocker: bool = false,
     promotion_ready_kernel: ?[]const u8 = null,
     runtime_route_kernel: ?[]const u8 = null,
     runtime_route_all: bool = false,
@@ -763,6 +764,7 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.check_blocker_evidence) {
         const summary = try checkBlockerEvidence(allocator);
         printBlockerEvidenceAuditSummary(summary);
+        try enforceClearedBlockerPolicy(summary, cfg.fail_on_cleared_blocker);
         return;
     }
 
@@ -785,6 +787,7 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.refresh_blocker_evidence) {
         const summary = try refreshBlockerEvidence(allocator);
         printBlockerEvidenceAuditSummary(summary);
+        try enforceClearedBlockerPolicy(summary, cfg.fail_on_cleared_blocker);
         return;
     }
 
@@ -912,6 +915,9 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--refresh-blocker-evidence")) {
             if (cfg.refresh_blocker_evidence) return error.DuplicateRefreshBlockerEvidence;
             cfg.refresh_blocker_evidence = true;
+        } else if (std.mem.eql(u8, arg, "--fail-on-cleared-blocker")) {
+            if (cfg.fail_on_cleared_blocker) return error.DuplicateFailOnClearedBlocker;
+            cfg.fail_on_cleared_blocker = true;
         } else if (std.mem.eql(u8, arg, "--promotion-ready-kernel")) {
             if (cfg.promotion_ready_kernel != null) return error.DuplicatePromotionReadyKernel;
             i += 1;
@@ -957,6 +963,7 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.refresh_blocker_evidence and cfg.repeat_runs != 1) return error.RefreshBlockerEvidenceConflictsWithRepeatRuns;
     if (cfg.refresh_blocker_evidence and cfg.measure_iters != null) return error.RefreshBlockerEvidenceConflictsWithMeasureIters;
     if (cfg.refresh_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.require_evidence_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.RefreshBlockerEvidenceConflictsWithRuntimeMode;
+    if (cfg.fail_on_cleared_blocker and !cfg.check_blocker_evidence and !cfg.refresh_blocker_evidence) return error.FailOnClearedBlockerRequiresBlockerEvidence;
     if (cfg.require_promotion_ready and cfg.check_evidence_path == null) return error.PromotionReadyRequiresCheckEvidence;
     if (cfg.require_runtime_route_all and cfg.check_evidence_path == null) return error.RuntimeRouteAllRequiresCheckEvidence;
     if (cfg.require_runtime_route_all and cfg.require_promotion_ready) return error.RequireRuntimeRouteAllConflictsWithPromotionReady;
@@ -1026,6 +1033,9 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expect(blocker_check_cfg.check_blocker_evidence);
     const blocker_refresh_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence" });
     try std.testing.expect(blocker_refresh_cfg.refresh_blocker_evidence);
+    const strict_blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--fail-on-cleared-blocker" });
+    try std.testing.expect(strict_blocker_check_cfg.check_blocker_evidence);
+    try std.testing.expect(strict_blocker_check_cfg.fail_on_cleared_blocker);
     try std.testing.expectError(error.MissingRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--repeat-runs" }));
     try std.testing.expectError(error.InvalidRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--repeat-runs", "0" }));
     try std.testing.expectError(error.MissingMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--measure-iters" }));
@@ -1036,6 +1046,8 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.DuplicateMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--measure-iters", "100", "--measure-iters", "200" }));
     try std.testing.expectError(error.DuplicateRuntimeRouteAll, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--runtime-route-all", "--runtime-route-all" }));
     try std.testing.expectError(error.DuplicateCheckBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--check-blocker-evidence" }));
+    try std.testing.expectError(error.DuplicateFailOnClearedBlocker, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--fail-on-cleared-blocker", "--fail-on-cleared-blocker" }));
+    try std.testing.expectError(error.FailOnClearedBlockerRequiresBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--fail-on-cleared-blocker" }));
     try std.testing.expectError(error.CheckBlockerEvidenceConflictsWithEvidenceOut, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--evidence-out", "/tmp/evidence.json" }));
     try std.testing.expectError(error.CheckBlockerEvidenceConflictsWithCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--check-evidence", "/tmp/evidence.json" }));
     try std.testing.expectError(error.CheckBlockerEvidenceConflictsWithRuntimeMode, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--runtime-route-all" }));
@@ -2619,6 +2631,10 @@ const BlockerEvidenceAuditSummary = struct {
     evidence_blocker_counts: PromotionBlockerCounts = .{},
 };
 
+fn enforceClearedBlockerPolicy(summary: BlockerEvidenceAuditSummary, fail_on_cleared_blocker: bool) !void {
+    if (fail_on_cleared_blocker and summary.cleared_blocker_count != 0) return error.MetalBlockerEvidenceCleared;
+}
+
 fn printBlockerEvidenceAuditSummary(summary: BlockerEvidenceAuditSummary) void {
     std.debug.print(
         "quant-kernel-metal-runtime-check blocker_evidence ok entries={d} checked={d} skipped_no_path={d} cleared={d} timing_drift={d} table_blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}} evidence_blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}}\n",
@@ -4193,6 +4209,9 @@ test "quant kernel metal runtime promotion blocker reports unstable repeat timin
         },
         quant_kernel_compiler.metal_blocker_unstable_benchmark_timing,
     ));
+    try enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 0 }, true);
+    try enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 1 }, false);
+    try std.testing.expectError(error.MetalBlockerEvidenceCleared, enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 1 }, true));
     try std.testing.expect(!productionRegressionEvidenceHasHardBlocker(.{
         .case_count = 2,
         .promotion_case_count = 2,

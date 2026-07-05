@@ -305,6 +305,7 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_metal_production_regression_step = b.step("quant-kernel-metal-production-regression-check", "Run promoted Metal quant kernel production regression gate");
     const quant_kernel_metal_blocker_evidence_refresh_step = b.step("quant-kernel-metal-blocker-evidence-refresh", "Refresh local Metal promotion blocker evidence");
     const quant_kernel_metal_blocker_evidence_step = b.step("quant-kernel-metal-blocker-evidence-check", "Check saved Metal promotion blocker evidence");
+    const quant_kernel_metal_blocker_strict_step = b.step("quant-kernel-metal-blocker-strict-check", "Fail if saved Metal blocker evidence clears and needs promotion review");
     var quant_kernel_metal_production_regression_run_step: ?*std.Build.Step = null;
     if (target.result.os.tag == .macos) {
         const quant_kernel_metal_runtime_check_exe = b.addExecutable(.{
@@ -379,12 +380,24 @@ pub fn build(b: *std.Build) void {
         }
         check_quant_kernel_metal_blocker_evidence.step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
         quant_kernel_metal_blocker_evidence_step.dependOn(&check_quant_kernel_metal_blocker_evidence.step);
+
+        const strict_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        strict_quant_kernel_metal_blocker_evidence.addArgs(&.{
+            "--check-blocker-evidence",
+            "--fail-on-cleared-blocker",
+        });
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            strict_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
+        }
+        strict_quant_kernel_metal_blocker_evidence.step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
+        quant_kernel_metal_blocker_strict_step.dependOn(&strict_quant_kernel_metal_blocker_evidence.step);
     } else {
         quant_kernel_metal_runtime_check_step.dependOn(&quant_kernel_codegen_test_check.step);
         quant_kernel_metal_runtime_route_all_step.dependOn(&quant_kernel_codegen_test_check.step);
         quant_kernel_metal_production_regression_step.dependOn(&quant_kernel_codegen_test_check.step);
         quant_kernel_metal_blocker_evidence_refresh_step.dependOn(&quant_kernel_codegen_test_check.step);
         quant_kernel_metal_blocker_evidence_step.dependOn(&quant_kernel_codegen_test_check.step);
+        quant_kernel_metal_blocker_strict_step.dependOn(&quant_kernel_codegen_test_check.step);
     }
     const quant_kernel_metal_runtime_check_tests = b.addTest(.{
         .root_module = b.createModule(.{
