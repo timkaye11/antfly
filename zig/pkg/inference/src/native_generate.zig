@@ -363,7 +363,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     generation.gemma4_mtp_debug_override = opts.debug_mtp;
     try warmInitCudaBeforeLargeModelScan(opts.backend);
-    const model = try model_manager.loadFromDir(opts.model_dir);
+    const model = model_manager.loadFromDir(opts.model_dir) catch |err| {
+        print("error: failed to load model {s} with backend {s}: {s}\n", .{ opts.model_dir, @tagName(opts.backend), @errorName(err) });
+        return err;
+    };
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
     var gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
     if (opts.disable_gemma_embedding_scale and gpt_config.family == .gemma) {
@@ -478,7 +481,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         };
     }
 
-    if (try tryRunLiveWholeModelExecutorGenerate(
+    const live_whole_model_executed = tryRunLiveWholeModelExecutorGenerate(
         allocator,
         io,
         &opts,
@@ -491,7 +494,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         started_at,
         loaded_model_at,
         encoded_prompt_at,
-    )) return;
+    ) catch |err| {
+        print("error: live whole-model generate failed for {s} with backend {s}: {s}\n", .{
+            opts.model_dir,
+            @tagName(opts.backend),
+            @errorName(err),
+        });
+        return err;
+    };
+    if (live_whole_model_executed) return;
 
     if (!graph_mode) {
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
@@ -1548,6 +1559,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d}\n",
+                    .{
+                        cuda_stats.quant_kernel_planned_ops,
+                        cuda_stats.quant_kernel_handwritten_production,
+                        cuda_stats.quant_kernel_generated_production,
+                        cuda_stats.quant_kernel_unsupported_routes,
+                        cuda_stats.quant_kernel_generated_candidates,
+                        cuda_stats.quant_kernel_fallback_generated_artifact_missing,
+                        cuda_stats.quant_kernel_fallback_generated_runtime_not_wired,
+                        cuda_stats.quant_kernel_fallback_unsupported,
+                        cuda_stats.quant_kernel_fallback_unsupported_format,
+                        cuda_stats.quant_kernel_fallback_unsupported_shape,
+                        cuda_stats.quant_kernel_fallback_unsupported_epilogue,
+                        cuda_stats.quant_kernel_fallback_unsupported_backend,
+                        cuda_stats.quant_kernel_fallback_tensor_core_repack_required,
+                    },
+                );
+                print(
                     "cuda_head_norm_rope_counts: fused_hits={d} fused_fallbacks={d}\n",
                     .{
                         cuda_stats.head_norm_rope_fused_hits,
@@ -1620,6 +1649,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
     if (opts.json_timing_path) |path| {
+        const metal_stats_after_generate: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
+            if (cb.kind() == .metal) break :blk cb.debugTimingSnapshot();
+            break :blk null;
+        } else null;
         try writeJsonTiming(
             allocator,
             io,
@@ -1634,6 +1667,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             durationMillis(created_backend_at, created_decode_state_at),
             durationMillis(created_decode_state_at, finished_generate_at),
             durationMillis(started_at, finished_generate_at),
+            metal_stats_after_generate,
             cuda_stats_after_generate,
             cuda_generate_stats,
             draft_cuda_stats_after_generate,
@@ -1845,6 +1879,252 @@ fn cudaStatsCompactJson(
     return try out.toOwnedSlice(allocator);
 }
 
+fn metalStatsCompactJson(
+    allocator: std.mem.Allocator,
+    stats_opt: ?ops.BackendDebugTimingSnapshot,
+) ![]u8 {
+    const stats = stats_opt orelse return allocator.dupe(u8, "null");
+    const provider = stats.provider;
+    const command_operators = provider.metal_runtime_last_frame_planned_command_operator_counts;
+    const command_dispatch = provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts;
+    const generated_route_json = try graph_mod.quant_kernel_compiler.metalRuntimeRouteSummaryJson(allocator);
+    defer allocator.free(generated_route_json);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(
+        allocator,
+        &out,
+        \\{{
+        \\"native_quant_null":{},
+        \\"runtime_command_operators":{{
+        \\"fallback":{d},
+        \\"mul_mv":{d},
+        \\"mul_mv_ext":{d},
+        \\"mul_mm":{d},
+        \\"get_rows":{d},
+        \\"set_rows":{d},
+        \\"cpy_q_to_f32":{d},
+        \\"cpy_f32_to_q":{d},
+        \\"attention_flash":{d},
+        \\"attention_paged":{d},
+        \\"attention_quantized_kv":{d},
+        \\"dispatch_scalar":{d},
+        \\"dispatch_mmv":{d},
+        \\"dispatch_small_batch":{d},
+        \\"dispatch_mm":{d}
+        \\}}
+    ,
+        .{
+            stats.native_quant_null,
+            command_operators[0],
+            command_operators[1],
+            command_operators[2],
+            command_operators[3],
+            command_operators[4],
+            command_operators[5],
+            command_operators[6],
+            command_operators[7],
+            command_operators[8],
+            command_operators[9],
+            command_operators[10],
+            command_dispatch[0],
+            command_dispatch[1],
+            command_dispatch[2],
+            command_dispatch[3],
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"q8_0_dispatch":{{
+        \\"scalar":{d},
+        \\"mmv":{d},
+        \\"small_batch":{d},
+        \\"mm":{d},
+        \\"rows_1":{d},
+        \\"rows_2_8":{d},
+        \\"rows_9_64":{d},
+        \\"rows_65_plus":{d},
+        \\"pair_act_mm_out_f16":{d},
+        \\"linear_mm_in_f16":{d},
+        \\"pair_act_rms_mmv_out_f16":{d},
+        \\"linear_mmv_in_f16":{d}
+        \\}},
+        \\"k_quant_dispatch":{{
+        \\"q4_linear_reduce":{d},
+        \\"q4_pair_reduce":{d},
+        \\"q4_pair_act_reduce":{d},
+        \\"q4_pair_act_reduce_out_f16":{d},
+        \\"q4_activation_rhs_reduce":{d},
+        \\"q6_linear_reduce":{d},
+        \\"q6_linear_reduce_in_f16":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_q8_0_linear_dispatch_scalar,
+            provider.metal_runtime_q8_0_linear_dispatch_mmv,
+            provider.metal_runtime_q8_0_linear_dispatch_small_batch,
+            provider.metal_runtime_q8_0_linear_dispatch_mm,
+            provider.metal_runtime_q8_0_linear_rows_1,
+            provider.metal_runtime_q8_0_linear_rows_2_8,
+            provider.metal_runtime_q8_0_linear_rows_9_64,
+            provider.metal_runtime_q8_0_linear_rows_65_plus,
+            provider.metal_runtime_q8_0_pair_activation_mm_f16_output,
+            provider.metal_runtime_q8_0_linear_mm_f16_input,
+            provider.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output,
+            provider.metal_runtime_q8_0_linear_mmv_f16_input,
+            provider.metal_runtime_q4_k_linear_reduce,
+            provider.metal_runtime_q4_k_pair_reduce,
+            provider.metal_runtime_q4_k_pair_activation_reduce,
+            provider.metal_runtime_q4_k_pair_activation_reduce_f16_output,
+            provider.metal_runtime_q4_k_activation_rhs_reduce,
+            provider.metal_runtime_q6_k_linear_reduce,
+            provider.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"generated_quant_dispatch":{{
+        \\"q8_0_small_batch":{d},
+        \\"q8_0_small_batch_bias":{d},
+        \\"q8_0_small_batch_bias_gelu":{d},
+        \\"q8_0_small_batch_relu":{d},
+        \\"q8_1_small_batch":{d},
+        \\"q8_k_small_batch":{d},
+        \\"q2_k_small_batch":{d},
+        \\"q2_k_small_batch_bias":{d},
+        \\"q2_k_small_batch_bias_gelu":{d},
+        \\"q3_k_small_batch":{d},
+        \\"q3_k_small_batch_bias":{d},
+        \\"q3_k_small_batch_bias_gelu":{d},
+        \\"q4_0_small_batch":{d},
+        \\"q4_1_small_batch":{d},
+        \\"q5_0_small_batch":{d},
+        \\"q5_1_small_batch":{d},
+        \\"q4_k_small_batch":{d},
+        \\"q4_k_small_batch_bias":{d},
+        \\"q4_k_small_batch_bias_gelu":{d},
+        \\"q5_k_small_batch":{d},
+        \\"q5_k_small_batch_bias":{d},
+        \\"q5_k_small_batch_bias_gelu":{d},
+        \\"q6_k_small_batch":{d},
+        \\"q6_k_small_batch_bias":{d},
+        \\"q6_k_small_batch_bias_gelu":{d}
+        \\}},
+        \\"generated_quant_routes":{s}
+    ,
+        .{
+            provider.metal_runtime_antfly_q8_0_small_batch_dispatches,
+            provider.metal_runtime_antfly_q8_0_small_batch_bias_dispatches,
+            provider.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches,
+            provider.metal_runtime_antfly_q8_0_small_batch_relu_dispatches,
+            provider.metal_runtime_antfly_q8_1_small_batch_dispatches,
+            provider.metal_runtime_antfly_q8_k_small_batch_dispatches,
+            provider.metal_runtime_antfly_q2_k_small_batch_dispatches,
+            provider.metal_runtime_antfly_q2_k_small_batch_bias_dispatches,
+            provider.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches,
+            provider.metal_runtime_antfly_q3_k_small_batch_dispatches,
+            provider.metal_runtime_antfly_q3_k_small_batch_bias_dispatches,
+            provider.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches,
+            provider.metal_runtime_antfly_q4_0_small_batch_dispatches,
+            provider.metal_runtime_antfly_q4_1_small_batch_dispatches,
+            provider.metal_runtime_antfly_q5_0_small_batch_dispatches,
+            provider.metal_runtime_antfly_q5_1_small_batch_dispatches,
+            provider.metal_runtime_antfly_q4_k_small_batch_dispatches,
+            provider.metal_runtime_antfly_q4_k_small_batch_bias_dispatches,
+            provider.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches,
+            provider.metal_runtime_antfly_q5_k_small_batch_dispatches,
+            provider.metal_runtime_antfly_q5_k_small_batch_bias_dispatches,
+            provider.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches,
+            provider.metal_runtime_antfly_q6_k_small_batch_dispatches,
+            provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
+            provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
+            generated_route_json,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"frame_fallbacks":{{
+        \\"decode_attempts":{d},
+        \\"decode_success":{d},
+        \\"decode_disabled":{d},
+        \\"decode_scratch_fail":{d},
+        \\"decode_fallback":{d},
+        \\"decode_batch":{d},
+        \\"decode_initial":{d},
+        \\"decode_layer":{d},
+        \\"decode_tail":{d},
+        \\"prefill_plan":{d},
+        \\"prefill_plan_attempts":{d},
+        \\"prefill_plan_fail":{d},
+        \\"prefill_execute":{d},
+        \\"prefill_execute_attempts":{d},
+        \\"prefill_execute_fail":{d},
+        \\"prefill_missing_ple":{d}
+        \\}}
+    ,
+        .{
+            provider.active_decode_frame_attempts,
+            provider.active_decode_frame_successes,
+            provider.active_decode_frame_disabled,
+            provider.active_decode_frame_scratch_failures,
+            provider.active_decode_frame_fallbacks,
+            provider.active_decode_frame_batch_fallbacks,
+            provider.active_decode_frame_initial_tensor_fallbacks,
+            provider.active_decode_frame_layer_fallbacks,
+            provider.active_decode_frame_tail_fallbacks,
+            provider.prefill_frame_plan_successes,
+            provider.prefill_frame_plan_attempts,
+            provider.prefill_frame_plan_failures,
+            provider.prefill_frame_execute_successes,
+            provider.prefill_frame_execute_attempts,
+            provider.prefill_frame_execute_failures,
+            provider.prefill_frame_execute_missing_ple,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"residency":{{
+        \\"quantized_slots":{d},
+        \\"quantized_prepared_bytes":{d},
+        \\"runtime_prepared_slots":{d},
+        \\"runtime_prepared_bytes":{d},
+        \\"runtime_private_slots":{d},
+        \\"runtime_private_bytes":{d},
+        \\"runtime_mapped_slots":{d},
+        \\"runtime_mapped_bytes":{d},
+        \\"runtime_mapped_attempts":{d},
+        \\"runtime_mapped_fallbacks":{d},
+        \\"runtime_mapped_failures":{d},
+        \\"active_frame_bootstrap_misses":{d}
+        \\}}
+        \\}}
+    ,
+        .{
+            provider.metal_provider_quantized_slots,
+            provider.metal_provider_quantized_prepared_bytes,
+            provider.metal_provider_quantized_runtime_prepared_slots,
+            provider.metal_provider_quantized_runtime_prepared_bytes,
+            provider.metal_provider_quantized_runtime_private_slots,
+            provider.metal_provider_quantized_runtime_private_bytes,
+            provider.metal_provider_quantized_runtime_mapped_slots,
+            provider.metal_provider_quantized_runtime_mapped_bytes,
+            provider.metal_provider_quantized_runtime_mapped_attempts,
+            provider.metal_provider_quantized_runtime_mapped_fallbacks,
+            provider.metal_provider_quantized_runtime_mapped_failures,
+            provider.compressed_block_active_frame_bootstrap_misses,
+        },
+    );
+    return try out.toOwnedSlice(allocator);
+}
+
 fn writeJsonTiming(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1859,6 +2139,7 @@ fn writeJsonTiming(
     decode_setup_ms: u64,
     generate_ms: u64,
     total_ms: u64,
+    metal_stats_opt: ?ops.BackendDebugTimingSnapshot,
     cuda_stats_opt: ?session_factory.CudaRuntimeStats,
     cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
     draft_cuda_stats_opt: ?session_factory.CudaRuntimeStats,
@@ -2020,6 +2301,8 @@ fn writeJsonTiming(
         );
     } else try allocator.dupe(u8, "null");
     defer allocator.free(speculative_json);
+    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt);
+    defer allocator.free(metal_json);
     const cuda_json = if (comptime build_options.enable_cuda) blk: {
         if (cuda_stats_opt) |cuda_stats| {
             var cuda_out = std.ArrayListUnmanaged(u8).empty;
@@ -2669,6 +2952,7 @@ fn writeJsonTiming(
         \\"total_inner":{d}
         \\}},
         \\"speculative":{s},
+        \\"metal":{s},
         \\"cuda":{s},
         \\"cuda_generate":{s},
         \\"draft_cuda":{s},
@@ -2696,6 +2980,7 @@ fn writeJsonTiming(
             inner_timing.decode,
             inner_timing.total,
             speculative_json,
+            metal_json,
             cuda_json,
             cuda_generate_json,
             draft_cuda_json,
@@ -2862,7 +3147,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
 
     var runtime_model = try executor.createRuntime(allocator);
     defer runtime_model.deinit();
-    if (opts.print_timing and model.session.backend().usesGpuHostedSession()) {
+    if ((opts.print_timing or opts.json_timing_path != null) and model.session.backend().usesGpuHostedSession()) {
         runtime_model.resetDebugTimingStats();
     }
     const created_runtime_at = std.Io.Timestamp.now(io, .awake);
@@ -2891,7 +3176,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         if (!prewarm_ok) {
             std.log.warn("Gemma4 Metal runtime prewarm declined for {s}", .{opts.model_dir});
         }
-        if (opts.print_timing) {
+        if (opts.print_timing or opts.json_timing_path != null) {
             runtime_model.resetDebugTimingStats();
         }
     }
@@ -3295,6 +3580,49 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 },
             );
         }
+    }
+    if (opts.json_timing_path) |path| {
+        const live_timing = generation.GenerationTimingMs{
+            .prompt_format = 0,
+            .tokenize = durationMillis(loaded_model_at, encoded_prompt_at),
+            .runtime_prepare = durationMillis(encoded_prompt_at, warmed_runtime_at),
+            .prefill = durationMillis(prefill_started_at, finished_prefill_at),
+            .decode = durationMillis(finished_prefill_at, finished_generate_at),
+            .total = durationMillis(started_at, finished_generate_at),
+        };
+        const live_result = generation.GenerationResult{
+            .text = result_text,
+            .token_ids = result_token_ids,
+            .prompt_tokens = prompt_tokens,
+            .tokens_used = result_token_ids.len,
+            .finish_reason = finish_reason,
+            .timing_ms = live_timing,
+            .allocator = allocator,
+        };
+        const metal_stats: ?ops.BackendDebugTimingSnapshot = if (comptime build_options.enable_metal) blk: {
+            if (model.session.backend() == .metal) break :blk runtime_model.debugTimingStats().backend;
+            break :blk null;
+        } else null;
+        try writeJsonTiming(
+            allocator,
+            io,
+            path,
+            opts.model_dir,
+            @tagName(model.session.backend()),
+            &live_result,
+            durationMillis(started_at, loaded_model_at),
+            durationMillis(loaded_model_at, encoded_prompt_at),
+            0,
+            durationMillis(encoded_prompt_at, created_runtime_at),
+            0,
+            durationMillis(warmed_runtime_at, finished_generate_at),
+            durationMillis(started_at, finished_generate_at),
+            metal_stats,
+            null,
+            null,
+            null,
+            null,
+        );
     }
     return true;
 }
@@ -4524,6 +4852,46 @@ fn countPromptTokens(attention_mask: anytype) usize {
     var count: usize = 0;
     while (count < attention_mask.len and attention_mask[count] != 0) : (count += 1) {}
     return count;
+}
+
+test "metal stats compact json exposes generated quant and fallback counters" {
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_last_frame_planned_command_operator_counts[1] = 2;
+    snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
+    snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
+    snapshot.provider.metal_runtime_antfly_q8_0_small_batch_dispatches = 5;
+    snapshot.provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches = 6;
+    snapshot.provider.active_decode_frame_fallbacks = 7;
+    snapshot.provider.prefill_frame_execute_successes = 8;
+    snapshot.provider.prefill_frame_execute_attempts = 9;
+    snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
+    snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot);
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqual(false, root.get("native_quant_null").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), root.get("runtime_command_operators").?.object.get("mul_mv").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), root.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), root.get("q8_0_dispatch").?.object.get("rows_2_8").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);
+    try std.testing.expectEqualStrings(
+        "antfly_q8_0_small_batch_bias_msl_v1",
+        root.get("generated_quant_routes").?.object.get("q8_0_small_batch_bias").?.object.get("kernel_id").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 7), root.get("frame_fallbacks").?.object.get("decode_fallback").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), root.get("frame_fallbacks").?.object.get("prefill_execute").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), root.get("frame_fallbacks").?.object.get("prefill_execute_attempts").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
+
+    const null_json = try metalStatsCompactJson(std.testing.allocator, null);
+    defer std.testing.allocator.free(null_json);
+    try std.testing.expectEqualStrings("null", null_json);
 }
 
 test "parseArgs accepts artifact dir" {

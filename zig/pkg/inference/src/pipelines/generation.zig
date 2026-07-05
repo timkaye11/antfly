@@ -2251,7 +2251,9 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        debugGenerationStage("prepare compiled generation runtime begin prompt_token_count={d}", .{prompt_token_count});
         const runtime_prepared = try self.prepareCompiledGenerationRuntime(prompt_token_count);
+        debugGenerationStage("prepare compiled generation runtime end prepared={}", .{runtime_prepared});
         const prefill_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         if (runtime_prepared) {
             debugGenerationStage("prepared compiled generation runtime prompt_token_count={d}", .{prompt_token_count});
@@ -2936,14 +2938,18 @@ pub const NativeGenerationPipeline = struct {
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
-                if (try self.forwardGreedyCompiledModelToken(
+                const greedy_token = self.forwardGreedyCompiledModelToken(
                     prompt_ids,
                     1,
                     seq_len,
                     &decode_context,
                     config,
                     false,
-                )) |token| {
+                ) catch |err| {
+                    debugGenerationStage("executePrefill whole-model greedy failed: {s}", .{@errorName(err)});
+                    return err;
+                };
+                if (greedy_token) |token| {
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             scheduler.notePrefillProgress(lease, seq_len, seq_len);
@@ -2953,7 +2959,10 @@ pub const NativeGenerationPipeline = struct {
                     return .{ .greedy_token = token };
                 }
             }
-            prefill_last_logits = try self.forwardLastLogits(prompt_ids, 1, seq_len, &decode_context);
+            prefill_last_logits = self.forwardLastLogits(prompt_ids, 1, seq_len, &decode_context) catch |err| {
+                debugGenerationStage("executePrefill whole-model logits failed: {s}", .{@errorName(err)});
+                return err;
+            };
             if (self.scheduler) |scheduler| {
                 if (self.scheduler_lease) |lease| {
                     scheduler.notePrefillProgress(lease, seq_len, seq_len);
@@ -3702,6 +3711,8 @@ pub const NativeGenerationPipeline = struct {
         const cache = self.graph_cache orelse return false;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
+        // ponytail: Metal prefill prepares lazily; eager prepare is only a warmup and can be skipped.
+        if (self.compiled_partition_backend == .metal) return false;
         return graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint);
     }
 

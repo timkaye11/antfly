@@ -661,6 +661,36 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
+    std.debug.print(
+        "metal_generated_quant_dispatch: q8_0_small_batch={d} q8_0_small_batch_bias={d} q8_0_small_batch_bias_gelu={d} q8_0_small_batch_relu={d} q8_1_small_batch={d} q8_k_small_batch={d} q2_k_small_batch={d} q2_k_small_batch_bias={d} q2_k_small_batch_bias_gelu={d} q3_k_small_batch={d} q3_k_small_batch_bias={d} q3_k_small_batch_bias_gelu={d} q4_0_small_batch={d} q4_1_small_batch={d} q5_0_small_batch={d} q5_1_small_batch={d} q4_k_small_batch={d} q4_k_small_batch_bias={d} q4_k_small_batch_bias_gelu={d} q5_k_small_batch={d} q5_k_small_batch_bias={d} q5_k_small_batch_bias_gelu={d} q6_k_small_batch={d} q6_k_small_batch_bias={d} q6_k_small_batch_bias_gelu={d}\n",
+        .{
+            provider_stats.metal_runtime_antfly_q8_0_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q8_0_small_batch_bias_dispatches,
+            provider_stats.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches,
+            provider_stats.metal_runtime_antfly_q8_0_small_batch_relu_dispatches,
+            provider_stats.metal_runtime_antfly_q8_1_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q8_k_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q2_k_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q2_k_small_batch_bias_dispatches,
+            provider_stats.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches,
+            provider_stats.metal_runtime_antfly_q3_k_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q3_k_small_batch_bias_dispatches,
+            provider_stats.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches,
+            provider_stats.metal_runtime_antfly_q4_0_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q4_1_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q5_0_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q5_1_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q4_k_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q4_k_small_batch_bias_dispatches,
+            provider_stats.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches,
+            provider_stats.metal_runtime_antfly_q5_k_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q5_k_small_batch_bias_dispatches,
+            provider_stats.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches,
+            provider_stats.metal_runtime_antfly_q6_k_small_batch_dispatches,
+            provider_stats.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
+            provider_stats.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
+        },
+    );
     const q8_family_dispatch = provider_stats.metal_runtime_q8_0_linear_family_dispatch_counts;
     std.debug.print(
         "metal_q8_0_dispatch_families: none={d}/{d}/{d}/{d} pair_act={d}/{d}/{d}/{d} pair_act_rms={d}/{d}/{d}/{d} act_rhs={d}/{d}/{d}/{d} pair={d}/{d}/{d}/{d} qkv={d}/{d}/{d}/{d}\n",

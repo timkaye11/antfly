@@ -2923,6 +2923,12 @@ fn ensureMetalHostedSessionAvailable() !void {
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
 }
 
+test "gpu-hosted Metal availability gate agrees with linked runtime probe" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (metal_runtime.termite_metal_device_available() == 0) return error.SkipZigTest;
+    try ensureMetalHostedSessionAvailable();
+}
+
 fn openMetalHostedStream() !GpuHostedStream {
     try ensureMetalHostedSessionAvailable();
     if (comptime false) {

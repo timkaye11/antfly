@@ -52,6 +52,7 @@ pub const native_generate = @import("native_generate.zig");
 pub const native_compile = @import("native_compile.zig");
 pub const native_export = @import("native_export.zig");
 pub const native_quantize = @import("native_quantize.zig");
+pub const native_quant_kernel_codegen = @import("native_quant_kernel_codegen.zig");
 pub const native_export_gguf = @import("native_export_gguf.zig");
 pub const native_export_safetensors = @import("native_export_safetensors.zig");
 pub const native_run_artifact = @import("native_run_artifact.zig");
@@ -110,6 +111,7 @@ test {
     _ = native_compile;
     _ = native_export;
     _ = native_quantize;
+    _ = native_quant_kernel_codegen;
     _ = native_export_gguf;
     _ = native_export_safetensors;
     _ = native_run_artifact;

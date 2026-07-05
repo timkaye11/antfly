@@ -1066,7 +1066,6 @@ pub const ModelManager = struct {
         sm: *backends.SessionManager,
         cache_default_alias: bool,
     ) !*LoadedModel {
-
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();

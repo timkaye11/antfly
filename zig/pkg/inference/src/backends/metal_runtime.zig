@@ -6021,19 +6021,52 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_k_activation_rhs_reduce: u64 = 0,
     q6_k_linear_reduce: u64 = 0,
     q6_k_linear_reduce_f16_input: u64 = 0,
+    antfly_q8_0_small_batch_dispatches: u64 = 0,
+    antfly_q8_0_small_batch_bias_dispatches: u64 = 0,
+    antfly_q8_0_small_batch_bias_gelu_dispatches: u64 = 0,
+    antfly_q8_0_small_batch_relu_dispatches: u64 = 0,
+    antfly_q8_1_small_batch_dispatches: u64 = 0,
+    antfly_q8_k_small_batch_dispatches: u64 = 0,
+    antfly_q2_k_small_batch_dispatches: u64 = 0,
+    antfly_q2_k_small_batch_bias_dispatches: u64 = 0,
+    antfly_q2_k_small_batch_bias_gelu_dispatches: u64 = 0,
+    antfly_q3_k_small_batch_dispatches: u64 = 0,
+    antfly_q3_k_small_batch_bias_dispatches: u64 = 0,
+    antfly_q3_k_small_batch_bias_gelu_dispatches: u64 = 0,
+    antfly_q4_0_small_batch_dispatches: u64 = 0,
+    antfly_q4_1_small_batch_dispatches: u64 = 0,
+    antfly_q5_0_small_batch_dispatches: u64 = 0,
+    antfly_q5_1_small_batch_dispatches: u64 = 0,
+    antfly_q4_k_small_batch_dispatches: u64 = 0,
+    antfly_q4_k_small_batch_bias_dispatches: u64 = 0,
+    antfly_q4_k_small_batch_bias_gelu_dispatches: u64 = 0,
+    antfly_q5_k_small_batch_dispatches: u64 = 0,
+    antfly_q5_k_small_batch_bias_dispatches: u64 = 0,
+    antfly_q5_k_small_batch_bias_gelu_dispatches: u64 = 0,
+    antfly_q6_k_small_batch_dispatches: u64 = 0,
+    antfly_q6_k_small_batch_bias_dispatches: u64 = 0,
+    antfly_q6_k_small_batch_bias_gelu_dispatches: u64 = 0,
 };
 
 pub extern fn termite_metal_device_available() c_int;
 
+fn metalDeviceProbeTraceEnabled() bool {
+    return std.c.getenv("TERMITE_METAL_TRACE_DEVICE_AVAILABLE") != null;
+}
+
 fn sleepMetalProbeRetry() void {
-    var ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
+    var ts = std.c.timespec{ .sec = 0, .nsec = 100_000_000 };
     _ = std.c.nanosleep(&ts, &ts);
 }
 
 pub fn metalDeviceAvailable() bool {
-    for (0..3) |attempt| {
-        if (termite_metal_device_available() != 0) return true;
-        if (attempt != 2) sleepMetalProbeRetry();
+    const attempts = 10;
+    const trace = metalDeviceProbeTraceEnabled();
+    for (0..attempts) |attempt| {
+        const available = termite_metal_device_available() != 0;
+        if (trace) std.log.warn("metal device probe attempt={d} available={}", .{ attempt + 1, available });
+        if (available) return true;
+        if (attempt + 1 != attempts) sleepMetalProbeRetry();
     }
     return false;
 }
@@ -9669,6 +9702,35 @@ pub extern fn termite_metal_provider_linear_q8_0(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q8_0_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q8_0_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q8_0_relu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q8_1(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -9697,6 +9759,26 @@ pub extern fn termite_metal_provider_linear_q2_k(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q2_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q2_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q3_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -9704,6 +9786,26 @@ pub extern fn termite_metal_provider_linear_q3_k(
     in_dim: usize,
     weight_raw: [*c]const u8,
     out_dim: usize,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q3_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q3_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
     output: [*c]f32,
 ) c_int;
 pub extern fn termite_metal_provider_linear_q4_k(
@@ -9715,6 +9817,26 @@ pub extern fn termite_metal_provider_linear_q4_k(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q4_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q4_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q5_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -9724,6 +9846,26 @@ pub extern fn termite_metal_provider_linear_q5_k(
     out_dim: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn termite_metal_provider_linear_q5_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q5_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_provider_linear_q6_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -9731,6 +9873,26 @@ pub extern fn termite_metal_provider_linear_q6_k(
     in_dim: usize,
     weight_raw: [*c]const u8,
     out_dim: usize,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q6_k_bias(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
+    output: [*c]f32,
+) c_int;
+pub extern fn termite_metal_provider_linear_q6_k_bias_gelu(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    bias: [*c]const f32,
     output: [*c]f32,
 ) c_int;
 pub extern fn termite_metal_provider_linear_iq4_xs(

@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-  printf 'usage: %s [--check|--write] [--portable|--fatbin|--sm89|--all]\n' "$0"
+  printf 'usage: %s [--check|--write|--check-source-policy] [--portable|--fatbin|--sm89|--all]\n' "$0"
   printf 'Regenerates checked-in CUDA artifacts with the pinned CUDA 13.2 toolkit contract.\n'
 }
 
 mode="check"
 artifact_mode="all"
+source_policy_only="false"
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h)
@@ -16,6 +17,9 @@ while [ $# -gt 0 ]; do
       ;;
     --check)
       mode="check"
+      ;;
+    --check-source-policy)
+      source_policy_only="true"
       ;;
     --write)
       mode="write"
@@ -42,10 +46,51 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pkg_dir="$(cd "$script_dir/.." && pwd)"
+artifact_src_dir="$pkg_dir/src/ops/cuda/artifacts"
+dev_generated_src_dir="$pkg_dir/src/ops/cuda/generated"
 src="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.cu"
 ptx_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.ptx"
 fatbin_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin"
 sm89_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin"
+
+check_source_policy() {
+  if [ ! -f "$src" ]; then
+    printf 'error: CUDA artifact source does not exist: %s\n' "$src" >&2
+    exit 1
+  fi
+
+  case "$src" in
+    "$artifact_src_dir"/*) ;;
+    *)
+      printf 'error: CUDA artifact source must live under %s\n' "$artifact_src_dir" >&2
+      printf 'found: %s\n' "$src" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$src" in
+    "$dev_generated_src_dir"/*)
+      printf 'error: dev-generated CUDA kernels are not production artifact inputs: %s\n' "$src" >&2
+      exit 1
+      ;;
+  esac
+
+  if grep -Eq '^[[:space:]]*#include[[:space:]]*[<"][^">]*generated/' "$src"; then
+    printf 'error: production CUDA artifact source must not include dev-generated kernels\n' >&2
+    exit 1
+  fi
+
+  if grep -Eq 'Dev-only generated .*candidate from graph/quant_kernel_compiler\.zig|^[[:space:]]*//[[:space:]]*production_enabled=false' "$src"; then
+    printf 'error: production CUDA artifact source must not contain dev-only quant kernel candidates\n' >&2
+    exit 1
+  fi
+}
+
+check_source_policy
+if [ "$source_policy_only" = "true" ]; then
+  printf 'CUDA artifact source policy is up to date: %s\n' "$src"
+  exit 0
+fi
 
 cuda_home="${CUDA_HOME:-}"
 

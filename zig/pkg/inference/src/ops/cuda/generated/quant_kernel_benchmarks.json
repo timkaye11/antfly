@@ -1,0 +1,33 @@
+{
+  "schema": "antfly.quant_kernel_benchmarks.v1",
+  "benchmark_count": 1,
+  "evidence_count": 0,
+  "benchmarks": [
+    {
+      "name": "q4_k_small_batch_bias_gelu",
+      "backend": "cuda",
+      "format": "q4_k",
+      "row_bucket": "rows_2_8",
+      "epilogue": "bias_gelu",
+      "dispatch": "small_batch",
+      "generated_kernel_id": "antfly_q4_k_small_batch_bias_gelu_f32_v1",
+      "generated_source_path": "src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu",
+      "generated_source_fingerprint": 6179320649780566675,
+      "generated_ptx_path": "/tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx",
+      "generated_ptx_command": "nvcc -ptx -arch=compute_75 src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx",
+      "benchmark_command": "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json",
+      "generated_ptx_arg": "--quant-compiler-generated-ptx",
+      "handwritten_baseline": "termite_linear_q4_k_bias_gelu_f32_tile4_r2",
+      "correctness_tolerance_abs": 0.009999999776482582,
+      "minimum_speedup": 1,
+      "measured_speedup": 0,
+      "correctness_evidence_path": "",
+      "benchmark_evidence_path": "",
+      "benchmark_mode": "",
+      "production_enabled": false,
+      "promotion_ready": false,
+      "promotion_blocker": "production_disabled"
+    }
+  ],
+  "evidence_records": []
+}

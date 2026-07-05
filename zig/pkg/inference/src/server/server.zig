@@ -711,13 +711,22 @@ pub const Node = struct {
         defer io_impl.deinit();
         const io = io_impl.io();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
+        const model_path = self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators") catch |err| {
+            std.log.err("direct generator resolve failed model={s}: {s}", .{ model_name, @errorName(err) });
+            return err;
+        };
         const resolved_at_ns = embedTimingNowNs();
-        const model = if (preferred_backends) |backends|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, false)
+        const model = (if (preferred_backends) |backends|
+            self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            self.model_manager.loadFromDir(model_path)) catch |err| {
+            std.log.err("direct generator load failed model={s} path={s}: {s}", .{ model_name, model_path, @errorName(err) });
+            return err;
+        };
         const loaded_at_ns = embedTimingNowNs();
+        if (timing != null) {
+            std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
+        }
         model.lockNativeGeneration();
         defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
@@ -817,7 +826,17 @@ pub const Node = struct {
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
         const setup_at_ns = embedTimingNowNs();
-        var result = try pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 });
+        if (timing != null) {
+            std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
+        }
+        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 }) catch |err| {
+            std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
+                model_name,
+                @tagName(model.session.backend()),
+                @errorName(err),
+            });
+            return err;
+        };
         const generated_at_ns = embedTimingNowNs();
         defer result.deinit();
         if (debug_metal_timing) {
@@ -838,7 +857,18 @@ pub const Node = struct {
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
-        for (self.config.preload) |model| try self.warmModel(allocator, model);
+        for (self.config.preload) |model| {
+            self.warmModel(allocator, model) catch |err| {
+                const backend_name = if (model.backend) |backend| @tagName(backend) else "auto";
+                std.log.err("warming configured model failed kind={s} model={s} backend={s}: {s}", .{
+                    @tagName(model.kind),
+                    model.name,
+                    backend_name,
+                    @errorName(err),
+                });
+                return err;
+            };
+        }
     }
 
     pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
@@ -5483,6 +5513,24 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
     try appendPromMetric(writer, "inference_graph_executor_boundary_output_materializations_total", "counter", "Total graph executor boundary output materializations", stats.boundary_output_materializations);
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_slots_reserved_total", "counter", "Total graph executor planned buffer slots reserved", stats.graph_plan_slots_reserved);
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_bytes_reserved_total", "counter", "Total graph executor planned buffer bytes reserved", stats.graph_plan_bytes_reserved);
+    try appendPromMetric(writer, "inference_quant_kernel_planned_ops_total", "counter", "Total quant kernel planned operations", stats.quant_kernel_planned_ops);
+    try appendPromMetric(writer, "inference_quant_kernel_handwritten_production_total", "counter", "Total quant kernel handwritten production routes", stats.quant_kernel_handwritten_production);
+    try appendPromMetric(writer, "inference_quant_kernel_generated_production_total", "counter", "Total quant kernel generated production routes", stats.quant_kernel_generated_production);
+    try appendPromMetric(writer, "inference_quant_kernel_unsupported_routes_total", "counter", "Total quant kernel unsupported routes", stats.quant_kernel_unsupported_routes);
+    try appendPromMetric(writer, "inference_quant_kernel_generated_candidates_total", "counter", "Total quant kernel generated dev candidates observed", stats.quant_kernel_generated_candidates);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_generated_artifact_missing_total", "counter", "Total quant kernel fallbacks because generated artifacts are missing", stats.quant_kernel_fallback_generated_artifact_missing);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_generated_runtime_not_wired_total", "counter", "Total quant kernel fallbacks because generated artifacts are promoted but runtime dispatch is not wired", stats.quant_kernel_fallback_generated_runtime_not_wired);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_format_total", "counter", "Total quant kernel fallbacks due to unsupported formats", stats.quant_kernel_fallback_unsupported_format);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_shape_total", "counter", "Total quant kernel fallbacks due to unsupported shapes", stats.quant_kernel_fallback_unsupported_shape);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_epilogue_total", "counter", "Total quant kernel fallbacks due to unsupported epilogues", stats.quant_kernel_fallback_unsupported_epilogue);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_backend_total", "counter", "Total quant kernel fallbacks due to unsupported backends", stats.quant_kernel_fallback_unsupported_backend);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_tensor_core_repack_required_total", "counter", "Total quant kernel fallbacks requiring tensor-core repacking", stats.quant_kernel_fallback_tensor_core_repack_required);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_total", "counter", "Total quant kernel unsupported fallbacks", stats.quant_kernel_fallback_unsupported);
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(stats);
+    try writer.print(
+        "# HELP inference_quant_kernel_top_fallback_reason Current top quant kernel fallback reason by count\n# TYPE inference_quant_kernel_top_fallback_reason gauge\ninference_quant_kernel_top_fallback_reason{{reason=\"{s}\"}} {d}\n",
+        .{ top_fallback.name, top_fallback.count },
+    );
 }
 
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {
@@ -5519,11 +5567,38 @@ test "graph executor metrics render counters" {
         .partitions_executed = 1,
         .interpreter_fallbacks = 2,
         .host_materialized_outputs = 3,
+        .quant_kernel_planned_ops = 4,
+        .quant_kernel_handwritten_production = 5,
+        .quant_kernel_generated_production = 6,
+        .quant_kernel_unsupported_routes = 7,
+        .quant_kernel_generated_candidates = 8,
+        .quant_kernel_fallback_generated_artifact_missing = 9,
+        .quant_kernel_fallback_generated_runtime_not_wired = 10,
+        .quant_kernel_fallback_unsupported_format = 10,
+        .quant_kernel_fallback_unsupported_shape = 11,
+        .quant_kernel_fallback_unsupported_epilogue = 12,
+        .quant_kernel_fallback_unsupported_backend = 13,
+        .quant_kernel_fallback_tensor_core_repack_required = 14,
+        .quant_kernel_fallback_unsupported = 15,
     });
     const output = writer.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_partitions_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_interpreter_fallbacks_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_host_materialized_outputs_total 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_planned_ops_total 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_handwritten_production_total 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_generated_production_total 6\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_unsupported_routes_total 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_generated_candidates_total 8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_generated_artifact_missing_total 9\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_generated_runtime_not_wired_total 10\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_format_total 10\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_shape_total 11\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_epilogue_total 12\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_backend_total 13\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_tensor_core_repack_required_total 14\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_total 15\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_top_fallback_reason{reason=\"tensor_core_repack_required\"} 14\n") != null);
 }
 
 fn taskMatchesModelListing(task: []const u8, model_kind: []const u8, gliner_model_type: []const u8, tasks: []const []const u8, capabilities: []const []const u8) bool {

@@ -184,6 +184,8 @@ pub fn runFromArgs(
         try inference.native_export.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "quantize")) {
         try inference.native_quantize.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "quant-kernel-codegen")) {
+        try inference.native_quant_kernel_codegen.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "run-artifact")) {
         try inference.native_run_artifact.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "transcribe")) {
@@ -200,6 +202,8 @@ pub fn runFromArgs(
         try inference.finetune_cli.main(init, command_args);
     } else if (std.mem.eql(u8, command, "cuda-info")) {
         try inference.cuda_info.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "metal-info")) {
+        printMetalInfo();
     } else if (std.mem.eql(u8, command, "bench-cuda")) {
         try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
@@ -408,6 +412,13 @@ pub fn printVersion() void {
     });
 }
 
+fn printMetalInfo() void {
+    print("metal build_enabled={}\n", .{build_options.enable_metal});
+    if (comptime build_options.enable_metal) {
+        print("metal device_available={}\n", .{inference.metal_runtime.metalDeviceAvailable()});
+    }
+}
+
 fn printUsage(usage_name: []const u8) void {
     print(
         \\Usage: {s} <command> [options]
@@ -421,6 +432,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
         \\  quantize  Create a quantized model variant
+        \\  quant-kernel-codegen Verify or rewrite dev-generated quant kernel sources
         \\  run-artifact Run or validate a compiled offline artifact
         \\  transcribe Run native audio transcription from the command line
         \\  read      Run image/document reading from the command line
@@ -430,6 +442,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
         \\  cuda-info Inspect CUDA Driver API availability and optionally run CUDA smoke checks
+        \\  metal-info Inspect Metal device availability
         \\  bench-cuda Benchmark CUDA Q4_K, GLiNER2, and CLIP/CLAP kernel shapes
         \\  list      List available models
         \\  pull      Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL

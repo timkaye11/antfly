@@ -28,7 +28,9 @@ const native_compute_mod = @import("../native_compute.zig");
 const run_memory = @import("../../runtime/tier/memory.zig");
 const gguf_tensor_types = @import("../../gguf/tensor_types.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
+const backend_contracts = @import("../../graph/backend_contracts.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
+const quant_kernel_compiler = @import("../../graph/quant_kernel_compiler.zig");
 const operator_plan = @import("../../graph/operator_plan.zig");
 const kv_storage_runtime = @import("../../runtime/kv/storage_runtime.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
@@ -345,6 +347,19 @@ pub const RuntimeStats = struct {
     pub const top_transfer_size_count = 8;
 
     quant_ops: operator_plan.Stats = .{},
+    quant_kernel_planned_ops: usize = 0,
+    quant_kernel_handwritten_production: usize = 0,
+    quant_kernel_generated_production: usize = 0,
+    quant_kernel_unsupported_routes: usize = 0,
+    quant_kernel_generated_candidates: usize = 0,
+    quant_kernel_fallback_generated_artifact_missing: usize = 0,
+    quant_kernel_fallback_generated_runtime_not_wired: usize = 0,
+    quant_kernel_fallback_unsupported_format: usize = 0,
+    quant_kernel_fallback_unsupported_shape: usize = 0,
+    quant_kernel_fallback_unsupported_epilogue: usize = 0,
+    quant_kernel_fallback_unsupported_backend: usize = 0,
+    quant_kernel_fallback_tensor_core_repack_required: usize = 0,
+    quant_kernel_fallback_unsupported: usize = 0,
     h2d_bytes: usize = 0,
     d2h_bytes: usize = 0,
     d2d_bytes: usize = 0,
@@ -4589,18 +4604,37 @@ fn isKnownQuant(tensor: *const CudaTensor, known: gguf_tensor_types.KnownTensorT
 
 fn quantPlanFormatForTensor(tensor: *const CudaTensor) quant_matmul.Format {
     const quant_type = tensor.quant_type orelse return .f32;
-    return switch (quant_type) {
-        .known => |known| switch (known) {
-            .Q8_0 => .q8_0,
-            .Q4_0 => .q4_0,
-            .Q4_K => .q4_k,
-            .Q5_K => .q5_k,
-            .Q6_K => .q6_k,
-            .Q8_K => .q8_k,
-            else => .unknown,
-        },
-        else => .unknown,
+    return backend_contracts.quantFormatFromGgufTensorType(quant_type) orelse .unknown;
+}
+
+test "cuda quant plan format mirrors graph quant tensor mapping" {
+    const cases = [_]struct {
+        tensor_type: ?gguf_tensor_types.TensorType,
+        format: quant_matmul.Format,
+    }{
+        .{ .tensor_type = null, .format = .f32 },
+        .{ .tensor_type = .{ .known = .Q4_0 }, .format = .q4_0 },
+        .{ .tensor_type = .{ .known = .Q4_1 }, .format = .q4_1 },
+        .{ .tensor_type = .{ .known = .Q5_0 }, .format = .q5_0 },
+        .{ .tensor_type = .{ .known = .Q5_1 }, .format = .q5_1 },
+        .{ .tensor_type = .{ .known = .Q1_0 }, .format = .q1_0 },
+        .{ .tensor_type = .{ .known = .Q2_K }, .format = .q2_k },
+        .{ .tensor_type = .{ .known = .Q3_K }, .format = .q3_k },
+        .{ .tensor_type = .{ .known = .Q4_K }, .format = .q4_k },
+        .{ .tensor_type = .{ .known = .Q8_1 }, .format = .q8_1 },
+        .{ .tensor_type = .{ .known = .Q8_K }, .format = .q8_k },
+        .{ .tensor_type = .{ .known = .F16 }, .format = .unknown },
     };
+    for (cases) |case| {
+        const tensor = CudaTensor{
+            .buffer = .{},
+            .dtype = .f32,
+            .shape = &.{},
+            .elem_count = 0,
+            .quant_type = case.tensor_type,
+        };
+        try std.testing.expectEqual(case.format, quantPlanFormatForTensor(&tensor));
+    }
 }
 
 fn cudaAllowPlannedFallback() bool {
@@ -4632,10 +4666,26 @@ fn cudaDisableFusedQkv() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FUSED_QKV", false);
 }
 
-fn recordQuantMatmulPlan(self: *CudaCompute, weight_tensor: *const CudaTensor, op_plan: operator_plan.OperatorPlan) !void {
+fn recordQuantKernelCompilerPlan(
+    self: *CudaCompute,
+    plan: quant_matmul.Plan,
+    epilogue: quant_kernel_compiler.Epilogue,
+) void {
+    const lowering = quant_kernel_compiler.registryLoweringFor(.cuda, plan.format, plan.row_bucket, epilogue, plan.dispatch);
+    const counters = quant_kernel_compiler.countersForLowering(lowering);
+    quant_kernel_compiler.addCountersToStats(&self.stats, counters);
+}
+
+fn recordQuantMatmulPlan(
+    self: *CudaCompute,
+    weight_tensor: *const CudaTensor,
+    op_plan: operator_plan.OperatorPlan,
+    epilogue: quant_kernel_compiler.Epilogue,
+) !void {
     switch (op_plan) {
         .quant_matmul => |plan| {
             self.stats.quant_ops.add(plan.operator);
+            recordQuantKernelCompilerPlan(self, plan, epilogue);
             if (plan.format != quantPlanFormatForTensor(weight_tensor)) return error.CudaPlanFormatMismatch;
             if (plan.operator == .fallback and !cudaAllowPlannedFallback()) return error.CudaPlannedFallbackDisabled;
         },
@@ -5330,7 +5380,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
 fn linearPlanned(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(request.weight);
-    try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan);
+    try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan, .bias);
     return linear(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim);
 }
 
@@ -5619,7 +5669,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
 fn linearNoBiasPlanned(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedRequest) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(request.weight);
-    try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan);
+    try recordQuantMatmulPlan(self, weight_tensor, request.operator_plan, .none);
     return linearNoBias(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
 }
 

@@ -38,6 +38,7 @@ pub const webgpu_partition_executor = @import("webgpu_partition_executor.zig");
 pub const compiled_backend = @import("compiled_backend.zig");
 pub const compiled_registry = @import("compiled_registry.zig");
 pub const backend_contracts = @import("backend_contracts.zig");
+pub const quant_kernel_compiler = @import("quant_kernel_compiler.zig");
 pub const model_runtime = @import("model_runtime.zig");
 pub const decode_state_runtime = @import("decode_state_runtime.zig");
 pub const live_model_executor = @import("live_model_executor.zig");
@@ -136,6 +137,7 @@ test {
     _ = compiled_backend;
     _ = compiled_registry;
     _ = backend_contracts;
+    _ = quant_kernel_compiler;
     _ = model_runtime;
     _ = decode_state_runtime;
     _ = live_model_executor;

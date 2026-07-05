@@ -208,6 +208,7 @@ pub const FileAdvice = enum { normal, sequential, random, will_need, dont_need, 
 
 pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize, advice: FileAdvice) void {
     if (!comptime build_options.link_libc) return;
+    if (comptime builtin.os.tag != .linux) return;
     const path_z = allocator.dupeZ(u8, path) catch return;
     defer allocator.free(path_z);
     const fd = openReadOnlyZ(path_z) catch return;

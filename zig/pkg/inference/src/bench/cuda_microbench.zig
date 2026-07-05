@@ -22,6 +22,7 @@ const cuda_artifact = if (build_options.enable_cuda) @import("../ops/cuda/artifa
     const image = "";
 };
 const native_embed = @import("../native_embed.zig");
+const quant_kernel_compiler = @import("../graph/quant_kernel_compiler.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const compat = @import("../io/compat.zig");
 
@@ -58,6 +59,8 @@ const gemma4_shapes = [_]Shape{
     .{ .label = "Gemma4 LM head", .rows = 1, .in_dim = 3840, .out_dim = 262144 },
 };
 
+const quant_compiler_lazy_shape = Shape{ .label = "Q4_K compiler lazy", .rows = 8, .in_dim = 512, .out_dim = 768 };
+
 const Config = struct {
     warmup_iters: usize = 5,
     measure_iters: usize = 50,
@@ -65,8 +68,16 @@ const Config = struct {
     text: []const u8 = "a photo of a document with audio metadata",
     full_iters: usize = 1,
     gemma4_shapes: bool = false,
+    quant_compiler_lazy_target: bool = false,
+    quant_compiler_generated_ptx_path: ?[]const u8 = null,
+    quant_compiler_evidence_out_path: ?[]const u8 = null,
+    quant_compiler_check_evidence_path: ?[]const u8 = null,
+    quant_compiler_require_promotion_ready: bool = false,
+    quant_compiler_repeat_runs: usize = 1,
     json_out_path: ?[]const u8 = null,
 };
+
+const quant_compiler_evidence_repeat_runs: usize = 3;
 
 const BenchModule = if (build_options.enable_cuda) struct {
     module: cuda_driver.CUmodule = null,
@@ -80,6 +91,7 @@ const BenchModule = if (build_options.enable_cuda) struct {
     linear_q4_k_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_f32_tile8: cuda_driver.CUfunction = null,
     linear_q4_k_bias_f32_tile4: cuda_driver.CUfunction = null,
+    linear_q4_k_bias_gelu_f32_tile4_r2: cuda_driver.CUfunction = null,
     linear_q4_k_bias_quick_gelu_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_k_triple_bias_f32: cuda_driver.CUfunction = null,
     linear_q4_k_triple_bias_f32_tiled: cuda_driver.CUfunction = null,
@@ -110,6 +122,8 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tile8, module, "termite_linear_q4_k_f32_tile8"));
         var linear_q4_k_bias_f32_tile4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32_tile4, module, "termite_linear_q4_k_bias_f32_tile4"));
+        var linear_q4_k_bias_gelu_f32_tile4_r2: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_gelu_f32_tile4_r2, module, "termite_linear_q4_k_bias_gelu_f32_tile4_r2"));
         var linear_q4_k_bias_quick_gelu_f32_tile4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_quick_gelu_f32_tile4, module, "termite_linear_q4_k_bias_quick_gelu_f32_tile4"));
         var linear_q4_k_triple_bias_f32: cuda_driver.CUfunction = null;
@@ -129,6 +143,7 @@ const BenchModule = if (build_options.enable_cuda) struct {
             .linear_q4_k_f32_tile4 = linear_q4_k_f32_tile4,
             .linear_q4_k_f32_tile8 = linear_q4_k_f32_tile8,
             .linear_q4_k_bias_f32_tile4 = linear_q4_k_bias_f32_tile4,
+            .linear_q4_k_bias_gelu_f32_tile4_r2 = linear_q4_k_bias_gelu_f32_tile4_r2,
             .linear_q4_k_bias_quick_gelu_f32_tile4 = linear_q4_k_bias_quick_gelu_f32_tile4,
             .linear_q4_k_triple_bias_f32 = linear_q4_k_triple_bias_f32,
             .linear_q4_k_triple_bias_f32_tiled = linear_q4_k_triple_bias_f32_tiled,
@@ -150,6 +165,7 @@ const BenchModule = if (build_options.enable_cuda) struct {
             self.linear_q4_k_f32_tile4 = null;
             self.linear_q4_k_f32_tile8 = null;
             self.linear_q4_k_bias_f32_tile4 = null;
+            self.linear_q4_k_bias_gelu_f32_tile4_r2 = null;
             self.linear_q4_k_bias_quick_gelu_f32_tile4 = null;
             self.linear_q4_k_triple_bias_f32 = null;
             self.linear_q4_k_triple_bias_f32_tiled = null;
@@ -163,6 +179,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
     const cfg = try parseArgs(args);
+    if (cfg.quant_compiler_check_evidence_path) |path| {
+        try checkQuantCompilerEvidenceFile(allocator, io, path, cfg.quant_compiler_require_promotion_ready);
+        print("bench-cuda quant compiler evidence_check={s} ok\n", .{path});
+        return;
+    }
     if (!build_options.enable_cuda) {
         print("bench-cuda requires a build with -Dcuda=true\n", .{});
         return error.CudaUnavailable;
@@ -176,32 +197,73 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
 fn parseArgs(args: []const []const u8) !Config {
     var cfg = Config{};
+    var seen_quant_compiler_lazy_target = false;
+    var seen_benchmark_option = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--warmup-iters")) {
+            seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingWarmupIters;
             cfg.warmup_iters = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--measure-iters")) {
+            seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingMeasureIters;
             cfg.measure_iters = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--model")) {
+            seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingModelPath;
             cfg.model_path = args[i];
         } else if (std.mem.eql(u8, arg, "--text")) {
+            seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingText;
             cfg.text = args[i];
         } else if (std.mem.eql(u8, arg, "--full-iters")) {
+            seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingFullIters;
             cfg.full_iters = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--gemma4-shapes")) {
+            seen_benchmark_option = true;
             cfg.gemma4_shapes = true;
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-lazy-target")) {
+            if (seen_quant_compiler_lazy_target) return error.DuplicateQuantCompilerLazyTarget;
+            seen_quant_compiler_lazy_target = true;
+            seen_benchmark_option = true;
+            cfg.quant_compiler_lazy_target = true;
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-generated-ptx")) {
+            if (cfg.quant_compiler_generated_ptx_path != null) return error.DuplicateGeneratedPtxPath;
+            seen_benchmark_option = true;
+            i += 1;
+            if (i >= args.len) return error.MissingGeneratedPtxPath;
+            cfg.quant_compiler_lazy_target = true;
+            cfg.quant_compiler_generated_ptx_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-evidence-out")) {
+            if (cfg.quant_compiler_evidence_out_path != null) return error.DuplicateQuantCompilerEvidenceOutPath;
+            seen_benchmark_option = true;
+            i += 1;
+            if (i >= args.len) return error.MissingQuantCompilerEvidenceOutPath;
+            cfg.quant_compiler_evidence_out_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-check-evidence")) {
+            if (cfg.quant_compiler_check_evidence_path != null) return error.DuplicateQuantCompilerCheckEvidencePath;
+            i += 1;
+            if (i >= args.len) return error.MissingQuantCompilerCheckEvidencePath;
+            cfg.quant_compiler_check_evidence_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-require-promotion-ready")) {
+            if (cfg.quant_compiler_require_promotion_ready) return error.DuplicateQuantCompilerRequirePromotionReady;
+            cfg.quant_compiler_require_promotion_ready = true;
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-repeat-runs")) {
+            if (cfg.quant_compiler_repeat_runs != 1) return error.DuplicateQuantCompilerRepeatRuns;
+            seen_benchmark_option = true;
+            i += 1;
+            if (i >= args.len) return error.MissingQuantCompilerRepeatRuns;
+            cfg.quant_compiler_repeat_runs = try parseQuantCompilerRepeatRuns(args[i]);
         } else if (std.mem.eql(u8, arg, "--json-out")) {
+            seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingJsonOutPath;
             cfg.json_out_path = args[i];
@@ -211,9 +273,24 @@ fn parseArgs(args: []const []const u8) !Config {
             return error.InvalidArgument;
         }
     }
+    if (cfg.quant_compiler_require_promotion_ready and cfg.quant_compiler_check_evidence_path == null) return error.QuantCompilerPromotionReadyRequiresCheckEvidence;
+    if (cfg.quant_compiler_check_evidence_path != null) {
+        if (seen_benchmark_option) return error.QuantCompilerCheckEvidenceConflictsWithBenchmark;
+        return cfg;
+    }
     if (cfg.measure_iters == 0) return error.InvalidArgument;
     if (cfg.full_iters == 0) return error.InvalidArgument;
+    if (cfg.quant_compiler_lazy_target and cfg.quant_compiler_generated_ptx_path == null) return error.MissingGeneratedPtxPath;
+    if (cfg.quant_compiler_evidence_out_path != null and !cfg.quant_compiler_lazy_target) return error.QuantCompilerEvidenceRequiresLazyTarget;
+    if (cfg.quant_compiler_evidence_out_path != null and (cfg.warmup_iters != 5 or cfg.measure_iters != 50)) return error.QuantCompilerEvidenceRequiresManifestIterations;
+    if (cfg.quant_compiler_evidence_out_path != null and cfg.quant_compiler_repeat_runs != quant_compiler_evidence_repeat_runs) return error.QuantCompilerEvidenceRequiresManifestRepeatRuns;
     return cfg;
+}
+
+fn parseQuantCompilerRepeatRuns(text: []const u8) !usize {
+    const runs = try std.fmt.parseInt(usize, text, 10);
+    if (runs == 0 or runs > 31) return error.InvalidQuantCompilerRepeatRuns;
+    return runs;
 }
 
 fn wantsHelp(args: []const []const u8) bool {
@@ -223,14 +300,60 @@ fn wantsHelp(args: []const []const u8) bool {
     return false;
 }
 
+test "cuda microbench quant compiler flags select lazy target" {
+    const cfg = try parseArgs(&.{ "--quant-compiler-generated-ptx", "/tmp/generated.ptx", "--quant-compiler-repeat-runs", "3", "--quant-compiler-evidence-out", "/tmp/evidence.json" });
+    try std.testing.expect(cfg.quant_compiler_lazy_target);
+    try std.testing.expectEqualStrings("/tmp/generated.ptx", cfg.quant_compiler_generated_ptx_path.?);
+    try std.testing.expectEqualStrings("/tmp/evidence.json", cfg.quant_compiler_evidence_out_path.?);
+    try std.testing.expectEqual(@as(usize, 3), cfg.quant_compiler_repeat_runs);
+    try std.testing.expectError(error.MissingGeneratedPtxPath, parseArgs(&.{"--quant-compiler-generated-ptx"}));
+    try std.testing.expectError(error.MissingGeneratedPtxPath, parseArgs(&.{"--quant-compiler-lazy-target"}));
+    try std.testing.expectError(error.MissingQuantCompilerEvidenceOutPath, parseArgs(&.{"--quant-compiler-evidence-out"}));
+    const check_cfg = try parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json" });
+    try std.testing.expectEqualStrings("/tmp/evidence.json", check_cfg.quant_compiler_check_evidence_path.?);
+    const promotion_check_cfg = try parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-require-promotion-ready" });
+    try std.testing.expect(promotion_check_cfg.quant_compiler_require_promotion_ready);
+    try std.testing.expectError(error.MissingQuantCompilerCheckEvidencePath, parseArgs(&.{"--quant-compiler-check-evidence"}));
+    try std.testing.expectError(error.DuplicateQuantCompilerLazyTarget, parseArgs(&.{ "--quant-compiler-lazy-target", "--quant-compiler-lazy-target" }));
+    try std.testing.expectError(error.DuplicateGeneratedPtxPath, parseArgs(&.{ "--quant-compiler-generated-ptx", "/tmp/a.ptx", "--quant-compiler-generated-ptx", "/tmp/b.ptx" }));
+    try std.testing.expectError(error.DuplicateQuantCompilerEvidenceOutPath, parseArgs(&.{ "--quant-compiler-evidence-out", "/tmp/a.json", "--quant-compiler-evidence-out", "/tmp/b.json" }));
+    try std.testing.expectError(error.DuplicateQuantCompilerCheckEvidencePath, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/a.json", "--quant-compiler-check-evidence", "/tmp/b.json" }));
+    try std.testing.expectError(error.DuplicateQuantCompilerRequirePromotionReady, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-require-promotion-ready", "--quant-compiler-require-promotion-ready" }));
+    try std.testing.expectError(error.QuantCompilerPromotionReadyRequiresCheckEvidence, parseArgs(&.{"--quant-compiler-require-promotion-ready"}));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-lazy-target" }));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-generated-ptx", "/tmp/generated.ptx" }));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-evidence-out", "/tmp/out.json" }));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--warmup-iters", "5" }));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--gemma4-shapes" }));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--json-out", "/tmp/out.json" }));
+    try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-repeat-runs", "3" }));
+    try std.testing.expectError(error.MissingQuantCompilerRepeatRuns, parseArgs(&.{"--quant-compiler-repeat-runs"}));
+    try std.testing.expectError(error.InvalidQuantCompilerRepeatRuns, parseArgs(&.{ "--quant-compiler-repeat-runs", "0" }));
+    try std.testing.expectError(error.DuplicateQuantCompilerRepeatRuns, parseArgs(&.{ "--quant-compiler-repeat-runs", "2", "--quant-compiler-repeat-runs", "3" }));
+    try std.testing.expectError(error.QuantCompilerEvidenceRequiresLazyTarget, parseArgs(&.{ "--quant-compiler-evidence-out", "/tmp/evidence.json" }));
+    try std.testing.expectError(error.QuantCompilerEvidenceRequiresManifestRepeatRuns, parseArgs(&.{ "--quant-compiler-generated-ptx", "/tmp/generated.ptx", "--quant-compiler-evidence-out", "/tmp/evidence.json" }));
+    try std.testing.expectError(error.QuantCompilerEvidenceRequiresManifestIterations, parseArgs(&.{ "--quant-compiler-generated-ptx", "/tmp/generated.ptx", "--warmup-iters", "1", "--quant-compiler-evidence-out", "/tmp/evidence.json" }));
+    try std.testing.expectError(error.QuantCompilerEvidenceRequiresManifestIterations, parseArgs(&.{ "--quant-compiler-generated-ptx", "/tmp/generated.ptx", "--measure-iters", "49", "--quant-compiler-evidence-out", "/tmp/evidence.json" }));
+
+    const repeat_cfg = try parseArgs(&.{ "--quant-compiler-generated-ptx", "/tmp/generated.ptx", "--quant-compiler-repeat-runs", "3", "--quant-compiler-evidence-out", "/tmp/evidence.json" });
+    try std.testing.expectEqual(@as(usize, 3), repeat_cfg.quant_compiler_repeat_runs);
+}
+
 fn printUsage() void {
     print(
         \\usage: antfly inference bench-cuda [--warmup-iters N] [--measure-iters N]
         \\                         [--model <clipclap-model-dir>] [--text <prompt>] [--full-iters N]
         \\                         [--gemma4-shapes] [--json-out PATH]
+        \\                         [--quant-compiler-lazy-target --quant-compiler-generated-ptx PATH]
+        \\                         [--quant-compiler-evidence-out PATH]
+        \\                         [--quant-compiler-check-evidence PATH]
+        \\                         [--quant-compiler-require-promotion-ready]
+        \\                         [--quant-compiler-repeat-runs N]
         \\
         \\Benchmarks CUDA Q4_K linear kernels on CLIP/CLAP-sized shapes.
         \\With --gemma4-shapes, also benchmarks Gemma4 Q8_0/Q4_K decode-sized matmuls.
+        \\With --quant-compiler-generated-ptx, compares the dev generated Q4_K rows 2..8 bias_gelu
+        \\candidate against the checked-in handwritten CUDA baseline and CPU quant reference.
         \\If --model is provided, also runs full ClipCLAP text embedding through the CUDA backend.
         \\
     , .{});
@@ -242,6 +365,11 @@ fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
 
     var module = try BenchModule.load(&ctx);
     defer module.unload(&ctx);
+
+    if (cfg.quant_compiler_lazy_target) {
+        try benchQuantCompilerLazyTarget(allocator, io, &ctx, &module, cfg);
+        return;
+    }
 
     print("CUDA Q4_K microbench: device={s} cc={d}.{d} warmup={d} measure={d}\n", .{
         ctx.info.nameSlice(),
@@ -367,6 +495,165 @@ fn benchShape(
     });
 }
 
+const GeneratedCandidateModule = if (build_options.enable_cuda) struct {
+    module: cuda_driver.CUmodule = null,
+    function: cuda_driver.CUfunction = null,
+
+    fn load(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        ctx: *cuda_context.CudaContext,
+        ptx_path: []const u8,
+        kernel_id: []const u8,
+    ) !GeneratedCandidateModule {
+        const ptx = try std.Io.Dir.cwd().readFileAlloc(io, ptx_path, allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(ptx);
+        const image = try allocator.alloc(u8, ptx.len + 1);
+        defer allocator.free(image);
+        @memcpy(image[0..ptx.len], ptx);
+        image[ptx.len] = 0;
+
+        try ctx.makeCurrent();
+        var module: cuda_driver.CUmodule = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
+        errdefer _ = ctx.driver.fns.cuModuleUnload(module);
+
+        const kernel_name = try allocator.dupeZ(u8, kernel_id);
+        defer allocator.free(kernel_name);
+        var function: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, kernel_name));
+
+        return .{
+            .module = module,
+            .function = function,
+        };
+    }
+
+    fn unload(self: *GeneratedCandidateModule, ctx: *cuda_context.CudaContext) void {
+        if (self.module != null) {
+            ctx.makeCurrent() catch {};
+            _ = ctx.driver.fns.cuModuleUnload(self.module);
+            self.module = null;
+            self.function = null;
+        }
+    }
+} else struct {};
+
+fn benchQuantCompilerLazyTarget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+) !void {
+    const bench = quant_kernel_compiler.first_lazy_benchmark;
+    const lowering = quant_kernel_compiler.registryLoweringFor(.cuda, bench.format, bench.row_bucket, bench.epilogue, .small_batch);
+    const route_diagnostic = try quant_kernel_compiler.loweringDiagnostic(allocator, lowering);
+    defer allocator.free(route_diagnostic);
+    const shape = quant_compiler_lazy_shape;
+    const input_count = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const output_count = try std.math.mul(usize, shape.rows, shape.out_dim);
+    const row_blocks = shape.in_dim / q4_k_values_per_block;
+    const weight_bytes = try std.math.mul(usize, try std.math.mul(usize, shape.out_dim, row_blocks), q4_k_block_bytes);
+
+    const input_host = try allocator.alloc(f32, input_count);
+    defer allocator.free(input_host);
+    const bias_host = try allocator.alloc(f32, shape.out_dim);
+    defer allocator.free(bias_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillInput(input_host);
+    fillBias(bias_host);
+    fillQ4KWeights(weight_host);
+
+    const reference_host = try allocator.alloc(f32, output_count);
+    defer allocator.free(reference_host);
+    try quant_kernel_compiler.referenceMatmulBiasGelu(
+        allocator,
+        bench.format,
+        weight_host,
+        input_host,
+        bias_host,
+        shape.rows,
+        shape.in_dim,
+        shape.out_dim,
+        reference_host,
+    );
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(ctx, input_count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var bias = try cuda_buffer.DeviceBuffer.alloc(ctx, bias_host.len * @sizeOf(f32));
+    defer bias.free(ctx);
+    var output = try cuda_buffer.DeviceBuffer.alloc(ctx, output_count * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try bias.copyFromHost(ctx, std.mem.sliceAsBytes(bias_host));
+    try ctx.synchronize();
+
+    const baseline_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4KBiasGeluRows2, .{ module, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim });
+    const baseline_host = try allocator.alloc(f32, output_count);
+    defer allocator.free(baseline_host);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(baseline_host));
+    try ctx.synchronize();
+    const baseline_cpu_max_abs_diff = try maxAbsDiffFinite(baseline_host, reference_host);
+    if (baseline_cpu_max_abs_diff > bench.correctness_tolerance_abs) return error.HandwrittenBaselineMismatch;
+
+    print("CUDA quant compiler lazy target: {s} rows={d} in={d} out={d}\n", .{ route_diagnostic, shape.rows, shape.in_dim, shape.out_dim });
+    print("baseline kernel={s} ns={d} checksum={d:.6} cpu_max_abs_diff={d:.6}\n", .{ bench.handwritten_baseline, baseline_ns, baseline_host[0], baseline_cpu_max_abs_diff });
+    print("candidate kernel={s} source={s} production=false\n", .{ bench.generated_kernel_id, bench.generated_source_path });
+
+    const ptx_path = cfg.quant_compiler_generated_ptx_path orelse return error.MissingGeneratedPtxPath;
+    if (cfg.quant_compiler_evidence_out_path) |evidence_path| try validateQuantCompilerEvidenceRequest(bench, ptx_path, evidence_path);
+
+    var generated = try GeneratedCandidateModule.load(allocator, io, ctx, ptx_path, bench.generated_kernel_id);
+    defer generated.unload(ctx);
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchGeneratedQ4KBiasGeluRows2, .{ &generated, ctx, output, input, weight, bias, shape.rows, shape.in_dim, shape.out_dim });
+
+    const generated_host = try allocator.alloc(f32, output_count);
+    defer allocator.free(generated_host);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(generated_host));
+    try ctx.synchronize();
+
+    const baseline_max_abs_diff = try maxAbsDiffFinite(generated_host, baseline_host);
+    const cpu_max_abs_diff = try maxAbsDiffFinite(generated_host, reference_host);
+    if (cpu_max_abs_diff > bench.correctness_tolerance_abs) return error.GeneratedCandidateMismatch;
+    const candidate_speedup = speedup(baseline_ns, generated_ns);
+    print("generated ptx={s} ns={d} speedup={d:.6} min_speedup={d:.6} checksum={d:.6} baseline_max_abs_diff={d:.6} cpu_max_abs_diff={d:.6} tolerance={d:.6}\n", .{
+        ptx_path,
+        generated_ns,
+        candidate_speedup,
+        bench.minimum_speedup,
+        generated_host[0],
+        baseline_max_abs_diff,
+        cpu_max_abs_diff,
+        bench.correctness_tolerance_abs,
+    });
+    if (candidate_speedup < bench.minimum_speedup) return error.GeneratedCandidateSlowerThanBaseline;
+    if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
+        try writeQuantCompilerEvidence(
+            allocator,
+            io,
+            evidence_path,
+            bench,
+            shape,
+            ptx_path,
+            cfg,
+            baseline_ns,
+            generated_ns,
+            baseline_host[0],
+            generated_host[0],
+            baseline_cpu_max_abs_diff,
+            baseline_max_abs_diff,
+            cpu_max_abs_diff,
+        );
+        print("wrote quant compiler evidence: {s}\n", .{evidence_path});
+    }
+}
+
 fn timeCudaStep(
     ctx: *cuda_context.CudaContext,
     cfg: Config,
@@ -386,6 +673,23 @@ fn timeCudaStep(
         total_ns += nowNs() - started;
     }
     return total_ns / cfg.measure_iters;
+}
+
+fn repeatCudaStep(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    cfg: Config,
+    comptime step: anytype,
+    args: anytype,
+) !u64 {
+    if (cfg.quant_compiler_repeat_runs == 1) return timeCudaStep(ctx, cfg, step, args);
+    const runs = try allocator.alloc(u64, cfg.quant_compiler_repeat_runs);
+    defer allocator.free(runs);
+    for (runs) |*run| {
+        run.* = try timeCudaStep(ctx, cfg, step, args);
+    }
+    std.mem.sort(u64, runs, {}, std.sort.asc(u64));
+    return runs[runs.len / 2];
 }
 
 fn benchTripleShape(
@@ -461,6 +765,449 @@ const Gemma4Q4BenchResult = struct {
 fn speedup(base_ns: u64, candidate_ns: u64) f64 {
     if (base_ns == 0 or candidate_ns == 0) return 0;
     return @as(f64, @floatFromInt(base_ns)) / @as(f64, @floatFromInt(candidate_ns));
+}
+
+fn validateQuantCompilerEvidencePtxPath(bench: quant_kernel_compiler.BenchmarkCase, ptx_path: []const u8) !void {
+    if (!std.mem.eql(u8, ptx_path, bench.generated_ptx_path)) return error.GeneratedPtxPathMismatch;
+}
+
+fn validateQuantCompilerEvidenceRequest(bench: quant_kernel_compiler.BenchmarkCase, ptx_path: []const u8, evidence_path: []const u8) !void {
+    try validateQuantCompilerEvidencePtxPath(bench, ptx_path);
+    if (!std.mem.eql(u8, evidence_path, quant_kernel_compiler.first_lazy_benchmark_evidence_path)) return error.QuantCompilerEvidencePathMismatch;
+}
+
+fn maxAbsDiffFinite(a: []const f32, b: []const f32) !f32 {
+    if (a.len != b.len) return error.InvalidArgument;
+    var max_abs_diff: f32 = 0.0;
+    for (a, b) |left, right| {
+        if (!std.math.isFinite(left) or !std.math.isFinite(right)) return error.NonFiniteBenchmarkOutput;
+        max_abs_diff = @max(max_abs_diff, @abs(left - right));
+    }
+    return max_abs_diff;
+}
+
+fn writeQuantCompilerEvidence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    bench: quant_kernel_compiler.BenchmarkCase,
+    shape: Shape,
+    ptx_path: []const u8,
+    cfg: Config,
+    baseline_ns: u64,
+    generated_ns: u64,
+    baseline_checksum: f32,
+    generated_checksum: f32,
+    baseline_cpu_max_abs_diff: f32,
+    baseline_max_abs_diff: f32,
+    cpu_max_abs_diff: f32,
+) !void {
+    const benchmark_command = try std.fmt.allocPrint(allocator, "zig-out/bin/antfly-inference bench-cuda --warmup-iters {d} --measure-iters {d} --quant-compiler-lazy-target {s} {s} --quant-compiler-repeat-runs {d} --quant-compiler-evidence-out {s}", .{
+        cfg.warmup_iters,
+        cfg.measure_iters,
+        bench.generated_ptx_arg,
+        ptx_path,
+        cfg.quant_compiler_repeat_runs,
+        path,
+    });
+    defer allocator.free(benchmark_command);
+
+    const measured_speedup = speedup(baseline_ns, generated_ns);
+    const benchmark_passed = std.math.isFinite(measured_speedup) and measured_speedup >= bench.minimum_speedup;
+    const promotion_blocker = if (benchmark_passed) "dev_only_candidate" else "generated_slower_than_handwritten";
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    try appendJsonFmt(allocator, &out,
+        \\{{
+        \\"schema":"antfly.quant_kernel_benchmark_evidence.v1",
+        \\"kernel_id":{f},
+        \\"generated_source_path":{f},
+        \\"generated_source_fingerprint":{d},
+        \\"generated_ptx_path":{f},
+        \\"generated_ptx_command":{f},
+        \\"benchmark_command":{f},
+        \\"correctness_evidence_path":{f},
+        \\"benchmark_evidence_path":{f},
+        \\"benchmark_mode":"sequential",
+        \\"repeat_runs":{d},
+        \\"timing_aggregation":{f},
+        \\"production_enabled":false,
+        \\"correctness_passed":true,
+        \\"benchmark_passed":{s},
+        \\"promotion_ready":false,
+        \\"promotion_blocker":{f},
+        \\"measured_speedup":{d:.6},
+        \\"minimum_speedup":{d:.6},
+        \\"correctness_tolerance_abs":{d:.6},
+        \\"baseline_kernel":{f},
+        \\"baseline_ns":{d},
+        \\"generated_ns":{d},
+        \\"baseline_checksum":{d:.6},
+        \\"generated_checksum":{d:.6},
+        \\"baseline_cpu_max_abs_diff":{d:.6},
+        \\"baseline_max_abs_diff":{d:.6},
+        \\"cpu_max_abs_diff":{d:.6},
+        \\"warmup_iters":{d},
+        \\"measure_iters":{d},
+        \\"shape":{{"label":{f},"rows":{d},"in_dim":{d},"out_dim":{d}}}
+        \\}}
+        \\
+    , .{
+        std.json.fmt(bench.generated_kernel_id, .{}),
+        std.json.fmt(bench.generated_source_path, .{}),
+        bench.generated_source_fingerprint,
+        std.json.fmt(ptx_path, .{}),
+        std.json.fmt(bench.generated_ptx_command, .{}),
+        std.json.fmt(benchmark_command, .{}),
+        std.json.fmt(path, .{}),
+        std.json.fmt(path, .{}),
+        cfg.quant_compiler_repeat_runs,
+        std.json.fmt(if (cfg.quant_compiler_repeat_runs == 1) "single" else "median", .{}),
+        if (benchmark_passed) "true" else "false",
+        std.json.fmt(promotion_blocker, .{}),
+        measured_speedup,
+        bench.minimum_speedup,
+        bench.correctness_tolerance_abs,
+        std.json.fmt(bench.handwritten_baseline, .{}),
+        baseline_ns,
+        generated_ns,
+        baseline_checksum,
+        generated_checksum,
+        baseline_cpu_max_abs_diff,
+        baseline_max_abs_diff,
+        cpu_max_abs_diff,
+        cfg.warmup_iters,
+        cfg.measure_iters,
+        std.json.fmt(shape.label, .{}),
+        shape.rows,
+        shape.in_dim,
+        shape.out_dim,
+    });
+    try checkQuantCompilerEvidenceJson(allocator, out.items, false);
+    try writeFileCreatingParent(io, path, out.items);
+}
+
+fn checkQuantCompilerEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_promotion_ready: bool) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return error.InvalidQuantCompilerEvidence;
+    const bench = quant_kernel_compiler.first_lazy_benchmark;
+
+    const schema = jsonString(root.object.get("schema")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, schema, "antfly.quant_kernel_benchmark_evidence.v1")) return error.InvalidQuantCompilerEvidence;
+    const benchmark_mode = jsonString(root.object.get("benchmark_mode")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, benchmark_mode, "sequential")) return error.InvalidQuantCompilerEvidence;
+    const repeat_runs = jsonUsize(root.object.get("repeat_runs")) orelse return error.InvalidQuantCompilerEvidence;
+    if (repeat_runs == 0 or repeat_runs > 31) return error.InvalidQuantCompilerEvidence;
+    const timing_aggregation = jsonString(root.object.get("timing_aggregation")) orelse return error.InvalidQuantCompilerEvidence;
+    const expected_timing_aggregation = if (repeat_runs == 1) "single" else "median";
+    if (!std.mem.eql(u8, timing_aggregation, expected_timing_aggregation)) return error.InvalidQuantCompilerEvidence;
+    const production_enabled = jsonBoolValue(root.object.get("production_enabled")) orelse return error.InvalidQuantCompilerEvidence;
+    if (require_promotion_ready) {
+        if (!production_enabled) return error.QuantCompilerEvidencePromotionNotReady;
+    } else if (production_enabled) {
+        return error.InvalidQuantCompilerEvidence;
+    }
+    const correctness_passed = jsonBoolValue(root.object.get("correctness_passed")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!correctness_passed) return error.InvalidQuantCompilerEvidence;
+    const promotion_ready = jsonBoolValue(root.object.get("promotion_ready")) orelse return error.InvalidQuantCompilerEvidence;
+    if (require_promotion_ready) {
+        if (!promotion_ready) return error.QuantCompilerEvidencePromotionNotReady;
+        if (repeat_runs < quant_compiler_evidence_repeat_runs) return error.QuantCompilerEvidencePromotionNotReady;
+    } else if (promotion_ready) {
+        return error.InvalidQuantCompilerEvidence;
+    }
+
+    const baseline_ns = jsonU64(root.object.get("baseline_ns")) orelse return error.InvalidQuantCompilerEvidence;
+    const generated_ns = jsonU64(root.object.get("generated_ns")) orelse return error.InvalidQuantCompilerEvidence;
+    if (baseline_ns == 0 or generated_ns == 0) return error.InvalidQuantCompilerEvidence;
+    const measured_speedup = jsonF64(root.object.get("measured_speedup")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!approximately(measured_speedup, speedup(baseline_ns, generated_ns), 0.000001)) return error.InvalidQuantCompilerEvidence;
+
+    const minimum_speedup = jsonF64(root.object.get("minimum_speedup")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.math.isFinite(minimum_speedup) or minimum_speedup < 1.0) return error.InvalidQuantCompilerEvidence;
+    const benchmark_passed = jsonBoolValue(root.object.get("benchmark_passed")) orelse return error.InvalidQuantCompilerEvidence;
+    if (benchmark_passed != (measured_speedup >= minimum_speedup)) return error.InvalidQuantCompilerEvidence;
+    const blocker = jsonString(root.object.get("promotion_blocker")) orelse return error.InvalidQuantCompilerEvidence;
+    if (promotion_ready) {
+        if (!benchmark_passed) return error.InvalidQuantCompilerEvidence;
+        if (blocker.len != 0) return error.InvalidQuantCompilerEvidence;
+    } else {
+        const expected_blocker = if (benchmark_passed) "dev_only_candidate" else "generated_slower_than_handwritten";
+        if (!std.mem.eql(u8, blocker, expected_blocker)) return error.InvalidQuantCompilerEvidence;
+    }
+
+    const tolerance = jsonF64(root.object.get("correctness_tolerance_abs")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.math.isFinite(tolerance) or tolerance <= 0.0) return error.InvalidQuantCompilerEvidence;
+    if (!approximately(tolerance, @as(f64, @floatCast(bench.correctness_tolerance_abs)), 0.000001)) return error.InvalidQuantCompilerEvidence;
+    const baseline_cpu_max_abs_diff = jsonF64(root.object.get("baseline_cpu_max_abs_diff")) orelse return error.InvalidQuantCompilerEvidence;
+    const baseline_max_abs_diff = jsonF64(root.object.get("baseline_max_abs_diff")) orelse return error.InvalidQuantCompilerEvidence;
+    const cpu_max_abs_diff = jsonF64(root.object.get("cpu_max_abs_diff")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.math.isFinite(baseline_cpu_max_abs_diff) or baseline_cpu_max_abs_diff > tolerance) return error.InvalidQuantCompilerEvidence;
+    if (!std.math.isFinite(baseline_max_abs_diff) or baseline_max_abs_diff > tolerance) return error.InvalidQuantCompilerEvidence;
+    if (!std.math.isFinite(cpu_max_abs_diff) or cpu_max_abs_diff > tolerance) return error.InvalidQuantCompilerEvidence;
+
+    const kernel_id = jsonString(root.object.get("kernel_id")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, kernel_id, bench.generated_kernel_id)) return error.InvalidQuantCompilerEvidence;
+    const generated_source_path = jsonString(root.object.get("generated_source_path")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, generated_source_path, bench.generated_source_path)) return error.InvalidQuantCompilerEvidence;
+    const generated_source_fingerprint = jsonU64(root.object.get("generated_source_fingerprint")) orelse return error.InvalidQuantCompilerEvidence;
+    if (generated_source_fingerprint != bench.generated_source_fingerprint) return error.InvalidQuantCompilerEvidence;
+    const generated_ptx_path = jsonString(root.object.get("generated_ptx_path")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, generated_ptx_path, bench.generated_ptx_path)) return error.InvalidQuantCompilerEvidence;
+    const generated_ptx_command = jsonString(root.object.get("generated_ptx_command")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, generated_ptx_command, bench.generated_ptx_command)) return error.InvalidQuantCompilerEvidence;
+    const baseline_kernel = jsonString(root.object.get("baseline_kernel")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, baseline_kernel, bench.handwritten_baseline)) return error.InvalidQuantCompilerEvidence;
+    inline for (&.{ "kernel_id", "generated_source_path", "generated_ptx_path", "generated_ptx_command", "benchmark_command", "correctness_evidence_path", "benchmark_evidence_path", "baseline_kernel" }) |field| {
+        const text = jsonString(root.object.get(field)) orelse return error.InvalidQuantCompilerEvidence;
+        if (text.len == 0) return error.InvalidQuantCompilerEvidence;
+    }
+    const correctness_path = jsonString(root.object.get("correctness_evidence_path")) orelse return error.InvalidQuantCompilerEvidence;
+    const benchmark_path = jsonString(root.object.get("benchmark_evidence_path")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, correctness_path, benchmark_path)) return error.InvalidQuantCompilerEvidence;
+    const benchmark_command = jsonString(root.object.get("benchmark_command")) orelse return error.InvalidQuantCompilerEvidence;
+    const expected_benchmark_command = try std.fmt.allocPrint(
+        allocator,
+        "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target {s} {s} --quant-compiler-repeat-runs {d} --quant-compiler-evidence-out {s}",
+        .{ bench.generated_ptx_arg, bench.generated_ptx_path, repeat_runs, benchmark_path },
+    );
+    defer allocator.free(expected_benchmark_command);
+    if (!std.mem.eql(u8, benchmark_command, expected_benchmark_command)) return error.InvalidQuantCompilerEvidence;
+
+    if ((jsonUsize(root.object.get("warmup_iters")) orelse 0) != 5) return error.InvalidQuantCompilerEvidence;
+    if ((jsonUsize(root.object.get("measure_iters")) orelse 0) != 50) return error.InvalidQuantCompilerEvidence;
+    if (repeat_runs != quant_compiler_evidence_repeat_runs) return error.InvalidQuantCompilerEvidence;
+    const shape_value = root.object.get("shape") orelse return error.InvalidQuantCompilerEvidence;
+    if (shape_value != .object) return error.InvalidQuantCompilerEvidence;
+    const shape_label = jsonString(shape_value.object.get("label")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, shape_label, quant_compiler_lazy_shape.label)) return error.InvalidQuantCompilerEvidence;
+    if ((jsonUsize(shape_value.object.get("rows")) orelse 0) != quant_compiler_lazy_shape.rows) return error.InvalidQuantCompilerEvidence;
+    if ((jsonUsize(shape_value.object.get("in_dim")) orelse 0) != quant_compiler_lazy_shape.in_dim) return error.InvalidQuantCompilerEvidence;
+    if ((jsonUsize(shape_value.object.get("out_dim")) orelse 0) != quant_compiler_lazy_shape.out_dim) return error.InvalidQuantCompilerEvidence;
+}
+
+fn checkQuantCompilerEvidenceFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, require_promotion_ready: bool) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+    defer allocator.free(bytes);
+    try checkQuantCompilerEvidenceJson(allocator, bytes, require_promotion_ready);
+    try checkQuantCompilerEvidenceJsonPath(allocator, bytes, path);
+}
+
+fn checkQuantCompilerEvidenceJsonPath(allocator: std.mem.Allocator, bytes: []const u8, path: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return error.InvalidQuantCompilerEvidence;
+    const correctness_path = jsonString(root.object.get("correctness_evidence_path")) orelse return error.InvalidQuantCompilerEvidence;
+    const benchmark_path = jsonString(root.object.get("benchmark_evidence_path")) orelse return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, correctness_path, path)) return error.InvalidQuantCompilerEvidence;
+    if (!std.mem.eql(u8, benchmark_path, path)) return error.InvalidQuantCompilerEvidence;
+}
+
+fn writeFileCreatingParent(io: std.Io, path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        if (parent.len > 0) try compat.cwd().createDirPath(io, parent);
+    }
+    if (std.fs.path.isAbsolute(path)) {
+        var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, data);
+    } else {
+        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+    }
+}
+
+fn approximately(actual: f64, expected: f64, tolerance: f64) bool {
+    return std.math.isFinite(actual) and std.math.isFinite(expected) and @abs(actual - expected) <= tolerance;
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonBoolValue(value: ?std.json.Value) ?bool {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .bool => |val| val,
+        else => null,
+    };
+}
+
+fn jsonUsize(value: ?std.json.Value) ?usize {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |val| if (val >= 0) @intCast(val) else null,
+        else => null,
+    };
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |val| if (val >= 0) @intCast(val) else null,
+        .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonF64(value: ?std.json.Value) ?f64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .float => |val| val,
+        .integer => |val| @floatFromInt(val),
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
+        else => null,
+    };
+}
+
+test "cuda microbench finite diff guards reference comparisons" {
+    try std.testing.expectEqual(@as(f32, 0.25), try maxAbsDiffFinite(&.{ 1.0, 2.0 }, &.{ 1.25, 1.75 }));
+    try std.testing.expectError(error.InvalidArgument, maxAbsDiffFinite(&.{1.0}, &.{ 1.0, 2.0 }));
+    try std.testing.expectError(error.NonFiniteBenchmarkOutput, maxAbsDiffFinite(&.{std.math.nan(f32)}, &.{0.0}));
+}
+
+test "cuda microbench promotion evidence requires manifest ptx path" {
+    const bench = quant_kernel_compiler.first_lazy_benchmark;
+    try validateQuantCompilerEvidencePtxPath(bench, bench.generated_ptx_path);
+    try std.testing.expectError(error.GeneratedPtxPathMismatch, validateQuantCompilerEvidencePtxPath(bench, "/tmp/other.ptx"));
+    try validateQuantCompilerEvidenceRequest(bench, bench.generated_ptx_path, quant_kernel_compiler.first_lazy_benchmark_evidence_path);
+    try std.testing.expectError(error.QuantCompilerEvidencePathMismatch, validateQuantCompilerEvidenceRequest(bench, bench.generated_ptx_path, "/tmp/other-evidence.json"));
+}
+
+test "cuda microbench writes quant compiler evidence json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4.json" });
+    defer std.testing.allocator.free(evidence_path);
+
+    try writeQuantCompilerEvidence(
+        std.testing.allocator,
+        std.testing.io,
+        evidence_path,
+        quant_kernel_compiler.first_lazy_benchmark,
+        quant_compiler_lazy_shape,
+        quant_kernel_compiler.first_lazy_benchmark.generated_ptx_path,
+        .{ .warmup_iters = 5, .measure_iters = 50, .quant_compiler_repeat_runs = quant_compiler_evidence_repeat_runs },
+        100,
+        80,
+        1.0,
+        1.0,
+        0.001,
+        0.001,
+        0.001,
+    );
+
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, evidence_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(actual);
+    try checkQuantCompilerEvidenceJson(std.testing.allocator, actual, false);
+    try checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, evidence_path, false);
+    try std.testing.expectError(error.QuantCompilerEvidencePromotionNotReady, checkQuantCompilerEvidenceJson(std.testing.allocator, actual, true));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_benchmark_evidence.v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_source_fingerprint\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_ptx_command\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, quant_kernel_compiler.first_lazy_benchmark.generated_ptx_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_command\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "--warmup-iters 5"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "--measure-iters 50"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "--quant-compiler-repeat-runs 3"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_mode\":\"sequential\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"repeat_runs\":3"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"timing_aggregation\":\"median\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"production_enabled\":false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"correctness_passed\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_passed\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_ready\":false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_blocker\":\"dev_only_candidate\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"measured_speedup\":1.250000"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, evidence_path));
+
+    const copied_evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4_copied.json" });
+    defer std.testing.allocator.free(copied_evidence_path);
+    try writeFileCreatingParent(std.testing.io, copied_evidence_path, actual);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, copied_evidence_path, false));
+
+    const wrong_speedup = try replaceOnce(std.testing.allocator, actual, "\"measured_speedup\":1.250000", "\"measured_speedup\":1.100000");
+    defer std.testing.allocator.free(wrong_speedup);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, wrong_speedup, false));
+    const wrong_command = try replaceOnce(std.testing.allocator, actual, "--quant-compiler-lazy-target", "--gemma4-shapes");
+    defer std.testing.allocator.free(wrong_command);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, wrong_command, false));
+    const wrong_ptx_path = try replaceOnce(std.testing.allocator, actual, quant_kernel_compiler.first_lazy_benchmark.generated_ptx_path, "/tmp/wrong.ptx");
+    defer std.testing.allocator.free(wrong_ptx_path);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, wrong_ptx_path, false));
+    const wrong_shape = try replaceOnce(std.testing.allocator, actual, "\"rows\":8", "\"rows\":7");
+    defer std.testing.allocator.free(wrong_shape);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, wrong_shape, false));
+    const loose_tolerance = try replaceOnce(std.testing.allocator, actual, "\"correctness_tolerance_abs\":0.010000", "\"correctness_tolerance_abs\":0.020000");
+    defer std.testing.allocator.free(loose_tolerance);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, loose_tolerance, false));
+    const bad_evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4_bad.json" });
+    defer std.testing.allocator.free(bad_evidence_path);
+    try writeFileCreatingParent(std.testing.io, bad_evidence_path, wrong_speedup);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, bad_evidence_path, false));
+
+    const slow_evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4_slow.json" });
+    defer std.testing.allocator.free(slow_evidence_path);
+    try writeQuantCompilerEvidence(
+        std.testing.allocator,
+        std.testing.io,
+        slow_evidence_path,
+        quant_kernel_compiler.first_lazy_benchmark,
+        quant_compiler_lazy_shape,
+        quant_kernel_compiler.first_lazy_benchmark.generated_ptx_path,
+        .{ .warmup_iters = 5, .measure_iters = 50, .quant_compiler_repeat_runs = quant_compiler_evidence_repeat_runs },
+        100,
+        125,
+        1.0,
+        1.0,
+        0.001,
+        0.001,
+        0.001,
+    );
+    const slow_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, slow_evidence_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(slow_actual);
+    try checkQuantCompilerEvidenceJson(std.testing.allocator, slow_actual, false);
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_actual, 1, "\"benchmark_passed\":false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_actual, 1, "\"promotion_blocker\":\"generated_slower_than_handwritten\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_actual, 1, "\"measured_speedup\":0.800000"));
+
+    const wrong_blocker = try replaceOnce(std.testing.allocator, slow_actual, "\"promotion_blocker\":\"generated_slower_than_handwritten\"", "\"promotion_blocker\":\"dev_only_candidate\"");
+    defer std.testing.allocator.free(wrong_blocker);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, wrong_blocker, false));
+    const production_slow = try replaceOnce(std.testing.allocator, slow_actual, "\"production_enabled\":false", "\"production_enabled\":true");
+    defer std.testing.allocator.free(production_slow);
+    const promoted_slow_tmp = try replaceOnce(std.testing.allocator, production_slow, "\"promotion_ready\":false", "\"promotion_ready\":true");
+    defer std.testing.allocator.free(promoted_slow_tmp);
+    const promoted_slow = try replaceOnce(std.testing.allocator, promoted_slow_tmp, "\"promotion_blocker\":\"generated_slower_than_handwritten\"", "\"promotion_blocker\":\"\"");
+    defer std.testing.allocator.free(promoted_slow);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, promoted_slow, true));
+}
+
+fn replaceOnce(allocator: std.mem.Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const index = std.mem.indexOf(u8, input, needle) orelse return error.InvalidArgument;
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ input[0..index], replacement, input[index + needle.len ..] });
+}
+
+test "cuda microbench evidence writer creates absolute parent directories" {
+    const root = try std.fmt.allocPrint(std.testing.allocator, "/tmp/antfly_quant_evidence_test_{d}", .{std.posix.system.getpid()});
+    defer std.testing.allocator.free(root);
+    compat.cwd().deleteTree(std.testing.io, root) catch {};
+    defer compat.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const evidence_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/q4.json", .{root});
+    defer std.testing.allocator.free(evidence_path);
+
+    try writeFileCreatingParent(std.testing.io, evidence_path, "evidence");
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, evidence_path, std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("evidence", actual);
 }
 
 fn q8CandidateName(q8: Gemma4Q8BenchResult) []const u8 {
@@ -803,6 +1550,34 @@ fn launchQ4KBiasTiled(
     try launchLinearQ4KTile4(ctx, module.linear_q4_k_bias_f32_tile4, output, input, weight, bias, rows, in_dim, out_dim, true, false);
 }
 
+fn launchQ4KBiasGeluRows2(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchLinearQ4KBiasGeluRows2(ctx, module.linear_q4_k_bias_gelu_f32_tile4_r2, output, input, weight, bias, rows, in_dim, out_dim);
+}
+
+fn launchGeneratedQ4KBiasGeluRows2(
+    module: *GeneratedCandidateModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    try launchGeneratedLinearQ4KBiasGeluRows2(ctx, module.function, output, input, weight, bias, rows, in_dim, out_dim);
+}
+
 fn launchQ4KBiasQuickGeluTiled(
     module: *BenchModule,
     ctx: *cuda_context.CudaContext,
@@ -854,6 +1629,68 @@ fn launchLinearQ4KTile4(
         params[5] = @ptrCast(&out_dim_u32);
     }
     try launch2d(ctx, function, (out_dim + 3) / 4, rows, 256, &params);
+}
+
+fn launchLinearQ4KBiasGeluRows2(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4KBuffers(output, input, weight, bias, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var bias_ptr = bias.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&bias_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, function, (out_dim + 3) / 4, (rows + 1) / 2, 256, &params);
+}
+
+fn launchGeneratedLinearQ4KBiasGeluRows2(
+    ctx: *cuda_context.CudaContext,
+    function: cuda_driver.CUfunction,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    bias: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4KBuffers(output, input, weight, bias, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var bias_ptr = bias.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&bias_ptr),
+        @ptrCast(&dst_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, function, out_dim, rows, 128, &params);
 }
 
 fn launchLinearQ4KTile8(

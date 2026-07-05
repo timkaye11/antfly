@@ -21,28 +21,117 @@ source "$SCRIPT_DIR/inference_cli.sh"
 
 ANTFLY_BIN="$(resolve_antfly_inference_bin)"
 DEFAULT_MODELS_DIR="$HOME/.antfly/inference/models"
-MODEL_NAME="${ANTFLY_INFERENCE_GEMMA4_MODEL_NAME:-ggml-org/gemma-4-e2b-it-gguf}"
-MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_MODEL:-$DEFAULT_MODELS_DIR/$MODEL_NAME}"
 MODELS_DIR="${ANTFLY_INFERENCE_GEMMA4_MODELS_DIR:-$DEFAULT_MODELS_DIR}"
+MODEL_NAME="${ANTFLY_INFERENCE_GEMMA4_MODEL_NAME:-ggml-org/gemma-4-e2b-it-gguf}"
+MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_MODEL:-$MODELS_DIR/$MODEL_NAME}"
 if [[ -z "${ANTFLY_INFERENCE_GEMMA4_MODEL_NAME:-}" && "$MODEL_DIR" == "$MODELS_DIR/"* ]]; then
   MODEL_NAME="${MODEL_DIR#"$MODELS_DIR"/}"
 fi
 PROMPT="${ANTFLY_INFERENCE_GEMMA4_BENCH_PROMPT:-Write one short paragraph about local inference.}"
+RAW_PROMPT="${ANTFLY_INFERENCE_GEMMA4_BENCH_RAW_PROMPT:-0}"
 WARMUP_TOKENS="${ANTFLY_INFERENCE_GEMMA4_BENCH_WARMUP_TOKENS:-64}"
 MAX_TOKENS="${ANTFLY_INFERENCE_GEMMA4_BENCH_MAX_TOKENS:-128}"
 RUNS="${ANTFLY_INFERENCE_GEMMA4_BENCH_RUNS:-5}"
 SERVER_WARM="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_WARM:-0}"
 SERVER_TOKENS="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_TOKENS:-4 64}"
 SERVER_PORT="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_PORT:-$((18090 + RANDOM % 1000))}"
+SERVER_READY_POLLS="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_READY_POLLS:-900}"
 MIN_DECODE_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_DECODE_TOK_S:-0}"
 MIN_HOT_DECODE_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_HOT_DECODE_TOK_S:-0}"
 MIN_Q4_PAIR_ACT_REDUCE_OUT_F16="${ANTFLY_INFERENCE_GEMMA4_MIN_Q4_PAIR_ACT_REDUCE_OUT_F16:-0}"
 MIN_Q6_REDUCE_IN_F16="${ANTFLY_INFERENCE_GEMMA4_MIN_Q6_REDUCE_IN_F16:-0}"
+MIN_GENERATED_Q4_SMALL_BATCH="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q4_SMALL_BATCH:-0}"
+MIN_GENERATED_Q6_SMALL_BATCH="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q6_SMALL_BATCH:-0}"
+MIN_GENERATED_COUNTERS="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_COUNTERS:-}"
 MIN_SERVER_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S:-0}"
 MAX_SERVER_WARM_MS="${ANTFLY_INFERENCE_GEMMA4_MAX_SERVER_WARM_MS:-0}"
 CACHE_DTYPE="${ANTFLY_INFERENCE_GEMMA4_CACHE_DTYPE:-}"
 REUSE_PROBE="${ANTFLY_INFERENCE_GEMMA4_REUSE_PROBE:-1}"
 OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-gemma4-e2b-metal-$(date -u +%Y%m%d-%H%M%S)}"
+
+if (( MIN_GENERATED_Q4_SMALL_BATCH > 0 )); then
+  export TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH="${TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH:-1}"
+fi
+if (( MIN_GENERATED_Q6_SMALL_BATCH > 0 )); then
+  export TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH="${TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH:-1}"
+fi
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/antfly-gemma4-metal-bench-self-test.XXXXXX")"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  fake_bin="$tmp_dir/antfly-inference"
+  model_dir="$tmp_dir/model"
+  mkdir -p "$model_dir"
+  cat >"$fake_bin" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != "generate" ]]; then
+  echo "unexpected fake antfly invocation: $*" >&2
+  exit 2
+fi
+cat <<'OUT'
++2026-07-05T00:00:00Z info  [default] selected backend metal for fake-model
+tokens=2
+timing_ms: load_model=1 prompt_prep=0 scheduler=0 backend_setup=0 runtime_prewarm=0 decode_setup=0 generate=100 total=120
+first_token_ms: request=100 service=80 prefill=70 sample=10
+metal_executor_reuse_first_token_ms: service=20 prefill=15 sample=5
+metal_executor_ms: greedy_calls=1 greedy_direct=10 prefill_direct_family=20
+decoder_gated_decode_ms: greedy_layer_specs=0
+decoder_gated_prefill_ops: tokens=2 attn_out_linear=0 attn_post_norm=0 attn_residual_add=0
+metal_decoder_frame: begins=1 submits=1 wait_ms=1 gpu_ms=1
+metal_runtime_command_ops: total=447 attention_pre_norm=0 qkv_linear=0
+metal_runtime_command_operators: fallback=0 mul_mv=1 mul_mv_ext=0 mul_mm=0 get_rows=0 set_rows=0 cpy_q_to_f32=0 cpy_f32_to_q=0 attention_flash=0 attention_paged=1 attention_quantized_kv=0 dispatch_scalar=0 dispatch_mmv=1 dispatch_small_batch=0 dispatch_mm=0
+metal_q8_0_dispatch: scalar=0 mmv=1 small_batch=1 mm=0 rows_1=1 rows_2_8=1 rows_9_64=0 rows_65_plus=0 pair_act_mm_out_f16=0 linear_mm_in_f16=0 pair_act_rms_mmv_out_f16=0 linear_mmv_in_f16=0
+metal_q4_q6_k_dispatch: q4_linear_reduce=0 q4_pair_reduce=0 q4_pair_act_reduce=0 q4_pair_act_reduce_out_f16=0 q4_activation_rhs_reduce=0 q6_linear_reduce=0 q6_linear_reduce_in_f16=0
+metal_generated_quant_dispatch: q8_0_small_batch=1 q8_0_small_batch_bias=0 q8_0_small_batch_bias_gelu=0 q8_0_small_batch_relu=0 q8_1_small_batch=0 q8_k_small_batch=0 q2_k_small_batch=0 q2_k_small_batch_bias=0 q2_k_small_batch_bias_gelu=0 q3_k_small_batch=0 q3_k_small_batch_bias=0 q3_k_small_batch_bias_gelu=0 q4_0_small_batch=0 q4_1_small_batch=0 q5_0_small_batch=0 q5_1_small_batch=0 q4_k_small_batch=0 q4_k_small_batch_bias=0 q4_k_small_batch_bias_gelu=0 q5_k_small_batch=0 q5_k_small_batch_bias=0 q5_k_small_batch_bias_gelu=0 q6_k_small_batch=0 q6_k_small_batch_bias=0 q6_k_small_batch_bias_gelu=0
+metal_generated_quant_dispatch: q8_0_small_batch=2 q8_0_small_batch_bias=0 q8_0_small_batch_bias_gelu=0 q8_0_small_batch_relu=0 q8_1_small_batch=0 q8_k_small_batch=0 q2_k_small_batch=0 q2_k_small_batch_bias=0 q2_k_small_batch_bias_gelu=0 q3_k_small_batch=0 q3_k_small_batch_bias=0 q3_k_small_batch_bias_gelu=0 q4_0_small_batch=0 q4_1_small_batch=0 q5_0_small_batch=0 q5_1_small_batch=0 q4_k_small_batch=0 q4_k_small_batch_bias=0 q4_k_small_batch_bias_gelu=0 q5_k_small_batch=0 q5_k_small_batch_bias=0 q5_k_small_batch_bias_gelu=0 q6_k_small_batch=0 q6_k_small_batch_bias=0 q6_k_small_batch_bias_gelu=0
+metal_frame_fallbacks: decode_attempts=1 decode_success=1 decode_disabled=0 decode_scratch_fail=0 decode_fallback=0 decode_batch=0 decode_initial=0 decode_layer=0 decode_tail=0 prefill_plan=1/1 prefill_plan_fail=0 prefill_execute=1/1 prefill_execute_fail=0 prefill_missing_ple=0
+metal_quant_runtime_prepare: private_slots=1 private_ms=1 mapped_slots=1 mapped_failures=0
+OUT
+SH
+  chmod +x "$fake_bin"
+
+  env \
+    ANTFLY_BIN="$fake_bin" \
+    ANTFLY_INFERENCE_GEMMA4_MODEL="$model_dir" \
+    ANTFLY_INFERENCE_GEMMA4_BENCH_WARMUP_TOKENS=2 \
+    ANTFLY_INFERENCE_GEMMA4_BENCH_MAX_TOKENS=2 \
+    ANTFLY_INFERENCE_GEMMA4_BENCH_RUNS=1 \
+    ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_COUNTERS=q8_0_small_batch=2 \
+    OUT_DIR="$tmp_dir/pass" \
+    "$BASH" "$0" >"$tmp_dir/pass.out" 2>"$tmp_dir/pass.err"
+  if ! grep -q '"q8_0_small_batch": 2' "$tmp_dir/pass/summary.json"; then
+    cat "$tmp_dir/pass.out" >&2
+    cat "$tmp_dir/pass.err" >&2
+    echo "missing generated counter gate in bench self-test summary" >&2
+    exit 1
+  fi
+
+  set +e
+  env \
+    ANTFLY_BIN="$fake_bin" \
+    ANTFLY_INFERENCE_GEMMA4_MODEL="$model_dir" \
+    ANTFLY_INFERENCE_GEMMA4_BENCH_WARMUP_TOKENS=2 \
+    ANTFLY_INFERENCE_GEMMA4_BENCH_MAX_TOKENS=2 \
+    ANTFLY_INFERENCE_GEMMA4_BENCH_RUNS=1 \
+    ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_COUNTERS=q8_0_small_batch=3 \
+    OUT_DIR="$tmp_dir/fail" \
+    "$BASH" "$0" >"$tmp_dir/fail.out" 2>"$tmp_dir/fail.err"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    echo "expected generated counter gate failure" >&2
+    exit 1
+  fi
+  if ! grep -q 'generated q8_0_small_batch dispatch below gate' "$tmp_dir/fail.err"; then
+    cat "$tmp_dir/fail.out" >&2
+    cat "$tmp_dir/fail.err" >&2
+    exit 1
+  fi
+
+  echo "metal Gemma4 bench script self-test passed"
+  exit 0
+fi
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
   echo "antfly inference binary not executable: $ANTFLY_BIN" >&2
@@ -87,7 +176,7 @@ run_server_warm_bench() {
   ) >"$server_out" 2>&1 &
   server_pid="$!"
 
-  for _ in $(seq 1 900); do
+  for _ in $(seq 1 "$SERVER_READY_POLLS"); do
     if ! kill -0 "$server_pid" >/dev/null 2>&1; then
       cat "$server_out" >&2 || true
       echo "server exited before listening" >&2
@@ -109,9 +198,11 @@ run_server_warm_bench() {
     idx=$((idx + 1))
     local out="$OUT_DIR/server-request-$idx-${tokens}tok.txt"
     echo "requesting warmed server tokens=$tokens..." >&2
+    set +e
     (
       cd "$ANTFLY_INFERENCE_ZIG_ROOT"
-      run_antfly_inference generate "$MODEL_DIR" "$PROMPT" \
+      args=(
+        generate "$MODEL_DIR" "$PROMPT"
         --server "http://127.0.0.1:$SERVER_PORT" \
         --backend metal \
         --max-tokens "$tokens" \
@@ -119,7 +210,19 @@ run_server_warm_bench() {
         --print-timing \
         --print-finish-reason \
         --require-server
+      )
+      if [[ "$RAW_PROMPT" != "0" ]]; then
+        args+=(--raw-prompt)
+      fi
+      run_antfly_inference "${args[@]}"
     ) >"$out" 2>&1
+    local rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+      echo "Gemma4 warmed server request failed: tokens=$tokens exit=$rc output=$out" >&2
+      sed -n '1,220p' "$out" >&2 || true
+      exit "$rc"
+    fi
   done
 
   python3 - "$OUT_DIR" "$MIN_SERVER_TOK_S" "$MAX_SERVER_WARM_MS" <<'PY'
@@ -242,7 +345,11 @@ run_case() {
   if [[ -n "$CACHE_DTYPE" ]]; then
     args+=(--cache-dtype "$CACHE_DTYPE")
   fi
+  if [[ "$RAW_PROMPT" != "0" ]]; then
+    args+=(--raw-prompt)
+  fi
   echo "running $label tokens=$tokens cache_dtype=${CACHE_DTYPE:-default} reuse_probe=$REUSE_PROBE..." >&2
+  set +e
   (
     cd "$ANTFLY_INFERENCE_ZIG_ROOT"
     if [[ "$REUSE_PROBE" != "0" ]]; then
@@ -251,6 +358,13 @@ run_case() {
       run_antfly_inference "${args[@]}"
     fi
   ) >"$out" 2>&1
+  local rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "Gemma4 Metal bench case failed: label=$label exit=$rc output=$out" >&2
+    sed -n '1,220p' "$out" >&2 || true
+    exit "$rc"
+  fi
 }
 
 run_case warmup "$WARMUP_TOKENS"
@@ -258,7 +372,7 @@ for i in $(seq 1 "$RUNS"); do
   run_case "run-$i" "$MAX_TOKENS"
 done
 
-python3 - "$OUT_DIR" "$MIN_DECODE_TOK_S" "$MIN_HOT_DECODE_TOK_S" "$MIN_Q4_PAIR_ACT_REDUCE_OUT_F16" "$MIN_Q6_REDUCE_IN_F16" <<'PY'
+python3 - "$OUT_DIR" "$MIN_DECODE_TOK_S" "$MIN_HOT_DECODE_TOK_S" "$MIN_Q4_PAIR_ACT_REDUCE_OUT_F16" "$MIN_Q6_REDUCE_IN_F16" "$MIN_GENERATED_Q4_SMALL_BATCH" "$MIN_GENERATED_Q6_SMALL_BATCH" "$MIN_GENERATED_COUNTERS" <<'PY'
 import json
 import re
 import statistics
@@ -270,13 +384,48 @@ min_decode = float(sys.argv[2])
 min_hot_decode = float(sys.argv[3])
 min_q4_pair_act_f16 = int(sys.argv[4])
 min_q6_f16 = int(sys.argv[5])
+min_generated_q4_small_batch = int(sys.argv[6])
+min_generated_q6_small_batch = int(sys.argv[7])
+min_generated_counter_gates_raw = sys.argv[8]
 rows = []
+
+def parse_counter_gates(raw):
+    gates = {}
+    for token in re.split(r"[\s,]+", raw.strip()):
+        if not token:
+            continue
+        if "=" not in token or token.startswith("="):
+            raise SystemExit(f"invalid generated quant counter gate {token!r}; expected counter=min_count")
+        key, value = token.split("=", 1)
+        if not key or not value.isdigit():
+            raise SystemExit(f"invalid generated quant counter gate {token!r}; expected counter=min_count")
+        gates[key] = int(value)
+    return gates
+
+min_generated_counter_gates = parse_counter_gates(min_generated_counter_gates_raw)
 
 def grab(pattern, text, default=None, cast=int):
     m = re.search(pattern, text)
     if not m:
         return default
     return cast(m.group(1))
+
+def generated_counters_from(text, path):
+    matches = re.findall(r"^metal_generated_quant_dispatch:\s*(.*)$", text, re.MULTILINE)
+    if not matches:
+        raise SystemExit(f"missing generated quant dispatch counters in {path}")
+    counters = {}
+    for line in matches:
+        for item in line.split():
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            try:
+                parsed = int(value)
+            except ValueError:
+                raise SystemExit(f"generated quant dispatch counter {key} was not numeric in {path}: {value!r}") from None
+            counters[key] = max(counters.get(key, parsed), parsed)
+    return counters
 
 for path in sorted(out_dir.glob("*.txt")):
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -305,7 +454,13 @@ for path in sorted(out_dir.glob("*.txt")):
     q4_activation_rhs_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_activation_rhs_reduce=(\d+)", text, default=0)
     q6_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce=(\d+)", text, default=0)
     q6_linear_reduce_in_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_in_f16=(\d+)", text, default=0)
-    command_ops = grab(r"metal_runtime_command_ops:\s+total=(\d+)", text, default=0)
+    generated_counters = generated_counters_from(text, path)
+    gen_q8_small_batch = generated_counters.get("q8_0_small_batch")
+    gen_q4_small_batch = generated_counters.get("q4_k_small_batch")
+    gen_q5_small_batch = generated_counters.get("q5_k_small_batch")
+    gen_q6_small_batch = generated_counters.get("q6_k_small_batch")
+    command_ops = grab(r"metal_runtime_command_ops:\s+total=(\d+)", text)
+    command_operator_fallback = grab(r"metal_runtime_command_operators:.*\bfallback=(\d+)", text)
     greedy_calls = grab(r"metal_executor_ms:.*\bgreedy_calls=(\d+)", text, default=0)
     greedy_direct_ms = grab(r"metal_executor_ms:.*\bgreedy_direct=(\d+)", text, default=0)
     greedy_layer_specs_ms = grab(r"decoder_gated_decode_ms:.*\bgreedy_layer_specs=(\d+)", text, default=0)
@@ -318,6 +473,12 @@ for path in sorted(out_dir.glob("*.txt")):
     quant_mapped_failures = grab(r"metal_quant_runtime_prepare:.*\bmapped_failures=(\d+)", text, default=0)
     if tokens is None or generate_ms is None or total_ms is None:
         raise SystemExit(f"missing timing fields in {path}")
+    if gen_q8_small_batch is None or gen_q4_small_batch is None or gen_q5_small_batch is None or gen_q6_small_batch is None:
+        raise SystemExit(f"missing generated quant dispatch counters in {path}")
+    if command_ops is None:
+        raise SystemExit(f"missing Metal command operator counters in {path}")
+    if command_operator_fallback is None:
+        raise SystemExit(f"missing Metal command operator fallback counter in {path}")
     decode_tok_s = tokens / (generate_ms / 1000.0) if generate_ms else 0.0
     e2e_tok_s = tokens / (total_ms / 1000.0) if total_ms else 0.0
     hot_decode_tok_s = greedy_calls / (greedy_direct_ms / 1000.0) if greedy_calls and greedy_direct_ms else 0.0
@@ -351,7 +512,13 @@ for path in sorted(out_dir.glob("*.txt")):
         "q4_activation_rhs_reduce": q4_activation_rhs_reduce,
         "q6_linear_reduce": q6_linear_reduce,
         "q6_linear_reduce_in_f16": q6_linear_reduce_in_f16,
+        "gen_q8_small_batch": gen_q8_small_batch,
+        "gen_q4_small_batch": gen_q4_small_batch,
+        "gen_q5_small_batch": gen_q5_small_batch,
+        "gen_q6_small_batch": gen_q6_small_batch,
+        "generated_counters": generated_counters,
         "command_ops": command_ops,
+        "command_operator_fallback": command_operator_fallback,
         "greedy_calls": greedy_calls,
         "greedy_direct_ms": greedy_direct_ms,
         "hot_decode_tok_s": hot_decode_tok_s,
@@ -385,11 +552,14 @@ summary = {
     "min_hot_decode_tok_s": min_hot_decode,
     "min_q4_pair_act_reduce_out_f16": min_q4_pair_act_f16,
     "min_q6_reduce_in_f16": min_q6_f16,
+    "min_generated_q4_small_batch": min_generated_q4_small_batch,
+    "min_generated_q6_small_batch": min_generated_q6_small_batch,
+    "min_generated_counters": min_generated_counter_gates,
     "rows": rows,
 }
 (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
-    f.write("label\ttokens\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tq8_mmv\tq8_mm\tq4_linear_reduce\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_in_f16\tcommand_ops\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tfile\n")
+    f.write("label\ttokens\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tq8_mmv\tq8_mm\tq4_linear_reduce\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_in_f16\tgen_q8_small_batch\tgen_q4_small_batch\tgen_q5_small_batch\tgen_q6_small_batch\tcommand_ops\tcommand_operator_fallback\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tfile\n")
     for r in rows:
         f.write(
             f"{r['label']}\t{r['tokens']}\t{r['generate_ms']}\t{r['total_ms']}\t{r['runtime_prewarm_ms']}\t"
@@ -403,7 +573,10 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
             f"{r['q4_linear_reduce']}\t{r['q4_pair_reduce']}\t"
             f"{r['q4_pair_act_reduce']}\t{r['q4_pair_act_reduce_out_f16']}\t"
             f"{r['q4_activation_rhs_reduce']}\t{r['q6_linear_reduce']}\t"
-            f"{r['q6_linear_reduce_in_f16']}\t{r['command_ops']}\t"
+            f"{r['q6_linear_reduce_in_f16']}\t{r['gen_q8_small_batch']}\t"
+            f"{r['gen_q4_small_batch']}\t{r['gen_q5_small_batch']}\t"
+            f"{r['gen_q6_small_batch']}\t{r['command_ops']}\t"
+            f"{r['command_operator_fallback']}\t"
             f"{r['greedy_calls']}\t{r['greedy_direct_ms']}\t{r['greedy_layer_specs_ms']}\t"
             f"{r['prefill_direct_family_ms']}\t{r['ple_prepare_ms']}\t{r['quant_private_ms']}\t"
             f"{r['quant_private_slots']}\t{r['quant_mapped_slots']}\t{r['quant_mapped_failures']}\t"
@@ -412,9 +585,16 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
 
 bad_backend = [r for r in measured if r["backend"] != "metal"]
 fallbacks = [r for r in measured if r["decode_fallback"] != 0]
+command_operator_fallbacks = [r for r in measured if r["command_operator_fallback"] != 0]
 mapped_failures = [r for r in measured if r["quant_mapped_failures"] != 0]
 missing_q4_f16 = [r for r in measured if r["q4_pair_act_reduce_out_f16"] < min_q4_pair_act_f16]
 missing_q6_f16 = [r for r in measured if r["q6_linear_reduce_in_f16"] < min_q6_f16]
+missing_generated_q4 = [r for r in measured if r["gen_q4_small_batch"] < min_generated_q4_small_batch]
+missing_generated_q6 = [r for r in measured if r["gen_q6_small_batch"] < min_generated_q6_small_batch]
+missing_generated_counters = {
+    key: [r["label"] for r in measured if r["generated_counters"].get(key, -1) < minimum]
+    for key, minimum in min_generated_counter_gates.items()
+}
 print(f"summary: {out_dir / 'summary.tsv'}")
 print(f"median_decode_tok_s={median_decode:.3f} mean_decode_tok_s={mean_decode:.3f} median_e2e_tok_s={median_e2e:.3f}")
 print(f"median_hot_decode_tok_s={median_hot_decode:.3f} mean_hot_decode_tok_s={mean_hot_decode:.3f}")
@@ -422,12 +602,21 @@ if bad_backend:
     raise SystemExit(f"non-metal backend in measured runs: {[r['label'] for r in bad_backend]}")
 if fallbacks:
     raise SystemExit(f"decode fallback in measured runs: {[r['label'] for r in fallbacks]}")
+if command_operator_fallbacks:
+    raise SystemExit(f"Metal runtime command operator fallback in measured runs: {[r['label'] for r in command_operator_fallbacks]}")
 if mapped_failures:
     raise SystemExit(f"mapped weight residency failures in measured runs: {[r['label'] for r in mapped_failures]}")
 if min_q4_pair_act_f16 and missing_q4_f16:
     raise SystemExit(f"Q4_K pair activation f16-output dispatch below gate in measured runs: {[r['label'] for r in missing_q4_f16]}")
 if min_q6_f16 and missing_q6_f16:
     raise SystemExit(f"Q6_K f16-input reduce dispatch below gate in measured runs: {[r['label'] for r in missing_q6_f16]}")
+if min_generated_q4_small_batch and missing_generated_q4:
+    raise SystemExit(f"generated Q4_K small-batch dispatch below gate in measured runs: {[r['label'] for r in missing_generated_q4]}")
+if min_generated_q6_small_batch and missing_generated_q6:
+    raise SystemExit(f"generated Q6_K small-batch dispatch below gate in measured runs: {[r['label'] for r in missing_generated_q6]}")
+for key, labels in missing_generated_counters.items():
+    if labels:
+        raise SystemExit(f"generated {key} dispatch below gate in measured runs: {labels}")
 if median_decode < min_decode:
     raise SystemExit(f"median decode tok/s {median_decode:.3f} below gate {min_decode:.3f}")
 if median_hot_decode < min_hot_decode:

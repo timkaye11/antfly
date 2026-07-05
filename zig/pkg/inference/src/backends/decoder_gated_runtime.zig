@@ -945,6 +945,10 @@ fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.kHeadNormSlot(configured_layer_count, layer);
 }
 
+fn layerHasOwnKvWeights(gpt_config: gpt_mod.Config, layer: usize) bool {
+    return !gpt_config.layerSharesKv(layer);
+}
+
 fn layerRopeThetaForActiveDim(gpt_config: gpt_mod.Config, layer: usize) f32 {
     const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
     const base_theta = gpt_config.layerRopeTheta(layer);
@@ -4500,6 +4504,7 @@ pub fn prepareDecodeRuntime(
     const prepared_layer_count = preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers));
     for (0..prepared_layer_count) |layer| {
         var name_buf: [256]u8 = undefined;
+        const has_own_kv_weights = layerHasOwnKvWeights(gpt_config, layer);
         const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
         const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
         const attention_input_size = gpt_config.num_attention_heads * layer_head_dim;
@@ -4601,20 +4606,22 @@ pub fn prepareDecodeRuntime(
             finished_at = monotonicNowNs();
             if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
 
-            started_at = monotonicNowNs();
-            const k_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
-            const k_head_norm_w = try gpt_arch.getModelWeight(cb, gpt_config, k_head_norm_name);
-            defer cb.free(k_head_norm_w);
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-            started_at = monotonicNowNs();
-            if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, kHeadNormSlot(configured_layer_count, layer), k_head_norm_w, layer_head_dim))) {
-                timing_stats.prepare_attn_pre_norm_failures += 1;
-                tracePrepareLayerFailure(layer, "k_head_norm", kHeadNormSlot(configured_layer_count, layer), layer_head_dim, layer_head_dim);
-                return false;
+            if (has_own_kv_weights) {
+                started_at = monotonicNowNs();
+                const k_head_norm_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+                const k_head_norm_w = try gpt_arch.getModelWeight(cb, gpt_config, k_head_norm_name);
+                defer cb.free(k_head_norm_w);
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+                started_at = monotonicNowNs();
+                if (!(try decoder_rms_runtime.prepareRmsNormSlot(cb, allocator, gpt_config, kHeadNormSlot(configured_layer_count, layer), k_head_norm_w, layer_head_dim))) {
+                    timing_stats.prepare_attn_pre_norm_failures += 1;
+                    tracePrepareLayerFailure(layer, "k_head_norm", kHeadNormSlot(configured_layer_count, layer), layer_head_dim, layer_head_dim);
+                    return false;
+                }
+                finished_at = monotonicNowNs();
+                if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
             }
-            finished_at = monotonicNowNs();
-            if (finished_at > started_at) timing_stats.norm_prep_nanos += finished_at - started_at;
         }
 
         started_at = monotonicNowNs();
@@ -4632,35 +4639,37 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const k_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
-        const k_w = try gpt_arch.getModelWeight(cb, gpt_config, k_name);
-        defer cb.free(k_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
-            timing_stats.prepare_attn_k_failures += 1;
-            tracePrepareLayerFailure(layer, "attn_k", linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
-            return false;
-        }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
+        if (has_own_kv_weights) {
+            started_at = monotonicNowNs();
+            const k_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+            const k_w = try gpt_arch.getModelWeight(cb, gpt_config, k_name);
+            defer cb.free(k_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
+                timing_stats.prepare_attn_k_failures += 1;
+                tracePrepareLayerFailure(layer, "attn_k", linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
-        const v_w = try gpt_arch.getModelWeight(cb, gpt_config, v_name);
-        defer cb.free(v_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
-            timing_stats.prepare_attn_v_failures += 1;
-            tracePrepareLayerFailure(layer, "attn_v", linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
-            return false;
+            started_at = monotonicNowNs();
+            const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+            const v_w = try gpt_arch.getModelWeight(cb, gpt_config, v_name);
+            defer cb.free(v_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
+                timing_stats.prepare_attn_v_failures += 1;
+                tracePrepareLayerFailure(layer, "attn_v", linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
         }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
         started_at = monotonicNowNs();
         const attn_out_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
@@ -5595,4 +5604,24 @@ test "direct gemma runtime allows gemma4-style global head configs without share
     shared_kv.num_kv_shared_layers = 2;
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &decode_context));
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &prefill_context));
+}
+
+test "gemma4 shared kv layers do not own decode runtime kv weights" {
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .hidden_size = 1536,
+        .attention_head_dim = 256,
+        .intermediate_size = 6144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .num_kv_shared_layers = 2,
+        .vocab_size = 1024,
+    };
+
+    try std.testing.expect(layerHasOwnKvWeights(config, 3));
+    try std.testing.expect(!layerHasOwnKvWeights(config, 4));
+    try std.testing.expect(!layerHasOwnKvWeights(config, 5));
 }

@@ -94,11 +94,8 @@ Relevant local state:
   `pkg/inference/src/ops/metal_compute.zig`, and
   `pkg/inference/src/ops/wasm_compute.zig` already contain quantized matmul
   behavior and fallback patterns.
-- `pkg/inference/src/graph/backend_contracts.zig` does not yet include
-  `cuda` as a graph `BackendKind` or `cuda_buffer` storage class.
-- `pkg/inference/src/backends/backends.zig` does not yet expose CUDA as a direct
-  session backend.
-- `build.zig` does not yet have `-Dcuda` or CUDA artifact options.
+- `build.zig` exposes `-Dcuda` and `-Dcuda-artifacts` for embedding checked-in
+  CUDA artifacts without invoking CUDA tooling during normal builds.
 
 The CUDA work should integrate through these existing contracts instead of
 creating another quant selector or model-specific backend path.
@@ -213,6 +210,71 @@ fatbin cubins for the supported SM targets when `cuobjdump` is available, and
 checks that required CUDA symbols are present before updating checked-in
 artifacts. CUDA-enabled CI may verify checked-in artifact freshness, but normal
 CI should not need CUDA.
+The equivalent Linux CUDA 13.2 build target is
+`zig build cuda-artifacts-check`.
+
+## Quant Kernel Compiler Lane
+
+Quant matmul codegen is a build/dev-time lane, not runtime JIT. The compiler
+spec lives in `pkg/inference/src/graph/quant_kernel_compiler.zig`; generated
+dev candidates and manifests live under `pkg/inference/src/ops/cuda/generated`
+and `pkg/inference/src/ops/metal/generated`. Generated MSL currently covers the
+first `Q4_K` `bias_gelu` target, a `Q4_K` bias epilogue target, plus `Q4_K`,
+`Q8_0`, `Q5_K`, and `Q6_K` no-epilogue small-batch candidates. `Q8_0`,
+`Q5_K`, and `Q6_K` no-epilogue small batch are promoted Metal artifacts; the
+remaining generated kernels stay dev-only until they have promotion evidence.
+
+Use `zig build quant-kernel-codegen -- --check` to verify generated sources and
+manifests, or `zig build quant-kernel-codegen -- --write` after intentionally
+changing the spec. Generated CUDA candidates must stay out of
+`pkg/inference/src/ops/cuda/artifacts` until they have correctness evidence,
+sequential benchmark evidence, and reviewed promotion into the checked-in
+artifact flow.
+
+Use `zig build quant-kernel-local-check -Dmetal=true -Dcuda=false` for the
+local compiler gate: generated-source freshness, route/manifest unit tests,
+CUDA evidence unit tests, promoted/dev Metal compile, dev-only Metal runtime
+correctness, and CUDA artifact source-policy checks. This does not replace the
+Linux CUDA 13.2 `zig build cuda-artifacts-check` gate.
+
+Use `zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false` for
+the dev-only generated MSL runtime correctness check; add
+`-- --evidence-out /private/tmp/antfly-quant-metal-evidence.json` to persist the
+same sequential correctness and handwritten-baseline timing evidence as JSON.
+Add `--repeat-runs N` to aggregate sequential timings by median. Metal promotion
+evidence requires at least 5 repeats, records `minimum_speedup`, and currently
+requires median generated speedup of at least `1.05` over the handwritten
+baseline for every promoted-kernel case.
+Use `-- --check-evidence PATH --require-promotion-ready --require-kernel KERNEL`
+to fail a promotion attempt for one candidate when the evidence is still
+dev-only, lacks a baseline, misses the speed gate, or loses to the handwritten
+route. Promotion evidence paths are kernel-specific and must include `KERNEL`;
+the generated artifact manifest pins the exact evidence and check commands for
+each Metal candidate.
+
+From `pkg/inference`, the first lazy target evidence uses the manifest-pinned
+PTX and benchmark commands:
+
+```sh
+nvcc -ptx -arch=compute_75 \
+  src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu \
+  -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx
+
+zig-out/bin/antfly-inference bench-cuda \
+  --warmup-iters 5 \
+  --measure-iters 50 \
+  --quant-compiler-lazy-target \
+  --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx \
+  --quant-compiler-repeat-runs 3 \
+  --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json
+
+zig-out/bin/antfly-inference bench-cuda \
+  --quant-compiler-check-evidence src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json \
+  --quant-compiler-require-promotion-ready
+```
+
+That final check is intentionally a promotion gate: it fails while the CUDA
+candidate is still dev-only.
 
 ## GLiNER2 CUDA Q4 Span Kernels
 
@@ -517,7 +579,7 @@ portable `compute_75` PTX.
 
 ### Phase 0: Build And Backend Plumbing
 
-- Add `-Dcuda` and `-Dcuda-artifacts`.
+- Keep `-Dcuda` and `-Dcuda-artifacts` wired to checked-in artifacts only.
 - Add `cuda` to graph/backend contracts:
   - `BackendKind.cuda`
   - `TensorStorageClass.cuda_buffer`
