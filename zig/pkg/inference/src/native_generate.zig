@@ -989,7 +989,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
-            printMetalQuantDispatchSummary(metal_snapshot, graph_generate_stats);
+            printMetalQuantDispatchSummary(
+                metal_snapshot,
+                metalStatsWithRuntimePlanCounters(graph_generate_stats, metal_snapshot.provider),
+            );
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -2944,6 +2947,33 @@ fn metalStatsWithRuntimePlanCounters(
 ) graph_mod.executor_stats.ExecutionStats {
     if (graph_stats.quant_kernel_planned_ops != 0) return graph_stats;
     var stats = graph_stats;
+
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_2_8);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_sumsq);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_activation_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_activation_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_activation_rhs_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_activation_rhs_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_ple_linear_reduce_f16_input);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_activation_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_activation_reduce_f16_output);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_activation_rhs_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_f16_input);
+
     addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_dispatches, .q8_0, .none);
     addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_bias_dispatches, .q8_0, .bias);
     addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches, .q8_0, .bias_gelu);
@@ -2970,6 +3000,15 @@ fn metalStatsWithRuntimePlanCounters(
     addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches, .q6_k, .bias);
     addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches, .q6_k, .bias_gelu);
     return stats;
+}
+
+fn addMetalRuntimeHandwrittenPlanCounter(
+    stats: *graph_mod.executor_stats.ExecutionStats,
+    count: u64,
+) void {
+    if (count == 0) return;
+    stats.quant_kernel_planned_ops += count;
+    stats.quant_kernel_handwritten_production += count;
 }
 
 fn addMetalRuntimeGeneratedPlanCounter(
@@ -4829,7 +4868,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
-            printMetalQuantDispatchSummary(metal_snapshot, graph_generate_stats);
+            printMetalQuantDispatchSummary(
+                metal_snapshot,
+                metalStatsWithRuntimePlanCounters(graph_generate_stats, metal_snapshot.provider),
+            );
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -6443,6 +6485,27 @@ test "metal stats compact json derives plan counters from runtime generated disp
     try std.testing.expectEqual(@as(i64, 2), plan.get("handwritten_production").?.integer);
     try std.testing.expectEqual(@as(i64, 3), plan.get("generated_production").?.integer);
     try std.testing.expectEqual(@as(i64, 2), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
+}
+
+test "metal stats compact json derives plan counters from runtime handwritten dispatches" {
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_q8_0_linear_rows_1 = 2;
+    snapshot.provider.metal_runtime_q8_0_linear_rows_9_64 = 3;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_reduce = 5;
+    snapshot.provider.metal_runtime_q6_k_linear_reduce = 7;
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const plan = parsed.value.object.get("quant_kernel_plan").?.object;
+    try std.testing.expectEqual(@as(i64, 17), plan.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
 }
