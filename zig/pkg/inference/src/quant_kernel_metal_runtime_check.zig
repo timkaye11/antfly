@@ -4116,12 +4116,12 @@ test "quant kernel metal runtime benchmark math gates on minimum repeat speedup"
     defer parsed_good.deinit();
     try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_good.value));
 
-    const tolerated =
-        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.099999,"repeat_runs":5}
+    const borderline =
+        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":false,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.099999,"repeat_runs":5}
     ;
-    var parsed_tolerated = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tolerated, .{});
-    defer parsed_tolerated.deinit();
-    try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_tolerated.value));
+    var parsed_borderline = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, borderline, .{});
+    defer parsed_borderline.deinit();
+    try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_borderline.value));
 
     const bad =
         \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.098000,"repeat_runs":5}
@@ -4140,7 +4140,7 @@ test "quant kernel metal runtime benchmark math gates on minimum repeat speedup"
 
 test "quant kernel metal runtime promotion blocker reports unstable repeat timing" {
     try std.testing.expectEqualStrings("speedup_gate_missing", quant_kernel_compiler.metalPromotionSpeedupBlocker(0.9, 0.9));
-    try std.testing.expectEqualStrings("none", quant_kernel_compiler.metalPromotionSpeedupBlocker(2.0, 1.099999));
+    try std.testing.expectEqualStrings("unstable_benchmark_timing", quant_kernel_compiler.metalPromotionSpeedupBlocker(2.0, 1.099999));
     try std.testing.expectEqualStrings("unstable_benchmark_timing", quant_kernel_compiler.metalPromotionSpeedupBlocker(2.0, 1.098000));
     try std.testing.expect(promotionBlockerEvidenceMatchesExactly(.{ .speedup_gate_missing = 1 }, quant_kernel_compiler.metal_blocker_speedup_gate_missing));
     try std.testing.expect(promotionBlockerEvidenceMatches(.{ .unstable_benchmark_timing = 1 }, quant_kernel_compiler.metal_blocker_speedup_gate_missing));

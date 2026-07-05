@@ -5861,7 +5861,7 @@ pub fn metalPromotionSpeedupBlocker(measured_speedup: f64, minimum_repeat_speedu
 
 pub fn metalPromotionSpeedupPasses(speedup_value: f64) bool {
     if (!std.math.isFinite(speedup_value)) return false;
-    return speedup_value + metal_promotion_speedup_tolerance >= metal_promotion_min_speedup;
+    return speedup_value >= metal_promotion_min_speedup;
 }
 
 pub fn metalProviderRouteRequiredForKernel(kernel_id: []const u8) bool {
