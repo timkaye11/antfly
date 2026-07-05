@@ -122,7 +122,7 @@ metal_q4_0_dispatch: linear_reduce=3 linear_reduce_rows=1/2/0/0 linear_reduce_in
 metal_q4_q6_k_dispatch: q4_linear_reduce=4 q4_linear_reduce_rows=0/4/0/0 q4_pair_reduce=0 q4_pair_act_reduce=0 q4_pair_act_reduce_out_f16=0 q4_activation_rhs_reduce=0 q6_linear_reduce=5 q6_linear_reduce_rows=5/0/0/0 q6_linear_reduce_in_f16=0
 metal_generated_quant_dispatch: q8_0_small_batch=1 q8_0_small_batch_bias=0 q8_0_small_batch_bias_gelu=0 q8_0_small_batch_relu=0 q8_1_small_batch=0 q8_k_small_batch=0 q2_k_small_batch=0 q2_k_small_batch_bias=0 q2_k_small_batch_bias_gelu=0 q3_k_small_batch=0 q3_k_small_batch_bias=0 q3_k_small_batch_bias_gelu=0 q4_0_small_batch=0 q4_1_small_batch=0 q5_0_small_batch=0 q5_1_small_batch=0 q4_k_small_batch=0 q4_k_small_batch_bias=0 q4_k_small_batch_bias_gelu=0 q5_k_small_batch=0 q5_k_small_batch_bias=0 q5_k_small_batch_bias_gelu=0 q6_k_small_batch=0 q6_k_small_batch_bias=0 q6_k_small_batch_bias_gelu=0
 metal_generated_quant_dispatch: q8_0_small_batch=2 q8_0_small_batch_bias=0 q8_0_small_batch_bias_gelu=0 q8_0_small_batch_relu=0 q8_1_small_batch=0 q8_k_small_batch=0 q2_k_small_batch=0 q2_k_small_batch_bias=0 q2_k_small_batch_bias_gelu=0 q3_k_small_batch=0 q3_k_small_batch_bias=0 q3_k_small_batch_bias_gelu=0 q4_0_small_batch=0 q4_1_small_batch=0 q5_0_small_batch=0 q5_1_small_batch=0 q4_k_small_batch=0 q4_k_small_batch_bias=0 q4_k_small_batch_bias_gelu=0 q5_k_small_batch=0 q5_k_small_batch_bias=0 q5_k_small_batch_bias_gelu=0 q6_k_small_batch=0 q6_k_small_batch_bias=0 q6_k_small_batch_bias_gelu=0
-metal_quant_kernel_plan: planned=2 handwritten_production=2 generated_production=0 unsupported_routes=0 generated_candidates=2 generated_artifact_missing=0 generated_runtime_not_wired=0 unsupported=0 unsupported_format=0 unsupported_shape=0 unsupported_epilogue=0 unsupported_backend=0 tensor_core_repack_required=0 top_fallback_reason=none top_fallback_count=0
+metal_quant_kernel_plan: planned=14 handwritten_production=14 generated_production=0 unsupported_routes=0 generated_candidates=2 generated_artifact_missing=0 generated_runtime_not_wired=0 unsupported=0 unsupported_format=0 unsupported_shape=0 unsupported_epilogue=0 unsupported_backend=0 tensor_core_repack_required=0 top_fallback_reason=none top_fallback_count=0
 metal_frame_fallbacks: decode_attempts=1 decode_success=1 decode_disabled=0 decode_scratch_fail=0 decode_fallback=0 decode_batch=0 decode_initial=0 decode_layer=0 decode_tail=0 prefill_plan=1/1 prefill_plan_fail=0 prefill_execute=1/1 prefill_execute_fail=0 prefill_missing_ple=0
 metal_quant_runtime_prepare: private_slots=1 private_ms=1 mapped_slots=1 mapped_failures=0
 OUT
@@ -144,7 +144,7 @@ SH
     echo "missing generated counter gate in bench self-test summary" >&2
     exit 1
   fi
-  if ! grep -q '"quant_plan_planned": 2' "$tmp_dir/pass/summary.json"; then
+  if ! grep -q '"quant_plan_planned": 14' "$tmp_dir/pass/summary.json"; then
     cat "$tmp_dir/pass.out" >&2
     cat "$tmp_dir/pass.err" >&2
     echo "missing quant plan counters in bench self-test summary" >&2
@@ -170,7 +170,7 @@ SH
     echo "missing row bucket columns in bench self-test TSV" >&2
     exit 1
   fi
-  if ! awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) h[$i] = i } NR == 2 { found = ($(h["quant_plan_planned"]) == 2 && $(h["quant_plan_handwritten_production"]) == 2) } END { exit found ? 0 : 1 }' "$tmp_dir/pass/summary.tsv"; then
+  if ! awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) h[$i] = i } NR == 2 { found = ($(h["quant_plan_planned"]) == 14 && $(h["quant_plan_handwritten_production"]) == 14) } END { exit found ? 0 : 1 }' "$tmp_dir/pass/summary.tsv"; then
     cat "$tmp_dir/pass/summary.tsv" >&2
     echo "missing quant plan row values in bench self-test TSV" >&2
     exit 1
@@ -635,6 +635,7 @@ for path in sorted(out_dir.glob("*.txt")):
     q8_mm = grab(r"metal_q8_0_dispatch:.*\bmm=(\d+)", text, default=0)
     q4_0_linear_reduce = grab(r"metal_q4_0_dispatch:.*\blinear_reduce=(\d+)", text, default=0)
     q4_0_linear_reduce_rows_1, q4_0_linear_reduce_rows_2_8, q4_0_linear_reduce_rows_9_64, q4_0_linear_reduce_rows_65_plus = grab_buckets(r"metal_q4_0_dispatch:.*\blinear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)", text)
+    q4_0_linear_reduce_row_total = q4_0_linear_reduce_rows_1 + q4_0_linear_reduce_rows_2_8 + q4_0_linear_reduce_rows_9_64 + q4_0_linear_reduce_rows_65_plus
     q4_0_linear_reduce_in_f16 = grab(r"metal_q4_0_dispatch:.*\blinear_reduce_in_f16=(\d+)", text, default=0)
     q4_0_linear_reduce_out_f16 = grab(r"metal_q4_0_dispatch:.*\blinear_reduce_out_f16=(\d+)", text, default=0)
     q4_0_linear_reduce_in_f16_out_f16 = grab(r"metal_q4_0_dispatch:.*\blinear_reduce_in_f16_out_f16=(\d+)", text, default=0)
@@ -656,12 +657,14 @@ for path in sorted(out_dir.glob("*.txt")):
     q4_0_activation_rhs_reduce_encode_us = grab(r"metal_q4_0_encode_us:.*\bactivation_rhs_reduce=(\d+)", text, default=0)
     q4_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_linear_reduce=(\d+)", text, default=0)
     q4_linear_reduce_rows_1, q4_linear_reduce_rows_2_8, q4_linear_reduce_rows_9_64, q4_linear_reduce_rows_65_plus = grab_buckets(r"metal_q4_q6_k_dispatch:.*\bq4_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)", text)
+    q4_linear_reduce_row_total = q4_linear_reduce_rows_1 + q4_linear_reduce_rows_2_8 + q4_linear_reduce_rows_9_64 + q4_linear_reduce_rows_65_plus
     q4_pair_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_reduce=(\d+)", text, default=0)
     q4_pair_act_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_act_reduce=(\d+)", text, default=0)
     q4_pair_act_reduce_out_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_act_reduce_out_f16=(\d+)", text, default=0)
     q4_activation_rhs_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_activation_rhs_reduce=(\d+)", text, default=0)
     q6_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce=(\d+)", text, default=0)
     q6_linear_reduce_rows_1, q6_linear_reduce_rows_2_8, q6_linear_reduce_rows_9_64, q6_linear_reduce_rows_65_plus = grab_buckets(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)", text)
+    q6_linear_reduce_row_total = q6_linear_reduce_rows_1 + q6_linear_reduce_rows_2_8 + q6_linear_reduce_rows_9_64 + q6_linear_reduce_rows_65_plus
     q6_linear_reduce_in_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_in_f16=(\d+)", text, default=0)
     generated_counters = generated_counters_from(text, path)
     gen_q8_small_batch = generated_counters.get("q8_0_small_batch")
@@ -793,6 +796,7 @@ for path in sorted(out_dir.glob("*.txt")):
         "q4_0_linear_reduce_rows_2_8": q4_0_linear_reduce_rows_2_8,
         "q4_0_linear_reduce_rows_9_64": q4_0_linear_reduce_rows_9_64,
         "q4_0_linear_reduce_rows_65_plus": q4_0_linear_reduce_rows_65_plus,
+        "q4_0_linear_reduce_row_total": q4_0_linear_reduce_row_total,
         "q4_0_linear_reduce_in_f16": q4_0_linear_reduce_in_f16,
         "q4_0_linear_reduce_out_f16": q4_0_linear_reduce_out_f16,
         "q4_0_linear_reduce_in_f16_out_f16": q4_0_linear_reduce_in_f16_out_f16,
@@ -817,6 +821,7 @@ for path in sorted(out_dir.glob("*.txt")):
         "q4_linear_reduce_rows_2_8": q4_linear_reduce_rows_2_8,
         "q4_linear_reduce_rows_9_64": q4_linear_reduce_rows_9_64,
         "q4_linear_reduce_rows_65_plus": q4_linear_reduce_rows_65_plus,
+        "q4_linear_reduce_row_total": q4_linear_reduce_row_total,
         "q4_pair_reduce": q4_pair_reduce,
         "q4_pair_act_reduce": q4_pair_act_reduce,
         "q4_pair_act_reduce_out_f16": q4_pair_act_reduce_out_f16,
@@ -826,6 +831,7 @@ for path in sorted(out_dir.glob("*.txt")):
         "q6_linear_reduce_rows_2_8": q6_linear_reduce_rows_2_8,
         "q6_linear_reduce_rows_9_64": q6_linear_reduce_rows_9_64,
         "q6_linear_reduce_rows_65_plus": q6_linear_reduce_rows_65_plus,
+        "q6_linear_reduce_row_total": q6_linear_reduce_row_total,
         "q6_linear_reduce_in_f16": q6_linear_reduce_in_f16,
         "gen_q8_small_batch": gen_q8_small_batch,
         "gen_q4_small_batch": gen_q4_small_batch,
@@ -1063,6 +1069,32 @@ missing_q6_f16 = [r for r in measured if r["q6_linear_reduce_in_f16"] < min_q6_f
 missing_generated_q4 = [r for r in measured if r["gen_q4_small_batch"] < min_generated_q4_small_batch]
 missing_generated_q6 = [r for r in measured if r["gen_q6_small_batch"] < min_generated_q6_small_batch]
 missing_quant_plan = [r for r in measured if sum(r["generated_counters"].values()) > 0 and r["quant_plan_planned"] == 0]
+row_bucket_mismatches = [
+    (
+        r["label"],
+        r["q4_0_linear_reduce"], r["q4_0_linear_reduce_row_total"],
+        r["q4_linear_reduce"], r["q4_linear_reduce_row_total"],
+        r["q6_linear_reduce"], r["q6_linear_reduce_row_total"],
+    )
+    for r in measured
+    if r["q4_0_linear_reduce"] != r["q4_0_linear_reduce_row_total"]
+    or r["q4_linear_reduce"] != r["q4_linear_reduce_row_total"]
+    or r["q6_linear_reduce"] != r["q6_linear_reduce_row_total"]
+]
+missing_row_bucket_plan = [
+    (
+        r["label"],
+        r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"],
+        r["quant_plan_planned"],
+        r["quant_plan_handwritten_production"],
+    )
+    for r in measured
+    if r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"] > 0
+    and (
+        r["quant_plan_planned"] < r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"]
+        or r["quant_plan_handwritten_production"] < r["q4_0_linear_reduce_row_total"] + r["q4_linear_reduce_row_total"] + r["q6_linear_reduce_row_total"]
+    )
+]
 missing_generated_counters = {
     key: [r["label"] for r in measured if r["generated_counters"].get(key, -1) < minimum]
     for key, minimum in min_generated_counter_gates.items()
@@ -1158,6 +1190,10 @@ if min_generated_q6_small_batch and missing_generated_q6:
     raise SystemExit(f"generated Q6_K small-batch dispatch below gate in measured runs: {[r['label'] for r in missing_generated_q6]}")
 if missing_quant_plan:
     raise SystemExit(f"quant kernel plan counters missing despite generated dispatches: {[r['label'] for r in missing_quant_plan]}")
+if row_bucket_mismatches:
+    raise SystemExit(f"Metal quant row bucket totals disagree with aggregate counters: {row_bucket_mismatches}")
+if missing_row_bucket_plan:
+    raise SystemExit(f"Metal quant row bucket dispatches missing from plan counters: {missing_row_bucket_plan}")
 for key, labels in missing_generated_counters.items():
     if labels:
         raise SystemExit(f"generated {key} dispatch below gate in measured runs: {labels}")
