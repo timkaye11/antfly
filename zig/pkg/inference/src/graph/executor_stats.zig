@@ -110,6 +110,17 @@ pub fn snapshot() ExecutionStats {
     };
 }
 
+pub fn delta(after: ExecutionStats, before: ExecutionStats) ExecutionStats {
+    var result = after;
+    inline for (std.meta.fields(ExecutionStats)) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => @field(result, field.name) = @field(after, field.name) -| @field(before, field.name),
+            else => {},
+        }
+    }
+    return result;
+}
+
 pub fn reset() void {
     aggregate_partitions_executed.store(0, .monotonic);
     aggregate_cross_device_transfers.store(0, .monotonic);
@@ -417,6 +428,29 @@ test "executor stats aggregate quant kernel plan counters" {
     try std.testing.expectEqual(@as(u64, 4), stats.quant_kernel_fallback_unsupported_backend);
     try std.testing.expectEqual(@as(u64, 5), stats.quant_kernel_fallback_tensor_core_repack_required);
     try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_fallback_unsupported);
+}
+
+test "executor stats delta reports per-run quant kernel counters" {
+    const before = ExecutionStats{
+        .partitions_executed = 9,
+        .quant_kernel_planned_ops = 10,
+        .quant_kernel_generated_production = 5,
+        .quant_kernel_fallback_unsupported_shape = 3,
+    };
+    const after = ExecutionStats{
+        .partitions_executed = 11,
+        .quant_kernel_planned_ops = 17,
+        .quant_kernel_generated_production = 8,
+        .quant_kernel_fallback_unsupported_shape = 2,
+        .quant_kernel_fallback_unsupported_epilogue = 4,
+    };
+
+    const run = delta(after, before);
+    try std.testing.expectEqual(@as(u64, 2), run.partitions_executed);
+    try std.testing.expectEqual(@as(u64, 7), run.quant_kernel_planned_ops);
+    try std.testing.expectEqual(@as(u64, 3), run.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(u64, 0), run.quant_kernel_fallback_unsupported_shape);
+    try std.testing.expectEqual(@as(u64, 4), run.quant_kernel_fallback_unsupported_epilogue);
 }
 
 test "executor stats wires every quant kernel plan counter" {

@@ -818,6 +818,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
     else
         null;
+    const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     if (opts.raw_decode_bench) {
         const bench_result = runRawDecodeBench(
             allocator,
@@ -918,6 +919,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             null
     else
         null;
+    const graph_generate_stats = graph_mod.executor_stats.delta(graph_mod.executor_stats.snapshot(), graph_stats_before_generate);
     defer result.deinit();
 
     if (!opts.stream) print("{s}\n", .{result.text});
@@ -979,7 +981,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
-            printMetalQuantDispatchSummary(metal_snapshot);
+            printMetalQuantDispatchSummary(metal_snapshot, graph_generate_stats);
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -1937,6 +1939,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             durationMillis(created_decode_state_at, finished_generate_at),
             durationMillis(started_at, finished_generate_at),
             metal_stats_after_generate,
+            graph_generate_stats,
             cuda_stats_after_generate,
             cuda_generate_stats,
             draft_cuda_stats_after_generate,
@@ -2934,6 +2937,7 @@ fn writeJsonTiming(
     generate_ms: u64,
     total_ms: u64,
     metal_stats_opt: ?ops.BackendDebugTimingSnapshot,
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
     cuda_stats_opt: ?session_factory.CudaRuntimeStats,
     cuda_generate_stats_opt: ?session_factory.CudaRuntimeStats,
     draft_cuda_stats_opt: ?session_factory.CudaRuntimeStats,
@@ -3125,7 +3129,7 @@ fn writeJsonTiming(
         );
     } else try allocator.dupe(u8, "null");
     defer allocator.free(speculative_json);
-    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt, graph_mod.executor_stats.snapshot());
+    const metal_json = try metalStatsCompactJson(allocator, metal_stats_opt, graph_stats);
     defer allocator.free(metal_json);
     const cuda_json = if (comptime build_options.enable_cuda) blk: {
         if (cuda_stats_opt) |cuda_stats| {
@@ -4192,8 +4196,7 @@ fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
     );
 }
 
-fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot) void {
-    const plan_stats = graph_mod.executor_stats.snapshot();
+fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot, plan_stats: graph_mod.executor_stats.ExecutionStats) void {
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     print(
         "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
@@ -4584,6 +4587,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
+    const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
@@ -4686,6 +4690,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer allocator.free(result_text);
 
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    const graph_generate_stats = graph_mod.executor_stats.delta(graph_mod.executor_stats.snapshot(), graph_stats_before_generate);
     const load_model_ms = durationMillis(started_at, loaded_model_at);
     const prompt_prep_ms = durationMillis(loaded_model_at, encoded_prompt_at);
     const backend_setup_ms = durationMillis(encoded_prompt_at, created_runtime_at);
@@ -4760,7 +4765,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     metal_snapshot.quant.gated_block_fast_attempts,
                 },
             );
-            printMetalQuantDispatchSummary(metal_snapshot);
+            printMetalQuantDispatchSummary(metal_snapshot, graph_generate_stats);
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
@@ -5014,6 +5019,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             durationMillis(warmed_runtime_at, finished_generate_at),
             durationMillis(started_at, finished_generate_at),
             metal_stats,
+            graph_generate_stats,
             null,
             null,
             null,
