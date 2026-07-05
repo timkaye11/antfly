@@ -46,11 +46,14 @@ const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
 const metrics_lsm_maintenance_snapshot_ttl_ns: u64 = 60 * std.time.ns_per_s;
-const data_raft_batch_leader_wait_ns: u64 = 25 * std.time.ns_per_s;
+const data_raft_batch_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
+const metadata_bootstrap_retry_base_ms: u64 = 250;
+const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
+const metadata_bootstrap_retry_jitter_ms: u64 = 250;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -78,10 +81,11 @@ const CliConfig = struct {
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
     extension_package_store_dir: ?[]const u8 = null,
-    secret_store_path: ?[]const u8 = null,
+    secret_store_paths: std.ArrayListUnmanaged([]const u8) = .empty,
     help: bool = false,
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+        self.secret_store_paths.deinit(alloc);
         self.metadata_apis.deinit(alloc);
         self.* = undefined;
     }
@@ -369,7 +373,8 @@ pub const HealthSource = struct {
         const runtime_summary = self.data_server.provisioned_storage.runtime_status_cache.summary();
         const read_cache_stats = self.data_server.provisioned_storage.read_cache.cacheStats();
         const write_cache_stats = self.data_server.provisioned_storage.write_cache.cacheStats();
-        const auto_bulk_stats = self.data_server.write_source.autoBulkIngestStatsBestEffort();
+        const live_write_source = self.data_server.liveRuntimeWriteSource();
+        const auto_bulk_stats = live_write_source.autoBulkIngestStatsBestEffort();
         const fanout_metrics = antfly.public_api.table_reads.parallelFanoutMetricsSnapshot();
         const graph_fanout_metrics = antfly.public_api.distributed_graph.graphFanoutMetricsSnapshot();
         const api_request_stats = if (self.data_server.http_server) |*http_server|
@@ -476,11 +481,11 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_misses_total", "counter", "Provisioned write-cache opens that had to open a local table DB", write_cache_stats.miss_count);
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
         try writeLsmCacheMetrics(writer, self.data_server.provisioned_storage.lsm_cache.snapshotStats());
-        try writeLsmNativeStorageMetrics(writer, self.data_server.write_source.lsmNativeStorageStatsBestEffort());
-        try writeFullTextMemoryMetrics(writer, self.data_server.write_source.textMemoryAttributionStatsBestEffort());
+        try writeLsmNativeStorageMetrics(writer, live_write_source.lsmNativeStorageStatsBestEffort());
+        try writeFullTextMemoryMetrics(writer, live_write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(self.data_server.write_source.cachedWriteDbCountBestEffort()));
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", live_write_source.lsmMaintenanceScoreBestEffort());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(live_write_source.cachedWriteDbCountBestEffort()));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_active", "gauge", "Whether the data server LSM maintenance background worker is currently active", if (self.data_server.lsm_maintenance_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_started_total", "counter", "Data server LSM maintenance background worker wake cycles started", self.data_server.lsm_maintenance_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_completed_total", "counter", "Data server LSM maintenance background worker wake cycles completed with no immediate work remaining", self.data_server.lsm_maintenance_completed.load(.monotonic));
@@ -492,9 +497,9 @@ pub const HealthSource = struct {
         const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
         try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
         try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
-        try writeLsmWriteMetrics(writer, self.data_server.write_source.lsmWriteStatsBestEffort());
-        try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
-        try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
+        try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
+        try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
+        try writeAsyncIndexingMetrics(writer, live_write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
     }
 
@@ -554,7 +559,7 @@ pub const HealthSource = struct {
         if (!should_refresh) return cached;
 
         const refresh_started_ns: u64 = @intCast(platform_time.monotonicNs());
-        const refreshed_stats = self.data_server.write_source.lsmMaintenanceStatsBestEffort();
+        const refreshed_stats = self.data_server.liveRuntimeWriteSource().lsmMaintenanceStatsBestEffort();
         const refresh_finished_ns: u64 = @intCast(platform_time.monotonicNs());
 
         lockAtomic(&self.lsm_maintenance_metrics_mutex);
@@ -868,6 +873,7 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_failed", "gauge", "LSM-backed stores that failed startup open", stats.startup.lsm_open_failed);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_total_ns", "gauge", "Summed LSM open duration across startup stores", stats.startup.lsm_open_total_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_initializing_storage_ns", "gauge", "Summed LSM storage initialization duration during startup open", stats.startup.lsm_open_initializing_storage_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_cleanup_ns", "gauge", "Summed recovered table temp file cleanup duration during startup open", stats.startup.lsm_open_recovered_temp_cleanup_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_manifest_ns", "gauge", "Summed LSM manifest load duration during startup open", stats.startup.lsm_open_manifest_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_ensuring_dirs_ns", "gauge", "Summed LSM directory creation duration during startup open", stats.startup.lsm_open_ensuring_dirs_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_wal_replay_ns", "gauge", "Summed LSM WAL replay duration during startup open", stats.startup.lsm_open_wal_replay_ns);
@@ -876,6 +882,8 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_obsolete_paths", "gauge", "LSM obsolete paths loaded during startup open", stats.startup.lsm_open_obsolete_paths);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay", "gauge", "LSM mutable entries after startup WAL replay", stats.startup.lsm_open_mutable_entries_after_replay);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_immutable_memtables_after_replay", "gauge", "LSM immutable memtables after startup WAL replay", stats.startup.lsm_open_immutable_memtables_after_replay);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_files_deleted", "gauge", "Recovered table temp files deleted during startup open", stats.startup.lsm_open_recovered_temp_files_deleted);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_bytes_deleted", "gauge", "Recovered table temp bytes deleted during startup open", stats.startup.lsm_open_recovered_temp_bytes_deleted);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_records", "gauge", "Observed LSM WAL replay records during startup index open", stats.startup.wal_replay_records);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_entries", "gauge", "Observed LSM WAL replay entries during startup index open", stats.startup.wal_replay_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_bytes", "gauge", "Observed LSM WAL replay bytes during startup index open", stats.startup.wal_replay_bytes);
@@ -1681,6 +1689,61 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
     };
 }
 
+fn isRetryableMetadataBootstrapError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        error.NotListening,
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        => true,
+        else => false,
+    };
+}
+
+fn metadataBootstrapRetryDelayMs(registration: ?StoreRegistrationConfig, attempts: u32, now_ms: u64) u64 {
+    const capped_attempts = @min(attempts, 5);
+    const exponential = metadata_bootstrap_retry_base_ms << @intCast(capped_attempts -| 1);
+    const bounded = @min(exponential, metadata_bootstrap_retry_max_ms);
+    var hasher = std.hash.Wyhash.init(0x8d6a_2026_4c1f_b007);
+    hashU64(&hasher, now_ms);
+    hashU64(&hasher, attempts);
+    if (registration) |record| {
+        hashU64(&hasher, record.node_id);
+        hashU64(&hasher, record.store_id);
+    }
+    const jitter = hasher.final() % (metadata_bootstrap_retry_jitter_ms + 1);
+    return @min(bounded +| jitter, metadata_bootstrap_retry_max_ms + metadata_bootstrap_retry_jitter_ms);
+}
+
+test "data runtime treats metadata leadership churn as retryable bootstrap failure" {
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.NotLeader));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
+}
+
+test "data runtime metadata bootstrap retry delay is bounded and jittered" {
+    const registration = StoreRegistrationConfig{
+        .node_id = 7,
+        .store_id = 11,
+        .role = "data",
+    };
+    const first = metadataBootstrapRetryDelayMs(registration, 1, 1000);
+    const later = metadataBootstrapRetryDelayMs(registration, 4, 1000);
+    const capped = metadataBootstrapRetryDelayMs(registration, 16, 1000);
+    try std.testing.expect(first >= metadata_bootstrap_retry_base_ms);
+    try std.testing.expect(first <= metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+    try std.testing.expect(later >= first);
+    try std.testing.expect(capped <= metadata_bootstrap_retry_max_ms + metadata_bootstrap_retry_jitter_ms);
+}
+
 pub const StoreRegistrationConfig = struct {
     node_id: u64,
     store_id: u64,
@@ -1890,6 +1953,9 @@ pub const DataServer = struct {
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
+    metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
+    metadata_bootstrap_retry_attempts: u32 = 0,
+    next_metadata_bootstrap_retry_at_ms: u64 = 0,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -1898,6 +1964,7 @@ pub const DataServer = struct {
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
     last_data_raft_placement_fingerprint: ?u64 = null,
+    last_data_raft_status_fingerprint: ?u64 = null,
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
     last_provision_metadata_epoch: ?u64 = null,
@@ -2233,6 +2300,7 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
             _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
+            _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
@@ -2267,6 +2335,7 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
+        self.syncInferenceRuntimeConfig();
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
             api_server_cfg,
@@ -2481,6 +2550,22 @@ pub const DataServer = struct {
             apply_sm.write_cache.antfly_provider = provider;
         }
         if (self.http_server) |*server| server.antfly_provider = provider;
+        self.syncInferenceRuntimeConfig();
+    }
+
+    fn configuredInferenceAPIURL(self: *const DataServer) ?[]const u8 {
+        const node_config = self.api_server_cfg.node_config orelse return null;
+        return node_config.inference.api_url;
+    }
+
+    fn syncInferenceRuntimeConfig(self: *DataServer) void {
+        const inference_api_url = self.configuredInferenceAPIURL();
+        _ = self.read_source.withInferenceAPIURL(inference_api_url);
+        _ = self.write_source.withInferenceAPIURL(inference_api_url);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
+            apply_sm.write_cache.inference_api_url = inference_api_url;
+        }
     }
 
     pub fn start(self: *DataServer) !void {
@@ -2532,6 +2617,55 @@ pub const DataServer = struct {
         };
     }
 
+    fn metadataBootstrapRetryDue(self: *DataServer, now_ms: u64) bool {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.next_metadata_bootstrap_retry_at_ms == 0 or
+            now_ms >= self.next_metadata_bootstrap_retry_at_ms;
+    }
+
+    fn clearMetadataBootstrapRetry(self: *DataServer) void {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        self.metadata_bootstrap_retry_attempts = 0;
+        self.next_metadata_bootstrap_retry_at_ms = 0;
+    }
+
+    fn deferMetadataBootstrapRetry(self: *DataServer, now_ms: u64) void {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        self.metadata_bootstrap_retry_attempts = self.metadata_bootstrap_retry_attempts +| 1;
+        const delay_ms = metadataBootstrapRetryDelayMs(
+            self.store_registration,
+            self.metadata_bootstrap_retry_attempts,
+            now_ms,
+        );
+        self.next_metadata_bootstrap_retry_at_ms = now_ms +| delay_ms;
+    }
+
+    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+        if (!isRetryableMetadataBootstrapError(err)) return err;
+        self.deferMetadataBootstrapRetry(now_ms);
+    }
+
+    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+        if (!isRetryableMetadataBootstrapError(err)) return err;
+        self.provisioned_root_refresh_dirty.store(true, .release);
+        self.deferMetadataBootstrapRetry(now_ms);
+    }
+
+    fn metadataBootstrapRetryAttemptsForTest(self: *DataServer) u32 {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.metadata_bootstrap_retry_attempts;
+    }
+
+    fn nextMetadataBootstrapRetryAtMsForTest(self: *DataServer) u64 {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.next_metadata_bootstrap_retry_at_ms;
+    }
+
     pub fn runRound(self: *DataServer) !void {
         const ha_standby_replication_ok = blk: {
             self.runHAStandbyReplicationRound() catch |err| {
@@ -2565,83 +2699,65 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
-            if (!self.store_registration_confirmed) {
-                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    error.NotListening,
-                    => {},
-                    else => return register_err,
-                };
-            }
-            self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-            const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
-                now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
-            const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
-            const due_data_raft_status_refresh = self.data_raft != null;
-            if (self.store_status_ticks >= store_status_report_interval_ticks and
-                (self.store_status_dirty or due_store_status_heartbeat or due_full_store_status or due_data_raft_status_refresh))
-            {
-                self.store_status_ticks = 0;
-                const result = if (self.store_status_dirty or due_full_store_status or due_data_raft_status_refresh)
-                    self.reportStoreStatus()
-                else
-                    self.reportStoreStatusHeartbeat();
-                result catch |err| switch (err) {
-                    // Split runtime can briefly observe placement before the
-                    // local replica root is fully provisioned on disk.
-                    error.FileNotFound,
-                    error.UnknownGroup,
-                    error.LmdbUnexpected,
-                    error.Corrupted,
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    => {},
-                    error.UnknownStore => {
-                        self.store_registration_confirmed = false;
-                        self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
-                            error.HttpConnectionClosing,
-                            error.ConnectionResetByPeer,
-                            error.ConnectionRefused,
-                            error.BrokenPipe,
-                            error.EndOfStream,
-                            error.UnexpectedHttpStatus,
-                            => {},
-                            else => return register_err,
+            if (self.metadataBootstrapRetryDue(now_ms)) {
+                const registration_ready = blk: {
+                    if (!self.store_registration_confirmed) {
+                        self.registerNodeIfConfigured() catch |err| {
+                            try self.recordMetadataBootstrapError(err, now_ms);
+                            break :blk false;
                         };
-                    },
-                    else => return err,
+                    }
+                    break :blk true;
                 };
-            }
+                if (registration_ready) {
+                    self.store_status_ticks += 1;
+                    const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
+                        now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
+                    const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
+                    const due_data_raft_status_refresh = self.data_raft != null;
+                    if (self.store_status_ticks >= store_status_report_interval_ticks and
+                        (self.store_status_dirty or due_store_status_heartbeat or due_full_store_status or due_data_raft_status_refresh))
+                    {
+                        self.store_status_ticks = 0;
+                        const result = if (self.store_status_dirty or due_full_store_status or due_data_raft_status_refresh)
+                            self.reportStoreStatus()
+                        else
+                            self.reportStoreStatusHeartbeat();
+                        result catch |err| switch (err) {
+                            // Split runtime can briefly observe placement before the
+                            // local replica root is fully provisioned on disk.
+                            error.FileNotFound,
+                            error.UnknownGroup,
+                            error.LmdbUnexpected,
+                            error.Corrupted,
+                            => {},
+                            error.UnknownStore => {
+                                self.store_registration_confirmed = false;
+                                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
+                            },
+                            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
+                        };
+                    }
+                }
 
-            self.provision_ticks += 1;
-            if (self.provision_ticks >= 4) {
-                self.provision_ticks = 0;
-                self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
-                    // Local split-runtime provisioning can race with active writes.
-                    // Treat those as transient and retry on the next provision tick.
-                    error.WriterLocked,
-                    error.FileNotFound,
-                    error.UnknownGroup,
-                    error.LmdbUnexpected,
-                    error.Corrupted,
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    => {},
-                    else => return err,
-                };
+                if (self.metadataBootstrapRetryDue(now_ms)) {
+                    self.provision_ticks += 1;
+                    if (self.provision_ticks >= 4) {
+                        self.provision_ticks = 0;
+                        self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
+                            // Local split-runtime provisioning can race with active writes.
+                            // Treat those as transient and retry on the next provision tick.
+                            error.WriterLocked,
+                            error.FileNotFound,
+                            error.UnknownGroup,
+                            error.LmdbUnexpected,
+                            error.Corrupted,
+                            => {},
+                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err, now_ms),
+                        };
+                    }
+                }
             }
         }
         try self.maybeRequestRuntimeStatusRefresh();
@@ -2728,7 +2844,7 @@ pub const DataServer = struct {
 
     fn runLsmMaintenanceForegroundRound(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
-        _ = self.write_source.runLsmMaintenanceRound() catch |err| switch (err) {
+        _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
             error.ReadOnly,
             error.FileNotFound,
             error.LmdbUnexpected,
@@ -2816,14 +2932,15 @@ pub const DataServer = struct {
 
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return false;
-        if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+        const live_write_source = self.liveRuntimeWriteSource();
+        if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
             return true;
         }
         if (self.densePostingMaintenanceDue(now_ns)) return true;
         const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
         if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
-        if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+        if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
             if (delay_ns > 0) {
                 self.deferLsmObsoleteReclaim(now_ns, delay_ns);
                 return false;
@@ -2894,10 +3011,11 @@ pub const DataServer = struct {
 
             self.lsm_maintenance_active.store(true, .release);
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
+            const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const did_work = self.write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
+                const did_work = live_write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -2910,10 +3028,10 @@ pub const DataServer = struct {
                     break;
                 };
                 if (!did_work) {
-                    if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                    if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
-                    } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                         if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                     }
                     completed = true;
@@ -2921,9 +3039,9 @@ pub const DataServer = struct {
                 }
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
-                if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                     self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
-                } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                     if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                 }
             }
@@ -2934,7 +3052,7 @@ pub const DataServer = struct {
             // work alongside the regular LSM maintenance.
             const posting_now_ns = platform_time.monotonicNs();
             if (self.densePostingMaintenanceDue(posting_now_ns)) {
-                const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+                const posting_steps = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
                 const next_delay_ns: u64 = if (posting_steps > 0)
                     dense_posting_maintenance_retry_interval_ns
                 else
@@ -2960,7 +3078,7 @@ pub const DataServer = struct {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     return;
                 },
             }
@@ -3111,7 +3229,7 @@ pub const DataServer = struct {
                     const status = raft.host.http_host.host.raftStatus(group_id);
                     local_status_missing = status == null;
                     leader_node_id = if (status) |raft_status| raft_status.soft.leader_id else null;
-                    if (leader_node_id == null and localRaftStatusIsVoter(status, local_node_id)) {
+                    if (leader_node_id == null and localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
                         const now_ns = platform_time.monotonicNs();
                         if (last_local_campaign_ns == 0 or
                             now_ns -| last_local_campaign_ns >= data_raft_campaign_retry_interval_ns)
@@ -3132,7 +3250,8 @@ pub const DataServer = struct {
                 if (req.sync_level != .propose) {
                     try self.waitForLocalRaftBatchApply(group_id, index, deadline_ns);
                 }
-                try self.write_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
+                const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                try sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
                 return;
             }
 
@@ -3152,6 +3271,7 @@ pub const DataServer = struct {
                             const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
                             defer alloc.free(body);
                             var response = client.fetchGroupBatch(base_uri, group_id, table_name, body) catch |err| switch (err) {
+                                error.LeaderUnavailable,
                                 error.UnexpectedHttpStatus,
                                 error.HttpConnectionClosing,
                                 error.ConnectionResetByPeer,
@@ -3281,6 +3401,7 @@ pub const DataServer = struct {
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         var response = client.fetchGroupBatch(target_store.api_url, group_id, table_name, body) catch |err| switch (err) {
+            error.LeaderUnavailable,
             error.UnexpectedHttpStatus,
             error.HttpConnectionClosing,
             error.ConnectionResetByPeer,
@@ -3332,6 +3453,16 @@ pub const DataServer = struct {
         return false;
     }
 
+    fn localRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
+        const raft_status = status orelse return false;
+        if (raft_status.soft.leader_id != null) return false;
+        switch (raft_status.soft.role) {
+            .follower, .pre_candidate => {},
+            .candidate, .leader => return false,
+        }
+        return localRaftStatusIsVoter(raft_status, local_node_id);
+    }
+
     fn sleepDataRaftBatchLeaderRetry() void {
         var req = std.posix.timespec{
             .sec = @intCast(@divTrunc(data_raft_batch_leader_retry_sleep_ns, std.time.ns_per_s)),
@@ -3343,7 +3474,7 @@ pub const DataServer = struct {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     return;
                 },
             }
@@ -3404,13 +3535,11 @@ pub const DataServer = struct {
             .data => self.markLocalGroupDataChanged(),
             .structural => {
                 self.invalidateLocalGroupStatusCache();
-                self.refreshVisibleProvisionedReplicaState() catch |err| {
-                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
-                        table_name,
-                        err,
-                    });
-                };
                 if (self.data_raft_apply) |apply_sm| {
+                    // Raft-backed tables write through the apply state machine.
+                    // Move create-time seeded writers before refreshing visible
+                    // roots so status reconciliation and the first batch share
+                    // one root writer owner.
                     _ = self.write_source.transferAdoptableWriteCacheEntriesTo(&apply_sm.write_source, table_name) catch |err| {
                         std.log.warn("failed to transfer provisioned write cache to raft apply table={s} err={}", .{
                             table_name,
@@ -3418,6 +3547,12 @@ pub const DataServer = struct {
                         });
                     };
                 }
+                self.refreshVisibleProvisionedReplicaState() catch |err| {
+                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
+                        table_name,
+                        err,
+                    });
+                };
                 self.syncDataRaftFromRemoteMetadata() catch |err| {
                     std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
                         table_name,
@@ -3437,8 +3572,22 @@ pub const DataServer = struct {
         // forcing a local group-status refresh. The next runtime round should
         // publish promptly; otherwise slow debug builds can sit behind the
         // periodic tick gate even though fresh writer status is available.
+        self.markStoreStatusDirtyImmediate();
+    }
+
+    fn markStoreStatusDirtyImmediate(self: *DataServer) void {
         self.store_status_dirty = true;
         self.store_status_ticks = store_status_report_interval_ticks;
+    }
+
+    fn observeDataRaftStatusFingerprint(self: *DataServer, fingerprint: u64) void {
+        if (self.last_data_raft_status_fingerprint != null and
+            self.last_data_raft_status_fingerprint.? == fingerprint)
+        {
+            return;
+        }
+        self.last_data_raft_status_fingerprint = fingerprint;
+        self.markStoreStatusDirtyImmediate();
     }
 
     fn markRuntimeStatusDirty(
@@ -3825,17 +3974,43 @@ pub const DataServer = struct {
         return db.core.identity_namespace;
     }
 
+    fn tableNameForLocalGroupAlloc(self: *DataServer, group_id: u64) !?[]u8 {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
+        const table = findTableById(snapshot.tables, range.table_id) orelse return null;
+        return try self.alloc.dupe(u8, table.name);
+    }
+
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
         var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
         if ((try source_store.latestBatch(source_group_id)) != null) return;
+
+        if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
+            defer self.alloc.free(table_name);
+            if (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
+                var cached = cached_db;
+                defer cached.deinit(self.alloc);
+                try self.seedSplitSourceApplyStoreFromDb(&source_store, source_group_id, cached.db);
+                return;
+            }
+        }
 
         var db = antfly.db.DB.open(self.alloc, source_root_dir, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer db.close();
+        try self.seedSplitSourceApplyStoreFromDb(&source_store, source_group_id, &db);
+    }
 
+    fn seedSplitSourceApplyStoreFromDb(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        source_group_id: u64,
+        db: *antfly.db.DB,
+    ) !void {
         var ops = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (ops.items) |op| self.alloc.free(op);
@@ -3966,6 +4141,7 @@ pub const DataServer = struct {
             .live = true,
         });
         self.store_registration_confirmed = true;
+        self.clearMetadataBootstrapRetry();
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
@@ -4239,7 +4415,9 @@ pub const DataServer = struct {
                         continue;
                     }
 
-                    switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+                    var writer_probe = self.probeManagedWriterGroupBestEffort(table.name, group_id);
+                    defer writer_probe.deinit();
+                    switch (writer_probe) {
                         .leased => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                                 try reports.append(alloc, cached);
@@ -4497,6 +4675,7 @@ pub const DataServer = struct {
         try self.storeStatusHeartbeatCacheReplace(report);
         self.store_status_dirty = false;
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        self.clearMetadataBootstrapRetry();
     }
 
     fn syncDataRaftFromRemoteMetadata(self: *DataServer) !void {
@@ -4535,7 +4714,7 @@ pub const DataServer = struct {
         if (placement_changed) {
             self.last_data_raft_placement_fingerprint = placement_fingerprint;
             self.invalidateLocalGroupStatusCache();
-            self.store_status_dirty = true;
+            self.markStoreStatusDirtyImmediate();
         }
 
         var updates = std.ArrayListUnmanaged(antfly.raft.MetadataUpdate).empty;
@@ -4578,7 +4757,7 @@ pub const DataServer = struct {
         for (local_intents.items) |intent| {
             if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
-            if (status == null or status.?.soft.leader_id != null or !localRaftStatusIsVoter(status, registration.node_id)) continue;
+            if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                 std.log.warn("data raft bootstrap campaign failed group_id={} node_id={} err={}", .{
                     intent.record.group_id,
@@ -4594,6 +4773,8 @@ pub const DataServer = struct {
                 std.log.warn("data raft bootstrap campaign drive failed node_id={} err={}", .{ registration.node_id, err });
             };
         }
+
+        self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
     }
 
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
@@ -4603,6 +4784,7 @@ pub const DataServer = struct {
         defer freeStoreStatusReportOwned(self.alloc, &report);
         try remote_metadata.reportNodeStatus(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        self.clearMetadataBootstrapRetry();
     }
 
     fn cloneHeartbeatStoreStatusReport(
@@ -5140,7 +5322,15 @@ pub const DataServer = struct {
                     };
                     defer self.clearProvisionedStartupCatchUpTarget();
 
-                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithIndexesJson(&self.write_source, self.alloc, group_id, table.name, table.indexes_json) catch |err| {
+                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithMetadata(&self.write_source, self.alloc, group_id, table.name, .{
+                        .indexes_json = table.indexes_json,
+                        .schema_json = table.schema_json,
+                        .identity_namespace = .{
+                            .table_id = table.table_id,
+                            .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                            .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+                        },
+                    }) catch |err| {
                         _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned startup catch-up failed group={} table={s} err={}", .{ group_id, table.name, err });
                         stats.debt_remaining = true;
@@ -5427,7 +5617,7 @@ pub const DataServer = struct {
         _ = self.auto_bulk_finish_started.fetchAdd(1, .monotonic);
         defer self.auto_bulk_finish_last_duration_ns.store(platform_time.monotonicNs() - started_ns, .monotonic);
 
-        const finished = self.write_source.tryFinishExpiredAutoBulkIngestAndPublishStatus(self.alloc) orelse {
+        const finished = self.liveRuntimeWriteSource().tryFinishExpiredAutoBulkIngestAndPublishStatus(self.alloc) orelse {
             _ = self.auto_bulk_finish_lock_deferred.fetchAdd(1, .monotonic);
             _ = self.auto_bulk_finish_completed.fetchAdd(1, .monotonic);
             return;
@@ -6047,11 +6237,15 @@ pub const DataServer = struct {
         defer self.provisioned_root_refresh_last_duration_ns.store(platform_time.monotonicNs() - started_ns, .monotonic);
 
         self.refreshProvisionedReplicaRoot() catch |err| {
-            self.provisioned_root_refresh_dirty.store(true, .release);
+            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            self.recordProvisionedRootRefreshMetadataError(err, now_ms) catch {
+                self.provisioned_root_refresh_dirty.store(true, .release);
+            };
             _ = self.provisioned_root_refresh_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned replica-root refresh failed err={}", .{err});
             return;
         };
+        self.clearMetadataBootstrapRetry();
         _ = self.provisioned_root_refresh_completed.fetchAdd(1, .monotonic);
     }
 
@@ -6073,10 +6267,12 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
+        const refresh_write_source = self.liveRuntimeWriteSource();
         self.provisioned_storage.pruneGroupVisibleRootGenerations(local_group_ids);
         if (local_group_ids.len == 0) {
             self.provisioned_storage.read_cache.clear();
-            self.write_source.clearWriteCache();
+            refresh_write_source.clearWriteCache();
+            if (refresh_write_source != &self.write_source) self.write_source.clearWriteCache();
             self.last_provision_fingerprint = null;
             self.last_provision_metadata_epoch = head.metadata_epoch;
             self.invalidateLocalGroupStatusCache();
@@ -6096,30 +6292,50 @@ pub const DataServer = struct {
         }
 
         const fingerprint = blk: {
-            lockAtomic(self.write_source.localDbMutex());
-            defer self.write_source.localDbMutex().unlock();
+            const next_fingerprint = blk_fingerprint: {
+                lockAtomic(refresh_write_source.localDbMutex());
+                defer refresh_write_source.localDbMutex().unlock();
 
-            try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
+                try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
-            const next_fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
-                head.metadata_group_id,
-                local_group_ids,
-                snapshot.tables,
-                snapshot.ranges,
-            );
+                break :blk_fingerprint antfly.metadata.table_provisioner.provisioningFingerprint(
+                    head.metadata_group_id,
+                    local_group_ids,
+                    snapshot.tables,
+                    snapshot.ranges,
+                );
+            };
             if (self.last_provision_fingerprint == next_fingerprint) {
                 self.last_provision_metadata_epoch = head.metadata_epoch;
                 return;
             }
-            _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-                self.alloc,
-                head.metadata_group_id,
-                local_group_ids,
-                snapshot.tables,
-                snapshot.ranges,
-                try self.ensureBackendRuntime(),
-            );
-            try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
+
+            const backend_runtime = try self.ensureBackendRuntime();
+            for (local_group_ids) |group_id| {
+                if (group_id == head.metadata_group_id) continue;
+                const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
+                const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+
+                {
+                    var activity = refresh_write_source.beginGroupRefreshActivity(table.name, group_id);
+                    defer activity.deinit();
+
+                    var group_ids_one = [_]u64{group_id};
+                    {
+                        lockAtomic(refresh_write_source.localDbMutex());
+                        defer refresh_write_source.localDbMutex().unlock();
+                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                            self.alloc,
+                            head.metadata_group_id,
+                            group_ids_one[0..],
+                            snapshot.tables,
+                            snapshot.ranges,
+                            backend_runtime,
+                        );
+                    }
+                    try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
+                }
+            }
             self.provisioned_storage.read_cache.clear();
             break :blk next_fingerprint;
         };
@@ -6403,6 +6619,10 @@ fn appendOwnedPeerRouteUpsert(
 }
 
 const RemoteMetadataSource = struct {
+    const TestFaults = if (@import("builtin").is_test) struct {
+        fetch_head_error: ?anyerror = null,
+    } else struct {};
+
     alloc: std.mem.Allocator,
     base_uris: [][]u8,
     preferred_base_uri_index: usize = 0,
@@ -6411,6 +6631,7 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    test_faults: TestFaults = .{},
 
     fn init(alloc: std.mem.Allocator, base_uris: []const []const u8) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
@@ -6453,6 +6674,9 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchHead(self: *RemoteMetadataSource) !antfly.metadata_api.MetadataHead {
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
         if (self.cached_head) |head| {
@@ -7942,6 +8166,35 @@ fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementInt
     return hasher.final();
 }
 
+fn dataRaftLocalStatusFingerprint(
+    raft: *antfly.raft.ManagedHttpHostService,
+    intents: []const antfly.raft.PlacementIntent,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0x4d2c_e31a_7f8b_2026);
+    hashU64(&hasher, intents.len);
+    for (intents) |intent| {
+        hashU64(&hasher, intent.record.group_id);
+        const status = raft.host.http_host.host.raftStatus(intent.record.group_id) orelse {
+            hashU64(&hasher, 0);
+            continue;
+        };
+        hashU64(&hasher, 1);
+        hashU64(&hasher, status.id);
+        hashU64(&hasher, @intFromEnum(status.soft.role));
+        if (status.soft.leader_id) |leader_id| {
+            hashU64(&hasher, 1);
+            hashU64(&hasher, leader_id);
+        } else {
+            hashU64(&hasher, 0);
+        }
+        hashU64(&hasher, status.conf_state.voters.len);
+        for (status.conf_state.voters) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.voters_outgoing.len);
+        for (status.conf_state.voters_outgoing) |node_id| hashU64(&hasher, node_id);
+    }
+    return hasher.final();
+}
+
 fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
     hasher.update(std.mem.asBytes(&value));
 }
@@ -8331,10 +8584,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_path) |raw_secret_store_path| {
-        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
-        defer alloc.free(normalized_secret_store_path);
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+    if (cli.secret_store_paths.items.len > 0) {
+        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
         secret_store_initialized = true;
     }
 
@@ -8599,12 +8850,29 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             continue;
         }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
-            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
+            try cfg.secret_store_paths.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
         return error.InvalidArguments;
     }
     return cfg;
+}
+
+fn initLayeredSecretStore(
+    alloc: std.mem.Allocator,
+    raw_paths: []const []const u8,
+) !antfly.common.secrets.FileStore {
+    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (normalized_paths.items) |path| alloc.free(path);
+        normalized_paths.deinit(alloc);
+    }
+    for (raw_paths) |raw_path| {
+        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
+        errdefer alloc.free(normalized_path);
+        try normalized_paths.append(alloc, normalized_path);
+    }
+    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
 }
 
 fn resolveLocalBaseDir(
@@ -8874,7 +9142,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Data raft snapshot root directory
         \\  --extension-package-store <path> Extension package store directory
-        \\  --secret-store-path <path>     Antfly secrets.json file path
+        \\  --secret-store-path <path>     Antfly secrets.json file path; repeat for fallback layers
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
@@ -8886,6 +9154,77 @@ test "data runtime module compiles" {
     _ = DataServerConfig;
     _ = DataServer;
     _ = GroupLeadershipSource;
+}
+
+test "data raft bootstrap campaign retries leaderless voter elections" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var status = raft_engine.core.Status{
+        .id = 1,
+        .group_id = 7001,
+        .soft = .{ .leader_id = null, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .pre_candidate;
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .candidate;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .leader;
+    status.soft.leader_id = 1;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .follower;
+    status.soft.leader_id = 2;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.leader_id = null;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "data runtime live writer source follows raft apply ownership" {
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = undefined;
+    server.data_raft_apply = null;
+    server.write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-live-writer-source", Catalog.iface());
+    defer server.write_source.deinit();
+
+    try std.testing.expectEqual(&server.write_source, server.liveRuntimeWriteSource());
+
+    var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
+    defer apply_sm.deinit();
+    server.data_raft_apply = &apply_sm;
+
+    try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
 }
 
 test "data server can register a store without enabling data raft" {
@@ -8954,7 +9293,7 @@ test "data runtime cli accepts secret store path" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
 }
 
 test "data runtime cli accepts extension package store path" {
@@ -9182,6 +9521,7 @@ test "data runtime local group status status-only open preserves replay debt" {
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
         defer db.close();
 
@@ -9436,10 +9776,12 @@ test "data runtime local group status provider collects and caches group statuse
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provider-cache", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
+    var db = try antfly.db.DB.open(alloc, db_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+    });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -9562,6 +9904,49 @@ test "data runtime local group status provider collects and caches group statuse
     const empty_cached = (try server.cloneCachedLocalGroupStatuses(alloc, 3, 99)) orelse return error.TestUnexpectedResult;
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, empty_cached);
     try std.testing.expectEqual(@as(usize, 0), empty_cached.len);
+}
+
+test "data runtime raft status changes force immediate store status publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-raft-status-publication", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root_dir);
+
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_status_dirty = false;
+    server.store_status_ticks = 0;
+    server.observeDataRaftStatusFingerprint(11);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
+
+    server.store_status_dirty = false;
+    server.store_status_ticks = 0;
+    server.observeDataRaftStatusFingerprint(11);
+    try std.testing.expect(!server.store_status_dirty);
+    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks);
+
+    server.observeDataRaftStatusFingerprint(12);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
 }
 
 test "data runtime local split fallback preserves source identity namespace" {
@@ -9693,6 +10078,101 @@ test "data runtime local split fallback preserves source identity namespace" {
     try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
     try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "data runtime split apply store seeding reuses cached source writer" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-seed-cached-writer", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const source_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 180);
+    defer alloc.free(source_db_path);
+
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 180,
+        .range_id = 9000,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, source_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 180,
+                    .table_id = 7,
+                    .range_id = 9000,
+                    .start_key = "doc:a",
+                    .end_key = "doc:z",
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = antfly.public_api.table_writes.ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    server.write_source.write_cache = &write_cache;
+    defer server.deinit();
+
+    var held = (try server.write_source.leaseCachedGroupWriter(alloc, 180, "docs")) orelse return error.TestUnexpectedResult;
+    defer held.deinit(alloc);
+
+    try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
+
+    var source_store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = source_db_path });
+    defer source_store.deinit();
+    const latest = (try source_store.latestBatch(180)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(latest.entry_count > 0);
 }
 
 test "data runtime local merge fallback derives receiver identity namespace from catalog" {
@@ -9877,7 +10357,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-refresh", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
     var db = try antfly.db.DB.open(alloc, db_path, .{});
@@ -10426,12 +10906,16 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
 
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -10544,7 +11028,7 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     try std.testing.expect(server.runtime_status_refresh_last_duration_ns.load(.monotonic) > 0);
 }
 
-test "data runtime provisioned cache warmup populates only the read cache for local tables" {
+test "data runtime provisioned cache warmup populates runtime status without pinning db caches" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -10552,15 +11036,19 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provisioned-warmup", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
 
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -10662,9 +11150,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     try server.requestProvisionedCacheWarmup();
 
     try std.testing.expectEqual(@as(usize, 0), server.write_source.cachedWriteDbCount());
-    try std.testing.expectEqual(@as(usize, 1), server.provisioned_storage.read_cache.entries.items.len);
-    try std.testing.expectEqual(@as(u64, 77), server.provisioned_storage.read_cache.entries.items[0].group_id);
-    try std.testing.expectEqualStrings("docs", server.provisioned_storage.read_cache.entries.items[0].table_name);
+    try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_warmup_failed.load(.monotonic));
@@ -10672,7 +11158,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     try std.testing.expect(server.provisioned_warmup_last_duration_ns.load(.monotonic) > 0);
     const warmed_read_cache = server.provisioned_storage.read_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), warmed_read_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.miss_count);
     const warmed_write_cache = server.provisioned_storage.write_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.hit_count);
     try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.miss_count);
@@ -10681,14 +11167,16 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     defer snapshot_statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), snapshot_statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 1), snapshot_statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, snapshot_statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, snapshot_statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
 
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer warmed_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, warmed_lookup.json, "\"alpha\"") != null);
     const post_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 1), post_lookup_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), post_lookup_read_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.hit_count);
+    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.miss_count);
 
     _ = try server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
@@ -10696,8 +11184,8 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
         .sync_level = .write,
     });
     const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 1), post_batch_write_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), post_batch_write_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);
+    try std.testing.expect(post_batch_write_cache.miss_count >= 1);
 
     const pre_live_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
     var live_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:b", .{}, .read_index)).?;
@@ -12079,6 +12567,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
         defer db.close();
 
@@ -12248,7 +12737,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     try server.requestRuntimeStatusRefresh();
-    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
+    server.provisioned_startup_catch_up_dirty.store(true, .monotonic);
 
     try server.requestProvisionedStartupCatchUp();
 
@@ -12989,7 +13478,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     defer alloc.free(replica_root_dir);
 
     const remote_metadata = try alloc.create(RemoteMetadataSource);
-    const metadata_api_urls = [_][]const u8{"http://127.0.0.1:1"};
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
     remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
 
     var server: DataServer = .{
@@ -13018,6 +13507,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     };
     defer server.deinit();
 
+    server.store_registration_confirmed = true;
     server.store_status_dirty = false;
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
@@ -13031,6 +13521,136 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.last_provision_head_check_at_ms);
+}
+
+test "data runtime runRound backs off retryable provision metadata failures" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_registration_confirmed = true;
+    server.store_status_dirty = false;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provisioned_root_refresh_dirty.store(false, .release);
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.provision_ticks);
+    try std.testing.expect(server.last_provision_head_check_at_ms != 0);
+
+    const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    const last_head_check_at_ms = server.last_provision_head_check_at_ms;
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    try std.testing.expectEqual(last_head_check_at_ms, server.last_provision_head_check_at_ms);
+    try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+}
+
+test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.provisioned_root_refresh_dirty.store(true, .release);
+
+    server.runProvisionedRootRefresh();
+
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_root_refresh_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
+
+    const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    server.store_registration_confirmed = true;
+    server.store_status_dirty = false;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
 }
 
 test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {
@@ -13826,7 +14446,7 @@ test "data runtime remote admin snapshot clone preserves replication status surf
 
 test "data runtime metrics use prometheus labels for resource and cache dimensions" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    var writer_buf: [65536]u8 = undefined;
+    var writer_buf: [262144]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_buf);
 
     try writeResourceMetrics(&writer, &resource_manager);
@@ -14139,7 +14759,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -14153,6 +14773,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     const items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
     items[0] = .{
         .group_id = 77,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+        },
         .stats = .{
             .doc_count = 3,
             .index_count = 2,
@@ -14173,10 +14797,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .lsm_open_stores = 3,
                     .lsm_open_completed = 2,
                     .lsm_open_total_ns = 1000,
+                    .lsm_open_recovered_temp_cleanup_ns = 333,
                     .lsm_open_manifest_ns = 111,
                     .lsm_open_wal_replay_ns = 222,
                     .lsm_open_loaded_runs = 5,
                     .lsm_open_mutable_entries_after_replay = 7,
+                    .lsm_open_recovered_temp_files_deleted = 4,
+                    .lsm_open_recovered_temp_bytes_deleted = 2048,
                     .wal_replay_records = 8,
                     .wal_replay_entries = 9,
                     .wal_replay_bytes = 10,
@@ -14203,6 +14830,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     };
 
     const snapshots = try std.testing.allocator.alloc(runtime_status.TableRuntimeSnapshot, 1);
+    defer std.testing.allocator.free(snapshots);
     snapshots[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = items },
@@ -14239,10 +14867,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     server.provisioned_root_refresh_last_duration_ns.store(66, .monotonic);
 
     var health = HealthSource{ .data_server = &server };
-    var writer_buf: [65536]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&writer_buf);
-    try health.metricsWriter().writeMetrics(&writer);
-    const output = writer.buffered();
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try health.metricsWriter().writeMetrics(&writer.writer);
+    const output = writer.writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_tables 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_groups 1") != null);
@@ -14350,10 +14978,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_stores 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_completed 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_total_ns 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_cleanup_ns 333") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_manifest_ns 111") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_wal_replay_ns 222") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_loaded_runs 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_files_deleted 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_bytes_deleted 2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_records 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_entries 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_bytes 10") != null);

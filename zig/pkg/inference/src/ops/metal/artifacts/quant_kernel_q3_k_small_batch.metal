@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q3_k/rows_2_8/none/small_batch
 // kernel_id=antfly_q3_k_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=true
-// Production Metal dispatch uses this checked-in artifact after
-// correctness and benchmark gates passed.
+// production_enabled=false
+// Runtime route evidence can opt into this checked-in artifact while
+// promotion is blocked by unstable benchmark timing.
 
 #include <metal_stdlib>
 using namespace metal;

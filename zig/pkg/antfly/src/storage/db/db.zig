@@ -127,6 +127,8 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+const generated_embed_default_batch_items: usize = 8;
+const generated_embed_default_batch_bytes: usize = 256 * 1024;
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -160,7 +162,10 @@ fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void
         if (producer_cfg.type != .document_extraction) continue;
 
         if (entry.source_template.len > 0) {
-            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch continue;
+            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch |err| switch (err) {
+                error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                else => continue,
+            };
             defer db.alloc.free(rendered);
             try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
             continue;
@@ -864,6 +869,7 @@ const StartupOpenStats = struct {
     lsm_open_failed: AtomicU64 = .init(0),
     lsm_open_total_ns: AtomicU64 = .init(0),
     lsm_open_initializing_storage_ns: AtomicU64 = .init(0),
+    lsm_open_recovered_temp_cleanup_ns: AtomicU64 = .init(0),
     lsm_open_manifest_ns: AtomicU64 = .init(0),
     lsm_open_ensuring_dirs_ns: AtomicU64 = .init(0),
     lsm_open_wal_replay_ns: AtomicU64 = .init(0),
@@ -872,6 +878,8 @@ const StartupOpenStats = struct {
     lsm_open_obsolete_paths: AtomicU64 = .init(0),
     lsm_open_mutable_entries_after_replay: AtomicU64 = .init(0),
     lsm_open_immutable_memtables_after_replay: AtomicU64 = .init(0),
+    lsm_open_recovered_temp_files_deleted: AtomicU64 = .init(0),
+    lsm_open_recovered_temp_bytes_deleted: AtomicU64 = .init(0),
     wal_replay_records: AtomicU64 = .init(0),
     wal_replay_entries: AtomicU64 = .init(0),
     wal_replay_bytes: AtomicU64 = .init(0),
@@ -903,6 +911,7 @@ const StartupOpenStats = struct {
             .lsm_open_failed = self.lsm_open_failed.load(.monotonic),
             .lsm_open_total_ns = self.lsm_open_total_ns.load(.monotonic),
             .lsm_open_initializing_storage_ns = self.lsm_open_initializing_storage_ns.load(.monotonic),
+            .lsm_open_recovered_temp_cleanup_ns = self.lsm_open_recovered_temp_cleanup_ns.load(.monotonic),
             .lsm_open_manifest_ns = self.lsm_open_manifest_ns.load(.monotonic),
             .lsm_open_ensuring_dirs_ns = self.lsm_open_ensuring_dirs_ns.load(.monotonic),
             .lsm_open_wal_replay_ns = self.lsm_open_wal_replay_ns.load(.monotonic),
@@ -911,6 +920,8 @@ const StartupOpenStats = struct {
             .lsm_open_obsolete_paths = self.lsm_open_obsolete_paths.load(.monotonic),
             .lsm_open_mutable_entries_after_replay = self.lsm_open_mutable_entries_after_replay.load(.monotonic),
             .lsm_open_immutable_memtables_after_replay = self.lsm_open_immutable_memtables_after_replay.load(.monotonic),
+            .lsm_open_recovered_temp_files_deleted = self.lsm_open_recovered_temp_files_deleted.load(.monotonic),
+            .lsm_open_recovered_temp_bytes_deleted = self.lsm_open_recovered_temp_bytes_deleted.load(.monotonic),
             .wal_replay_records = self.wal_replay_records.load(.monotonic),
             .wal_replay_entries = self.wal_replay_entries.load(.monotonic),
             .wal_replay_bytes = self.wal_replay_bytes.load(.monotonic),
@@ -2919,6 +2930,7 @@ pub const DB = struct {
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
                 opts.external_derived_checkpoints,
+                openModeRequiresReadOnlyBackends(opts.open_mode),
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
@@ -3121,8 +3133,39 @@ pub const DB = struct {
         if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
     }
 
-    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
+    const DetachedEnrichmentRuntime = struct {
+        append_ctx: ?*EnrichmentAppendContext = null,
+        runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.runtime) |runtime| {
+                runtime.deinit();
+                alloc.destroy(runtime);
+                self.runtime = null;
+            }
+            if (self.append_ctx) |ctx| {
+                alloc.destroy(ctx);
+                self.append_ctx = null;
+            }
+        }
+
+        fn take(self: *@This()) struct {
+            append_ctx: *EnrichmentAppendContext,
+            runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+        } {
+            const append_ctx = self.append_ctx.?;
+            const runtime = self.runtime.?;
+            self.append_ctx = null;
+            self.runtime = null;
+            return .{
+                .append_ctx = append_ctx,
+                .runtime = runtime,
+            };
+        }
+    };
+
+    fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -3156,15 +3199,101 @@ pub const DB = struct {
             self.core.replaySource(),
             self.core.batchExecutionResources().index_manager,
             append_ctx,
-            appendDerivedBatchFromEnrichment,
+            appendGeneratedBatchFromEnrichment,
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
             enrichment_cfg,
         );
         errdefer runtime.deinit();
-        self.enrichment_append_context = append_ctx;
-        self.enrichment_runtime = runtime;
+        return .{
+            .append_ctx = append_ctx,
+            .runtime = runtime,
+        };
+    }
+
+    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
+        var detached = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
+        const owned = detached.take();
+        self.enrichment_append_context = owned.append_ctx;
+        self.enrichment_runtime = owned.runtime;
+    }
+
+    fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
+        if (cfg.dense_embedder) |dense_embedder| {
+            dense_embedder.deinit(self.runtime_alloc);
+            cfg.dense_embedder = null;
+        }
+        if (cfg.sparse_embedder) |sparse_embedder| {
+            sparse_embedder.deinit(self.runtime_alloc);
+            cfg.sparse_embedder = null;
+        }
+        if (cfg.asset_producer) |producer| {
+            producer.deinit(self.runtime_alloc);
+            cfg.asset_producer = null;
+        }
+    }
+
+    pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        var owned_cfg = cfg;
+        var cfg_owned = true;
+        errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
+
+        const query_visibility_hook = self.async_context.query_visibility_hook;
+        var detached = try self.createDetachedEnrichmentRuntime(owned_cfg);
+        cfg_owned = false;
+        errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
+        if (detached) |*runtime| {
+            if (self.core.hasGeneratedEnrichmentTargets()) {
+                const target_sequence = self.core.nextEnrichmentSequence();
+                if (target_sequence != 0) try runtime.runtime.?.resumeFrom(target_sequence, target_sequence);
+            }
+            if (query_visibility_hook != null) {
+                runtime.runtime.?.setStatusHook(.{
+                    .ptr = self.async_context,
+                    .on_change = notifyAsyncContextVisibilityHook,
+                });
+            }
+        }
+
+        const should_start_replacement = detached != null and self.open_mode.allowsOptionalRuntimes();
+        var stopped_existing_runtime = false;
+        if (should_start_replacement) {
+            if (self.enrichment_runtime) |runtime| {
+                runtime.stop();
+                stopped_existing_runtime = true;
+            }
+        }
+        errdefer if (stopped_existing_runtime) {
+            if (self.enrichment_runtime) |runtime| {
+                runtime.start() catch |err| {
+                    std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
+                };
+            }
+        };
+
+        if (should_start_replacement) {
+            try detached.?.runtime.?.start();
+        }
+
+        if (self.enrichment_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.enrichment_runtime = null;
+        }
+        if (self.enrichment_append_context) |ctx| {
+            self.runtime_alloc.destroy(ctx);
+            self.enrichment_append_context = null;
+        }
+
+        if (detached) |*runtime| {
+            const owned = runtime.take();
+            self.enrichment_append_context = owned.append_ctx;
+            self.enrichment_runtime = owned.runtime;
+        }
+        self.setQueryVisibilityHook(query_visibility_hook);
     }
 
     fn initResolutionRuntime(self: *DB) !void {
@@ -3752,6 +3881,7 @@ pub const DB = struct {
         self.async_context.stats.startup.lsm_open_failed.store(lsm_open_stats.failed, .monotonic);
         self.async_context.stats.startup.lsm_open_total_ns.store(lsm_open_stats.total_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_initializing_storage_ns.store(lsm_open_stats.initializing_storage_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_recovered_temp_cleanup_ns.store(lsm_open_stats.cleaning_recovered_run_temps_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_manifest_ns.store(lsm_open_stats.opening_manifest_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_ensuring_dirs_ns.store(lsm_open_stats.ensuring_dirs_ns, .monotonic);
         self.async_context.stats.startup.lsm_open_wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
@@ -3760,6 +3890,8 @@ pub const DB = struct {
         self.async_context.stats.startup.lsm_open_obsolete_paths.store(lsm_open_stats.obsolete_paths, .monotonic);
         self.async_context.stats.startup.lsm_open_mutable_entries_after_replay.store(lsm_open_stats.mutable_entries_after_replay, .monotonic);
         self.async_context.stats.startup.lsm_open_immutable_memtables_after_replay.store(lsm_open_stats.immutable_memtables_after_replay, .monotonic);
+        self.async_context.stats.startup.lsm_open_recovered_temp_files_deleted.store(lsm_open_stats.recovered_table_temp_files_deleted, .monotonic);
+        self.async_context.stats.startup.lsm_open_recovered_temp_bytes_deleted.store(lsm_open_stats.recovered_table_temp_bytes_deleted, .monotonic);
         self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
         self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
         self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
@@ -3969,6 +4101,9 @@ pub const DB = struct {
 
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
+            // This test drives primary maintenance explicitly; keep detached
+            // primary LSM maintenance from racing the precondition checks.
+            .executor = .{ .backend = .manual },
             .primary_backend = .{ .lsm = .{
                 .flush_threshold = 1,
                 .defer_flush_on_commit = true,
@@ -4060,6 +4195,10 @@ pub const DB = struct {
 
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
+            // This test verifies the explicit primary-only maintenance entry
+            // point; keep detached LSM maintenance from consuming the queued
+            // primary obsolete path before the assertion.
+            .executor = .{ .backend = .manual },
             .primary_backend = .{ .lsm = .{
                 .flush_threshold = 1,
                 .defer_flush_on_commit = true,
@@ -4789,7 +4928,6 @@ pub const DB = struct {
         const use_thin_replay_fast_path =
             effective_req.sync_level != .full_text and
             effective_req.sync_level != .enrichments and
-            effective_req.sync_level != .aknn and
             effective_req.sync_level != .full_index and
             !splitShadowRequiresMaterializedDerivedBatch(self);
         const include_generated_enrichment_hint = use_thin_replay_fast_path and
@@ -6971,6 +7109,7 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         var apply_locked = true;
         errdefer if (apply_locked) self.core.unlockApply();
@@ -6997,18 +7136,21 @@ pub const DB = struct {
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.upsertEnrichment(cfg);
     }
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         {
             lockApply(self);
             defer self.core.unlockApply();
@@ -7035,6 +7177,7 @@ pub const DB = struct {
         cfg: index_manager_mod.ResolverConfig,
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const upsert_result = blk: {
             lockApply(self);
             defer self.core.unlockApply();
@@ -7093,6 +7236,7 @@ pub const DB = struct {
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.retireResolverReplayBeforeCatalogRemoval();
 
         const retirement_sequence = blk: {
@@ -7680,24 +7824,28 @@ pub const DB = struct {
     }
 
     pub fn compactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.compactTextIndexes();
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.drainScheduledTextMerges();
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.bestEffortForceCompactTextIndexes();
@@ -7995,6 +8143,7 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         self.executor.removeWorker(name);
         lockApply(self);
         defer self.core.unlockApply();
@@ -8055,6 +8204,7 @@ pub const DB = struct {
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.deleteEnrichment(kind, name);
@@ -8269,7 +8419,7 @@ pub const DB = struct {
                         try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
                     }
                 },
-                .aknn, .full_index => {
+                .full_index => {
                     try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
                     if (index_ref.kind == .full_text) {
                         try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
@@ -8310,10 +8460,13 @@ pub const DB = struct {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
             const starting_sequence = self.core.nextDerivedSequence();
+            const starting_resolution_applied = if (self.resolution_runtime) |runtime| runtime.stats().applied_sequence else 0;
+            const starting_promotion_applied = if (self.promotion_runtime) |runtime| runtime.stats().applied_sequence else 0;
             try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             const drained_sequence = self.core.nextDerivedSequence();
 
-            if (self.resolverReplayNeedsDrain()) {
+            const drain_resolver_replay = self.resolverReplayNeedsDrain();
+            if (drain_resolver_replay) {
                 if (self.resolution_runtime) |runtime| {
                     if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
                     try runtime.catchUp();
@@ -8324,9 +8477,19 @@ pub const DB = struct {
                     if (latest > 0) runtime.notifySequence(latest - 1);
                     try runtime.catchUp();
                 }
+
+                try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             }
 
-            if (self.core.nextDerivedSequence() <= starting_sequence) return;
+            const resolution_advanced = if (self.resolution_runtime) |runtime|
+                runtime.stats().applied_sequence > starting_resolution_applied
+            else
+                false;
+            const promotion_advanced = if (self.promotion_runtime) |runtime|
+                runtime.stats().applied_sequence > starting_promotion_applied
+            else
+                false;
+            if (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced) return;
         }
         return error.RunUntilIdleDidNotConverge;
     }
@@ -9242,17 +9405,17 @@ pub const DB = struct {
                 try self.runEnrichmentUntil(sequence);
             },
             .full_text => {
-                try self.runMaintenanceUntilTargets(sequence, sync_targets.full_text_indexes);
+                try self.runDerivedUntilTargets(sequence, sync_targets.full_text_indexes);
+                try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
-            .aknn, .full_index => try self.runMaintenanceUntil(sequence, sync_targets),
+            .full_index => try self.runMaintenanceUntil(sequence, sync_targets),
         }
     }
 
     fn generatedPrecomputeModeForSyncLevel(sync_level: types.SyncLevel) GeneratedPrecomputeMode {
         return switch (sync_level) {
-            .enrichments, .aknn, .full_index => .all,
-            .full_text => .full_text_only,
-            .propose, .write => .none,
+            .enrichments, .full_index => .all,
+            .propose, .write, .full_text => .none,
         };
     }
 
@@ -13490,6 +13653,11 @@ fn shouldAppendSplitDelta(self: *DB) bool {
     return state.phase == .splitting;
 }
 
+fn shouldAppendSplitDeltaForContext(ctx: *const BatchExecutionContext) bool {
+    const state = ctx.shard_manager.getSplitState() orelse return false;
+    return state.phase == .splitting;
+}
+
 fn splitShadowRequiresMaterializedDerivedBatch(self: *DB) bool {
     if (self.shadow == null) return false;
     const state = self.core.splitState() orelse return false;
@@ -13860,6 +14028,28 @@ fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool
     return request.chunk_size > 0 or request.chunker_json.len > 0;
 }
 
+fn requestUsesMaterializedChunkArtifact(db: *const DB, artifact_name: []const u8) bool {
+    if (artifact_name.len == 0) return false;
+    const chunk_cfg = db.core.index_manager.getEnrichment(.chunk, artifact_name) orelse return false;
+    return chunk_cfg.source_artifact_name.len > 0;
+}
+
+fn generatedEmbedBatchItems() usize {
+    if (comptime builtin.os.tag == .freestanding) return generated_embed_default_batch_items;
+    const raw = getenv("ANTFLY_ENRICHMENT_EMBED_BATCH_ITEMS") orelse return generated_embed_default_batch_items;
+    if (raw.len == 0) return generated_embed_default_batch_items;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_embed_default_batch_items;
+    return @max(@as(usize, 1), parsed);
+}
+
+fn generatedEmbedBatchBytes() usize {
+    if (comptime builtin.os.tag == .freestanding) return generated_embed_default_batch_bytes;
+    const raw = getenv("ANTFLY_ENRICHMENT_EMBED_BATCH_BYTES") orelse return generated_embed_default_batch_bytes;
+    if (raw.len == 0) return generated_embed_default_batch_bytes;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_embed_default_batch_bytes;
+    return @max(@as(usize, 1), parsed);
+}
+
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
@@ -13881,6 +14071,14 @@ fn renderSourceTemplateText(
     template_source: []const u8,
     doc_value: []const u8,
 ) ![]const u8 {
+    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
+        return try template_remote.renderJsonToValidatedTextWithConfig(
+            alloc,
+            template_source,
+            doc_value,
+            remoteRenderConfig(secret_store, remote_content),
+        );
+    }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
@@ -13985,7 +14183,10 @@ fn getOrCreateChunks(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -14184,9 +14385,16 @@ fn computeAssetRequestDerived(
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
     defer alloc.free(key);
 
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, request.full_text_index);
+    defer {
+        for (text_indexes) |name| alloc.free(name);
+        alloc.free(text_indexes);
+    }
+
     const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
+        try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
         if (producer_cfg.type == .document_extraction) {
             try appendDocumentExtractionDeleteKeys(alloc, db, request.doc_key, artifact_name, key, artifact_delete_keys);
             return;
@@ -14244,6 +14452,7 @@ fn computeAssetRequestDerived(
                     .key = try alloc.dupe(u8, key),
                     .value = try alloc.dupe(u8, value),
                 });
+                try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
                 return;
             }
         }
@@ -14266,6 +14475,7 @@ fn computeAssetRequestDerived(
         .key = try alloc.dupe(u8, key),
         .value = try alloc.dupe(u8, value),
     });
+    try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
 
     if (producer_cfg.type != .copy) {
         try artifact_writes.append(alloc, .{
@@ -14435,7 +14645,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         }
     }
 
-    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, false);
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, request.full_text_index);
     defer {
         for (text_indexes) |name| alloc.free(name);
         alloc.free(text_indexes);
@@ -14823,6 +15033,62 @@ fn appendStoredFullTextDocument(
     text_indexes: []const []const u8,
 ) !void {
     if (text_indexes.len == 0) return;
+    const targets = try fullTextTargetRefsAlloc(alloc, text_indexes);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .upsert,
+        .targets = targets,
+    });
+}
+
+fn appendInlineFullTextDocument(
+    alloc: Allocator,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    key: []const u8,
+    value: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try fullTextTargetRefsAlloc(alloc, text_indexes);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .upsert,
+        .cleaned_value = try alloc.dupe(u8, value),
+        .targets = targets,
+    });
+}
+
+fn appendFullTextDeleteDocument(
+    alloc: Allocator,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    key: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try fullTextTargetRefsAlloc(alloc, text_indexes);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .delete,
+        .targets = targets,
+    });
+}
+
+fn fullTextTargetRefsAlloc(
+    alloc: Allocator,
+    text_indexes: []const []const u8,
+) ![]derived_types.DerivedTargetRef {
     const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
     errdefer {
         for (targets) |target| alloc.free(target.index_name);
@@ -14834,11 +15100,7 @@ fn appendStoredFullTextDocument(
             .index_name = try alloc.dupe(u8, index_name),
         };
     }
-    try documents.append(alloc, .{
-        .key = try alloc.dupe(u8, key),
-        .action = .upsert,
-        .targets = targets,
-    });
+    return targets;
 }
 
 fn appendDocumentUnitStoredFullTextDocuments(
@@ -16174,7 +16436,10 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
     if (request.source_template.len > 0) {
-        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         errdefer alloc.free(rendered);
         try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
         return @constCast(rendered);
@@ -16393,6 +16658,54 @@ fn appendSparseEmbeddingArtifactWrite(
     return try alloc.dupe(u8, key);
 }
 
+fn embeddingArtifactKeyForBaseAlloc(alloc: Allocator, base_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return if (internal_keys.isInternalUserKey(base_key))
+        try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, base_key, artifact_name)
+    else
+        try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, base_key, artifact_name);
+}
+
+const PendingArtifactWriteIndex = struct {
+    values: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    fn init(alloc: Allocator, writes: []const types.BatchWrite) !PendingArtifactWriteIndex {
+        var index = PendingArtifactWriteIndex{};
+        errdefer index.deinit(alloc);
+        for (writes) |write| {
+            try index.values.put(alloc, write.key, write.value);
+        }
+        return index;
+    }
+
+    fn deinit(self: *PendingArtifactWriteIndex, alloc: Allocator) void {
+        self.values.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn get(self: *const PendingArtifactWriteIndex, key: []const u8) ?[]const u8 {
+        return self.values.get(key);
+    }
+};
+
+fn storedOrPendingEmbeddingSourceHash(
+    alloc: Allocator,
+    db: *DB,
+    pending_writes: ?*const PendingArtifactWriteIndex,
+    artifact_key: []const u8,
+) !?u64 {
+    if (pending_writes) |index| {
+        if (index.get(artifact_key)) |value| {
+            return enrichment_artifact_codec.sourceHash(value) catch null;
+        }
+    }
+    const existing = db.core.store.get(alloc, artifact_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(existing);
+    return enrichment_artifact_codec.sourceHash(existing) catch null;
+}
+
 fn appendGraphEdgeArtifactWrite(
     alloc: Allocator,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
@@ -16587,6 +16900,14 @@ fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSo
     if (sources.len > 0) alloc.free(sources);
 }
 
+fn clearChunkEmbeddingSourceList(alloc: Allocator, sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource)) void {
+    for (sources.items) |source| {
+        alloc.free(source.key);
+        alloc.free(source.text);
+    }
+    sources.clearRetainingCapacity();
+}
+
 fn containsChunkEmbeddingSource(sources: []const ChunkEmbeddingSource, key: []const u8) bool {
     for (sources) |source| {
         if (std.mem.eql(u8, source.key, key)) return true;
@@ -16601,6 +16922,13 @@ fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []
     const source = parsed.value.object.get(source_field) orelse return null;
     if (source != .string or source.string.len == 0) return null;
     return try alloc.dupe(u8, source.string);
+}
+
+fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, key.len + 1);
+    @memcpy(out[0..key.len], key);
+    out[key.len] = 0;
+    return out;
 }
 
 fn collectChunkEmbeddingSourcesFromWrites(
@@ -16708,6 +17036,235 @@ fn appendDenseEmbeddingForConsumers(
     }
 }
 
+fn flushGeneratedDenseChunkBatch(
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: anytype,
+    sources: []const ChunkEmbeddingSource,
+    source_indexes: *std.ArrayListUnmanaged(usize),
+    chunk_texts: *std.ArrayListUnmanaged([]const u8),
+    consumer_indexes: []const []const u8,
+    comptime appendForConsumers: anytype,
+) !void {
+    if (chunk_texts.items.len == 0) return;
+
+    const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts.items, request.expected_dims);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    if (vectors.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
+
+    for (source_indexes.items, vectors) |source_index, vector| {
+        const source = sources[source_index];
+        const artifact_key = try appendEmbeddingArtifactWrite(
+            alloc,
+            artifact_writes,
+            source.key,
+            request.doc_key,
+            embedding_name,
+            request.source_field,
+            source.key,
+            enrichment_artifact_codec.hashSource(source.text),
+            vector,
+        );
+        defer alloc.free(artifact_key);
+        try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, vector, consumer_indexes);
+    }
+
+    chunk_texts.clearRetainingCapacity();
+    source_indexes.clearRetainingCapacity();
+}
+
+fn flushGeneratedSparseChunkBatch(
+    alloc: Allocator,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    sources: []const ChunkEmbeddingSource,
+    source_indexes: *std.ArrayListUnmanaged(usize),
+    chunk_texts: *std.ArrayListUnmanaged([]const u8),
+    consumer_indexes: []const []const u8,
+) !void {
+    if (chunk_texts.items.len == 0) return;
+
+    const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts.items);
+    defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
+    if (sparse_batch.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
+
+    for (source_indexes.items, sparse_batch) |source_index, sparse| {
+        const source = sources[source_index];
+        const artifact_key = try appendSparseEmbeddingArtifactWrite(
+            alloc,
+            artifact_writes,
+            source.key,
+            embedding_name,
+            enrichment_artifact_codec.hashSource(source.text),
+            sparse.indices,
+            sparse.values,
+        );
+        defer alloc.free(artifact_key);
+        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+    }
+
+    chunk_texts.clearRetainingCapacity();
+    source_indexes.clearRetainingCapacity();
+}
+
+fn flushGeneratedDenseChunkSourceBatch(
+    alloc: Allocator,
+    db: *DB,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: anytype,
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    consumer_indexes: []const []const u8,
+    skip_unchanged_artifacts: bool,
+    pending_lookup: ?*const PendingArtifactWriteIndex,
+    comptime appendForConsumers: anytype,
+) !void {
+    if (sources.items.len == 0) return;
+    defer clearChunkEmbeddingSourceList(alloc, sources);
+
+    var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer chunk_texts.deinit(alloc);
+    var source_indexes = std.ArrayListUnmanaged(usize).empty;
+    defer source_indexes.deinit(alloc);
+
+    for (sources.items, 0..) |source, i| {
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+        defer alloc.free(artifact_key);
+        if (skip_unchanged_artifacts) {
+            if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
+                if (existing_hash == source_hash) {
+                    try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, &.{}, consumer_indexes);
+                    continue;
+                }
+            }
+        }
+        try chunk_texts.append(alloc, source.text);
+        try source_indexes.append(alloc, i);
+    }
+
+    try flushGeneratedDenseChunkBatch(alloc, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+}
+
+fn flushGeneratedSparseChunkSourceBatch(
+    alloc: Allocator,
+    db: *DB,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    consumer_indexes: []const []const u8,
+    pending_lookup: *const PendingArtifactWriteIndex,
+) !void {
+    if (sources.items.len == 0) return;
+    defer clearChunkEmbeddingSourceList(alloc, sources);
+
+    var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer chunk_texts.deinit(alloc);
+    var source_indexes = std.ArrayListUnmanaged(usize).empty;
+    defer source_indexes.deinit(alloc);
+
+    for (sources.items, 0..) |source, i| {
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
+        defer alloc.free(artifact_key);
+        if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
+            if (existing_hash == source_hash) {
+                try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
+                continue;
+            }
+        }
+        try chunk_texts.append(alloc, source.text);
+        try source_indexes.append(alloc, i);
+    }
+
+    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+}
+
+fn appendMaterializedChunkSourceToBatch(
+    alloc: Allocator,
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    batch_source_bytes: *usize,
+    key: []const u8,
+    value: []const u8,
+    source_field: []const u8,
+) !bool {
+    const text = (try chunkPayloadTextAlloc(alloc, value, source_field)) orelse return false;
+    var text_owned = true;
+    errdefer if (text_owned) alloc.free(text);
+    try sources.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .text = text,
+    });
+    text_owned = false;
+    batch_source_bytes.* += text.len;
+    return true;
+}
+
+fn scanMaterializedChunkSourceStoreBatch(
+    alloc: Allocator,
+    db: *DB,
+    prefix: []const u8,
+    upper_bound: []const u8,
+    lower: []const u8,
+    source_field: []const u8,
+    pending_chunk_keys: *const std.StringHashMapUnmanaged(void),
+    sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    batch_source_bytes: *usize,
+    max_batch_items: usize,
+    max_batch_bytes: usize,
+) !?[]u8 {
+    const ScanCtx = struct {
+        alloc: Allocator,
+        prefix: []const u8,
+        source_field: []const u8,
+        pending_chunk_keys: *const std.StringHashMapUnmanaged(void),
+        sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+        batch_source_bytes: *usize,
+        max_batch_items: usize,
+        max_batch_bytes: usize,
+        stopped_key: ?[]u8 = null,
+
+        fn consume(ctx_ptr: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr orelse return error.InvalidArgument));
+            if (!std.mem.startsWith(u8, key, ctx.prefix)) return .stop;
+            if (!internal_keys.isChunkArtifactRecordKey(key)) return .@"continue";
+            if (ctx.pending_chunk_keys.contains(key)) return .@"continue";
+            if (!try appendMaterializedChunkSourceToBatch(ctx.alloc, ctx.sources, ctx.batch_source_bytes, key, value, ctx.source_field)) return .@"continue";
+            if (ctx.sources.items.len >= ctx.max_batch_items or ctx.batch_source_bytes.* >= ctx.max_batch_bytes) {
+                ctx.stopped_key = try ctx.alloc.dupe(u8, key);
+                return .stop;
+            }
+            return .@"continue";
+        }
+    };
+
+    var scan_ctx = ScanCtx{
+        .alloc = alloc,
+        .prefix = prefix,
+        .source_field = source_field,
+        .pending_chunk_keys = pending_chunk_keys,
+        .sources = sources,
+        .batch_source_bytes = batch_source_bytes,
+        .max_batch_items = max_batch_items,
+        .max_batch_bytes = max_batch_bytes,
+    };
+    try db.core.store.scanWithContext(lower, upper_bound, .{}, &scan_ctx, ScanCtx.consume);
+    if (scan_ctx.stopped_key) |key| {
+        defer alloc.free(key);
+        return try keyAfterAlloc(alloc, key);
+    }
+    return null;
+}
+
 fn computeDenseRequest(
     alloc: Allocator,
     db: *DB,
@@ -16717,7 +17274,7 @@ fn computeDenseRequest(
     dense_embeddings: *std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite),
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
-    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, appendDenseEmbeddingForConsumers);
+    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, false, appendDenseEmbeddingForConsumers);
 }
 
 fn computeDenseRequestDerived(
@@ -16729,7 +17286,71 @@ fn computeDenseRequestDerived(
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
-    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, appendDerivedDenseEmbeddingForConsumers);
+    return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, true, appendDerivedDenseEmbeddingForConsumers);
+}
+
+fn computeDenseMaterializedChunkRequestImpl(
+    alloc: Allocator,
+    db: *DB,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: anytype,
+    skip_unchanged_artifacts: bool,
+    comptime appendForConsumers: anytype,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    consumer_indexes: []const []const u8,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var pending_writes = if (skip_unchanged_artifacts)
+        try PendingArtifactWriteIndex.init(alloc, artifact_writes.items)
+    else
+        PendingArtifactWriteIndex{};
+    defer pending_writes.deinit(alloc);
+    const pending_lookup: ?*const PendingArtifactWriteIndex = if (skip_unchanged_artifacts) &pending_writes else null;
+
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    defer {
+        clearChunkEmbeddingSourceList(alloc, &sources);
+        sources.deinit(alloc);
+    }
+    var batch_source_bytes: usize = 0;
+    var pending_chunk_keys = std.StringHashMapUnmanaged(void).empty;
+    defer pending_chunk_keys.deinit(alloc);
+
+    for (artifact_writes.items) |write| {
+        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (pending_chunk_keys.contains(write.key)) continue;
+        try pending_chunk_keys.put(alloc, write.key, {});
+        _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
+        if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+            try flushGeneratedDenseChunkSourceBatch(alloc, db, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
+            batch_source_bytes = 0;
+        }
+    }
+    try flushGeneratedDenseChunkSourceBatch(alloc, db, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
+    batch_source_bytes = 0;
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+    var lower = try alloc.dupe(u8, prefix);
+    defer alloc.free(lower);
+    while (true) {
+        const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
+        try flushGeneratedDenseChunkSourceBatch(alloc, db, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
+        batch_source_bytes = 0;
+        if (next_lower) |owned_next| {
+            alloc.free(lower);
+            lower = owned_next;
+            continue;
+        }
+        break;
+    }
 }
 
 fn computeDenseRequestImpl(
@@ -16740,6 +17361,7 @@ fn computeDenseRequestImpl(
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     dense_embeddings: anytype,
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+    skip_unchanged_artifacts: bool,
     comptime appendForConsumers: anytype,
 ) !void {
     const dense_embedder = if (db.enrichment_runtime) |runtime|
@@ -16756,38 +17378,59 @@ fn computeDenseRequestImpl(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
+        if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
+            try computeDenseMaterializedChunkRequestImpl(alloc, db, request, artifact_writes, dense_embeddings, skip_unchanged_artifacts, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
+            return;
+        }
         const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
+        var pending_writes = if (skip_unchanged_artifacts)
+            try PendingArtifactWriteIndex.init(alloc, artifact_writes.items)
+        else
+            PendingArtifactWriteIndex{};
+        defer pending_writes.deinit(alloc);
+        const pending_lookup: ?*const PendingArtifactWriteIndex = if (skip_unchanged_artifacts) &pending_writes else null;
 
-        const chunk_texts = try alloc.alloc([]const u8, sources.len);
-        defer alloc.free(chunk_texts);
-        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
-
-        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts, request.expected_dims);
-        defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        if (vectors.len != sources.len) return error.InvalidEmbeddingResponse;
-
-        for (sources, vectors) |source, vector| {
-            const artifact_key = try appendEmbeddingArtifactWrite(
-                alloc,
-                artifact_writes,
-                source.key,
-                request.doc_key,
-                embedding_name,
-                request.source_field,
-                source.key,
-                enrichment_artifact_codec.hashSource(source.text),
-                vector,
-            );
+        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+        defer chunk_texts.deinit(alloc);
+        var source_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer source_indexes.deinit(alloc);
+        const max_batch_items = generatedEmbedBatchItems();
+        const max_batch_bytes = generatedEmbedBatchBytes();
+        var batch_source_bytes: usize = 0;
+        for (sources, 0..) |source, i| {
+            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
             defer alloc.free(artifact_key);
-            try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, vector, consumer_indexes);
+            if (skip_unchanged_artifacts) {
+                if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
+                    if (existing_hash == source_hash) {
+                        try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, &.{}, consumer_indexes);
+                        continue;
+                    }
+                }
+            }
+            if (chunk_texts.items.len > 0 and
+                (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
+            {
+                try flushGeneratedDenseChunkBatch(alloc, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                batch_source_bytes = 0;
+            }
+            try chunk_texts.append(alloc, source.text);
+            try source_indexes.append(alloc, i);
+            batch_source_bytes += source.text.len;
+            if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+                try flushGeneratedDenseChunkBatch(alloc, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
+                batch_source_bytes = 0;
+            }
         }
+        try flushGeneratedDenseChunkBatch(alloc, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes, appendForConsumers);
         return;
     }
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(alloc, db, doc_value, request) catch null;
+        const source_parts = try renderSourceParts(alloc, db, doc_value, request);
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
@@ -16811,7 +17454,10 @@ fn computeDenseRequestImpl(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -16837,6 +17483,64 @@ fn computeDenseRequestImpl(
     try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, vector, consumer_indexes);
 }
 
+fn computeSparseMaterializedChunkRequest(
+    alloc: Allocator,
+    db: *DB,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    consumer_indexes: []const []const u8,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var pending_writes = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
+    defer pending_writes.deinit(alloc);
+
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    defer {
+        clearChunkEmbeddingSourceList(alloc, &sources);
+        sources.deinit(alloc);
+    }
+    var batch_source_bytes: usize = 0;
+    var pending_chunk_keys = std.StringHashMapUnmanaged(void).empty;
+    defer pending_chunk_keys.deinit(alloc);
+
+    for (artifact_writes.items) |write| {
+        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (pending_chunk_keys.contains(write.key)) continue;
+        try pending_chunk_keys.put(alloc, write.key, {});
+        _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
+        if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+            batch_source_bytes = 0;
+        }
+    }
+    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+    batch_source_bytes = 0;
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |key| alloc.free(key);
+    const upper_bound = if (upper) |key| key else "";
+    var lower = try alloc.dupe(u8, prefix);
+    defer alloc.free(lower);
+    while (true) {
+        const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
+        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+        batch_source_bytes = 0;
+        if (next_lower) |owned_next| {
+            alloc.free(lower);
+            lower = owned_next;
+            continue;
+        }
+        break;
+    }
+}
+
 fn computeSparseRequestDerived(
     alloc: Allocator,
     db: *DB,
@@ -16860,36 +17564,56 @@ fn computeSparseRequestDerived(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
+        if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
+            try computeSparseMaterializedChunkRequest(alloc, db, request, artifact_writes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes);
+            return;
+        }
         const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
+        var pending_writes = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
+        defer pending_writes.deinit(alloc);
 
-        const chunk_texts = try alloc.alloc([]const u8, sources.len);
-        defer alloc.free(chunk_texts);
-        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
-
-        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts);
-        defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
-        if (sparse_batch.len != sources.len) return error.InvalidEmbeddingResponse;
-
-        for (sources, sparse_batch) |source, sparse| {
-            const artifact_key = try appendSparseEmbeddingArtifactWrite(
-                alloc,
-                artifact_writes,
-                source.key,
-                embedding_name,
-                enrichment_artifact_codec.hashSource(source.text),
-                sparse.indices,
-                sparse.values,
-            );
+        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
+        defer chunk_texts.deinit(alloc);
+        var source_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer source_indexes.deinit(alloc);
+        const max_batch_items = generatedEmbedBatchItems();
+        const max_batch_bytes = generatedEmbedBatchBytes();
+        var batch_source_bytes: usize = 0;
+        for (sources, 0..) |source, i| {
+            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
             defer alloc.free(artifact_key);
-            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+            if (try storedOrPendingEmbeddingSourceHash(alloc, db, &pending_writes, artifact_key)) |existing_hash| {
+                if (existing_hash == source_hash) {
+                    try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
+                    continue;
+                }
+            }
+            if (chunk_texts.items.len > 0 and
+                (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
+            {
+                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                batch_source_bytes = 0;
+            }
+            try chunk_texts.append(alloc, source.text);
+            try source_indexes.append(alloc, i);
+            batch_source_bytes += source.text.len;
+            if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
+                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                batch_source_bytes = 0;
+            }
         }
+        try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
         return;
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch null
+        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => null,
+        }
     else
         try extractStringField(alloc, doc_value, request.source_field);
     if (source_text == null or source_text.?.len == 0) {
@@ -17073,7 +17797,10 @@ fn renderSourceParts(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+        else => return null,
+    };
     if (parts.len == 0) {
         template_mod.freeContentParts(alloc, parts);
         return null;
@@ -17147,7 +17874,6 @@ const ChunkCacheEntry = struct {
 
 const GeneratedPrecomputeMode = enum {
     none,
-    full_text_only,
     all,
 };
 
@@ -17686,6 +18412,101 @@ fn graphArtifactSourceConsumesRef(
     };
 }
 
+const GraphArtifactRefView = struct {
+    name: []const u8,
+    kind: types.ArtifactKind,
+    unit_id_present: bool = false,
+};
+
+fn graphArtifactSourceConsumesArtifactKey(
+    index_manager: *const index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_key: []const u8,
+) bool {
+    if (decodeArtifactRefViewForGraphApplicability(artifact_key) catch null) |artifact_ref| {
+        return graphArtifactSourceConsumesRefView(index_manager, source, artifact_ref);
+    }
+
+    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch return false) orelse return false;
+    defer artifact_ref.deinit(index_manager.alloc);
+    return graphArtifactSourceConsumesRef(index_manager, source, artifact_ref);
+}
+
+fn graphArtifactSourceConsumesRefView(
+    index_manager: *const index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_ref: GraphArtifactRefView,
+) bool {
+    if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) return false;
+    return switch (artifact_ref.kind) {
+        .asset => graphAssetSourceConsumesAssetRefView(index_manager, artifact_ref),
+        .chunk => index_manager.getEnrichment(.chunk, artifact_ref.name) != null,
+        .embedding => false,
+    };
+}
+
+fn graphAssetSourceConsumesAssetRefView(index_manager: *const index_manager_mod.IndexManager, artifact_ref: GraphArtifactRefView) bool {
+    if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
+    if (artifact_ref.unit_id_present) return true;
+    const cfg = index_manager.getEnrichment(.asset, artifact_ref.name) orelse return false;
+    var producer_cfg = asset_producer_mod.parseProducerConfig(index_manager.alloc, cfg.producer_json) catch return true;
+    defer producer_cfg.deinit(index_manager.alloc);
+    return producer_cfg.type != .document_extraction;
+}
+
+fn decodeArtifactRefViewForGraphApplicability(key: []const u8) !?GraphArtifactRefView {
+    if (!internal_keys.isInternalUserKey(key)) return null;
+
+    const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != internal_keys.artifact_kind) return null;
+    pos += 1;
+
+    const type_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const raw_kind = (try internal_keys.decodeBodyView(key[pos..type_term])) orelse return null;
+    const kind = try artifactKindFromInternalLabel(raw_kind);
+    pos = type_term + 2;
+
+    const name_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const name = (try internal_keys.decodeBodyView(key[pos..name_term])) orelse return null;
+    pos = name_term + 2;
+
+    var unit_id_present = false;
+    if (kind == .asset and pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+        pos += 1;
+        const unit_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+        if ((try internal_keys.decodeBodyView(key[pos..unit_term])) == null) return null;
+        pos = unit_term + 2;
+        if (pos == key.len) return .{ .name = name, .kind = .asset, .unit_id_present = true };
+    } else if (kind == .chunk) {
+        if (pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+            pos += 1;
+            const unit_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+            if ((try internal_keys.decodeBodyView(key[pos..unit_term])) == null) return null;
+            pos = unit_term + 2;
+            unit_id_present = true;
+        }
+        if (pos + 1 + @sizeOf(u32) > key.len or key[pos] != internal_keys.chunk_record_kind) return error.InvalidInternalUserKey;
+        pos += 1 + @sizeOf(u32);
+        if (pos == key.len) return .{ .name = name, .kind = .chunk, .unit_id_present = unit_id_present };
+    }
+
+    if (pos == key.len) return .{ .name = name, .kind = kind, .unit_id_present = unit_id_present };
+    if (key[pos] != internal_keys.derived_embedding_kind) return error.InvalidInternalUserKey;
+    pos += 1;
+    const derived_name_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const derived_name = (try internal_keys.decodeBodyView(key[pos..derived_name_term])) orelse return null;
+    if (derived_name_term + 2 != key.len) return error.InvalidInternalUserKey;
+    return .{ .name = derived_name, .kind = .embedding };
+}
+
+fn artifactKindFromInternalLabel(raw_kind: []const u8) !types.ArtifactKind {
+    if (std.mem.eql(u8, raw_kind, "chunk")) return .chunk;
+    if (std.mem.eql(u8, raw_kind, "asset")) return .asset;
+    if (std.mem.eql(u8, raw_kind, "embedding")) return .embedding;
+    return error.InvalidInternalUserKey;
+}
+
 fn graphAssetSourceConsumesAssetRef(index_manager: *const index_manager_mod.IndexManager, artifact_ref: types.ArtifactRef) bool {
     if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
     if (artifact_ref.unit_id != null) return true;
@@ -17725,20 +18546,11 @@ fn shouldPrecomputeGeneratedRequest(
     mode: GeneratedPrecomputeMode,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !bool {
+    _ = self;
+    _ = request;
     return switch (mode) {
         .none => false,
         .all => true,
-        .full_text_only => blk: {
-            if (request.kind != .chunk_text) break :blk false;
-            const include_default_full_text = request.full_text_index or
-                try chunking_types_mod.parseHasFullTextIndexFromSlice(self.alloc, request.chunker_json);
-            const text_indexes = try self.core.index_manager.textIndexesForChunk(self.alloc, request.artifact_name, include_default_full_text);
-            defer {
-                for (text_indexes) |name| self.alloc.free(name);
-                self.alloc.free(text_indexes);
-            }
-            break :blk text_indexes.len > 0;
-        },
     };
 }
 
@@ -17992,7 +18804,7 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     @memset(fallback_to_hit, false);
 
     for (hits, 0..) |hit, i| {
-        if (internal_keys.isChunkArtifactRecordKey(hit.id)) {
+        if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
             const parent = (try internal_keys.decodeDocumentComponentAlloc(alloc, hit.id)) orelse {
                 fallback_to_hit[i] = true;
                 parent_ids[i] = hit.id;
@@ -18710,6 +19522,8 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    ctx.apply_mutex.lockExclusive();
+    defer ctx.apply_mutex.unlockExclusive();
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
@@ -18921,7 +19735,7 @@ fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
     switch (sync_level) {
         .propose, .write => return,
-        .enrichments, .full_text, .aknn, .full_index => {},
+        .enrichments, .full_text, .full_index => {},
     }
     if (!ctx.executor.shouldThrottleBacklog()) return;
     if (sync_level == .full_text) {
@@ -18941,7 +19755,7 @@ fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequenc
 fn shouldDeferBacklogPressureForExternalDenseBulk(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel) bool {
     switch (sync_level) {
         .propose, .write, .enrichments => {},
-        .full_text, .aknn, .full_index => return false,
+        .full_text, .full_index => return false,
     }
     const async_context = ctx.async_context orelse return false;
     return async_context.active_external_dense_bulk_sessions.load(.acquire) != 0;
@@ -19035,16 +19849,17 @@ fn waitForSyncLevelContext(ctx: *const BatchExecutionContext, sync_level: types.
             try runEnrichmentUntilContext(ctx, sequence);
         },
         .full_text => {
-            try runMaintenanceUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
+            try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
+            try waitForManagedIndexesAppliedContext(ctx, sequence, sync_targets.full_text_indexes);
         },
-        .aknn, .full_index => try runMaintenanceUntilContext(ctx, sequence, sync_targets),
+        .full_index => try runMaintenanceUntilContext(ctx, sequence, sync_targets),
     }
 }
 
 fn syncLevelRequiresDerivedVisibility(sync_level: types.SyncLevel) bool {
     return switch (sync_level) {
         .propose, .write, .enrichments => false,
-        .full_text, .aknn, .full_index => true,
+        .full_text, .full_index => true,
     };
 }
 
@@ -19292,7 +20107,7 @@ fn storeMaxAtomicU64(value: *AtomicU64, candidate: u64) void {
 fn deferExternalBulkExecutorNotification(ctx: *AsyncContext, sync_level: types.SyncLevel, sequence: u64) bool {
     switch (sync_level) {
         .propose, .write, .enrichments => {},
-        .full_text, .aknn, .full_index => return false,
+        .full_text, .full_index => return false,
     }
     if (ctx.active_external_dense_bulk_sessions.load(.acquire) == 0) return false;
     storeMaxAtomicU64(&ctx.deferred_external_bulk_notify_sequence, sequence);
@@ -19323,7 +20138,7 @@ fn notifyExecutorForSyncLevel(
 ) void {
     switch (sync_level) {
         .full_text => executor.notifyIndexes(sequence, sync_targets.full_text_indexes),
-        .propose, .write, .enrichments, .aknn, .full_index => executor.notifySequence(sequence),
+        .propose, .write, .enrichments, .full_index => executor.notifySequence(sequence),
     }
 }
 
@@ -19414,8 +20229,6 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .enrichments, 13));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_text, 17));
-    try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
-    try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .aknn, 19));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_index, 23));
     try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
@@ -19547,6 +20360,47 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     return sequence;
 }
 
+fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
+    if (artifact_delete_keys.len == 0) return appendDerivedBatchFromEnrichment(ctx_ptr, batch);
+
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    var batch_ctx = ctx.batchContext();
+    try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+    const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
+    defer batch_ctx.alloc.free(replay_deleted_keys);
+    var replay_batch = batch;
+    replay_batch.deleted_keys = replay_deleted_keys;
+
+    batch_ctx.apply_mutex.lockExclusive();
+    const sequence = blk: {
+        defer batch_ctx.apply_mutex.unlockExclusive();
+        const reserved_sequence = batch_ctx.store.reserveNextReplaySequence(1);
+        const payload = try encodeChangeRecordPayload(&batch_ctx, replay_batch, reserved_sequence);
+        defer batch_ctx.alloc.free(payload);
+        try batch_ctx.store.putBatchWithReplay(batch_ctx.io, &.{}, artifact_delete_keys, .{
+            .sequence = reserved_sequence,
+            .payload = payload,
+        });
+        if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
+            try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
+        }
+        mirrorHAReplayPayloadBestEffortContext(&batch_ctx, payload);
+        batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
+        break :blk reserved_sequence;
+    };
+
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    if (ctx.executor.hasWorkers()) {
+        ctx.executor.forceSequence(sequence);
+        return sequence;
+    }
+
+    var applied_batch = replay_batch;
+    applied_batch.sequence = sequence;
+    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    return sequence;
+}
+
 fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
     const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
     defer {
@@ -19569,6 +20423,11 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             ctx.applied_sequence_checkpoint_path,
             index_ref.name,
         );
+        const target_sequence = try ctx.replay_source.latestMatchingSequence(
+            ctx.alloc,
+            applied,
+            managedIndexReplayHint(index_ref.kind),
+        );
         const use_dense_maintenance = index_ref.kind == .dense_vector;
         const stats = try derived_worker.catchUpIndexWithOptions(
             ctx.alloc,
@@ -19582,6 +20441,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
                 .window_ctx = &replay_ctx,
                 .begin_window_fn = @field(@This(), "beginDerivedCatchUpWindowContext"),
                 .finish_window_fn = @field(@This(), "finishDerivedCatchUpWindowContext"),
+                .target_sequence = target_sequence,
             },
         );
         if (openProfileEnabled()) logReplayCatchUpProfile(index_ref, applied, stats);
@@ -19589,16 +20449,50 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             _ = try ctx.index_manager.runDenseLsmMaintenanceByName(index_ref.name, denseCatchUpMaintenanceSteps());
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
-        if (stats.last_sequence > applied) {
+        if (stats.appliedSequenceAdvance(applied)) |sequence| {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
-                .sequence = stats.last_sequence,
+                .sequence = sequence,
+            });
+        } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
+            try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence))
+        {
+            try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+            try updates.append(ctx.alloc, .{
+                .index_name = index_ref.name,
+                .sequence = target_sequence,
             });
         }
     }
     try saveAppliedSequencesBatchContext(ctx, updates.items);
     try truncateReplayJournalIfSafeContext(ctx);
+}
+
+fn canAdvanceDerivedReplayTargetContext(
+    ctx: *const BatchExecutionContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    from_sequence: u64,
+    target_sequence: u64,
+) !bool {
+    if (target_sequence <= from_sequence) return true;
+    if (ctx.async_context) |async_ctx| {
+        return try canAdvanceDerivedToTargetAsync(async_ctx, index_ref, from_sequence, target_sequence);
+    }
+
+    var async_ctx = AsyncContext{
+        .alloc = ctx.alloc,
+        .io = ctx.io,
+        .store = ctx.store,
+        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
+        .index_manager = ctx.index_manager,
+        .apply_mutex = ctx.apply_mutex,
+        .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+        .resolution_runtime = ctx.resolution_runtime,
+        .promotion_runtime = ctx.promotion_runtime,
+    };
+    defer async_ctx.deinit(ctx.alloc);
+    return try canAdvanceDerivedToTargetAsync(&async_ctx, index_ref, from_sequence, target_sequence);
 }
 
 fn applyDerivedBatchToIndexReplayContext(
@@ -19977,8 +20871,13 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             }
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
-        if (stats.last_sequence > applied) {
-            try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
+        if (stats.appliedSequenceAdvance(applied)) |sequence| {
+            try self.core.saveAppliedSequence(index_ref.name, sequence);
+            try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+        } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
+            try canAdvanceDerivedToTargetAsync(self.async_context, index_ref, applied, target_sequence))
+        {
+            try self.core.saveAppliedSequence(index_ref.name, target_sequence);
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
         }
     }
@@ -20298,10 +21197,8 @@ fn managedIndexBatchApplicability(
             }
             for (batch.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
-                    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
-                    defer artifact_ref.deinit(index_manager.alloc);
                     const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) return .relevant;
+                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
@@ -20477,6 +21374,10 @@ fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
         try internal_keys.documentKeyAlloc(alloc, key);
 }
 
+fn replayDocumentKeyInRange(byte_range: types.ByteRange, key: []const u8) bool {
+    return internal_keys.isInternalUserKey(key) or byte_range.contains(key);
+}
+
 const OwnedSparseFieldWrites = struct {
     alloc: Allocator,
     items: []sparse_mod.SparseWrite = &.{},
@@ -20535,7 +21436,7 @@ fn collectSparseFieldWritesProfiled(
     const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
-        if (!byte_range.contains(doc.key)) continue;
+        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (opts.skip_doc_keys) |skip_doc_keys| {
             if (skip_doc_keys.contains(doc.key)) continue;
         }
@@ -20694,7 +21595,7 @@ fn collectDocumentWritesProfiled(
     const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
-        if (!byte_range.contains(doc.key)) continue;
+        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (opts.skip_doc_keys) |skip_doc_keys| {
             if (skip_doc_keys.contains(doc.key)) continue;
         }
@@ -20885,7 +21786,7 @@ fn applyTextDocumentsForIndex(
 
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
-        if (!byte_range.contains(doc.key)) continue;
+        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
         if (trust_inline and doc.cleaned_value != null) {
             try writes.append(alloc, .{
@@ -21261,6 +22162,13 @@ fn concatArtifactKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []cons
     const out = try alloc.alloc([]const u8, lhs.len + rhs.len);
     @memcpy(out[0..lhs.len], lhs);
     for (rhs, 0..) |key, i| out[lhs.len + i] = key;
+    return out;
+}
+
+fn concatKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, lhs.len + rhs.len);
+    @memcpy(out[0..lhs.len], lhs);
+    @memcpy(out[lhs.len..], rhs);
     return out;
 }
 
@@ -24317,6 +25225,7 @@ fn cleanupTempDir(path: [*:0]const u8) void {
 
 const default_test_wait_attempts: usize = 100;
 const slow_test_wait_attempts: usize = 500;
+const graph_replay_test_wait_attempts: usize = 2000;
 
 fn waitForSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
     return waitForSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
@@ -24335,6 +25244,64 @@ fn waitForSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchR
         return error.Timeout;
     }
     return last;
+}
+
+fn waitForGraphEdges(
+    alloc: Allocator,
+    db: *DB,
+    index_name: []const u8,
+    key: []const u8,
+    edge_type: []const u8,
+    direction: graph_mod.EdgeDirection,
+    min_edges: usize,
+) ![]graph_mod.Edge {
+    return waitForGraphEdgesWithAttempts(alloc, db, index_name, key, edge_type, direction, min_edges, graph_replay_test_wait_attempts);
+}
+
+fn replayStageHasPendingWork(stats: types.ReplayStageStats) bool {
+    if (stats.blocked or stats.error_count != 0) return false;
+    return stats.catch_up_required or stats.applied_sequence < stats.target_sequence;
+}
+
+fn graphEdgeProducerHasPendingWork(alloc: Allocator, db: *DB, index_name: []const u8) !bool {
+    const graph_applied = try db.core.loadAppliedSequence(alloc, index_name);
+    if (graph_applied < db.core.nextDerivedSequence()) return true;
+    const pending = db.pendingWorkStats();
+    return replayStageHasPendingWork(pending.resolution) or
+        replayStageHasPendingWork(pending.promotion);
+}
+
+fn waitForGraphEdgesWithAttempts(
+    alloc: Allocator,
+    db: *DB,
+    index_name: []const u8,
+    key: []const u8,
+    edge_type: []const u8,
+    direction: graph_mod.EdgeDirection,
+    min_edges: usize,
+    max_attempts: usize,
+) ![]graph_mod.Edge {
+    var drained_without_edges: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        const edges = try db.getEdges(alloc, index_name, key, edge_type, direction);
+        if (edges.len >= min_edges) return edges;
+        graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try db.runUntilIdle();
+        if (try graphEdgeProducerHasPendingWork(alloc, db, index_name)) {
+            drained_without_edges = 0;
+        } else {
+            drained_without_edges += 1;
+            if (drained_without_edges >= default_test_wait_attempts) return error.Timeout;
+        }
+        sleepPollInterval();
+    }
+    const edges = try db.getEdges(alloc, index_name, key, edge_type, direction);
+    if (edges.len < min_edges) {
+        graph_mod.GraphIndex.freeEdges(alloc, edges);
+        return error.Timeout;
+    }
+    return edges;
 }
 
 fn waitForDenseSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
@@ -25850,6 +26817,33 @@ test "db enrichment enabled requires backend runtime io" {
     }));
 }
 
+test "db enrichment reconfigure preserves active runtime when replacement cannot initialize" {
+    const alloc = std.testing.allocator;
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    const original_backend_runtime = db.backend_runtime;
+    defer db.backend_runtime = original_backend_runtime;
+
+    const original_runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    var manual_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer manual_runtime.deinit();
+
+    db.backend_runtime = manual_runtime.ptr();
+    var replacement_embedder = embedder_mod.DeterministicDenseEmbedder{};
+    try std.testing.expectError(error.MissingBackendRuntimeIo, db.reconfigureEnrichmentRuntime(.{
+        .dense_embedder = replacement_embedder.interface(),
+    }));
+    try std.testing.expectEqual(original_runtime, db.enrichment_runtime.?);
+}
+
 test "db ttl cleanup enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
@@ -26676,6 +27670,68 @@ test "db allocates final document ordinal then rejects new documents" {
     }));
 }
 
+test "document extraction template prompt failure is rejected before persistence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .template = "<<<error:status=413 message=StreamTooLong>>> fallback text",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try std.testing.expectError(error.PermanentPromptFailure, db.batch(.{
+        .writes = &.{.{
+            .key = "doc:templated-prompt-failure",
+            .value = "{\"url\":\"data:text/plain;base64,Zm9v\"}",
+        }},
+        .sync_level = .write,
+    }));
+}
+
+fn testRemoteTemplateHostRenderJsonToPartsErrorDirective(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    _: []const u8,
+    _: []const u8,
+    _: template_remote.RenderConfig,
+) ![]template_mod.ContentPart {
+    const parts = try alloc.alloc(template_mod.ContentPart, 1);
+    errdefer alloc.free(parts);
+    parts[0] = .{ .text = try alloc.dupe(u8, "<<<error:status=413 message=StreamTooLong>>> fallback text") };
+    return parts;
+}
+
+test "remote template host-rendered parts preserve prompt failures" {
+    const alloc = std.testing.allocator;
+    template_remote.setHostRenderer(.{
+        .render_json_to_parts = testRemoteTemplateHostRenderJsonToPartsErrorDirective,
+    });
+    defer template_remote.setHostRenderer(null);
+
+    try std.testing.expectError(
+        error.PermanentPromptFailure,
+        renderSourceTemplateParts(
+            alloc,
+            null,
+            null,
+            "{{remoteMedia url=this}}",
+            "\"https://example.com/photo.png\"",
+        ),
+    );
+}
+
 test "db allocates final document ordinal with all index families present" {
     const alloc = std.testing.allocator;
 
@@ -26794,7 +27850,6 @@ test "db rejects new document writes at ordinal exhaustion for every sync level"
         .write,
         .full_text,
         .enrichments,
-        .aknn,
         .full_index,
     };
     for (levels, 0..) |level, i| {
@@ -29429,6 +30484,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
         .sync_level = .enrichments,
     });
     try db.runUntilIdle();
+    try db.runUntilIdle();
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
@@ -29442,7 +30498,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
     try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
-    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    const edges = try waitForGraphEdges(alloc, &db, "relations_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
@@ -29513,7 +30569,10 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .executor = .{ .backend = .manual },
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -30173,7 +31232,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
 
     // Outbound: doc:a mentions both canonical entities.
     {
-        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 2);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 2), out.len);
         // Each mention edge records the resolved DocRef target table so the
@@ -30184,7 +31243,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     }
     // Inbound provenance: "which documents mention this entity" == inbound edges.
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
         try std.testing.expectEqualStrings("doc:a", inbound[0].source);
@@ -30215,7 +31274,11 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     var sink = FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .entity_sink = sink.sink(),
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -30287,7 +31350,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
     }
     {
-        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 1), out.len);
         var parsed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, out[0].metadata, .{});
@@ -30300,7 +31363,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         try std.testing.expectEqualStrings(second_mention_artifact_key, mention_artifact_keys[1].string);
     }
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -30416,7 +31479,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
 
-    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
@@ -30468,7 +31531,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     });
     try db.runUntilIdle();
 
-    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
     defer graph_mod.GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
@@ -30518,7 +31581,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
 
     // The mention edge points at the resolved DocRef from the resolution artifact.
     {
-        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        const inbound = try waitForGraphEdges(alloc, &db, "prov_graph", "person/ada_lovelace", "mentions", .in, 1);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
@@ -33477,6 +34540,13 @@ test "db document extraction chunks units through source artifact enrichment" {
         .expected_dims = 3,
     });
     try db.addEnrichment(.{
+        .name = "document_chunk_caption_dense_v1",
+        .kind = .embedding,
+        .field = "caption",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addEnrichment(.{
         .name = "document_chunk_sparse_v1",
         .kind = .embedding,
         .field = "text",
@@ -33488,9 +34558,14 @@ test "db document extraction chunks units through source artifact enrichment" {
         .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
     });
     try db.addIndex(.{
-        .name = "dv_document_chunks",
+        .name = "document_vectors",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "document_caption_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_caption_dense_v1\"}",
     });
     try db.addIndex(.{
         .name = "document_chunk_sparse_v1",
@@ -33506,7 +34581,7 @@ test "db document extraction chunks units through source artifact enrichment" {
         alloc.free(dense_consumers);
     }
     try std.testing.expectEqual(@as(usize, 1), dense_consumers.len);
-    try std.testing.expectEqualStrings("dv_document_chunks", dense_consumers[0]);
+    try std.testing.expectEqualStrings("document_vectors", dense_consumers[0]);
     const sparse_consumers = try db.core.index_manager.sparseIndexesForEmbedding(alloc, "document_chunk_sparse_v1");
     defer {
         for (sparse_consumers) |name| alloc.free(name);
@@ -33518,13 +34593,14 @@ test "db document extraction chunks units through source artifact enrichment" {
     const planned = try db.core.planGeneratedEnrichments(
         alloc,
         "doc:planned",
-        "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"source document decoy\"}",
         &.{},
         &.{},
     );
     defer enrichment_types.deinitGeneratedRequests(alloc, planned);
     var saw_document_asset = false;
     var saw_document_chunk_dense = false;
+    var saw_document_chunk_caption_dense = false;
     var saw_document_chunk_sparse = false;
     for (planned) |request| {
         if (request.kind == .asset and std.mem.eql(u8, request.artifact_name, "document_units_v1")) saw_document_asset = true;
@@ -33535,6 +34611,13 @@ test "db document extraction chunks units through source artifact enrichment" {
         {
             saw_document_chunk_dense = true;
         }
+        if (request.kind == .dense_embedding and
+            std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
+            std.mem.eql(u8, request.embedding_name, "document_chunk_caption_dense_v1") and
+            request.chunk_size == 256)
+        {
+            saw_document_chunk_caption_dense = true;
+        }
         if (request.kind == .sparse_embedding and
             std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
             std.mem.eql(u8, request.embedding_name, "document_chunk_sparse_v1") and
@@ -33544,13 +34627,14 @@ test "db document extraction chunks units through source artifact enrichment" {
         }
     }
     try std.testing.expect(saw_document_asset);
-    try std.testing.expect(!saw_document_chunk_dense);
-    try std.testing.expect(!saw_document_chunk_sparse);
+    try std.testing.expect(saw_document_chunk_dense);
+    try std.testing.expect(saw_document_chunk_caption_dense);
+    try std.testing.expect(saw_document_chunk_sparse);
 
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"source document decoy\"}",
         }},
         .sync_level = .full_index,
     });
@@ -33642,7 +34726,7 @@ test "db document extraction chunks units through source artifact enrichment" {
 
     const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
     defer alloc.free(query_vec);
-    const dense_index = db.core.index_manager.denseIndex("dv_document_chunks") orelse return error.IndexNotFound;
+    const dense_index = db.core.index_manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
     var direct = try waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
     defer direct.deinit();
     const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
@@ -33653,6 +34737,25 @@ test "db document extraction chunks units through source artifact enrichment" {
     };
     defer alloc.free(dense_internal_id);
     try std.testing.expectEqualStrings(chunk_key, dense_internal_id);
+
+    var semantic_rollup = try db.search(alloc, .{
+        .index_name = "document_vectors",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent_with_chunks,
+        .limit = 1,
+        .include_stored = false,
+    });
+    defer semantic_rollup.deinit();
+    try std.testing.expectEqual(@as(u32, 1), semantic_rollup.total_hits);
+    try std.testing.expectEqualStrings("doc:a", semantic_rollup.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), semantic_rollup.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings(chunk_public_id_for_rollup.id, semantic_rollup.hits[0].chunk_hits[0].id);
+    const semantic_chunk_ref = semantic_rollup.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", semantic_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", semantic_chunk_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, semantic_chunk_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), semantic_chunk_ref.chunk_id);
+    try std.testing.expectEqualStrings("document:000001", semantic_chunk_ref.unit_id.?);
 
     var sparse_query = try deterministic_sparse.interface().embedSparse(alloc, "document_chunk_sparse_v1", "alpha beta gamma");
     defer sparse_query.deinit(alloc);
@@ -33684,10 +34787,11 @@ test "db document extraction chunks units through source artifact enrichment" {
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\"}",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\",\"text\":\"updated source document decoy\"}",
         }},
-        .sync_level = .full_index,
+        .sync_level = .write,
     });
+    try db.waitForCurrentSyncLevel(.full_index);
     const updated_manifest = try db.core.store.get(alloc, manifest_key);
     defer alloc.free(updated_manifest);
     try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"generation\":2") != null);
@@ -33696,6 +34800,10 @@ test "db document extraction chunks units through source artifact enrichment" {
     const updated_chunk_payload = try db.core.store.get(alloc, chunk_key);
     defer alloc.free(updated_chunk_payload);
     try std.testing.expect(std.mem.indexOf(u8, updated_chunk_payload, "\"text\":\"alpha beta delta\"") != null);
+    const refreshed_dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(refreshed_dense_artifact_payload);
+    const refreshed_sparse_artifact_payload = try db.core.store.get(alloc, sparse_artifact_key);
+    defer alloc.free(refreshed_sparse_artifact_payload);
 
     try db.batch(.{
         .writes = &.{.{
@@ -33991,14 +35099,18 @@ test "db managed dense enrichment remains searchable after transient rate limits
     while (attempts_after_release < 500) : (attempts_after_release += 1) {
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
-        if (stats.indexes[0].doc_count == 3 and
-            stats.indexes[0].replay_applied_sequence >= 2 and
-            stats.indexes[0].replay_applied_sequence == stats.indexes[0].replay_target_sequence and
-            !stats.indexes[0].backfill_active)
-        {
-            ready = true;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "semantic_idx")) continue;
+            if (item.doc_count == 3 and
+                item.replay_applied_sequence >= 2 and
+                item.replay_applied_sequence == item.replay_target_sequence and
+                !item.backfill_active)
+            {
+                ready = true;
+            }
             break;
         }
+        if (ready) break;
         sleepNs(10 * std.time.ns_per_ms);
     }
     try std.testing.expect(ready);
@@ -35468,7 +36580,7 @@ test "db default full text index searches template chunk text when chunker full 
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
         },
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
 
     var result = try waitForSearchResult(alloc, &db, .{
@@ -35482,7 +36594,7 @@ test "db default full text index searches template chunk text when chunker full 
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
-test "db full_text sync level covers template chunk full text routing" {
+test "db full_text sync level does not precompute template chunk full text routing" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -35517,8 +36629,7 @@ test "db full_text sync level covers template chunk full text routing" {
     });
 
     const pending = db.pendingWorkStats();
-    try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
-    try std.testing.expect(pending.enrichment.applied_sequence >= 1);
+    try std.testing.expect(pending.enrichment.target_sequence >= 1);
 
     var result = try db.search(alloc, .{
         .index_name = "full_text_index_v0",
@@ -35527,8 +36638,19 @@ test "db full_text sync level covers template chunk full text routing" {
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
-    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "semantic_template_chunked_idx_chunks");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    var chunk_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+    try std.testing.expect(chunk_count > 0);
 }
 
 test "cloneManagedSyncTargetsAll duplicates names independently" {
@@ -36733,6 +37855,76 @@ test "db addEnrichment allows unrelated definitions after field sparse index" {
     });
 }
 
+test "db asset enrichment full_text_index feeds default full text index after full_index sync" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addEnrichment(.{
+        .name = "image_caption_v1",
+        .kind = .asset,
+        .field = "caption_json",
+        .content_type = "application/json",
+        .full_text_index = true,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "image:1",
+                .value = "{\"title\":\"row text\",\"caption_json\":{\"caption\":\"crimson sunset harbor\"}}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "image:1", "asset", "image_caption_v1");
+    defer alloc.free(asset_key);
+    const asset_value = try db.core.store.get(alloc, asset_key);
+    defer alloc.free(asset_value);
+    try std.testing.expect(std.mem.indexOf(u8, asset_value, "crimson sunset harbor") != null);
+    try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0").?.snapshot().global_doc_count > 0);
+
+    var results = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "_all", .text = "harbor" } },
+        .limit = 10,
+    });
+    defer results.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), results.total_hits);
+    try std.testing.expectEqualStrings("image:1", results.hits[0].id);
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "image:1",
+                .value = "{\"title\":\"row text\"}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    var after_delete = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "_all", .text = "harbor" } },
+        .limit = 10,
+    });
+    defer after_delete.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), after_delete.total_hits);
+}
+
 test "db dense index can reference existing whole-doc embedding enrichment" {
     const alloc = std.testing.allocator;
 
@@ -37080,7 +38272,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
         },
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
@@ -37247,7 +38439,7 @@ test "db full-text chunk parent paging applies after grouping" {
             .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha\"}" },
             .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
         },
-        .sync_level = .full_text,
+        .sync_level = .full_index,
     });
 
     var result = try waitForSearchResult(alloc, &db, .{
@@ -39349,6 +40541,119 @@ test "db query_readonly lsm primary opens physical backend read-only" {
     }));
 }
 
+test "db read-only open modes can share lsm root with live writer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var writer = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+
+    try writer.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try writer.sync(true);
+
+    {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = .query_readonly,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer readonly.close();
+
+        var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.TestUnexpectedResult;
+        defer result.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+    }
+
+    {
+        var status = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = .status_only,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer status.close();
+    }
+}
+
+test "db read-only open modes reject catalog mutations before side effects" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer writer.close();
+
+        try writer.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        try writer.sync(true);
+    }
+
+    for ([_]OpenOptions.OpenMode{ .query_readonly, .status_only }) |mode| {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .open_mode = mode,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer readonly.close();
+
+        try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing_idx"));
+        try std.testing.expectError(error.ReadOnly, readonly.addEnrichment(.{
+            .name = "readonly_asset_v1",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.upsertEnrichment(.{
+            .name = "readonly_asset_v1",
+            .kind = .asset,
+            .template = "{{url}}",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "readonly_asset_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.addResolver(.{
+            .name = "readonly_resolver_v1",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}",
+            .config_generation = 1,
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.upsertResolver(.{
+            .name = "readonly_resolver_v1",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}",
+            .config_generation = 1,
+        }));
+        try std.testing.expectError(error.ReadOnly, readonly.removeResolver("readonly_resolver_v1"));
+        try std.testing.expectError(error.ReadOnly, readonly.compactTextIndexes());
+        try std.testing.expectError(error.ReadOnly, readonly.drainScheduledTextMerges());
+        try std.testing.expectError(error.ReadOnly, readonly.forceCompactTextIndexes());
+        try std.testing.expectError(error.ReadOnly, readonly.bestEffortForceCompactTextIndexes());
+    }
+}
+
 test "db query_readonly lmdb primary does not create missing database" {
     const alloc = std.testing.allocator;
 
@@ -39507,6 +40812,140 @@ test "db writer_no_replay open defers pending derived replay until runUntilIdle"
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db catch-up advances vacuous derived replay target gap" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const target_sequence: u64 = 7;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
+        var latest_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
+        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+        var batch = try db.core.store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(latest_key[0..], latest_raw[0..]);
+        try batch.commit();
+
+        const before = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (before) |*status| status.deinit(alloc);
+            alloc.free(before);
+        }
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqual(@as(u64, 0), before[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, before[0].target_sequence);
+        try std.testing.expect(before[0].catch_up_required);
+
+        try db.catchUpPendingDerivedReplay();
+
+        const after = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (after) |*status| status.deinit(alloc);
+            alloc.free(after);
+        }
+        try std.testing.expectEqual(@as(usize, 1), after.len);
+        try std.testing.expectEqual(target_sequence, after[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, after[0].target_sequence);
+        try std.testing.expect(!after[0].catch_up_required);
+    }
+}
+
+test "db catch-up rebuilds dense coverage before vacuous target advance" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const target_sequence: u64 = 7;
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(stored_key);
+    try db.core.store.putBatch(&.{
+        .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+    }, &.{});
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+    try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
+    var latest_raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
+    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+    var batch = try db.core.store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(latest_key[0..], latest_raw[0..]);
+    try batch.commit();
+
+    {
+        const before = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (before) |*status| status.deinit(alloc);
+            alloc.free(before);
+        }
+        try std.testing.expectEqual(@as(usize, 1), before.len);
+        try std.testing.expectEqual(@as(u64, 0), before[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, before[0].target_sequence);
+        try std.testing.expect(before[0].catch_up_required);
+    }
+
+    try db.catchUpPendingDerivedReplay();
+
+    {
+        const after = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (after) |*status| status.deinit(alloc);
+            alloc.free(after);
+        }
+        try std.testing.expectEqual(@as(usize, 1), after.len);
+        try std.testing.expectEqual(target_sequence, after[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, after[0].target_sequence);
+        try std.testing.expect(!after[0].catch_up_required);
+    }
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 

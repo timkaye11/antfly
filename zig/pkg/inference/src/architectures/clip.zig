@@ -373,41 +373,41 @@ fn selfAttn(
     const v_b = try cb.getWeight(try fmt(&v_b_buf, "{s}.{d}.self_attn.v_proj.bias", .{ prefix, layer }));
 
     const qkv = try cb.linearTriple(input, q_w, q_b, k_w, k_b, v_w, v_b, total, hidden, hidden);
-    const Q = qkv.first;
-    const K = qkv.second;
-    const V = qkv.third;
-    defer cb.free(Q);
-    defer cb.free(K);
-    defer cb.free(V);
-
-    const Q_heads = try packTokenMajorToHeadMajor(cb, allocator, Q, batch, seq_len, num_heads, head_dim);
-    defer cb.free(Q_heads);
-    const K_heads = try packTokenMajorToHeadMajor(cb, allocator, K, batch, seq_len, num_heads, head_dim);
-    defer cb.free(K_heads);
-    const V_heads = try packTokenMajorToHeadMajor(cb, allocator, V, batch, seq_len, num_heads, head_dim);
-    defer cb.free(V_heads);
+    const Q_token = qkv.first;
+    const K_token = qkv.second;
+    const V_token = qkv.third;
+    defer cb.free(Q_token);
+    defer cb.free(K_token);
+    defer cb.free(V_token);
+    const Q = if (causal) Q_token else try packTokenMajorToHeadMajor(cb, allocator, Q_token, batch, seq_len, num_heads, head_dim);
+    defer if (!causal) cb.free(Q);
+    const K = if (causal) K_token else try packTokenMajorToHeadMajor(cb, allocator, K_token, batch, seq_len, num_heads, head_dim);
+    defer if (!causal) cb.free(K);
+    const V = if (causal) V_token else try packTokenMajorToHeadMajor(cb, allocator, V_token, batch, seq_len, num_heads, head_dim);
+    defer if (!causal) cb.free(V);
 
     const attn_out = if (causal)
-        try cb.causalSelfAttention(Q_heads, K_heads, V_heads, null, batch, seq_len, num_heads, head_dim)
+        try cb.causalSelfAttention(Q, K, V, null, batch, seq_len, num_heads, head_dim)
     else blk: {
         const ones = try allocator.alloc(i64, batch * seq_len);
         defer allocator.free(ones);
         @memset(ones, 1);
-        break :blk try cb.scaledDotProductAttention(Q_heads, K_heads, V_heads, ones, null, batch, seq_len, num_heads, head_dim);
+        break :blk try cb.scaledDotProductAttention(Q, K, V, ones, null, batch, seq_len, num_heads, head_dim);
     };
     defer cb.free(attn_out);
-    const attn_token_major = try unpackHeadMajorToTokenMajor(cb, allocator, attn_out, batch, seq_len, num_heads, head_dim);
-    defer cb.free(attn_token_major);
+    const projected_input = if (causal) attn_out else try unpackHeadMajorToTokenMajor(cb, allocator, attn_out, batch, seq_len, num_heads, head_dim);
+    defer if (!causal) cb.free(projected_input);
 
     var o_w_buf: [128]u8 = undefined;
     var o_b_buf: [128]u8 = undefined;
     const o_w = try cb.getWeight(try fmt(&o_w_buf, "{s}.{d}.self_attn.out_proj.weight", .{ prefix, layer }));
     const o_b = try cb.getWeight(try fmt(&o_b_buf, "{s}.{d}.self_attn.out_proj.bias", .{ prefix, layer }));
-    return (try cb.linearAdd(attn_token_major, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
-        const projected = try cb.linear(attn_token_major, o_w, o_b, total, hidden, hidden);
+    const projected = (try cb.linearAdd(projected_input, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
+        const projected = try cb.linear(projected_input, o_w, o_b, total, hidden, hidden);
         defer cb.free(projected);
         break :blk try cb.add(residual, projected);
     };
+    return projected;
 }
 
 fn packTokenMajorToHeadMajor(
