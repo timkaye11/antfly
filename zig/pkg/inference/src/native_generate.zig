@@ -25,6 +25,7 @@ const gpt_arch = @import("architectures/gpt.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
 const graph_mod = @import("graph/root.zig");
+const quant_matmul = @import("graph/quant_matmul.zig");
 const onnx_decoder_only_vlm = @import("pipelines/onnx_decoder_only_vlm.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const manifest_mod = @import("models/manifest.zig");
@@ -2659,7 +2660,8 @@ fn metalStatsCompactJson(
     const command_dispatch = provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts;
     const generated_route_json = try graph_mod.quant_kernel_compiler.metalRuntimeRouteSummaryJson(allocator);
     defer allocator.free(generated_route_json);
-    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(graph_stats);
+    const plan_stats = metalStatsWithRuntimePlanCounters(graph_stats, provider);
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try appendFmt(
@@ -2839,19 +2841,19 @@ fn metalStatsCompactJson(
         \\}}
     ,
         .{
-            graph_stats.quant_kernel_planned_ops,
-            graph_stats.quant_kernel_handwritten_production,
-            graph_stats.quant_kernel_generated_production,
-            graph_stats.quant_kernel_unsupported_routes,
-            graph_stats.quant_kernel_generated_candidates,
-            graph_stats.quant_kernel_fallback_generated_artifact_missing,
-            graph_stats.quant_kernel_fallback_generated_runtime_not_wired,
-            graph_stats.quant_kernel_fallback_unsupported,
-            graph_stats.quant_kernel_fallback_unsupported_format,
-            graph_stats.quant_kernel_fallback_unsupported_shape,
-            graph_stats.quant_kernel_fallback_unsupported_epilogue,
-            graph_stats.quant_kernel_fallback_unsupported_backend,
-            graph_stats.quant_kernel_fallback_tensor_core_repack_required,
+            plan_stats.quant_kernel_planned_ops,
+            plan_stats.quant_kernel_handwritten_production,
+            plan_stats.quant_kernel_generated_production,
+            plan_stats.quant_kernel_unsupported_routes,
+            plan_stats.quant_kernel_generated_candidates,
+            plan_stats.quant_kernel_fallback_generated_artifact_missing,
+            plan_stats.quant_kernel_fallback_generated_runtime_not_wired,
+            plan_stats.quant_kernel_fallback_unsupported,
+            plan_stats.quant_kernel_fallback_unsupported_format,
+            plan_stats.quant_kernel_fallback_unsupported_shape,
+            plan_stats.quant_kernel_fallback_unsupported_epilogue,
+            plan_stats.quant_kernel_fallback_unsupported_backend,
+            plan_stats.quant_kernel_fallback_tensor_core_repack_required,
             std.json.fmt(top_fallback.name, .{}),
             top_fallback.count,
         },
@@ -2934,6 +2936,54 @@ fn metalStatsCompactJson(
         },
     );
     return try out.toOwnedSlice(allocator);
+}
+
+fn metalStatsWithRuntimePlanCounters(
+    graph_stats: graph_mod.executor_stats.ExecutionStats,
+    provider: ops.NativeQuantTimingStats,
+) graph_mod.executor_stats.ExecutionStats {
+    if (graph_stats.quant_kernel_planned_ops != 0) return graph_stats;
+    var stats = graph_stats;
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_dispatches, .q8_0, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_bias_dispatches, .q8_0, .bias);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches, .q8_0, .bias_gelu);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_relu_dispatches, .q8_0, .relu);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_1_small_batch_dispatches, .q8_1, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_k_small_batch_dispatches, .q8_k, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q2_k_small_batch_dispatches, .q2_k, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q2_k_small_batch_bias_dispatches, .q2_k, .bias);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches, .q2_k, .bias_gelu);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q3_k_small_batch_dispatches, .q3_k, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q3_k_small_batch_bias_dispatches, .q3_k, .bias);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches, .q3_k, .bias_gelu);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_0_small_batch_dispatches, .q4_0, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_1_small_batch_dispatches, .q4_1, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_0_small_batch_dispatches, .q5_0, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_1_small_batch_dispatches, .q5_1, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_k_small_batch_dispatches, .q4_k, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_k_small_batch_bias_dispatches, .q4_k, .bias);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches, .q4_k, .bias_gelu);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_k_small_batch_dispatches, .q5_k, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_k_small_batch_bias_dispatches, .q5_k, .bias);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches, .q5_k, .bias_gelu);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_dispatches, .q6_k, .none);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches, .q6_k, .bias);
+    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches, .q6_k, .bias_gelu);
+    return stats;
+}
+
+fn addMetalRuntimeGeneratedPlanCounter(
+    stats: *graph_mod.executor_stats.ExecutionStats,
+    count: u64,
+    format: quant_matmul.Format,
+    epilogue: graph_mod.quant_kernel_compiler.Epilogue,
+) void {
+    if (count == 0) return;
+    const lowering = graph_mod.quant_kernel_compiler.registryLoweringFor(.metal, format, .rows_2_8, epilogue, .small_batch);
+    const counters = graph_mod.quant_kernel_compiler.countersForLowering(lowering);
+    inline for (@typeInfo(graph_mod.quant_kernel_compiler.PlanCounters).@"struct".fields) |field| {
+        @field(stats.*, field.name) += @as(u64, @intCast(@field(counters, field.name))) * count;
+    }
 }
 
 fn writeJsonTiming(
@@ -6376,6 +6426,25 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
     defer std.testing.allocator.free(null_json);
     try std.testing.expectEqualStrings("null", null_json);
+}
+
+test "metal stats compact json derives plan counters from runtime generated dispatches" {
+    var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
+    snapshot.provider.metal_runtime_antfly_q8_0_small_batch_dispatches = 2;
+    snapshot.provider.metal_runtime_antfly_q5_k_small_batch_bias_dispatches = 3;
+
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const plan = parsed.value.object.get("quant_kernel_plan").?.object;
+    try std.testing.expectEqual(@as(i64, 5), plan.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), plan.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
 }
 
 test "raw decode bench json includes metal compact stats" {

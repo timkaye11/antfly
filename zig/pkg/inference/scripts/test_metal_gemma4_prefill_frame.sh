@@ -210,6 +210,13 @@ assert_json_timing_anchor() {
     sed -n '1,220p' "$json" >&2 || true
     exit 1
   fi
+  if ! grep -q '"quant_kernel_plan":{' "$json"; then
+    echo "JSON timing did not include quant kernel plan counters for $label" >&2
+    echo "json: $json" >&2
+    sed -n '1,220p' "$json" >&2 || true
+    exit 1
+  fi
+  assert_json_counter_at_least "$label" "$json" planned 1
   if [[ "$(json_counter_from "$json" fallback)" != "0" ]]; then
     echo "JSON timing reported Metal command fallback for $label" >&2
     echo "json: $json" >&2
@@ -399,7 +406,7 @@ assert_anchor() {
 if [[ "$SELF_TEST" == "1" ]]; then
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/antfly-prefill-frame-self-test.XXXXXX")"
   trap 'rm -rf "$tmp_dir"' EXIT
-  JSON_TIMING=0
+  JSON_TIMING=1
   sample="$tmp_dir/sample.txt"
   cat >"$sample" <<'OUT'
 token_ids: 1
@@ -411,6 +418,31 @@ metal_generated_quant_dispatch: q8_0_small_batch=2 q8_0_small_batch_bias_gelu=3 
 decoder_gated_prefill_ops: tokens=3 attn_out_linear=0 attn_post_norm=0 attn_residual_add=0
 metal_frame_fallbacks: decode_fallback=0
 OUT
+  cat >"${sample%.txt}.json" <<'JSON'
+{
+"backend":"metal",
+"metal":{
+"runtime_command_operators":{
+"fallback":0
+},
+"generated_quant_dispatch":{
+"q8_0_small_batch":2,
+"q8_0_small_batch_bias_gelu":3,
+"q2_k_small_batch":4,
+"q4_0_small_batch":1,
+"q4_k_small_batch":1,
+"q5_k_small_batch":1,
+"q6_k_small_batch":1
+},
+"quant_kernel_plan":{
+"planned":5
+},
+"frame_fallbacks":{
+"decode_fallback":0
+}
+}
+}
+JSON
   EXPECTED_TOKEN_IDS=1
   MIN_GENERATED_Q8_0_SMALL_BATCH=1
   MIN_GENERATED_Q4_0_SMALL_BATCH=1
