@@ -2948,10 +2948,10 @@ fn metalStatsWithRuntimePlanCounters(
     if (graph_stats.quant_kernel_planned_ops != 0) return graph_stats;
     var stats = graph_stats;
 
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1);
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_2_8);
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64);
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus);
+    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1, .q8_0, .rows_1, .none, .mmv);
+    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_2_8, .q8_0, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64, .q8_0, .rows_9_64, .none, .mm);
+    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus, .q8_0, .rows_65_plus, .none, .mm);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_output);
@@ -3009,6 +3009,22 @@ fn addMetalRuntimeHandwrittenPlanCounter(
     if (count == 0) return;
     stats.quant_kernel_planned_ops += count;
     stats.quant_kernel_handwritten_production += count;
+}
+
+fn addMetalRuntimeLoweringPlanCounter(
+    stats: *graph_mod.executor_stats.ExecutionStats,
+    count: u64,
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: graph_mod.quant_kernel_compiler.Epilogue,
+    dispatch: quant_matmul.DispatchKind,
+) void {
+    if (count == 0) return;
+    const lowering = graph_mod.quant_kernel_compiler.registryLoweringFor(.metal, format, row_bucket, epilogue, dispatch);
+    const counters = graph_mod.quant_kernel_compiler.countersForLowering(lowering);
+    inline for (@typeInfo(graph_mod.quant_kernel_compiler.PlanCounters).@"struct".fields) |field| {
+        @field(stats.*, field.name) += @as(u64, @intCast(@field(counters, field.name))) * count;
+    }
 }
 
 fn addMetalRuntimeGeneratedPlanCounter(
@@ -6492,6 +6508,7 @@ test "metal stats compact json derives plan counters from runtime generated disp
 test "metal stats compact json derives plan counters from runtime handwritten dispatches" {
     var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
     snapshot.provider.metal_runtime_q8_0_linear_rows_1 = 2;
+    snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
     snapshot.provider.metal_runtime_q8_0_linear_rows_9_64 = 3;
     snapshot.provider.metal_runtime_q4_0_pair_activation_reduce = 5;
     snapshot.provider.metal_runtime_q6_k_linear_reduce = 7;
@@ -6502,10 +6519,10 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     defer parsed.deinit();
 
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
-    try std.testing.expectEqual(@as(i64, 17), plan.get("planned").?.integer);
-    try std.testing.expectEqual(@as(i64, 17), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 21), plan.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 21), plan.get("handwritten_production").?.integer);
     try std.testing.expectEqual(@as(i64, 0), plan.get("generated_production").?.integer);
-    try std.testing.expectEqual(@as(i64, 0), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), plan.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
 }
