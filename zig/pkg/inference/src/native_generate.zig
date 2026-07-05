@@ -2727,13 +2727,28 @@ fn metalStatsCompactJson(
         \\"pair_act_rms_mmv_out_f16":{d},
         \\"linear_mmv_in_f16":{d}
         \\}},
+        \\"q4_0_dispatch":{{
+        \\"linear_reduce":{d},
+        \\"linear_reduce_rows_1":{d},
+        \\"linear_reduce_rows_2_8":{d},
+        \\"linear_reduce_rows_9_64":{d},
+        \\"linear_reduce_rows_65_plus":{d}
+        \\}},
         \\"k_quant_dispatch":{{
         \\"q4_linear_reduce":{d},
+        \\"q4_linear_reduce_rows_1":{d},
+        \\"q4_linear_reduce_rows_2_8":{d},
+        \\"q4_linear_reduce_rows_9_64":{d},
+        \\"q4_linear_reduce_rows_65_plus":{d},
         \\"q4_pair_reduce":{d},
         \\"q4_pair_act_reduce":{d},
         \\"q4_pair_act_reduce_out_f16":{d},
         \\"q4_activation_rhs_reduce":{d},
         \\"q6_linear_reduce":{d},
+        \\"q6_linear_reduce_rows_1":{d},
+        \\"q6_linear_reduce_rows_2_8":{d},
+        \\"q6_linear_reduce_rows_9_64":{d},
+        \\"q6_linear_reduce_rows_65_plus":{d},
         \\"q6_linear_reduce_in_f16":{d}
         \\}}
     ,
@@ -2750,12 +2765,25 @@ fn metalStatsCompactJson(
             provider.metal_runtime_q8_0_linear_mm_f16_input,
             provider.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output,
             provider.metal_runtime_q8_0_linear_mmv_f16_input,
+            provider.metal_runtime_q4_0_linear_reduce,
+            provider.metal_runtime_q4_0_linear_reduce_rows_1,
+            provider.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            provider.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            provider.metal_runtime_q4_0_linear_reduce_rows_65_plus,
             provider.metal_runtime_q4_k_linear_reduce,
+            provider.metal_runtime_q4_k_linear_reduce_rows_1,
+            provider.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            provider.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            provider.metal_runtime_q4_k_linear_reduce_rows_65_plus,
             provider.metal_runtime_q4_k_pair_reduce,
             provider.metal_runtime_q4_k_pair_activation_reduce,
             provider.metal_runtime_q4_k_pair_activation_reduce_f16_output,
             provider.metal_runtime_q4_k_activation_rhs_reduce,
             provider.metal_runtime_q6_k_linear_reduce,
+            provider.metal_runtime_q6_k_linear_reduce_rows_1,
+            provider.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
@@ -2948,11 +2976,20 @@ fn metalStatsWithRuntimePlanCounters(
     if (graph_stats.quant_kernel_planned_ops != 0) return graph_stats;
     var stats = graph_stats;
 
-    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1, .q8_0, .rows_1, .none, .mmv);
-    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_2_8, .q8_0, .rows_2_8, .none, .small_batch);
-    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64, .q8_0, .rows_9_64, .none, .mm);
-    addMetalRuntimeLoweringPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus, .q8_0, .rows_65_plus, .none, .mm);
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1, .q8_0, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q8_0_linear_rows_2_8, provider.metal_runtime_antfly_q8_0_small_batch_dispatches), .q8_0, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64, .q8_0, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus, .q8_0, .rows_65_plus, .none, .mm);
+
+    const q4_0_linear_reduce_rows = provider.metal_runtime_q4_0_linear_reduce_rows_1 +
+        provider.metal_runtime_q4_0_linear_reduce_rows_2_8 +
+        provider.metal_runtime_q4_0_linear_reduce_rows_9_64 +
+        provider.metal_runtime_q4_0_linear_reduce_rows_65_plus;
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_1, .q4_0, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_2_8, .q4_0, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_9_64, .q4_0, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_rows_65_plus, .q4_0, .rows_65_plus, .none, .mm);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q4_0_linear_reduce, q4_0_linear_reduce_rows));
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_output);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output);
@@ -2966,12 +3003,30 @@ fn metalStatsWithRuntimePlanCounters(
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_activation_rhs_reduce_f16_output);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_0_ple_linear_reduce_f16_input);
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce);
+
+    const q4_k_linear_reduce_rows = provider.metal_runtime_q4_k_linear_reduce_rows_1 +
+        provider.metal_runtime_q4_k_linear_reduce_rows_2_8 +
+        provider.metal_runtime_q4_k_linear_reduce_rows_9_64 +
+        provider.metal_runtime_q4_k_linear_reduce_rows_65_plus;
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_1, .q4_k, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_2_8, .q4_k, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_9_64, .q4_k, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_linear_reduce_rows_65_plus, .q4_k, .rows_65_plus, .none, .mm);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q4_k_linear_reduce, q4_k_linear_reduce_rows));
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_reduce);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_activation_reduce);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_pair_activation_reduce_f16_output);
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q4_k_activation_rhs_reduce);
-    addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce);
+
+    const q6_k_linear_reduce_rows = provider.metal_runtime_q6_k_linear_reduce_rows_1 +
+        provider.metal_runtime_q6_k_linear_reduce_rows_2_8 +
+        provider.metal_runtime_q6_k_linear_reduce_rows_9_64 +
+        provider.metal_runtime_q6_k_linear_reduce_rows_65_plus;
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_1, .q6_k, .rows_1, .none, .mmv);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_2_8, .q6_k, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_9_64, .q6_k, .rows_9_64, .none, .mm);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_rows_65_plus, .q6_k, .rows_65_plus, .none, .mm);
+    addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q6_k_linear_reduce, q6_k_linear_reduce_rows));
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_f16_input);
 
     addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_dispatches, .q8_0, .none);
@@ -3011,7 +3066,7 @@ fn addMetalRuntimeHandwrittenPlanCounter(
     stats.quant_kernel_handwritten_production += count;
 }
 
-fn addMetalRuntimeLoweringPlanCounter(
+fn addMetalRuntimeObservedHandwrittenPlanCounter(
     stats: *graph_mod.executor_stats.ExecutionStats,
     count: u64,
     format: quant_matmul.Format,
@@ -3021,10 +3076,15 @@ fn addMetalRuntimeLoweringPlanCounter(
 ) void {
     if (count == 0) return;
     const lowering = graph_mod.quant_kernel_compiler.registryLoweringFor(.metal, format, row_bucket, epilogue, dispatch);
-    const counters = graph_mod.quant_kernel_compiler.countersForLowering(lowering);
-    inline for (@typeInfo(graph_mod.quant_kernel_compiler.PlanCounters).@"struct".fields) |field| {
-        @field(stats.*, field.name) += @as(u64, @intCast(@field(counters, field.name))) * count;
+    stats.quant_kernel_planned_ops += count;
+    stats.quant_kernel_handwritten_production += count;
+    if (lowering.candidate_route == .generated_dev_candidate) {
+        stats.quant_kernel_generated_candidates += count;
     }
+}
+
+fn saturatingSub(lhs: u64, rhs: u64) u64 {
+    return if (lhs > rhs) lhs - rhs else 0;
 }
 
 fn addMetalRuntimeGeneratedPlanCounter(
@@ -4359,9 +4419,13 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         .{metal_snapshot.provider.metal_runtime_paged_attention_1x_calls},
     );
     print(
-        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_1,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input,
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
@@ -4377,14 +4441,22 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q4_k_pair_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_pair_activation_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_pair_activation_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_k_activation_rhs_reduce,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
@@ -6510,19 +6582,29 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     snapshot.provider.metal_runtime_q8_0_linear_rows_1 = 2;
     snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
     snapshot.provider.metal_runtime_q8_0_linear_rows_9_64 = 3;
+    snapshot.provider.metal_runtime_q4_0_linear_reduce = 6;
+    snapshot.provider.metal_runtime_q4_0_linear_reduce_rows_2_8 = 6;
     snapshot.provider.metal_runtime_q4_0_pair_activation_reduce = 5;
-    snapshot.provider.metal_runtime_q6_k_linear_reduce = 7;
+    snapshot.provider.metal_runtime_q6_k_linear_reduce = 10;
+    snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
 
+    const q4_0 = parsed.value.object.get("q4_0_dispatch").?.object;
+    try std.testing.expectEqual(@as(i64, 6), q4_0.get("linear_reduce").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), q4_0.get("linear_reduce_rows_2_8").?.integer);
+    const k_quant = parsed.value.object.get("k_quant_dispatch").?.object;
+    try std.testing.expectEqual(@as(i64, 10), k_quant.get("q6_linear_reduce").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), k_quant.get("q6_linear_reduce_rows_1").?.integer);
+
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
-    try std.testing.expectEqual(@as(i64, 21), plan.get("planned").?.integer);
-    try std.testing.expectEqual(@as(i64, 21), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), plan.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), plan.get("handwritten_production").?.integer);
     try std.testing.expectEqual(@as(i64, 0), plan.get("generated_production").?.integer);
-    try std.testing.expectEqual(@as(i64, 4), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), plan.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
 }

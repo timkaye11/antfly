@@ -847,6 +847,10 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q8_0_linear_mmv_f16_input;
     uint64_t q8_0_linear_family_dispatch_counts[TERMITE_METAL_Q8_0_LINEAR_FAMILY_COUNT][TERMITE_METAL_Q8_0_LINEAR_DISPATCH_COUNT];
     uint64_t q4_0_linear_reduce;
+    uint64_t q4_0_linear_reduce_rows_1;
+    uint64_t q4_0_linear_reduce_rows_2_8;
+    uint64_t q4_0_linear_reduce_rows_9_64;
+    uint64_t q4_0_linear_reduce_rows_65_plus;
     uint64_t q4_0_linear_reduce_f16_input;
     uint64_t q4_0_linear_reduce_f16_output;
     uint64_t q4_0_linear_reduce_f16_input_f16_output;
@@ -865,11 +869,19 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q4_0_pair_activation_reduce_encode_nanos;
     uint64_t q4_0_activation_rhs_reduce_encode_nanos;
     uint64_t q4_k_linear_reduce;
+    uint64_t q4_k_linear_reduce_rows_1;
+    uint64_t q4_k_linear_reduce_rows_2_8;
+    uint64_t q4_k_linear_reduce_rows_9_64;
+    uint64_t q4_k_linear_reduce_rows_65_plus;
     uint64_t q4_k_pair_reduce;
     uint64_t q4_k_pair_activation_reduce;
     uint64_t q4_k_pair_activation_reduce_f16_output;
     uint64_t q4_k_activation_rhs_reduce;
     uint64_t q6_k_linear_reduce;
+    uint64_t q6_k_linear_reduce_rows_1;
+    uint64_t q6_k_linear_reduce_rows_2_8;
+    uint64_t q6_k_linear_reduce_rows_9_64;
+    uint64_t q6_k_linear_reduce_rows_65_plus;
     uint64_t q6_k_linear_reduce_f16_input;
     uint64_t antfly_q8_0_small_batch_dispatches;
     uint64_t antfly_q8_0_small_batch_bias_dispatches;
@@ -1102,6 +1114,10 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t q8_0_linear_mmv_f16_input;
     uint64_t q8_0_linear_family_dispatch_counts[TERMITE_METAL_Q8_0_LINEAR_FAMILY_COUNT][TERMITE_METAL_Q8_0_LINEAR_DISPATCH_COUNT];
     uint64_t q4_0_linear_reduce;
+    uint64_t q4_0_linear_reduce_rows_1;
+    uint64_t q4_0_linear_reduce_rows_2_8;
+    uint64_t q4_0_linear_reduce_rows_9_64;
+    uint64_t q4_0_linear_reduce_rows_65_plus;
     uint64_t q4_0_linear_reduce_f16_input;
     uint64_t q4_0_linear_reduce_f16_output;
     uint64_t q4_0_linear_reduce_f16_input_f16_output;
@@ -1120,11 +1136,19 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t q4_0_pair_activation_reduce_encode_nanos;
     uint64_t q4_0_activation_rhs_reduce_encode_nanos;
     uint64_t q4_k_linear_reduce;
+    uint64_t q4_k_linear_reduce_rows_1;
+    uint64_t q4_k_linear_reduce_rows_2_8;
+    uint64_t q4_k_linear_reduce_rows_9_64;
+    uint64_t q4_k_linear_reduce_rows_65_plus;
     uint64_t q4_k_pair_reduce;
     uint64_t q4_k_pair_activation_reduce;
     uint64_t q4_k_pair_activation_reduce_f16_output;
     uint64_t q4_k_activation_rhs_reduce;
     uint64_t q6_k_linear_reduce;
+    uint64_t q6_k_linear_reduce_rows_1;
+    uint64_t q6_k_linear_reduce_rows_2_8;
+    uint64_t q6_k_linear_reduce_rows_9_64;
+    uint64_t q6_k_linear_reduce_rows_65_plus;
     uint64_t q6_k_linear_reduce_f16_input;
     uint64_t antfly_q8_0_small_batch_dispatches;
     uint64_t antfly_q8_0_small_batch_bias_dispatches;
@@ -8345,6 +8369,18 @@ static void termite_metal_record_q8_0_linear_dispatch(
     }
 }
 
+static void termite_metal_record_quant_row_bucket(size_t rows, uint64_t *rows_1, uint64_t *rows_2_8, uint64_t *rows_9_64, uint64_t *rows_65_plus) {
+    if (rows == 1) {
+        *rows_1 += 1;
+    } else if (rows <= 8) {
+        *rows_2_8 += 1;
+    } else if (rows <= 64) {
+        *rows_9_64 += 1;
+    } else {
+        *rows_65_plus += 1;
+    }
+}
+
 static int termite_metal_encode_quant_matmul_none_on_encoder_family(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
@@ -9586,14 +9622,17 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                 runtime->q4_0_linear_reduce_f16_input += 1;
             } else {
                 runtime->q4_0_linear_reduce += 1;
+                termite_metal_record_quant_row_bucket(descriptor->rows, &runtime->q4_0_linear_reduce_rows_1, &runtime->q4_0_linear_reduce_rows_2_8, &runtime->q4_0_linear_reduce_rows_9_64, &runtime->q4_0_linear_reduce_rows_65_plus);
             }
         } else if (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_K) {
             runtime->q4_k_linear_reduce += 1;
+            termite_metal_record_quant_row_bucket(descriptor->rows, &runtime->q4_k_linear_reduce_rows_1, &runtime->q4_k_linear_reduce_rows_2_8, &runtime->q4_k_linear_reduce_rows_9_64, &runtime->q4_k_linear_reduce_rows_65_plus);
         } else if (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q6_K) {
             if (use_f16_input) {
                 runtime->q6_k_linear_reduce_f16_input += 1;
             } else {
                 runtime->q6_k_linear_reduce += 1;
+                termite_metal_record_quant_row_bucket(descriptor->rows, &runtime->q6_k_linear_reduce_rows_1, &runtime->q6_k_linear_reduce_rows_2_8, &runtime->q6_k_linear_reduce_rows_9_64, &runtime->q6_k_linear_reduce_rows_65_plus);
             }
         }
         [encoder setThreadgroupMemoryLength:reduce_shmem_floats * sizeof(float) atIndex:0];
@@ -39335,6 +39374,10 @@ int termite_metal_decode_runtime_memory_snapshot(
         runtime->q8_0_linear_family_dispatch_counts,
         sizeof(snapshot->q8_0_linear_family_dispatch_counts));
     snapshot->q4_0_linear_reduce = runtime->q4_0_linear_reduce;
+    snapshot->q4_0_linear_reduce_rows_1 = runtime->q4_0_linear_reduce_rows_1;
+    snapshot->q4_0_linear_reduce_rows_2_8 = runtime->q4_0_linear_reduce_rows_2_8;
+    snapshot->q4_0_linear_reduce_rows_9_64 = runtime->q4_0_linear_reduce_rows_9_64;
+    snapshot->q4_0_linear_reduce_rows_65_plus = runtime->q4_0_linear_reduce_rows_65_plus;
     snapshot->q4_0_linear_reduce_f16_input = runtime->q4_0_linear_reduce_f16_input;
     snapshot->q4_0_linear_reduce_f16_output = runtime->q4_0_linear_reduce_f16_output;
     snapshot->q4_0_linear_reduce_f16_input_f16_output = runtime->q4_0_linear_reduce_f16_input_f16_output;
@@ -39353,11 +39396,19 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->q4_0_pair_activation_reduce_encode_nanos = runtime->q4_0_pair_activation_reduce_encode_nanos;
     snapshot->q4_0_activation_rhs_reduce_encode_nanos = runtime->q4_0_activation_rhs_reduce_encode_nanos;
     snapshot->q4_k_linear_reduce = runtime->q4_k_linear_reduce;
+    snapshot->q4_k_linear_reduce_rows_1 = runtime->q4_k_linear_reduce_rows_1;
+    snapshot->q4_k_linear_reduce_rows_2_8 = runtime->q4_k_linear_reduce_rows_2_8;
+    snapshot->q4_k_linear_reduce_rows_9_64 = runtime->q4_k_linear_reduce_rows_9_64;
+    snapshot->q4_k_linear_reduce_rows_65_plus = runtime->q4_k_linear_reduce_rows_65_plus;
     snapshot->q4_k_pair_reduce = runtime->q4_k_pair_reduce;
     snapshot->q4_k_pair_activation_reduce = runtime->q4_k_pair_activation_reduce;
     snapshot->q4_k_pair_activation_reduce_f16_output = runtime->q4_k_pair_activation_reduce_f16_output;
     snapshot->q4_k_activation_rhs_reduce = runtime->q4_k_activation_rhs_reduce;
     snapshot->q6_k_linear_reduce = runtime->q6_k_linear_reduce;
+    snapshot->q6_k_linear_reduce_rows_1 = runtime->q6_k_linear_reduce_rows_1;
+    snapshot->q6_k_linear_reduce_rows_2_8 = runtime->q6_k_linear_reduce_rows_2_8;
+    snapshot->q6_k_linear_reduce_rows_9_64 = runtime->q6_k_linear_reduce_rows_9_64;
+    snapshot->q6_k_linear_reduce_rows_65_plus = runtime->q6_k_linear_reduce_rows_65_plus;
     snapshot->q6_k_linear_reduce_f16_input = runtime->q6_k_linear_reduce_f16_input;
     snapshot->antfly_q8_0_small_batch_dispatches = runtime->antfly_q8_0_small_batch_dispatches;
     snapshot->antfly_q8_0_small_batch_bias_dispatches = runtime->antfly_q8_0_small_batch_bias_dispatches;
