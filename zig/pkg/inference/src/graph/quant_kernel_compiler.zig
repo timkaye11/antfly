@@ -345,6 +345,12 @@ const ArtifactManifest = struct {
     schema: []const u8,
     artifact_count: usize,
     checked_in_metal_evidence_count: usize,
+    metal_promotion_blocker_evidence_count: usize,
+    metal_promotion_blocker_evidence_path_count: usize,
+    metal_promotion_blocker_check_command_count: usize,
+    metal_promotion_blocker_speedup_gate_missing_count: usize,
+    metal_promotion_blocker_unstable_benchmark_timing_count: usize,
+    metal_promotion_blocker_unsupported_handwritten_count: usize,
     metal_local_check_command: []const u8,
     metal_model_local_check_command: []const u8,
     metal_model_generated_route_check_command: []const u8,
@@ -4914,6 +4920,12 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         .schema = "antfly.quant_kernel_artifacts.v1",
         .artifact_count = first_generated_artifacts.len,
         .checked_in_metal_evidence_count = first_metal_runtime_evidence_count,
+        .metal_promotion_blocker_evidence_count = first_metal_promotion_blocker_evidence_count,
+        .metal_promotion_blocker_evidence_path_count = metalPromotionBlockerEvidencePathCount(),
+        .metal_promotion_blocker_check_command_count = metalPromotionBlockerEvidencePathCount(),
+        .metal_promotion_blocker_speedup_gate_missing_count = metalPromotionBlockerEvidenceCount(metal_blocker_speedup_gate_missing),
+        .metal_promotion_blocker_unstable_benchmark_timing_count = metalPromotionBlockerEvidenceCount(metal_blocker_unstable_benchmark_timing),
+        .metal_promotion_blocker_unsupported_handwritten_count = metalPromotionBlockerEvidenceCount(metal_blocker_unsupported_handwritten),
         .metal_local_check_command = first_metal_local_check_command,
         .metal_model_local_check_command = first_metal_model_local_check_command,
         .metal_model_generated_route_check_command = first_metal_model_generated_route_check_command,
@@ -6901,6 +6913,24 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     const metal_evidence_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"checked_in_metal_evidence_count\": {d}", .{first_metal_runtime_evidence_count});
     defer std.testing.allocator.free(metal_evidence_count_field);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, metal_evidence_count_field));
+    const blocker_evidence_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_evidence_count\": {d}", .{first_metal_promotion_blocker_evidence_count});
+    defer std.testing.allocator.free(blocker_evidence_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_evidence_count_field));
+    const blocker_path_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_evidence_path_count\": {d}", .{metalPromotionBlockerEvidencePathCount()});
+    defer std.testing.allocator.free(blocker_path_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_path_count_field));
+    const blocker_check_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_check_command_count\": {d}", .{metalPromotionBlockerEvidencePathCount()});
+    defer std.testing.allocator.free(blocker_check_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_check_count_field));
+    const blocker_speedup_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_speedup_gate_missing_count\": {d}", .{metalPromotionBlockerEvidenceCount(metal_blocker_speedup_gate_missing)});
+    defer std.testing.allocator.free(blocker_speedup_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_speedup_count_field));
+    const blocker_unstable_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_unstable_benchmark_timing_count\": {d}", .{metalPromotionBlockerEvidenceCount(metal_blocker_unstable_benchmark_timing)});
+    defer std.testing.allocator.free(blocker_unstable_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_unstable_count_field));
+    const blocker_unsupported_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_promotion_blocker_unsupported_handwritten_count\": {d}", .{metalPromotionBlockerEvidenceCount(metal_blocker_unsupported_handwritten)});
+    defer std.testing.allocator.free(blocker_unsupported_count_field);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, blocker_unsupported_count_field));
     const route_all_case_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"metal_runtime_route_all_expected_case_count\": {d}", .{first_metal_runtime_route_all_expected_case_count});
     defer std.testing.allocator.free(route_all_case_count_field);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, route_all_case_count_field));
