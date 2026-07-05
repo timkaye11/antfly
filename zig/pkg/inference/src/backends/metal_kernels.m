@@ -21213,7 +21213,6 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_gelu_slot_devi
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
-    if (getenv("TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU") == NULL) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0 || (in_dim & 255u) != 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;

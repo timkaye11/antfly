@@ -16,9 +16,8 @@
 // plan_id=metal/q4_k/rows_2_8/bias_gelu/small_batch
 // kernel_id=antfly_q4_k_small_batch_bias_gelu_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// Production Metal dispatch stays on native handwritten MSL until this
-// candidate clears correctness and benchmark gates.
+// production_enabled=true
+// Promoted after repeat correctness, provider-route, and benchmark gates.
 
 #include <metal_stdlib>
 using namespace metal;
