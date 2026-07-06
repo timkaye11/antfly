@@ -5564,6 +5564,7 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
     try appendPromMetric(writer, "inference_quant_kernel_handwritten_production_total", "counter", "Total quant kernel handwritten production routes", stats.quant_kernel_handwritten_production);
     try appendPromMetric(writer, "inference_quant_kernel_generated_production_total", "counter", "Total quant kernel generated production routes", stats.quant_kernel_generated_production);
     try appendPromMetric(writer, "inference_quant_kernel_unsupported_routes_total", "counter", "Total quant kernel unsupported routes", stats.quant_kernel_unsupported_routes);
+    try appendPromMetric(writer, "inference_quant_kernel_fast_path_misses_total", "counter", "Total quant kernel fast-path misses", graph_mod.executor_stats.quantKernelFastPathMisses(stats));
     try appendPromMetric(writer, "inference_quant_kernel_generated_candidates_total", "counter", "Total quant kernel generated dev candidates observed", stats.quant_kernel_generated_candidates);
     try appendPromMetric(writer, "inference_quant_kernel_fallback_generated_artifact_missing_total", "counter", "Total quant kernel fallbacks because generated artifacts are missing", stats.quant_kernel_fallback_generated_artifact_missing);
     try appendPromMetric(writer, "inference_quant_kernel_fallback_generated_runtime_not_wired_total", "counter", "Total quant kernel fallbacks because generated artifacts are promoted but runtime dispatch is not wired", stats.quant_kernel_fallback_generated_runtime_not_wired);
@@ -5636,6 +5637,7 @@ test "graph executor metrics render counters" {
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_handwritten_production_total 5\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_generated_production_total 6\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_unsupported_routes_total 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fast_path_misses_total 79\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_generated_candidates_total 8\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_generated_artifact_missing_total 9\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_generated_runtime_not_wired_total 10\n") != null);

@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q4_k/rows_2_8/none/small_batch
 // kernel_id=antfly_q4_k_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// Production Metal dispatch stays on native handwritten MSL until this
-// candidate clears correctness and benchmark gates.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;

@@ -87,6 +87,9 @@ Relevant local state:
 - `pkg/inference/src/graph/quant_matmul.zig` already provides the shared
   quantized matmul vocabulary: dispatch buckets, row buckets, packed format
   descriptors, and operator support.
+- `pkg/inference/QUANT_KERNEL_COMPILER.md` documents the shared build-time
+  quant kernel spec/codegen flow and promotion evidence policy used by Metal
+  today and CUDA artifacts later.
 - `pkg/inference/src/gguf/tensor_types.zig` and
   `pkg/inference/src/gguf/quant_codec.zig` are the canonical GGUF type and
   dequantization references.

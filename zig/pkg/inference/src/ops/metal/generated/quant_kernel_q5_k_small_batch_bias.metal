@@ -16,9 +16,9 @@
 // plan_id=metal/q5_k/rows_2_8/bias/small_batch
 // kernel_id=antfly_q5_k_small_batch_bias_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// General MSL lowering smoke for descriptor-driven K-quant matmul epilogues.
-// Promotion is blocked until repeat benchmark timing is stable.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -43,9 +43,7 @@ static inline void antfly_q5_k_unpack_scale_min(
     min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
 }
 
-static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane) {
-    const device uchar *d = block;
-    const device uchar *dmin = block + 2;
+static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin) {
     const device uchar *scales = block + 4;
     const device uchar *qh = block + 16;
     const device uchar *ql = block + 48;
@@ -59,7 +57,7 @@ static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane
     float raw_scale = 0.0f;
     float raw_min = 0.0f;
     antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    return antfly_half_le_to_float(d) * raw_scale * (float)q - antfly_half_le_to_float(dmin) * raw_min;
+    return d * raw_scale * (float)q - dmin * raw_min;
 }
 
 kernel void antfly_q5_k_small_batch_bias_msl_v1(
@@ -86,17 +84,18 @@ kernel void antfly_q5_k_small_batch_bias_msl_v1(
         for (int block_idx = 0; block_idx < block_count; ++block_idx) {
             const device uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176);
             const int base = block_idx << 8;
+            const float d = antfly_half_le_to_float(block);
+            const float dmin = antfly_half_le_to_float(block + 2);
             for (int lane = (int)tid; lane < 256; lane += 128) {
-                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane);
+                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane, d, dmin);
             }
         }
     }
 
     threadgroup float partial[32];
-    if (simdgroup_id == 0u) partial[lane_id] = 0.0f;
     acc = simd_sum(acc);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane_id == 0u) partial[simdgroup_id] = acc;
+    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float total = simd_sum(partial[lane_id]);
     if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];

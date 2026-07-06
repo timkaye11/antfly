@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q6_k/rows_2_8/bias/small_batch
 // kernel_id=antfly_q6_k_small_batch_bias_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// General MSL lowering smoke for descriptor-driven K-quant matmul epilogues.
-// Candidate until repeat benchmark and production-regression evidence clears.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -28,11 +28,10 @@ static inline float antfly_half_le_to_float(const device uchar *p) {
     return (float)as_type<half>(bits);
 }
 
-static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane) {
+static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {
     const device uchar *ql = block;
     const device uchar *qh = block + 128;
     const device uchar *scales = block + 192;
-    const device uchar *d = block + 208;
     const int sub = lane >> 4;
     const int i = lane & 15;
     const int half_idx = sub >> 3;
@@ -47,7 +46,7 @@ static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane
     const int q = (low4 | (high2 << 4)) - 32;
     const int scale_u = (int)scales[sub];
     const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-    return antfly_half_le_to_float(d) * (float)scale * (float)q;
+    return d * (float)scale * (float)q;
 }
 
 kernel void antfly_q6_k_small_batch_bias_msl_v1(
@@ -59,7 +58,9 @@ kernel void antfly_q6_k_small_batch_bias_msl_v1(
     constant int &in_dim [[buffer(5)]],
     constant int &out_dim [[buffer(6)]],
     uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
+    uint3 group_pos [[threadgroup_position_in_grid]],
+    ushort lane_id [[thread_index_in_simdgroup]],
+    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
 ) {
     const uint tid = thread_pos.x;
     const int col = (int)group_pos.x;
@@ -72,18 +73,18 @@ kernel void antfly_q6_k_small_batch_bias_msl_v1(
         for (int block_idx = 0; block_idx < block_count; ++block_idx) {
             const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210);
             const int base = block_idx << 8;
+            const float d = antfly_half_le_to_float(block + 208);
             for (int lane = (int)tid; lane < 256; lane += 128) {
-                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane);
+                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
             }
         }
     }
 
-    threadgroup float partial[128];
-    if (tid < 128) partial[tid] = acc;
+    threadgroup float partial[32];
+    acc = simd_sum(acc);
+    if (lane_id == 0u) partial[simdgroup_id] = acc;
+    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) output[row * out_dim + col] = partial[0] + bias[col];
+    const float total = simd_sum(partial[lane_id]);
+    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
 }

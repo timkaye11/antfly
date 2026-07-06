@@ -31,6 +31,7 @@ const model_manager_mod = inference.server.model_manager;
 const embedding_mod = inference.pipelines.embedding;
 const native_backend_guard = inference.native_backend_guard;
 const metal_runtime = inference.metal_runtime;
+const metal_generated_quant_stats_mod = inference.metal_generated_quant_stats;
 
 const max_file_bytes = 512 * 1024 * 1024;
 
@@ -134,6 +135,8 @@ const Timing = struct {
     }
 };
 
+const MetalGeneratedQuantStats = metal_generated_quant_stats_mod.Stats;
+
 const BenchResult = struct {
     mode: []const u8,
     modality: Modality,
@@ -152,6 +155,7 @@ const BenchResult = struct {
     resident_stats: embedding_mod.ResidentProjectionStats = .{},
     quant_stats: native_compute.NativeQuantDispatchStats = .{},
     graph_stats: graph_executor_stats.ExecutionStats = .{},
+    metal_generated_quant_stats: MetalGeneratedQuantStats = .{},
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -264,7 +268,15 @@ fn runColdOnce(allocator: std.mem.Allocator, io: std.Io, opts: Options) !BenchRe
         .values = output.values,
         .checksum = output.checksum,
     };
-    return resultFromSamples(allocator, "cold_load_cli_like", opts, loaded.model.session.backend(), &.{sample}, loaded.model.resident_projection_stats.snapshot());
+    return resultFromSamples(
+        allocator,
+        "cold_load_cli_like",
+        opts,
+        loaded.model.session.backend(),
+        &.{sample},
+        loaded.model.resident_projection_stats.snapshot(),
+        snapshotMetalGeneratedQuantStats(allocator, loaded.model),
+    );
 }
 
 const AllFiles = struct {
@@ -288,6 +300,7 @@ fn runWarmCachedBytes(
     native_compute.resetNativeQuantDispatchStats();
     graph_executor_stats.reset();
     const before_stats = model.resident_projection_stats.snapshot();
+    const before_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
     const samples = try allocator.alloc(RequestSample, opts.measure_iters);
     defer allocator.free(samples);
 
@@ -310,7 +323,16 @@ fn runWarmCachedBytes(
             .checksum = output.checksum,
         };
     }
-    return resultFromSamples(allocator, "warm_cached_bytes", opts, model.session.backend(), samples, diffResidentStats(before_stats, model.resident_projection_stats.snapshot()));
+    const after_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
+    return resultFromSamples(
+        allocator,
+        "warm_cached_bytes",
+        opts,
+        model.session.backend(),
+        samples,
+        diffResidentStats(before_stats, model.resident_projection_stats.snapshot()),
+        MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
+    );
 }
 
 fn runWarmWithFileReads(
@@ -322,6 +344,7 @@ fn runWarmWithFileReads(
     native_compute.resetNativeQuantDispatchStats();
     graph_executor_stats.reset();
     const before_stats = model.resident_projection_stats.snapshot();
+    const before_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
     const samples = try allocator.alloc(RequestSample, opts.measure_iters);
     defer allocator.free(samples);
 
@@ -350,7 +373,16 @@ fn runWarmWithFileReads(
             .checksum = output.checksum,
         };
     }
-    return resultFromSamples(allocator, "warm_file_read_cli_like", opts, model.session.backend(), samples, diffResidentStats(before_stats, model.resident_projection_stats.snapshot()));
+    const after_metal_generated = snapshotMetalGeneratedQuantStats(allocator, model);
+    return resultFromSamples(
+        allocator,
+        "warm_file_read_cli_like",
+        opts,
+        model.session.backend(),
+        samples,
+        diffResidentStats(before_stats, model.resident_projection_stats.snapshot()),
+        MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
+    );
 }
 
 fn runRequestWithBytes(
@@ -460,6 +492,7 @@ fn resultFromSamples(
     actual_backend: backends.BackendType,
     samples: []const RequestSample,
     resident_stats: embedding_mod.ResidentProjectionStats,
+    metal_generated_quant_stats: MetalGeneratedQuantStats,
 ) !BenchResult {
     const timing = try timingFromSamples(allocator, samples);
     var file_read_total: u64 = 0;
@@ -490,6 +523,7 @@ fn resultFromSamples(
         .resident_stats = resident_stats,
         .quant_stats = native_compute.nativeQuantDispatchStats(),
         .graph_stats = graph_executor_stats.snapshot(),
+        .metal_generated_quant_stats = metal_generated_quant_stats,
     };
 }
 
@@ -564,6 +598,19 @@ fn diffResidentStats(
     };
 }
 
+fn snapshotMetalGeneratedQuantStats(
+    allocator: std.mem.Allocator,
+    model: *model_manager_mod.LoadedModel,
+) MetalGeneratedQuantStats {
+    var stats = metal_generated_quant_stats_mod.snapshotForSession(allocator, model.session);
+    if (model.vision_session) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.audio_session) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.text_projection) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.visual_projection) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    if (model.audio_projection) |session| stats = stats.add(metal_generated_quant_stats_mod.snapshotForSession(allocator, session));
+    return stats;
+}
+
 fn effectiveModality(opts: Options) Modality {
     var modality: ?Modality = null;
     for (opts.order.items) |item| {
@@ -603,7 +650,7 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                 },
             );
             std.debug.print(
-                " resident_text={}/{} resident_image={}/{} resident_audio={}/{} q4q5={} q4q5_pair={} q4q5_triple={} packed_qkv_mr4={} packed_qkv_mr2={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8k_alloc_ms={d:.3} q8k_quant_ms={d:.3} q4q5_compute_ms={d:.3} q4q5_triple_compute_ms={d:.3} dequant_fetch_ms={d:.3} dequant_sgemm_compute_ms={d:.3} graph_partitions={} graph_planned={} graph_commands={} graph_fallbacks={} host_outputs={} boundary_materializations={}\n",
+                " resident_text={}/{} resident_image={}/{} resident_audio={}/{} q4q5={} q4q5_pair={} q4q5_triple={} packed_qkv_mr4={} packed_qkv_mr2={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8k_alloc_ms={d:.3} q8k_quant_ms={d:.3} q4q5_compute_ms={d:.3} q4q5_triple_compute_ms={d:.3} dequant_fetch_ms={d:.3} dequant_sgemm_compute_ms={d:.3} graph_partitions={} graph_planned={} graph_commands={} graph_fallbacks={} host_outputs={} boundary_materializations={}",
                 .{
                     result.resident_stats.text_success,
                     result.resident_stats.text_fallback,
@@ -632,6 +679,37 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                     result.graph_stats.interpreter_fallbacks,
                     result.graph_stats.host_materialized_outputs,
                     result.graph_stats.boundary_output_materializations,
+                },
+            );
+            std.debug.print(
+                " metal_generated_quant={} metal_generated_q4_k={}/{}/{} metal_generated_q5_k={}/{}/{} metal_generated_q6_k={}/{}/{} metal_generated_q8_0={}/{}/{}/{} metal_q4_k_rows={}/{}/{}/{} metal_q6_k_rows={}/{}/{}/{} metal_q8_0_rows={}/{}/{}/{}\n",
+                .{
+                    result.metal_generated_quant_stats.generatedTotal(),
+                    result.metal_generated_quant_stats.q4_k,
+                    result.metal_generated_quant_stats.q4_k_bias,
+                    result.metal_generated_quant_stats.q4_k_bias_gelu,
+                    result.metal_generated_quant_stats.q5_k,
+                    result.metal_generated_quant_stats.q5_k_bias,
+                    result.metal_generated_quant_stats.q5_k_bias_gelu,
+                    result.metal_generated_quant_stats.q6_k,
+                    result.metal_generated_quant_stats.q6_k_bias,
+                    result.metal_generated_quant_stats.q6_k_bias_gelu,
+                    result.metal_generated_quant_stats.q8_0,
+                    result.metal_generated_quant_stats.q8_0_bias,
+                    result.metal_generated_quant_stats.q8_0_bias_gelu,
+                    result.metal_generated_quant_stats.q8_0_relu,
+                    result.metal_generated_quant_stats.q4_k_rows_1,
+                    result.metal_generated_quant_stats.q4_k_rows_2_8,
+                    result.metal_generated_quant_stats.q4_k_rows_9_64,
+                    result.metal_generated_quant_stats.q4_k_rows_65_plus,
+                    result.metal_generated_quant_stats.q6_k_rows_1,
+                    result.metal_generated_quant_stats.q6_k_rows_2_8,
+                    result.metal_generated_quant_stats.q6_k_rows_9_64,
+                    result.metal_generated_quant_stats.q6_k_rows_65_plus,
+                    result.metal_generated_quant_stats.q8_0_rows_1,
+                    result.metal_generated_quant_stats.q8_0_rows_2_8,
+                    result.metal_generated_quant_stats.q8_0_rows_9_64,
+                    result.metal_generated_quant_stats.q8_0_rows_65_plus,
                 },
             );
         },
@@ -672,7 +750,7 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                 },
             );
             std.debug.print(
-                "{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{},{},{},{}\n",
+                "{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 .{
                     result.quant_stats.dequant_sgemm,
                     result.quant_stats.dequant_sgemm_pair,
@@ -689,6 +767,17 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
                     result.graph_stats.interpreter_fallbacks,
                     result.graph_stats.host_materialized_outputs,
                     result.graph_stats.boundary_output_materializations,
+                    result.metal_generated_quant_stats.generatedTotal(),
+                    result.metal_generated_quant_stats.q4_k,
+                    result.metal_generated_quant_stats.q4_k_bias,
+                    result.metal_generated_quant_stats.q4_k_bias_gelu,
+                    result.metal_generated_quant_stats.q5_k,
+                    result.metal_generated_quant_stats.q6_k,
+                    result.metal_generated_quant_stats.q8_0,
+                    result.metal_generated_quant_stats.q4_k_rows_1,
+                    result.metal_generated_quant_stats.q4_k_rows_2_8,
+                    result.metal_generated_quant_stats.q4_k_rows_9_64,
+                    result.metal_generated_quant_stats.q4_k_rows_65_plus,
                 },
             );
         },
@@ -696,7 +785,7 @@ fn printResult(result: BenchResult, format: OutputFormat) void {
 }
 
 fn printCsvHeader() void {
-    std.debug.print("mode,modality,backend,actual_backend,batch,avg_ms,p50_ms,p95_ms,min_ms,max_ms,throughput_embeddings_s,file_read_avg_ms,embed_avg_ms,serialize_avg_ms,file_bytes,response_bytes,values,checksum,resident_text_success,resident_text_fallback,resident_image_success,resident_image_fallback,resident_audio_success,resident_audio_fallback,q4q5,q4q5_pair,q4q5_triple,packed_qkv_mr4,packed_qkv_mr2,q4q5_panel,dequant,dequant_pair,dequant_triple,q8k_alloc_ms,q8k_quant_ms,q4q5_compute_ms,q4q5_triple_compute_ms,dequant_fetch_ms,dequant_sgemm_compute_ms,graph_partitions,graph_planned,graph_commands,graph_fallbacks,host_outputs,boundary_materializations\n", .{});
+    std.debug.print("mode,modality,backend,actual_backend,batch,avg_ms,p50_ms,p95_ms,min_ms,max_ms,throughput_embeddings_s,file_read_avg_ms,embed_avg_ms,serialize_avg_ms,file_bytes,response_bytes,values,checksum,resident_text_success,resident_text_fallback,resident_image_success,resident_image_fallback,resident_audio_success,resident_audio_fallback,q4q5,q4q5_pair,q4q5_triple,packed_qkv_mr4,packed_qkv_mr2,q4q5_panel,dequant,dequant_pair,dequant_triple,q8k_alloc_ms,q8k_quant_ms,q4q5_compute_ms,q4q5_triple_compute_ms,dequant_fetch_ms,dequant_sgemm_compute_ms,graph_partitions,graph_planned,graph_commands,graph_fallbacks,host_outputs,boundary_materializations,metal_generated_quant,metal_generated_q4_k,metal_generated_q4_k_bias,metal_generated_q4_k_bias_gelu,metal_generated_q5_k,metal_generated_q6_k,metal_generated_q8_0,metal_q4_k_rows_1,metal_q4_k_rows_2_8,metal_q4_k_rows_9_64,metal_q4_k_rows_65_plus\n", .{});
 }
 
 fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {

@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q6_k/rows_2_8/none/small_batch
 // kernel_id=antfly_q6_k_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
 // production_enabled=true
-// Production Metal dispatch uses this checked-in artifact after
-// correctness and benchmark gates.
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -28,11 +28,10 @@ static inline float antfly_half_le_to_float(const device uchar *p) {
     return (float)as_type<half>(bits);
 }
 
-static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane) {
+static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {
     const device uchar *ql = block;
     const device uchar *qh = block + 128;
     const device uchar *scales = block + 192;
-    const device uchar *d = block + 208;
     const int sub = lane >> 4;
     const int i = lane & 15;
     const int half_idx = sub >> 3;
@@ -47,7 +46,7 @@ static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane
     const int q = (low4 | (high2 << 4)) - 32;
     const int scale_u = (int)scales[sub];
     const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-    return antfly_half_le_to_float(d) * (float)scale * (float)q;
+    return d * (float)scale * (float)q;
 }
 
 kernel void antfly_q6_k_small_batch_msl_v1(
@@ -71,8 +70,9 @@ kernel void antfly_q6_k_small_batch_msl_v1(
         for (int block_idx = 0; block_idx < block_count; ++block_idx) {
             const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210);
             const int base = block_idx << 8;
+            const float d = antfly_half_le_to_float(block + 208);
             for (int lane = (int)tid; lane < 256; lane += 128) {
-                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane);
+                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
             }
         }
     }

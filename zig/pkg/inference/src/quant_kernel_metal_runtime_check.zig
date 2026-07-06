@@ -35,13 +35,22 @@ const metal_quant_format_q8_1: u32 = 14;
 const metal_quant_format_q8_k: u32 = 15;
 const metal_storage_private: c_int = 1;
 const metal_quant_evidence_contract = "antfly.quant_kernel_metal_evidence.v1";
-const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v1";
+const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v8";
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
 extern fn termite_metal_device_available() c_int;
 extern fn termite_metal_provider_create() ?*RawMetalProvider;
 extern fn termite_metal_provider_destroy(provider: ?*RawMetalProvider) void;
+extern fn termite_metal_provider_linear_q2_k(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
 extern fn termite_metal_provider_linear_q4_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
@@ -70,6 +79,42 @@ extern fn termite_metal_provider_linear_q5_k(
     output: [*c]f32,
 ) c_int;
 extern fn termite_metal_provider_linear_q6_k(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
+extern fn termite_metal_provider_linear_q5_0(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
+extern fn termite_metal_provider_linear_q5_1(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
+extern fn termite_metal_provider_linear_q8_1(
+    provider: ?*RawMetalProvider,
+    input: [*c]const f32,
+    rows: usize,
+    in_dim: usize,
+    weight_raw: [*c]const u8,
+    out_dim: usize,
+    output: [*c]f32,
+) c_int;
+extern fn termite_metal_provider_linear_q8_k(
     provider: ?*RawMetalProvider,
     input: [*c]const f32,
     rows: usize,
@@ -220,6 +265,9 @@ extern fn termite_metal_provider_linear_q6_k_bias_gelu(
 extern fn termite_metal_decode_runtime_create() ?*RawMetalDecodeRuntime;
 extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRuntime) void;
 extern fn termite_metal_decode_runtime_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_begin_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 extern fn termite_metal_decode_runtime_prepare_quantized_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,
@@ -572,19 +620,10 @@ const CheckCase = struct {
 
 const default_warmup_iters: u32 = 5;
 const default_measure_iters: u32 = 25;
-const repeated_check_warmup_runs: u32 = 1;
+const repeated_check_warmup_runs: u32 = quant_kernel_compiler.metal_promotion_warmup_repeat_runs;
 
-const RuntimeCheckShape = enum {
-    small,
-    wide,
-};
-
-const RuntimeCheckDims = struct {
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    tolerance: f32,
-};
+const RuntimeCheckShape = quant_kernel_compiler.MetalBenchmarkShape;
+const RuntimeCheckDims = quant_kernel_compiler.MetalBenchmarkDims;
 
 const metal_runtime_check_count = metalRuntimeCheckCount();
 const metal_runtime_checks = buildMetalRuntimeChecks();
@@ -624,40 +663,16 @@ fn metalRuntimeCheckForArtifactShape(comptime artifact: quant_kernel_compiler.Ge
         .out_dim = dims.out_dim,
         .threads_per_threadgroup = @intCast(quant_kernel_compiler.metalGeneratedThreadsPerThreadgroup(artifact.format, artifact.row_bucket, artifact.epilogue)),
         .cols_per_threadgroup = @intCast(quant_kernel_compiler.metalGeneratedColsPerThreadgroup(artifact.format, artifact.row_bucket, artifact.epilogue)),
-        .tolerance = dims.tolerance,
+        .tolerance = dims.tolerance_abs,
     };
 }
 
 fn metalRuntimeCheckName(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RuntimeCheckShape) []const u8 {
-    return switch (shape) {
-        .small => std.fmt.comptimePrint("{s}_rows_2_8_{s}", .{ @tagName(artifact.format), @tagName(artifact.epilogue) }),
-        .wide => std.fmt.comptimePrint("{s}_rows_8_cols_7_{s}", .{ @tagName(artifact.format), @tagName(artifact.epilogue) }),
-    };
+    return quant_kernel_compiler.metalBenchmarkCaseName(artifact, shape);
 }
 
 fn metalRuntimeDimsForArtifact(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RuntimeCheckShape) RuntimeCheckDims {
-    return switch (shape) {
-        .small => .{
-            .rows = if (artifact.format == .q4_k and artifact.epilogue == .bias_gelu) 4 else 3,
-            .in_dim = 512,
-            .out_dim = if (artifact.format == .q4_k and artifact.epilogue == .bias_gelu) 3 else 2,
-            .tolerance = metalRuntimeTolerance(artifact.format, shape),
-        },
-        .wide => .{
-            .rows = 8,
-            .in_dim = 768,
-            .out_dim = 7,
-            .tolerance = metalRuntimeTolerance(artifact.format, shape),
-        },
-    };
-}
-
-fn metalRuntimeTolerance(comptime format: quant_matmul.Format, comptime shape: RuntimeCheckShape) f32 {
-    const loose = format == .q2_k or format == .q3_k or format == .q8_k;
-    return switch (shape) {
-        .small => if (loose) 0.0005 else 0.0002,
-        .wide => if (loose) 0.001 else 0.0005,
-    };
+    return quant_kernel_compiler.metalBenchmarkDimsForArtifact(artifact, shape);
 }
 
 test "quant kernel metal runtime checks cover generated Metal artifacts" {
@@ -735,6 +750,31 @@ test "quant kernel metal runtime generated counter snapshot order matches C" {
     try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_k_small_batch_dispatches") + word, @offsetOf(Stats, "antfly_q2_k_small_batch_dispatches"));
 }
 
+test "quant kernel metal runtime production benchmark cases match compiler manifest" {
+    var index: usize = 0;
+    for (metal_runtime_checks) |check| {
+        if (!productionMetalRuntimeCheck(check)) continue;
+        const manifest_case = quant_kernel_compiler.first_metal_production_benchmark_cases[index];
+        try std.testing.expectEqualStrings(manifest_case.name, check.name);
+        try std.testing.expectEqualStrings(manifest_case.kernel_id, check.kernel_name);
+        try std.testing.expectEqual(manifest_case.format, check.format);
+        try std.testing.expectEqual(manifest_case.row_bucket, quant_matmul.rowBucket(check.rows));
+        try std.testing.expectEqual(manifest_case.epilogue, check.epilogue);
+        try std.testing.expectEqual(manifest_case.rows, check.rows);
+        try std.testing.expectEqual(manifest_case.in_dim, check.in_dim);
+        try std.testing.expectEqual(manifest_case.out_dim, check.out_dim);
+        try std.testing.expectEqual(manifest_case.threads_per_threadgroup, check.threads_per_threadgroup);
+        try std.testing.expectEqual(manifest_case.cols_per_threadgroup, check.cols_per_threadgroup);
+        try std.testing.expectEqual(manifest_case.tolerance_abs, check.tolerance);
+        try std.testing.expectEqualStrings(manifest_case.generated_source_path, generatedSourcePathFor(check));
+        try std.testing.expectEqualStrings(manifest_case.check_command, metalCheckCommandFor(check));
+        try std.testing.expectEqualStrings(manifest_case.production_kernel_id, check.kernel_name);
+        try std.testing.expectEqualStrings(quant_kernel_compiler.first_metal_production_regression_evidence_command, manifest_case.benchmark_command);
+        index += 1;
+    }
+    try std.testing.expectEqual(quant_kernel_compiler.first_metal_production_benchmark_case_count, index);
+}
+
 const Config = struct {
     evidence_out_path: ?[]const u8 = null,
     check_evidence_path: ?[]const u8 = null,
@@ -744,6 +784,7 @@ const Config = struct {
     require_evidence_kernel: ?[]const u8 = null,
     check_blocker_evidence: bool = false,
     refresh_blocker_evidence: bool = false,
+    confirm_cleared_blockers: bool = false,
     fail_on_cleared_blocker: bool = false,
     promotion_ready_kernel: ?[]const u8 = null,
     runtime_route_kernel: ?[]const u8 = null,
@@ -762,7 +803,7 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try parseArgs(args);
 
     if (cfg.check_blocker_evidence) {
-        const summary = try checkBlockerEvidence(allocator);
+        const summary = try checkBlockerEvidence(allocator, cfg.confirm_cleared_blockers);
         printBlockerEvidenceAuditSummary(summary);
         try enforceClearedBlockerPolicy(summary, cfg.fail_on_cleared_blocker);
         return;
@@ -785,7 +826,7 @@ pub fn main(init: std.process.Init) !void {
     if (termite_metal_device_available() == 0) return error.MetalDeviceUnavailable;
 
     if (cfg.refresh_blocker_evidence) {
-        const summary = try refreshBlockerEvidence(allocator);
+        const summary = try refreshBlockerEvidence(allocator, cfg.confirm_cleared_blockers);
         printBlockerEvidenceAuditSummary(summary);
         try enforceClearedBlockerPolicy(summary, cfg.fail_on_cleared_blocker);
         return;
@@ -849,15 +890,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("quant-kernel-metal-runtime-check evidence_out={s}\n", .{path});
         if (cfg.production_regression_check) {
             const summary = try checkEvidenceFileWithSummary(allocator, path, false, false, null);
+            const status = productionRegressionEvidenceStatus(summary);
+            printEvidenceSummary(path, status, summary);
             if (productionRegressionEvidenceHasHardBlocker(summary)) {
-                printEvidenceSummary(path, "production_regression", summary);
                 return error.MetalEvidencePromotionNotReady;
             }
-            const status = if (summary.promotion_ready_count == summary.promotion_case_count)
-                "production_regression_ok"
-            else
-                "production_regression_unstable";
-            printEvidenceSummary(path, status, summary);
         }
     }
 }
@@ -866,6 +903,7 @@ const CheckResult = struct {
     max_error: f32,
     measure_iters: u32,
     elapsed_nanos: u64,
+    generated_timing_route: GeneratedTimingRoute = .standalone_generated,
     handwritten_elapsed_nanos: ?u64 = null,
     minimum_repeat_speedup: ?f64 = null,
     repeat_generated_ns: [max_evidence_repeat_runs]u64 = [_]u64{0} ** max_evidence_repeat_runs,
@@ -877,6 +915,25 @@ const CheckResult = struct {
     provider_route_checked: bool = false,
     repeat_runs: u32 = 1,
 };
+
+const GeneratedTimingRoute = enum {
+    standalone_generated,
+    decode_runtime_generated,
+};
+
+fn generatedTimingRouteName(route: GeneratedTimingRoute) []const u8 {
+    return switch (route) {
+        .standalone_generated => "standalone_generated",
+        .decode_runtime_generated => "decode_runtime_generated",
+    };
+}
+
+fn generatedTimingScopeName(route: GeneratedTimingRoute) []const u8 {
+    return switch (route) {
+        .standalone_generated => "standalone_command_buffer",
+        .decode_runtime_generated => "decode_runtime_active_frame_batch",
+    };
+}
 
 fn parseArgs(args: []const [:0]const u8) !Config {
     var cfg: Config = .{};
@@ -915,6 +972,9 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--refresh-blocker-evidence")) {
             if (cfg.refresh_blocker_evidence) return error.DuplicateRefreshBlockerEvidence;
             cfg.refresh_blocker_evidence = true;
+        } else if (std.mem.eql(u8, arg, "--confirm-cleared-blockers")) {
+            if (cfg.confirm_cleared_blockers) return error.DuplicateConfirmClearedBlockers;
+            cfg.confirm_cleared_blockers = true;
         } else if (std.mem.eql(u8, arg, "--fail-on-cleared-blocker")) {
             if (cfg.fail_on_cleared_blocker) return error.DuplicateFailOnClearedBlocker;
             cfg.fail_on_cleared_blocker = true;
@@ -963,6 +1023,7 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.refresh_blocker_evidence and cfg.repeat_runs != 1) return error.RefreshBlockerEvidenceConflictsWithRepeatRuns;
     if (cfg.refresh_blocker_evidence and cfg.measure_iters != null) return error.RefreshBlockerEvidenceConflictsWithMeasureIters;
     if (cfg.refresh_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.require_evidence_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.RefreshBlockerEvidenceConflictsWithRuntimeMode;
+    if (cfg.confirm_cleared_blockers and !cfg.check_blocker_evidence and !cfg.refresh_blocker_evidence) return error.ConfirmClearedBlockersRequiresBlockerEvidence;
     if (cfg.fail_on_cleared_blocker and !cfg.check_blocker_evidence and !cfg.refresh_blocker_evidence) return error.FailOnClearedBlockerRequiresBlockerEvidence;
     if (cfg.require_promotion_ready and cfg.check_evidence_path == null) return error.PromotionReadyRequiresCheckEvidence;
     if (cfg.require_runtime_route_all and cfg.check_evidence_path == null) return error.RuntimeRouteAllRequiresCheckEvidence;
@@ -981,6 +1042,9 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.production_regression_check and cfg.promotion_ready_kernel != null) return error.ProductionRegressionCheckConflictsWithPromotionReadyKernel;
     if (cfg.production_regression_check and cfg.runtime_route_kernel != null) return error.ProductionRegressionCheckConflictsWithRuntimeRouteKernel;
     if (cfg.production_regression_check and cfg.runtime_route_all) return error.ProductionRegressionCheckConflictsWithRuntimeRouteAll;
+    if (cfg.promotion_ready_kernel) |kernel| {
+        if (!std.mem.containsAtLeast(u8, cfg.evidence_out_path.?, 1, kernel)) return error.PromotionReadyKernelRequiresKernelEvidencePath;
+    }
     return cfg;
 }
 
@@ -996,7 +1060,7 @@ test "quant kernel metal runtime check parses evidence output flag" {
     const evidence_kernel_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-evidence-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id });
     try std.testing.expectEqualStrings("/tmp/evidence.json", evidence_kernel_cfg.check_evidence_path.?);
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_general_metal_q4_kernel_id, evidence_kernel_cfg.require_evidence_kernel.?);
-    const promotion_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "500", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id });
+    const promotion_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/" ++ quant_kernel_compiler.first_general_metal_q4_kernel_id ++ "-evidence.json", "--repeat-runs", "5", "--measure-iters", "500", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id });
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_general_metal_q4_kernel_id, promotion_cfg.promotion_ready_kernel.?);
     try std.testing.expectError(error.MissingCheckEvidencePath, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence" }));
     try std.testing.expectError(error.MissingRequireKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--require-kernel" }));
@@ -1011,6 +1075,7 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.PromotionReadyKernelRequiresRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
     try std.testing.expectError(error.PromotionReadyKernelRequiresMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
     try std.testing.expectError(error.PromotionReadyKernelRequiresMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "100", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
+    try std.testing.expectError(error.PromotionReadyKernelRequiresKernelEvidencePath, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "500", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
     try std.testing.expectError(error.CheckEvidenceConflictsWithEvidenceOut, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--evidence-out", "/tmp/out.json" }));
     try std.testing.expectError(error.CheckEvidenceConflictsWithRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--repeat-runs", "3" }));
     try std.testing.expectError(error.DuplicateCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/a.json", "--check-evidence", "/tmp/b.json" }));
@@ -1033,8 +1098,9 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expect(blocker_check_cfg.check_blocker_evidence);
     const blocker_refresh_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence" });
     try std.testing.expect(blocker_refresh_cfg.refresh_blocker_evidence);
-    const strict_blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--fail-on-cleared-blocker" });
+    const strict_blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--confirm-cleared-blockers", "--fail-on-cleared-blocker" });
     try std.testing.expect(strict_blocker_check_cfg.check_blocker_evidence);
+    try std.testing.expect(strict_blocker_check_cfg.confirm_cleared_blockers);
     try std.testing.expect(strict_blocker_check_cfg.fail_on_cleared_blocker);
     try std.testing.expectError(error.MissingRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--repeat-runs" }));
     try std.testing.expectError(error.InvalidRepeatRuns, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--repeat-runs", "0" }));
@@ -1046,7 +1112,9 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.DuplicateMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--measure-iters", "100", "--measure-iters", "200" }));
     try std.testing.expectError(error.DuplicateRuntimeRouteAll, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--runtime-route-all", "--runtime-route-all" }));
     try std.testing.expectError(error.DuplicateCheckBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--check-blocker-evidence" }));
+    try std.testing.expectError(error.DuplicateConfirmClearedBlockers, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--confirm-cleared-blockers", "--confirm-cleared-blockers" }));
     try std.testing.expectError(error.DuplicateFailOnClearedBlocker, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--fail-on-cleared-blocker", "--fail-on-cleared-blocker" }));
+    try std.testing.expectError(error.ConfirmClearedBlockersRequiresBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--confirm-cleared-blockers" }));
     try std.testing.expectError(error.FailOnClearedBlockerRequiresBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--fail-on-cleared-blocker" }));
     try std.testing.expectError(error.CheckBlockerEvidenceConflictsWithEvidenceOut, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--evidence-out", "/tmp/evidence.json" }));
     try std.testing.expectError(error.CheckBlockerEvidenceConflictsWithCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--check-evidence", "/tmp/evidence.json" }));
@@ -1123,15 +1191,18 @@ fn runRepeatedCheck(
 
     const generated_route_checked = runs[0].generated_route_checked;
     const provider_route_checked = runs[0].provider_route_checked;
+    const generated_timing_route = runs[0].generated_timing_route;
     for (runs[1..]) |run| {
         if (run.generated_route_checked != generated_route_checked) return error.InvalidArgument;
         if (run.provider_route_checked != provider_route_checked) return error.InvalidArgument;
+        if (run.generated_timing_route != generated_timing_route) return error.InvalidArgument;
     }
 
     var result = CheckResult{
         .max_error = max_error,
         .measure_iters = runs[0].measure_iters,
         .elapsed_nanos = medianU64Const(generated_ns),
+        .generated_timing_route = generated_timing_route,
         .handwritten_elapsed_nanos = if (handwritten_count == run_count) medianU64Const(handwritten_ns[0..handwritten_count]) else null,
         .minimum_repeat_speedup = if (handwritten_count == run_count) minimum_repeat_speedup else null,
         .repeat_timing_count = repeat_runs,
@@ -1265,16 +1336,19 @@ fn runCheck(
     const selected_for_route = route_kernel != null and std.mem.eql(u8, route_kernel.?, check.kernel_name);
     const selected_for_promotion = promotion_ready_kernel != null and std.mem.eql(u8, promotion_ready_kernel.?, check.kernel_name);
     const runtime_bias: ?[]const f32 = if (check.epilogue == .none) null else bias;
-    const generated_route_checked = if (selected_for_route and !generatedRouteSupported(check))
+    const generated_route_elapsed_nanos = if (selected_for_route and !generatedRouteSupported(check))
         try runGeneratedRouteForPromotion(allocator, check, raw_weight, input, runtime_bias, expected)
     else
         try runProductionRouteIfGenerated(allocator, check, raw_weight, input, runtime_bias, expected);
+    const generated_route_checked = generated_route_elapsed_nanos != null;
     const provider_route_checked = try runProviderRouteIfSupported(allocator, check, raw_weight, input, bias, expected, selected_for_promotion or selected_for_route);
     const handwritten_elapsed_nanos = try runHandwrittenBaselineIfSupported(allocator, check, raw_weight, input, bias, expected);
+    const route_timing_selected = (selected_for_route or selected_for_promotion) and generated_route_elapsed_nanos != null;
     return .{
         .max_error = max_error,
         .measure_iters = check.measure_iters,
-        .elapsed_nanos = elapsed_nanos,
+        .elapsed_nanos = if (route_timing_selected) generated_route_elapsed_nanos.? else elapsed_nanos,
+        .generated_timing_route = if (route_timing_selected) .decode_runtime_generated else .standalone_generated,
         .handwritten_elapsed_nanos = handwritten_elapsed_nanos,
         .generated_route_checked = generated_route_checked,
         .provider_route_checked = provider_route_checked,
@@ -1339,6 +1413,21 @@ fn runQuantBiasSplitBaseline(
     if (termite_metal_decode_runtime_ready(runtime) == 0) return error.MetalRuntimeUnavailable;
     const format = metalFormatFor(check.format) orelse return error.MetalRuntimeUnavailable;
 
+    const disable_env = disableEnvForSplitBaselineLinearRoute(check);
+    const old_disable = if (disable_env) |env_name| std.c.getenv(env_name) else null;
+    const old_disable_copy = if (old_disable) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (old_disable_copy) |value| allocator.free(value);
+    if (disable_env) |env_name| {
+        if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
+    }
+    defer if (disable_env) |env_name| {
+        if (old_disable_copy) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    };
+
     const slot: usize = 0;
     const prep_rc = termite_metal_decode_runtime_prepare_quantized_linear_slot(
         runtime,
@@ -1367,9 +1456,15 @@ fn runQuantBiasSplitBaseline(
     if (termite_metal_buffer_upload(runtime, input_buffer, 0, input.ptr, input_bytes) != 0) return error.HandwrittenMetalBaselineFailed;
     if (termite_metal_buffer_upload(runtime, bias_buffer, 0, bias.ptr, bias_bytes) != 0) return error.HandwrittenMetalBaselineFailed;
 
-    for (0..check.warmup_iters) |_| try applyQuantBiasSplitBaseline(runtime, slot, input_buffer, bias_buffer, output_buffer, check);
+    if (check.warmup_iters != 0) {
+        try beginDecodeFrame(runtime, "split baseline", check);
+        for (0..check.warmup_iters) |_| try applyQuantBiasSplitBaseline(runtime, slot, input_buffer, bias_buffer, output_buffer, check);
+        try submitAndWaitDecodeFrame(runtime, "split baseline", check);
+    }
+    try beginDecodeFrame(runtime, "split baseline", check);
     const start = nowNs();
     for (0..check.measure_iters) |_| try applyQuantBiasSplitBaseline(runtime, slot, input_buffer, bias_buffer, output_buffer, check);
+    try submitAndWaitDecodeFrame(runtime, "split baseline", check);
     const elapsed = nowNs() - start;
 
     const actual = try allocator.alloc(f32, expected.len);
@@ -1515,24 +1610,26 @@ fn runProductionRouteIfGenerated(
     input: []const f32,
     bias: ?[]const f32,
     expected: []const f32,
-) !bool {
+) !?u64 {
     const route = quant_kernel_compiler.loweringFor(.metal, check.format, quant_matmul.rowBucket(check.rows), check.epilogue);
-    if (route.production_route != .generated_production) return false;
+    if (route.production_route != .generated_production) return null;
+    var disabled_env_name: ?[*:0]const u8 = null;
+    var disabled_old_value_copy: ?[:0]u8 = null;
+    defer if (disabled_old_value_copy) |value| allocator.free(value);
+    defer if (disabled_env_name) |env_name| {
+        if (disabled_old_value_copy) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    };
     if (disableEnvForGeneratedProductionRoute(check)) |env_name| {
         const old_value = std.c.getenv(env_name);
-        const old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
-        defer if (old_value_copy) |value| allocator.free(value);
+        disabled_old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        disabled_env_name = env_name;
         if (unsetenv(env_name) != 0) return error.MetalRuntimeUnavailable;
-        defer {
-            if (old_value_copy) |value| {
-                _ = setenv(env_name, value.ptr, 1);
-            } else {
-                _ = unsetenv(env_name);
-            }
-        }
     }
-    _ = try runDecodeRuntime(allocator, check, raw_weight, input, bias, expected, "production", true);
-    return true;
+    return try runDecodeRuntime(allocator, check, raw_weight, input, bias, expected, "production", true);
 }
 
 fn runGeneratedRouteForPromotion(
@@ -1542,9 +1639,9 @@ fn runGeneratedRouteForPromotion(
     input: []const f32,
     bias: ?[]const f32,
     expected: []const f32,
-) !bool {
-    if (try runProductionRouteIfGenerated(allocator, check, raw_weight, input, bias, expected)) return true;
-    const env_name = enableEnvForGeneratedCandidateRoute(check) orelse return false;
+) !?u64 {
+    if (try runProductionRouteIfGenerated(allocator, check, raw_weight, input, bias, expected)) |elapsed| return elapsed;
+    const env_name = enableEnvForGeneratedCandidateRoute(check) orelse return null;
     const old_value = std.c.getenv(env_name);
     const old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
     defer if (old_value_copy) |value| allocator.free(value);
@@ -1556,8 +1653,7 @@ fn runGeneratedRouteForPromotion(
             _ = unsetenv(env_name);
         }
     }
-    _ = try runDecodeRuntime(allocator, check, raw_weight, input, bias, expected, "promotion", true);
-    return true;
+    return try runDecodeRuntime(allocator, check, raw_weight, input, bias, expected, "promotion", true);
 }
 
 fn runProviderRouteIfSupported(
@@ -1569,34 +1665,41 @@ fn runProviderRouteIfSupported(
     expected: []const f32,
     selected_for_generated_candidate: bool,
 ) !bool {
-    const use_candidate_route = selected_for_generated_candidate and providerCandidateRouteSupported(check) and !providerRouteSupported(check);
-    if (!providerRouteSupported(check) and !use_candidate_route) return false;
+    const route_supported = providerRouteSupported(check);
+    const use_candidate_route = selected_for_generated_candidate and providerCandidateRouteSupported(check);
+    if (!route_supported and !use_candidate_route) return false;
+    var enabled_env_name: ?[*:0]const u8 = null;
+    var enabled_old_value_copy: ?[:0]u8 = null;
+    defer if (enabled_old_value_copy) |value| allocator.free(value);
+    defer if (enabled_env_name) |env_name| {
+        if (enabled_old_value_copy) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    };
     if (use_candidate_route) {
         const env_name = enableEnvForGeneratedCandidateRoute(check) orelse return false;
         const old_value = std.c.getenv(env_name);
-        const old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
-        defer if (old_value_copy) |value| allocator.free(value);
+        enabled_old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        enabled_env_name = env_name;
         if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
-        defer {
-            if (old_value_copy) |value| {
-                _ = setenv(env_name, value.ptr, 1);
-            } else {
-                _ = unsetenv(env_name);
-            }
-        }
     }
+    var disabled_env_name: ?[*:0]const u8 = null;
+    var disabled_old_value_copy: ?[:0]u8 = null;
+    defer if (disabled_old_value_copy) |value| allocator.free(value);
+    defer if (disabled_env_name) |env_name| {
+        if (disabled_old_value_copy) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    };
     if (disableEnvForGeneratedProductionRoute(check)) |env_name| {
         const old_value = std.c.getenv(env_name);
-        const old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
-        defer if (old_value_copy) |value| allocator.free(value);
+        disabled_old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        disabled_env_name = env_name;
         if (unsetenv(env_name) != 0) return error.MetalRuntimeUnavailable;
-        defer {
-            if (old_value_copy) |value| {
-                _ = setenv(env_name, value.ptr, 1);
-            } else {
-                _ = unsetenv(env_name);
-            }
-        }
     }
 
     const provider = termite_metal_provider_create() orelse return error.MetalRuntimeUnavailable;
@@ -1612,11 +1715,15 @@ fn runProviderRouteIfSupported(
             .relu => termite_metal_provider_linear_q8_0_relu(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
             else => termite_metal_provider_linear_q8_0_planned(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, @intFromEnum(quant_matmul.DispatchKind.small_batch), actual.ptr),
         },
+        .q8_1 => termite_metal_provider_linear_q8_1(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
+        .q8_k => termite_metal_provider_linear_q8_k(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
         .q2_k => switch (check.epilogue) {
             .bias => termite_metal_provider_linear_q2_k_bias(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, bias.ptr, actual.ptr),
             .bias_gelu => termite_metal_provider_linear_q2_k_bias_gelu(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, bias.ptr, actual.ptr),
-            else => unreachable,
+            else => termite_metal_provider_linear_q2_k(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
         },
+        .q5_0 => termite_metal_provider_linear_q5_0(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
+        .q5_1 => termite_metal_provider_linear_q5_1(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, actual.ptr),
         .q3_k => switch (check.epilogue) {
             .bias => termite_metal_provider_linear_q3_k_bias(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, bias.ptr, actual.ptr),
             .bias_gelu => termite_metal_provider_linear_q3_k_bias_gelu(provider, input.ptr, check.rows, check.in_dim, raw_weight.ptr, check.out_dim, bias.ptr, actual.ptr),
@@ -1677,6 +1784,13 @@ fn disableEnvForGeneratedProductionRoute(check: CheckCase) ?[*:0]const u8 {
     return if (std.mem.startsWith(u8, std.mem.span(env_name), "TERMITE_METAL_DISABLE_")) env_name else null;
 }
 
+fn disableEnvForSplitBaselineLinearRoute(check: CheckCase) ?[*:0]const u8 {
+    if (!isQuantBiasEpilogue(check)) return null;
+    var linear_check = check;
+    linear_check.epilogue = .none;
+    return disableEnvForGeneratedProductionRoute(linear_check);
+}
+
 fn runtimeMemorySnapshot(runtime: ?*RawMetalDecodeRuntime) metal_runtime.RawRuntimeMemoryStats {
     var snapshot: metal_runtime.RawRuntimeMemoryStats = .{};
     _ = termite_metal_decode_runtime_memory_snapshot(runtime, &snapshot);
@@ -1718,6 +1832,27 @@ fn generatedDispatchCount(check: CheckCase, snapshot: metal_runtime.RawRuntimeMe
 
 fn generatedRouteSupported(check: CheckCase) bool {
     return quant_kernel_compiler.loweringFor(.metal, check.format, quant_matmul.rowBucket(check.rows), check.epilogue).production_route == .generated_production;
+}
+
+fn beginDecodeFrame(runtime: *RawMetalDecodeRuntime, label: []const u8, check: CheckCase) !void {
+    const rc = termite_metal_decode_runtime_begin_frame(runtime);
+    if (rc != 0) {
+        std.debug.print("{s} Metal runtime begin frame failed {s} rc={d}\n", .{ label, check.name, rc });
+        return error.MetalRuntimeUnavailable;
+    }
+}
+
+fn submitAndWaitDecodeFrame(runtime: *RawMetalDecodeRuntime, label: []const u8, check: CheckCase) !void {
+    const submit_rc = termite_metal_decode_runtime_submit_frame(runtime);
+    if (submit_rc != 0) {
+        std.debug.print("{s} Metal runtime submit frame failed {s} rc={d}\n", .{ label, check.name, submit_rc });
+        return error.HandwrittenMetalBaselineFailed;
+    }
+    const wait_rc = termite_metal_decode_runtime_wait_frame(runtime);
+    if (wait_rc != 0) {
+        std.debug.print("{s} Metal runtime wait frame failed {s} rc={d}\n", .{ label, check.name, wait_rc });
+        return error.HandwrittenMetalBaselineFailed;
+    }
 }
 
 fn runDecodeRuntime(
@@ -1772,9 +1907,15 @@ fn runDecodeRuntime(
         }
     }
 
-    for (0..check.warmup_iters) |_| try applyDecodeRuntimeLinear(runtime, format, slot, input_buffer, bias_buffer, output_buffer, check, label);
+    if (check.warmup_iters != 0) {
+        try beginDecodeFrame(runtime, label, check);
+        for (0..check.warmup_iters) |_| try applyDecodeRuntimeLinear(runtime, format, slot, input_buffer, bias_buffer, output_buffer, check, label);
+        try submitAndWaitDecodeFrame(runtime, label, check);
+    }
+    try beginDecodeFrame(runtime, label, check);
     const start = nowNs();
     for (0..check.measure_iters) |_| try applyDecodeRuntimeLinear(runtime, format, slot, input_buffer, bias_buffer, output_buffer, check, label);
+    try submitAndWaitDecodeFrame(runtime, label, check);
     const elapsed = nowNs() - start;
     const snapshot = runtimeMemorySnapshot(runtime);
     if (require_generated_route) {
@@ -2134,6 +2275,9 @@ fn writeEvidence(
         \\"minimum_speedup_tolerance":{d:.6},
         \\"production_enabled":{s},
         \\"production_regression_check":{s},
+        \\"compiler_benchmark_manifest_schema":{f},
+        \\"compiler_benchmark_manifest_case_count":{d},
+        \\"compiler_benchmark_manifest_case_fingerprint":{d},
         \\"runtime_route_kernel":{s},
         \\"runtime_route_all":{s},
         \\"case_count":{d},
@@ -2150,6 +2294,9 @@ fn writeEvidence(
         quant_kernel_compiler.metal_promotion_speedup_tolerance,
         jsonBool(production_enabled),
         jsonBool(production_regression_check),
+        std.json.fmt(quant_kernel_compiler.first_benchmark_manifest_schema, .{}),
+        quant_kernel_compiler.first_metal_production_benchmark_case_count,
+        quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint(),
         runtime_route_kernel_json,
         jsonBool(runtime_route_all),
         checks.len,
@@ -2159,6 +2306,11 @@ fn writeEvidence(
     var promotion_ready_count: usize = 0;
     var runtime_route_checked_count: usize = 0;
     var provider_route_checked_count: usize = 0;
+    var candidate_route_ready_count: usize = 0;
+    var candidate_benchmark_ready_count: usize = 0;
+    var promotion_worst_repeat_speedup: ?f64 = null;
+    var promotion_worst_repeat_case: ?[]const u8 = null;
+    var benchmark_speedups = BenchmarkSpeedupSummary{};
     var blocker_counts = PromotionBlockerCounts{};
     for (checks, results, 0..) |check, result, i| {
         if (result.repeat_runs != repeat_runs) return error.InvalidArgument;
@@ -2176,7 +2328,20 @@ fn writeEvidence(
         defer allocator.free(route_checked_json);
         if (result.generated_route_checked) runtime_route_checked_count += 1;
         if (result.provider_route_checked) provider_route_checked_count += 1;
+        const provider_route_needed = quant_kernel_compiler.metalProviderRouteRequiredForKernel(check.kernel_name);
+        const route_evidence_passed = result.max_error <= check.tolerance and result.generated_route_checked and (!provider_route_needed or result.provider_route_checked);
+        if (route_evidence_passed) candidate_route_ready_count += 1;
         const generated_avg_us = averageUs(result.elapsed_nanos, result.measure_iters);
+        const timing_metadata_json = try std.fmt.allocPrint(
+            allocator,
+            "\"timing_aggregation\":{f},\"generated_timing_route\":{f},\"generated_timing_scope\":{f}",
+            .{
+                std.json.fmt(timing_aggregation, .{}),
+                std.json.fmt(generatedTimingRouteName(result.generated_timing_route), .{}),
+                std.json.fmt(generatedTimingScopeName(result.generated_timing_route), .{}),
+            },
+        );
+        defer allocator.free(timing_metadata_json);
         const baseline_supported = handwrittenBaselineSupported(check);
         if ((result.handwritten_elapsed_nanos != null) != baseline_supported) return error.InvalidArgument;
         if (result.handwritten_elapsed_nanos) |handwritten_elapsed_nanos| {
@@ -2185,6 +2350,7 @@ fn writeEvidence(
             const minimum_repeat_speedup = result.minimum_repeat_speedup orelse measured_speedup;
             const benchmark_blocker = quant_kernel_compiler.metalPromotionSpeedupBlocker(measured_speedup, minimum_repeat_speedup);
             const benchmark_passed = std.mem.eql(u8, benchmark_blocker, quant_kernel_compiler.metal_blocker_none);
+            benchmark_speedups.add(check.name, measured_speedup, benchmark_passed);
             const selected_for_promotion = (promotion_ready_kernel != null and std.mem.eql(u8, promotion_ready_kernel.?, check.kernel_name)) or
                 (production_regression_check and productionMetalRuntimeCheck(check));
             const selected_for_runtime_route = if (runtime_route_all)
@@ -2193,10 +2359,20 @@ fn writeEvidence(
                 productionMetalRuntimeCheck(check)
             else
                 runtime_route_kernel != null and std.mem.eql(u8, runtime_route_kernel.?, check.kernel_name);
-            const provider_route_needed = quant_kernel_compiler.metalProviderRouteRequiredForKernel(check.kernel_name);
-            const route_evidence_passed = result.generated_route_checked and (!provider_route_needed or result.provider_route_checked);
+            const generated_production_route = lowering.production_route == .generated_production and
+                std.mem.eql(u8, lowering.production_kernel_id, check.kernel_name);
+            const generated_production_route_ready = generated_production_route and selected_for_runtime_route and benchmark_passed and route_evidence_passed;
+            if (benchmark_passed) candidate_benchmark_ready_count += 1;
             const promotion_ready = selected_for_promotion and benchmark_passed and route_evidence_passed;
+            if (selected_for_promotion) {
+                if (promotion_worst_repeat_speedup == null or minimum_repeat_speedup < promotion_worst_repeat_speedup.?) {
+                    promotion_worst_repeat_speedup = minimum_repeat_speedup;
+                    promotion_worst_repeat_case = check.name;
+                }
+            }
             const promotion_blocker = if (promotion_ready)
+                ""
+            else if (generated_production_route_ready)
                 ""
             else if (!benchmark_passed)
                 benchmark_blocker
@@ -2243,7 +2419,7 @@ fn writeEvidence(
                 }
             }
             try appendJsonFmt(allocator, &out,
-                \\{{"name":{f},"backend":"metal","plan_id":{f},"production_route":{f},"candidate_route":{f},"production_kernel_id":{f},"candidate_kernel_id":{f},"route_fallback_reason":{f},"kernel_id":{f},"generated_source_path":{f},"generated_source_fingerprint":{d},"metal_check_command":{f},"format":{f},"row_bucket":{f},"epilogue":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"threads_per_threadgroup":{d},"cols_per_threadgroup":{d},"correctness_passed":true,{s},"max_abs_error":{d:.7},"tolerance_abs":{d:.7},"warmup_iters":{d},"measure_iters":{d},"repeat_runs":{d},"timing_aggregation":{f},"generated_ns":{d},"generated_avg_us":{d:.3},"handwritten_baseline_supported":true,"handwritten_baseline":{f},"handwritten_ns":{d},"handwritten_avg_us":{d:.3},"measured_speedup":{d:.6}
+                \\{{"name":{f},"backend":"metal","plan_id":{f},"production_route":{f},"candidate_route":{f},"production_kernel_id":{f},"candidate_kernel_id":{f},"route_fallback_reason":{f},"kernel_id":{f},"generated_source_path":{f},"generated_source_fingerprint":{d},"metal_check_command":{f},"format":{f},"row_bucket":{f},"epilogue":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"threads_per_threadgroup":{d},"cols_per_threadgroup":{d},"correctness_passed":true,{s},"max_abs_error":{d:.7},"tolerance_abs":{d:.7},"warmup_iters":{d},"measure_iters":{d},"repeat_runs":{d},{s},"generated_ns":{d},"generated_avg_us":{d:.3},"handwritten_baseline_supported":true,"handwritten_baseline":{f},"handwritten_ns":{d},"handwritten_avg_us":{d:.3},"measured_speedup":{d:.6}
             , .{
                 std.json.fmt(check.name, .{}),
                 std.json.fmt(plan_id, .{}),
@@ -2270,7 +2446,7 @@ fn writeEvidence(
                 check.warmup_iters,
                 result.measure_iters,
                 result.repeat_runs,
-                std.json.fmt(timing_aggregation, .{}),
+                timing_metadata_json,
                 result.elapsed_nanos,
                 generated_avg_us,
                 std.json.fmt(handwrittenBaselineName(check), .{}),
@@ -2300,7 +2476,7 @@ fn writeEvidence(
             }
             if (!blocker_counts.add(quant_kernel_compiler.metal_blocker_unsupported_handwritten)) return error.InvalidArgument;
             try appendJsonFmt(allocator, &out,
-                \\{{"name":{f},"backend":"metal","plan_id":{f},"production_route":{f},"candidate_route":{f},"production_kernel_id":{f},"candidate_kernel_id":{f},"route_fallback_reason":{f},"kernel_id":{f},"generated_source_path":{f},"generated_source_fingerprint":{d},"metal_check_command":{f},"format":{f},"row_bucket":{f},"epilogue":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"threads_per_threadgroup":{d},"cols_per_threadgroup":{d},"correctness_passed":true,{s},"max_abs_error":{d:.7},"tolerance_abs":{d:.7},"warmup_iters":{d},"measure_iters":{d},"repeat_runs":{d},"timing_aggregation":{f},"generated_ns":{d},"generated_avg_us":{d:.3},"handwritten_baseline_supported":false,"handwritten_baseline":"none","fallback_reason":{f},"benchmark_passed":false,"promotion_ready":false,"promotion_blocker":"unsupported_handwritten_baseline"}}
+                \\{{"name":{f},"backend":"metal","plan_id":{f},"production_route":{f},"candidate_route":{f},"production_kernel_id":{f},"candidate_kernel_id":{f},"route_fallback_reason":{f},"kernel_id":{f},"generated_source_path":{f},"generated_source_fingerprint":{d},"metal_check_command":{f},"format":{f},"row_bucket":{f},"epilogue":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"threads_per_threadgroup":{d},"cols_per_threadgroup":{d},"correctness_passed":true,{s},"max_abs_error":{d:.7},"tolerance_abs":{d:.7},"warmup_iters":{d},"measure_iters":{d},"repeat_runs":{d},{s},"generated_ns":{d},"generated_avg_us":{d:.3},"handwritten_baseline_supported":false,"handwritten_baseline":"none","fallback_reason":{f},"benchmark_passed":false,"promotion_ready":false,"promotion_blocker":"unsupported_handwritten_baseline"}}
             , .{
                 std.json.fmt(check.name, .{}),
                 std.json.fmt(plan_id, .{}),
@@ -2327,7 +2503,7 @@ fn writeEvidence(
                 check.warmup_iters,
                 result.measure_iters,
                 result.repeat_runs,
-                std.json.fmt(timing_aggregation, .{}),
+                timing_metadata_json,
                 result.elapsed_nanos,
                 generated_avg_us,
                 std.json.fmt(fallback_reason, .{}),
@@ -2339,24 +2515,99 @@ fn writeEvidence(
         \\],
         \\
     );
+    if (runtime_route_all) {
+        try appendJsonFmt(allocator, &out,
+            \\"runtime_route_all_status":{f},
+            \\
+        , .{std.json.fmt(runtimeRouteAllEvidenceStatus(.{
+            .case_count = checks.len,
+            .promotion_case_count = promotion_case_count,
+            .promotion_ready_count = promotion_ready_count,
+            .runtime_route_checked_count = runtime_route_checked_count,
+            .provider_route_checked_count = provider_route_checked_count,
+            .candidate_route_ready_count = candidate_route_ready_count,
+            .candidate_benchmark_ready_count = candidate_benchmark_ready_count,
+            .blocker_counts = blocker_counts,
+        }), .{})});
+    }
+    if (production_regression_check) {
+        try appendJsonFmt(allocator, &out,
+            \\"production_regression_status":{f},
+            \\
+        , .{std.json.fmt(productionRegressionEvidenceStatus(.{
+            .case_count = checks.len,
+            .promotion_case_count = promotion_case_count,
+            .promotion_ready_count = promotion_ready_count,
+            .runtime_route_checked_count = runtime_route_checked_count,
+            .provider_route_checked_count = provider_route_checked_count,
+            .candidate_route_ready_count = candidate_route_ready_count,
+            .candidate_benchmark_ready_count = candidate_benchmark_ready_count,
+            .blocker_counts = blocker_counts,
+        }), .{})});
+    }
+    const worst_repeat_speedup_json = if (promotion_worst_repeat_speedup) |value|
+        try std.fmt.allocPrint(allocator, "{d:.6}", .{value})
+    else
+        "null";
+    defer if (promotion_worst_repeat_speedup != null) allocator.free(worst_repeat_speedup_json);
+    const worst_repeat_case_json = if (promotion_worst_repeat_case) |name|
+        try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(name, .{})})
+    else
+        "null";
+    defer if (promotion_worst_repeat_case != null) allocator.free(worst_repeat_case_json);
+    const benchmark_min_speedup_json = try nullableF64Json(allocator, benchmark_speedups.min_speedup);
+    defer allocator.free(benchmark_min_speedup_json);
+    const benchmark_min_case_json = try nullableStringJson(allocator, benchmark_speedups.min_case);
+    defer allocator.free(benchmark_min_case_json);
+    const benchmark_max_speedup_json = try nullableF64Json(allocator, benchmark_speedups.max_speedup);
+    defer allocator.free(benchmark_max_speedup_json);
+    const benchmark_max_case_json = try nullableStringJson(allocator, benchmark_speedups.max_case);
+    defer allocator.free(benchmark_max_case_json);
+    const benchmark_avg_speedup_json = try nullableF64Json(allocator, benchmark_speedups.average());
+    defer allocator.free(benchmark_avg_speedup_json);
     try appendJsonFmt(allocator, &out,
+        \\"promotion_worst_repeat_speedup":{s},
+        \\"promotion_worst_repeat_case":{s},
         \\"promotion_case_count":{d},
         \\"promotion_ready_count":{d},
         \\"runtime_route_checked_count":{d},
         \\"provider_route_checked_count":{d},
+        \\"candidate_route_ready_count":{d},
+        \\"candidate_benchmark_ready_count":{d},
+        \\"benchmark_supported_count":{d},
+        \\"benchmark_speedup_pass_count":{d},
+        \\"benchmark_speedup_min":{s},
+        \\"benchmark_speedup_min_case":{s},
+        \\"benchmark_speedup_max":{s},
+        \\"benchmark_speedup_max_case":{s},
+        \\"benchmark_speedup_avg":{s},
         \\"promotion_blocker_speedup_gate_missing_count":{d},
         \\"promotion_blocker_unstable_benchmark_timing_count":{d},
         \\"promotion_blocker_runtime_route_only_count":{d},
         \\"promotion_blocker_missing_generated_route_count":{d},
         \\"promotion_blocker_missing_provider_route_count":{d},
         \\"promotion_blocker_unsupported_handwritten_count":{d},
-        \\"promotion_blocker_dev_only_candidate_count":{d}
+        \\"promotion_blocker_dev_only_candidate_count":{d},
+        \\"slow_fallback_count":{d},
+        \\"top_slow_fallback_reason":{f},
+        \\"top_slow_fallback_count":{d}
         \\
     , .{
+        worst_repeat_speedup_json,
+        worst_repeat_case_json,
         promotion_case_count,
         promotion_ready_count,
         runtime_route_checked_count,
         provider_route_checked_count,
+        candidate_route_ready_count,
+        candidate_benchmark_ready_count,
+        benchmark_speedups.supported_count,
+        benchmark_speedups.pass_count,
+        benchmark_min_speedup_json,
+        benchmark_min_case_json,
+        benchmark_max_speedup_json,
+        benchmark_max_case_json,
+        benchmark_avg_speedup_json,
         blocker_counts.speedup_gate_missing,
         blocker_counts.unstable_benchmark_timing,
         blocker_counts.runtime_route_only,
@@ -2364,6 +2615,9 @@ fn writeEvidence(
         blocker_counts.missing_provider_route,
         blocker_counts.unsupported_handwritten_baseline,
         blocker_counts.dev_only_candidate,
+        blocker_counts.slowFallbackCount(),
+        std.json.fmt(blocker_counts.topSlowFallbackReason(), .{}),
+        blocker_counts.topSlowFallbackCount(),
     });
     try out.appendSlice(allocator,
         \\}
@@ -2435,6 +2689,21 @@ const PromotionBlockerCounts = struct {
             self.unsupported_handwritten_baseline == other.unsupported_handwritten_baseline and
             self.dev_only_candidate == other.dev_only_candidate;
     }
+
+    fn slowFallbackCount(self: @This()) usize {
+        return self.speedup_gate_missing + self.unstable_benchmark_timing;
+    }
+
+    fn topSlowFallbackReason(self: @This()) []const u8 {
+        if (self.slowFallbackCount() == 0) return quant_kernel_compiler.metal_blocker_none;
+        if (self.speedup_gate_missing >= self.unstable_benchmark_timing) return quant_kernel_compiler.metal_blocker_speedup_gate_missing;
+        return quant_kernel_compiler.metal_blocker_unstable_benchmark_timing;
+    }
+
+    fn topSlowFallbackCount(self: @This()) usize {
+        if (self.slowFallbackCount() == 0) return 0;
+        return @max(self.speedup_gate_missing, self.unstable_benchmark_timing);
+    }
 };
 
 fn addPromotionBlockerCounts(total: *PromotionBlockerCounts, addend: PromotionBlockerCounts) void {
@@ -2459,8 +2728,11 @@ fn promotionBlockerCount(counts: PromotionBlockerCounts, blocker: []const u8) ?u
 }
 
 fn promotionBlockerEvidenceMatches(counts: PromotionBlockerCounts, expected_blocker: []const u8) bool {
-    return promotionBlockerEvidenceMatchesExactly(counts, expected_blocker) or
-        promotionBlockerEvidenceTimingDrifted(counts, expected_blocker);
+    if (promotionBlockerEvidenceMatchesExactly(counts, expected_blocker)) return true;
+    if (std.mem.eql(u8, expected_blocker, quant_kernel_compiler.metal_blocker_unstable_benchmark_timing)) {
+        return counts.speedup_gate_missing != 0;
+    }
+    return promotionBlockerEvidenceTimingDrifted(counts, expected_blocker);
 }
 
 fn promotionBlockerEvidenceMatchesExactly(counts: PromotionBlockerCounts, expected_blocker: []const u8) bool {
@@ -2471,9 +2743,6 @@ fn promotionBlockerEvidenceMatchesExactly(counts: PromotionBlockerCounts, expect
 fn promotionBlockerEvidenceTimingDrifted(counts: PromotionBlockerCounts, expected_blocker: []const u8) bool {
     if (std.mem.eql(u8, expected_blocker, quant_kernel_compiler.metal_blocker_speedup_gate_missing)) {
         return counts.unstable_benchmark_timing != 0;
-    }
-    if (std.mem.eql(u8, expected_blocker, quant_kernel_compiler.metal_blocker_unstable_benchmark_timing)) {
-        return counts.speedup_gate_missing != 0;
     }
     return false;
 }
@@ -2505,6 +2774,16 @@ fn appendJsonFmt(
     const chunk = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(chunk);
     try out.appendSlice(allocator, chunk);
+}
+
+fn nullableF64Json(allocator: std.mem.Allocator, value: ?f64) ![]const u8 {
+    if (value) |actual| return try std.fmt.allocPrint(allocator, "{d:.6}", .{actual});
+    return try allocator.dupe(u8, "null");
+}
+
+fn nullableStringJson(allocator: std.mem.Allocator, value: ?[]const u8) ![]const u8 {
+    if (value) |actual| return try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(actual, .{})});
+    return try allocator.dupe(u8, "null");
 }
 
 fn appendRepeatTimingFields(
@@ -2586,11 +2865,61 @@ const EvidenceSummary = struct {
     promotion_ready_count: usize,
     runtime_route_checked_count: usize,
     provider_route_checked_count: usize,
+    candidate_route_ready_count: usize = 0,
+    candidate_benchmark_ready_count: usize = 0,
     blocker_counts: PromotionBlockerCounts,
+    promotion_worst_repeat_speedup: ?f64 = null,
+    production_regression_check: bool = false,
+    compiler_benchmark_manifest_case_count: ?usize = null,
+    compiler_benchmark_manifest_case_fingerprint: ?u64 = null,
 };
 
+const BenchmarkSpeedupSummary = struct {
+    supported_count: usize = 0,
+    pass_count: usize = 0,
+    min_speedup: ?f64 = null,
+    min_case: ?[]const u8 = null,
+    max_speedup: ?f64 = null,
+    max_case: ?[]const u8 = null,
+    sum_speedup: f64 = 0.0,
+
+    fn add(self: *@This(), case_name: []const u8, measured_speedup: f64, benchmark_passed: bool) void {
+        self.supported_count += 1;
+        if (benchmark_passed) self.pass_count += 1;
+        self.sum_speedup += measured_speedup;
+        if (self.min_speedup == null or measured_speedup < self.min_speedup.?) {
+            self.min_speedup = measured_speedup;
+            self.min_case = case_name;
+        }
+        if (self.max_speedup == null or measured_speedup > self.max_speedup.?) {
+            self.max_speedup = measured_speedup;
+            self.max_case = case_name;
+        }
+    }
+
+    fn average(self: @This()) ?f64 {
+        if (self.supported_count == 0) return null;
+        return self.sum_speedup / @as(f64, @floatFromInt(self.supported_count));
+    }
+
+    fn eql(self: @This(), other: @This()) bool {
+        return self.supported_count == other.supported_count and
+            self.pass_count == other.pass_count and
+            nullableF64Approximately(self.min_speedup, other.min_speedup, 0.000001) and
+            nullableF64Approximately(self.max_speedup, other.max_speedup, 0.000001) and
+            nullableF64Approximately(self.average(), other.average(), 0.000001) and
+            nullableStringEql(self.min_case, other.min_case) and
+            nullableStringEql(self.max_case, other.max_case);
+    }
+};
+
+fn evidenceSummaryHasRouteReadyCoverage(summary: EvidenceSummary) bool {
+    return summary.case_count != 0 and summary.candidate_route_ready_count == summary.case_count;
+}
+
 fn productionRegressionEvidenceHasHardBlocker(summary: EvidenceSummary) bool {
-    return summary.promotion_case_count == 0 or
+    if (summary.promotion_case_count == 0) return false;
+    return !evidenceSummaryHasRouteReadyCoverage(summary) or
         summary.blocker_counts.speedup_gate_missing != 0 or
         summary.blocker_counts.runtime_route_only != 0 or
         summary.blocker_counts.missing_generated_route != 0 or
@@ -2599,15 +2928,37 @@ fn productionRegressionEvidenceHasHardBlocker(summary: EvidenceSummary) bool {
         summary.blocker_counts.dev_only_candidate != 0;
 }
 
+fn productionRegressionEvidenceStatus(summary: EvidenceSummary) []const u8 {
+    if (productionRegressionEvidenceHasHardBlocker(summary)) return "production_regression_blocked";
+    if (summary.promotion_case_count == 0) return "production_regression_skipped";
+    if (summary.promotion_ready_count == summary.promotion_case_count) return "production_regression_ok";
+    return "production_regression_timing_drift";
+}
+
+fn runtimeRouteAllEvidenceStatus(summary: EvidenceSummary) []const u8 {
+    if (summary.case_count == quant_kernel_compiler.first_metal_runtime_route_all_expected_case_count and
+        summary.runtime_route_checked_count == summary.case_count and
+        evidenceSummaryHasRouteReadyCoverage(summary) and
+        summary.provider_route_checked_count == quant_kernel_compiler.first_metal_runtime_route_all_expected_provider_route_count)
+    {
+        return "runtime_route_all_ok";
+    }
+    return "runtime_route_all_blocked";
+}
+
 fn printEvidenceSummary(path: []const u8, status: []const u8, summary: EvidenceSummary) void {
     std.debug.print(
-        "quant-kernel-metal-runtime-check evidence_check={s} {s} cases={d} route_checked={d} provider_checked={d} promotion_ready={d}/{d} blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}}\n",
+        "quant-kernel-metal-runtime-check evidence_check={s} {s} cases={d} route_checked={d} provider_checked={d} route_ready={d}/{d} benchmark_ready={d}/{d} promotion_ready={d}/{d} blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}} slow_fallbacks={d} top_slow={s}:{d}",
         .{
             path,
             status,
             summary.case_count,
             summary.runtime_route_checked_count,
             summary.provider_route_checked_count,
+            summary.candidate_route_ready_count,
+            summary.case_count,
+            summary.candidate_benchmark_ready_count,
+            summary.case_count,
             summary.promotion_ready_count,
             summary.promotion_case_count,
             summary.blocker_counts.speedup_gate_missing,
@@ -2617,8 +2968,25 @@ fn printEvidenceSummary(path: []const u8, status: []const u8, summary: EvidenceS
             summary.blocker_counts.missing_provider_route,
             summary.blocker_counts.unsupported_handwritten_baseline,
             summary.blocker_counts.dev_only_candidate,
+            summary.blocker_counts.slowFallbackCount(),
+            summary.blocker_counts.topSlowFallbackReason(),
+            summary.blocker_counts.topSlowFallbackCount(),
         },
     );
+    if (summary.promotion_worst_repeat_speedup) |worst| {
+        std.debug.print(" worst_repeat_speedup={d:.3}", .{worst});
+    }
+    if (summary.production_regression_check) {
+        std.debug.print(
+            " benchmark_manifest={s}:{d}:{d}",
+            .{
+                quant_kernel_compiler.first_benchmark_manifest_schema,
+                summary.compiler_benchmark_manifest_case_count orelse 0,
+                summary.compiler_benchmark_manifest_case_fingerprint orelse 0,
+            },
+        );
+    }
+    std.debug.print("\n", .{});
 }
 
 const BlockerEvidenceAuditSummary = struct {
@@ -2626,24 +2994,53 @@ const BlockerEvidenceAuditSummary = struct {
     checked_path_count: usize = 0,
     skipped_no_path_count: usize = 0,
     cleared_blocker_count: usize = 0,
+    confirmed_cleared_blocker_count: usize = 0,
+    unconfirmed_cleared_blocker_count: usize = 0,
+    production_regression_guarded_count: usize = 0,
     timing_blocker_drift_count: usize = 0,
+    evidence_case_count: usize = 0,
+    candidate_route_ready_count: usize = 0,
+    candidate_benchmark_ready_count: usize = 0,
+    promotion_case_count: usize = 0,
+    promotion_ready_count: usize = 0,
     table_blocker_counts: PromotionBlockerCounts = .{},
     evidence_blocker_counts: PromotionBlockerCounts = .{},
 };
 
+fn blockerEvidenceAuditStatus(summary: BlockerEvidenceAuditSummary) []const u8 {
+    if (summary.confirmed_cleared_blocker_count != 0) return "blocker_evidence_confirmed_cleared";
+    if (summary.unconfirmed_cleared_blocker_count != 0) return "blocker_evidence_unconfirmed_cleared";
+    if (summary.cleared_blocker_count != 0) return "blocker_evidence_cleared";
+    if (summary.production_regression_guarded_count != 0) return "blocker_evidence_production_regression_guarded";
+    if (summary.timing_blocker_drift_count != 0) return "blocker_evidence_timing_drift";
+    return "blocker_evidence_ok";
+}
+
 fn enforceClearedBlockerPolicy(summary: BlockerEvidenceAuditSummary, fail_on_cleared_blocker: bool) !void {
-    if (fail_on_cleared_blocker and summary.cleared_blocker_count != 0) return error.MetalBlockerEvidenceCleared;
+    if (!fail_on_cleared_blocker) return;
+    if (summary.confirmed_cleared_blocker_count != 0) return error.MetalBlockerEvidenceCleared;
+    if (summary.unconfirmed_cleared_blocker_count == 0 and summary.cleared_blocker_count != 0) return error.MetalBlockerEvidenceCleared;
 }
 
 fn printBlockerEvidenceAuditSummary(summary: BlockerEvidenceAuditSummary) void {
     std.debug.print(
-        "quant-kernel-metal-runtime-check blocker_evidence ok entries={d} checked={d} skipped_no_path={d} cleared={d} timing_drift={d} table_blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}} evidence_blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}}\n",
+        "quant-kernel-metal-runtime-check blocker_evidence status={s} entries={d} checked={d} skipped_no_path={d} cleared={d} confirmed_cleared={d} unconfirmed_cleared={d} production_regression_guarded={d} timing_drift={d} readiness={{route:{d}/{d},benchmark:{d}/{d},promotion:{d}/{d}}} table_blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}} evidence_blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}}\n",
         .{
+            blockerEvidenceAuditStatus(summary),
             summary.table_entry_count,
             summary.checked_path_count,
             summary.skipped_no_path_count,
             summary.cleared_blocker_count,
+            summary.confirmed_cleared_blocker_count,
+            summary.unconfirmed_cleared_blocker_count,
+            summary.production_regression_guarded_count,
             summary.timing_blocker_drift_count,
+            summary.candidate_route_ready_count,
+            summary.evidence_case_count,
+            summary.candidate_benchmark_ready_count,
+            summary.evidence_case_count,
+            summary.promotion_ready_count,
+            summary.promotion_case_count,
             summary.table_blocker_counts.speedup_gate_missing,
             summary.table_blocker_counts.unstable_benchmark_timing,
             summary.table_blocker_counts.runtime_route_only,
@@ -2662,7 +3059,7 @@ fn printBlockerEvidenceAuditSummary(summary: BlockerEvidenceAuditSummary) void {
     );
 }
 
-fn refreshBlockerEvidence(allocator: std.mem.Allocator) !BlockerEvidenceAuditSummary {
+fn refreshBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
     var checks_storage = metal_runtime_checks;
     for (&checks_storage) |*check| {
         check.measure_iters = quant_kernel_compiler.metal_promotion_measure_iters;
@@ -2695,14 +3092,66 @@ fn refreshBlockerEvidence(allocator: std.mem.Allocator) !BlockerEvidenceAuditSum
             true,
         );
     }
-    return checkBlockerEvidenceWithDetails(allocator, false);
+    return checkBlockerEvidenceWithDetails(allocator, false, confirm_cleared_blockers);
 }
 
-fn checkBlockerEvidence(allocator: std.mem.Allocator) !BlockerEvidenceAuditSummary {
-    return checkBlockerEvidenceWithDetails(allocator, true);
+fn checkBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
+    return checkBlockerEvidenceWithDetails(allocator, true, confirm_cleared_blockers);
 }
 
-fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: bool) !BlockerEvidenceAuditSummary {
+fn confirmClearedBlocker(allocator: std.mem.Allocator, kernel_id: []const u8) !EvidenceSummary {
+    const repeat_runs: u32 = @intCast(quant_kernel_compiler.metal_promotion_repeat_runs);
+    var summary = EvidenceSummary{
+        .case_count = 0,
+        .promotion_case_count = 0,
+        .promotion_ready_count = 0,
+        .runtime_route_checked_count = 0,
+        .provider_route_checked_count = 0,
+        .blocker_counts = .{},
+    };
+
+    for (metal_runtime_checks) |base_check| {
+        if (!std.mem.eql(u8, base_check.kernel_name, kernel_id)) continue;
+        var check = base_check;
+        check.measure_iters = quant_kernel_compiler.metal_promotion_measure_iters;
+        const result = try runRepeatedCheck(allocator, check, repeat_runs, kernel_id, kernel_id);
+        summary.case_count += 1;
+        summary.promotion_case_count += 1;
+        if (result.generated_route_checked) summary.runtime_route_checked_count += 1;
+        if (result.provider_route_checked) summary.provider_route_checked_count += 1;
+
+        const promotion_blocker = if (result.handwritten_elapsed_nanos) |handwritten_elapsed_nanos| blocker: {
+            const measured_speedup = speedup(handwritten_elapsed_nanos, result.elapsed_nanos);
+            const minimum_repeat_speedup = result.minimum_repeat_speedup orelse measured_speedup;
+            const benchmark_blocker = quant_kernel_compiler.metalPromotionSpeedupBlocker(measured_speedup, minimum_repeat_speedup);
+            const benchmark_passed = std.mem.eql(u8, benchmark_blocker, quant_kernel_compiler.metal_blocker_none);
+            const provider_route_needed = quant_kernel_compiler.metalProviderRouteRequiredForKernel(check.kernel_name);
+            const route_evidence_passed = result.generated_route_checked and (!provider_route_needed or result.provider_route_checked);
+            if (route_evidence_passed) summary.candidate_route_ready_count += 1;
+            if (benchmark_passed) summary.candidate_benchmark_ready_count += 1;
+            if (benchmark_passed and route_evidence_passed) {
+                summary.promotion_ready_count += 1;
+                break :blocker "";
+            }
+            if (!benchmark_passed) break :blocker benchmark_blocker;
+            if (!result.generated_route_checked) break :blocker quant_kernel_compiler.metal_blocker_missing_generated_route;
+            if (provider_route_needed and !result.provider_route_checked) break :blocker quant_kernel_compiler.metal_blocker_missing_provider_route;
+            break :blocker "";
+        } else unsupported: {
+            const provider_route_needed = quant_kernel_compiler.metalProviderRouteRequiredForKernel(check.kernel_name);
+            if (result.generated_route_checked and (!provider_route_needed or result.provider_route_checked)) {
+                summary.candidate_route_ready_count += 1;
+            }
+            break :unsupported quant_kernel_compiler.metal_blocker_unsupported_handwritten;
+        };
+        if (!summary.blocker_counts.add(promotion_blocker)) return error.InvalidArgument;
+    }
+
+    if (summary.case_count == 0) return error.InvalidArgument;
+    return summary;
+}
+
+fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: bool, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
     var summary = BlockerEvidenceAuditSummary{
         .table_entry_count = quant_kernel_compiler.first_metal_promotion_blocker_evidence_count,
     };
@@ -2728,9 +3177,69 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
             return err;
         };
         addPromotionBlockerCounts(&summary.evidence_blocker_counts, evidence_summary.blocker_counts);
+        summary.evidence_case_count += evidence_summary.case_count;
+        summary.candidate_route_ready_count += evidence_summary.candidate_route_ready_count;
+        summary.candidate_benchmark_ready_count += evidence_summary.candidate_benchmark_ready_count;
+        summary.promotion_case_count += evidence_summary.promotion_case_count;
+        summary.promotion_ready_count += evidence_summary.promotion_ready_count;
+        if (!evidenceSummaryHasRouteReadyCoverage(evidence_summary)) {
+            std.debug.print(
+                "quant-kernel-metal-runtime-check blocker_evidence missing_route_ready kernel={s} blocker={s} path={s} route_ready={d}/{d}\n",
+                .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.candidate_route_ready_count, evidence_summary.case_count },
+            );
+            return error.MetalBlockerEvidenceRouteMissing;
+        }
         const blocker_cleared = promotionBlockerEvidenceCleared(evidence_summary, evidence.blocker);
-        if (blocker_cleared) {
+        const production_regression_guarded = blocker_cleared and evidence.requires_production_regression_clear;
+        if (production_regression_guarded) {
+            summary.production_regression_guarded_count += 1;
+            if (print_details) {
+                std.debug.print(
+                    "quant-kernel-metal-runtime-check blocker_evidence production_regression_guarded kernel={s} table_blocker={s} path={s} promotion_ready={d}/{d}\n",
+                    .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
+                );
+            }
+        } else if (blocker_cleared) {
             summary.cleared_blocker_count += 1;
+            if (confirm_cleared_blockers) {
+                const required_confirmation_rounds: usize = 3;
+                var confirmation_rounds: usize = 1;
+                var confirmation_summary = try confirmClearedBlocker(allocator, evidence.kernel_id);
+                var confirmed_clear = promotionBlockerEvidenceCleared(confirmation_summary, evidence.blocker);
+                while (confirmed_clear and confirmation_rounds < required_confirmation_rounds) : (confirmation_rounds += 1) {
+                    confirmation_summary = try confirmClearedBlocker(allocator, evidence.kernel_id);
+                    confirmed_clear = promotionBlockerEvidenceCleared(confirmation_summary, evidence.blocker);
+                }
+                if (confirmed_clear) {
+                    summary.confirmed_cleared_blocker_count += 1;
+                    if (print_details) {
+                        std.debug.print(
+                            "quant-kernel-metal-runtime-check blocker_evidence confirmed_cleared kernel={s} table_blocker={s} confirmation_rounds={d} promotion_ready={d}/{d}\n",
+                            .{ evidence.kernel_id, evidence.blocker, confirmation_rounds, confirmation_summary.promotion_ready_count, confirmation_summary.promotion_case_count },
+                        );
+                    }
+                } else {
+                    summary.unconfirmed_cleared_blocker_count += 1;
+                    if (print_details) {
+                        std.debug.print(
+                            "quant-kernel-metal-runtime-check blocker_evidence unconfirmed_cleared kernel={s} table_blocker={s} confirmation_ready={d}/{d} blockers={{speedup_gate:{d},unstable_benchmark:{d},runtime_route_only:{d},missing_generated:{d},missing_provider:{d},unsupported_handwritten:{d},dev_only:{d}}}\n",
+                            .{
+                                evidence.kernel_id,
+                                evidence.blocker,
+                                confirmation_summary.promotion_ready_count,
+                                confirmation_summary.promotion_case_count,
+                                confirmation_summary.blocker_counts.speedup_gate_missing,
+                                confirmation_summary.blocker_counts.unstable_benchmark_timing,
+                                confirmation_summary.blocker_counts.runtime_route_only,
+                                confirmation_summary.blocker_counts.missing_generated_route,
+                                confirmation_summary.blocker_counts.missing_provider_route,
+                                confirmation_summary.blocker_counts.unsupported_handwritten_baseline,
+                                confirmation_summary.blocker_counts.dev_only_candidate,
+                            },
+                        );
+                    }
+                }
+            }
             if (print_details) {
                 std.debug.print(
                     "quant-kernel-metal-runtime-check blocker_evidence cleared kernel={s} table_blocker={s} path={s} promotion_ready={d}/{d}\n",
@@ -2764,6 +3273,20 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
         }
         summary.checked_path_count += 1;
     }
+    if (summary.evidence_case_count != quant_kernel_compiler.first_metal_promotion_blocker_evidence_expected_case_count) {
+        std.debug.print(
+            "quant-kernel-metal-runtime-check blocker_evidence case_count_mismatch expected={d} actual={d}\n",
+            .{ quant_kernel_compiler.first_metal_promotion_blocker_evidence_expected_case_count, summary.evidence_case_count },
+        );
+        return error.MetalBlockerEvidenceCaseCountMismatch;
+    }
+    if (summary.candidate_route_ready_count != quant_kernel_compiler.first_metal_promotion_blocker_evidence_expected_route_ready_count) {
+        std.debug.print(
+            "quant-kernel-metal-runtime-check blocker_evidence route_ready_mismatch expected={d} actual={d}\n",
+            .{ quant_kernel_compiler.first_metal_promotion_blocker_evidence_expected_route_ready_count, summary.candidate_route_ready_count },
+        );
+        return error.MetalBlockerEvidenceRouteMissing;
+    }
     return summary;
 }
 
@@ -2784,21 +3307,80 @@ fn evidenceSummaryFromJson(allocator: std.mem.Allocator, bytes: []const u8) !Evi
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidMetalEvidence;
+    var promotion_worst_repeat_speedup: ?f64 = null;
+    if (!jsonNullableF64(root.object.get("promotion_worst_repeat_speedup") orelse return error.InvalidMetalEvidence, &promotion_worst_repeat_speedup)) return error.InvalidMetalEvidence;
+    const blocker_counts = PromotionBlockerCounts{
+        .speedup_gate_missing = jsonUsize(root.object.get("promotion_blocker_speedup_gate_missing_count")) orelse return error.InvalidMetalEvidence,
+        .unstable_benchmark_timing = jsonUsize(root.object.get("promotion_blocker_unstable_benchmark_timing_count")) orelse return error.InvalidMetalEvidence,
+        .runtime_route_only = jsonUsize(root.object.get("promotion_blocker_runtime_route_only_count")) orelse return error.InvalidMetalEvidence,
+        .missing_generated_route = jsonUsize(root.object.get("promotion_blocker_missing_generated_route_count")) orelse return error.InvalidMetalEvidence,
+        .missing_provider_route = jsonUsize(root.object.get("promotion_blocker_missing_provider_route_count")) orelse return error.InvalidMetalEvidence,
+        .unsupported_handwritten_baseline = jsonUsize(root.object.get("promotion_blocker_unsupported_handwritten_count")) orelse return error.InvalidMetalEvidence,
+        .dev_only_candidate = jsonUsize(root.object.get("promotion_blocker_dev_only_candidate_count")) orelse return error.InvalidMetalEvidence,
+    };
+    try validateSlowFallbackSummary(root, blocker_counts);
+    _ = try benchmarkSpeedupSummaryFromRoot(root);
+    const production_regression_check = jsonBoolValue(root.object.get("production_regression_check")) orelse false;
+    const compiler_manifest_case_count = jsonUsize(root.object.get("compiler_benchmark_manifest_case_count"));
+    const compiler_manifest_case_fingerprint = jsonU64(root.object.get("compiler_benchmark_manifest_case_fingerprint"));
     return .{
         .case_count = jsonUsize(root.object.get("case_count")) orelse return error.InvalidMetalEvidence,
         .promotion_case_count = jsonUsize(root.object.get("promotion_case_count")) orelse return error.InvalidMetalEvidence,
         .promotion_ready_count = jsonUsize(root.object.get("promotion_ready_count")) orelse return error.InvalidMetalEvidence,
         .runtime_route_checked_count = jsonUsize(root.object.get("runtime_route_checked_count")) orelse return error.InvalidMetalEvidence,
         .provider_route_checked_count = jsonUsize(root.object.get("provider_route_checked_count")) orelse return error.InvalidMetalEvidence,
-        .blocker_counts = .{
-            .speedup_gate_missing = jsonUsize(root.object.get("promotion_blocker_speedup_gate_missing_count")) orelse return error.InvalidMetalEvidence,
-            .unstable_benchmark_timing = jsonUsize(root.object.get("promotion_blocker_unstable_benchmark_timing_count")) orelse return error.InvalidMetalEvidence,
-            .runtime_route_only = jsonUsize(root.object.get("promotion_blocker_runtime_route_only_count")) orelse return error.InvalidMetalEvidence,
-            .missing_generated_route = jsonUsize(root.object.get("promotion_blocker_missing_generated_route_count")) orelse return error.InvalidMetalEvidence,
-            .missing_provider_route = jsonUsize(root.object.get("promotion_blocker_missing_provider_route_count")) orelse return error.InvalidMetalEvidence,
-            .unsupported_handwritten_baseline = jsonUsize(root.object.get("promotion_blocker_unsupported_handwritten_count")) orelse return error.InvalidMetalEvidence,
-            .dev_only_candidate = jsonUsize(root.object.get("promotion_blocker_dev_only_candidate_count")) orelse return error.InvalidMetalEvidence,
-        },
+        .candidate_route_ready_count = jsonUsize(root.object.get("candidate_route_ready_count")) orelse return error.InvalidMetalEvidence,
+        .candidate_benchmark_ready_count = jsonUsize(root.object.get("candidate_benchmark_ready_count")) orelse return error.InvalidMetalEvidence,
+        .promotion_worst_repeat_speedup = promotion_worst_repeat_speedup,
+        .production_regression_check = production_regression_check,
+        .compiler_benchmark_manifest_case_count = compiler_manifest_case_count,
+        .compiler_benchmark_manifest_case_fingerprint = compiler_manifest_case_fingerprint,
+        .blocker_counts = blocker_counts,
+    };
+}
+
+fn validateSlowFallbackSummary(root: std.json.Value, blocker_counts: PromotionBlockerCounts) !void {
+    const slow_fallback_count = jsonUsize(root.object.get("slow_fallback_count")) orelse return error.InvalidMetalEvidence;
+    if (slow_fallback_count != blocker_counts.slowFallbackCount()) return error.InvalidMetalEvidence;
+    const top_slow_reason = jsonString(root.object.get("top_slow_fallback_reason")) orelse return error.InvalidMetalEvidence;
+    if (!std.mem.eql(u8, top_slow_reason, blocker_counts.topSlowFallbackReason())) return error.InvalidMetalEvidence;
+    const top_slow_count = jsonUsize(root.object.get("top_slow_fallback_count")) orelse return error.InvalidMetalEvidence;
+    if (top_slow_count != blocker_counts.topSlowFallbackCount()) return error.InvalidMetalEvidence;
+}
+
+fn benchmarkSpeedupSummaryFromRoot(root: std.json.Value) !BenchmarkSpeedupSummary {
+    if (root != .object) return error.InvalidMetalEvidence;
+    const supported_count = jsonUsize(root.object.get("benchmark_supported_count")) orelse return error.InvalidMetalEvidence;
+    const pass_count = jsonUsize(root.object.get("benchmark_speedup_pass_count")) orelse return error.InvalidMetalEvidence;
+    if (pass_count > supported_count) return error.InvalidMetalEvidence;
+
+    var min_speedup: ?f64 = null;
+    if (!jsonNullableF64(root.object.get("benchmark_speedup_min") orelse return error.InvalidMetalEvidence, &min_speedup)) return error.InvalidMetalEvidence;
+    var max_speedup: ?f64 = null;
+    if (!jsonNullableF64(root.object.get("benchmark_speedup_max") orelse return error.InvalidMetalEvidence, &max_speedup)) return error.InvalidMetalEvidence;
+    var avg_speedup: ?f64 = null;
+    if (!jsonNullableF64(root.object.get("benchmark_speedup_avg") orelse return error.InvalidMetalEvidence, &avg_speedup)) return error.InvalidMetalEvidence;
+
+    var min_case: ?[]const u8 = null;
+    if (!jsonNullableString(root.object.get("benchmark_speedup_min_case") orelse return error.InvalidMetalEvidence, &min_case)) return error.InvalidMetalEvidence;
+    var max_case: ?[]const u8 = null;
+    if (!jsonNullableString(root.object.get("benchmark_speedup_max_case") orelse return error.InvalidMetalEvidence, &max_case)) return error.InvalidMetalEvidence;
+
+    if (supported_count == 0) {
+        if (pass_count != 0 or min_speedup != null or max_speedup != null or avg_speedup != null or min_case != null or max_case != null) return error.InvalidMetalEvidence;
+    } else {
+        if (min_speedup == null or max_speedup == null or avg_speedup == null or min_case == null or max_case == null) return error.InvalidMetalEvidence;
+        if (min_speedup.? > max_speedup.?) return error.InvalidMetalEvidence;
+    }
+
+    return .{
+        .supported_count = supported_count,
+        .pass_count = pass_count,
+        .min_speedup = min_speedup,
+        .min_case = min_case,
+        .max_speedup = max_speedup,
+        .max_case = max_case,
+        .sum_speedup = if (avg_speedup) |avg| avg * @as(f64, @floatFromInt(supported_count)) else 0.0,
     };
 }
 
@@ -2879,6 +3461,12 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     if (production_regression_check) {
         if (!commandHasToken(benchmark_command, "--production-regression-check")) return error.InvalidMetalEvidence;
         if (!hasPromotionRepeatRuns(repeat_runs)) return error.InvalidMetalEvidence;
+        const compiler_manifest_schema = jsonString(root.object.get("compiler_benchmark_manifest_schema")) orelse return error.InvalidMetalEvidence;
+        if (!std.mem.eql(u8, compiler_manifest_schema, quant_kernel_compiler.first_benchmark_manifest_schema)) return error.InvalidMetalEvidence;
+        const compiler_manifest_case_count = jsonUsize(root.object.get("compiler_benchmark_manifest_case_count")) orelse return error.InvalidMetalEvidence;
+        if (compiler_manifest_case_count != quant_kernel_compiler.first_metal_production_benchmark_case_count) return error.InvalidMetalEvidence;
+        const compiler_manifest_case_fingerprint = jsonU64(root.object.get("compiler_benchmark_manifest_case_fingerprint")) orelse return error.InvalidMetalEvidence;
+        if (compiler_manifest_case_fingerprint != quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint()) return error.InvalidMetalEvidence;
     } else if (commandHasToken(benchmark_command, "--production-regression-check")) {
         return error.InvalidMetalEvidence;
     }
@@ -2939,12 +3527,25 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     if (case_count != cases_value.array.items.len or (case_count == 0 and !production_regression_check)) return error.InvalidMetalEvidence;
     if (case_count != expected_case_count) return error.InvalidMetalEvidence;
     if (!evidenceCasesHaveUniqueNames(cases_value.array.items)) return error.InvalidMetalEvidence;
+    if (production_regression_check and !productionEvidenceCasesMatchCompilerManifest(cases_value.array.items)) return error.InvalidMetalEvidence;
 
     const expected_promotion_case_count = jsonUsize(root.object.get("promotion_case_count")) orelse return error.InvalidMetalEvidence;
     const expected_promotion_ready_count = jsonUsize(root.object.get("promotion_ready_count")) orelse return error.InvalidMetalEvidence;
     if (expected_promotion_ready_count > expected_promotion_case_count) return error.InvalidMetalEvidence;
+    var expected_promotion_worst_repeat_speedup: ?f64 = null;
+    if (!jsonNullableF64(root.object.get("promotion_worst_repeat_speedup") orelse return error.InvalidMetalEvidence, &expected_promotion_worst_repeat_speedup)) return error.InvalidMetalEvidence;
+    const expected_promotion_worst_repeat_case_value = root.object.get("promotion_worst_repeat_case") orelse return error.InvalidMetalEvidence;
+    const expected_promotion_worst_repeat_case: ?[]const u8 = switch (expected_promotion_worst_repeat_case_value) {
+        .null => null,
+        else => jsonString(expected_promotion_worst_repeat_case_value) orelse return error.InvalidMetalEvidence,
+    };
     const expected_runtime_route_checked_count = jsonUsize(root.object.get("runtime_route_checked_count")) orelse return error.InvalidMetalEvidence;
     const expected_provider_route_checked_count = jsonUsize(root.object.get("provider_route_checked_count")) orelse return error.InvalidMetalEvidence;
+    const expected_candidate_route_ready_count = jsonUsize(root.object.get("candidate_route_ready_count")) orelse return error.InvalidMetalEvidence;
+    const expected_candidate_benchmark_ready_count = jsonUsize(root.object.get("candidate_benchmark_ready_count")) orelse return error.InvalidMetalEvidence;
+    if (expected_candidate_route_ready_count > case_count or expected_candidate_benchmark_ready_count > case_count) return error.InvalidMetalEvidence;
+    const expected_benchmark_speedups = try benchmarkSpeedupSummaryFromRoot(root);
+    if (expected_benchmark_speedups.supported_count > case_count) return error.InvalidMetalEvidence;
     if (runtime_route_all and expected_provider_route_checked_count != quant_kernel_compiler.first_metal_runtime_route_all_expected_provider_route_count) return error.InvalidMetalEvidence;
     const expected_blocker_counts = PromotionBlockerCounts{
         .speedup_gate_missing = jsonUsize(root.object.get("promotion_blocker_speedup_gate_missing_count")) orelse return error.InvalidMetalEvidence,
@@ -2955,6 +3556,39 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
         .unsupported_handwritten_baseline = jsonUsize(root.object.get("promotion_blocker_unsupported_handwritten_count")) orelse return error.InvalidMetalEvidence,
         .dev_only_candidate = jsonUsize(root.object.get("promotion_blocker_dev_only_candidate_count")) orelse return error.InvalidMetalEvidence,
     };
+    try validateSlowFallbackSummary(root, expected_blocker_counts);
+    if (runtime_route_all) {
+        const status = jsonString(root.object.get("runtime_route_all_status")) orelse return error.InvalidMetalEvidence;
+        const expected_status = runtimeRouteAllEvidenceStatus(.{
+            .case_count = case_count,
+            .promotion_case_count = expected_promotion_case_count,
+            .promotion_ready_count = expected_promotion_ready_count,
+            .runtime_route_checked_count = expected_runtime_route_checked_count,
+            .provider_route_checked_count = expected_provider_route_checked_count,
+            .candidate_route_ready_count = expected_candidate_route_ready_count,
+            .candidate_benchmark_ready_count = expected_candidate_benchmark_ready_count,
+            .blocker_counts = expected_blocker_counts,
+        });
+        if (!std.mem.eql(u8, status, expected_status)) return error.InvalidMetalEvidence;
+    } else if (root.object.get("runtime_route_all_status") != null) {
+        return error.InvalidMetalEvidence;
+    }
+    if (production_regression_check) {
+        const status = jsonString(root.object.get("production_regression_status")) orelse return error.InvalidMetalEvidence;
+        const expected_status = productionRegressionEvidenceStatus(.{
+            .case_count = case_count,
+            .promotion_case_count = expected_promotion_case_count,
+            .promotion_ready_count = expected_promotion_ready_count,
+            .runtime_route_checked_count = expected_runtime_route_checked_count,
+            .provider_route_checked_count = expected_provider_route_checked_count,
+            .candidate_route_ready_count = expected_candidate_route_ready_count,
+            .candidate_benchmark_ready_count = expected_candidate_benchmark_ready_count,
+            .blocker_counts = expected_blocker_counts,
+        });
+        if (!std.mem.eql(u8, status, expected_status)) return error.InvalidMetalEvidence;
+    } else if (root.object.get("production_regression_status") != null) {
+        return error.InvalidMetalEvidence;
+    }
 
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
         if (artifact.backend != .metal or artifact.runtime_evidence_command.len == 0) continue;
@@ -3000,9 +3634,15 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     var actual_promotion_ready_count: usize = 0;
     var actual_runtime_route_checked_count: usize = 0;
     var actual_provider_route_checked_count: usize = 0;
+    var actual_candidate_route_ready_count: usize = 0;
+    var actual_candidate_benchmark_ready_count: usize = 0;
+    var actual_promotion_worst_repeat_speedup: ?f64 = null;
+    var actual_promotion_worst_repeat_case: ?[]const u8 = null;
+    var actual_benchmark_speedups = BenchmarkSpeedupSummary{};
     var actual_blocker_counts = PromotionBlockerCounts{};
     for (cases_value.array.items) |case_value| {
         if (case_value != .object) return error.InvalidMetalEvidence;
+        const case_name = jsonString(case_value.object.get("name")) orelse return error.InvalidMetalEvidence;
         const kernel_id = jsonString(case_value.object.get("kernel_id")) orelse return error.InvalidMetalEvidence;
         const kernel_required = if (require_kernel) |required| std.mem.eql(u8, kernel_id, required) else true;
         if (kernel_required) found_required_kernel = true;
@@ -3017,9 +3657,18 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
         if (generated_route_checked) actual_runtime_route_checked_count += 1;
         if (provider_route_checked) actual_provider_route_checked_count += 1;
         if (!evidenceCaseHasValidError(case_value)) return error.InvalidMetalEvidence;
-        _ = jsonBoolValue(case_value.object.get("benchmark_passed")) orelse return error.InvalidMetalEvidence;
+        const benchmark_passed = jsonBoolValue(case_value.object.get("benchmark_passed")) orelse return error.InvalidMetalEvidence;
         if (!evidenceCaseHasTiming(case_value)) return error.InvalidMetalEvidence;
         if (!evidenceCaseHasConsistentBenchmarkMath(case_value)) return error.InvalidMetalEvidence;
+        const case_handwritten_supported = jsonBoolValue(case_value.object.get("handwritten_baseline_supported")) orelse return error.InvalidMetalEvidence;
+        if (case_handwritten_supported) {
+            const measured_speedup = jsonF64(case_value.object.get("measured_speedup")) orelse return error.InvalidMetalEvidence;
+            actual_benchmark_speedups.add(case_name, measured_speedup, benchmark_passed);
+        }
+        if (generated_route_checked and (!quant_kernel_compiler.metalProviderRouteRequiredForKernel(kernel_id) or provider_route_checked)) {
+            actual_candidate_route_ready_count += 1;
+        }
+        if (benchmark_passed) actual_candidate_benchmark_ready_count += 1;
         const case_repeat_runs = jsonUsize(case_value.object.get("repeat_runs")) orelse return error.InvalidMetalEvidence;
         if (case_repeat_runs != repeat_runs) return error.InvalidMetalEvidence;
         const case_timing_aggregation = jsonString(case_value.object.get("timing_aggregation")) orelse return error.InvalidMetalEvidence;
@@ -3027,10 +3676,20 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
         const promotion_ready = jsonBoolValue(case_value.object.get("promotion_ready")) orelse return error.InvalidMetalEvidence;
         if (promotion_ready and promoted_kernel == null and !production_regression_check) return error.InvalidMetalEvidence;
         if (promotion_ready and promoted_kernel != null and !std.mem.eql(u8, kernel_id, promoted_kernel.?)) return error.InvalidMetalEvidence;
-        if (promoted_kernel) |kernel| {
-            if (std.mem.eql(u8, kernel_id, kernel)) actual_promotion_case_count += 1;
-        } else if (production_regression_check and productionMetalRuntimeKernel(kernel_id)) {
+        const selected_for_promotion = if (promoted_kernel) |kernel|
+            std.mem.eql(u8, kernel_id, kernel)
+        else
+            production_regression_check and productionMetalRuntimeKernel(kernel_id);
+        if (selected_for_promotion) {
             actual_promotion_case_count += 1;
+            const handwritten_supported = jsonBoolValue(case_value.object.get("handwritten_baseline_supported")) orelse return error.InvalidMetalEvidence;
+            if (handwritten_supported) {
+                const minimum_repeat_speedup = jsonF64(case_value.object.get("minimum_repeat_speedup")) orelse return error.InvalidMetalEvidence;
+                if (actual_promotion_worst_repeat_speedup == null or minimum_repeat_speedup < actual_promotion_worst_repeat_speedup.?) {
+                    actual_promotion_worst_repeat_speedup = minimum_repeat_speedup;
+                    actual_promotion_worst_repeat_case = case_name;
+                }
+            }
         }
         if (promotion_ready) actual_promotion_ready_count += 1;
         if (require_promotion_ready and require_kernel != null and !kernel_required and promotion_ready) return error.InvalidMetalEvidence;
@@ -3048,8 +3707,20 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     if (!found_required_kernel) return error.InvalidMetalEvidence;
     if (expected_promotion_case_count != actual_promotion_case_count) return error.InvalidMetalEvidence;
     if (expected_promotion_ready_count != actual_promotion_ready_count) return error.InvalidMetalEvidence;
+    if (expected_promotion_worst_repeat_speedup) |expected_worst| {
+        const actual_worst = actual_promotion_worst_repeat_speedup orelse return error.InvalidMetalEvidence;
+        if (!approximately(expected_worst, actual_worst, 0.000001)) return error.InvalidMetalEvidence;
+        const expected_case = expected_promotion_worst_repeat_case orelse return error.InvalidMetalEvidence;
+        const actual_case = actual_promotion_worst_repeat_case orelse return error.InvalidMetalEvidence;
+        if (!std.mem.eql(u8, expected_case, actual_case)) return error.InvalidMetalEvidence;
+    } else if (actual_promotion_worst_repeat_speedup != null or expected_promotion_worst_repeat_case != null) {
+        return error.InvalidMetalEvidence;
+    }
     if (expected_runtime_route_checked_count != actual_runtime_route_checked_count) return error.InvalidMetalEvidence;
     if (expected_provider_route_checked_count != actual_provider_route_checked_count) return error.InvalidMetalEvidence;
+    if (expected_candidate_route_ready_count != actual_candidate_route_ready_count) return error.InvalidMetalEvidence;
+    if (expected_candidate_benchmark_ready_count != actual_candidate_benchmark_ready_count) return error.InvalidMetalEvidence;
+    if (!actual_benchmark_speedups.eql(expected_benchmark_speedups)) return error.InvalidMetalEvidence;
     if (!expected_blocker_counts.eql(actual_blocker_counts)) return error.InvalidMetalEvidence;
     if (production_enabled and expected_promotion_case_count == 0 and !production_regression_check) return error.InvalidMetalEvidence;
 }
@@ -3114,6 +3785,51 @@ fn evidenceCasesHaveUniqueNames(cases: []const std.json.Value) bool {
             if (std.mem.eql(u8, name, other_name)) return false;
         }
     }
+    return true;
+}
+
+fn productionEvidenceCasesMatchCompilerManifest(cases: []const std.json.Value) bool {
+    if (cases.len != quant_kernel_compiler.first_metal_production_benchmark_case_count) return false;
+    for (cases, quant_kernel_compiler.first_metal_production_benchmark_cases) |case_value, expected| {
+        if (!productionEvidenceCaseMatchesCompilerManifest(case_value, expected)) return false;
+    }
+    return true;
+}
+
+fn productionEvidenceCaseMatchesCompilerManifest(case_value: std.json.Value, expected: quant_kernel_compiler.MetalProductionBenchmarkCase) bool {
+    if (case_value != .object) return false;
+    const name = jsonString(case_value.object.get("name")) orelse return false;
+    if (!std.mem.eql(u8, name, expected.name)) return false;
+    const backend = jsonString(case_value.object.get("backend")) orelse return false;
+    if (!std.mem.eql(u8, backend, "metal")) return false;
+    const kernel_id = jsonString(case_value.object.get("kernel_id")) orelse return false;
+    if (!std.mem.eql(u8, kernel_id, expected.kernel_id)) return false;
+    const production_kernel_id = jsonString(case_value.object.get("production_kernel_id")) orelse return false;
+    if (!std.mem.eql(u8, production_kernel_id, expected.production_kernel_id)) return false;
+    const source_path = jsonString(case_value.object.get("generated_source_path")) orelse return false;
+    if (!std.mem.eql(u8, source_path, expected.generated_source_path)) return false;
+    const source_fingerprint = jsonU64(case_value.object.get("generated_source_fingerprint")) orelse return false;
+    if (source_fingerprint != expected.generated_source_fingerprint) return false;
+    const check_command = jsonString(case_value.object.get("metal_check_command")) orelse return false;
+    if (!std.mem.eql(u8, check_command, expected.check_command)) return false;
+    const format = jsonString(case_value.object.get("format")) orelse return false;
+    if (!std.mem.eql(u8, format, @tagName(expected.format))) return false;
+    const row_bucket = jsonString(case_value.object.get("row_bucket")) orelse return false;
+    if (!std.mem.eql(u8, row_bucket, @tagName(expected.row_bucket))) return false;
+    const epilogue = jsonString(case_value.object.get("epilogue")) orelse return false;
+    if (!std.mem.eql(u8, epilogue, @tagName(expected.epilogue))) return false;
+    const rows = jsonUsize(case_value.object.get("rows")) orelse return false;
+    if (rows != expected.rows) return false;
+    const in_dim = jsonUsize(case_value.object.get("in_dim")) orelse return false;
+    if (in_dim != expected.in_dim) return false;
+    const out_dim = jsonUsize(case_value.object.get("out_dim")) orelse return false;
+    if (out_dim != expected.out_dim) return false;
+    const threads_per_threadgroup = jsonUsize(case_value.object.get("threads_per_threadgroup")) orelse return false;
+    if (threads_per_threadgroup != expected.threads_per_threadgroup) return false;
+    const cols_per_threadgroup = jsonUsize(case_value.object.get("cols_per_threadgroup")) orelse return false;
+    if (cols_per_threadgroup != expected.cols_per_threadgroup) return false;
+    const tolerance = jsonF64(case_value.object.get("tolerance_abs")) orelse return false;
+    if (!approximately(tolerance, @as(f64, @floatCast(expected.tolerance_abs)), 0.0000001)) return false;
     return true;
 }
 
@@ -3255,6 +3971,18 @@ fn evidenceCaseMatchesCheck(
     if (decode_runtime_route_checked != generated_route_checked) return false;
     const generated_route_expected = generatedRouteSupported(check) or (selected_for_route and enableEnvForGeneratedCandidateRoute(check) != null);
     if (generated_route_checked != generated_route_expected) return false;
+    const generated_timing_route = jsonString(case_value.object.get("generated_timing_route")) orelse return false;
+    const expected_timing_route = if ((selected_for_route or selected_for_promotion) and generated_route_expected)
+        "decode_runtime_generated"
+    else
+        "standalone_generated";
+    if (!std.mem.eql(u8, generated_timing_route, expected_timing_route)) return false;
+    const generated_timing_scope = jsonString(case_value.object.get("generated_timing_scope")) orelse return false;
+    const expected_timing_scope = if ((selected_for_route or selected_for_promotion) and generated_route_expected)
+        "decode_runtime_active_frame_batch"
+    else
+        "standalone_command_buffer";
+    if (!std.mem.eql(u8, generated_timing_scope, expected_timing_scope)) return false;
     const baseline_supported = jsonBoolValue(case_value.object.get("handwritten_baseline_supported")) orelse return false;
     if (baseline_supported != handwrittenBaselineSupported(check)) return false;
     if (!baseline_supported) {
@@ -3352,6 +4080,14 @@ fn evidenceCaseHasConsistentPromotionBlocker(case_value: std.json.Value) bool {
         const minimum_repeat_speedup = jsonF64(case_value.object.get("minimum_repeat_speedup")) orelse return false;
         return std.mem.eql(u8, blocker, quant_kernel_compiler.metalPromotionSpeedupBlocker(measured_speedup, minimum_repeat_speedup));
     }
+    if (blocker.len == 0) {
+        const production_route = jsonString(case_value.object.get("production_route")) orelse return false;
+        if (!std.mem.eql(u8, production_route, quant_kernel_compiler.loweringRouteName(.generated_production))) return false;
+        const kernel_id = jsonString(case_value.object.get("kernel_id")) orelse return false;
+        const generated_route_checked = jsonBoolValue(case_value.object.get("generated_route_checked")) orelse return false;
+        const provider_route_checked = jsonBoolValue(case_value.object.get("provider_route_checked")) orelse return false;
+        return generated_route_checked and (!quant_kernel_compiler.metalProviderRouteRequiredForKernel(kernel_id) or provider_route_checked);
+    }
     if (std.mem.eql(u8, blocker, quant_kernel_compiler.metal_blocker_missing_generated_route)) return true;
     if (std.mem.eql(u8, blocker, quant_kernel_compiler.metal_blocker_missing_provider_route)) return true;
     if (std.mem.eql(u8, blocker, quant_kernel_compiler.metal_blocker_runtime_route_only)) {
@@ -3368,6 +4104,16 @@ fn averageUsFromUsize(elapsed_nanos: u64, measure_iters: usize) f64 {
 
 fn approximately(actual: f64, expected: f64, tolerance: f64) bool {
     return std.math.isFinite(actual) and std.math.isFinite(expected) and @abs(actual - expected) <= tolerance;
+}
+
+fn nullableF64Approximately(actual: ?f64, expected: ?f64, tolerance: f64) bool {
+    if (actual == null or expected == null) return actual == null and expected == null;
+    return approximately(actual.?, expected.?, tolerance);
+}
+
+fn nullableStringEql(actual: ?[]const u8, expected: ?[]const u8) bool {
+    if (actual == null or expected == null) return actual == null and expected == null;
+    return std.mem.eql(u8, actual.?, expected.?);
 }
 
 fn jsonString(value: ?std.json.Value) ?[]const u8 {
@@ -3411,6 +4157,33 @@ fn jsonF64(value: ?std.json.Value) ?f64 {
         .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
         else => null,
     };
+}
+
+fn jsonNullableF64(value: std.json.Value, out: *?f64) bool {
+    switch (value) {
+        .null => {
+            out.* = null;
+            return true;
+        },
+        else => {
+            out.* = jsonF64(value) orelse return false;
+            return true;
+        },
+    }
+}
+
+fn jsonNullableString(value: std.json.Value, out: *?[]const u8) bool {
+    switch (value) {
+        .null => {
+            out.* = null;
+            return true;
+        },
+        .string => |text| {
+            out.* = text;
+            return true;
+        },
+        else => return false,
+    }
 }
 
 fn jsonU64Array(value: std.json.Value, out: *[max_evidence_repeat_runs]u64) ?[]u64 {
@@ -3633,7 +4406,11 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer parsed.deinit();
 
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"evidence_contract\":\"antfly.quant_kernel_metal_evidence.v1\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v8\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_timing_route\":\"standalone_generated\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_timing_scope\":\"standalone_command_buffer\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_worst_repeat_speedup\":null"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_worst_repeat_case\":null"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"production_enabled\":false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_case_count\":0"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_ready_count\":0"));
@@ -3648,6 +4425,8 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"fallback_reason\":\"unsupported_epilogue\""));
     var expected_generated_route_checked: usize = 0;
     var expected_provider_route_checked: usize = 0;
+    var expected_candidate_route_ready: usize = 0;
+    var expected_candidate_benchmark_ready: usize = 0;
     var expected_generated_production: usize = 0;
     var expected_handwritten_production: usize = 0;
     var expected_candidate_dev: usize = 0;
@@ -3655,10 +4434,24 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     var expected_fallback_missing: usize = 0;
     var expected_fallback_runtime_not_wired: usize = 0;
     var expected_fallback_none: usize = 0;
-    for (metal_runtime_checks) |check| {
+    var expected_benchmark_speedups = BenchmarkSpeedupSummary{};
+    for (metal_runtime_checks, results) |check, result| {
         const lowering = loweringForCheck(check);
         if (generatedRouteSupported(check)) expected_generated_route_checked += 1;
         if (providerRouteSupported(check)) expected_provider_route_checked += 1;
+        const provider_route_needed = quant_kernel_compiler.metalProviderRouteRequiredForKernel(check.kernel_name);
+        if (result.max_error <= check.tolerance and result.generated_route_checked and (!provider_route_needed or result.provider_route_checked)) {
+            expected_candidate_route_ready += 1;
+        }
+        if (result.handwritten_elapsed_nanos) |handwritten_elapsed| {
+            const measured_speedup = speedup(handwritten_elapsed, result.elapsed_nanos);
+            const minimum_repeat_speedup = result.minimum_repeat_speedup orelse measured_speedup;
+            const benchmark_passed = std.mem.eql(u8, quant_kernel_compiler.metalPromotionSpeedupBlocker(measured_speedup, minimum_repeat_speedup), quant_kernel_compiler.metal_blocker_none);
+            if (benchmark_passed) {
+                expected_candidate_benchmark_ready += 1;
+            }
+            expected_benchmark_speedups.add(check.name, measured_speedup, benchmark_passed);
+        }
         switch (lowering.production_route) {
             .generated_production => expected_generated_production += 1,
             .handwritten_production => expected_handwritten_production += 1,
@@ -3693,17 +4486,39 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectEqual(expected_fallback_none, std.mem.count(u8, actual, "\"route_fallback_reason\":\"none\""));
     try std.testing.expectEqual(expected_generated_route_checked, jsonUsize(parsed.value.object.get("runtime_route_checked_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(expected_provider_route_checked, jsonUsize(parsed.value.object.get("provider_route_checked_count")) orelse return error.InvalidMetalEvidence);
-    try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"speedup_gate_missing\""), jsonUsize(parsed.value.object.get("promotion_blocker_speedup_gate_missing_count")) orelse return error.InvalidMetalEvidence);
-    try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"unstable_benchmark_timing\""), jsonUsize(parsed.value.object.get("promotion_blocker_unstable_benchmark_timing_count")) orelse return error.InvalidMetalEvidence);
+    try std.testing.expectEqual(expected_candidate_route_ready, jsonUsize(parsed.value.object.get("candidate_route_ready_count")) orelse return error.InvalidMetalEvidence);
+    try std.testing.expectEqual(expected_candidate_benchmark_ready, jsonUsize(parsed.value.object.get("candidate_benchmark_ready_count")) orelse return error.InvalidMetalEvidence);
+    try std.testing.expect(expected_benchmark_speedups.eql(try benchmarkSpeedupSummaryFromRoot(parsed.value)));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_supported_count\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_speedup_min_case\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_speedup_max_case\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"benchmark_speedup_avg\":"));
+    const expected_speedup_blockers = std.mem.count(u8, actual, "\"promotion_blocker\":\"speedup_gate_missing\"");
+    const expected_unstable_blockers = std.mem.count(u8, actual, "\"promotion_blocker\":\"unstable_benchmark_timing\"");
+    try std.testing.expectEqual(expected_speedup_blockers, jsonUsize(parsed.value.object.get("promotion_blocker_speedup_gate_missing_count")) orelse return error.InvalidMetalEvidence);
+    try std.testing.expectEqual(expected_unstable_blockers, jsonUsize(parsed.value.object.get("promotion_blocker_unstable_benchmark_timing_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"runtime_route_only\""), jsonUsize(parsed.value.object.get("promotion_blocker_runtime_route_only_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"missing_metal_generated_route_evidence\""), jsonUsize(parsed.value.object.get("promotion_blocker_missing_generated_route_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"missing_metal_provider_route_evidence\""), jsonUsize(parsed.value.object.get("promotion_blocker_missing_provider_route_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"unsupported_handwritten_baseline\""), jsonUsize(parsed.value.object.get("promotion_blocker_unsupported_handwritten_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(std.mem.count(u8, actual, "\"promotion_blocker\":\"dev_only_candidate\""), jsonUsize(parsed.value.object.get("promotion_blocker_dev_only_candidate_count")) orelse return error.InvalidMetalEvidence);
+    const expected_slow_fallbacks = expected_speedup_blockers + expected_unstable_blockers;
+    try std.testing.expectEqual(expected_slow_fallbacks, jsonUsize(parsed.value.object.get("slow_fallback_count")) orelse return error.InvalidMetalEvidence);
+    const expected_top_slow_reason = if (expected_slow_fallbacks == 0)
+        quant_kernel_compiler.metal_blocker_none
+    else if (expected_speedup_blockers >= expected_unstable_blockers)
+        quant_kernel_compiler.metal_blocker_speedup_gate_missing
+    else
+        quant_kernel_compiler.metal_blocker_unstable_benchmark_timing;
+    const expected_top_slow_count = if (expected_slow_fallbacks == 0) 0 else @max(expected_speedup_blockers, expected_unstable_blockers);
+    try std.testing.expectEqualStrings(expected_top_slow_reason, jsonString(parsed.value.object.get("top_slow_fallback_reason")) orelse return error.InvalidMetalEvidence);
+    try std.testing.expectEqual(expected_top_slow_count, jsonUsize(parsed.value.object.get("top_slow_fallback_count")) orelse return error.InvalidMetalEvidence);
     const summary = try evidenceSummaryFromJson(std.testing.allocator, actual);
     try std.testing.expectEqual(metal_runtime_checks.len, summary.case_count);
     try std.testing.expectEqual(expected_generated_route_checked, summary.runtime_route_checked_count);
     try std.testing.expectEqual(expected_provider_route_checked, summary.provider_route_checked_count);
+    try std.testing.expectEqual(expected_candidate_route_ready, summary.candidate_route_ready_count);
+    try std.testing.expectEqual(expected_candidate_benchmark_ready, summary.candidate_benchmark_ready_count);
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         const promotion_ready = quant_kernel_compiler.artifactHasPromotionEvidence(artifact);
@@ -3723,7 +4538,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_ready\":false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_blocker\":\"dev_only_candidate\""));
 
-    const route_kernel = quant_kernel_compiler.first_general_metal_q8_bias_gelu_kernel_id;
+    const route_kernel = quant_kernel_compiler.first_general_metal_q8_kernel_id;
     var route_checks: [metal_runtime_checks.len]CheckCase = undefined;
     var route_results: [metal_runtime_checks.len]CheckResult = undefined;
     var route_count: usize = 0;
@@ -3732,6 +4547,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         route_checks[route_count] = check;
         route_results[route_count] = result;
         route_results[route_count].generated_route_checked = true;
+        route_results[route_count].generated_timing_route = .decode_runtime_generated;
         route_results[route_count].provider_route_checked = true;
         route_count += 1;
     }
@@ -3745,7 +4561,9 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "\"runtime_route_kernel\":\"" ++ route_kernel ++ "\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "--runtime-route-kernel " ++ route_kernel));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "\"generated_route_checked\":true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "\"promotion_blocker\":\"runtime_route_only\""));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, route_actual, "\"production_route\":\"generated_production\""));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, route_actual, "\"promotion_blocker\":\"\""));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, route_actual, "\"promotion_blocker\":\"runtime_route_only\""));
     try checkEvidenceFile(std.testing.allocator, route_path, false, false, null);
     try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceFile(std.testing.allocator, route_path, true, false, route_kernel));
 
@@ -3758,6 +4576,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         route_all_checks[route_all_count] = check;
         route_all_results[route_all_count] = result;
         route_all_results[route_all_count].generated_route_checked = true;
+        route_all_results[route_all_count].generated_timing_route = .decode_runtime_generated;
         route_all_results[route_all_count].provider_route_checked = providerRouteSupported(check) or providerCandidateRouteSupported(check);
         if (route_all_results[route_all_count].provider_route_checked) route_all_provider_count += 1;
         route_all_count += 1;
@@ -3771,16 +4590,23 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(route_all_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"runtime_route_kernel\":null"));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"runtime_route_all\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"runtime_route_all_status\":\"runtime_route_all_ok\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "--runtime-route-all"));
     try std.testing.expectEqual(quant_kernel_compiler.first_metal_runtime_route_all_expected_case_count, route_all_count);
     try std.testing.expectEqual(quant_kernel_compiler.first_metal_runtime_route_all_expected_provider_route_count, route_all_provider_count);
     try std.testing.expectEqual(route_all_count, std.mem.count(u8, route_all_actual, "\"generated_route_checked\":true"));
     try std.testing.expectEqual(route_all_provider_count, std.mem.count(u8, route_all_actual, "\"provider_route_checked\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"promotion_blocker\":\"runtime_route_only\""));
+    const route_all_generated_production_count = std.mem.count(u8, route_all_actual, "\"production_route\":\"generated_production\"");
+    try std.testing.expect(route_all_generated_production_count > 0);
+    const route_all_generated_production_ready_count = std.mem.count(u8, route_all_actual, "\"promotion_blocker\":\"\"");
+    try std.testing.expect(route_all_generated_production_ready_count > 0);
+    try std.testing.expect(route_all_generated_production_ready_count <= route_all_generated_production_count);
     var parsed_route_all = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, route_all_actual, .{});
     defer parsed_route_all.deinit();
     try std.testing.expectEqual(route_all_count, jsonUsize(parsed_route_all.value.object.get("runtime_route_checked_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(route_all_provider_count, jsonUsize(parsed_route_all.value.object.get("provider_route_checked_count")) orelse return error.InvalidMetalEvidence);
+    try std.testing.expectEqual(route_all_count, jsonUsize(parsed_route_all.value.object.get("candidate_route_ready_count")) orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(std.mem.count(u8, route_all_actual, "\"promotion_blocker\":\"runtime_route_only\""), jsonUsize(parsed_route_all.value.object.get("promotion_blocker_runtime_route_only_count")) orelse return error.InvalidMetalEvidence);
     try checkEvidenceFile(std.testing.allocator, route_all_path, false, true, null);
     try std.testing.expectError(error.MetalEvidenceRuntimeRouteAllMissing, checkEvidenceFile(std.testing.allocator, route_path, false, true, null));
@@ -3801,6 +4627,23 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const stale_route_all_provider_summary = try replaceOnce(std.testing.allocator, route_all_actual, route_all_provider_count_field, stale_route_all_provider_count_field);
     defer std.testing.allocator.free(stale_route_all_provider_summary);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_route_all_provider_summary, false, true, null));
+    const route_all_route_ready_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"candidate_route_ready_count\":{d}", .{route_all_count});
+    defer std.testing.allocator.free(route_all_route_ready_count_field);
+    const stale_route_all_route_ready_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"candidate_route_ready_count\":{d}", .{route_all_count - 1});
+    defer std.testing.allocator.free(stale_route_all_route_ready_count_field);
+    const stale_route_all_route_ready_summary = try replaceOnce(std.testing.allocator, route_all_actual, route_all_route_ready_count_field, stale_route_all_route_ready_count_field);
+    defer std.testing.allocator.free(stale_route_all_route_ready_summary);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_route_all_route_ready_summary, false, true, null));
+    const stale_route_all_status = try replaceOnce(std.testing.allocator, route_all_actual, "\"runtime_route_all_status\":\"runtime_route_all_ok\"", "\"runtime_route_all_status\":\"runtime_route_all_blocked\"");
+    defer std.testing.allocator.free(stale_route_all_status);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_route_all_status, false, true, null));
+    const slow_fallback_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"slow_fallback_count\":{d}", .{jsonUsize(parsed_route_all.value.object.get("slow_fallback_count")) orelse return error.InvalidMetalEvidence});
+    defer std.testing.allocator.free(slow_fallback_count_field);
+    const stale_slow_fallback_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"slow_fallback_count\":{d}", .{(jsonUsize(parsed_route_all.value.object.get("slow_fallback_count")) orelse return error.InvalidMetalEvidence) + 1});
+    defer std.testing.allocator.free(stale_slow_fallback_count_field);
+    const stale_slow_fallback_summary = try replaceOnce(std.testing.allocator, route_all_actual, slow_fallback_count_field, stale_slow_fallback_count_field);
+    defer std.testing.allocator.free(stale_slow_fallback_summary);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_slow_fallback_summary, false, true, null));
 
     var promoted_artifact = quant_kernel_compiler.first_generated_artifacts[1];
     promoted_artifact.source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal";
@@ -3849,8 +4692,8 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const bad = try replaceOnce(
         std.testing.allocator,
         actual,
-        quant_kernel_compiler.first_general_metal_q4_artifact_source_path,
-        "src/ops/metal/generated/missing_q4_k_small_batch.metal",
+        quant_kernel_compiler.first_general_metal_q4_0_source_path,
+        "src/ops/metal/generated/missing_q4_0_small_batch.metal",
     );
     defer std.testing.allocator.free(bad);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, bad, false, false, null));
@@ -3858,7 +4701,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const q4_fingerprint = try std.fmt.allocPrint(
         std.testing.allocator,
         "{d}",
-        .{std.hash.Wyhash.hash(0, quant_kernel_compiler.firstGeneralMetalQ4Source())},
+        .{std.hash.Wyhash.hash(0, quant_kernel_compiler.firstGeneralMetalQ40Source())},
     );
     defer std.testing.allocator.free(q4_fingerprint);
     const stale = try replaceOnce(std.testing.allocator, actual, q4_fingerprint, "0");
@@ -3868,6 +4711,9 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const parallel = try replaceOnce(std.testing.allocator, actual, "\"benchmark_mode\":\"sequential\"", "\"benchmark_mode\":\"parallel\"");
     defer std.testing.allocator.free(parallel);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, parallel, false, false, null));
+    const stale_schema = try replaceOnce(std.testing.allocator, actual, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v8\"", "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v3\"");
+    defer std.testing.allocator.free(stale_schema);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_schema, false, false, null));
 
     const wrong_command = try replaceOnce(
         std.testing.allocator,
@@ -3938,6 +4784,14 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(wrong_blocker);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, wrong_blocker, false, false, null));
 
+    const expected_benchmark_supported_field = try std.fmt.allocPrint(std.testing.allocator, "\"benchmark_supported_count\":{d}", .{expected_benchmark_speedups.supported_count});
+    defer std.testing.allocator.free(expected_benchmark_supported_field);
+    const stale_benchmark_supported_field = try std.fmt.allocPrint(std.testing.allocator, "\"benchmark_supported_count\":{d}", .{expected_benchmark_speedups.supported_count + 1});
+    defer std.testing.allocator.free(stale_benchmark_supported_field);
+    const stale_benchmark_summary = try replaceOnce(std.testing.allocator, actual, expected_benchmark_supported_field, stale_benchmark_supported_field);
+    defer std.testing.allocator.free(stale_benchmark_summary);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_benchmark_summary, false, false, null));
+
     const promotion_repeat_runs: u32 = @intCast(quant_kernel_compiler.metal_promotion_repeat_runs);
     var repeat_results = results;
     for (&repeat_results) |*result| {
@@ -3961,6 +4815,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         production_checks[production_count] = check;
         production_results[production_count] = result;
         production_results[production_count].generated_route_checked = true;
+        production_results[production_count].generated_timing_route = .decode_runtime_generated;
         production_results[production_count].provider_route_checked = providerRouteSupported(check);
         production_results[production_count].handwritten_elapsed_nanos = result.elapsed_nanos * 2;
         production_results[production_count].minimum_repeat_speedup = 2.0;
@@ -3980,15 +4835,64 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try writeEvidence(std.testing.allocator, production_regression_path, production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false);
     const production_regression_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, production_regression_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(production_regression_actual);
-    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_enabled\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_regression_check\":true"));
+    const expected_compiler_manifest_schema = try std.fmt.allocPrint(std.testing.allocator, "\"compiler_benchmark_manifest_schema\":\"{s}\"", .{quant_kernel_compiler.first_benchmark_manifest_schema});
+    defer std.testing.allocator.free(expected_compiler_manifest_schema);
+    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, expected_compiler_manifest_schema));
+    const expected_compiler_manifest_case_count = try std.fmt.allocPrint(std.testing.allocator, "\"compiler_benchmark_manifest_case_count\":{d}", .{quant_kernel_compiler.first_metal_production_benchmark_case_count});
+    defer std.testing.allocator.free(expected_compiler_manifest_case_count);
+    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, expected_compiler_manifest_case_count));
+    const expected_compiler_manifest_fingerprint = try std.fmt.allocPrint(std.testing.allocator, "\"compiler_benchmark_manifest_case_fingerprint\":{d}", .{quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint()});
+    defer std.testing.allocator.free(expected_compiler_manifest_fingerprint);
+    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, expected_compiler_manifest_fingerprint));
+    if (production_count == 0) {
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"case_count\":0"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_regression_status\":\"production_regression_skipped\""));
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"promotion_worst_repeat_speedup\":null"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"promotion_worst_repeat_case\":null"));
+    } else {
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_enabled\":true"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_regression_status\":\"production_regression_ok\""));
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"promotion_worst_repeat_speedup\":2.000000"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"promotion_worst_repeat_case\":"));
+    }
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, " --production-regression-check"));
     try std.testing.expectEqual(production_count, std.mem.count(u8, production_regression_actual, "\"promotion_ready\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"candidate_route_ready_count\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"candidate_benchmark_ready_count\":"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, production_regression_actual, "\"promotion_blocker\":\"speedup_gate_missing\""));
-    try checkEvidenceFile(std.testing.allocator, production_regression_path, true, false, null);
+    try checkEvidenceFile(std.testing.allocator, production_regression_path, production_count != 0, false, null);
+    const production_summary = try checkEvidenceFileWithSummary(std.testing.allocator, production_regression_path, production_count != 0, false, null);
+    try std.testing.expect(production_summary.production_regression_check);
+    try std.testing.expectEqual(quant_kernel_compiler.first_metal_production_benchmark_case_count, production_summary.compiler_benchmark_manifest_case_count orelse return error.InvalidMetalEvidence);
+    try std.testing.expectEqual(quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint(), production_summary.compiler_benchmark_manifest_case_fingerprint orelse return error.InvalidMetalEvidence);
+    const stale_production_manifest_case = try replaceOnce(std.testing.allocator, production_regression_actual, "\"name\":\"q4_k_rows_2_8_bias_gelu\"", "\"name\":\"q4_k_rows_2_8_bias_gelu_stale\"");
+    defer std.testing.allocator.free(stale_production_manifest_case);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_manifest_case, false, false, null));
+    const stale_production_manifest_count = try replaceOnce(std.testing.allocator, production_regression_actual, expected_compiler_manifest_case_count, "\"compiler_benchmark_manifest_case_count\":1");
+    defer std.testing.allocator.free(stale_production_manifest_count);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_manifest_count, false, false, null));
+    const stale_production_manifest_fingerprint = try replaceOnce(std.testing.allocator, production_regression_actual, expected_compiler_manifest_fingerprint, "\"compiler_benchmark_manifest_case_fingerprint\":0");
+    defer std.testing.allocator.free(stale_production_manifest_fingerprint);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_manifest_fingerprint, false, false, null));
     const stale_production_regression = try replaceOnce(std.testing.allocator, production_regression_actual, "\"production_regression_check\":true", "\"production_regression_check\":false");
     defer std.testing.allocator.free(stale_production_regression);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_regression, false, false, null));
+    const expected_status = if (production_count == 0) "production_regression_skipped" else "production_regression_ok";
+    const expected_status_json = try std.fmt.allocPrint(std.testing.allocator, "\"production_regression_status\":\"{s}\"", .{expected_status});
+    defer std.testing.allocator.free(expected_status_json);
+    const stale_production_regression_status = try replaceOnce(
+        std.testing.allocator,
+        production_regression_actual,
+        expected_status_json,
+        "\"production_regression_status\":\"production_regression_timing_drift\"",
+    );
+    defer std.testing.allocator.free(stale_production_regression_status);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_regression_status, false, false, null));
+    const expected_worst = if (production_count == 0) "\"promotion_worst_repeat_speedup\":null" else "\"promotion_worst_repeat_speedup\":2.000000";
+    const stale_production_regression_worst = try replaceOnce(std.testing.allocator, production_regression_actual, expected_worst, "\"promotion_worst_repeat_speedup\":1.000000");
+    defer std.testing.allocator.free(stale_production_regression_worst);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_regression_worst, false, false, null));
 
     const repeat_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence-repeat.json" });
     defer std.testing.allocator.free(repeat_path);
@@ -3996,7 +4900,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const repeat_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, repeat_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(repeat_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_runs\":5"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"warmup_repeat_runs\":1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"warmup_repeat_runs\":2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"timing_aggregation\":\"median\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_generated_ns\":["));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_handwritten_ns\":["));
@@ -4027,6 +4931,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     for (&q6_promotion_results, metal_runtime_checks) |*result, check| {
         if (std.mem.eql(u8, check.kernel_name, quant_kernel_compiler.first_general_metal_q6_kernel_id)) {
             result.generated_route_checked = true;
+            result.generated_timing_route = .decode_runtime_generated;
             result.provider_route_checked = true;
         }
     }
@@ -4049,6 +4954,10 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"production_enabled\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_case_count\":2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_ready_count\":2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"candidate_route_ready_count\":2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"candidate_benchmark_ready_count\":2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_worst_repeat_speedup\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_worst_repeat_case\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "--promotion-ready-kernel " ++ quant_kernel_compiler.first_general_metal_q6_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_ready\":true,\"promotion_blocker\":\"\""));
     try checkEvidenceJson(std.testing.allocator, promoted_actual, false, false, null);
@@ -4057,6 +4966,9 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const stale_promoted_ready_count = try replaceOnce(std.testing.allocator, promoted_actual, "\"promotion_ready_count\":2", "\"promotion_ready_count\":1");
     defer std.testing.allocator.free(stale_promoted_ready_count);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_promoted_ready_count, false, false, null));
+    const stale_promoted_benchmark_count = try replaceOnce(std.testing.allocator, promoted_actual, "\"candidate_benchmark_ready_count\":2", "\"candidate_benchmark_ready_count\":1");
+    defer std.testing.allocator.free(stale_promoted_benchmark_count);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_promoted_benchmark_count, false, false, null));
     const wrong_promoted_case_kernel = try replaceOnce(
         std.testing.allocator,
         promoted_actual,
@@ -4077,6 +4989,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     for (&q5_promotion_results, metal_runtime_checks) |*result, check| {
         if (std.mem.eql(u8, check.kernel_name, quant_kernel_compiler.first_general_metal_q5_kernel_id)) {
             result.generated_route_checked = true;
+            result.generated_timing_route = .decode_runtime_generated;
             result.provider_route_checked = true;
         }
     }
@@ -4098,9 +5011,15 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(slow_promoted_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_case_count\":2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_ready_count\":0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"candidate_route_ready_count\":2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"candidate_benchmark_ready_count\":0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_worst_repeat_speedup\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_worst_repeat_case\":"));
     const slow_summary = try evidenceSummaryFromJson(std.testing.allocator, slow_promoted_actual);
     try std.testing.expectEqual(@as(usize, 2), slow_summary.promotion_case_count);
     try std.testing.expectEqual(@as(usize, 0), slow_summary.promotion_ready_count);
+    try std.testing.expectEqual(@as(usize, 2), slow_summary.candidate_route_ready_count);
+    try std.testing.expectEqual(@as(usize, 0), slow_summary.candidate_benchmark_ready_count);
     try std.testing.expectEqual(@as(usize, 2), slow_summary.blocker_counts.speedup_gate_missing);
     try checkEvidenceJson(std.testing.allocator, slow_promoted_actual, false, false, null);
     try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceJson(std.testing.allocator, slow_promoted_actual, true, false, quant_kernel_compiler.first_general_metal_q5_kernel_id));
@@ -4162,7 +5081,7 @@ test "quant kernel metal runtime promotion blocker reports unstable repeat timin
     try std.testing.expect(promotionBlockerEvidenceMatches(.{ .unstable_benchmark_timing = 1 }, quant_kernel_compiler.metal_blocker_speedup_gate_missing));
     try std.testing.expect(promotionBlockerEvidenceTimingDrifted(.{ .unstable_benchmark_timing = 1 }, quant_kernel_compiler.metal_blocker_speedup_gate_missing));
     try std.testing.expect(promotionBlockerEvidenceMatches(.{ .speedup_gate_missing = 1 }, quant_kernel_compiler.metal_blocker_unstable_benchmark_timing));
-    try std.testing.expect(promotionBlockerEvidenceTimingDrifted(.{ .speedup_gate_missing = 1 }, quant_kernel_compiler.metal_blocker_unstable_benchmark_timing));
+    try std.testing.expect(!promotionBlockerEvidenceTimingDrifted(.{ .speedup_gate_missing = 1 }, quant_kernel_compiler.metal_blocker_unstable_benchmark_timing));
     try std.testing.expect(!promotionBlockerEvidenceTimingDrifted(.{ .speedup_gate_missing = 1 }, quant_kernel_compiler.metal_blocker_speedup_gate_missing));
     try std.testing.expect(!promotionBlockerEvidenceMatches(.{ .runtime_route_only = 1 }, quant_kernel_compiler.metal_blocker_speedup_gate_missing));
     try std.testing.expect(promotionBlockerEvidenceCleared(
@@ -4211,14 +5130,67 @@ test "quant kernel metal runtime promotion blocker reports unstable repeat timin
     ));
     try enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 0 }, true);
     try enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 1 }, false);
+    try enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 1, .unconfirmed_cleared_blocker_count = 1 }, true);
+    try std.testing.expectError(error.MetalBlockerEvidenceCleared, enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 1, .confirmed_cleared_blocker_count = 1 }, true));
     try std.testing.expectError(error.MetalBlockerEvidenceCleared, enforceClearedBlockerPolicy(.{ .cleared_blocker_count = 1 }, true));
+    try std.testing.expectEqualStrings("blocker_evidence_ok", blockerEvidenceAuditStatus(.{}));
+    try std.testing.expectEqualStrings("blocker_evidence_timing_drift", blockerEvidenceAuditStatus(.{ .timing_blocker_drift_count = 1 }));
+    try std.testing.expectEqualStrings("blocker_evidence_production_regression_guarded", blockerEvidenceAuditStatus(.{ .production_regression_guarded_count = 1 }));
+    try std.testing.expectEqualStrings("blocker_evidence_cleared", blockerEvidenceAuditStatus(.{ .cleared_blocker_count = 1 }));
+    try std.testing.expectEqualStrings("blocker_evidence_unconfirmed_cleared", blockerEvidenceAuditStatus(.{
+        .cleared_blocker_count = 1,
+        .unconfirmed_cleared_blocker_count = 1,
+        .timing_blocker_drift_count = 1,
+    }));
+    try std.testing.expectEqualStrings("blocker_evidence_confirmed_cleared", blockerEvidenceAuditStatus(.{
+        .cleared_blocker_count = 1,
+        .confirmed_cleared_blocker_count = 1,
+        .unconfirmed_cleared_blocker_count = 1,
+    }));
+    try std.testing.expect(evidenceSummaryHasRouteReadyCoverage(.{
+        .case_count = 2,
+        .promotion_case_count = 2,
+        .promotion_ready_count = 1,
+        .runtime_route_checked_count = 2,
+        .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 2,
+        .blocker_counts = .{ .unstable_benchmark_timing = 1 },
+    }));
+    try std.testing.expect(!evidenceSummaryHasRouteReadyCoverage(.{
+        .case_count = 2,
+        .promotion_case_count = 2,
+        .promotion_ready_count = 1,
+        .runtime_route_checked_count = 2,
+        .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 1,
+        .blocker_counts = .{ .unstable_benchmark_timing = 1 },
+    }));
     try std.testing.expect(!productionRegressionEvidenceHasHardBlocker(.{
         .case_count = 2,
         .promotion_case_count = 2,
         .promotion_ready_count = 1,
         .runtime_route_checked_count = 2,
         .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 2,
         .blocker_counts = .{ .unstable_benchmark_timing = 1 },
+    }));
+    try std.testing.expectEqualStrings("production_regression_timing_drift", productionRegressionEvidenceStatus(.{
+        .case_count = 2,
+        .promotion_case_count = 2,
+        .promotion_ready_count = 1,
+        .runtime_route_checked_count = 2,
+        .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 2,
+        .blocker_counts = .{ .unstable_benchmark_timing = 1 },
+    }));
+    try std.testing.expect(productionRegressionEvidenceHasHardBlocker(.{
+        .case_count = 2,
+        .promotion_case_count = 2,
+        .promotion_ready_count = 2,
+        .runtime_route_checked_count = 2,
+        .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 1,
+        .blocker_counts = .{},
     }));
     try std.testing.expect(productionRegressionEvidenceHasHardBlocker(.{
         .case_count = 2,
@@ -4226,7 +5198,34 @@ test "quant kernel metal runtime promotion blocker reports unstable repeat timin
         .promotion_ready_count = 1,
         .runtime_route_checked_count = 2,
         .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 2,
         .blocker_counts = .{ .speedup_gate_missing = 1 },
+    }));
+    try std.testing.expectEqualStrings("production_regression_blocked", productionRegressionEvidenceStatus(.{
+        .case_count = 2,
+        .promotion_case_count = 2,
+        .promotion_ready_count = 1,
+        .runtime_route_checked_count = 2,
+        .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 2,
+        .blocker_counts = .{ .speedup_gate_missing = 1 },
+    }));
+    try std.testing.expectEqualStrings("production_regression_ok", productionRegressionEvidenceStatus(.{
+        .case_count = 2,
+        .promotion_case_count = 2,
+        .promotion_ready_count = 2,
+        .runtime_route_checked_count = 2,
+        .provider_route_checked_count = 0,
+        .candidate_route_ready_count = 2,
+        .blocker_counts = .{},
+    }));
+    try std.testing.expectEqualStrings("production_regression_skipped", productionRegressionEvidenceStatus(.{
+        .case_count = 0,
+        .promotion_case_count = 0,
+        .promotion_ready_count = 0,
+        .runtime_route_checked_count = 0,
+        .provider_route_checked_count = 0,
+        .blocker_counts = .{},
     }));
 
     const unstable =

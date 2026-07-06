@@ -208,13 +208,15 @@ pub fn print(stats: ExecutionStats) void {
     );
     if (hasQuantKernelPlanStats(stats)) {
         const top_fallback = quantKernelTopFallbackReason(stats);
+        const fast_path_misses = quantKernelFastPathMisses(stats);
         std.debug.print(
-            "quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
+            "quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
             .{
                 stats.quant_kernel_planned_ops,
                 stats.quant_kernel_handwritten_production,
                 stats.quant_kernel_generated_production,
                 stats.quant_kernel_unsupported_routes,
+                fast_path_misses,
                 stats.quant_kernel_generated_candidates,
                 stats.quant_kernel_fallback_generated_artifact_missing,
                 stats.quant_kernel_fallback_generated_runtime_not_wired,
@@ -290,6 +292,16 @@ pub const FallbackReasonCount = struct {
     name: []const u8,
     count: u64,
 };
+
+pub fn quantKernelFastPathMisses(stats: ExecutionStats) u64 {
+    return stats.quant_kernel_fallback_generated_artifact_missing +|
+        stats.quant_kernel_fallback_generated_runtime_not_wired +|
+        stats.quant_kernel_fallback_unsupported_format +|
+        stats.quant_kernel_fallback_unsupported_shape +|
+        stats.quant_kernel_fallback_unsupported_epilogue +|
+        stats.quant_kernel_fallback_unsupported_backend +|
+        stats.quant_kernel_fallback_tensor_core_repack_required;
+}
 
 pub fn quantKernelTopFallbackReason(stats: ExecutionStats) FallbackReasonCount {
     const reasons = [_]FallbackReasonCount{
@@ -419,6 +431,7 @@ test "executor stats aggregate quant kernel plan counters" {
     try std.testing.expectEqual(@as(u64, 2), stats.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(u64, 7), stats.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(u64, 8), stats.quant_kernel_unsupported_routes);
+    try std.testing.expectEqual(@as(u64, 22), quantKernelFastPathMisses(stats));
     try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(u64, 1), stats.quant_kernel_fallback_generated_artifact_missing);
     try std.testing.expectEqual(@as(u64, 6), stats.quant_kernel_fallback_generated_runtime_not_wired);
@@ -477,6 +490,7 @@ test "executor stats wires every quant kernel plan counter" {
 }
 
 test "executor stats reports top quant kernel fallback reason" {
+    try std.testing.expectEqual(@as(u64, 0), quantKernelFastPathMisses(.{}));
     try std.testing.expectEqualStrings("none", quantKernelTopFallbackReason(.{}).name);
     try std.testing.expectEqual(@as(u64, 0), quantKernelTopFallbackReason(.{}).count);
 
@@ -488,10 +502,17 @@ test "executor stats reports top quant kernel fallback reason" {
         .quant_kernel_fallback_unsupported_epilogue = 7,
         .quant_kernel_fallback_unsupported_backend = 4,
         .quant_kernel_fallback_tensor_core_repack_required = 6,
+        .quant_kernel_fallback_unsupported = 8,
     };
     const top = quantKernelTopFallbackReason(stats);
     try std.testing.expectEqualStrings("unsupported_epilogue", top.name);
     try std.testing.expectEqual(@as(u64, 7), top.count);
+    try std.testing.expectEqual(@as(u64, 28), quantKernelFastPathMisses(stats));
+
+    try std.testing.expectEqual(std.math.maxInt(u64), quantKernelFastPathMisses(.{
+        .quant_kernel_fallback_generated_artifact_missing = std.math.maxInt(u64),
+        .quant_kernel_fallback_generated_runtime_not_wired = 1,
+    }));
 }
 
 const OpCount = struct {

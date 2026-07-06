@@ -26,6 +26,7 @@ const multistage_reader_mod = @import("multistage_reader.zig");
 const pix2struct_mod = @import("pix2struct.zig");
 const vision_reader_mod = @import("vision_reader.zig");
 const reader_types = @import("types.zig");
+const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
 
 pub const Field = reader_types.Field;
 pub const Region = reader_types.Region;
@@ -229,6 +230,13 @@ pub const LoadedReader = union(enum) {
             .genai => |*reader| reader.read(image_data, options),
             .vlm => |*reader| reader.read(image_data, options),
             .multistage => |*reader| reader.read(image_data, options),
+        };
+    }
+
+    pub fn snapshotMetalGeneratedQuantStats(self: *LoadedReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
+        return switch (self.*) {
+            .vision => |*reader| reader.core.snapshotMetalGeneratedQuantStats(allocator),
+            .genai, .vlm, .multistage => .{},
         };
     }
 };

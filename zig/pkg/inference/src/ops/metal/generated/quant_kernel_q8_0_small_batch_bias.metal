@@ -16,8 +16,9 @@
 // plan_id=metal/q8_0/rows_2_8/bias/small_batch
 // kernel_id=antfly_q8_0_small_batch_bias_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// Promotion is blocked until repeat benchmark timing clears the speedup gate.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -42,7 +43,9 @@ kernel void antfly_q8_0_small_batch_bias_msl_v1(
     constant int &in_dim [[buffer(5)]],
     constant int &out_dim [[buffer(6)]],
     uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
+    uint3 group_pos [[threadgroup_position_in_grid]],
+    ushort lane_id [[thread_index_in_simdgroup]],
+    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
 ) {
     const uint tid = thread_pos.x;
     const int col = (int)group_pos.x;

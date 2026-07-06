@@ -17,7 +17,9 @@
 // kernel_id=antfly_q8_0_small_batch_bias_gelu_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
 // production_enabled=false
-// Promotion is blocked until repeat benchmark timing clears the speedup gate.
+// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
+// Production Metal dispatch stays on native handwritten MSL until this
+// candidate clears correctness and benchmark gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -49,33 +51,23 @@ kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(
     uint3 group_pos [[threadgroup_position_in_grid]]
 ) {
     const uint tid = thread_pos.x;
-    const int col0 = (int)(group_pos.x << 1);
-    const int col1 = col0 + 1;
+    const int col = (int)group_pos.x;
     const int row = (int)group_pos.y;
-    if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return;
+    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
+    float acc = 0.0f;
     const int block_count = in_dim >> 5;
     const int lane = (int)tid;
     const device float *row_input = input + row * in_dim;
-    const device uchar *col0_weight = weight_q8_0 + col0 * block_count * 34;
-    const bool has_col1 = col1 < out_dim;
-    const device uchar *col1_weight = has_col1 ? weight_q8_0 + col1 * block_count * 34 : col0_weight;
+    const device uchar *col_weight = weight_q8_0 + col * block_count * 34;
     for (int block_idx = 0; block_idx < block_count; ++block_idx) {
         const float x = row_input[(block_idx << 5) + lane];
-        const device uchar *block0 = col0_weight + block_idx * 34;
-        acc0 += x * antfly_q8_0_dequant_lane(block0, lane);
-        if (has_col1) {
-            const device uchar *block1 = col1_weight + block_idx * 34;
-            acc1 += x * antfly_q8_0_dequant_lane(block1, lane);
-        }
+        const device uchar *block = col_weight + block_idx * 34;
+        acc += x * antfly_q8_0_dequant_lane(block, lane);
     }
 
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
+    acc = simd_sum(acc);
     if (tid == 0) {
-        output[row * out_dim + col0] = antfly_gelu(acc0 + bias[col0]);
-        if (has_col1) output[row * out_dim + col1] = antfly_gelu(acc1 + bias[col1]);
+        output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
     }
 }

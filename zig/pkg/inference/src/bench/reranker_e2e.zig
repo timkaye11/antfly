@@ -25,8 +25,10 @@ const inference = @import("inference_internal");
 const platform = inference.platform;
 const backends = inference.backends;
 const native_backend_choice = inference.native_backend_choice;
+const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
 
 const print = std.debug.print;
+const MetalGeneratedQuantStats = metal_generated_quant_stats.Stats;
 
 const OutputFormat = enum {
     text,
@@ -108,6 +110,7 @@ const BenchResult = struct {
     docs_per_s: f64,
     checksum: f64,
     graph_stats: GraphStats = .{},
+    metal_generated_quant: MetalGeneratedQuantStats = .{},
 };
 
 const GraphStats = struct {
@@ -128,7 +131,6 @@ fn runTimed(
     opts: Options,
     docs: []const []const u8,
 ) !BenchResult {
-    _ = session;
     var checksum: f64 = 0;
     for (0..opts.warmup_iters) |_| {
         const scores = try pipeline.rerank(opts.query, docs);
@@ -136,6 +138,7 @@ fn runTimed(
         allocator.free(scores);
     }
 
+    const before_metal_generated = metal_generated_quant_stats.snapshotForSession(allocator, session);
     var total_ns: u64 = 0;
     var min_ns: u64 = std.math.maxInt(u64);
     const samples_ns = try allocator.alloc(u64, opts.measure_iters);
@@ -150,6 +153,7 @@ fn runTimed(
         for (scores) |score| checksum += score;
         allocator.free(scores);
     }
+    const after_metal_generated = metal_generated_quant_stats.snapshotForSession(allocator, session);
 
     std.mem.sort(u64, samples_ns, {}, struct {
         fn lessThan(_: void, a: u64, b: u64) bool {
@@ -172,6 +176,7 @@ fn runTimed(
         .docs_per_s = docs_per_s,
         .checksum = checksum,
         .graph_stats = .{},
+        .metal_generated_quant = MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
     };
 }
 
@@ -203,6 +208,34 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
                 result.graph_stats.graph_owned_bytes,
                 result.graph_stats.dynamic_copy_bytes,
                 result.graph_stats.last_fallback_reason,
+            });
+            print("metal_generated_quant={d} metal_generated_q4_k={d}/{d}/{d} metal_generated_q5_k={d}/{d}/{d} metal_generated_q6_k={d}/{d}/{d} metal_generated_q8_0={d}/{d}/{d}/{d} metal_q4_k_rows={d}/{d}/{d}/{d} metal_q6_k_rows={d}/{d}/{d}/{d} metal_q8_0_rows={d}/{d}/{d}/{d}\n", .{
+                result.metal_generated_quant.generatedTotal(),
+                result.metal_generated_quant.q4_k,
+                result.metal_generated_quant.q4_k_bias,
+                result.metal_generated_quant.q4_k_bias_gelu,
+                result.metal_generated_quant.q5_k,
+                result.metal_generated_quant.q5_k_bias,
+                result.metal_generated_quant.q5_k_bias_gelu,
+                result.metal_generated_quant.q6_k,
+                result.metal_generated_quant.q6_k_bias,
+                result.metal_generated_quant.q6_k_bias_gelu,
+                result.metal_generated_quant.q8_0,
+                result.metal_generated_quant.q8_0_bias,
+                result.metal_generated_quant.q8_0_bias_gelu,
+                result.metal_generated_quant.q8_0_relu,
+                result.metal_generated_quant.q4_k_rows_1,
+                result.metal_generated_quant.q4_k_rows_2_8,
+                result.metal_generated_quant.q4_k_rows_9_64,
+                result.metal_generated_quant.q4_k_rows_65_plus,
+                result.metal_generated_quant.q6_k_rows_1,
+                result.metal_generated_quant.q6_k_rows_2_8,
+                result.metal_generated_quant.q6_k_rows_9_64,
+                result.metal_generated_quant.q6_k_rows_65_plus,
+                result.metal_generated_quant.q8_0_rows_1,
+                result.metal_generated_quant.q8_0_rows_2_8,
+                result.metal_generated_quant.q8_0_rows_9_64,
+                result.metal_generated_quant.q8_0_rows_65_plus,
             });
         },
         .csv => {

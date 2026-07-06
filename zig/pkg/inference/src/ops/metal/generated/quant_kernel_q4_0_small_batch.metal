@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q4_0/rows_2_8/none/small_batch
 // kernel_id=antfly_q4_0_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
@@ -45,9 +45,7 @@ kernel void antfly_q4_0_small_batch_msl_v1(
     constant int &in_dim [[buffer(4)]],
     constant int &out_dim [[buffer(5)]],
     uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]],
-    ushort lane_id [[thread_index_in_simdgroup]],
-    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
+    uint3 group_pos [[threadgroup_position_in_grid]]
 ) {
     const uint tid = thread_pos.x;
     const int col = (int)group_pos.x;

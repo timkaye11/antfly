@@ -28,6 +28,9 @@ const backends = inference.backends;
 const graph_runtime = inference.graph.runtime;
 const model_manager_mod = inference.server.model_manager;
 const native_compute = inference.native_compute.native;
+const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
+
+const MetalGeneratedQuantStats = metal_generated_quant_stats.Stats;
 
 const BackendChoice = enum {
     auto,
@@ -89,6 +92,7 @@ const Sample = struct {
     score_sum: f64,
     relation_score_sum: f64 = 0.0,
     quant: QuantCounters = .{},
+    metal_generated_quant: MetalGeneratedQuantStats = .{},
     native_quant_stats_enabled: bool = false,
 };
 
@@ -105,6 +109,7 @@ const Result = struct {
     score_sum: f64,
     relation_score_sum: f64,
     quant: QuantCounters,
+    metal_generated_quant: MetalGeneratedQuantStats,
     native_quant_stats_enabled: bool,
 };
 
@@ -149,13 +154,13 @@ pub fn main(init: std.process.Init) !void {
     defer rows.deinit(allocator);
 
     if (opts.task == .entities or opts.task == .both) {
-        const task_result = try runBenchmarkTask(allocator, &pipeline, texts, labels, relation_labels, .entities, load_elapsed_ns, opts.warmup_iters, opts.measure_iters, opts.dump_entities);
+        const task_result = try runBenchmarkTask(allocator, &pipeline, model.session, texts, labels, relation_labels, .entities, load_elapsed_ns, opts.warmup_iters, opts.measure_iters, opts.dump_entities);
         try rows.append(allocator, task_result.first);
         try rows.append(allocator, task_result.warm);
     }
 
     if (opts.task == .relations or opts.task == .both) {
-        const task_result = try runBenchmarkTask(allocator, &pipeline, texts, labels, relation_labels, .relations, load_elapsed_ns, opts.warmup_iters, opts.measure_iters, opts.dump_entities);
+        const task_result = try runBenchmarkTask(allocator, &pipeline, model.session, texts, labels, relation_labels, .relations, load_elapsed_ns, opts.warmup_iters, opts.measure_iters, opts.dump_entities);
         try rows.append(allocator, task_result.first);
         try rows.append(allocator, task_result.warm);
     }
@@ -174,6 +179,7 @@ pub fn main(init: std.process.Init) !void {
 fn runBenchmarkTask(
     allocator: std.mem.Allocator,
     pipeline: anytype,
+    session: backends.Session,
     texts: []const []const u8,
     labels: ?[]const []const u8,
     relation_labels: ?[]const []const u8,
@@ -183,7 +189,7 @@ fn runBenchmarkTask(
     measure_iters: usize,
     dump_entities: bool,
 ) !TaskResult {
-    const first = try runTask(pipeline, texts, labels, relation_labels, task, dump_entities);
+    const first = try runTask(allocator, pipeline, session, texts, labels, relation_labels, task, dump_entities);
     const first_run = Result{
         .task = task,
         .mode = "first_run",
@@ -197,17 +203,18 @@ fn runBenchmarkTask(
         .score_sum = first.score_sum,
         .relation_score_sum = first.relation_score_sum,
         .quant = first.quant,
+        .metal_generated_quant = first.metal_generated_quant,
         .native_quant_stats_enabled = first.native_quant_stats_enabled,
     };
 
     for (0..warmup_iters) |_| {
-        _ = try runTask(pipeline, texts, labels, relation_labels, task, false);
+        _ = try runTask(allocator, pipeline, session, texts, labels, relation_labels, task, false);
     }
 
     const samples = try allocator.alloc(Sample, measure_iters);
     defer allocator.free(samples);
     for (samples) |*sample| {
-        sample.* = try runTask(pipeline, texts, labels, relation_labels, task, false);
+        sample.* = try runTask(allocator, pipeline, session, texts, labels, relation_labels, task, false);
     }
     const warm = try resultFromSamples(allocator, task, "warm_loaded_session", samples);
 
@@ -215,7 +222,9 @@ fn runBenchmarkTask(
 }
 
 fn runTask(
+    allocator: std.mem.Allocator,
     pipeline: anytype,
+    session: backends.Session,
     texts: []const []const u8,
     labels: ?[]const []const u8,
     relation_labels: ?[]const []const u8,
@@ -223,6 +232,7 @@ fn runTask(
     dump_entities: bool,
 ) !Sample {
     native_compute.resetNativeQuantDispatchStats();
+    const before_metal_generated = metal_generated_quant_stats.snapshotForSession(allocator, session);
     const start = nowNs();
 
     switch (task) {
@@ -238,11 +248,13 @@ fn runTask(
                 for (row) |entity| score_sum += entity.score;
             }
             if (dump_entities) dumpEntityRows("entities", entities);
+            const after_metal_generated = metal_generated_quant_stats.snapshotForSession(allocator, session);
             return .{
                 .elapsed_ns = elapsed_ns,
                 .entity_count = entity_count,
                 .score_sum = score_sum,
                 .quant = quantCountersFromStats(native_compute.nativeQuantDispatchStats()),
+                .metal_generated_quant = MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
                 .native_quant_stats_enabled = native_compute.nativeQuantDispatchStatsEnabled(),
             };
         },
@@ -268,6 +280,7 @@ fn runTask(
                 dumpEntityRows("relations.entities", extracted.entities);
                 dumpRelationRows(extracted.relations);
             }
+            const after_metal_generated = metal_generated_quant_stats.snapshotForSession(allocator, session);
             return .{
                 .elapsed_ns = elapsed_ns,
                 .entity_count = entity_count,
@@ -275,6 +288,7 @@ fn runTask(
                 .score_sum = score_sum,
                 .relation_score_sum = relation_score_sum,
                 .quant = quantCountersFromStats(native_compute.nativeQuantDispatchStats()),
+                .metal_generated_quant = MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
                 .native_quant_stats_enabled = native_compute.nativeQuantDispatchStatsEnabled(),
             };
         },
@@ -294,6 +308,8 @@ fn resultFromSamples(allocator: std.mem.Allocator, task: BenchTask, mode: []cons
 
     var total_ns: u128 = 0;
     for (samples) |sample| total_ns += sample.elapsed_ns;
+    var metal_generated_quant = MetalGeneratedQuantStats{};
+    for (samples) |sample| metal_generated_quant = metal_generated_quant.add(sample.metal_generated_quant);
     const avg_ns: u64 = @intCast(total_ns / samples.len);
     const p50_idx = samples.len / 2;
     const p95_idx = @min(samples.len - 1, (samples.len * 95 + 99) / 100 - 1);
@@ -311,6 +327,7 @@ fn resultFromSamples(allocator: std.mem.Allocator, task: BenchTask, mode: []cons
         .score_sum = last.score_sum,
         .relation_score_sum = last.relation_score_sum,
         .quant = last.quant,
+        .metal_generated_quant = metal_generated_quant,
         .native_quant_stats_enabled = last.native_quant_stats_enabled,
     };
 }
@@ -484,6 +501,39 @@ fn printText(opts: Options, result: Result) void {
             result.quant.q8_0,
             result.quant.q8_0_pair,
             result.quant.q8_0_triple,
+        },
+    );
+    std.debug.print(
+        "{s}/{s}: metal_generated_quant={} metal_generated_q4_k={}/{}/{} metal_generated_q5_k={}/{}/{} metal_generated_q6_k={}/{}/{} metal_generated_q8_0={}/{}/{}/{} metal_q4_k_rows={}/{}/{}/{} metal_q6_k_rows={}/{}/{}/{} metal_q8_0_rows={}/{}/{}/{}\n",
+        .{
+            @tagName(result.task),
+            result.mode,
+            result.metal_generated_quant.generatedTotal(),
+            result.metal_generated_quant.q4_k,
+            result.metal_generated_quant.q4_k_bias,
+            result.metal_generated_quant.q4_k_bias_gelu,
+            result.metal_generated_quant.q5_k,
+            result.metal_generated_quant.q5_k_bias,
+            result.metal_generated_quant.q5_k_bias_gelu,
+            result.metal_generated_quant.q6_k,
+            result.metal_generated_quant.q6_k_bias,
+            result.metal_generated_quant.q6_k_bias_gelu,
+            result.metal_generated_quant.q8_0,
+            result.metal_generated_quant.q8_0_bias,
+            result.metal_generated_quant.q8_0_bias_gelu,
+            result.metal_generated_quant.q8_0_relu,
+            result.metal_generated_quant.q4_k_rows_1,
+            result.metal_generated_quant.q4_k_rows_2_8,
+            result.metal_generated_quant.q4_k_rows_9_64,
+            result.metal_generated_quant.q4_k_rows_65_plus,
+            result.metal_generated_quant.q6_k_rows_1,
+            result.metal_generated_quant.q6_k_rows_2_8,
+            result.metal_generated_quant.q6_k_rows_9_64,
+            result.metal_generated_quant.q6_k_rows_65_plus,
+            result.metal_generated_quant.q8_0_rows_1,
+            result.metal_generated_quant.q8_0_rows_2_8,
+            result.metal_generated_quant.q8_0_rows_9_64,
+            result.metal_generated_quant.q8_0_rows_65_plus,
         },
     );
 }

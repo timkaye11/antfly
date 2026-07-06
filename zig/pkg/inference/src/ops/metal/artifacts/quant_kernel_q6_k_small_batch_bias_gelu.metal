@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal production artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q6_k/rows_2_8/bias_gelu/small_batch
 // kernel_id=antfly_q6_k_small_batch_bias_gelu_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// General MSL lowering smoke for descriptor-driven K-quant matmul epilogues.
-// Promoted after repeat benchmark and production-regression evidence.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -32,11 +32,10 @@ static inline float antfly_gelu(float x) {
     return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
 }
 
-static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane) {
+static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {
     const device uchar *ql = block;
     const device uchar *qh = block + 128;
     const device uchar *scales = block + 192;
-    const device uchar *d = block + 208;
     const int sub = lane >> 4;
     const int i = lane & 15;
     const int half_idx = sub >> 3;
@@ -51,7 +50,7 @@ static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane
     const int q = (low4 | (high2 << 4)) - 32;
     const int scale_u = (int)scales[sub];
     const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-    return antfly_half_le_to_float(d) * (float)scale * (float)q;
+    return d * (float)scale * (float)q;
 }
 
 kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1(
@@ -78,17 +77,17 @@ kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1(
         for (int block_idx = 0; block_idx < block_count; ++block_idx) {
             const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210);
             const int base = block_idx << 8;
+            const float d = antfly_half_le_to_float(block + 208);
             for (int lane = (int)tid; lane < 256; lane += 128) {
-                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane);
+                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
             }
         }
     }
 
     threadgroup float partial[32];
-    if (simdgroup_id == 0u) partial[lane_id] = 0.0f;
     acc = simd_sum(acc);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane_id == 0u) partial[simdgroup_id] = acc;
+    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float total = simd_sum(partial[lane_id]);
     if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_gelu(total + bias[col]);

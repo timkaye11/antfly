@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
+// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q4_k/rows_2_8/bias/small_batch
 // kernel_id=antfly_q4_k_small_batch_bias_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// Production Metal dispatch stays on native handwritten MSL until this
-// candidate clears correctness and benchmark gates.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -67,7 +67,9 @@ kernel void antfly_q4_k_small_batch_bias_msl_v1(
     constant int &in_dim [[buffer(5)]],
     constant int &out_dim [[buffer(6)]],
     uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
+    uint3 group_pos [[threadgroup_position_in_grid]],
+    ushort lane_id [[thread_index_in_simdgroup]],
+    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
 ) {
     const uint tid = thread_pos.x;
     const int col = (int)group_pos.x;

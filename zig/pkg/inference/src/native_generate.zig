@@ -2665,6 +2665,7 @@ fn metalStatsCompactJson(
     defer allocator.free(generated_route_json);
     const plan_stats = metalStatsWithRuntimePlanCounters(graph_stats, provider);
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
+    const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try appendFmt(
@@ -2858,6 +2859,7 @@ fn metalStatsCompactJson(
         \\"handwritten_production":{d},
         \\"generated_production":{d},
         \\"unsupported_routes":{d},
+        \\"fast_path_misses":{d},
         \\"generated_candidates":{d},
         \\"generated_artifact_missing":{d},
         \\"generated_runtime_not_wired":{d},
@@ -2876,6 +2878,7 @@ fn metalStatsCompactJson(
             plan_stats.quant_kernel_handwritten_production,
             plan_stats.quant_kernel_generated_production,
             plan_stats.quant_kernel_unsupported_routes,
+            fast_path_misses,
             plan_stats.quant_kernel_generated_candidates,
             plan_stats.quant_kernel_fallback_generated_artifact_missing,
             plan_stats.quant_kernel_fallback_generated_runtime_not_wired,
@@ -2947,7 +2950,8 @@ fn metalStatsCompactJson(
         \\"runtime_mapped_attempts":{d},
         \\"runtime_mapped_fallbacks":{d},
         \\"runtime_mapped_failures":{d},
-        \\"active_frame_bootstrap_misses":{d}
+        \\"active_frame_bootstrap_misses":{d},
+        \\"misses":{d}
         \\}}
         \\}}
     ,
@@ -2964,9 +2968,16 @@ fn metalStatsCompactJson(
             provider.metal_provider_quantized_runtime_mapped_fallbacks,
             provider.metal_provider_quantized_runtime_mapped_failures,
             provider.compressed_block_active_frame_bootstrap_misses,
+            metalResidencyMisses(provider),
         },
     );
     return try out.toOwnedSlice(allocator);
+}
+
+fn metalResidencyMisses(provider: ops.NativeQuantTimingStats) u64 {
+    return provider.metal_provider_quantized_runtime_mapped_fallbacks +|
+        provider.metal_provider_quantized_runtime_mapped_failures +|
+        provider.compressed_block_active_frame_bootstrap_misses;
 }
 
 fn metalStatsWithRuntimePlanCounters(
@@ -3095,9 +3106,14 @@ fn addMetalRuntimeGeneratedPlanCounter(
 ) void {
     if (count == 0) return;
     const lowering = graph_mod.quant_kernel_compiler.registryLoweringFor(.metal, format, .rows_2_8, epilogue, .small_batch);
-    const counters = graph_mod.quant_kernel_compiler.countersForLowering(lowering);
-    inline for (@typeInfo(graph_mod.quant_kernel_compiler.PlanCounters).@"struct".fields) |field| {
-        @field(stats.*, field.name) += @as(u64, @intCast(@field(counters, field.name))) * count;
+    stats.quant_kernel_planned_ops += count;
+    switch (lowering.production_route) {
+        .generated_production => stats.quant_kernel_generated_production += count,
+        else => if (lowering.candidate_route == .generated_dev_candidate) {
+            stats.quant_kernel_generated_candidates += count;
+        } else {
+            stats.quant_kernel_unsupported_routes += count;
+        },
     }
 }
 
@@ -4377,13 +4393,15 @@ fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
 
 fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot, plan_stats: graph_mod.executor_stats.ExecutionStats) void {
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
+    const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
     print(
-        "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
+        "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
         .{
             plan_stats.quant_kernel_planned_ops,
             plan_stats.quant_kernel_handwritten_production,
             plan_stats.quant_kernel_generated_production,
             plan_stats.quant_kernel_unsupported_routes,
+            fast_path_misses,
             plan_stats.quant_kernel_generated_candidates,
             plan_stats.quant_kernel_fallback_generated_artifact_missing,
             plan_stats.quant_kernel_fallback_generated_runtime_not_wired,
@@ -6493,12 +6511,14 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
     snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
     snapshot.provider.metal_runtime_antfly_q8_0_small_batch_dispatches = 5;
+    snapshot.provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches = 24;
     snapshot.provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches = 6;
     snapshot.provider.active_decode_frame_fallbacks = 7;
     snapshot.provider.prefill_frame_execute_successes = 8;
     snapshot.provider.prefill_frame_execute_attempts = 9;
     snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
     snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
+    snapshot.provider.metal_provider_quantized_runtime_mapped_failures = 12;
 
     const graph_stats = graph_mod.executor_stats.ExecutionStats{
         .quant_kernel_planned_ops = 12,
@@ -6527,15 +6547,21 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 3), root.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 4), root.get("q8_0_dispatch").?.object.get("rows_2_8").?.integer);
     try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
+    try std.testing.expectEqual(@as(i64, 24), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias").?.integer);
     try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);
     try std.testing.expectEqualStrings(
         "antfly_q8_0_small_batch_bias_msl_v1",
         root.get("generated_quant_routes").?.object.get("q8_0_small_batch_bias").?.object.get("kernel_id").?.string,
     );
+    try std.testing.expectEqualStrings(
+        "antfly_q6_k_small_batch_bias_msl_v1",
+        root.get("generated_quant_routes").?.object.get("q6_k_small_batch_bias").?.object.get("kernel_id").?.string,
+    );
     try std.testing.expectEqual(@as(i64, 12), root.get("quant_kernel_plan").?.object.get("planned").?.integer);
     try std.testing.expectEqual(@as(i64, 13), root.get("quant_kernel_plan").?.object.get("handwritten_production").?.integer);
     try std.testing.expectEqual(@as(i64, 14), root.get("quant_kernel_plan").?.object.get("generated_production").?.integer);
     try std.testing.expectEqual(@as(i64, 15), root.get("quant_kernel_plan").?.object.get("unsupported_routes").?.integer);
+    try std.testing.expectEqual(@as(i64, 144), root.get("quant_kernel_plan").?.object.get("fast_path_misses").?.integer);
     try std.testing.expectEqual(@as(i64, 16), root.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
     try std.testing.expectEqual(@as(i64, 17), root.get("quant_kernel_plan").?.object.get("generated_artifact_missing").?.integer);
     try std.testing.expectEqual(@as(i64, 18), root.get("quant_kernel_plan").?.object.get("generated_runtime_not_wired").?.integer);
@@ -6552,6 +6578,8 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 9), root.get("frame_fallbacks").?.object.get("prefill_execute_attempts").?.integer);
     try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), root.get("residency").?.object.get("runtime_mapped_failures").?.integer);
+    try std.testing.expectEqual(@as(i64, 33), root.get("residency").?.object.get("misses").?.integer);
 
     const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
     defer std.testing.allocator.free(null_json);
@@ -6570,9 +6598,10 @@ test "metal stats compact json derives plan counters from runtime generated disp
 
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
     try std.testing.expectEqual(@as(i64, 5), plan.get("planned").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), plan.get("handwritten_production").?.integer);
-    try std.testing.expectEqual(@as(i64, 3), plan.get("generated_production").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("handwritten_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), plan.get("generated_production").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("fast_path_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), plan.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
 }
@@ -6604,9 +6633,18 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     try std.testing.expectEqual(@as(i64, 30), plan.get("planned").?.integer);
     try std.testing.expectEqual(@as(i64, 30), plan.get("handwritten_production").?.integer);
     try std.testing.expectEqual(@as(i64, 0), plan.get("generated_production").?.integer);
-    try std.testing.expectEqual(@as(i64, 10), plan.get("generated_candidates").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), plan.get("fast_path_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), plan.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("none", plan.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 0), plan.get("top_fallback_count").?.integer);
+}
+
+test "metal stats compact json saturates residency miss summary" {
+    var provider = ops.NativeQuantTimingStats{};
+    provider.metal_provider_quantized_runtime_mapped_fallbacks = std.math.maxInt(u64);
+    provider.metal_provider_quantized_runtime_mapped_failures = 1;
+    provider.compressed_block_active_frame_bootstrap_misses = 1;
+    try std.testing.expectEqual(std.math.maxInt(u64), metalResidencyMisses(provider));
 }
 
 test "raw decode bench json includes metal compact stats" {
@@ -6621,6 +6659,7 @@ test "raw decode bench json includes metal compact stats" {
 
     const graph_stats = graph_mod.executor_stats.ExecutionStats{
         .quant_kernel_planned_ops = 5,
+        .quant_kernel_unsupported_routes = 2,
         .quant_kernel_generated_candidates = 3,
         .quant_kernel_fallback_unsupported_shape = 2,
     };
@@ -6661,6 +6700,7 @@ test "raw decode bench json includes metal compact stats" {
     const metal = parsed.value.object.get("metal").?.object;
     try std.testing.expectEqual(@as(i64, 7), metal.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 5), metal.get("quant_kernel_plan").?.object.get("planned").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("fast_path_misses").?.integer);
     try std.testing.expectEqual(@as(i64, 3), metal.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("unsupported_shape", metal.get("quant_kernel_plan").?.object.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);

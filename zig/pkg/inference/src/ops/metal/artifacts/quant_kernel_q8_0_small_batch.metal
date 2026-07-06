@@ -17,7 +17,8 @@
 // kernel_id=antfly_q8_0_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
 // production_enabled=true
-// Promoted after repeat correctness, provider-route, and benchmark gates.
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;

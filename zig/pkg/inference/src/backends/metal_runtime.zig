@@ -6495,6 +6495,10 @@ pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
     snapshot: *RawRuntimeMemoryStats,
 ) c_int;
+pub extern fn termite_metal_provider_generated_quant_snapshot(
+    provider: ?*RawMetalProvider,
+    snapshot: *RawRuntimeMemoryStats,
+) c_int;
 pub extern fn termite_metal_decode_runtime_begin_graph_plan(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_graph_plan_slot(
     runtime: ?*RawMetalDecodeRuntime,
@@ -7099,6 +7103,12 @@ pub fn lastFrameGpuNanos(runtime: ?*RawMetalDecodeRuntime) u64 {
 pub fn runtimeMemorySnapshot(runtime: ?*RawMetalDecodeRuntime) RawRuntimeMemoryStats {
     var snapshot: RawRuntimeMemoryStats = .{};
     _ = termite_metal_decode_runtime_memory_snapshot(runtime, &snapshot);
+    return snapshot;
+}
+
+pub fn providerGeneratedQuantSnapshot(provider: ?*RawMetalProvider) RawRuntimeMemoryStats {
+    var snapshot: RawRuntimeMemoryStats = .{};
+    _ = termite_metal_provider_generated_quant_snapshot(provider, &snapshot);
     return snapshot;
 }
 

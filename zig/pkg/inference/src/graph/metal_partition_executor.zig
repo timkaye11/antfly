@@ -5269,9 +5269,9 @@ test "metal partition executor records pair epilogue in quant kernel compiler st
     var no_bias_stats: PartitionExecutor.ExecutionStats = .{};
     recordQuantKernelCompilerPlan(&no_bias_stats, .{ .fused_linear_no_bias = .{ .rows = 4, .in_dim = 256, .out_dim = 8 } }, op_plan);
     try std.testing.expectEqual(@as(u64, 1), no_bias_stats.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(u64, 1), no_bias_stats.quant_kernel_handwritten_production);
-    try std.testing.expectEqual(@as(u64, 0), no_bias_stats.quant_kernel_generated_production);
-    try std.testing.expectEqual(@as(u64, 1), no_bias_stats.quant_kernel_generated_candidates);
+    try std.testing.expectEqual(@as(u64, 0), no_bias_stats.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(u64, 1), no_bias_stats.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(u64, 0), no_bias_stats.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(u64, 0), no_bias_stats.quant_kernel_fallback_generated_artifact_missing);
 }
 

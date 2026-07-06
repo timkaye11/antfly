@@ -13,12 +13,13 @@
 // limitations under the License.
 
 // Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-// plan_id=metal/q5_1/rows_2_8/none/small_batch
-// kernel_id=antfly_q5_1_small_batch_msl_v1
+// plan_id=metal/q4_1/rows_2_8/none/small_batch
+// kernel_id=antfly_q4_1_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=true
-// Promoted after sequential Metal runtime evidence cleared correctness,
-// route, and speedup gates.
+// production_enabled=false
+// General MSL lowering smoke for descriptor-driven quant matmul.
+// Production Metal dispatch stays on native handwritten MSL until this
+// candidate clears correctness and benchmark gates.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -28,24 +29,18 @@ static inline float antfly_half_le_to_float(const device uchar *p) {
     return (float)as_type<half>(bits);
 }
 
-static inline uint antfly_u32_le(const device uchar *p) {
-    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-}
-
-static inline float antfly_q5_1_dequant_lane(const device uchar *block, int lane) {
+static inline float antfly_q4_1_dequant_lane(const device uchar *block, int lane) {
     const float d = antfly_half_le_to_float(block);
     const float m = antfly_half_le_to_float(block + 2);
-    const uint qh = antfly_u32_le(block + 4);
     const int packed_index = lane & 15;
-    const uchar packed = block[8 + packed_index];
-    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    const int high = (int)((qh >> (uint)lane) & 1u);
-    return d * (float)(low4 | (high << 4)) + m;
+    const uchar packed = block[4 + packed_index];
+    const int q = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
+    return d * (float)q + m;
 }
 
-kernel void antfly_q5_1_small_batch_msl_v1(
+kernel void antfly_q4_1_small_batch_msl_v1(
     const device float *input [[buffer(0)]],
-    const device uchar *weight_q5_1 [[buffer(1)]],
+    const device uchar *weight_q4_1 [[buffer(1)]],
     device float *output [[buffer(2)]],
     constant int &rows [[buffer(3)]],
     constant int &in_dim [[buffer(4)]],
@@ -64,16 +59,16 @@ kernel void antfly_q5_1_small_batch_msl_v1(
     const int block_count = in_dim >> 5;
     const int lane = (int)tid;
     const device float *row_input = input + row * in_dim;
-    const device uchar *col0_weight = weight_q5_1 + col0 * block_count * 24;
+    const device uchar *col0_weight = weight_q4_1 + col0 * block_count * 20;
     const bool has_col1 = col1 < out_dim;
-    const device uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;
+    const device uchar *col1_weight = has_col1 ? weight_q4_1 + col1 * block_count * 20 : col0_weight;
     for (int block_idx = 0; block_idx < block_count; ++block_idx) {
         const float x = row_input[(block_idx << 5) + lane];
-        const device uchar *block0 = col0_weight + block_idx * 24;
-        acc0 += x * antfly_q5_1_dequant_lane(block0, lane);
+        const device uchar *block0 = col0_weight + block_idx * 20;
+        acc0 += x * antfly_q4_1_dequant_lane(block0, lane);
         if (has_col1) {
-            const device uchar *block1 = col1_weight + block_idx * 24;
-            acc1 += x * antfly_q5_1_dequant_lane(block1, lane);
+            const device uchar *block1 = col1_weight + block_idx * 20;
+            acc1 += x * antfly_q4_1_dequant_lane(block1, lane);
         }
     }
 

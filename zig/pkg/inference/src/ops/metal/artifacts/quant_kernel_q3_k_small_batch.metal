@@ -16,9 +16,9 @@
 // plan_id=metal/q3_k/rows_2_8/none/small_batch
 // kernel_id=antfly_q3_k_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// Runtime route evidence can opt into this checked-in artifact while
-// promotion is blocked by unstable benchmark timing.
+// production_enabled=true
+// Promoted after sequential Metal runtime evidence cleared correctness,
+// route, provider-route, and speedup gates.
 
 #include <metal_stdlib>
 using namespace metal;

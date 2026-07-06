@@ -63,6 +63,13 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const host = b.graph.host.result;
+    return target.result.os.tag == host.os.tag and
+        target.result.cpu.arch == host.cpu.arch and
+        target.result.abi == host.abi;
+}
+
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
     const sdk_root = b.sysroot orelse
@@ -273,7 +280,7 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-quant-kernel-codegen",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/quant_kernel_codegen_main.zig"),
-            .target = target,
+            .target = b.graph.host,
             .optimize = optimize,
         }),
     });
@@ -288,8 +295,10 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
     quant_kernel_codegen_step.dependOn(&quant_kernel_codegen_check.step);
 
+    const metal_unavailable_message = "Metal quant kernel evidence targets require a macOS target with xcrun/Metal; no Metal runtime evidence was run.";
     const quant_kernel_metal_check_step = b.step("quant-kernel-metal-check", "Compile generated and promoted Metal quant kernels");
     var quant_kernel_metal_artifact_check_step: ?*std.Build.Step = null;
+    var quant_kernel_metal_unavailable_step: ?*std.Build.Step = null;
     if (target.result.os.tag == .macos) {
         const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);
         quant_kernel_metal_artifact_check.addArg("--check-metal");
@@ -297,7 +306,9 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_artifact_check_step = &quant_kernel_metal_artifact_check.step;
         quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_artifact_check.step);
     } else {
-        quant_kernel_metal_check_step.dependOn(&quant_kernel_codegen_test_check.step);
+        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);
+        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;
+        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);
     }
 
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
@@ -361,7 +372,6 @@ pub fn build(b: *std.Build) void {
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_production_regression.step.dependOn(metal_artifact_check_step);
         }
-        run_quant_kernel_metal_runtime_route_all.step.dependOn(&run_quant_kernel_metal_production_regression.step);
         quant_kernel_metal_production_regression_run_step = &run_quant_kernel_metal_production_regression.step;
         quant_kernel_metal_production_regression_step.dependOn(&run_quant_kernel_metal_production_regression.step);
 
@@ -384,6 +394,7 @@ pub fn build(b: *std.Build) void {
         const strict_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         strict_quant_kernel_metal_blocker_evidence.addArgs(&.{
             "--check-blocker-evidence",
+            "--confirm-cleared-blockers",
             "--fail-on-cleared-blocker",
         });
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
@@ -392,12 +403,13 @@ pub fn build(b: *std.Build) void {
         strict_quant_kernel_metal_blocker_evidence.step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
         quant_kernel_metal_blocker_strict_step.dependOn(&strict_quant_kernel_metal_blocker_evidence.step);
     } else {
-        quant_kernel_metal_runtime_check_step.dependOn(&quant_kernel_codegen_test_check.step);
-        quant_kernel_metal_runtime_route_all_step.dependOn(&quant_kernel_codegen_test_check.step);
-        quant_kernel_metal_production_regression_step.dependOn(&quant_kernel_codegen_test_check.step);
-        quant_kernel_metal_blocker_evidence_refresh_step.dependOn(&quant_kernel_codegen_test_check.step);
-        quant_kernel_metal_blocker_evidence_step.dependOn(&quant_kernel_codegen_test_check.step);
-        quant_kernel_metal_blocker_strict_step.dependOn(&quant_kernel_codegen_test_check.step);
+        const metal_unavailable_step = quant_kernel_metal_unavailable_step orelse unreachable;
+        quant_kernel_metal_runtime_check_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_runtime_route_all_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_production_regression_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_blocker_evidence_refresh_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_blocker_evidence_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_blocker_strict_step.dependOn(metal_unavailable_step);
     }
     const quant_kernel_metal_runtime_check_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -408,10 +420,12 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"quant kernel metal runtime"},
     });
     const run_quant_kernel_metal_runtime_check_tests = b.addRunArtifact(quant_kernel_metal_runtime_check_tests);
-    if (quant_kernel_metal_production_regression_run_step) |production_regression_step| {
-        production_regression_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        if (quant_kernel_metal_production_regression_run_step) |production_regression_step| {
+            production_regression_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+        }
+        quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     }
-    quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
 
     const cuda_artifact_source_policy_check = b.addSystemCommand(&.{
         "bash",
@@ -430,16 +444,18 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_local_check_step = b.step("quant-kernel-local-check", "Run local quant kernel compiler readiness checks");
     const quant_kernel_metal_local_check_step = b.step("quant-kernel-metal-local-check", "Run local Metal quant kernel compiler readiness checks");
     quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_check_step);
-    quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
+    }
     quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_runtime_route_all_step);
     quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_production_regression_step);
     quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_blocker_evidence_step);
+    quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_blocker_strict_step);
+    quant_kernel_local_check_step.dependOn(&quant_kernel_codegen_test_check.step);
     quant_kernel_local_check_step.dependOn(&cuda_artifact_source_policy_check.step);
-    quant_kernel_local_check_step.dependOn(quant_kernel_metal_check_step);
-    quant_kernel_local_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
-    quant_kernel_local_check_step.dependOn(quant_kernel_metal_runtime_route_all_step);
-    quant_kernel_local_check_step.dependOn(quant_kernel_metal_production_regression_step);
-    quant_kernel_local_check_step.dependOn(quant_kernel_metal_blocker_evidence_step);
+    if (target.result.os.tag == .macos) {
+        quant_kernel_local_check_step.dependOn(quant_kernel_metal_local_check_step);
+    }
 
     const metal_gemma4_prefill_frame_script_self_test = b.addSystemCommand(&.{
         "bash",
@@ -451,8 +467,9 @@ pub fn build(b: *std.Build) void {
         "Run the Metal Gemma4 prefill-frame smoke script self-test",
     );
     metal_gemma4_prefill_frame_script_self_test_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
-    quant_kernel_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
-    quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
+    }
 
     const metal_quant_summary_check_self_test = b.addSystemCommand(&.{
         "python3",
@@ -464,8 +481,9 @@ pub fn build(b: *std.Build) void {
         "Run the Metal quant summary checker self-test",
     );
     metal_quant_summary_check_self_test_step.dependOn(&metal_quant_summary_check_self_test.step);
-    quant_kernel_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
-    quant_kernel_metal_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
+    }
 
     const metal_gemma4_bench_script_self_test = b.addSystemCommand(&.{
         "bash",
@@ -477,8 +495,9 @@ pub fn build(b: *std.Build) void {
         "Run the Metal Gemma4 bench script self-test",
     );
     metal_gemma4_bench_script_self_test_step.dependOn(&metal_gemma4_bench_script_self_test.step);
-    quant_kernel_local_check_step.dependOn(&metal_gemma4_bench_script_self_test.step);
-    quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_bench_script_self_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_bench_script_self_test.step);
+    }
 
     const metal_gemma4_prefill_frame_test = b.addSystemCommand(&.{
         "bash",
@@ -556,7 +575,11 @@ pub fn build(b: *std.Build) void {
         "quant-kernel-metal-model-local-check",
         "Run local model-level Metal quant kernel smoke checks",
     );
-    quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
+    quant_kernel_metal_model_local_check_step.dependOn(quant_kernel_metal_local_check_step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step.dependOn(quant_kernel_metal_local_check_step);
+        quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
+    }
 
     const quant_kernel_metal_industry_local_check_step = b.step(
         "quant-kernel-metal-industry-local-check",
@@ -995,12 +1018,16 @@ pub fn build(b: *std.Build) void {
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
     run_quant_kernel_compiler_tests.addArg("--test-filter");
     run_quant_kernel_compiler_tests.addArg("quant kernel compiler");
-    quant_kernel_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
-    quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
+    if (targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
+        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
+    }
     const run_quant_kernel_cuda_microbench_tests = b.addRunArtifact(tests);
     run_quant_kernel_cuda_microbench_tests.addArg("--test-filter");
     run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
-    quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
+    if (targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
+    }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&quant_kernel_codegen_test_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);

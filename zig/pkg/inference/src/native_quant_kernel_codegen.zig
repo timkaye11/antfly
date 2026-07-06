@@ -29,6 +29,11 @@ const GeneratedFile = struct {
     owned: bool = false,
 };
 
+const CompiledSourceData = struct {
+    data: []const u8,
+    owned: bool = false,
+};
+
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const mode = try parseMode(args);
     const files = try generatedFiles(allocator);
@@ -67,33 +72,40 @@ fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
     errdefer freeGeneratedFiles(allocator, files);
     var index: usize = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        const source = try compiledSourceForArtifact(allocator, artifact);
         files[index] = .{
             .path = artifact.source_path,
-            .data = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedQuantKernelSource,
+            .data = source.data,
+            .owned = source.owned,
         };
         index += 1;
     }
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
         if (artifact.generated_source_path.len != 0 and !std.mem.eql(u8, artifact.generated_source_path, artifact.source_path)) {
+            const source = try compiledSourceForArtifact(allocator, artifact);
             files[index] = .{
                 .path = artifact.generated_source_path,
-                .data = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedQuantKernelSource,
+                .data = source.data,
+                .owned = source.owned,
             };
             index += 1;
         }
         if (artifact.backend == .metal) {
             if (quant_kernel_compiler.metalArtifactSourcePathForKernel(artifact.kernel_id)) |artifact_source_path| {
                 if (!std.mem.eql(u8, artifact_source_path, artifact.source_path) and !std.mem.eql(u8, artifact_source_path, artifact.generated_source_path)) {
+                    const source = try compiledSourceForArtifact(allocator, artifact);
                     files[index] = .{
                         .path = artifact_source_path,
-                        .data = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedQuantKernelSource,
+                        .data = source.data,
+                        .owned = source.owned,
                     };
                     index += 1;
                 }
             }
         }
     }
-    var manifest_index = source_count;
+    if (index != source_count) return error.GeneratedQuantKernelSourceCountMismatch;
+    var manifest_index = index;
     files[manifest_index] = .{
         .path = quant_kernel_compiler.first_spec_manifest_path,
         .data = try quant_kernel_compiler.specManifestJson(allocator),
@@ -118,6 +130,27 @@ fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
         .owned = true,
     };
     return files;
+}
+
+fn compiledSourceForArtifact(
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+) !CompiledSourceData {
+    const compiled = quant_kernel_compiler.compileQuantKernelSource(.{
+        .backend = artifact.backend,
+        .format = artifact.format,
+        .row_bucket = artifact.row_bucket,
+        .epilogue = artifact.epilogue,
+    }) orelse return error.MissingGeneratedQuantKernelSource;
+    if (!std.mem.eql(u8, compiled.artifact.kernel_id, artifact.kernel_id)) {
+        return error.MissingGeneratedQuantKernelSource;
+    }
+    const emitted = try quant_kernel_compiler.emitCompiledSource(allocator, compiled);
+    errdefer emitted.deinit(allocator);
+    if (!try quant_kernel_compiler.compiledSourceHeaderMatchesSource(allocator, compiled, emitted.data)) {
+        return error.GeneratedQuantKernelSourceHeaderMismatch;
+    }
+    return .{ .data = emitted.data, .owned = emitted.owned };
 }
 
 fn generatedSourceFileCount() usize {
@@ -243,6 +276,13 @@ fn metalCheckOutputPath(command: []const u8) ?[]const u8 {
     return null;
 }
 
+fn generatedFilePathExists(sources: []const GeneratedFile, path: []const u8) bool {
+    for (sources) |source| {
+        if (std.mem.eql(u8, source.path, path)) return true;
+    }
+    return false;
+}
+
 test "quant kernel codegen defaults to check mode" {
     try std.testing.expectEqual(Mode.check, try parseMode(&.{}));
     try std.testing.expectEqual(Mode.check, try parseMode(&.{"--check"}));
@@ -271,7 +311,7 @@ test "quant kernel codegen sources map to compiler artifacts" {
 
     const artifact_manifest = sources[sources.len - 3];
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_artifact_manifest_path, artifact_manifest.path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, "antfly.quant_kernel_artifacts.v1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_artifact_manifest_schema));
     const artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"artifact_count\": {d}", .{quant_kernel_compiler.first_generated_artifacts.len});
     defer std.testing.allocator.free(artifact_count);
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, artifact_count));
@@ -315,14 +355,27 @@ test "quant kernel codegen sources map to compiler artifacts" {
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, metal_evidence_count, "--require-kernel"));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, metal_evidence_count, "\"metal_promotion_min_speedup\": 1.1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, metal_evidence_count, "\"metal_promotion_repeat_runs\": 5"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, metal_evidence_count, "\"metal_promotion_warmup_repeat_runs\": 2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, quant_kernel_compiler.first_metal_runtime_evidence_count, "\"candidate_status\": \"promoted\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, "\"candidate_status\": \"dev_only_candidate\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, "\"candidate_status\": \"blocked_by_evidence\""));
 
     const benchmark_manifest = sources[sources.len - 2];
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_benchmark_manifest_path, benchmark_manifest.path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "antfly.quant_kernel_benchmarks.v1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_benchmark_manifest_schema));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"benchmark_count\": 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"metal_promotion_warmup_repeat_runs\": 2"));
+    const metal_production_regression_case_count = try std.fmt.allocPrint(std.testing.allocator, "\"metal_production_regression_expected_case_count\": {d}", .{quant_kernel_compiler.first_metal_production_regression_expected_case_count});
+    defer std.testing.allocator.free(metal_production_regression_case_count);
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, metal_production_regression_case_count));
+    const metal_production_regression_case_fingerprint = try std.fmt.allocPrint(std.testing.allocator, "\"metal_production_regression_case_fingerprint\": {d}", .{quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint()});
+    defer std.testing.allocator.free(metal_production_regression_case_fingerprint);
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, metal_production_regression_case_fingerprint));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"metal_production_regression_cases\": ["));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"name\": \"q6_k_rows_8_cols_7_bias_gelu\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"production_kernel_id\": \"antfly_q6_k_small_batch_bias_gelu_msl_v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_metal_production_regression_build_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_metal_production_regression_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_lazy_benchmark.generated_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_lazy_benchmark.benchmark_command));
 
@@ -332,6 +385,38 @@ test "quant kernel codegen sources map to compiler artifacts" {
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"format\": \"q4_k\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"cuda_fallback_reason\": \"generated_artifact_missing\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"metal_fallback_reason\": \"generated_artifact_missing\""));
+}
+
+test "quant kernel codegen includes generated and artifact sidecar paths" {
+    const sources = try generatedFiles(std.testing.allocator);
+    defer freeGeneratedFiles(std.testing.allocator, sources);
+
+    var generated_sidecar_count: usize = 0;
+    var metal_artifact_path_count: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        try std.testing.expect(generatedFilePathExists(sources, artifact.source_path));
+        const primary_path = try existingSourcePath(std.testing.allocator, std.testing.io, artifact.source_path);
+        defer if (primary_path.owned) std.testing.allocator.free(primary_path.value);
+
+        if (artifact.generated_source_path.len != 0) {
+            generated_sidecar_count += 1;
+            try std.testing.expect(generatedFilePathExists(sources, artifact.generated_source_path));
+            const generated_path = try existingSourcePath(std.testing.allocator, std.testing.io, artifact.generated_source_path);
+            defer if (generated_path.owned) std.testing.allocator.free(generated_path.value);
+        }
+
+        if (artifact.backend == .metal) {
+            if (quant_kernel_compiler.metalArtifactSourcePathForKernel(artifact.kernel_id)) |artifact_source_path| {
+                metal_artifact_path_count += 1;
+                try std.testing.expect(generatedFilePathExists(sources, artifact_source_path));
+                const artifact_path = try existingSourcePath(std.testing.allocator, std.testing.io, artifact_source_path);
+                defer if (artifact_path.owned) std.testing.allocator.free(artifact_path.value);
+            }
+        }
+    }
+
+    try std.testing.expect(generated_sidecar_count > 0);
+    try std.testing.expect(metal_artifact_path_count > 0);
 }
 
 test "quant kernel codegen resolves package-root source paths" {
