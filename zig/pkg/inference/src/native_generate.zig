@@ -35,6 +35,7 @@ const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
+const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
 const compat = @import("io/compat.zig");
 const cuda_context = if (build_options.enable_cuda) @import("ops/cuda/context.zig") else struct {};
 const hf_tokenizer = @import("inference_hf_tokenizer");
@@ -2666,6 +2667,8 @@ fn metalStatsCompactJson(
     const plan_stats = metalStatsWithRuntimePlanCounters(graph_stats, provider);
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
+    const generated_quant = metal_generated_quant_stats.Stats.fromProviderStats(provider);
+    const generated_quant_top = generated_quant.topFamily();
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try appendFmt(
@@ -2819,7 +2822,11 @@ fn metalStatsCompactJson(
         \\"q6_k_small_batch_bias":{d},
         \\"q6_k_small_batch_bias_gelu":{d}
         \\}},
-        \\"generated_quant_routes":{s}
+        \\"generated_quant_routes":{s},
+        \\"metal_generated_quant":{d},
+        \\"metal_generated_quant_family_count":{d},
+        \\"metal_generated_quant_top_family":{f},
+        \\"metal_generated_quant_top_count":{d}
     ,
         .{
             provider.metal_runtime_antfly_q8_0_small_batch_dispatches,
@@ -2848,6 +2855,10 @@ fn metalStatsCompactJson(
             provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
             provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
             generated_route_json,
+            generated_quant.generatedTotal(),
+            generated_quant.nonzeroFamilyCount(),
+            std.json.fmt(generated_quant_top.name, .{}),
+            generated_quant_top.count,
         },
     );
     try appendFmt(
@@ -6549,6 +6560,10 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 24), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias").?.integer);
     try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);
+    try std.testing.expectEqual(@as(i64, 35), root.get("metal_generated_quant").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("metal_generated_quant_family_count").?.integer);
+    try std.testing.expectEqualStrings("q6_k", root.get("metal_generated_quant_top_family").?.string);
+    try std.testing.expectEqual(@as(i64, 30), root.get("metal_generated_quant_top_count").?.integer);
     try std.testing.expectEqualStrings(
         "antfly_q8_0_small_batch_bias_msl_v1",
         root.get("generated_quant_routes").?.object.get("q8_0_small_batch_bias").?.object.get("kernel_id").?.string,

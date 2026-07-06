@@ -154,17 +154,17 @@ production-regression gate.
 
 ## Current Metal State
 
-The current checked-in state has 17 promoted generated Metal production routes:
-`Q2_K none`, `Q3_K none`, `Q4_K none`, `Q4_K bias`,
-`Q4_K bias_gelu`, `Q5_0 none`, `Q5_1 none`, `Q5_K none`,
-`Q5_K bias`, `Q5_K bias_gelu`, `Q6_K none`, `Q6_K bias`,
-`Q6_K bias_gelu`, `Q8_0 none`, `Q8_0 bias`, `Q8_1 none`, and
-`Q8_K none`. The production-regression gate covers 34
-generated-vs-handwritten benchmark cases for those routes.
+The current checked-in state has 8 promoted generated Metal production routes:
+`Q2_K none`, `Q3_K none`, `Q4_K bias`, `Q5_K bias`, `Q6_K none`,
+`Q6_K bias`, `Q8_0 none`, and `Q8_0 bias`.
+The production-regression gate covers 16 generated-vs-handwritten benchmark
+cases for those routes.
 
 Runtime-wired generated candidates that are not promoted stay on handwritten
 production dispatch by default. They remain opt-in through
-`TERMITE_METAL_ENABLE_ANTFLY_*` gates and are tracked with explicit blockers.
+`TERMITE_METAL_ENABLE_ANTFLY_*` gates, or all at once with
+`ANTFLY_METAL_GENERATED_QUANT=1` / `TERMITE_METAL_ENABLE_ANTFLY_GENERATED_QUANT=1`,
+and are tracked with explicit blockers.
 The route-all evidence covers 50 generated cases: all 50 must be route-ready,
 46 must have provider-route evidence, and every non-promoted candidate must
 explain itself with an explicit blocker such as `speedup_gate_missing`,
@@ -173,21 +173,25 @@ counts for non-promoted candidates may vary with timing noise; production
 promotion does not rely on route-all speedup alone.
 
 The dedicated blocker evidence table remains intentionally stricter than
-route-all: 8 candidate kernels are guarded, 3 have benchmark-evidence paths
-(`speedup_gate_missing` for Q4_0 and Q8_0 bias+GELU,
-`unstable_benchmark_timing` for Q4_1), and 5 are route-evidence-only because
-their handwritten baseline is unsupported. Cleared one-off evidence for these
-kernels is production-regression guarded and does not promote the kernel by
-itself.
+route-all: 17 candidate kernels are guarded, 12 have benchmark-evidence paths
+(`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q4_K none, Q6_K bias+GELU, and
+Q8_0 bias+GELU; `unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU,
+Q5_K none, Q5_K bias+GELU, Q8_1 none, and Q8_K none), and 5 are
+route-evidence-only
+because their handwritten baseline is unsupported. Cleared one-off evidence for
+these kernels is production-regression guarded and does not promote the kernel
+by itself.
 
 This is intentional. A slow or noisy candidate is useful for compiler coverage,
 route testing, and future tuning, but it must not silently become the production
 route.
 
-Current Q4_0, Q4_1, and Q8_0 bias+GELU note: these generated kernels are
-correct and useful for route coverage, but they are not production defaults.
-Their blocker evidence is production-regression guarded; a one-off local
-promotion-ready result is a signal to investigate, not enough to promote.
+Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K none/bias+GELU, Q5_K none/bias+GELU,
+Q6_K bias+GELU, Q8_0 bias+GELU, Q8_1 none, and Q8_K none note: these
+generated kernels are correct and useful for route coverage, but they are not
+production defaults. Their blocker evidence is production-regression guarded; a
+one-off local promotion-ready result is a signal to investigate, not enough to
+promote.
 
 Current Q2_K/Q3_K bias and bias+GELU plus Q8_0 relu note: these generated
 kernels prove correctness and dispatch wiring through route-all, but they do not
@@ -207,8 +211,8 @@ Current local validation snapshot:
 - `zig build quant-kernel-codegen -- --check-metal` compiles the generated and
   promoted Metal sources through `xcrun`.
 - `zig build quant-kernel-metal-production-regression-check -Dmetal=true -Dcuda=false`
-  runs the 17 promoted kernels across 34 generated-vs-handwritten cases.
-  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 34
+  runs the 8 promoted kernels across 16 generated-vs-handwritten cases.
+  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 16
   Metal production-regression cases with shape, dims, tolerance, source
   fingerprint, and benchmark command metadata. The target fails on hard route
   blockers such as missing generated/provider routes, unsupported production
@@ -221,7 +225,10 @@ Current local validation snapshot:
   blockers instead of silently promoting candidates.
 - `zig build quant-kernel-metal-industry-local-check -Dmetal=true -Dcuda=false`
   adds blocker evidence refresh/strict checks and the Gemma4 generated-route
-  prefill-frame smoke.
+  prefill-frame smoke. The generated-route smoke now gates model-level
+  generated-family coverage: the local Gemma4 E4B path must report at least two
+  generated quant families, with `q4_0` as the top family and Q8_0/Q4_0
+  generated dispatch counters present.
 
 Metal-named evidence targets are macOS-only by contract. They report a clear
 build failure off macOS so a Linux/CUDA VM can still run CUDA/source checks
@@ -231,13 +238,16 @@ when Metal runtime evidence is required.
 
 ## Evidence Commands
 
-Metal runtime evidence uses the `antfly.quant_kernel_metal_runtime_evidence.v8`
+Metal runtime evidence uses the `antfly.quant_kernel_metal_runtime_evidence.v9`
 schema. In addition to per-case timings, each evidence file records the
 machine-checked compiled-vs-handwritten summary:
 `benchmark_supported_count`, `benchmark_speedup_pass_count`,
 `benchmark_speedup_min`, `benchmark_speedup_min_case`, `benchmark_speedup_max`,
 `benchmark_speedup_max_case`, and `benchmark_speedup_avg`. The runtime evidence
 checker recomputes these fields from the case list and rejects stale summaries.
+Repeated timing evidence also records `repeat_gate_index`, allowing the
+promotion gate to tolerate one isolated outlier while still requiring the sorted
+repeat speedup gate to clear.
 
 Route-all evidence is an observability check, not a promotion decision. Promoted
 generated-production routes report an empty `promotion_blocker` when route

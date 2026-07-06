@@ -85,6 +85,45 @@ pub const Stats = struct {
             self.q8_k;
     }
 
+    pub const FamilySummary = struct {
+        name: []const u8 = "none",
+        count: u64 = 0,
+    };
+
+    pub fn topFamily(self: Stats) FamilySummary {
+        var best = FamilySummary{};
+        best = chooseTopFamily(best, "q2_k", self.q2_k + self.q2_k_bias + self.q2_k_bias_gelu);
+        best = chooseTopFamily(best, "q3_k", self.q3_k + self.q3_k_bias + self.q3_k_bias_gelu);
+        best = chooseTopFamily(best, "q4_0", self.q4_0);
+        best = chooseTopFamily(best, "q4_1", self.q4_1);
+        best = chooseTopFamily(best, "q5_0", self.q5_0);
+        best = chooseTopFamily(best, "q5_1", self.q5_1);
+        best = chooseTopFamily(best, "q4_k", self.q4_k + self.q4_k_bias + self.q4_k_bias_gelu);
+        best = chooseTopFamily(best, "q5_k", self.q5_k + self.q5_k_bias + self.q5_k_bias_gelu);
+        best = chooseTopFamily(best, "q6_k", self.q6_k + self.q6_k_bias + self.q6_k_bias_gelu);
+        best = chooseTopFamily(best, "q8_0", self.q8_0 + self.q8_0_bias + self.q8_0_bias_gelu + self.q8_0_relu);
+        best = chooseTopFamily(best, "q8_1", self.q8_1);
+        best = chooseTopFamily(best, "q8_k", self.q8_k);
+        return best;
+    }
+
+    pub fn nonzeroFamilyCount(self: Stats) u64 {
+        var count: u64 = 0;
+        if (self.q2_k + self.q2_k_bias + self.q2_k_bias_gelu != 0) count += 1;
+        if (self.q3_k + self.q3_k_bias + self.q3_k_bias_gelu != 0) count += 1;
+        if (self.q4_0 != 0) count += 1;
+        if (self.q4_1 != 0) count += 1;
+        if (self.q5_0 != 0) count += 1;
+        if (self.q5_1 != 0) count += 1;
+        if (self.q4_k + self.q4_k_bias + self.q4_k_bias_gelu != 0) count += 1;
+        if (self.q5_k + self.q5_k_bias + self.q5_k_bias_gelu != 0) count += 1;
+        if (self.q6_k + self.q6_k_bias + self.q6_k_bias_gelu != 0) count += 1;
+        if (self.q8_0 + self.q8_0_bias + self.q8_0_bias_gelu + self.q8_0_relu != 0) count += 1;
+        if (self.q8_1 != 0) count += 1;
+        if (self.q8_k != 0) count += 1;
+        return count;
+    }
+
     pub fn add(lhs: Stats, rhs: Stats) Stats {
         return .{
             .q2_k = lhs.q2_k + rhs.q2_k,
@@ -212,6 +251,10 @@ pub const Stats = struct {
     }
 };
 
+fn chooseTopFamily(current: Stats.FamilySummary, name: []const u8, count: u64) Stats.FamilySummary {
+    return if (count > current.count) .{ .name = name, .count = count } else current;
+}
+
 pub fn snapshotForSession(
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -259,4 +302,7 @@ test "quant kernel compiler metal generated quant stats total covers every gener
     try std.testing.expectEqual(@as(u64, 25), stats.generatedTotal());
     try std.testing.expectEqual(@as(u64, 25), Stats.diff(.{}, stats).generatedTotal());
     try std.testing.expectEqual(@as(u64, 50), stats.add(stats).generatedTotal());
+    try std.testing.expectEqual(@as(u64, 12), stats.nonzeroFamilyCount());
+    try std.testing.expectEqualStrings("q8_0", stats.topFamily().name);
+    try std.testing.expectEqual(@as(u64, 4), stats.topFamily().count);
 }

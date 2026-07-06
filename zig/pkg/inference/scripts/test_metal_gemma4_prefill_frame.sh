@@ -30,6 +30,9 @@ MIN_GENERATED_Q4_SMALL_BATCH="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q4_SMALL_B
 MIN_GENERATED_Q5_SMALL_BATCH="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q5_SMALL_BATCH:-0}"
 MIN_GENERATED_Q6_SMALL_BATCH="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q6_SMALL_BATCH:-0}"
 MIN_GENERATED_COUNTERS="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_COUNTERS:-}"
+EXPECTED_GENERATED_TOP_FAMILY="${ANTFLY_INFERENCE_GEMMA4_EXPECTED_GENERATED_TOP_FAMILY:-}"
+MIN_GENERATED_TOP_COUNT="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT:-0}"
+MIN_GENERATED_FAMILY_COUNT="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_FAMILY_COUNT:-0}"
 JSON_TIMING="${ANTFLY_INFERENCE_GEMMA4_JSON_TIMING:-1}"
 RAW_PROMPT="${ANTFLY_INFERENCE_GEMMA4_PREFILL_RAW_PROMPT:-0}"
 OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-prefill-frame-test}"
@@ -158,6 +161,22 @@ json_counter_from() {
   ' "$json"
 }
 
+json_string_from() {
+  local json="$1"
+  local key="$2"
+  awk -v needle="\"${key}\"" '
+    index($0, needle) {
+      value = $0
+      sub(".*" needle "[[:space:]]*:[[:space:]]*\"", "", value)
+      sub("\".*", "", value)
+      if (value != "") {
+        print value
+        exit
+      }
+    }
+  ' "$json"
+}
+
 assert_json_counter_at_least() {
   local label="$1"
   local json="$2"
@@ -252,6 +271,25 @@ assert_json_timing_anchor() {
     generated_counter_min="${generated_counter_gate#*=}"
     assert_json_counter_at_least "$label" "$json" "$generated_counter_key" "$generated_counter_min"
   done
+
+  if [[ -n "$EXPECTED_GENERATED_TOP_FAMILY" ]]; then
+    local actual_top_family
+    actual_top_family="$(json_string_from "$json" metal_generated_quant_top_family)"
+    if [[ "$actual_top_family" != "$EXPECTED_GENERATED_TOP_FAMILY" ]]; then
+      echo "generated quant top family mismatch for $label" >&2
+      echo "expected: $EXPECTED_GENERATED_TOP_FAMILY" >&2
+      echo "actual: ${actual_top_family:-<missing>}" >&2
+      echo "json: $json" >&2
+      sed -n '1,220p' "$json" >&2 || true
+      exit 1
+    fi
+  fi
+  if (( MIN_GENERATED_TOP_COUNT > 0 )); then
+    assert_json_counter_at_least "$label" "$json" metal_generated_quant_top_count "$MIN_GENERATED_TOP_COUNT"
+  fi
+  if (( MIN_GENERATED_FAMILY_COUNT > 0 )); then
+    assert_json_counter_at_least "$label" "$json" metal_generated_quant_family_count "$MIN_GENERATED_FAMILY_COUNT"
+  fi
 }
 
 assert_anchor() {
@@ -440,7 +478,11 @@ OUT
 "frame_fallbacks":{
 "decode_fallback":0
 }
-}
+},
+"metal_generated_quant":12,
+"metal_generated_quant_family_count":6,
+"metal_generated_quant_top_family":"q8_0",
+"metal_generated_quant_top_count":5
 }
 JSON
   EXPECTED_TOKEN_IDS=1
@@ -449,6 +491,9 @@ JSON
   MIN_GENERATED_Q4_SMALL_BATCH=1
   MIN_GENERATED_Q5_SMALL_BATCH=1
   MIN_GENERATED_Q6_SMALL_BATCH=1
+  EXPECTED_GENERATED_TOP_FAMILY=q8_0
+  MIN_GENERATED_TOP_COUNT=5
+  MIN_GENERATED_FAMILY_COUNT=6
   assert_anchor self-test-pass "$sample"
   MIN_GENERATED_Q8_0_SMALL_BATCH=3
   if ( assert_anchor self-test-q8-0-fail "$sample" ) 2>"$tmp_dir/q8-0-fail.err"; then
@@ -518,6 +563,36 @@ JSON
   fi
   if ! grep -q 'missing generated quant dispatch counter missing_counter' "$tmp_dir/generic-missing-fail.err"; then
     cat "$tmp_dir/generic-missing-fail.err" >&2
+    exit 1
+  fi
+  MIN_GENERATED_COUNTERS=
+  EXPECTED_GENERATED_TOP_FAMILY=q6_k
+  if ( assert_anchor self-test-top-family-fail "$sample" ) 2>"$tmp_dir/top-family-fail.err"; then
+    echo "expected generated top family gate failure" >&2
+    exit 1
+  fi
+  if ! grep -q 'generated quant top family mismatch' "$tmp_dir/top-family-fail.err"; then
+    cat "$tmp_dir/top-family-fail.err" >&2
+    exit 1
+  fi
+  EXPECTED_GENERATED_TOP_FAMILY=q8_0
+  MIN_GENERATED_TOP_COUNT=6
+  if ( assert_anchor self-test-top-count-fail "$sample" ) 2>"$tmp_dir/top-count-fail.err"; then
+    echo "expected generated top count gate failure" >&2
+    exit 1
+  fi
+  if ! grep -q 'metal_generated_quant_top_count below gate' "$tmp_dir/top-count-fail.err"; then
+    cat "$tmp_dir/top-count-fail.err" >&2
+    exit 1
+  fi
+  MIN_GENERATED_TOP_COUNT=5
+  MIN_GENERATED_FAMILY_COUNT=7
+  if ( assert_anchor self-test-family-count-fail "$sample" ) 2>"$tmp_dir/family-count-fail.err"; then
+    echo "expected generated family count gate failure" >&2
+    exit 1
+  fi
+  if ! grep -q 'metal_generated_quant_family_count below gate' "$tmp_dir/family-count-fail.err"; then
+    cat "$tmp_dir/family-count-fail.err" >&2
     exit 1
   fi
   echo "metal Gemma4 prefill-frame script self-test passed"

@@ -209,8 +209,12 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
                 result.graph_stats.dynamic_copy_bytes,
                 result.graph_stats.last_fallback_reason,
             });
-            print("metal_generated_quant={d} metal_generated_q4_k={d}/{d}/{d} metal_generated_q5_k={d}/{d}/{d} metal_generated_q6_k={d}/{d}/{d} metal_generated_q8_0={d}/{d}/{d}/{d} metal_q4_k_rows={d}/{d}/{d}/{d} metal_q6_k_rows={d}/{d}/{d}/{d} metal_q8_0_rows={d}/{d}/{d}/{d}\n", .{
+            const metal_generated_top = result.metal_generated_quant.topFamily();
+            print("metal_generated_quant={d} metal_generated_top={s}:{d} metal_generated_families={d} metal_generated_q4_k={d}/{d}/{d} metal_generated_q5_k={d}/{d}/{d} metal_generated_q6_k={d}/{d}/{d} metal_generated_q8_0={d}/{d}/{d}/{d} metal_q4_k_rows={d}/{d}/{d}/{d} metal_q6_k_rows={d}/{d}/{d}/{d} metal_q8_0_rows={d}/{d}/{d}/{d}\n", .{
                 result.metal_generated_quant.generatedTotal(),
+                metal_generated_top.name,
+                metal_generated_top.count,
+                result.metal_generated_quant.nonzeroFamilyCount(),
                 result.metal_generated_quant.q4_k,
                 result.metal_generated_quant.q4_k_bias,
                 result.metal_generated_quant.q4_k_bias_gelu,

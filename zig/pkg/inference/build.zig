@@ -558,6 +558,9 @@ pub fn build(b: *std.Build) void {
     const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test = b.addSystemCommand(&.{
         "env",
         "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q4_0_SMALL_BATCH=1",
+        "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_FAMILY_COUNT=2",
+        "ANTFLY_INFERENCE_GEMMA4_EXPECTED_GENERATED_TOP_FAMILY=q4_0",
+        "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT=1",
         "bash",
         "scripts/test_metal_gemma4_prefill_frame.sh",
         "--e4b-smoke",
@@ -577,7 +580,6 @@ pub fn build(b: *std.Build) void {
     );
     quant_kernel_metal_model_local_check_step.dependOn(quant_kernel_metal_local_check_step);
     if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
-        metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step.dependOn(quant_kernel_metal_local_check_step);
         quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
     }
 

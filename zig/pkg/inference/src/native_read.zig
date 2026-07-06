@@ -429,6 +429,13 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     }
     try buf.appendSlice(allocator, ",\"metal_generated_quant\":");
     try appendIntJson(&buf, allocator, result.metal_generated_quant.generatedTotal());
+    const metal_generated_top = result.metal_generated_quant.topFamily();
+    try buf.appendSlice(allocator, ",\"metal_generated_quant_family_count\":");
+    try appendIntJson(&buf, allocator, result.metal_generated_quant.nonzeroFamilyCount());
+    try buf.appendSlice(allocator, ",\"metal_generated_quant_top_family\":");
+    try jsonEncodeString(&buf, allocator, metal_generated_top.name);
+    try buf.appendSlice(allocator, ",\"metal_generated_quant_top_count\":");
+    try appendIntJson(&buf, allocator, metal_generated_top.count);
     try buf.appendSlice(allocator, ",\"metal_generated_q2_k\":");
     try appendIntJson(&buf, allocator, result.metal_generated_quant.q2_k);
     try buf.appendSlice(allocator, ",\"metal_generated_q2_k_bias\":");

@@ -35,7 +35,7 @@ const metal_quant_format_q8_1: u32 = 14;
 const metal_quant_format_q8_k: u32 = 15;
 const metal_storage_private: c_int = 1;
 const metal_quant_evidence_contract = "antfly.quant_kernel_metal_evidence.v1";
-const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v8";
+const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v9";
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
@@ -1174,7 +1174,6 @@ fn runRepeatedCheck(
 
     var max_error: f32 = 0.0;
     var handwritten_count: usize = 0;
-    var minimum_repeat_speedup: ?f64 = null;
     var repeat_speedups: [max_evidence_repeat_runs]f64 = [_]f64{0.0} ** max_evidence_repeat_runs;
     for (runs, 0..) |*run, i| {
         run.* = try runCheck(allocator, check, route_kernel, promotion_ready_kernel);
@@ -1185,7 +1184,6 @@ fn runRepeatedCheck(
             handwritten_count += 1;
             const run_speedup = speedup(elapsed, run.elapsed_nanos);
             repeat_speedups[i] = run_speedup;
-            minimum_repeat_speedup = if (minimum_repeat_speedup) |current| @min(current, run_speedup) else run_speedup;
         }
     }
 
@@ -1204,7 +1202,7 @@ fn runRepeatedCheck(
         .elapsed_nanos = medianU64Const(generated_ns),
         .generated_timing_route = generated_timing_route,
         .handwritten_elapsed_nanos = if (handwritten_count == run_count) medianU64Const(handwritten_ns[0..handwritten_count]) else null,
-        .minimum_repeat_speedup = if (handwritten_count == run_count) minimum_repeat_speedup else null,
+        .minimum_repeat_speedup = if (handwritten_count == run_count) repeatGateSpeedup(repeat_speedups[0..run_count]) else null,
         .repeat_timing_count = repeat_runs,
         .repeat_handwritten_count = @intCast(handwritten_count),
         .generated_route_checked = generated_route_checked,
@@ -1226,6 +1224,17 @@ fn medianU64Const(values: []const u64) u64 {
     var copy: [max_evidence_repeat_runs]u64 = undefined;
     @memcpy(copy[0..values.len], values);
     return medianU64(copy[0..values.len]);
+}
+
+fn repeatGateSpeedup(values: []const f64) f64 {
+    var copy: [max_evidence_repeat_runs]f64 = undefined;
+    @memcpy(copy[0..values.len], values);
+    std.mem.sort(f64, copy[0..values.len], {}, std.sort.asc(f64));
+    return copy[repeatGateRank(values.len)];
+}
+
+fn repeatGateRank(count: usize) usize {
+    return if (count >= quant_kernel_compiler.metal_promotion_repeat_runs) 1 else 0;
 }
 
 fn runCheck(
@@ -2390,9 +2399,9 @@ fn writeEvidence(
                 if (promotion_ready) {
                     promotion_ready_count += 1;
                 } else if (emit_promotion_diagnostics) {
-                    if (minimumRepeatIndex(result)) |repeat_index| {
+                    if (repeatGateIndex(result)) |repeat_index| {
                         std.debug.print(
-                            "quant-kernel-metal-runtime-check promotion not ready kernel={s} case={s} blocker={s} worst_repeat={d} generated_avg_us={d:.3} handwritten_avg_us={d:.3} repeat_speedup={d:.3} required={d:.3}\n",
+                            "quant-kernel-metal-runtime-check promotion not ready kernel={s} case={s} blocker={s} repeat_gate={d} generated_avg_us={d:.3} handwritten_avg_us={d:.3} repeat_speedup={d:.3} required={d:.3}\n",
                             .{
                                 check.kernel_name,
                                 check.name,
@@ -2801,6 +2810,9 @@ fn appendRepeatTimingFields(
         if (minimumRepeatIndex(result)) |index| {
             try appendJsonFmt(allocator, out, ",\"minimum_repeat_index\":{d}", .{index});
         }
+        if (repeatGateIndex(result)) |index| {
+            try appendJsonFmt(allocator, out, ",\"repeat_gate_index\":{d}", .{index});
+        }
     }
 }
 
@@ -2816,6 +2828,16 @@ fn minimumRepeatIndex(result: CheckResult) ?usize {
         }
     }
     return index;
+}
+
+fn repeatGateIndex(result: CheckResult) ?usize {
+    if (result.repeat_timing_count == 0 or result.repeat_timing_count != result.repeat_handwritten_count) return null;
+    const count: usize = @intCast(result.repeat_timing_count);
+    const gate_speedup = repeatGateSpeedup(result.repeat_speedups[0..count]);
+    for (result.repeat_speedups[0..count], 0..) |speedup_value, i| {
+        if (approximately(speedup_value, gate_speedup, 0.000001)) return i;
+    }
+    return null;
 }
 
 fn appendU64ArrayField(
@@ -4062,7 +4084,13 @@ fn evidenceCaseHasConsistentRepeatTimings(
     const minimum_index = jsonUsize(case_value.object.get("minimum_repeat_index")) orelse return false;
     if (minimum_index >= speedups.len) return false;
     if (!approximately(speedups[minimum_index], min_speedup, 0.000001)) return false;
-    return approximately(min_speedup, minimum_repeat_speedup, 0.000001);
+    const gate_speedup = if (case_value.object.get("repeat_gate_index")) |gate_value| gate: {
+        const gate_index = jsonUsize(gate_value) orelse return false;
+        if (gate_index >= speedups.len) return false;
+        if (!approximately(speedups[gate_index], repeatGateSpeedup(speedups), 0.000001)) return false;
+        break :gate speedups[gate_index];
+    } else min_speedup;
+    return approximately(gate_speedup, minimum_repeat_speedup, 0.000001);
 }
 
 fn evidenceCaseHasConsistentPromotionBlocker(case_value: std.json.Value) bool {
@@ -4406,7 +4434,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer parsed.deinit();
 
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"evidence_contract\":\"antfly.quant_kernel_metal_evidence.v1\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v8\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v9\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_timing_route\":\"standalone_generated\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_timing_scope\":\"standalone_command_buffer\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_worst_repeat_speedup\":null"));
@@ -4711,7 +4739,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const parallel = try replaceOnce(std.testing.allocator, actual, "\"benchmark_mode\":\"sequential\"", "\"benchmark_mode\":\"parallel\"");
     defer std.testing.allocator.free(parallel);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, parallel, false, false, null));
-    const stale_schema = try replaceOnce(std.testing.allocator, actual, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v8\"", "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v3\"");
+    const stale_schema = try replaceOnce(std.testing.allocator, actual, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v9\"", "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v3\"");
     defer std.testing.allocator.free(stale_schema);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_schema, false, false, null));
 
@@ -4866,7 +4894,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(production_summary.production_regression_check);
     try std.testing.expectEqual(quant_kernel_compiler.first_metal_production_benchmark_case_count, production_summary.compiler_benchmark_manifest_case_count orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint(), production_summary.compiler_benchmark_manifest_case_fingerprint orelse return error.InvalidMetalEvidence);
-    const stale_production_manifest_case = try replaceOnce(std.testing.allocator, production_regression_actual, "\"name\":\"q4_k_rows_2_8_bias_gelu\"", "\"name\":\"q4_k_rows_2_8_bias_gelu_stale\"");
+    const stale_production_manifest_case = try replaceOnce(std.testing.allocator, production_regression_actual, "\"name\":\"q6_k_rows_2_8_bias\"", "\"name\":\"q6_k_rows_2_8_bias_stale\"");
     defer std.testing.allocator.free(stale_production_manifest_case);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_manifest_case, false, false, null));
     const stale_production_manifest_count = try replaceOnce(std.testing.allocator, production_regression_actual, expected_compiler_manifest_case_count, "\"compiler_benchmark_manifest_case_count\":1");
@@ -5071,6 +5099,22 @@ test "quant kernel metal runtime benchmark math gates on minimum repeat speedup"
     var parsed_bad_average = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bad_average, .{});
     defer parsed_bad_average.deinit();
     try std.testing.expect(!evidenceCaseHasConsistentBenchmarkMath(parsed_bad_average.value));
+}
+
+test "quant kernel metal runtime benchmark math tolerates one repeat outlier" {
+    const robust =
+        \\{"measure_iters":25,"generated_ns":100,"generated_avg_us":0.004,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":120,"handwritten_avg_us":0.0048,"measured_speedup":1.200000,"minimum_repeat_speedup":1.200000,"repeat_runs":5,"repeat_generated_ns":[100,100,100,100,100],"repeat_handwritten_ns":[50,120,120,120,120],"repeat_speedups":[0.500000,1.200000,1.200000,1.200000,1.200000],"minimum_repeat_index":0,"repeat_gate_index":1}
+    ;
+    var parsed_robust = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, robust, .{});
+    defer parsed_robust.deinit();
+    try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_robust.value));
+
+    const stale_min =
+        \\{"measure_iters":25,"generated_ns":100,"generated_avg_us":0.004,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":120,"handwritten_avg_us":0.0048,"measured_speedup":1.200000,"minimum_repeat_speedup":1.200000,"repeat_runs":5,"repeat_generated_ns":[100,100,100,100,100],"repeat_handwritten_ns":[50,120,120,120,120],"repeat_speedups":[0.500000,1.200000,1.200000,1.200000,1.200000],"minimum_repeat_index":0}
+    ;
+    var parsed_stale_min = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stale_min, .{});
+    defer parsed_stale_min.deinit();
+    try std.testing.expect(!evidenceCaseHasConsistentBenchmarkMath(parsed_stale_min.value));
 }
 
 test "quant kernel metal runtime promotion blocker reports unstable repeat timing" {

@@ -503,12 +503,16 @@ fn printText(opts: Options, result: Result) void {
             result.quant.q8_0_triple,
         },
     );
+    const metal_generated_top = result.metal_generated_quant.topFamily();
     std.debug.print(
-        "{s}/{s}: metal_generated_quant={} metal_generated_q4_k={}/{}/{} metal_generated_q5_k={}/{}/{} metal_generated_q6_k={}/{}/{} metal_generated_q8_0={}/{}/{}/{} metal_q4_k_rows={}/{}/{}/{} metal_q6_k_rows={}/{}/{}/{} metal_q8_0_rows={}/{}/{}/{}\n",
+        "{s}/{s}: metal_generated_quant={} metal_generated_top={s}:{} metal_generated_families={} metal_generated_q4_k={}/{}/{} metal_generated_q5_k={}/{}/{} metal_generated_q6_k={}/{}/{} metal_generated_q8_0={}/{}/{}/{} metal_q4_k_rows={}/{}/{}/{} metal_q6_k_rows={}/{}/{}/{} metal_q8_0_rows={}/{}/{}/{}\n",
         .{
             @tagName(result.task),
             result.mode,
             result.metal_generated_quant.generatedTotal(),
+            metal_generated_top.name,
+            metal_generated_top.count,
+            result.metal_generated_quant.nonzeroFamilyCount(),
             result.metal_generated_quant.q4_k,
             result.metal_generated_quant.q4_k_bias,
             result.metal_generated_quant.q4_k_bias_gelu,
