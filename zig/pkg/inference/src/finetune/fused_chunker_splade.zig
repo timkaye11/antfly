@@ -21,6 +21,44 @@
 // Weight key: SPLADE_WEIGHT_KEY [vocab_size, hidden_size]
 
 const std = @import("std");
+const linalg = @import("inference_linalg");
+
+// ---------------------------------------------------------------------------
+// Projection helper
+// ---------------------------------------------------------------------------
+
+/// Dense SPLADE projection: logits[total_tokens, V] = hidden[total_tokens, H] @ W[V, H]^T.
+///
+/// This is the dominant cost of the SPLADE head-only training step (768 -> 50368
+/// projection). The previous implementation used a hand-rolled scalar triple loop
+/// (token x vocab x hidden), which ran at ~97s/step on full data. Routing the
+/// projection through the shared tiled + multithreaded SGEMM (`inference_linalg`,
+/// the same host GEMM the encoder dense-linear forward falls back to under the
+/// TERMITE_METAL_DISABLE_DEVICE_DENSE_LINEAR_FORWARD parity default) collapses it
+/// to a few seconds while preserving the exact max-pool / log1p / relu semantics
+/// applied afterwards.
+///
+/// `out_logits` must be `total_tokens * V` and is fully overwritten (beta = 0).
+fn projectSpladeLogits(
+    hidden: []const f32,
+    weight: []const f32,
+    out_logits: []f32,
+    total_tokens: usize,
+    hidden_size: usize,
+    vocab_size: usize,
+) void {
+    // C[m=total_tokens, n=V] = A[m, k=H] @ B[n=V, k=H]^T
+    linalg.sgemmTransBSync(
+        total_tokens,
+        vocab_size,
+        hidden_size,
+        1.0,
+        hidden,
+        weight,
+        0.0,
+        out_logits,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -77,18 +115,19 @@ pub fn computeSpladeActivation(
     std.debug.assert(out_splade.len == V);
 
     @memset(out_splade, 0);
+    if (total_tokens == 0) return;
+
+    // Dense projection through the tiled/threaded SGEMM (was a scalar triple loop).
+    const logits = try allocator.alloc(f32, total_tokens * V);
+    defer allocator.free(logits);
+    projectSpladeLogits(hidden, weight, logits, total_tokens, H, V);
 
     switch (pooling) {
         .max => {
             for (0..total_tokens) |t| {
-                const h_base = t * H;
+                const row = logits[t * V .. (t + 1) * V];
                 for (0..V) |v| {
-                    const w_base = v * H;
-                    var dot: f32 = 0;
-                    for (0..H) |k| {
-                        dot += hidden[h_base + k] * weight[w_base + k];
-                    }
-                    const act = std.math.log1p(@max(0.0, dot));
+                    const act = std.math.log1p(@max(0.0, row[v]));
                     if (act > out_splade[v]) out_splade[v] = act;
                 }
             }
@@ -100,22 +139,15 @@ pub fn computeSpladeActivation(
             @memset(acc, 0);
 
             for (0..total_tokens) |t| {
-                const h_base = t * H;
+                const row = logits[t * V .. (t + 1) * V];
                 for (0..V) |v| {
-                    const w_base = v * H;
-                    var dot: f32 = 0;
-                    for (0..H) |k| {
-                        dot += hidden[h_base + k] * weight[w_base + k];
-                    }
-                    acc[v] += std.math.log1p(@max(0.0, dot));
+                    acc[v] += std.math.log1p(@max(0.0, row[v]));
                 }
             }
 
-            if (total_tokens > 0) {
-                const inv_count: f64 = 1.0 / @as(f64, @floatFromInt(total_tokens));
-                for (0..V) |v| {
-                    out_splade[v] = @floatCast(acc[v] * inv_count);
-                }
+            const inv_count: f64 = 1.0 / @as(f64, @floatFromInt(total_tokens));
+            for (0..V) |v| {
+                out_splade[v] = @floatCast(acc[v] * inv_count);
             }
         },
     }
@@ -414,20 +446,22 @@ pub fn computeSpladeActivationWithInfo(
     errdefer allocator.free(pre_relu);
     @memset(pre_relu, 0);
 
-    for (0..total_tokens) |t| {
-        const h_base = t * H;
-        for (0..V) |v| {
-            const w_base = v * H;
-            var dot: f32 = 0;
-            for (0..H) |k| {
-                dot += hidden[h_base + k] * weight[w_base + k];
-            }
-            const relu_val = @max(0.0, dot);
-            const act = std.math.log1p(relu_val);
-            if (act > splade_vec[v]) {
-                splade_vec[v] = act;
-                argmax_tokens[v] = @intCast(t);
-                pre_relu[v] = relu_val;
+    if (total_tokens > 0) {
+        // Dense projection through the tiled/threaded SGEMM (was a scalar triple loop).
+        const logits = try allocator.alloc(f32, total_tokens * V);
+        defer allocator.free(logits);
+        projectSpladeLogits(hidden, weight, logits, total_tokens, H, V);
+
+        for (0..total_tokens) |t| {
+            const row = logits[t * V .. (t + 1) * V];
+            for (0..V) |v| {
+                const relu_val = @max(0.0, row[v]);
+                const act = std.math.log1p(relu_val);
+                if (act > splade_vec[v]) {
+                    splade_vec[v] = act;
+                    argmax_tokens[v] = @intCast(t);
+                    pre_relu[v] = relu_val;
+                }
             }
         }
     }
