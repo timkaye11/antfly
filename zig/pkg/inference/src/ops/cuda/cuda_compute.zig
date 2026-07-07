@@ -576,6 +576,12 @@ pub const RuntimeStats = struct {
     qkv_kernel_unavailable: usize = 0,
     q4k_decode_fast_hits: usize = 0,
     q4k_decode_fast_fallbacks: usize = 0,
+    q4_0_generated_mmv_hits: usize = 0,
+    q4_0_generated_mmv_fallbacks: usize = 0,
+    q4_0_generated_mm_hits: usize = 0,
+    q4_0_generated_mm_fallbacks: usize = 0,
+    q4_0_generated_pair_hits: usize = 0,
+    q4_0_generated_pair_fallbacks: usize = 0,
     head_norm_rope_fused_hits: usize = 0,
     head_norm_rope_fused_fallbacks: usize = 0,
     decoder_runtime_linear_slot_prepares: usize = 0,
@@ -2918,6 +2924,41 @@ fn cudaQ4_0LinearTile4W4Enabled() bool {
 
 fn cudaQ4_0LinearQ8_1Dp4aEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A", false);
+}
+
+fn cudaQ4_0GeneratedMmvEnabled() bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV", false)) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV", true);
+}
+
+fn cudaQ4_0GeneratedMmEnabled() bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM", false)) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM", true);
+}
+
+fn cudaQ4_0GeneratedPairEnabled() bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR", false)) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR", true);
+}
+
+// Checked-in evidence (src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json)
+// shows the generated rows 9..64 kernel losing to the handwritten baseline at
+// in_dim=256, so the runtime route only claims wider shapes.
+const cuda_q4_0_generated_mm_min_in_dim: usize = 512;
+
+fn launchLinearQ4_0Tile4ThenBaseF32(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, dst, input, weight, rows, in_dim, out_dim),
+        else => return tile4_err,
+    };
 }
 
 fn cudaQ4_0Q8_1PrefillRowsEnabled() bool {
@@ -7577,34 +7618,42 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                             error.CudaKernelUnavailable, error.InvalidCudaState => {
                                 if (cudaQ4_0LinearTile4W4Enabled()) {
                                     self.kernels.launchLinearQ4_0Tile4W4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4w4_err| switch (tile4w4_err) {
-                                        error.CudaKernelUnavailable, error.InvalidCudaState => self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
-                                            error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                                            else => return tile4_err,
-                                        },
+                                        error.CudaKernelUnavailable, error.InvalidCudaState => try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                                         else => return tile4w4_err,
                                     };
                                 } else {
-                                    self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
-                                        error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                                        else => return tile4_err,
-                                    };
+                                    try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                                 }
                             },
                             else => return tile8_err,
                         };
                     } else if (rows == 1 and cudaQ4_0LinearTile4W4Enabled()) {
                         self.kernels.launchLinearQ4_0Tile4W4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4w4_err| switch (tile4w4_err) {
-                            error.CudaKernelUnavailable, error.InvalidCudaState => self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
-                                error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                                else => return tile4_err,
-                            },
+                            error.CudaKernelUnavailable, error.InvalidCudaState => try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                             else => return tile4w4_err,
                         };
+                    } else if (rows == 1 and cudaQ4_0GeneratedMmvEnabled()) {
+                        if (self.kernels.launchLinearQ4_0GeneratedMmvF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+                            self.stats.q4_0_generated_mmv_hits += 1;
+                        } else |generated_err| switch (generated_err) {
+                            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                                self.stats.q4_0_generated_mmv_fallbacks += 1;
+                                try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                            },
+                            else => return generated_err,
+                        }
                     } else if (rows == 1) {
-                        self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
-                            error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                            else => return tile4_err,
-                        };
+                        try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                    } else if (rows >= 9 and rows <= 64 and in_dim >= cuda_q4_0_generated_mm_min_in_dim and cudaQ4_0GeneratedMmEnabled()) {
+                        if (self.kernels.launchLinearQ4_0GeneratedMmF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+                            self.stats.q4_0_generated_mm_hits += 1;
+                        } else |generated_err| switch (generated_err) {
+                            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                                self.stats.q4_0_generated_mm_fallbacks += 1;
+                                try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                            },
+                            else => return generated_err,
+                        }
                     } else {
                         try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     }
@@ -9290,8 +9339,32 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             break :blk false;
         };
         if (!used_q4_0_q8_1_dp4a and !used_q4_0_tile8) {
+            const used_q4_0_generated_pair = blk: {
+                if (rows == 1 and cudaQ4_0GeneratedPairEnabled()) {
+                    self.kernels.launchLinearQ4_0GeneratedPairF32(
+                        &self.ctx,
+                        device_a,
+                        device_b,
+                        input_tensor.buffer,
+                        weight_a_tensor.buffer,
+                        weight_b_tensor.buffer,
+                        rows,
+                        in_dim,
+                        out_dim,
+                    ) catch |err| switch (err) {
+                        error.CudaKernelUnavailable, error.InvalidCudaState => {
+                            self.stats.q4_0_generated_pair_fallbacks += 1;
+                            break :blk false;
+                        },
+                        else => return err,
+                    };
+                    self.stats.q4_0_generated_pair_hits += 1;
+                    break :blk true;
+                }
+                break :blk false;
+            };
             const used_q4_0_tile4_w4 = blk: {
-                if (rows == 1 and cudaQ4_0PairTile4W4Enabled()) {
+                if (!used_q4_0_generated_pair and rows == 1 and cudaQ4_0PairTile4W4Enabled()) {
                     self.kernels.launchLinearQ4_0PairNoBiasTile4W4F32(
                         &self.ctx,
                         device_a,
@@ -9310,7 +9383,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                 }
                 break :blk false;
             };
-            if (!used_q4_0_tile4_w4) {
+            if (!used_q4_0_generated_pair and !used_q4_0_tile4_w4) {
                 self.kernels.launchLinearQ4_0PairNoBiasTile4F32(
                     &self.ctx,
                     device_a,

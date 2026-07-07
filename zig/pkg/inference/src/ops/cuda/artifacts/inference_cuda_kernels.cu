@@ -12983,3 +12983,223 @@ extern "C" __global__ void termite_split_last_dim3_f32(
     second[idx] = input[src + dim];
     third[idx] = input[src + dim * 2u];
 }
+
+// Runtime-wired generated quant kernels from graph/quant_kernel_compiler.zig.
+// Kernel bodies must match src/ops/cuda/generated/quant_kernel_q4_0_mmv.cu and
+// src/ops/cuda/generated/quant_kernel_q4_0_mm.cu byte-for-byte modulo the
+// uint8_t/uint16_t -> unsigned char/unsigned short spellings; the compiler test
+// "promoted CUDA kernel bodies stay in sync with the production bundle"
+// enforces this, so update this copy whenever the generated source changes.
+// kernel_id=antfly_q4_0_mmv_f32_v1 plan_id=cuda/q4_0/rows_1/none/mmv
+// kernel_id=antfly_q4_0_mm_f32_v1 plan_id=cuda/q4_0/rows_9_64/none/mm
+
+static __device__ __forceinline__ float antfly_half_le_to_float(const unsigned char *p) {
+    const unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+    return __half2float(__ushort_as_half(bits));
+}
+
+static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+    return value;
+}
+
+extern "C" __global__ void antfly_q4_0_mmv_f32_v1(
+    const float *input,
+    const unsigned char *weight_q4_0,
+    float *output,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    const int col0 = blockIdx.x << 2;
+    if (rows != 1 || col0 >= out_dim) return;
+    if (blockDim.x != 256) return;
+    if ((in_dim & 31) != 0) return;
+
+    const int row_blocks = in_dim >> 5;
+    const int half_bytes = in_dim >> 1;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int byte_idx = threadIdx.x; byte_idx < half_bytes; byte_idx += 256) {
+        const int block_idx = byte_idx >> 4;
+        const int offset = byte_idx & 15;
+        const int base = block_idx << 5;
+        const float x_lo = input[base + offset];
+        const float x_hi = input[base + offset + 16];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            if (col0 + c >= out_dim) continue;
+            const unsigned char *block = weight_q4_0 + ((size_t)(col0 + c) * row_blocks + block_idx) * 18;
+            const float d = antfly_half_le_to_float(block);
+            const int packed = (int)block[2 + offset];
+            acc[c] += d * (x_lo * (float)((packed & 15) - 8) + x_hi * (float)((packed >> 4) - 8));
+        }
+    }
+
+    __shared__ float partial[4][8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const float total = antfly_warp_reduce_sum(acc[c]);
+        if (lane == 0) partial[c][warp] = total;
+    }
+    __syncthreads();
+    if (threadIdx.x < 4) {
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) total += partial[threadIdx.x][w];
+        if (col0 + threadIdx.x < out_dim) output[col0 + threadIdx.x] = total;
+    }
+}
+
+extern "C" __global__ void antfly_q4_0_mm_f32_v1(
+    const float *input,
+    const unsigned char *weight_q4_0,
+    float *output,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    const int col0 = blockIdx.x << 2;
+    const int row0 = blockIdx.y << 3;
+    if (rows < 9 || rows > 64) return;
+    if (col0 >= out_dim || row0 >= rows) return;
+    if (blockDim.x != 256) return;
+    if ((in_dim & 31) != 0) return;
+
+    const int row_blocks = in_dim >> 5;
+    const int half_bytes = in_dim >> 1;
+    float acc[4][8];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) acc[c][r] = 0.0f;
+    }
+
+    for (int byte_idx = threadIdx.x; byte_idx < half_bytes; byte_idx += 256) {
+        const int block_idx = byte_idx >> 4;
+        const int offset = byte_idx & 15;
+        const int base = block_idx << 5;
+        float x_lo[8];
+        float x_hi[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int row = row0 + r;
+            x_lo[r] = row < rows ? input[(size_t)row * in_dim + base + offset] : 0.0f;
+            x_hi[r] = row < rows ? input[(size_t)row * in_dim + base + offset + 16] : 0.0f;
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            if (col0 + c >= out_dim) continue;
+            const unsigned char *block = weight_q4_0 + ((size_t)(col0 + c) * row_blocks + block_idx) * 18;
+            const float d = antfly_half_le_to_float(block);
+            const int packed = (int)block[2 + offset];
+            const float w_lo = d * (float)((packed & 15) - 8);
+            const float w_hi = d * (float)((packed >> 4) - 8);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) acc[c][r] += w_lo * x_lo[r] + w_hi * x_hi[r];
+        }
+    }
+
+    __shared__ float partial[4][8][8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const float total = antfly_warp_reduce_sum(acc[c][r]);
+            if (lane == 0) partial[c][r][warp] = total;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int c = threadIdx.x >> 3;
+        const int r = threadIdx.x & 7;
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) total += partial[c][r][w];
+        const int col = col0 + c;
+        const int row = row0 + r;
+        if (col < out_dim && row < rows) output[(size_t)row * out_dim + col] = total;
+    }
+}
+
+// Runtime-wired generated quant kernel from graph/quant_kernel_compiler.zig.
+// Kernel body must match src/ops/cuda/generated/quant_kernel_q4_0_pair_mmv.cu
+// byte-for-byte modulo the uint8_t -> unsigned char spelling; enforced by the
+// compiler sync test, so update this copy whenever the generated source changes.
+// kernel_id=antfly_q4_0_pair_mmv_f32_v1 plan_id=cuda/q4_0/rows_1/pair/mmv
+
+extern "C" __global__ void antfly_q4_0_pair_mmv_f32_v1(
+    const float *input,
+    const unsigned char *weight_a_q4_0,
+    const unsigned char *weight_b_q4_0,
+    float *output_a,
+    float *output_b,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    const int col0 = blockIdx.x << 2;
+    if (rows != 1 || col0 >= out_dim) return;
+    if (blockDim.x != 256) return;
+    if ((in_dim & 31) != 0) return;
+
+    const int row_blocks = in_dim >> 5;
+    const int half_bytes = in_dim >> 1;
+    float acc[2][4];
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[w][c] = 0.0f;
+    }
+
+    for (int byte_idx = threadIdx.x; byte_idx < half_bytes; byte_idx += 256) {
+        const int block_idx = byte_idx >> 4;
+        const int offset = byte_idx & 15;
+        const int base = block_idx << 5;
+        const float x_lo = input[base + offset];
+        const float x_hi = input[base + offset + 16];
+#pragma unroll
+        for (int w = 0; w < 2; ++w) {
+            const unsigned char *weight = w == 0 ? weight_a_q4_0 : weight_b_q4_0;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                if (col0 + c >= out_dim) continue;
+                const unsigned char *block = weight + ((size_t)(col0 + c) * row_blocks + block_idx) * 18;
+                const float d = antfly_half_le_to_float(block);
+                const int packed = (int)block[2 + offset];
+                acc[w][c] += d * (x_lo * (float)((packed & 15) - 8) + x_hi * (float)((packed >> 4) - 8));
+            }
+        }
+    }
+
+    __shared__ float partial[2][4][8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float total = antfly_warp_reduce_sum(acc[w][c]);
+            if (lane == 0) partial[w][c][warp] = total;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        const int w = threadIdx.x >> 2;
+        const int c = threadIdx.x & 3;
+        float total = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) total += partial[w][c][i];
+        if (col0 + c < out_dim) {
+            float *output = w == 0 ? output_a : output_b;
+            output[col0 + c] = total;
+        }
+    }
+}

@@ -24,6 +24,13 @@ Generated artifacts are checked in:
 - `src/ops/metal/generated/*.metal`: generated Metal candidates.
 - `src/ops/metal/artifacts/*.metal`: checked-in artifact copies for candidates
   that have a runtime artifact path.
+- `src/ops/cuda/generated/quant_kernel_*.cu`: generated CUDA candidates.
+- `src/ops/cuda/artifacts/quant_kernel_*.cu`: checked-in promoted copies of
+  generated CUDA kernels; the same kernels are embedded in the production
+  `inference_cuda_kernels.{cu,ptx,fatbin,_sm89.cubin}` bundle via
+  `scripts/regen-cuda-artifacts.sh`.
+- `src/ops/cuda/generated/evidence/*.json`: checked-in CUDA promotion
+  benchmark evidence.
 - `src/ops/cuda/generated/quant_kernel_*.json`: spec, artifact, benchmark, and
   conformance manifests. The path is historical; the manifests cover both CUDA
   and Metal.
@@ -151,6 +158,90 @@ only when all of these are true:
 Cleared blocker evidence is not enough by itself. It is only a signal to
 investigate. Production promotion requires checked-in evidence plus the
 production-regression gate.
+
+CUDA promotion uses the same shape with CUDA-specific mechanics: the promoted
+source copy must live outside `src/ops/cuda/generated/`, the benchmark command
+is sequential `bench-cuda` with `--warmup-iters 5 --measure-iters 50
+--quant-compiler-repeat-runs 3` and an `--quant-compiler-evidence-out` path, the
+measured geomean speedup must clear `minimum_speedup` (1.0) against the named
+handwritten baseline with CPU-reference correctness inside tolerance, and a
+matching comptime `BenchmarkEvidence` record plus the checked-in evidence JSON
+are required before `production_enabled` may flip. Promoted CUDA kernels are
+embedded in the production artifact bundle, so runtime dispatch stays
+driver-only (`cuModuleLoadDataEx`; nvcc is dev-time only).
+
+## Current CUDA State
+
+The current checked-in state has 3 promoted generated CUDA production routes,
+all Q4_0, promoted on sequential benchmark evidence measured on an NVIDIA L4
+(driver 580.159.03, CUDA 13.2 nvcc; evidence JSONs under
+`src/ops/cuda/generated/evidence/`):
+
+| kernel | plan | handwritten baseline | measured speedup (geomean) |
+|---|---|---|---|
+| `antfly_q4_0_mmv_f32_v1` | `cuda/q4_0/rows_1/none/mmv` | `termite_linear_q4_0_f32_tile4` | 1.18 (worst shape 1.02, LM head 1.30) |
+| `antfly_q4_0_mm_f32_v1` | `cuda/q4_0/rows_9_64/none/mm` | `termite_linear_q4_0_f32` | 3.53 (up to 10.23 on FFN-down; 0.75 at in_dim=256, runtime-gated) |
+| `antfly_q4_0_pair_mmv_f32_v1` | `cuda/q4_0/rows_1/pair/mmv` | `termite_linear_q4_0_pair_nobias_f32_tile4_w4` | 1.29 |
+
+Speedups are geomeans across the Gemma4 E2B QAT dispatch shapes recorded in the
+bench targets (`bench-cuda --quant-compiler-q4-0-{mmv,mm,pair}-ptx`), with
+CPU-reference and baseline-output max-abs-diff at or below 3e-6. The mm
+evidence also records a losing shape: `in_dim=256` (E2B PLE projection) runs at
+about 0.73x the handwritten baseline, so the runtime route only claims rows
+9..64 shapes with `in_dim >= 512` (`cuda_q4_0_generated_mm_min_in_dim` in
+`cuda_compute.zig`); narrower shapes stay on the handwritten kernel. The mmv
+bench additionally cross-checks the Gemma4 LM-head shape (`1536 -> 262144`)
+generated-vs-baseline on device (the CPU reference is skipped above
+`quant_compiler_q4_0_max_reference_out_dim` because it dequantizes the full
+weight tensor to dense f32).
+
+End-to-end impact, Gemma4 E2B QAT (`--backend cuda`, 128 tokens, generated
+kernels default-on vs disabled, interleaved runs, bit-identical output):
+
+- prefill: 146-151 ms vs 200-201 ms (about -25%).
+- decode: 61.1/60.8 tok/s vs 59.6/59.5 tok/s (about +2.4%).
+- end-to-end total: 2241/2257 ms vs 2349/2353 ms (about -4.5%).
+- per-run generated launches: 16256 mmv + 92 mm + 4445 pair, zero fallbacks.
+
+Q4_K-only models are unaffected by construction (the promoted routes are keyed
+to Q4_0): clipclap embeddings are bit-identical with the kernels on/off (all
+quant matmuls ride the q4_k tensor-core route), and gliner2 passes the
+`scripts/verify_gliner2_cuda.sh` native/CUDA parity gate with identical entity
+counts and warm extraction timing unchanged (12.0 vs 12.1 ms).
+
+Runtime dispatch for the promoted CUDA routes is default-on and per-kernel
+opt-out via `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV`,
+`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM`, and
+`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR` (recorded per artifact as
+`runtime_gate_env` in `quant_kernel_artifacts.json`). Actual launch counts are
+reported by `generate --print-timing` as `cuda_q4_0_generated_counts:` with
+per-kernel hit/fallback counters; a fallback dispatches the handwritten
+baseline for that call.
+
+The Q4_0 `pair` epilogue (two no-bias projections sharing one input) is
+CUDA-only; Metal is carved out in `supportsEpilogueForBackend` and keeps its
+own Q4_0 small-batch route unchanged.
+
+Dispatch precedence note: in the rows==1 Q4_0 pair route the promoted
+generated kernel runs ahead of the default-on handwritten
+`ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_TILE4_W4` path (that env defaults to true, so
+it is the production default rather than an opt-in experiment). To select the
+handwritten pair kernel — for A/B timing or to rule out the generated kernel —
+set `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR=1`. The plain
+`linearNoBias` route keeps the opposite order: the genuinely opt-in tile8 and
+tile4_w4 experiment envs (default off) still take precedence over the
+generated mmv kernel when explicitly enabled.
+
+Local reproduction note: the manifest-pinned `nvcc -ptx -arch=compute_75`
+check commands emit PTX ISA matched to the pinned CUDA 13.2 toolkit. Drivers
+older than the toolkit (for example 580.x = CUDA 13.0) cannot JIT that PTX;
+compile `-cubin -arch=sm_89` to the pinned `/tmp/*.ptx` paths instead when
+running the benchmark/evidence commands locally. The production runtime is
+unaffected: it loads the checked-in fatbin/cubin artifacts.
+
+The remaining non-promoted CUDA candidate is the first lazy Q4_K
+`rows_2_8`/`bias_gelu` kernel, which loses to its handwritten baseline (0.74x)
+and stays dev-only with blocker evidence, as designed.
 
 ## Current Metal State
 

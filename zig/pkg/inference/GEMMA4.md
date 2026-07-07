@@ -242,6 +242,18 @@ the target, or a still-missing detail in the clustered output head.
 
 ### CUDA Branch Status
 
+Update 2026-07-07 on branch `codex/quant-kernel-metal-compiler`: the quant
+kernel compiler now ships 3 promoted generated CUDA Q4_0 kernels default-on
+for the Gemma4 QAT path (`antfly_q4_0_mmv_f32_v1`, `antfly_q4_0_mm_f32_v1`,
+`antfly_q4_0_pair_mmv_f32_v1`). Measured on E2B QAT
+(`gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf`, 128 tokens, NVIDIA L4) versus the
+handwritten routes: prefill 146-151 ms vs 200-201 ms (about -25%), decode
+61.1/60.8 vs 59.6/59.5 tok/s (about +2.4%), bit-identical output, zero
+fallbacks (16256 mmv + 92 mm + 4445 pair launches per run, reported by
+`--print-timing` as `cuda_q4_0_generated_counts:`). Per-kernel opt-out:
+`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_{MMV,MM,PAIR}`. Details and
+promotion evidence: `QUANT_KERNEL_COMPILER.md` (Current CUDA State).
+
 Status checked on 2026-06-21 on branch `gemma4_gpu_stuff`:
 
 - `zig build -Dcuda=true` succeeds.

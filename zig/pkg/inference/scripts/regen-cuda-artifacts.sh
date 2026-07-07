@@ -262,6 +262,9 @@ required_symbols=(
   termite_embedding_lookup_q6_k_f32
   termite_embedding_lookup_i32_q6_k_f32
   termite_embedding_add_weighted_i32_q6_k_f32
+  antfly_q4_0_mmv_f32_v1
+  antfly_q4_0_mm_f32_v1
+  antfly_q4_0_pair_mmv_f32_v1
 )
 
 check_required_symbols() {

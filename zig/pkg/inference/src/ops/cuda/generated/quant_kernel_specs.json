@@ -176,7 +176,8 @@
         "mm"
       ],
       "supported_epilogues": [
-        "none"
+        "none",
+        "pair"
       ],
       "supported_backends": [
         "cuda",

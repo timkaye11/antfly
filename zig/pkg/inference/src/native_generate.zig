@@ -1820,6 +1820,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
+                    "cuda_q4_0_generated_counts: mmv_hits={d} mmv_fallbacks={d} mm_hits={d} mm_fallbacks={d} pair_hits={d} pair_fallbacks={d}\n",
+                    .{
+                        cuda_stats.q4_0_generated_mmv_hits,
+                        cuda_stats.q4_0_generated_mmv_fallbacks,
+                        cuda_stats.q4_0_generated_mm_hits,
+                        cuda_stats.q4_0_generated_mm_fallbacks,
+                        cuda_stats.q4_0_generated_pair_hits,
+                        cuda_stats.q4_0_generated_pair_fallbacks,
+                    },
+                );
+                print(
                     "cuda_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d}\n",
                     .{
                         cuda_stats.quant_kernel_planned_ops,
@@ -3620,6 +3631,12 @@ fn writeJsonTiming(
                 \\"lm_head_argmax_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
+                \\"q4_0_generated_mmv_hits":{d},
+                \\"q4_0_generated_mmv_fallbacks":{d},
+                \\"q4_0_generated_mm_hits":{d},
+                \\"q4_0_generated_mm_fallbacks":{d},
+                \\"q4_0_generated_pair_hits":{d},
+                \\"q4_0_generated_pair_fallbacks":{d},
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
@@ -3642,6 +3659,12 @@ fn writeJsonTiming(
                     cuda_stats.lm_head_argmax_fallbacks,
                     cuda_stats.q4k_decode_fast_hits,
                     cuda_stats.q4k_decode_fast_fallbacks,
+                    cuda_stats.q4_0_generated_mmv_hits,
+                    cuda_stats.q4_0_generated_mmv_fallbacks,
+                    cuda_stats.q4_0_generated_mm_hits,
+                    cuda_stats.q4_0_generated_mm_fallbacks,
+                    cuda_stats.q4_0_generated_pair_hits,
+                    cuda_stats.q4_0_generated_pair_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,
