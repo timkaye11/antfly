@@ -57,6 +57,12 @@ pub const Epilogue = enum(u8) {
     gelu,
     add,
     argmax,
+    /// Fused FFN gate+up: two projections sharing one q8_1-quantized input,
+    /// activation multiply, q8_1-requantized output (CUDA decode contract).
+    pair_activation,
+    /// FFN down projection consuming the q8_1-quantized activated vector
+    /// produced by `pair_activation`, f32 output (CUDA decode contract).
+    gated_down,
 };
 
 pub const DType = enum(u8) {
@@ -1024,9 +1030,9 @@ const first_row_buckets = [_]quant_matmul.RowBucket{ .rows_1, .rows_2_8, .rows_9
 const first_schedules = [_]quant_matmul.DispatchKind{ .mmv, .small_batch, .mm };
 const first_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair };
 const q8_0_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair, .relu };
-const coverage_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair, .triple, .relu, .gelu, .add, .argmax };
+const coverage_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair, .triple, .relu, .gelu, .add, .argmax, .pair_activation, .gated_down };
 const no_bias_epilogues = [_]Epilogue{.none};
-const q4_0_epilogues = [_]Epilogue{ .none, .pair };
+const q4_0_epilogues = [_]Epilogue{ .none, .pair, .pair_activation, .gated_down };
 const q2_k_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu };
 const q3_k_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu };
 const k_quant_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu };
@@ -1523,7 +1529,54 @@ pub const first_q4_0_pair_benchmark = BenchmarkCase{
     .production_enabled = true,
 };
 
-pub const first_benchmarks = [_]BenchmarkCase{ first_lazy_benchmark, first_q4_0_mmv_benchmark, first_q4_0_mm_benchmark, first_q4_0_pair_benchmark };
+pub const first_general_cuda_q4_0_pair_q8_source_fingerprint = sourceFingerprint(first_general_cuda_q4_0_pair_q8_source);
+pub const first_general_cuda_q4_0_down_q8_source_fingerprint = sourceFingerprint(first_general_cuda_q4_0_down_q8_source);
+
+pub const first_q4_0_pair_q8_benchmark = BenchmarkCase{
+    .name = "q4_0_pair_activation_q8_1",
+    .backend = .cuda,
+    .format = .q4_0,
+    .row_bucket = .rows_1,
+    .epilogue = .pair_activation,
+    .generated_kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
+    .generated_source_path = first_general_cuda_q4_0_pair_q8_artifact_source_path,
+    .generated_source_fingerprint = first_general_cuda_q4_0_pair_q8_source_fingerprint,
+    .generated_ptx_path = first_general_cuda_q4_0_pair_q8_ptx_path,
+    .generated_ptx_command = first_general_cuda_q4_0_pair_q8_artifact_check_command,
+    .benchmark_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
+    .generated_ptx_arg = "--quant-compiler-q4-0-pair-q8-ptx",
+    .handwritten_baseline = "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn",
+    .correctness_tolerance_abs = 0.01,
+    .minimum_speedup = 1.0,
+    .correctness_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
+    .benchmark_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
+    .benchmark_mode = "sequential",
+    .production_enabled = true,
+};
+
+pub const first_q4_0_down_q8_benchmark = BenchmarkCase{
+    .name = "q4_0_down_q8_1",
+    .backend = .cuda,
+    .format = .q4_0,
+    .row_bucket = .rows_1,
+    .epilogue = .gated_down,
+    .generated_kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
+    .generated_source_path = first_general_cuda_q4_0_down_q8_artifact_source_path,
+    .generated_source_fingerprint = first_general_cuda_q4_0_down_q8_source_fingerprint,
+    .generated_ptx_path = first_general_cuda_q4_0_down_q8_ptx_path,
+    .generated_ptx_command = first_general_cuda_q4_0_down_q8_artifact_check_command,
+    .benchmark_command = first_general_cuda_q4_0_down_q8_benchmark_command,
+    .generated_ptx_arg = "--quant-compiler-q4-0-down-q8-ptx",
+    .handwritten_baseline = "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down",
+    .correctness_tolerance_abs = 0.01,
+    .minimum_speedup = 1.0,
+    .correctness_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
+    .benchmark_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
+    .benchmark_mode = "sequential",
+    .production_enabled = true,
+};
+
+pub const first_benchmarks = [_]BenchmarkCase{ first_lazy_benchmark, first_q4_0_mmv_benchmark, first_q4_0_mm_benchmark, first_q4_0_pair_benchmark, first_q4_0_pair_q8_benchmark, first_q4_0_down_q8_benchmark };
 // Measured on NVIDIA L4 (driver 580.159.03, CUDA 13.2 nvcc) via the recorded
 // benchmark_command; geomean sequential speedup across the four Gemma4 E2B QAT
 // shapes in quant_compiler_q4_0_dims (see the checked-in evidence JSONs).
@@ -1572,6 +1625,36 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .correctness_passed = true,
         .benchmark_passed = true,
         .measured_speedup = 1.290115,
+    },
+    .{
+        .kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
+        .generated_source_path = first_general_cuda_q4_0_pair_q8_artifact_source_path,
+        .generated_source_fingerprint = first_general_cuda_q4_0_pair_q8_source_fingerprint,
+        .generated_ptx_path = first_general_cuda_q4_0_pair_q8_ptx_path,
+        .generated_ptx_command = first_general_cuda_q4_0_pair_q8_artifact_check_command,
+        .benchmark_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
+        .correctness_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
+        .benchmark_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
+        .benchmark_mode = "sequential",
+        .repeat_runs = 3,
+        .correctness_passed = true,
+        .benchmark_passed = true,
+        .measured_speedup = 1.278555,
+    },
+    .{
+        .kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
+        .generated_source_path = first_general_cuda_q4_0_down_q8_artifact_source_path,
+        .generated_source_fingerprint = first_general_cuda_q4_0_down_q8_source_fingerprint,
+        .generated_ptx_path = first_general_cuda_q4_0_down_q8_ptx_path,
+        .generated_ptx_command = first_general_cuda_q4_0_down_q8_artifact_check_command,
+        .benchmark_command = first_general_cuda_q4_0_down_q8_benchmark_command,
+        .correctness_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
+        .benchmark_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
+        .benchmark_mode = "sequential",
+        .repeat_runs = 3,
+        .correctness_passed = true,
+        .benchmark_passed = true,
+        .measured_speedup = 1.312934,
     },
 };
 const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
@@ -1780,6 +1863,22 @@ pub const first_general_cuda_q4_0_pair_check_command = "nvcc -ptx -arch=compute_
 pub const first_general_cuda_q4_0_pair_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_ptx_path;
 pub const first_general_cuda_q4_0_pair_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json";
 pub const first_general_cuda_q4_0_pair_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-ptx " ++ first_general_cuda_q4_0_pair_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_evidence_path;
+pub const first_general_cuda_q4_0_pair_q8_kernel_id = "antfly_q4_0_pair_activation_q8_1_mmv_v1";
+pub const first_general_cuda_q4_0_pair_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1.cu";
+pub const first_general_cuda_q4_0_pair_q8_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_pair_activation_q8_1.cu";
+pub const first_general_cuda_q4_0_pair_q8_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1.ptx";
+pub const first_general_cuda_q4_0_pair_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_q8_source_path ++ " -o /tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1_dev.ptx";
+pub const first_general_cuda_q4_0_pair_q8_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_q8_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_q8_ptx_path;
+pub const first_general_cuda_q4_0_pair_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json";
+pub const first_general_cuda_q4_0_pair_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-q8-ptx " ++ first_general_cuda_q4_0_pair_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_q8_evidence_path;
+pub const first_general_cuda_q4_0_down_q8_kernel_id = "antfly_q4_0_down_q8_1_mmv_v1";
+pub const first_general_cuda_q4_0_down_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1.cu";
+pub const first_general_cuda_q4_0_down_q8_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_down_q8_1.cu";
+pub const first_general_cuda_q4_0_down_q8_ptx_path = "/tmp/antfly_q4_0_down_q8_1_mmv_v1.ptx";
+pub const first_general_cuda_q4_0_down_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_down_q8_source_path ++ " -o /tmp/antfly_q4_0_down_q8_1_mmv_v1_dev.ptx";
+pub const first_general_cuda_q4_0_down_q8_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_down_q8_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_down_q8_ptx_path;
+pub const first_general_cuda_q4_0_down_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json";
+pub const first_general_cuda_q4_0_down_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-down-q8-ptx " ++ first_general_cuda_q4_0_down_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_down_q8_evidence_path;
 pub const first_lazy_metal_kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1";
 pub const first_lazy_metal_source_path = "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal";
 pub const first_lazy_metal_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal";
@@ -2463,6 +2562,34 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .promotion_evidence_command = first_general_cuda_q4_0_pair_benchmark_command,
         .production_enabled = true,
     },
+    .{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .pair_activation,
+        .kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
+        .source_path = first_general_cuda_q4_0_pair_q8_artifact_source_path,
+        .check_command = first_general_cuda_q4_0_pair_q8_artifact_check_command,
+        .generated_source_path = first_general_cuda_q4_0_pair_q8_source_path,
+        .generated_check_command = first_general_cuda_q4_0_pair_q8_check_command,
+        .runtime_evidence_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
+        .promotion_evidence_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
+        .production_enabled = true,
+    },
+    .{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .gated_down,
+        .kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
+        .source_path = first_general_cuda_q4_0_down_q8_artifact_source_path,
+        .check_command = first_general_cuda_q4_0_down_q8_artifact_check_command,
+        .generated_source_path = first_general_cuda_q4_0_down_q8_source_path,
+        .generated_check_command = first_general_cuda_q4_0_down_q8_check_command,
+        .runtime_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
+        .promotion_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
+        .production_enabled = true,
+    },
 };
 
 const first_route_expectations = [_]RouteExpectation{
@@ -2491,6 +2618,26 @@ const first_route_expectations = [_]RouteExpectation{
         .format = .q4_0,
         .row_bucket = .rows_1,
         .epilogue = .pair,
+        .dispatch = .mmv,
+        .production_route = .generated_production,
+        .candidate_route = .unsupported,
+        .fallback_reason = .none,
+    },
+    .{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .pair_activation,
+        .dispatch = .mmv,
+        .production_route = .generated_production,
+        .candidate_route = .unsupported,
+        .fallback_reason = .none,
+    },
+    .{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .gated_down,
         .dispatch = .mmv,
         .production_route = .generated_production,
         .candidate_route = .unsupported,
@@ -3176,6 +3323,328 @@ const first_general_cuda_q4_0_pair_source =
     \\            float *output = w == 0 ? output_a : output_b;
     \\            output[col0 + c] = total;
     \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const first_general_cuda_q4_0_pair_q8_source =
+    \\// Copyright 2026 Antfly, Inc.
+    \\//
+    \\// Licensed under the Apache License, Version 2.0 (the "License");
+    \\// you may not use this file except in compliance with the License.
+    \\// You may obtain a copy of the License at
+    \\//
+    \\//     http://www.apache.org/licenses/LICENSE-2.0
+    \\//
+    \\// Unless required by applicable law or agreed to in writing, software
+    \\// distributed under the License is distributed on an "AS IS" BASIS,
+    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    \\// See the License for the specific language governing permissions and
+    \\// limitations under the License.
+    \\
+    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
+    \\// plan_id=cuda/q4_0/rows_1/pair_activation/mmv
+    \\// kernel_id=antfly_q4_0_pair_activation_q8_1_mmv_v1
+    \\// production_baseline=termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
+    \\// production_enabled=true
+    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
+    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8.
+    \\
+    \\#include <cuda_fp16.h>
+    \\
+    \\static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
+    \\    return __half2float(__ushort_as_half(bits));
+    \\}
+    \\
+    \\static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
+    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
+    \\    return value;
+    \\}
+    \\
+    \\static __device__ __forceinline__ float antfly_warp_reduce_max_f32(float value) {
+    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 16));
+    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 8));
+    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 4));
+    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 2));
+    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 1));
+    \\    return __shfl_sync(0xffffffffu, value, 0);
+    \\}
+    \\
+    \\static __device__ __forceinline__ float antfly_decoder_activation_f32(float x, unsigned int activation) {
+    \\    if (activation <= 1u) {
+    \\        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    \\        return 0.5f * x * (1.0f + tanhf(inner));
+    \\    }
+    \\    if (activation == 2u) return x / (1.0f + __expf(-x));
+    \\    if (activation == 3u) return fmaxf(x, 0.0f);
+    \\    if (activation == 4u) return x / (1.0f + __expf(-1.702f * x));
+    \\    const float r = fmaxf(x, 0.0f);
+    \\    return r * r;
+    \\}
+    \\
+    \\// q4_0 payload bytes live at bp+2; bp is always 2-byte aligned (18-byte
+    \\// blocks), so every 4-byte word can be assembled from two aligned u16 loads.
+    \\static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
+    \\    const unsigned short *halves = (const unsigned short *)payload;
+    \\    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
+    \\}
+    \\
+    \\static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
+    \\    const unsigned char *q4_bp,
+    \\    float q8_d,
+    \\    unsigned int iqs,
+    \\    int q8_low0,
+    \\    int q8_high0,
+    \\    int q8_low1,
+    \\    int q8_high1
+    \\) {
+    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+    \\    const unsigned int base0 = iqs * 4u;
+    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+    \\    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
+    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
+    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
+    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
+    \\    return q4_d * q8_d * (float)sumi;
+    \\}
+    \\
+    \\extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
+    \\    unsigned char *dst_q8,
+    \\    const unsigned char *q8_input,
+    \\    const unsigned char *weight_gate,
+    \\    const unsigned char *weight_up,
+    \\    unsigned int activation
+    \\) {
+    \\    const unsigned int row_blocks = 80u;
+    \\    const unsigned int out_row_blocks = 320u;
+    \\    const unsigned int group_cols = 4u;
+    \\    const unsigned int groups_per_wave = 4u;
+    \\    const unsigned int waves = 2u;
+    \\
+    \\    const unsigned int out_block = blockIdx.x % out_row_blocks;
+    \\    const unsigned int row = blockIdx.x / out_row_blocks;
+    \\    const unsigned int col_block = out_block * 32u;
+    \\    const unsigned int tid = threadIdx.x;
+    \\    const unsigned int lane = tid & 31u;
+    \\    const unsigned int warp = tid >> 5u;
+    \\    const unsigned int group = warp / 5u;
+    \\    const unsigned int group_warp = warp - group * 5u;
+    \\    if (blockDim.x != 640u) return;
+    \\
+    \\    __shared__ float gate_partial[4][4][5];
+    \\    __shared__ float up_partial[4][4][5];
+    \\    __shared__ float activated[32];
+    \\
+    \\    #pragma unroll
+    \\    for (unsigned int wave = 0u; wave < waves; ++wave) {
+    \\        if (group < groups_per_wave) {
+    \\            const unsigned int local_tid = group_warp * 32u + lane;
+    \\            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
+    \\            float gate_acc[4];
+    \\            float up_acc[4];
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0u; c < group_cols; ++c) {
+    \\                gate_acc[c] = 0.0f;
+    \\                up_acc[c] = 0.0f;
+    \\            }
+    \\
+    \\            const unsigned int iqs = (local_tid & 1u) * 2u;
+    \\            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 80u) {
+    \\                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
+    \\                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+    \\                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+    \\                const unsigned int q8_base0 = iqs * 4u;
+    \\                const unsigned int q8_base1 = q8_base0 + 4u;
+    \\                const int q8_low0 = *(const int *)(q8_values + q8_base0);
+    \\                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+    \\                const int q8_low1 = *(const int *)(q8_values + q8_base1);
+    \\                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+    \\
+    \\                #pragma unroll
+    \\                for (unsigned int c = 0u; c < group_cols; ++c) {
+    \\                    const unsigned int col = col_tile + c;
+    \\                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
+    \\                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
+    \\                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\                }
+    \\            }
+    \\
+    \\            #pragma unroll
+    \\            for (unsigned int c = 0u; c < group_cols; ++c) {
+    \\                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
+    \\                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
+    \\                if (lane == 0u) {
+    \\                    gate_partial[group][c][group_warp] = gate_sum;
+    \\                    up_partial[group][c][group_warp] = up_sum;
+    \\                }
+    \\            }
+    \\        }
+    \\        __syncthreads();
+    \\        if (tid < 16u) {
+    \\            const unsigned int out_group = tid >> 2u;
+    \\            const unsigned int c = tid & 3u;
+    \\            float gate_y = 0.0f;
+    \\            float up_y = 0.0f;
+    \\            #pragma unroll
+    \\            for (unsigned int w = 0u; w < 5u; ++w) {
+    \\                gate_y += gate_partial[out_group][c][w];
+    \\                up_y += up_partial[out_group][c][w];
+    \\            }
+    \\            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
+    \\        }
+    \\        __syncthreads();
+    \\    }
+    \\
+    \\    if (warp == 0u) {
+    \\        const float x = activated[lane];
+    \\        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
+    \\        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    \\        int q = 0;
+    \\        if (d > 0.0f) {
+    \\            q = __float2int_rn(x / d);
+    \\            q = max(-127, min(127, q));
+    \\        }
+    \\        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
+    \\        bp[4u + lane] = (unsigned char)(signed char)q;
+    \\        if (lane == 0u) {
+    \\            const unsigned short d_bits = __half_as_ushort(__float2half(d));
+    \\            bp[0] = (unsigned char)(d_bits & 0xffu);
+    \\            bp[1] = (unsigned char)(d_bits >> 8);
+    \\            bp[2] = 0u;
+    \\            bp[3] = 0u;
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+const first_general_cuda_q4_0_down_q8_source =
+    \\// Copyright 2026 Antfly, Inc.
+    \\//
+    \\// Licensed under the Apache License, Version 2.0 (the "License");
+    \\// you may not use this file except in compliance with the License.
+    \\// You may obtain a copy of the License at
+    \\//
+    \\//     http://www.apache.org/licenses/LICENSE-2.0
+    \\//
+    \\// Unless required by applicable law or agreed to in writing, software
+    \\// distributed under the License is distributed on an "AS IS" BASIS,
+    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    \\// See the License for the specific language governing permissions and
+    \\// limitations under the License.
+    \\
+    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
+    \\// plan_id=cuda/q4_0/rows_1/gated_down/mmv
+    \\// kernel_id=antfly_q4_0_down_q8_1_mmv_v1
+    \\// production_baseline=termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down
+    \\// production_enabled=true
+    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
+    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8.
+    \\
+    \\#include <cuda_fp16.h>
+    \\
+    \\static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
+    \\    return __half2float(__ushort_as_half(bits));
+    \\}
+    \\
+    \\static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
+    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
+    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
+    \\    return value;
+    \\}
+    \\
+    \\static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
+    \\    const unsigned short *halves = (const unsigned short *)payload;
+    \\    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
+    \\}
+    \\
+    \\static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
+    \\    const unsigned char *q4_bp,
+    \\    float q8_d,
+    \\    unsigned int iqs,
+    \\    int q8_low0,
+    \\    int q8_high0,
+    \\    int q8_low1,
+    \\    int q8_high1
+    \\) {
+    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+    \\    const unsigned int base0 = iqs * 4u;
+    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+    \\    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
+    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
+    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
+    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
+    \\    return q4_d * q8_d * (float)sumi;
+    \\}
+    \\
+    \\extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
+    \\    float *dst,
+    \\    const unsigned char *q8_input,
+    \\    const unsigned char *weight
+    \\) {
+    \\    const unsigned int cols = 4u;
+    \\    const unsigned int row_blocks = 320u;
+    \\    const unsigned int col_tile = blockIdx.x * cols;
+    \\    const unsigned int tid = threadIdx.x;
+    \\    const unsigned int lane = tid & 31u;
+    \\    const unsigned int warp = tid >> 5u;
+    \\    if (blockDim.x != 256u) return;
+    \\
+    \\    __shared__ float warp_partial[4][8];
+    \\    float acc[4];
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+    \\
+    \\    const unsigned int iqs = (tid & 1u) * 2u;
+    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
+    \\        const unsigned char *q8_bp = q8_input + block * 36u;
+    \\        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+    \\        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+    \\        const unsigned int q8_base0 = iqs * 4u;
+    \\        const unsigned int q8_base1 = q8_base0 + 4u;
+    \\        const int q8_low0 = *(const int *)(q8_values + q8_base0);
+    \\        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+    \\        const int q8_low1 = *(const int *)(q8_values + q8_base1);
+    \\        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+    \\
+    \\        #pragma unroll
+    \\        for (unsigned int c = 0u; c < cols; ++c) {
+    \\            const unsigned int col = col_tile + c;
+    \\            const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
+    \\            acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    \\        }
+    \\    }
+    \\
+    \\    #pragma unroll
+    \\    for (unsigned int c = 0u; c < cols; ++c) {
+    \\        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+    \\        if (lane == 0u) warp_partial[c][warp] = sum;
+    \\    }
+    \\    __syncthreads();
+    \\    if (tid < 4u) {
+    \\        float y = 0.0f;
+    \\        #pragma unroll
+    \\        for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
+    \\        dst[col_tile + tid] = y;
     \\    }
     \\}
     \\
@@ -5450,6 +5919,7 @@ fn supportsEpilogueForBackend(spec: QuantKernelSpec, backend: Backend, epilogue:
     if (!spec.supportsEpilogue(epilogue)) return false;
     if (backend == .cuda and spec.format == .q6_k and epilogue != .none) return false;
     if (backend == .metal and spec.format == .q4_0 and epilogue == .pair) return false;
+    if (backend == .metal and (epilogue == .pair_activation or epilogue == .gated_down)) return false;
     return true;
 }
 
@@ -6066,6 +6536,9 @@ pub fn artifactRuntimeWired(artifact: GeneratedArtifact) bool {
         if (artifact.format == .q4_0 and artifact.epilogue == .pair) {
             return artifact.row_bucket == .rows_1;
         }
+        if (artifact.format == .q4_0 and (artifact.epilogue == .pair_activation or artifact.epilogue == .gated_down)) {
+            return artifact.row_bucket == .rows_1;
+        }
         return false;
     }
     if (artifact.backend != .metal or artifact.row_bucket != .rows_2_8) return false;
@@ -6132,7 +6605,12 @@ fn artifactCandidateOptInGateEnv(artifact: GeneratedArtifact) ?[*:0]const u8 {
     if (!artifactRuntimeWired(artifact)) return null;
     if (artifact.backend == .cuda) {
         return switch (artifact.row_bucket) {
-            .rows_1 => if (artifact.epilogue == .pair) "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR" else "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV",
+            .rows_1 => switch (artifact.epilogue) {
+                .pair => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR",
+                .pair_activation => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8",
+                .gated_down => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8",
+                else => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV",
+            },
             .rows_9_64 => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM",
             else => null,
         };
@@ -6192,7 +6670,12 @@ pub fn artifactRuntimeGateEnv(artifact: GeneratedArtifact) ?[*:0]const u8 {
     if (artifact.backend == .cuda) {
         if (artifactHasPromotionEvidence(artifact)) {
             return switch (artifact.row_bucket) {
-                .rows_1 => if (artifact.epilogue == .pair) "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR" else "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV",
+                .rows_1 => switch (artifact.epilogue) {
+                    .pair => "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR",
+                    .pair_activation => "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8",
+                    .gated_down => "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8",
+                    else => "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV",
+                },
                 .rows_9_64 => "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM",
                 else => null,
             };
@@ -7041,6 +7524,8 @@ test "quant kernel compiler promoted CUDA kernel bodies stay in sync with the pr
         first_general_cuda_q4_0_mmv_source,
         first_general_cuda_q4_0_mm_source,
         first_general_cuda_q4_0_pair_source,
+        first_general_cuda_q4_0_pair_q8_source,
+        first_general_cuda_q4_0_down_q8_source,
     };
     for (promoted_sources) |source| {
         const marker = "extern \"C\" __global__ void ";
@@ -7059,6 +7544,8 @@ fn benchmarkPtxArgRecognized(arg: []const u8) bool {
         "--quant-compiler-q4-0-mmv-ptx",
         "--quant-compiler-q4-0-mm-ptx",
         "--quant-compiler-q4-0-pair-ptx",
+        "--quant-compiler-q4-0-pair-q8-ptx",
+        "--quant-compiler-q4-0-down-q8-ptx",
     };
     for (recognized) |candidate| {
         if (std.mem.eql(u8, arg, candidate)) return true;
@@ -9942,6 +10429,12 @@ pub fn generatedSourceForArtifact(artifact: GeneratedArtifact) ?[]const u8 {
     if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_pair_kernel_id)) {
         return first_general_cuda_q4_0_pair_source;
     }
+    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_pair_q8_kernel_id)) {
+        return first_general_cuda_q4_0_pair_q8_source;
+    }
+    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_down_q8_kernel_id)) {
+        return first_general_cuda_q4_0_down_q8_source;
+    }
     if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, first_lazy_metal_kernel_id)) {
         return first_lazy_metal_source;
     }
@@ -10040,6 +10533,18 @@ fn productionKernelId(
         if (format == .q4_0 and epilogue == .pair) {
             return switch (row_bucket) {
                 .rows_1 => "termite_linear_q4_0_pair_nobias_f32_tile4_w4",
+                else => "cuda_handwritten_quant_matmul",
+            };
+        }
+        if (format == .q4_0 and epilogue == .pair_activation) {
+            return switch (row_bucket) {
+                .rows_1 => "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn",
+                else => "cuda_handwritten_quant_matmul",
+            };
+        }
+        if (format == .q4_0 and epilogue == .gated_down) {
+            return switch (row_bucket) {
+                .rows_1 => "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down",
                 else => "cuda_handwritten_quant_matmul",
             };
         }
@@ -10983,17 +11488,17 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_artifact_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_artifact_source_path));
     const blocked_metal_promotion_count = first_metal_promotion_blocker_evidence_count;
-    const dev_only_candidate_count = first_generated_artifacts.len - first_metal_runtime_evidence_count - blocked_metal_promotion_count - 3;
+    const dev_only_candidate_count = first_generated_artifacts.len - first_metal_runtime_evidence_count - blocked_metal_promotion_count - 5;
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, dev_only_candidate_count, "\"candidate_status\": \"dev_only_candidate\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_metal_runtime_evidence_count, "\"candidate_status\": \"promoted\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, blocked_metal_promotion_count, "\"candidate_status\": \"blocked_by_evidence\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - first_metal_runtime_evidence_count - 3, "\"promotion_ready\": false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - first_metal_runtime_evidence_count - 5, "\"promotion_ready\": false"));
     const runtime_wired_artifacts = first_metal_runtime_route_all_expected_case_count / 2;
     var cuda_runtime_wired_count: usize = 0;
     for (first_generated_artifacts) |artifact| {
         if (artifact.backend == .cuda and artifactRuntimeWired(artifact)) cuda_runtime_wired_count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), cuda_runtime_wired_count);
+    try std.testing.expectEqual(@as(usize, 5), cuda_runtime_wired_count);
     const awaiting_metal_promotion_count = runtime_wired_artifacts - first_metal_runtime_evidence_count - blocked_metal_promotion_count;
     const blocked_speedup_count = metalPromotionBlockerEvidenceCount("speedup_gate_missing");
     const blocked_evidence_path_count = metalPromotionBlockerEvidencePathCount();
@@ -11497,34 +12002,34 @@ test "quant kernel compiler registry route summary is golden" {
     }
 
     const cuda = by_backend[@intFromEnum(@as(Backend, .cuda))];
-    try std.testing.expectEqual(@as(usize, 1008), cuda.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(usize, 45), cuda.quant_kernel_handwritten_production);
-    try std.testing.expectEqual(@as(usize, 3), cuda.quant_kernel_generated_production);
-    try std.testing.expectEqual(@as(usize, 960), cuda.quant_kernel_unsupported_routes);
+    try std.testing.expectEqual(@as(usize, 1232), cuda.quant_kernel_planned_ops);
+    try std.testing.expectEqual(@as(usize, 51), cuda.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 5), cuda.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(usize, 1176), cuda.quant_kernel_unsupported_routes);
     try std.testing.expectEqual(@as(usize, 1), cuda.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(usize, 1), cuda.quant_kernel_fallback_generated_artifact_missing);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_generated_runtime_not_wired);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_unsupported_format);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_unsupported_shape);
-    try std.testing.expectEqual(@as(usize, 96), cuda.quant_kernel_fallback_unsupported_epilogue);
-    try std.testing.expectEqual(@as(usize, 864), cuda.quant_kernel_fallback_unsupported_backend);
+    try std.testing.expectEqual(@as(usize, 120), cuda.quant_kernel_fallback_unsupported_epilogue);
+    try std.testing.expectEqual(@as(usize, 1056), cuda.quant_kernel_fallback_unsupported_backend);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_tensor_core_repack_required);
-    try std.testing.expectEqual(@as(usize, 960), cuda.quant_kernel_fallback_unsupported);
+    try std.testing.expectEqual(@as(usize, 1176), cuda.quant_kernel_fallback_unsupported);
 
     const metal = by_backend[@intFromEnum(@as(Backend, .metal))];
-    try std.testing.expectEqual(@as(usize, 1008), metal.quant_kernel_planned_ops);
+    try std.testing.expectEqual(@as(usize, 1232), metal.quant_kernel_planned_ops);
     try std.testing.expectEqual(@as(usize, 104), metal.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(usize, 8), metal.quant_kernel_generated_production);
-    try std.testing.expectEqual(@as(usize, 896), metal.quant_kernel_unsupported_routes);
+    try std.testing.expectEqual(@as(usize, 1120), metal.quant_kernel_unsupported_routes);
     try std.testing.expectEqual(@as(usize, 17), metal.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(usize, 17), metal.quant_kernel_fallback_generated_artifact_missing);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_generated_runtime_not_wired);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_unsupported_format);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_unsupported_shape);
-    try std.testing.expectEqual(@as(usize, 356), metal.quant_kernel_fallback_unsupported_epilogue);
-    try std.testing.expectEqual(@as(usize, 540), metal.quant_kernel_fallback_unsupported_backend);
+    try std.testing.expectEqual(@as(usize, 460), metal.quant_kernel_fallback_unsupported_epilogue);
+    try std.testing.expectEqual(@as(usize, 660), metal.quant_kernel_fallback_unsupported_backend);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_tensor_core_repack_required);
-    try std.testing.expectEqual(@as(usize, 896), metal.quant_kernel_fallback_unsupported);
+    try std.testing.expectEqual(@as(usize, 1120), metal.quant_kernel_fallback_unsupported);
 }
 
 test "quant kernel compiler route expectations are hand pinned" {
@@ -11624,23 +12129,23 @@ test "quant kernel compiler conformance manifest serializes the route matrix" {
     defer std.testing.allocator.free(manifest);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "antfly.quant_kernel_conformance.v1"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"case_count\": 1008"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"case_count\": 1232"));
     try expectManifestArrayCount(manifest, "case_count", "cases", first_conformance.len);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"format_count\": 28"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"row_bucket_count\": 4"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"epilogue_count\": 9"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"epilogue_count\": 11"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"backend_count\": 2"));
-    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_planned_ops", 1008);
+    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_planned_ops", 1232);
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_generated_candidates", 1);
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_artifact_missing", 1);
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
-    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_unsupported_epilogue", 96);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_planned_ops", 1008);
+    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_unsupported_epilogue", 120);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_planned_ops", 1232);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_production", 8);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_candidates", 17);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_artifact_missing", 17);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_unsupported_epilogue", 356);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_unsupported_epilogue", 460);
     try std.testing.expectEqual(first_conformance.len, std.mem.count(u8, manifest, "\"format\": "));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"format\": \"q4_k\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"block_values\": 256"));

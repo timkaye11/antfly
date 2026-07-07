@@ -582,6 +582,10 @@ pub const RuntimeStats = struct {
     q4_0_generated_mm_fallbacks: usize = 0,
     q4_0_generated_pair_hits: usize = 0,
     q4_0_generated_pair_fallbacks: usize = 0,
+    q4_0_generated_pair_q8_hits: usize = 0,
+    q4_0_generated_pair_q8_fallbacks: usize = 0,
+    q4_0_generated_down_q8_hits: usize = 0,
+    q4_0_generated_down_q8_fallbacks: usize = 0,
     head_norm_rope_fused_hits: usize = 0,
     head_norm_rope_fused_fallbacks: usize = 0,
     decoder_runtime_linear_slot_prepares: usize = 0,
@@ -2939,6 +2943,16 @@ fn cudaQ4_0GeneratedMmEnabled() bool {
 fn cudaQ4_0GeneratedPairEnabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR", false)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR", true);
+}
+
+fn cudaQ4_0GeneratedPairQ8Enabled() bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8", false)) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8", true);
+}
+
+fn cudaQ4_0GeneratedDownQ8Enabled() bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8", false)) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8", true);
 }
 
 // Checked-in evidence (src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json)
@@ -12795,7 +12809,29 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     }
     const pair_prefill_variant = self.kernels.q4_0PairActivationQ8_1Tile32W5E4BPrefillRowsVariant(rows);
     var pair_profile_scope = beginPrefillProfile(self, .q4_pair, rows);
-    self.kernels.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+    const used_generated_pair_q8 = blk: {
+        if (rows != 1 or !cudaQ4_0GeneratedPairQ8Enabled()) break :blk false;
+        self.kernels.launchLinearQ4_0GeneratedPairQ8(
+            &self.ctx,
+            q8_activated,
+            q8_hidden,
+            gate_slot.weight.buffer,
+            up_slot.weight.buffer,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            @intFromEnum(request.activation),
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                self.stats.q4_0_generated_pair_q8_fallbacks += 1;
+                break :blk false;
+            },
+            else => return err,
+        };
+        self.stats.q4_0_generated_pair_q8_hits += 1;
+        break :blk true;
+    };
+    if (!used_generated_pair_q8) self.kernels.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
         &self.ctx,
         q8_activated,
         q8_hidden,
@@ -12822,7 +12858,27 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     if (pair_profile_scope) |*scope| scope.end();
     const down_prefill_variant = self.kernels.q4_0Q8_1Tile4W8PrefillRowsVariant(rows, request.intermediate_size, request.hidden_size);
     var down_profile_scope = beginPrefillProfile(self, .q4_gated_down, rows);
-    self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, projected_device, q8_activated, down_slot.weight.buffer, rows, request.intermediate_size, request.hidden_size) catch |err| switch (err) {
+    const used_generated_down_q8 = blk: {
+        if (rows != 1 or !cudaQ4_0GeneratedDownQ8Enabled()) break :blk false;
+        self.kernels.launchLinearQ4_0GeneratedDownQ8(
+            &self.ctx,
+            projected_device,
+            q8_activated,
+            down_slot.weight.buffer,
+            rows,
+            request.intermediate_size,
+            request.hidden_size,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                self.stats.q4_0_generated_down_q8_fallbacks += 1;
+                break :blk false;
+            },
+            else => return err,
+        };
+        self.stats.q4_0_generated_down_q8_hits += 1;
+        break :blk true;
+    };
+    if (!used_generated_down_q8) self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, projected_device, q8_activated, down_slot.weight.buffer, rows, request.intermediate_size, request.hidden_size) catch |err| switch (err) {
         error.CudaKernelUnavailable, error.InvalidCudaState => {
             if (down_profile_scope) |*scope| scope.end();
             projected_device.free(&self.ctx);

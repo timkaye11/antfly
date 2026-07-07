@@ -96,6 +96,8 @@ const Config = struct {
     quant_compiler_q4_0_mmv_ptx_path: ?[]const u8 = null,
     quant_compiler_q4_0_mm_ptx_path: ?[]const u8 = null,
     quant_compiler_q4_0_pair_ptx_path: ?[]const u8 = null,
+    quant_compiler_q4_0_pair_q8_ptx_path: ?[]const u8 = null,
+    quant_compiler_q4_0_down_q8_ptx_path: ?[]const u8 = null,
     quant_compiler_evidence_out_path: ?[]const u8 = null,
     quant_compiler_check_evidence_path: ?[]const u8 = null,
     quant_compiler_require_promotion_ready: bool = false,
@@ -124,6 +126,8 @@ const BenchModule = if (build_options.enable_cuda) struct {
     linear_q4_0_f32: cuda_driver.CUfunction = null,
     linear_q4_0_f32_tile4: cuda_driver.CUfunction = null,
     linear_q4_0_pair_nobias_f32_tile4_w4: cuda_driver.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_e4b: cuda_driver.CUfunction = null,
+    linear_q4_0_q8_1_e4b_down: cuda_driver.CUfunction = null,
 
     fn load(ctx: *cuda_context.CudaContext) cuda_driver.Error!BenchModule {
         try ctx.makeCurrent();
@@ -165,6 +169,10 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32_tile4, module, "termite_linear_q4_0_f32_tile4"));
         var linear_q4_0_pair_nobias_f32_tile4_w4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_pair_nobias_f32_tile4_w4, module, "termite_linear_q4_0_pair_nobias_f32_tile4_w4"));
+        var linear_q4_0_pair_activation_q8_1_e4b: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_pair_activation_q8_1_e4b, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn"));
+        var linear_q4_0_q8_1_e4b_down: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_q8_1_e4b_down, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down"));
 
         return .{
             .module = module,
@@ -185,6 +193,8 @@ const BenchModule = if (build_options.enable_cuda) struct {
             .linear_q4_0_f32 = linear_q4_0_f32,
             .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
             .linear_q4_0_pair_nobias_f32_tile4_w4 = linear_q4_0_pair_nobias_f32_tile4_w4,
+            .linear_q4_0_pair_activation_q8_1_e4b = linear_q4_0_pair_activation_q8_1_e4b,
+            .linear_q4_0_q8_1_e4b_down = linear_q4_0_q8_1_e4b_down,
         };
     }
 
@@ -210,6 +220,8 @@ const BenchModule = if (build_options.enable_cuda) struct {
             self.linear_q4_0_f32 = null;
             self.linear_q4_0_f32_tile4 = null;
             self.linear_q4_0_pair_nobias_f32_tile4_w4 = null;
+            self.linear_q4_0_pair_activation_q8_1_e4b = null;
+            self.linear_q4_0_q8_1_e4b_down = null;
         }
     }
 } else struct {};
@@ -301,6 +313,18 @@ fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingQuantCompilerQ4_0PairPtxPath;
             cfg.quant_compiler_q4_0_pair_ptx_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-q4-0-pair-q8-ptx")) {
+            if (cfg.quant_compiler_q4_0_pair_q8_ptx_path != null) return error.DuplicateQuantCompilerQ4_0PairQ8PtxPath;
+            seen_benchmark_option = true;
+            i += 1;
+            if (i >= args.len) return error.MissingQuantCompilerQ4_0PairQ8PtxPath;
+            cfg.quant_compiler_q4_0_pair_q8_ptx_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-q4-0-down-q8-ptx")) {
+            if (cfg.quant_compiler_q4_0_down_q8_ptx_path != null) return error.DuplicateQuantCompilerQ4_0DownQ8PtxPath;
+            seen_benchmark_option = true;
+            i += 1;
+            if (i >= args.len) return error.MissingQuantCompilerQ4_0DownQ8PtxPath;
+            cfg.quant_compiler_q4_0_down_q8_ptx_path = args[i];
         } else if (std.mem.eql(u8, arg, "--quant-compiler-evidence-out")) {
             if (cfg.quant_compiler_evidence_out_path != null) return error.DuplicateQuantCompilerEvidenceOutPath;
             seen_benchmark_option = true;
@@ -340,8 +364,8 @@ fn parseArgs(args: []const []const u8) !Config {
     if (cfg.measure_iters == 0) return error.InvalidArgument;
     if (cfg.full_iters == 0) return error.InvalidArgument;
     if (cfg.quant_compiler_lazy_target and cfg.quant_compiler_generated_ptx_path == null) return error.MissingGeneratedPtxPath;
-    if (cfg.quant_compiler_lazy_target and (cfg.quant_compiler_q4_0_mmv_ptx_path != null or cfg.quant_compiler_q4_0_mm_ptx_path != null or cfg.quant_compiler_q4_0_pair_ptx_path != null)) return error.QuantCompilerQ4_0ConflictsWithLazyTarget;
-    const q4_0_target_count: usize = @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mmv_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mm_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_ptx_path != null));
+    if (cfg.quant_compiler_lazy_target and (cfg.quant_compiler_q4_0_mmv_ptx_path != null or cfg.quant_compiler_q4_0_mm_ptx_path != null or cfg.quant_compiler_q4_0_pair_ptx_path != null or cfg.quant_compiler_q4_0_pair_q8_ptx_path != null or cfg.quant_compiler_q4_0_down_q8_ptx_path != null)) return error.QuantCompilerQ4_0ConflictsWithLazyTarget;
+    const q4_0_target_count: usize = @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mmv_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mm_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_q8_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_down_q8_ptx_path != null));
     if (cfg.quant_compiler_evidence_out_path != null and !cfg.quant_compiler_lazy_target and q4_0_target_count == 0) return error.QuantCompilerEvidenceRequiresLazyTarget;
     if (cfg.quant_compiler_evidence_out_path != null and q4_0_target_count > 1) return error.QuantCompilerEvidenceRequiresSingleQ4_0Target;
     if (cfg.quant_compiler_evidence_out_path != null and (cfg.warmup_iters != 5 or cfg.measure_iters != 50)) return error.QuantCompilerEvidenceRequiresManifestIterations;
@@ -420,6 +444,7 @@ fn printUsage() void {
         \\                         [--quant-compiler-lazy-target --quant-compiler-generated-ptx PATH]
         \\                         [--quant-compiler-q4-0-mmv-ptx PATH] [--quant-compiler-q4-0-mm-ptx PATH]
         \\                         [--quant-compiler-q4-0-pair-ptx PATH]
+        \\                         [--quant-compiler-q4-0-pair-q8-ptx PATH] [--quant-compiler-q4-0-down-q8-ptx PATH]
         \\                         [--quant-compiler-evidence-out PATH]
         \\                         [--quant-compiler-check-evidence PATH]
         \\                         [--quant-compiler-require-promotion-ready]
@@ -434,6 +459,9 @@ fn printUsage() void {
         \\q4_simt kernels on Gemma4 E2B QAT shapes.
         \\With --quant-compiler-q4-0-pair-ptx, compares the generated Q4_0 rows=1 FFN
         \\gate+up pair kernel against the handwritten pair baseline.
+        \\With --quant-compiler-q4-0-pair-q8-ptx / --quant-compiler-q4-0-down-q8-ptx,
+        \\compares the generated q8_1/DP4A E4B fused-FFN kernels against the tuned
+        \\handwritten baselines.
         \\If --model is provided, also runs full ClipCLAP text embedding through the CUDA backend.
         \\
     , .{});
@@ -451,7 +479,7 @@ fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
         return;
     }
 
-    if (cfg.quant_compiler_q4_0_mmv_ptx_path != null or cfg.quant_compiler_q4_0_mm_ptx_path != null or cfg.quant_compiler_q4_0_pair_ptx_path != null) {
+    if (cfg.quant_compiler_q4_0_mmv_ptx_path != null or cfg.quant_compiler_q4_0_mm_ptx_path != null or cfg.quant_compiler_q4_0_pair_ptx_path != null or cfg.quant_compiler_q4_0_pair_q8_ptx_path != null or cfg.quant_compiler_q4_0_down_q8_ptx_path != null) {
         if (cfg.quant_compiler_q4_0_mmv_ptx_path) |ptx_path| {
             try benchQuantCompilerQ4_0Target(allocator, io, &ctx, &module, cfg, .mmv, ptx_path);
         }
@@ -460,6 +488,12 @@ fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
         }
         if (cfg.quant_compiler_q4_0_pair_ptx_path) |ptx_path| {
             try benchQuantCompilerQ4_0PairTarget(allocator, io, &ctx, &module, cfg, ptx_path);
+        }
+        if (cfg.quant_compiler_q4_0_pair_q8_ptx_path) |ptx_path| {
+            try benchQuantCompilerQ4_0PairQ8Target(allocator, io, &ctx, &module, cfg, ptx_path);
+        }
+        if (cfg.quant_compiler_q4_0_down_q8_ptx_path) |ptx_path| {
+            try benchQuantCompilerQ4_0DownQ8Target(allocator, io, &ctx, &module, cfg, ptx_path);
         }
         return;
     }
@@ -1042,6 +1076,318 @@ fn benchQuantCompilerQ4_0PairTarget(
         try writeQuantCompilerQ4_0Evidence(allocator, io, evidence_path, bench, cfg, geomean_speedup, worst_speedup, shape_details.items);
         print("wrote quant compiler evidence: {s}\n", .{evidence_path});
     }
+}
+
+// Experimental race harness for the tuned Gemma4 E4B decode FFN gate+up
+// kernel (q8_1 activations in, fused activation multiply, q8_1 out). The
+// candidate is compiler-owned (plan cuda/q4_0/rows_1/pair_activation/mmv)
+// and shares the baseline's exact launch contract.
+const quant_compiler_q4_0_pair_q8_kernel_id = "antfly_q4_0_pair_activation_q8_1_mmv_v1";
+const quant_compiler_q4_0_pair_q8_in_dim: usize = 2560;
+const quant_compiler_q4_0_pair_q8_out_dim: usize = 10240;
+const quant_compiler_q4_0_pair_q8_activation: u32 = 0; // GELU-tanh
+const q8_1_values_per_block: usize = 32;
+const q8_1_block_bytes: usize = 36;
+
+fn geluTanhF32(x: f32) f32 {
+    const inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+    return 0.5 * x * (1.0 + std.math.tanh(inner));
+}
+
+fn benchQuantCompilerQ4_0PairQ8Target(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    ptx_path: []const u8,
+) !void {
+    const bench = quant_kernel_compiler.first_q4_0_pair_q8_benchmark;
+    const in_dim = quant_compiler_q4_0_pair_q8_in_dim;
+    const out_dim = quant_compiler_q4_0_pair_q8_out_dim;
+    const out_blocks = out_dim / q8_1_values_per_block;
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const weight_bytes = out_dim * row_blocks * q4_0_block_bytes;
+    const baseline_name = bench.handwritten_baseline;
+    if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
+        if (!std.mem.eql(u8, ptx_path, bench.generated_ptx_path)) return error.GeneratedPtxPathMismatch;
+        if (!std.mem.eql(u8, evidence_path, bench.benchmark_evidence_path)) return error.QuantCompilerEvidencePathMismatch;
+    }
+
+    var generated = try GeneratedCandidateModule.load(allocator, io, ctx, ptx_path, bench.generated_kernel_id);
+    defer generated.unload(ctx);
+
+    print("CUDA quant compiler q4_0 pair-q8 target: rows=1 in={d} out={d} activation=gelu_tanh ptx={s}\n", .{ in_dim, out_dim, ptx_path });
+    print("candidate kernel={s} baseline kernel={s} production={}\n", .{ bench.generated_kernel_id, baseline_name, bench.production_enabled });
+
+    const input_host = try allocator.alloc(f32, in_dim);
+    defer allocator.free(input_host);
+    fillInput(input_host);
+    const q8_input_host = try quant_codec.quantizeQ8_1FromF32(allocator, input_host);
+    defer allocator.free(q8_input_host);
+    const weight_gate_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_gate_host);
+    const weight_up_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_up_host);
+    fillQ4_0Weights(weight_gate_host);
+    fillQ4_0WeightsAlt(weight_up_host);
+
+    // CPU reference: dequantize the q8 activations the kernels actually
+    // consume, run both projections through the q4_0 reference matmul, then
+    // apply the fused activation multiply.
+    const act_dequant = try allocator.alloc(f32, in_dim);
+    defer allocator.free(act_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, q8_input_host, act_dequant);
+    const gate_ref = try allocator.alloc(f32, out_dim);
+    defer allocator.free(gate_ref);
+    const up_ref = try allocator.alloc(f32, out_dim);
+    defer allocator.free(up_ref);
+    try quant_kernel_compiler.referenceMatmulNoBias(allocator, .q4_0, weight_gate_host, act_dequant, 1, in_dim, out_dim, gate_ref);
+    try quant_kernel_compiler.referenceMatmulNoBias(allocator, .q4_0, weight_up_host, act_dequant, 1, in_dim, out_dim, up_ref);
+    const activated_ref = try allocator.alloc(f32, out_dim);
+    defer allocator.free(activated_ref);
+    var activated_amax: f32 = 0.0;
+    for (activated_ref, 0..) |*value, i| {
+        value.* = geluTanhF32(gate_ref[i]) * up_ref[i];
+        activated_amax = @max(activated_amax, @abs(value.*));
+    }
+    // The kernel output is per-block q8_1-quantized; allow one quantization
+    // step at the global amax plus dot-product float noise.
+    const correctness_tolerance_abs: f32 = activated_amax / 127.0 + 0.05;
+
+    var q8_input = try cuda_buffer.DeviceBuffer.alloc(ctx, q8_input_host.len);
+    defer q8_input.free(ctx);
+    var weight_gate = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_bytes);
+    defer weight_gate.free(ctx);
+    var weight_up = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_bytes);
+    defer weight_up.free(ctx);
+    var dst_q8 = try cuda_buffer.DeviceBuffer.alloc(ctx, out_blocks * q8_1_block_bytes);
+    defer dst_q8.free(ctx);
+    try q8_input.copyFromHost(ctx, q8_input_host);
+    try weight_gate.copyFromHost(ctx, weight_gate_host);
+    try weight_up.copyFromHost(ctx, weight_up_host);
+    try ctx.synchronize();
+
+    const baseline_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0PairQ8, .{ module.linear_q4_0_pair_activation_q8_1_e4b, ctx, dst_q8, q8_input, weight_gate, weight_up, out_blocks });
+    const baseline_q8_host = try allocator.alloc(u8, out_blocks * q8_1_block_bytes);
+    defer allocator.free(baseline_q8_host);
+    try dst_q8.copyToHost(ctx, baseline_q8_host);
+    try ctx.synchronize();
+    const baseline_dequant = try allocator.alloc(f32, out_dim);
+    defer allocator.free(baseline_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, baseline_q8_host, baseline_dequant);
+    const baseline_cpu_max_abs_diff = try maxAbsDiffFinite(baseline_dequant, activated_ref);
+    if (baseline_cpu_max_abs_diff > correctness_tolerance_abs) return error.HandwrittenBaselineMismatch;
+
+    try poisonDeviceBytes(allocator, ctx, dst_q8, out_blocks * q8_1_block_bytes);
+
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0PairQ8, .{ generated.function, ctx, dst_q8, q8_input, weight_gate, weight_up, out_blocks });
+    const generated_q8_host = try allocator.alloc(u8, out_blocks * q8_1_block_bytes);
+    defer allocator.free(generated_q8_host);
+    try dst_q8.copyToHost(ctx, generated_q8_host);
+    try ctx.synchronize();
+    const generated_dequant = try allocator.alloc(f32, out_dim);
+    defer allocator.free(generated_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, generated_q8_host, generated_dequant);
+    const cpu_max_abs_diff = try maxAbsDiffFinite(generated_dequant, activated_ref);
+    if (cpu_max_abs_diff > correctness_tolerance_abs) return error.GeneratedCandidateMismatch;
+    const baseline_max_abs_diff = try maxAbsDiffFinite(generated_dequant, baseline_dequant);
+
+    const candidate_speedup = speedup(baseline_ns, generated_ns);
+    print("shape=E4B FFN gate+up q8_1 rows=1 in={d} out={d} baseline_ns={d} generated_ns={d} speedup={d:.6} tolerance={d:.6} baseline_cpu_max_abs_diff={d:.6} generated_cpu_max_abs_diff={d:.6} generated_baseline_max_abs_diff={d:.6}\n", .{
+        in_dim,
+        out_dim,
+        baseline_ns,
+        generated_ns,
+        candidate_speedup,
+        correctness_tolerance_abs,
+        baseline_cpu_max_abs_diff,
+        cpu_max_abs_diff,
+        baseline_max_abs_diff,
+    });
+    print("q4_0 pair-q8 summary: speedup={d:.6}\n", .{candidate_speedup});
+    if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
+        var shape_details = std.ArrayListUnmanaged(u8).empty;
+        defer shape_details.deinit(allocator);
+        try appendJsonFmt(allocator, &shape_details,
+            \\{{"label":"E4B FFN gate+up q8_1","rows":1,"in_dim":{d},"out_dim":{d},"baseline_ns":{d},"generated_ns":{d},"speedup":{d:.6},"quantized_output_tolerance":{d:.6},"baseline_cpu_max_abs_diff":{d:.6},"generated_cpu_max_abs_diff":{d:.6},"generated_baseline_max_abs_diff":{d:.6}}}
+        , .{
+            in_dim,
+            out_dim,
+            baseline_ns,
+            generated_ns,
+            candidate_speedup,
+            correctness_tolerance_abs,
+            baseline_cpu_max_abs_diff,
+            cpu_max_abs_diff,
+            baseline_max_abs_diff,
+        });
+        try writeQuantCompilerQ4_0Evidence(allocator, io, evidence_path, bench, cfg, candidate_speedup, candidate_speedup, shape_details.items);
+        print("wrote quant compiler evidence: {s}\n", .{evidence_path});
+    }
+}
+
+const quant_compiler_q4_0_down_q8_kernel_id = "antfly_q4_0_down_q8_1_mmv_v1";
+const quant_compiler_q4_0_down_q8_in_dim: usize = 10240;
+const quant_compiler_q4_0_down_q8_out_dim: usize = 2560;
+
+fn benchQuantCompilerQ4_0DownQ8Target(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    ptx_path: []const u8,
+) !void {
+    const bench = quant_kernel_compiler.first_q4_0_down_q8_benchmark;
+    const in_dim = quant_compiler_q4_0_down_q8_in_dim;
+    const out_dim = quant_compiler_q4_0_down_q8_out_dim;
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const weight_bytes = out_dim * row_blocks * q4_0_block_bytes;
+    const baseline_name = bench.handwritten_baseline;
+    const correctness_tolerance_abs: f32 = bench.correctness_tolerance_abs;
+    if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
+        if (!std.mem.eql(u8, ptx_path, bench.generated_ptx_path)) return error.GeneratedPtxPathMismatch;
+        if (!std.mem.eql(u8, evidence_path, bench.benchmark_evidence_path)) return error.QuantCompilerEvidencePathMismatch;
+    }
+
+    var generated = try GeneratedCandidateModule.load(allocator, io, ctx, ptx_path, bench.generated_kernel_id);
+    defer generated.unload(ctx);
+
+    print("CUDA quant compiler q4_0 down-q8 target: rows=1 in={d} out={d} ptx={s}\n", .{ in_dim, out_dim, ptx_path });
+    print("candidate kernel={s} baseline kernel={s} production={} tolerance={d:.6}\n", .{ bench.generated_kernel_id, baseline_name, bench.production_enabled, correctness_tolerance_abs });
+
+    const input_host = try allocator.alloc(f32, in_dim);
+    defer allocator.free(input_host);
+    fillInput(input_host);
+    const q8_input_host = try quant_codec.quantizeQ8_1FromF32(allocator, input_host);
+    defer allocator.free(q8_input_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillQ4_0Weights(weight_host);
+
+    const act_dequant = try allocator.alloc(f32, in_dim);
+    defer allocator.free(act_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, q8_input_host, act_dequant);
+    const reference_host = try allocator.alloc(f32, out_dim);
+    defer allocator.free(reference_host);
+    try quant_kernel_compiler.referenceMatmulNoBias(allocator, .q4_0, weight_host, act_dequant, 1, in_dim, out_dim, reference_host);
+
+    var q8_input = try cuda_buffer.DeviceBuffer.alloc(ctx, q8_input_host.len);
+    defer q8_input.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_bytes);
+    defer weight.free(ctx);
+    var output = try cuda_buffer.DeviceBuffer.alloc(ctx, out_dim * @sizeOf(f32));
+    defer output.free(ctx);
+    try q8_input.copyFromHost(ctx, q8_input_host);
+    try weight.copyFromHost(ctx, weight_host);
+    try ctx.synchronize();
+
+    const baseline_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0DownQ8, .{ module.linear_q4_0_q8_1_e4b_down, ctx, output, q8_input, weight, out_dim });
+    const baseline_host = try allocator.alloc(f32, out_dim);
+    defer allocator.free(baseline_host);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(baseline_host));
+    try ctx.synchronize();
+    const baseline_cpu_max_abs_diff = try maxAbsDiffFinite(baseline_host, reference_host);
+    if (baseline_cpu_max_abs_diff > correctness_tolerance_abs) return error.HandwrittenBaselineMismatch;
+
+    try poisonDeviceOutput(allocator, ctx, output, out_dim);
+
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0DownQ8, .{ generated.function, ctx, output, q8_input, weight, out_dim });
+    const generated_host = try allocator.alloc(f32, out_dim);
+    defer allocator.free(generated_host);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(generated_host));
+    try ctx.synchronize();
+    const cpu_max_abs_diff = try maxAbsDiffFinite(generated_host, reference_host);
+    if (cpu_max_abs_diff > correctness_tolerance_abs) return error.GeneratedCandidateMismatch;
+    const baseline_max_abs_diff = try maxAbsDiffFinite(generated_host, baseline_host);
+
+    const candidate_speedup = speedup(baseline_ns, generated_ns);
+    print("shape=E4B FFN down q8_1 rows=1 in={d} out={d} baseline_ns={d} generated_ns={d} speedup={d:.6} baseline_cpu_max_abs_diff={d:.6} generated_cpu_max_abs_diff={d:.6} generated_baseline_max_abs_diff={d:.6}\n", .{
+        in_dim,
+        out_dim,
+        baseline_ns,
+        generated_ns,
+        candidate_speedup,
+        baseline_cpu_max_abs_diff,
+        cpu_max_abs_diff,
+        baseline_max_abs_diff,
+    });
+    print("q4_0 down-q8 summary: speedup={d:.6}\n", .{candidate_speedup});
+    if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
+        var shape_details = std.ArrayListUnmanaged(u8).empty;
+        defer shape_details.deinit(allocator);
+        try appendJsonFmt(allocator, &shape_details,
+            \\{{"label":"E4B FFN down q8_1","rows":1,"in_dim":{d},"out_dim":{d},"baseline_ns":{d},"generated_ns":{d},"speedup":{d:.6},"baseline_cpu_max_abs_diff":{d:.6},"generated_cpu_max_abs_diff":{d:.6},"generated_baseline_max_abs_diff":{d:.6}}}
+        , .{
+            in_dim,
+            out_dim,
+            baseline_ns,
+            generated_ns,
+            candidate_speedup,
+            baseline_cpu_max_abs_diff,
+            cpu_max_abs_diff,
+            baseline_max_abs_diff,
+        });
+        try writeQuantCompilerQ4_0Evidence(allocator, io, evidence_path, bench, cfg, candidate_speedup, candidate_speedup, shape_details.items);
+        print("wrote quant compiler evidence: {s}\n", .{evidence_path});
+    }
+}
+
+fn launchQ4_0DownQ8(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    q8_input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    var dst_ptr = output.ptr;
+    var input_ptr = q8_input.ptr;
+    var weight_ptr = weight.ptr;
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+    };
+    try launchBlocks(ctx, function, out_dim / 4, 256, &params);
+}
+
+fn launchQ4_0PairQ8(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    dst_q8: cuda_buffer.DeviceBuffer,
+    q8_input: cuda_buffer.DeviceBuffer,
+    weight_gate: cuda_buffer.DeviceBuffer,
+    weight_up: cuda_buffer.DeviceBuffer,
+    out_blocks: usize,
+) cuda_driver.Error!void {
+    var dst_ptr = dst_q8.ptr;
+    var input_ptr = q8_input.ptr;
+    var weight_gate_ptr = weight_gate.ptr;
+    var weight_up_ptr = weight_up.ptr;
+    var activation_u32: u32 = quant_compiler_q4_0_pair_q8_activation;
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_gate_ptr),
+        @ptrCast(&weight_up_ptr),
+        @ptrCast(&activation_u32),
+    };
+    try launchBlocks(ctx, function, out_blocks, 640, &params);
+}
+
+fn poisonDeviceBytes(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    buffer: cuda_buffer.DeviceBuffer,
+    byte_count: usize,
+) !void {
+    const poison = try allocator.alloc(u8, byte_count);
+    defer allocator.free(poison);
+    @memset(poison, 0x7f);
+    try buffer.copyFromHost(ctx, poison);
+    try ctx.synchronize();
 }
 
 fn launchQ4_0PairBaseline(

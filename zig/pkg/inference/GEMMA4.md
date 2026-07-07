@@ -243,16 +243,23 @@ the target, or a still-missing detail in the clustered output head.
 ### CUDA Branch Status
 
 Update 2026-07-07 on branch `codex/quant-kernel-metal-compiler`: the quant
-kernel compiler now ships 3 promoted generated CUDA Q4_0 kernels default-on
+kernel compiler now ships 5 promoted generated CUDA Q4_0 kernels default-on
 for the Gemma4 QAT path (`antfly_q4_0_mmv_f32_v1`, `antfly_q4_0_mm_f32_v1`,
-`antfly_q4_0_pair_mmv_f32_v1`). Measured on E2B QAT
-(`gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf`, 128 tokens, NVIDIA L4) versus the
-handwritten routes: prefill 146-151 ms vs 200-201 ms (about -25%), decode
-61.1/60.8 vs 59.6/59.5 tok/s (about +2.4%), bit-identical output, zero
-fallbacks (16256 mmv + 92 mm + 4445 pair launches per run, reported by
-`--print-timing` as `cuda_q4_0_generated_counts:`). Per-kernel opt-out:
-`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_{MMV,MM,PAIR}`. Details and
-promotion evidence: `QUANT_KERNEL_COMPILER.md` (Current CUDA State).
+`antfly_q4_0_pair_mmv_f32_v1`, plus the q8_1/DP4A pair
+`antfly_q4_0_pair_activation_q8_1_mmv_v1` and
+`antfly_q4_0_down_q8_1_mmv_v1` inside the opt-in
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` tuned path).
+Measured on E2B QAT (`gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf`, 128 tokens,
+NVIDIA L4) versus the handwritten routes: prefill 150 ms vs 200 ms
+(about -25%), decode about +2.4%, bit-identical output, zero fallbacks.
+Measured on E4B QAT in the tuned llama.cpp pair-harness config: E2E median
+8197 ms vs 8370 ms with the q8_1 kernels disabled (about -2.1%), decode 63.4
+vs about 61.5 tok/s; the paired margin vs llama.cpp roughly halved. Launch
+counts appear in `--print-timing`/`--json-timing` as
+`cuda_q4_0_generated_counts:`. Per-kernel opt-out:
+`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_{MMV,MM,PAIR,PAIR_Q8,DOWN_Q8}`.
+Details and promotion evidence: `QUANT_KERNEL_COMPILER.md` (Current CUDA
+State).
 
 Status checked on 2026-06-21 on branch `gemma4_gpu_stuff`:
 

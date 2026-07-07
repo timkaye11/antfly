@@ -265,6 +265,8 @@ required_symbols=(
   antfly_q4_0_mmv_f32_v1
   antfly_q4_0_mm_f32_v1
   antfly_q4_0_pair_mmv_f32_v1
+  antfly_q4_0_pair_activation_q8_1_mmv_v1
+  antfly_q4_0_down_q8_1_mmv_v1
 )
 
 check_required_symbols() {

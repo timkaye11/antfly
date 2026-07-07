@@ -1820,7 +1820,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_q4_0_generated_counts: mmv_hits={d} mmv_fallbacks={d} mm_hits={d} mm_fallbacks={d} pair_hits={d} pair_fallbacks={d}\n",
+                    "cuda_q4_0_generated_counts: mmv_hits={d} mmv_fallbacks={d} mm_hits={d} mm_fallbacks={d} pair_hits={d} pair_fallbacks={d} pair_q8_hits={d} pair_q8_fallbacks={d} down_q8_hits={d} down_q8_fallbacks={d}\n",
                     .{
                         cuda_stats.q4_0_generated_mmv_hits,
                         cuda_stats.q4_0_generated_mmv_fallbacks,
@@ -1828,6 +1828,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.q4_0_generated_mm_fallbacks,
                         cuda_stats.q4_0_generated_pair_hits,
                         cuda_stats.q4_0_generated_pair_fallbacks,
+                        cuda_stats.q4_0_generated_pair_q8_hits,
+                        cuda_stats.q4_0_generated_pair_q8_fallbacks,
+                        cuda_stats.q4_0_generated_down_q8_hits,
+                        cuda_stats.q4_0_generated_down_q8_fallbacks,
                     },
                 );
                 print(
@@ -3637,6 +3641,10 @@ fn writeJsonTiming(
                 \\"q4_0_generated_mm_fallbacks":{d},
                 \\"q4_0_generated_pair_hits":{d},
                 \\"q4_0_generated_pair_fallbacks":{d},
+                \\"q4_0_generated_pair_q8_hits":{d},
+                \\"q4_0_generated_pair_q8_fallbacks":{d},
+                \\"q4_0_generated_down_q8_hits":{d},
+                \\"q4_0_generated_down_q8_fallbacks":{d},
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
@@ -3665,6 +3673,10 @@ fn writeJsonTiming(
                     cuda_stats.q4_0_generated_mm_fallbacks,
                     cuda_stats.q4_0_generated_pair_hits,
                     cuda_stats.q4_0_generated_pair_fallbacks,
+                    cuda_stats.q4_0_generated_pair_q8_hits,
+                    cuda_stats.q4_0_generated_pair_q8_fallbacks,
+                    cuda_stats.q4_0_generated_down_q8_hits,
+                    cuda_stats.q4_0_generated_down_q8_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,

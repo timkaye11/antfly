@@ -461,10 +461,10 @@ by ClipClap, GLiNER2, and DeBERTa reranker sessions:
   normalization, embedding, concat, convolution, and attention helpers
 - optional cuBLASLt f16/bf16 matmul dispatch for eligible dense weights
 - GGUF `Q8_0`, `Q4_0`, and `Q4_K` linear kernels
-- 3 promoted compiler-generated `Q4_0` kernels (decode GEMV, prefill rows
-  9-64, FFN gate+up pair), default-on with per-kernel disable envs; see
-  `QUANT_KERNEL_COMPILER.md` (Current CUDA State) for measured speedups and
-  promotion evidence
+- 5 promoted compiler-generated `Q4_0` kernels (decode GEMV, prefill rows
+  9-64, FFN gate+up pair, and the q8_1/DP4A E4B fused-FFN pair+down),
+  default-on with per-kernel disable envs; see `QUANT_KERNEL_COMPILER.md`
+  (Current CUDA State) for measured speedups and promotion evidence
 - GLiNER-oriented DeBERTa attention/head helper kernels
 
 Required common kernels are loaded eagerly when the CUDA module is loaded. If a

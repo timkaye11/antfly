@@ -172,7 +172,7 @@ driver-only (`cuModuleLoadDataEx`; nvcc is dev-time only).
 
 ## Current CUDA State
 
-The current checked-in state has 3 promoted generated CUDA production routes,
+The current checked-in state has 5 promoted generated CUDA production routes,
 all Q4_0, promoted on sequential benchmark evidence measured on an NVIDIA L4
 (driver 580.159.03, CUDA 13.2 nvcc; evidence JSONs under
 `src/ops/cuda/generated/evidence/`):
@@ -182,6 +182,25 @@ all Q4_0, promoted on sequential benchmark evidence measured on an NVIDIA L4
 | `antfly_q4_0_mmv_f32_v1` | `cuda/q4_0/rows_1/none/mmv` | `termite_linear_q4_0_f32_tile4` | 1.18 (worst shape 1.02, LM head 1.30) |
 | `antfly_q4_0_mm_f32_v1` | `cuda/q4_0/rows_9_64/none/mm` | `termite_linear_q4_0_f32` | 3.53 (up to 10.23 on FFN-down; 0.75 at in_dim=256, runtime-gated) |
 | `antfly_q4_0_pair_mmv_f32_v1` | `cuda/q4_0/rows_1/pair/mmv` | `termite_linear_q4_0_pair_nobias_f32_tile4_w4` | 1.29 |
+| `antfly_q4_0_pair_activation_q8_1_mmv_v1` | `cuda/q4_0/rows_1/pair_activation/mmv` | `termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn` | 1.28 |
+| `antfly_q4_0_down_q8_1_mmv_v1` | `cuda/q4_0/rows_1/gated_down/mmv` | `termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down` | 1.31 |
+
+The `pair_activation` and `gated_down` epilogues describe the tuned Gemma4
+E4B decode FFN contract (q8_1-quantized activations via DP4A; `pair_activation`
+also fuses the activation multiply and q8_1 output requantization; both are
+hardcoded to the 2560/10240 E4B dims and CUDA-only). Their win over the tuned
+handwritten kernels comes from fetching q4_0 weight words as aligned u16 pairs
+instead of four single-byte loads. They dispatch inside the existing opt-in
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` path; within
+that path they are default-on with per-kernel disable envs
+(`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8`, `..._DOWN_Q8`).
+Measured e2e on the tuned E4B QAT llama.cpp pair harness: about -2.1% Antfly
+E2E median and +3% decode from the pair kernel (the down kernel's increment is
+below the harness noise floor); the paired margin vs llama.cpp roughly halved.
+The `pair_activation` output comparison is quantization-aware: the harness
+bounds the dequantized output diff by the global amax quantization step, which
+is looser than the manifest's `correctness_tolerance_abs` field (that field
+applies to the f32-output targets).
 
 Speedups are geomeans across the Gemma4 E2B QAT dispatch shapes recorded in the
 bench targets (`bench-cuda --quant-compiler-q4-0-{mmv,mm,pair}-ptx`), with
@@ -210,13 +229,15 @@ quant matmuls ride the q4_k tensor-core route), and gliner2 passes the
 counts and warm extraction timing unchanged (12.0 vs 12.1 ms).
 
 Runtime dispatch for the promoted CUDA routes is default-on and per-kernel
-opt-out via `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV`,
-`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM`, and
-`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR` (recorded per artifact as
-`runtime_gate_env` in `quant_kernel_artifacts.json`). Actual launch counts are
-reported by `generate --print-timing` as `cuda_q4_0_generated_counts:` with
-per-kernel hit/fallback counters; a fallback dispatches the handwritten
-baseline for that call.
+opt-out via `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV`, `..._MM`,
+`..._PAIR`, `..._PAIR_Q8`, and `..._DOWN_Q8` (recorded per artifact as
+`runtime_gate_env` in `quant_kernel_artifacts.json`; the two `_Q8` kernels
+dispatch inside the opt-in
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` tuned path).
+Actual launch counts are reported by `generate --print-timing` as
+`cuda_q4_0_generated_counts:` with per-kernel hit/fallback counters (also in
+`--json-timing`); a fallback dispatches the handwritten baseline for that
+call.
 
 The Q4_0 `pair` epilogue (two no-bias projections sharing one input) is
 CUDA-only; Metal is carved out in `supportsEpilogueForBackend` and keeps its

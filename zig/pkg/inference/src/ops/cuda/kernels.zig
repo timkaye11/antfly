@@ -254,6 +254,8 @@ pub const KernelModule = struct {
     linear_q4_0_generated_mmv: driver_mod.CUfunction = null,
     linear_q4_0_generated_mm: driver_mod.CUfunction = null,
     linear_q4_0_generated_pair: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_q8: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_q8: driver_mod.CUfunction = null,
     linear_q4_0_f32_tile4: driver_mod.CUfunction = null,
     linear_q4_0_f32_tile4_w4: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile4: driver_mod.CUfunction = null,
@@ -551,6 +553,8 @@ pub const KernelModule = struct {
         const linear_q4_0_generated_mmv = loadOptionalFunction(ctx, module, "antfly_q4_0_mmv_f32_v1");
         const linear_q4_0_generated_mm = loadOptionalFunction(ctx, module, "antfly_q4_0_mm_f32_v1");
         const linear_q4_0_generated_pair = loadOptionalFunction(ctx, module, "antfly_q4_0_pair_mmv_f32_v1");
+        const linear_q4_0_generated_pair_q8 = loadOptionalFunction(ctx, module, "antfly_q4_0_pair_activation_q8_1_mmv_v1");
+        const linear_q4_0_generated_down_q8 = loadOptionalFunction(ctx, module, "antfly_q4_0_down_q8_1_mmv_v1");
         const linear_q4_0_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4");
         const linear_q4_0_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4_w4");
         const linear_q4_0_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4");
@@ -820,6 +824,8 @@ pub const KernelModule = struct {
             .linear_q4_0_generated_mmv = linear_q4_0_generated_mmv,
             .linear_q4_0_generated_mm = linear_q4_0_generated_mm,
             .linear_q4_0_generated_pair = linear_q4_0_generated_pair,
+            .linear_q4_0_generated_pair_q8 = linear_q4_0_generated_pair_q8,
+            .linear_q4_0_generated_down_q8 = linear_q4_0_generated_down_q8,
             .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
             .linear_q4_0_f32_tile4_w4 = linear_q4_0_f32_tile4_w4,
             .linear_q4_0_q8_1_f32_tile4 = linear_q4_0_q8_1_f32_tile4,
@@ -1065,6 +1071,8 @@ pub const KernelModule = struct {
             self.linear_q4_0_generated_mmv = null;
             self.linear_q4_0_generated_mm = null;
             self.linear_q4_0_generated_pair = null;
+            self.linear_q4_0_generated_pair_q8 = null;
+            self.linear_q4_0_generated_down_q8 = null;
             self.linear_q4_0_f32_tile4 = null;
             self.linear_q4_0_f32_tile4_w4 = null;
             self.linear_q4_0_q8_1_f32_tile4 = null;
@@ -9159,6 +9167,71 @@ pub const KernelModule = struct {
 
     // E4B FFN-specific: the CUDA body bakes in 2560 input columns and
     // 10240 activated columns to keep row-aware Q8_1 prefill fast.
+    pub fn launchLinearQ4_0GeneratedDownQ8(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_generated_down_q8 orelse return error.CudaKernelUnavailable;
+        if (rows != 1 or in_dim != 10240 or out_dim != 2560) return error.InvalidCudaState;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        try checkBytes(dst, out_dim);
+        try checkRawBytes(input_q8_1, try checkedTensorElements(input_row_blocks, q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes));
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+        };
+        try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedPairQ8(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_generated_pair_q8 orelse return error.CudaKernelUnavailable;
+        if (rows != 1 or in_dim != 2560 or out_dim != 10240) return error.InvalidCudaState;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        const out_row_blocks = out_dim / q8_1_values_per_block;
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes);
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(out_row_blocks, q8_1_block_bytes));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(input_row_blocks, q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+
+        var dst_ptr = dst_q8_1.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, out_row_blocks, q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+    }
+
     pub fn launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
