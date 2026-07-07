@@ -27,6 +27,14 @@
 //! All chunk vectors therefore live in the same projection space of the one
 //! chosen model. If a chunk's modality is not supported by the chosen model
 //! (e.g. an audio chunk with a CLIP model) the caller receives a clear error.
+//!
+//! The same mechanism generalizes to SPLIT-ENCODER serving for the fused
+//! chunker (`embedTextChunks`): boundaries come from the fine-tuned fused
+//! model (boundary-only forward), while each resulting text chunk is embedded
+//! through the raw frozen embed-base named by the request, optionally with a
+//! retrieval document prefix (nomic "search_document: "). This preserves the
+//! base encoder's retrieval quality, which the fused fine-tune catastrophically
+//! forgot (doc-level NDCG@10 0.0096 fused vs 0.335+ raw base, 2026-07).
 
 const std = @import("std");
 const embedding_mod = @import("embedding.zig");
@@ -175,6 +183,63 @@ pub fn embedChunks(
         const embeddings = try pipeline.embedEncodedAudio(clips);
         try assignEmbeddings(allocator, chunks, audio_idx.items, embeddings, opts);
     }
+}
+
+pub const TextEmbedOptions = struct {
+    /// Truncate each dense vector to this dimension and L2-renormalize
+    /// (Matryoshka). Null keeps the model's native dimension.
+    output_dimension: ?u32 = null,
+    /// Prefix prepended to each chunk's text before embedding, for
+    /// prefix-conditioned retrieval embedders (e.g. nomic's
+    /// "search_document: "). Empty applies no extra prefix; the embedding
+    /// pipeline's own manifest-level text_prefix (e.g. jina v5's "Document: ")
+    /// still applies inside pipeline.embed, so the two never stack unless the
+    /// model declares both.
+    prefix: []const u8 = "",
+};
+
+/// Split-encoder serving: embed TEXT chunks (e.g. produced boundary-only by
+/// the fused chunker) through a single frozen text embedder so retrieval
+/// quality comes from the raw base encoder rather than the fine-tuned fused
+/// weights. Results are written into `chunk.embedding` (+
+/// `embedding_dimension`, `owns_embedding`) in the original chunk order.
+///
+/// `pipeline` is duck-typed (anytype) so tests can substitute a synthetic
+/// implementation exposing `embed` without a real forward pass. In production
+/// this is a `*embedding_mod.EmbeddingPipeline`.
+pub fn embedTextChunks(
+    allocator: std.mem.Allocator,
+    pipeline: anytype,
+    chunks: []Chunk,
+    opts: TextEmbedOptions,
+) !void {
+    if (chunks.len == 0) return;
+
+    for (chunks) |chunk| {
+        if (try classifyChunk(chunk) != .text) return error.UnsupportedModality;
+    }
+
+    const texts = try allocator.alloc([]const u8, chunks.len);
+    defer allocator.free(texts);
+    var prefixed_count: usize = 0;
+    defer if (opts.prefix.len > 0) for (texts[0..prefixed_count]) |t| allocator.free(t);
+    for (chunks, texts) |chunk, *out| {
+        if (opts.prefix.len > 0) {
+            out.* = try std.fmt.allocPrint(allocator, "{s}{s}", .{ opts.prefix, chunk.text.? });
+            prefixed_count += 1;
+        } else {
+            out.* = chunk.text.?;
+        }
+    }
+
+    const embeddings = try pipeline.embed(texts);
+
+    const indices = try allocator.alloc(usize, chunks.len);
+    defer allocator.free(indices);
+    for (indices, 0..) |*idx, i| idx.* = i;
+    try assignEmbeddings(allocator, chunks, indices, embeddings, .{
+        .output_dimension = opts.output_dimension,
+    });
 }
 
 /// Take ownership of `embeddings` (an owned `[][]f32` returned by a tower) and
@@ -355,4 +420,125 @@ test "embedChunks rejects output_dimension larger than native size" {
         error.InvalidOutputDimension,
         embedChunks(alloc, &pipeline, &chunks, .{ .text = true, .image = true }, .{ .output_dimension = 8 }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Split-encoder text embedding tests (mock text embedder, no forward pass).
+// ---------------------------------------------------------------------------
+
+/// Text-only stand-in for EmbeddingPipeline. Records every text it receives
+/// so tests can assert prefix application and batch order, and tags each
+/// vector with its in-batch index so order preservation is observable.
+const MockTextPipeline = struct {
+    allocator: std.mem.Allocator,
+    dim: usize = 4,
+    calls: usize = 0,
+    seen_texts: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *MockTextPipeline) void {
+        for (self.seen_texts.items) |t| self.allocator.free(t);
+        self.seen_texts.deinit(self.allocator);
+    }
+
+    pub fn embed(self: *MockTextPipeline, texts: []const []const u8) ![][]f32 {
+        self.calls += 1;
+        for (texts) |t| try self.seen_texts.append(self.allocator, try self.allocator.dupe(u8, t));
+        const out = try self.allocator.alloc([]f32, texts.len);
+        errdefer self.allocator.free(out);
+        for (out, 0..) |*v, i| {
+            v.* = try self.allocator.alloc(f32, self.dim);
+            v.*[0] = 1.0 + @as(f32, @floatFromInt(i));
+            for (v.*[1..]) |*x| x.* = 0.0;
+        }
+        return out;
+    }
+};
+
+test "embedTextChunks embeds one batch in order with the document prefix" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{
+        Chunk.initText(0, "first chunk", 0, 11),
+        Chunk.initText(1, "second chunk", 11, 23),
+        Chunk.initText(2, "third chunk", 23, 34),
+    };
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockTextPipeline{ .allocator = alloc };
+    defer pipeline.deinit();
+    try embedTextChunks(alloc, &pipeline, &chunks, .{ .prefix = "search_document: " });
+
+    // One batched embed call; each text carries the nomic document prefix in
+    // original chunk order.
+    try std.testing.expectEqual(@as(usize, 1), pipeline.calls);
+    try std.testing.expectEqual(@as(usize, 3), pipeline.seen_texts.items.len);
+    try std.testing.expectEqualStrings("search_document: first chunk", pipeline.seen_texts.items[0]);
+    try std.testing.expectEqualStrings("search_document: second chunk", pipeline.seen_texts.items[1]);
+    try std.testing.expectEqualStrings("search_document: third chunk", pipeline.seen_texts.items[2]);
+
+    // Order preserved: chunk i carries the i-th batch vector.
+    try std.testing.expectEqual(@as(f32, 1.0), chunks[0].embedding.?[0]);
+    try std.testing.expectEqual(@as(f32, 2.0), chunks[1].embedding.?[0]);
+    try std.testing.expectEqual(@as(f32, 3.0), chunks[2].embedding.?[0]);
+    for (&chunks) |c| {
+        try std.testing.expectEqual(@as(?u32, 4), c.embedding_dimension);
+        try std.testing.expect(c.owns_embedding);
+    }
+}
+
+test "embedTextChunks without prefix passes chunk text verbatim" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{Chunk.initText(0, "plain text", 0, 10)};
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockTextPipeline{ .allocator = alloc };
+    defer pipeline.deinit();
+    try embedTextChunks(alloc, &pipeline, &chunks, .{});
+
+    try std.testing.expectEqualStrings("plain text", pipeline.seen_texts.items[0]);
+    try std.testing.expect(chunks[0].embedding != null);
+}
+
+test "embedTextChunks truncates and renormalizes to output_dimension" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{Chunk.initText(0, "chunk", 0, 5)};
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockTextPipeline{ .allocator = alloc, .dim = 4 };
+    defer pipeline.deinit();
+    try embedTextChunks(alloc, &pipeline, &chunks, .{ .output_dimension = 2 });
+
+    const emb = chunks[0].embedding.?;
+    try std.testing.expectEqual(@as(usize, 2), emb.len);
+    try std.testing.expectEqual(@as(?u32, 2), chunks[0].embedding_dimension);
+    var norm: f32 = 0;
+    for (emb) |v| norm += v * v;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm, 1e-5);
+}
+
+test "embedTextChunks rejects output_dimension larger than native size" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{Chunk.initText(0, "chunk", 0, 5)};
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockTextPipeline{ .allocator = alloc, .dim = 4 };
+    defer pipeline.deinit();
+    try std.testing.expectError(
+        error.InvalidOutputDimension,
+        embedTextChunks(alloc, &pipeline, &chunks, .{ .output_dimension = 8 }),
+    );
+}
+
+test "embedTextChunks rejects non-text chunks" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{
+        Chunk.initText(0, "text", 0, 4),
+        Chunk.initBinary(1, "image/png", "img"),
+    };
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockTextPipeline{ .allocator = alloc };
+    defer pipeline.deinit();
+    try std.testing.expectError(error.UnsupportedModality, embedTextChunks(alloc, &pipeline, &chunks, .{}));
+    // The pipeline was never invoked for a rejected batch.
+    try std.testing.expectEqual(@as(usize, 0), pipeline.calls);
 }

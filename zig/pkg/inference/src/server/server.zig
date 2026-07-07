@@ -294,6 +294,57 @@ fn fixedChunkerUnsupportedFeature(config: lib_chunker.FixedChunkConfig, has_embe
     return null;
 }
 
+/// SPLIT-ENCODER serving (2026-07 release decision): the fine-tuned fused
+/// chunker has excellent boundaries (chonky F1 0.79) but its fine-tune
+/// catastrophically forgot the base encoder's retrieval ability (doc-level
+/// NDCG@10 0.0096 vs 0.335+ for the raw embed-base). When a fused-path request
+/// supplies config.embedding_model together with include_embeddings, we serve
+/// boundaries from the fused model with a cheap BOUNDARY-ONLY forward and embed
+/// each resulting chunk's text through the named frozen embed-base instead
+/// (doc-level NDCG jumps ~35x).
+fn fusedSplitEncoderActive(config: lib_chunker.FixedChunkConfig, has_embedding_model: bool) bool {
+    return has_embedding_model and config.include_embeddings;
+}
+
+/// Fused-path feature rejections when an embedding_model is supplied.
+/// SPLADE-on-frozen-base is still training, so sparse output cannot yet be
+/// served consistently with split-encoder dense embeddings (follow-up).
+fn fusedChunkerSplitEncoderUnsupportedFeature(config: lib_chunker.FixedChunkConfig, has_embedding_model: bool) ?[]const u8 {
+    if (has_embedding_model and config.include_sparse) {
+        return "include_sparse is not yet supported together with embedding_model on a model-backed chunker; drop include_sparse or omit embedding_model";
+    }
+    return null;
+}
+
+/// Map a /chunk request config onto fused pipeline options. With split-encoder
+/// active, the fused model runs boundary-only (forwardBoundaryOnly skips the
+/// token-embedding heads) and dense embeddings — including the
+/// output_dimension truncate+renormalize — come from the frozen embed-base
+/// afterwards. Without an embedding_model this maps the config exactly as
+/// before (regression invariant: the fused path is unchanged).
+fn fusedChunkRequestOptions(config: lib_chunker.FixedChunkConfig, split_encoder: bool) fused_chunking_mod.ChunkRequestOptions {
+    return .{
+        .threshold = config.threshold,
+        .max_chunks = config.max_chunks,
+        .include_embeddings = config.include_embeddings and !split_encoder,
+        .include_sparse = config.include_sparse,
+        .output_dimension = if (split_encoder) null else config.output_dimension,
+        .sparse_top_k = config.sparse_top_k,
+    };
+}
+
+/// Document-side prefix for split-encoder chunk embedding. A request-level
+/// config.embedding_prefix wins (an explicit "" disables any extra prefix);
+/// otherwise the embedder manifest's declared retrieval document prefix
+/// applies (model_manifest.json "embedding_prefixes".document, e.g. nomic's
+/// "search_document: "). Empty means only the embedding pipeline's own
+/// unconditional manifest text_prefix (e.g. jina v5's "Document: ") applies
+/// inside embed(), so prefixes never stack unless a model declares both.
+fn splitEncoderDocumentPrefix(manifest: *const manifest_mod.ModelManifest, request_prefix: ?[]const u8) []const u8 {
+    if (request_prefix) |p| return p;
+    return manifest.embedding_document_prefix;
+}
+
 fn estimateTextsTokens(texts: []const []const u8) usize {
     var total: usize = 0;
     for (texts) |text| total += estimateTextTokens(text);
@@ -623,6 +674,66 @@ pub const Node = struct {
             error.UnsupportedModality, error.UnknownModality, error.MissingChunkPayload => return try ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "chunk modality is not supported by the selected embedding_model",
+            }),
+            error.InvalidOutputDimension => return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "output_dimension exceeds the embedding_model embedding size",
+            }),
+            else => return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+        };
+        return null;
+    }
+
+    /// SPLIT-ENCODER serving: embed fused-chunker text chunks in place through
+    /// the request-named frozen embed-base via the /embeddings model-resolution
+    /// path (resolveModelPath -> loadFromDir -> ensureEmbeddingAssets ->
+    /// embeddingPipeline), prepending the resolved document prefix (request
+    /// override or manifest "embedding_prefixes".document, e.g. nomic's
+    /// "search_document: "). Returns null on success or an HTTP error response
+    /// to propagate. The caller owns `chunks` and frees them.
+    fn embedFusedChunksSplitEncoder(
+        self: *Node,
+        ctx: *httpx.Context,
+        embedding_model: []const u8,
+        chunks: []lib_chunker.types.Chunk,
+        config: lib_chunker.FixedChunkConfig,
+        request_prefix: ?[]const u8,
+    ) !?httpx.Response {
+        if (chunks.len == 0) return null;
+
+        const model_path = self.resolveModelPath(ctx.io, embedding_model, "embedders") catch
+            return try ctx.status(404).json(.{
+                .@"error" = "MODEL_NOT_FOUND",
+                .message = "embedding_model not found; install it under models/embedders",
+            });
+
+        const model = self.model_manager.loadFromDir(model_path) catch |err|
+            return try ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+
+        if (model.manifest.model_type != .embedder) {
+            return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "embedding_model must be an embedder model",
+            });
+        }
+        if (model.manifest.hasCapability("sparse")) {
+            return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "embedding_model must be a dense text embedder; sparse embedders cannot produce chunk dense embeddings",
+            });
+        }
+
+        model.ensureEmbeddingAssets(true, false, false) catch |err|
+            return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+
+        var pipeline = model.embeddingPipeline(ctx.allocator);
+        multimodal_chunk_embedding_mod.embedTextChunks(ctx.allocator, &pipeline, chunks, .{
+            .output_dimension = config.output_dimension,
+            .prefix = splitEncoderDocumentPrefix(&model.manifest, request_prefix),
+        }) catch |err| switch (err) {
+            error.UnsupportedModality, error.UnknownModality, error.MissingChunkPayload => return try ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "embedding_model on a model-backed chunker supports text chunks only",
             }),
             error.InvalidOutputDimension => return try ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -1698,10 +1809,13 @@ pub const Node = struct {
             }
         }
 
-        // Route A: an optional shared-space embedder (CLIP/CLAP) that embeds
-        // each fixed-multimodal chunk via the tower matching its modality, so a
-        // text query can retrieve image/audio chunks. Only applies to the
-        // fixed (non-fused) path with include_embeddings set.
+        // An optional request-named embedder, active with include_embeddings:
+        // - Fixed path (Route A): a shared-space multimodal embedder
+        //   (CLIP/CLAP) embeds each chunk via the tower matching its modality
+        //   so a text query can retrieve image/audio chunks.
+        // - Fused path (split-encoder): boundaries come from the fused model
+        //   (boundary-only forward) and each chunk's text is embedded through
+        //   the raw frozen embed-base, preserving the base's retrieval quality.
         const embedding_model: ?[]const u8 = em: {
             if (body.config) |cfg| {
                 if (cfg.embedding_model) |em| {
@@ -1710,6 +1824,10 @@ pub const Node = struct {
             }
             break :em null;
         };
+        // Optional per-request document prefix override for split-encoder
+        // embedding; null defers to the embedder manifest's declared document
+        // prefix (e.g. nomic "search_document: ").
+        const embedding_prefix: ?[]const u8 = if (body.config) |cfg| cfg.embedding_prefix else null;
 
         var served_by_fixed_fallback = false;
         var served_by_fused = false;
@@ -1745,6 +1863,13 @@ pub const Node = struct {
                     return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
                 };
 
+                if (fusedChunkerSplitEncoderUnsupportedFeature(config, embedding_model != null)) |message| {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = message,
+                    });
+                }
+
                 if (config.include_sparse and !pipeline.has_splade) {
                     return ctx.status(400).json(.{
                         .@"error" = "SPARSE_EMBEDDINGS_UNSUPPORTED",
@@ -1752,15 +1877,16 @@ pub const Node = struct {
                     });
                 }
 
+                // SPLIT-ENCODER: fused boundaries + frozen embed-base chunk
+                // embeddings; see fusedSplitEncoderActive for the rationale.
+                const split_encoder = fusedSplitEncoderActive(config, embedding_model != null);
+
                 served_by_fused = true;
-                break :blk pipeline.chunkText(ctx.allocator, text, .{
-                    .threshold = config.threshold,
-                    .max_chunks = config.max_chunks,
-                    .include_embeddings = config.include_embeddings,
-                    .include_sparse = config.include_sparse,
-                    .output_dimension = config.output_dimension,
-                    .sparse_top_k = config.sparse_top_k,
-                }) catch |err| {
+                const fused_chunks = pipeline.chunkText(
+                    ctx.allocator,
+                    text,
+                    fusedChunkRequestOptions(config, split_encoder),
+                ) catch |err| {
                     // Fall back to fixed chunking only when the request needs
                     // no model-derived outputs (no embeddings, no SPLADE, no
                     // boundary scores); otherwise surface the failure.
@@ -1772,6 +1898,15 @@ pub const Node = struct {
                     }
                     return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
                 };
+
+                if (split_encoder) {
+                    if (try self.embedFusedChunksSplitEncoder(ctx, embedding_model.?, fused_chunks, config, embedding_prefix)) |err_response| {
+                        lib_chunker.types.freeChunks(ctx.allocator, fused_chunks);
+                        return err_response;
+                    }
+                }
+
+                break :blk fused_chunks;
             }
 
             if (fixedChunkerUnsupportedFeature(config, embedding_model != null)) |message| {
@@ -6672,6 +6807,67 @@ test "fixed chunker request guard rejects model-generated fields" {
     try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true, .output_dimension = 256 }, true) == null);
     try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, true) != null);
     try std.testing.expect(fixedChunkerUnsupportedFeature(.{ .include_embeddings = true, .include_boundary_scores = true }, true) != null);
+}
+
+test "fused split-encoder dispatch activates only with embedding_model + include_embeddings" {
+    try std.testing.expect(fusedSplitEncoderActive(.{ .include_embeddings = true }, true));
+    try std.testing.expect(!fusedSplitEncoderActive(.{ .include_embeddings = true }, false));
+    // embedding_model without include_embeddings requests no chunk vectors, so
+    // the fused path serves exactly as without an embedding_model.
+    try std.testing.expect(!fusedSplitEncoderActive(.{}, true));
+}
+
+test "fused split-encoder rejects include_sparse with embedding_model" {
+    try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, true) != null);
+    try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_sparse = true }, true) != null);
+    // Without an embedding_model the fused SPLADE path is untouched.
+    try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, false) == null);
+    try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true }, true) == null);
+}
+
+test "fused chunk options run boundary-only under split-encoder and are unchanged otherwise" {
+    const config = lib_chunker.FixedChunkConfig{
+        .max_chunks = 12,
+        .threshold = 0.42,
+        .include_embeddings = true,
+        .output_dimension = 256,
+    };
+
+    // Regression invariant: embedding_model unset maps the config exactly as
+    // the fused path always has.
+    const plain = fusedChunkRequestOptions(config, false);
+    try std.testing.expectEqual(@as(?f32, 0.42), plain.threshold);
+    try std.testing.expectEqual(@as(usize, 12), plain.max_chunks);
+    try std.testing.expect(plain.include_embeddings);
+    try std.testing.expect(!plain.include_sparse);
+    try std.testing.expectEqual(@as(?u32, 256), plain.output_dimension);
+
+    // Split-encoder: the fused forward is boundary-only; output_dimension is
+    // honored later by the frozen embed-base instead.
+    const split = fusedChunkRequestOptions(config, true);
+    try std.testing.expect(!split.include_embeddings);
+    try std.testing.expectEqual(@as(?u32, null), split.output_dimension);
+    try std.testing.expectEqual(@as(?f32, 0.42), split.threshold);
+    try std.testing.expectEqual(@as(usize, 12), split.max_chunks);
+}
+
+test "split-encoder document prefix prefers request override then manifest knob" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    manifest.embedding_document_prefix = try allocator.dupe(u8, "search_document: ");
+
+    // Manifest default (nomic-style prefix-conditioned embedder).
+    try std.testing.expectEqualStrings("search_document: ", splitEncoderDocumentPrefix(&manifest, null));
+    // Request override wins; explicit "" disables prefixing.
+    try std.testing.expectEqualStrings("custom: ", splitEncoderDocumentPrefix(&manifest, "custom: "));
+    try std.testing.expectEqualStrings("", splitEncoderDocumentPrefix(&manifest, ""));
+
+    var plain = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer plain.deinit();
+    // No manifest knob: no extra prefix (the pipeline's own text_prefix, e.g.
+    // jina v5 "Document: ", still applies inside embed()).
+    try std.testing.expectEqualStrings("", splitEncoderDocumentPrefix(&plain, null));
 }
 
 test "Antfly inference embeddings dense response supports truncation" {

@@ -116,6 +116,14 @@ paths:
         - Learned semantic boundaries with optional late-chunking dense
           embeddings and SPLADE sparse embeddings
         - Models auto-discovered from `models_dir/chunkers/`
+        - Split-encoder serving: set `config.embedding_model` (with
+          `include_embeddings`) to serve learned boundaries from the fused
+          model while embedding each chunk's text through the named raw
+          frozen embed-base, with the model's document prefix (e.g. nomic
+          `search_document: `; override via `config.embedding_prefix`).
+          Embed queries via `/embeddings` against the same embedder with its
+          query prefix (e.g. `search_query: `). `include_sparse` is not yet
+          supported together with `embedding_model` (400).
         - Falls back to fixed chunking ONLY when model inference fails and the
           request asks for no model-derived outputs (include_embeddings=false
           and include_sparse=false). The response `model` field reports the
@@ -1088,18 +1096,51 @@ components:
         embedding_model:
           type: string
           description: |
-            Optional shared-space multimodal embedder (CLIP for text+image,
-            CLAP for text+audio) applied to the deterministic multimodal
-            ('fixed') chunker. When set together with include_embeddings, every
-            chunk is embedded through the tower matching its modality (text
-            chunks via the text tower, image chunks via the vision tower, audio
-            chunks via the audio tower) so all chunk vectors share one space and
-            a text query can retrieve image/audio chunks. The model must be a
-            multimodal embedder; a chunk modality the model cannot embed (e.g.
-            an audio chunk with a CLIP model) is rejected. Dense embeddings only:
-            include_sparse and include_boundary_scores are not supported on this
-            path. Resolved from models/embedders/{name}/.
+            Optional embedder that produces the chunk dense embeddings instead
+            of the chunker itself. Active together with include_embeddings.
+            Resolved from models/embedders/{name}/.
+
+            On the deterministic multimodal ('fixed') chunker (Route A): a
+            shared-space multimodal embedder (CLIP for text+image, CLAP for
+            text+audio) embeds every chunk through the tower matching its
+            modality (text chunks via the text tower, image chunks via the
+            vision tower, audio chunks via the audio tower) so all chunk
+            vectors share one space and a text query can retrieve image/audio
+            chunks. The model must be a multimodal embedder; a chunk modality
+            the model cannot embed (e.g. an audio chunk with a CLIP model) is
+            rejected. include_sparse and include_boundary_scores are not
+            supported on the fixed path.
+
+            On a fused chunker model (split-encoder serving): boundaries come
+            from the fused chunker via a cheap boundary-only forward, and each
+            resulting chunk's text is embedded through this raw frozen
+            embed-base with the document-side prefix (see embedding_prefix).
+            This preserves the base encoder's retrieval quality, which the
+            boundary fine-tune does not retain. output_dimension
+            truncate+renormalize is honored by the embed-base vectors;
+            include_boundary_scores still works; include_sparse is rejected
+            with 400 for now (SPLADE on the frozen base is a follow-up). For
+            retrieval symmetry, embed queries via /embeddings against the SAME
+            embedder, prepending its query prefix (e.g. "search_query: " for
+            nomic prefix-conditioned models) to the query text.
+
+            Dense embeddings only on both paths. When unset, fused chunker
+            behavior is unchanged (embeddings, if requested, come from the
+            fused model itself).
           example: clip-vit-base-patch32
+        embedding_prefix:
+          type: string
+          description: |
+            Optional prefix prepended to each chunk's text before it is
+            embedded through embedding_model on a model-backed (fused)
+            chunker. When unset, defaults per model to the embedder
+            manifest's "embedding_prefixes".document value (e.g.
+            "search_document: " for nomic prefix-conditioned models); models
+            that declare no document prefix get no extra prefix. Set to ""
+            to explicitly disable prefixing. Queries should be embedded via
+            /embeddings with the matching query prefix (e.g.
+            "search_query: ") against the same embedder.
+          example: 'search_document: '
         include_sparse:
           type: boolean
           description: Return SPLADE sparse embeddings for each chunk when the selected chunker supports them.

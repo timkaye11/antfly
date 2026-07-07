@@ -861,8 +861,10 @@ pub const ChunkConfig = struct {
     threshold: ?f32 = null,
     /// Return contextual dense embeddings for each chunk when the selected chunker supports them.
     include_embeddings: ?bool = null,
-    /// Optional shared-space multimodal embedder (CLIP for text+image, CLAP for text+audio) applied to the deterministic multimodal ('fixed') chunker. When set together with include_embeddings, every chunk is embedded through the tower matching its modality so all chunk vectors share one space. Dense embeddings only. Resolved from models/embedders/{name}/.
+    /// Optional embedder that produces the chunk dense embeddings instead of the chunker itself. Fixed path (Route A): a shared-space multimodal embedder (CLIP/CLAP) embeds every chunk through the tower matching its modality. Fused path (split-encoder): boundaries come from the fused chunker (boundary-only forward) and each chunk's text is embedded through this raw frozen embed-base, preserving base retrieval quality. Dense embeddings only. Resolved from models/embedders/{name}/.
     embedding_model: ?[]const u8 = null,
+    /// Optional prefix prepended to each chunk's text before split-encoder embedding through embedding_model. Defaults per model to the embedder manifest's "embedding_prefixes".document (e.g. "search_document: " for nomic prefix-conditioned models). Set to "" to disable. Queries should be embedded via /embeddings with the matching query prefix (e.g. "search_query: ") against the same embedder.
+    embedding_prefix: ?[]const u8 = null,
     /// Return SPLADE sparse embeddings for each chunk when the selected chunker supports them.
     include_sparse: ?bool = null,
     /// Requested dense embedding dimension for Matryoshka-capable chunker models.

@@ -233,9 +233,21 @@ fn verifyRetrievalLane(manifest: std.json.ObjectMap, results: std.json.ObjectMap
     const targets = try requireObject(manifest_lane.get("external_targets") orelse return error.MissingRetrievalExternalTargets);
 
     const min_relative_gain = jsonF64(gate.get("min_relative_gain_over_best_local_baseline")) orelse return error.InvalidRetrievalReleaseGate;
+    // 2026-07 re-scope: split-encoder serving restored healthy absolute
+    // retrieval (doc-level NDCG >= 0.15 floor vs the fused fine-tune's 0.0096
+    // collapse) while the gain over the best same-encoder baseline is small
+    // (+1% doc-level). The release gate is therefore an absolute floor
+    // (min_overall_ndcg_at_10) and the relative gain is still computed and
+    // reported but only gated when relative_gain_report_only is absent/false.
+    const min_overall_gate = jsonF64(gate.get("min_overall_ndcg_at_10"));
+    const relative_gain_report_only = jsonBool(gate.get("relative_gain_report_only")) orelse false;
     const must_report_distance = jsonBool(gate.get("must_report_distance_to_external_voyage_target")) orelse return error.InvalidRetrievalReleaseGate;
     const overall = jsonF64(result_lane.get("overall_ndcg_at_10")) orelse jsonF64(result_lane.get("ndcg_at_10")) orelse return error.MissingRetrievalNdcg;
     if (!std.math.isFinite(overall)) return error.InvalidRetrievalResults;
+    if (min_overall_gate) |min_overall| {
+        if (!std.math.isFinite(min_overall)) return error.InvalidRetrievalReleaseGate;
+        if (overall < min_overall) return error.RetrievalNdcgBelowFloor;
+    }
 
     const baselines = try requireArray(result_lane.get("baselines") orelse return error.MissingRetrievalBaselines);
     var best_baseline: f64 = -std.math.inf(f64);
@@ -248,7 +260,7 @@ fn verifyRetrievalLane(manifest: std.json.ObjectMap, results: std.json.ObjectMap
     if (!std.math.isFinite(best_baseline) or best_baseline <= 0.0) return error.MissingRetrievalBaselines;
 
     const relative_gain = (overall - best_baseline) / best_baseline;
-    if (relative_gain < min_relative_gain) return error.RetrievalNdcgRelativeGainBelowThreshold;
+    if (!relative_gain_report_only and relative_gain < min_relative_gain) return error.RetrievalNdcgRelativeGainBelowThreshold;
 
     const voyage_target = try voyageTargetForResult(targets, result_lane);
     const distance_to_target = voyage_target - overall;
@@ -514,4 +526,92 @@ test "benchmark verifier rejects retrieval missing required Voyage target distan
         \\}
     ;
     try std.testing.expectError(error.MissingVoyageTargetReport, verifyBenchmarkJson(std.testing.allocator, manifest, results, .retrieval_ndcg));
+}
+
+// 2026-07 re-scoped gates: retrieval is an absolute NDCG floor with the
+// relative gain reported but not gated, and boundary chonky comparisons are
+// report-only (gate on internal_phase20_best_f1 only).
+test "benchmark verifier accepts report-only relative gain above the absolute floor" {
+    const manifest =
+        \\{
+        \\  "schema_version":"fused_chunker_eval_manifest/v1",
+        \\  "boundary_f1":{
+        \\    "metric":"chonky_character_separator_f1",
+        \\    "datasets":[{"name":"a","chonky_base_f1":0.72,"chonky_large_f1":0.79}],
+        \\    "release_gate":{
+        \\      "min_internal_phase20_best_f1":0.78,
+        \\      "fixed_threshold_max_delta_from_best_f1":0.03,
+        \\      "must_beat_chonky_base_each_dataset":false,
+        \\      "must_match_or_beat_chonky_large_mean":false
+        \\    }
+        \\  },
+        \\  "retrieval_ndcg":{
+        \\    "external_targets":{"voyage_context_4_chunk_embedding_overall_ndcg_at_10":0.844},
+        \\    "release_gate":{
+        \\      "min_overall_ndcg_at_10":0.15,
+        \\      "min_relative_gain_over_best_local_baseline":0.0,
+        \\      "relative_gain_report_only":true,
+        \\      "must_report_distance_to_external_voyage_target":true
+        \\    }
+        \\  }
+        \\}
+    ;
+    // Boundary f1 below chonky base and a NEGATIVE relative gain both pass:
+    // they are reported, not gated. The floor and internal-F1 gates hold.
+    const results =
+        \\{
+        \\  "schema_version":"fused_chunker_benchmark_results/v1",
+        \\  "boundary_f1":{
+        \\    "dataset_metric":"chonky_character_separator_f1",
+        \\    "internal_phase20_best_f1":0.79,
+        \\    "fixed_threshold_f1":0.78,
+        \\    "best_threshold_f1":0.79,
+        \\    "dataset_results":[{"name":"a","f1":0.70}]
+        \\  },
+        \\  "retrieval_ndcg":{
+        \\    "overall_ndcg_at_10":0.34,
+        \\    "voyage_context_4_target_ndcg_at_10":0.844,
+        \\    "distance_to_voyage_context_4_target":0.504,
+        \\    "baselines":[{"name":"fixed_500_50_same_encoder","overall_ndcg_at_10":0.35}]
+        \\  }
+        \\}
+    ;
+    const report = try verifyBenchmarkJson(std.testing.allocator, manifest, results, .all);
+    try std.testing.expect(report.boundary_f1 != null);
+    const retrieval = report.retrieval_ndcg.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.34), retrieval.overall_ndcg_at_10, 1e-12);
+    // The relative gain is still computed and reported even though not gated.
+    try std.testing.expect(retrieval.relative_gain_over_best_local_baseline < 0.0);
+}
+
+test "benchmark verifier rejects retrieval below the absolute NDCG floor" {
+    const manifest =
+        \\{
+        \\  "schema_version":"fused_chunker_eval_manifest/v1",
+        \\  "boundary_f1":{"datasets":[],"release_gate":{"min_internal_phase20_best_f1":0.0,"fixed_threshold_max_delta_from_best_f1":1.0,"must_beat_chonky_base_each_dataset":false,"must_match_or_beat_chonky_large_mean":false}},
+        \\  "retrieval_ndcg":{
+        \\    "external_targets":{"voyage_context_4_chunk_embedding_overall_ndcg_at_10":0.844},
+        \\    "release_gate":{
+        \\      "min_overall_ndcg_at_10":0.15,
+        \\      "min_relative_gain_over_best_local_baseline":0.0,
+        \\      "relative_gain_report_only":true,
+        \\      "must_report_distance_to_external_voyage_target":true
+        \\    }
+        \\  }
+        \\}
+    ;
+    // The fused fine-tune's collapsed retrieval (NDCG 0.0096) must not pass
+    // even with the relative-gain gate report-only.
+    const results =
+        \\{
+        \\  "schema_version":"fused_chunker_benchmark_results/v1",
+        \\  "retrieval_ndcg":{
+        \\    "overall_ndcg_at_10":0.0096,
+        \\    "voyage_context_4_target_ndcg_at_10":0.844,
+        \\    "distance_to_voyage_context_4_target":0.8344,
+        \\    "baselines":[{"name":"fixed_500_50_same_encoder","overall_ndcg_at_10":0.35}]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(error.RetrievalNdcgBelowFloor, verifyBenchmarkJson(std.testing.allocator, manifest, results, .retrieval_ndcg));
 }

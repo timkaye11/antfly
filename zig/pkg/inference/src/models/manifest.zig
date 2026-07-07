@@ -164,6 +164,15 @@ pub const ModelManifest = struct {
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
     embedding_text_prefix: []const u8 = "",
+    /// Retrieval prefixes for prefix-conditioned text embedders (e.g. nomic
+    /// models expect "search_document: " on documents and "search_query: " on
+    /// queries). Parsed from model_manifest.json:
+    ///   "embedding_prefixes": {"document": "search_document: ", "query": "search_query: "}
+    /// Unlike embedding_text_prefix (applied unconditionally inside the
+    /// embedding pipeline), these are applied by callers that know whether a
+    /// text is a document or a query (e.g. /chunk split-encoder embedding).
+    embedding_document_prefix: []const u8 = "",
+    embedding_query_prefix: []const u8 = "",
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
 
@@ -232,6 +241,8 @@ pub const ModelManifest = struct {
         }
         if (self.chat_template) |t| self.allocator.free(t);
         if (self.embedding_text_prefix.len > 0) self.allocator.free(self.embedding_text_prefix);
+        if (self.embedding_document_prefix.len > 0) self.allocator.free(self.embedding_document_prefix);
+        if (self.embedding_query_prefix.len > 0) self.allocator.free(self.embedding_query_prefix);
         if (self.gliner_model_type.len > 0) self.allocator.free(self.gliner_model_type);
         if (self.config_model_arch.len > 0) self.allocator.free(self.config_model_arch);
         if (self.gliner_default_labels.len > 0) {
@@ -1270,6 +1281,24 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     } else if (obj.get("sparse_output_layout")) |v| {
         if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
     }
+
+    // Retrieval prefixes for prefix-conditioned embedders (e.g. nomic).
+    if (obj.get("embedding_prefixes")) |v| {
+        if (v == .object) {
+            if (v.object.get("document")) |doc| {
+                if (doc == .string and doc.string.len > 0) {
+                    if (manifest.embedding_document_prefix.len > 0) allocator.free(manifest.embedding_document_prefix);
+                    manifest.embedding_document_prefix = allocator.dupe(u8, doc.string) catch "";
+                }
+            }
+            if (v.object.get("query")) |q| {
+                if (q == .string and q.string.len > 0) {
+                    if (manifest.embedding_query_prefix.len > 0) allocator.free(manifest.embedding_query_prefix);
+                    manifest.embedding_query_prefix = allocator.dupe(u8, q.string) catch "";
+                }
+            }
+        }
+    }
 }
 
 fn parseSparse3DOutputLayout(value: []const u8) ?Sparse3DOutputLayout {
@@ -1778,6 +1807,27 @@ test "parseModelManifestJson parses inputs array" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expectEqual(Sparse3DOutputLayout.seq_batch, manifest.sparse_3d_output_layout.?);
+}
+
+test "parseModelManifestJson parses nomic-style embedding prefixes" {
+    var manifest = ModelManifest{ .allocator = std.testing.allocator };
+    defer manifest.deinit();
+
+    try parseModelManifestJson(&manifest, std.testing.allocator,
+        \\{"type":"embedder","embedding_prefixes":{"document":"search_document: ","query":"search_query: "}}
+    );
+
+    try std.testing.expectEqualStrings("search_document: ", manifest.embedding_document_prefix);
+    try std.testing.expectEqualStrings("search_query: ", manifest.embedding_query_prefix);
+
+    // Absent knob leaves both prefixes empty.
+    var plain = ModelManifest{ .allocator = std.testing.allocator };
+    defer plain.deinit();
+    try parseModelManifestJson(&plain, std.testing.allocator,
+        \\{"type":"embedder"}
+    );
+    try std.testing.expectEqualStrings("", plain.embedding_document_prefix);
+    try std.testing.expectEqualStrings("", plain.embedding_query_prefix);
 }
 
 fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
