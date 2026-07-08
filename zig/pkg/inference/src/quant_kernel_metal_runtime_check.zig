@@ -4673,15 +4673,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(stale_slow_fallback_summary);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_slow_fallback_summary, false, true, null));
 
-    var promoted_artifact = quant_kernel_compiler.first_generated_artifacts[1];
-    promoted_artifact.source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal";
-    const promoted_check_command = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "xcrun --toolchain Metal metal -c {s} -o {s}",
-        .{ promoted_artifact.source_path, quant_kernel_compiler.first_lazy_metal_air_path },
-    );
-    defer std.testing.allocator.free(promoted_check_command);
-    promoted_artifact.check_command = promoted_check_command;
+    const promoted_artifact = quant_kernel_compiler.first_generated_artifacts[1];
     const cases_value = parsed.value.object.get("cases").?;
     var found_promoted_artifact_case = false;
     for (cases_value.array.items) |case_value| {

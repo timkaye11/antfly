@@ -20,7 +20,7 @@ The dispatch-facing API is still the existing graph planning contract:
 - `src/backends/metal_kernels.m`: native Metal runtime and provider lowering.
 
 Production Metal compiles the inline kernel copies embedded in
-`metal_kernels.m`, not the checked-in generated/artifact `.metal` files. Some
+`metal_kernels.m`, not the checked-in generated `.metal` files. Some
 inline copies are deliberately tuned differently from the canonical compiler
 source (for example two-column launch schedules); runtime-route correctness and
 promotion timing evidence are measured against the inline copies, while the
@@ -34,24 +34,22 @@ the inline copies from the compiler is the intended follow-up.
 
 Generated artifacts are checked in:
 
-- `src/ops/metal/generated/*.metal`: generated Metal candidates.
-- `src/ops/metal/artifacts/*.metal`: checked-in artifact copies for candidates
-  that have a runtime artifact path.
+- `src/ops/metal/generated/*.metal`: generated Metal candidates (promoted
+  kernels included; promotion is recorded in the manifest, not by a separate
+  file copy).
 - `src/ops/cuda/generated/quant_kernel_*.cu`: generated CUDA candidates.
-- `src/ops/cuda/artifacts/quant_kernel_*.cu`: checked-in promoted copies of
-  generated CUDA kernels; the same kernels are embedded in the production
-  `inference_cuda_kernels.{cu,ptx,fatbin,_sm89.cubin}` bundle via
-  `scripts/regen-cuda-artifacts.sh`.
+  Promoted CUDA kernels are additionally embedded in the production
+  `src/ops/cuda/artifacts/inference_cuda_kernels.{cu,ptx,fatbin,_sm89.cubin}`
+  bundle via `scripts/regen-cuda-artifacts.sh`.
 - `src/ops/cuda/generated/evidence/*.json`: checked-in CUDA promotion
   benchmark evidence.
 - `src/ops/cuda/generated/quant_kernel_*.json`: spec, artifact, benchmark, and
   conformance manifests. The path is historical; the manifests cover both CUDA
   and Metal.
 
-`zig build quant-kernel-codegen -- --check` verifies the primary source path,
-generated source sidecar path, and Metal artifact source path for every
-manifested artifact. Missing sidecars or artifact copies fail the codegen check
-instead of becoming a packaging surprise during review.
+`zig build quant-kernel-codegen -- --check` verifies the single generated
+source path for every manifested artifact. Stale or missing generated files
+fail the codegen check instead of becoming a packaging surprise during review.
 
 ## Compile Flow
 
@@ -59,12 +57,12 @@ The internal compile API is intentionally small. Callers build or look up a
 `QuantKernelCompileRequest`, then use `compileQuantKernelSource(...)` or the
 Metal convenience wrapper `compileMetalKernelSource(format, row_bucket,
 epilogue)`. The result ties together the descriptor, IR, route lowering,
-generated artifact metadata, canonical source text, check command, artifact
+generated artifact metadata, canonical source text, check command, source
 path, and runtime gate.
 
 `compileQuantKernelSource(...)` is also a guardrail. Before returning a compiled
 source record, it verifies that the descriptor, IR, route lowering, generated
-artifact, canonical source text, generated/artifact paths, check command,
+artifact, canonical source text, source path, check command,
 production bit, and Metal runtime gate all describe the same route. Drift returns
 `null` and fails the codegen path instead of emitting an orphan kernel.
 
@@ -77,7 +75,7 @@ const emitted = try quant_kernel_compiler.emitCompiledSource(allocator, compiled
 defer emitted.deinit(allocator);
 
 // emitted.data is the canonical generated source text.
-// compiled.source_path, artifact_source_path, check_command, runtime_gate_env,
+// compiled.source_path, check_command, runtime_gate_env,
 // and production_enabled describe how that source is checked and routed.
 ```
 
@@ -149,8 +147,7 @@ one non-Metal borrowed-source case so the fallback path remains covered.
 Generated kernels start as dev candidates. A candidate may become production
 only when all of these are true:
 
-- Generated source and checked-in artifact source match the manifest
-  fingerprint.
+- Checked-in generated source matches the manifest fingerprint.
 - Runtime route evidence proves the generated route is actually selected.
 - Provider route evidence exists when the provider surface exposes the same
   candidate.

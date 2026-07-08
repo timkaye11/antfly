@@ -80,30 +80,6 @@ fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
         };
         index += 1;
     }
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
-        if (artifact.generated_source_path.len != 0 and !std.mem.eql(u8, artifact.generated_source_path, artifact.source_path)) {
-            const source = try compiledSourceForArtifact(allocator, artifact);
-            files[index] = .{
-                .path = artifact.generated_source_path,
-                .data = source.data,
-                .owned = source.owned,
-            };
-            index += 1;
-        }
-        if (artifact.backend == .metal) {
-            if (quant_kernel_compiler.metalArtifactSourcePathForKernel(artifact.kernel_id)) |artifact_source_path| {
-                if (!std.mem.eql(u8, artifact_source_path, artifact.source_path) and !std.mem.eql(u8, artifact_source_path, artifact.generated_source_path)) {
-                    const source = try compiledSourceForArtifact(allocator, artifact);
-                    files[index] = .{
-                        .path = artifact_source_path,
-                        .data = source.data,
-                        .owned = source.owned,
-                    };
-                    index += 1;
-                }
-            }
-        }
-    }
     if (index != source_count) return error.GeneratedQuantKernelSourceCountMismatch;
     var manifest_index = index;
     files[manifest_index] = .{
@@ -154,16 +130,7 @@ fn compiledSourceForArtifact(
 }
 
 fn generatedSourceFileCount() usize {
-    var count = quant_kernel_compiler.first_generated_artifacts.len;
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
-        if (artifact.generated_source_path.len != 0 and !std.mem.eql(u8, artifact.generated_source_path, artifact.source_path)) count += 1;
-        if (artifact.backend == .metal) {
-            if (quant_kernel_compiler.metalArtifactSourcePathForKernel(artifact.kernel_id)) |artifact_source_path| {
-                if (!std.mem.eql(u8, artifact_source_path, artifact.source_path) and !std.mem.eql(u8, artifact_source_path, artifact.generated_source_path)) count += 1;
-            }
-        }
-    }
-    return count;
+    return quant_kernel_compiler.first_generated_artifacts.len;
 }
 
 fn freeGeneratedFiles(allocator: std.mem.Allocator, files: []GeneratedFile) void {
@@ -276,13 +243,6 @@ fn metalCheckOutputPath(command: []const u8) ?[]const u8 {
     return null;
 }
 
-fn generatedFilePathExists(sources: []const GeneratedFile, path: []const u8) bool {
-    for (sources) |source| {
-        if (std.mem.eql(u8, source.path, path)) return true;
-    }
-    return false;
-}
-
 test "quant kernel codegen defaults to check mode" {
     try std.testing.expectEqual(Mode.check, try parseMode(&.{}));
     try std.testing.expectEqual(Mode.check, try parseMode(&.{"--check"}));
@@ -338,11 +298,11 @@ test "quant kernel codegen sources map to compiler artifacts" {
     const checked_in_metal_evidence_count = try std.fmt.allocPrint(std.testing.allocator, "\"checked_in_metal_evidence_count\": {d}", .{quant_kernel_compiler.first_metal_runtime_evidence_count});
     defer std.testing.allocator.free(checked_in_metal_evidence_count);
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, checked_in_metal_evidence_count));
-    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q4_artifact_source_path));
-    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q8_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q4_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q8_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q8_bias_source_path));
-    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q5_artifact_source_path));
-    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q6_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q5_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_general_metal_q6_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_lazy_benchmark.benchmark_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_lazy_benchmark_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, metal_evidence_count, quant_kernel_compiler.first_metal_runtime_evidence_command));
@@ -363,7 +323,9 @@ test "quant kernel codegen sources map to compiler artifacts" {
     const benchmark_manifest = sources[sources.len - 2];
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_benchmark_manifest_path, benchmark_manifest.path);
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_benchmark_manifest_schema));
-    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"benchmark_count\": 1"));
+    const benchmark_count = try std.fmt.allocPrint(std.testing.allocator, "\"benchmark_count\": {d}", .{quant_kernel_compiler.first_benchmarks.len});
+    defer std.testing.allocator.free(benchmark_count);
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, benchmark_count));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"metal_promotion_warmup_repeat_runs\": 2"));
     const metal_production_regression_case_count = try std.fmt.allocPrint(std.testing.allocator, "\"metal_production_regression_expected_case_count\": {d}", .{quant_kernel_compiler.first_metal_production_regression_expected_case_count});
     defer std.testing.allocator.free(metal_production_regression_case_count);
@@ -372,8 +334,8 @@ test "quant kernel codegen sources map to compiler artifacts" {
     defer std.testing.allocator.free(metal_production_regression_case_fingerprint);
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, metal_production_regression_case_fingerprint));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"metal_production_regression_cases\": ["));
-    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"name\": \"q6_k_rows_8_cols_7_bias_gelu\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"production_kernel_id\": \"antfly_q6_k_small_batch_bias_gelu_msl_v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"name\": \"q6_k_rows_8_cols_7_bias\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, "\"production_kernel_id\": \"antfly_q6_k_small_batch_bias_msl_v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_metal_production_regression_build_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_metal_production_regression_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, benchmark_manifest.data, 1, quant_kernel_compiler.first_lazy_benchmark.generated_kernel_id));
@@ -385,38 +347,6 @@ test "quant kernel codegen sources map to compiler artifacts" {
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"format\": \"q4_k\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"cuda_fallback_reason\": \"generated_artifact_missing\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"metal_fallback_reason\": \"generated_artifact_missing\""));
-}
-
-test "quant kernel codegen includes generated and artifact sidecar paths" {
-    const sources = try generatedFiles(std.testing.allocator);
-    defer freeGeneratedFiles(std.testing.allocator, sources);
-
-    var generated_sidecar_count: usize = 0;
-    var metal_artifact_path_count: usize = 0;
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
-        try std.testing.expect(generatedFilePathExists(sources, artifact.source_path));
-        const primary_path = try existingSourcePath(std.testing.allocator, std.testing.io, artifact.source_path);
-        defer if (primary_path.owned) std.testing.allocator.free(primary_path.value);
-
-        if (artifact.generated_source_path.len != 0) {
-            generated_sidecar_count += 1;
-            try std.testing.expect(generatedFilePathExists(sources, artifact.generated_source_path));
-            const generated_path = try existingSourcePath(std.testing.allocator, std.testing.io, artifact.generated_source_path);
-            defer if (generated_path.owned) std.testing.allocator.free(generated_path.value);
-        }
-
-        if (artifact.backend == .metal) {
-            if (quant_kernel_compiler.metalArtifactSourcePathForKernel(artifact.kernel_id)) |artifact_source_path| {
-                metal_artifact_path_count += 1;
-                try std.testing.expect(generatedFilePathExists(sources, artifact_source_path));
-                const artifact_path = try existingSourcePath(std.testing.allocator, std.testing.io, artifact_source_path);
-                defer if (artifact_path.owned) std.testing.allocator.free(artifact_path.value);
-            }
-        }
-    }
-
-    try std.testing.expect(generated_sidecar_count > 0);
-    try std.testing.expect(metal_artifact_path_count > 0);
 }
 
 test "quant kernel codegen resolves package-root source paths" {

@@ -325,7 +325,6 @@ const BenchmarkEvidence = struct {
 const MetalRuntimeEvidence = struct {
     kernel_id: []const u8,
     source_path: []const u8,
-    artifact_source_path: []const u8,
     source_fingerprint: u64,
     check_command: []const u8,
     runtime_evidence_command: []const u8,
@@ -465,11 +464,8 @@ const ArtifactManifestRecord = struct {
     epilogue: []const u8,
     kernel_id: []const u8,
     source_path: []const u8,
-    generated_source_path: []const u8,
-    artifact_source_path: []const u8,
     generated_source_fingerprint: u64,
     check_command: []const u8,
-    generated_check_command: []const u8,
     runtime_evidence_command: []const u8,
     runtime_route_evidence_command: []const u8,
     promotion_evidence_command: []const u8,
@@ -572,8 +568,6 @@ pub const GeneratedArtifact = struct {
     kernel_id: []const u8,
     source_path: []const u8,
     check_command: []const u8,
-    generated_source_path: []const u8 = "",
-    generated_check_command: []const u8 = "",
     runtime_evidence_command: []const u8 = "",
     promotion_evidence_command: []const u8 = "",
     promotion_check_command: []const u8 = "",
@@ -595,7 +589,6 @@ pub const QuantKernelCompiledSource = struct {
     artifact: GeneratedArtifact,
     source: []const u8,
     source_path: []const u8,
-    artifact_source_path: []const u8,
     check_command: []const u8,
     runtime_gate_env: ?[*:0]const u8,
     production_enabled: bool,
@@ -1469,10 +1462,10 @@ pub const first_q4_0_mmv_benchmark = BenchmarkCase{
     .row_bucket = .rows_1,
     .epilogue = .none,
     .generated_kernel_id = first_general_cuda_q4_0_mmv_kernel_id,
-    .generated_source_path = first_general_cuda_q4_0_mmv_artifact_source_path,
+    .generated_source_path = first_general_cuda_q4_0_mmv_source_path,
     .generated_source_fingerprint = first_general_cuda_q4_0_mmv_source_fingerprint,
     .generated_ptx_path = first_general_cuda_q4_0_mmv_ptx_path,
-    .generated_ptx_command = first_general_cuda_q4_0_mmv_artifact_check_command,
+    .generated_ptx_command = first_general_cuda_q4_0_mmv_check_command,
     .benchmark_command = first_general_cuda_q4_0_mmv_benchmark_command,
     .generated_ptx_arg = "--quant-compiler-q4-0-mmv-ptx",
     .handwritten_baseline = "termite_linear_q4_0_f32_tile4",
@@ -1491,10 +1484,10 @@ pub const first_q4_0_mm_benchmark = BenchmarkCase{
     .row_bucket = .rows_9_64,
     .epilogue = .none,
     .generated_kernel_id = first_general_cuda_q4_0_mm_kernel_id,
-    .generated_source_path = first_general_cuda_q4_0_mm_artifact_source_path,
+    .generated_source_path = first_general_cuda_q4_0_mm_source_path,
     .generated_source_fingerprint = first_general_cuda_q4_0_mm_source_fingerprint,
     .generated_ptx_path = first_general_cuda_q4_0_mm_ptx_path,
-    .generated_ptx_command = first_general_cuda_q4_0_mm_artifact_check_command,
+    .generated_ptx_command = first_general_cuda_q4_0_mm_check_command,
     .benchmark_command = first_general_cuda_q4_0_mm_benchmark_command,
     .generated_ptx_arg = "--quant-compiler-q4-0-mm-ptx",
     .handwritten_baseline = "termite_linear_q4_0_f32",
@@ -1515,10 +1508,10 @@ pub const first_q4_0_pair_benchmark = BenchmarkCase{
     .row_bucket = .rows_1,
     .epilogue = .pair,
     .generated_kernel_id = first_general_cuda_q4_0_pair_kernel_id,
-    .generated_source_path = first_general_cuda_q4_0_pair_artifact_source_path,
+    .generated_source_path = first_general_cuda_q4_0_pair_source_path,
     .generated_source_fingerprint = first_general_cuda_q4_0_pair_source_fingerprint,
     .generated_ptx_path = first_general_cuda_q4_0_pair_ptx_path,
-    .generated_ptx_command = first_general_cuda_q4_0_pair_artifact_check_command,
+    .generated_ptx_command = first_general_cuda_q4_0_pair_check_command,
     .benchmark_command = first_general_cuda_q4_0_pair_benchmark_command,
     .generated_ptx_arg = "--quant-compiler-q4-0-pair-ptx",
     .handwritten_baseline = "termite_linear_q4_0_pair_nobias_f32_tile4_w4",
@@ -1540,10 +1533,10 @@ pub const first_q4_0_pair_q8_benchmark = BenchmarkCase{
     .row_bucket = .rows_1,
     .epilogue = .pair_activation,
     .generated_kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
-    .generated_source_path = first_general_cuda_q4_0_pair_q8_artifact_source_path,
+    .generated_source_path = first_general_cuda_q4_0_pair_q8_source_path,
     .generated_source_fingerprint = first_general_cuda_q4_0_pair_q8_source_fingerprint,
     .generated_ptx_path = first_general_cuda_q4_0_pair_q8_ptx_path,
-    .generated_ptx_command = first_general_cuda_q4_0_pair_q8_artifact_check_command,
+    .generated_ptx_command = first_general_cuda_q4_0_pair_q8_check_command,
     .benchmark_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
     .generated_ptx_arg = "--quant-compiler-q4-0-pair-q8-ptx",
     .handwritten_baseline = "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn",
@@ -1562,10 +1555,10 @@ pub const first_q4_0_down_q8_benchmark = BenchmarkCase{
     .row_bucket = .rows_1,
     .epilogue = .gated_down,
     .generated_kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
-    .generated_source_path = first_general_cuda_q4_0_down_q8_artifact_source_path,
+    .generated_source_path = first_general_cuda_q4_0_down_q8_source_path,
     .generated_source_fingerprint = first_general_cuda_q4_0_down_q8_source_fingerprint,
     .generated_ptx_path = first_general_cuda_q4_0_down_q8_ptx_path,
-    .generated_ptx_command = first_general_cuda_q4_0_down_q8_artifact_check_command,
+    .generated_ptx_command = first_general_cuda_q4_0_down_q8_check_command,
     .benchmark_command = first_general_cuda_q4_0_down_q8_benchmark_command,
     .generated_ptx_arg = "--quant-compiler-q4-0-down-q8-ptx",
     .handwritten_baseline = "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down",
@@ -1584,10 +1577,10 @@ pub const first_benchmarks = [_]BenchmarkCase{ first_lazy_benchmark, first_q4_0_
 const first_benchmark_evidence = [_]BenchmarkEvidence{
     .{
         .kernel_id = first_general_cuda_q4_0_mmv_kernel_id,
-        .generated_source_path = first_general_cuda_q4_0_mmv_artifact_source_path,
+        .generated_source_path = first_general_cuda_q4_0_mmv_source_path,
         .generated_source_fingerprint = first_general_cuda_q4_0_mmv_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_mmv_ptx_path,
-        .generated_ptx_command = first_general_cuda_q4_0_mmv_artifact_check_command,
+        .generated_ptx_command = first_general_cuda_q4_0_mmv_check_command,
         .benchmark_command = first_general_cuda_q4_0_mmv_benchmark_command,
         .correctness_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
@@ -1599,10 +1592,10 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
     },
     .{
         .kernel_id = first_general_cuda_q4_0_mm_kernel_id,
-        .generated_source_path = first_general_cuda_q4_0_mm_artifact_source_path,
+        .generated_source_path = first_general_cuda_q4_0_mm_source_path,
         .generated_source_fingerprint = first_general_cuda_q4_0_mm_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_mm_ptx_path,
-        .generated_ptx_command = first_general_cuda_q4_0_mm_artifact_check_command,
+        .generated_ptx_command = first_general_cuda_q4_0_mm_check_command,
         .benchmark_command = first_general_cuda_q4_0_mm_benchmark_command,
         .correctness_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
@@ -1614,10 +1607,10 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
     },
     .{
         .kernel_id = first_general_cuda_q4_0_pair_kernel_id,
-        .generated_source_path = first_general_cuda_q4_0_pair_artifact_source_path,
+        .generated_source_path = first_general_cuda_q4_0_pair_source_path,
         .generated_source_fingerprint = first_general_cuda_q4_0_pair_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_pair_ptx_path,
-        .generated_ptx_command = first_general_cuda_q4_0_pair_artifact_check_command,
+        .generated_ptx_command = first_general_cuda_q4_0_pair_check_command,
         .benchmark_command = first_general_cuda_q4_0_pair_benchmark_command,
         .correctness_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
@@ -1629,10 +1622,10 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
     },
     .{
         .kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
-        .generated_source_path = first_general_cuda_q4_0_pair_q8_artifact_source_path,
+        .generated_source_path = first_general_cuda_q4_0_pair_q8_source_path,
         .generated_source_fingerprint = first_general_cuda_q4_0_pair_q8_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_pair_q8_ptx_path,
-        .generated_ptx_command = first_general_cuda_q4_0_pair_q8_artifact_check_command,
+        .generated_ptx_command = first_general_cuda_q4_0_pair_q8_check_command,
         .benchmark_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
         .correctness_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
@@ -1644,10 +1637,10 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
     },
     .{
         .kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
-        .generated_source_path = first_general_cuda_q4_0_down_q8_artifact_source_path,
+        .generated_source_path = first_general_cuda_q4_0_down_q8_source_path,
         .generated_source_fingerprint = first_general_cuda_q4_0_down_q8_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_down_q8_ptx_path,
-        .generated_ptx_command = first_general_cuda_q4_0_down_q8_artifact_check_command,
+        .generated_ptx_command = first_general_cuda_q4_0_down_q8_check_command,
         .benchmark_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .correctness_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
@@ -1662,7 +1655,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q2_kernel_id,
         .source_path = first_general_metal_q2_source_path,
-        .artifact_source_path = first_general_metal_q2_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q2_source),
         .check_command = first_general_metal_q2_check_command,
         .runtime_evidence_command = first_general_metal_q2_promotion_evidence_command,
@@ -1680,7 +1672,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q3_kernel_id,
         .source_path = first_general_metal_q3_source_path,
-        .artifact_source_path = first_general_metal_q3_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q3_source),
         .check_command = first_general_metal_q3_check_command,
         .runtime_evidence_command = first_general_metal_q3_promotion_evidence_command,
@@ -1698,7 +1689,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q5_bias_kernel_id,
         .source_path = first_general_metal_q5_bias_source_path,
-        .artifact_source_path = first_general_metal_q5_bias_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q5_bias_source),
         .check_command = first_general_metal_q5_bias_check_command,
         .runtime_evidence_command = first_general_metal_q5_bias_promotion_evidence_command,
@@ -1716,7 +1706,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q6_bias_kernel_id,
         .source_path = first_general_metal_q6_bias_source_path,
-        .artifact_source_path = first_general_metal_q6_bias_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q6_bias_source),
         .check_command = first_general_metal_q6_bias_check_command,
         .runtime_evidence_command = first_general_metal_q6_bias_promotion_evidence_command,
@@ -1734,7 +1723,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q6_kernel_id,
         .source_path = first_general_metal_q6_source_path,
-        .artifact_source_path = first_general_metal_q6_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q6_source),
         .check_command = first_general_metal_q6_check_command,
         .runtime_evidence_command = first_general_metal_q6_promotion_evidence_command,
@@ -1752,7 +1740,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q4_bias_kernel_id,
         .source_path = first_general_metal_q4_bias_source_path,
-        .artifact_source_path = first_general_metal_q4_bias_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q4_bias_source),
         .check_command = first_general_metal_q4_bias_check_command,
         .runtime_evidence_command = first_general_metal_q4_bias_promotion_evidence_command,
@@ -1770,7 +1757,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q8_kernel_id,
         .source_path = first_general_metal_q8_source_path,
-        .artifact_source_path = first_general_metal_q8_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q8_source),
         .check_command = first_general_metal_q8_check_command,
         .runtime_evidence_command = first_general_metal_q8_promotion_evidence_command,
@@ -1788,7 +1774,6 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
         .kernel_id = first_general_metal_q8_bias_kernel_id,
         .source_path = first_general_metal_q8_bias_source_path,
-        .artifact_source_path = first_general_metal_q8_bias_artifact_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q8_bias_source),
         .check_command = first_general_metal_q8_bias_check_command,
         .runtime_evidence_command = first_general_metal_q8_bias_promotion_evidence_command,
@@ -1832,8 +1817,8 @@ pub const first_metal_promotion_blocker_evidence_expected_case_count = metalProm
 pub const first_metal_promotion_blocker_evidence_expected_route_ready_count = first_metal_promotion_blocker_evidence_expected_case_count;
 pub const first_metal_production_benchmark_cases = buildMetalProductionBenchmarkCases();
 pub const first_metal_production_benchmark_case_count = first_metal_production_benchmark_cases.len;
-pub const first_artifact_manifest_schema = "antfly.quant_kernel_artifacts.v2";
-pub const first_benchmark_manifest_schema = "antfly.quant_kernel_benchmarks.v4";
+pub const first_artifact_manifest_schema = "antfly.quant_kernel_artifacts.v3";
+pub const first_benchmark_manifest_schema = "antfly.quant_kernel_benchmarks.v5";
 pub const first_lazy_benchmark_check_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-check-evidence " ++ first_lazy_benchmark_evidence_path ++ " --quant-compiler-require-promotion-ready";
 pub const first_spec_manifest_path = "src/ops/cuda/generated/quant_kernel_specs.json";
 pub const first_artifact_manifest_path = "src/ops/cuda/generated/quant_kernel_artifacts.json";
@@ -1842,83 +1827,58 @@ pub const first_conformance_manifest_path = "src/ops/cuda/generated/quant_kernel
 
 pub const first_general_cuda_q4_0_mmv_kernel_id = "antfly_q4_0_mmv_f32_v1";
 pub const first_general_cuda_q4_0_mmv_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_mmv.cu";
-pub const first_general_cuda_q4_0_mmv_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_mmv.cu";
 pub const first_general_cuda_q4_0_mmv_ptx_path = "/tmp/antfly_q4_0_mmv_f32_v1.ptx";
-pub const first_general_cuda_q4_0_mmv_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mmv_source_path ++ " -o /tmp/antfly_q4_0_mmv_f32_v1_dev.ptx";
-pub const first_general_cuda_q4_0_mmv_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mmv_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_mmv_ptx_path;
+pub const first_general_cuda_q4_0_mmv_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mmv_source_path ++ " -o " ++ first_general_cuda_q4_0_mmv_ptx_path;
 pub const first_general_cuda_q4_0_mmv_evidence_path = "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json";
 pub const first_general_cuda_q4_0_mmv_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mmv-ptx " ++ first_general_cuda_q4_0_mmv_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mmv_evidence_path;
 pub const first_general_cuda_q4_0_mm_kernel_id = "antfly_q4_0_mm_f32_v1";
 pub const first_general_cuda_q4_0_mm_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_mm.cu";
-pub const first_general_cuda_q4_0_mm_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_mm.cu";
 pub const first_general_cuda_q4_0_mm_ptx_path = "/tmp/antfly_q4_0_mm_f32_v1.ptx";
-pub const first_general_cuda_q4_0_mm_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mm_source_path ++ " -o /tmp/antfly_q4_0_mm_f32_v1_dev.ptx";
-pub const first_general_cuda_q4_0_mm_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mm_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_mm_ptx_path;
+pub const first_general_cuda_q4_0_mm_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mm_source_path ++ " -o " ++ first_general_cuda_q4_0_mm_ptx_path;
 pub const first_general_cuda_q4_0_mm_evidence_path = "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json";
 pub const first_general_cuda_q4_0_mm_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mm-ptx " ++ first_general_cuda_q4_0_mm_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mm_evidence_path;
 pub const first_general_cuda_q4_0_pair_kernel_id = "antfly_q4_0_pair_mmv_f32_v1";
 pub const first_general_cuda_q4_0_pair_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_mmv.cu";
-pub const first_general_cuda_q4_0_pair_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_pair_mmv.cu";
 pub const first_general_cuda_q4_0_pair_ptx_path = "/tmp/antfly_q4_0_pair_mmv_f32_v1.ptx";
-pub const first_general_cuda_q4_0_pair_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_source_path ++ " -o /tmp/antfly_q4_0_pair_mmv_f32_v1_dev.ptx";
-pub const first_general_cuda_q4_0_pair_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_ptx_path;
+pub const first_general_cuda_q4_0_pair_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_ptx_path;
 pub const first_general_cuda_q4_0_pair_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json";
 pub const first_general_cuda_q4_0_pair_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-ptx " ++ first_general_cuda_q4_0_pair_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_evidence_path;
 pub const first_general_cuda_q4_0_pair_q8_kernel_id = "antfly_q4_0_pair_activation_q8_1_mmv_v1";
 pub const first_general_cuda_q4_0_pair_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1.cu";
-pub const first_general_cuda_q4_0_pair_q8_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_pair_activation_q8_1.cu";
 pub const first_general_cuda_q4_0_pair_q8_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1.ptx";
-pub const first_general_cuda_q4_0_pair_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_q8_source_path ++ " -o /tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1_dev.ptx";
-pub const first_general_cuda_q4_0_pair_q8_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_q8_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_q8_ptx_path;
+pub const first_general_cuda_q4_0_pair_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_q8_ptx_path;
 pub const first_general_cuda_q4_0_pair_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json";
 pub const first_general_cuda_q4_0_pair_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-q8-ptx " ++ first_general_cuda_q4_0_pair_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_q8_evidence_path;
 pub const first_general_cuda_q4_0_down_q8_kernel_id = "antfly_q4_0_down_q8_1_mmv_v1";
 pub const first_general_cuda_q4_0_down_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1.cu";
-pub const first_general_cuda_q4_0_down_q8_artifact_source_path = "src/ops/cuda/artifacts/quant_kernel_q4_0_down_q8_1.cu";
 pub const first_general_cuda_q4_0_down_q8_ptx_path = "/tmp/antfly_q4_0_down_q8_1_mmv_v1.ptx";
-pub const first_general_cuda_q4_0_down_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_down_q8_source_path ++ " -o /tmp/antfly_q4_0_down_q8_1_mmv_v1_dev.ptx";
-pub const first_general_cuda_q4_0_down_q8_artifact_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_down_q8_artifact_source_path ++ " -o " ++ first_general_cuda_q4_0_down_q8_ptx_path;
+pub const first_general_cuda_q4_0_down_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_down_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_down_q8_ptx_path;
 pub const first_general_cuda_q4_0_down_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json";
 pub const first_general_cuda_q4_0_down_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-down-q8-ptx " ++ first_general_cuda_q4_0_down_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_down_q8_evidence_path;
 pub const first_lazy_metal_kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1";
 pub const first_lazy_metal_source_path = "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal";
-pub const first_lazy_metal_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal";
 pub const first_lazy_metal_air_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1.air";
-pub const first_lazy_metal_artifact_air_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_lazy_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal -o /tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1.air";
-pub const first_lazy_metal_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal -o /tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_general_metal_q4_0_kernel_id = "antfly_q4_0_small_batch_msl_v1";
 pub const first_general_metal_q4_0_source_path = "src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal";
 pub const first_general_metal_q4_0_air_path = "/tmp/antfly_q4_0_small_batch_msl_v1.air";
 pub const first_general_metal_q4_0_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal -o /tmp/antfly_q4_0_small_batch_msl_v1.air";
 pub const first_general_metal_q4_1_kernel_id = "antfly_q4_1_small_batch_msl_v1";
 pub const first_general_metal_q4_1_source_path = "src/ops/metal/generated/quant_kernel_q4_1_small_batch.metal";
-pub const first_general_metal_q4_1_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q4_1_small_batch.metal";
 pub const first_general_metal_q4_1_air_path = "/tmp/antfly_q4_1_small_batch_msl_v1.air";
-pub const first_general_metal_q4_1_artifact_air_path = "/tmp/antfly_q4_1_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q4_1_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_1_small_batch.metal -o /tmp/antfly_q4_1_small_batch_msl_v1.air";
-pub const first_general_metal_q4_1_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q4_1_small_batch.metal -o /tmp/antfly_q4_1_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_0_kernel_id = "antfly_q5_0_small_batch_msl_v1";
 pub const first_general_metal_q5_0_source_path = "src/ops/metal/generated/quant_kernel_q5_0_small_batch.metal";
-pub const first_general_metal_q5_0_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q5_0_small_batch.metal";
 pub const first_general_metal_q5_0_air_path = "/tmp/antfly_q5_0_small_batch_msl_v1.air";
-pub const first_general_metal_q5_0_artifact_air_path = "/tmp/antfly_q5_0_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_0_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_0_small_batch.metal -o /tmp/antfly_q5_0_small_batch_msl_v1.air";
-pub const first_general_metal_q5_0_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q5_0_small_batch.metal -o /tmp/antfly_q5_0_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_1_kernel_id = "antfly_q5_1_small_batch_msl_v1";
 pub const first_general_metal_q5_1_source_path = "src/ops/metal/generated/quant_kernel_q5_1_small_batch.metal";
-pub const first_general_metal_q5_1_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q5_1_small_batch.metal";
 pub const first_general_metal_q5_1_air_path = "/tmp/antfly_q5_1_small_batch_msl_v1.air";
-pub const first_general_metal_q5_1_artifact_air_path = "/tmp/antfly_q5_1_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_1_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_1_small_batch.metal -o /tmp/antfly_q5_1_small_batch_msl_v1.air";
-pub const first_general_metal_q5_1_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q5_1_small_batch.metal -o /tmp/antfly_q5_1_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q2_kernel_id = "antfly_q2_k_small_batch_msl_v1";
 pub const first_general_metal_q2_source_path = "src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal";
-pub const first_general_metal_q2_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q2_k_small_batch.metal";
 pub const first_general_metal_q2_air_path = "/tmp/antfly_q2_k_small_batch_msl_v1.air";
-pub const first_general_metal_q2_artifact_air_path = "/tmp/antfly_q2_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q2_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1.air";
-pub const first_general_metal_q2_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q2_bias_kernel_id = "antfly_q2_k_small_batch_bias_msl_v1";
 pub const first_general_metal_q2_bias_source_path = "src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias.metal";
 pub const first_general_metal_q2_bias_air_path = "/tmp/antfly_q2_k_small_batch_bias_msl_v1.air";
@@ -1929,11 +1889,8 @@ pub const first_general_metal_q2_bias_gelu_air_path = "/tmp/antfly_q2_k_small_ba
 pub const first_general_metal_q2_bias_gelu_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias_gelu.metal -o /tmp/antfly_q2_k_small_batch_bias_gelu_msl_v1.air";
 pub const first_general_metal_q3_kernel_id = "antfly_q3_k_small_batch_msl_v1";
 pub const first_general_metal_q3_source_path = "src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal";
-pub const first_general_metal_q3_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q3_k_small_batch.metal";
 pub const first_general_metal_q3_air_path = "/tmp/antfly_q3_k_small_batch_msl_v1.air";
-pub const first_general_metal_q3_artifact_air_path = "/tmp/antfly_q3_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q3_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal -o /tmp/antfly_q3_k_small_batch_msl_v1.air";
-pub const first_general_metal_q3_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q3_k_small_batch.metal -o /tmp/antfly_q3_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q3_bias_kernel_id = "antfly_q3_k_small_batch_bias_msl_v1";
 pub const first_general_metal_q3_bias_source_path = "src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias.metal";
 pub const first_general_metal_q3_bias_air_path = "/tmp/antfly_q3_k_small_batch_bias_msl_v1.air";
@@ -1944,39 +1901,24 @@ pub const first_general_metal_q3_bias_gelu_air_path = "/tmp/antfly_q3_k_small_ba
 pub const first_general_metal_q3_bias_gelu_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias_gelu.metal -o /tmp/antfly_q3_k_small_batch_bias_gelu_msl_v1.air";
 pub const first_general_metal_q4_bias_kernel_id = "antfly_q4_k_small_batch_bias_msl_v1";
 pub const first_general_metal_q4_bias_source_path = "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal";
-pub const first_general_metal_q4_bias_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias.metal";
 pub const first_general_metal_q4_bias_air_path = "/tmp/antfly_q4_k_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q4_bias_artifact_air_path = "/tmp/antfly_q4_k_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q4_bias_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal -o /tmp/antfly_q4_k_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q4_bias_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias.metal -o /tmp/antfly_q4_k_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q4_kernel_id = "antfly_q4_k_small_batch_msl_v1";
 pub const first_general_metal_q4_source_path = "src/ops/metal/generated/quant_kernel_q4_k_small_batch.metal";
-pub const first_general_metal_q4_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch.metal";
 pub const first_general_metal_q4_air_path = "/tmp/antfly_q4_k_small_batch_msl_v1.air";
-pub const first_general_metal_q4_artifact_air_path = "/tmp/antfly_q4_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q4_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch.metal -o /tmp/antfly_q4_k_small_batch_msl_v1.air";
-pub const first_general_metal_q4_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q4_k_small_batch.metal -o /tmp/antfly_q4_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q8_kernel_id = "antfly_q8_0_small_batch_msl_v1";
 pub const first_general_metal_q8_source_path = "src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal";
-pub const first_general_metal_q8_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q8_0_small_batch.metal";
 pub const first_general_metal_q8_air_path = "/tmp/antfly_q8_0_small_batch_msl_v1.air";
-pub const first_general_metal_q8_artifact_air_path = "/tmp/antfly_q8_0_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q8_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal -o /tmp/antfly_q8_0_small_batch_msl_v1.air";
-pub const first_general_metal_q8_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q8_0_small_batch.metal -o /tmp/antfly_q8_0_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q8_bias_kernel_id = "antfly_q8_0_small_batch_bias_msl_v1";
 pub const first_general_metal_q8_bias_source_path = "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal";
-pub const first_general_metal_q8_bias_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q8_0_small_batch_bias.metal";
 pub const first_general_metal_q8_bias_air_path = "/tmp/antfly_q8_0_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q8_bias_artifact_air_path = "/tmp/antfly_q8_0_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q8_bias_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal -o /tmp/antfly_q8_0_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q8_bias_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q8_0_small_batch_bias.metal -o /tmp/antfly_q8_0_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q8_bias_gelu_kernel_id = "antfly_q8_0_small_batch_bias_gelu_msl_v1";
 pub const first_general_metal_q8_bias_gelu_source_path = "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias_gelu.metal";
-pub const first_general_metal_q8_bias_gelu_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q8_0_small_batch_bias_gelu.metal";
 pub const first_general_metal_q8_bias_gelu_air_path = "/tmp/antfly_q8_0_small_batch_bias_gelu_msl_v1.air";
-pub const first_general_metal_q8_bias_gelu_artifact_air_path = "/tmp/antfly_q8_0_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_general_metal_q8_bias_gelu_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias_gelu.metal -o /tmp/antfly_q8_0_small_batch_bias_gelu_msl_v1.air";
-pub const first_general_metal_q8_bias_gelu_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q8_0_small_batch_bias_gelu.metal -o /tmp/antfly_q8_0_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_general_metal_q8_bias_gelu_source_fingerprint = sourceFingerprint(first_general_metal_q8_bias_gelu_source);
 pub const first_general_metal_q8_relu_kernel_id = "antfly_q8_0_small_batch_relu_msl_v1";
 pub const first_general_metal_q8_relu_source_path = "src/ops/metal/generated/quant_kernel_q8_0_small_batch_relu.metal";
@@ -1984,60 +1926,36 @@ pub const first_general_metal_q8_relu_air_path = "/tmp/antfly_q8_0_small_batch_r
 pub const first_general_metal_q8_relu_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch_relu.metal -o /tmp/antfly_q8_0_small_batch_relu_msl_v1.air";
 pub const first_general_metal_q8_1_kernel_id = "antfly_q8_1_small_batch_msl_v1";
 pub const first_general_metal_q8_1_source_path = "src/ops/metal/generated/quant_kernel_q8_1_small_batch.metal";
-pub const first_general_metal_q8_1_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q8_1_small_batch.metal";
 pub const first_general_metal_q8_1_air_path = "/tmp/antfly_q8_1_small_batch_msl_v1.air";
-pub const first_general_metal_q8_1_artifact_air_path = "/tmp/antfly_q8_1_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q8_1_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_1_small_batch.metal -o /tmp/antfly_q8_1_small_batch_msl_v1.air";
-pub const first_general_metal_q8_1_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q8_1_small_batch.metal -o /tmp/antfly_q8_1_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q8_k_kernel_id = "antfly_q8_k_small_batch_msl_v1";
 pub const first_general_metal_q8_k_source_path = "src/ops/metal/generated/quant_kernel_q8_k_small_batch.metal";
-pub const first_general_metal_q8_k_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q8_k_small_batch.metal";
 pub const first_general_metal_q8_k_air_path = "/tmp/antfly_q8_k_small_batch_msl_v1.air";
-pub const first_general_metal_q8_k_artifact_air_path = "/tmp/antfly_q8_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q8_k_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_k_small_batch.metal -o /tmp/antfly_q8_k_small_batch_msl_v1.air";
-pub const first_general_metal_q8_k_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q8_k_small_batch.metal -o /tmp/antfly_q8_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_kernel_id = "antfly_q5_k_small_batch_msl_v1";
 pub const first_general_metal_q5_source_path = "src/ops/metal/generated/quant_kernel_q5_k_small_batch.metal";
-pub const first_general_metal_q5_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q5_k_small_batch.metal";
 pub const first_general_metal_q5_air_path = "/tmp/antfly_q5_k_small_batch_msl_v1.air";
-pub const first_general_metal_q5_artifact_air_path = "/tmp/antfly_q5_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_k_small_batch.metal -o /tmp/antfly_q5_k_small_batch_msl_v1.air";
-pub const first_general_metal_q5_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q5_k_small_batch.metal -o /tmp/antfly_q5_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q5_bias_kernel_id = "antfly_q5_k_small_batch_bias_msl_v1";
 pub const first_general_metal_q5_bias_source_path = "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal";
-pub const first_general_metal_q5_bias_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q5_k_small_batch_bias.metal";
 pub const first_general_metal_q5_bias_air_path = "/tmp/antfly_q5_k_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q5_bias_artifact_air_path = "/tmp/antfly_q5_k_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q5_bias_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal -o /tmp/antfly_q5_k_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q5_bias_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q5_k_small_batch_bias.metal -o /tmp/antfly_q5_k_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q5_bias_gelu_kernel_id = "antfly_q5_k_small_batch_bias_gelu_msl_v1";
 pub const first_general_metal_q5_bias_gelu_source_path = "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias_gelu.metal";
-pub const first_general_metal_q5_bias_gelu_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q5_k_small_batch_bias_gelu.metal";
 pub const first_general_metal_q5_bias_gelu_air_path = "/tmp/antfly_q5_k_small_batch_bias_gelu_msl_v1.air";
-pub const first_general_metal_q5_bias_gelu_artifact_air_path = "/tmp/antfly_q5_k_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_general_metal_q5_bias_gelu_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias_gelu.metal -o /tmp/antfly_q5_k_small_batch_bias_gelu_msl_v1.air";
-pub const first_general_metal_q5_bias_gelu_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q5_k_small_batch_bias_gelu.metal -o /tmp/antfly_q5_k_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_general_metal_q6_kernel_id = "antfly_q6_k_small_batch_msl_v1";
 pub const first_general_metal_q6_source_path = "src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal";
-pub const first_general_metal_q6_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q6_k_small_batch.metal";
 pub const first_general_metal_q6_air_path = "/tmp/antfly_q6_k_small_batch_msl_v1.air";
-pub const first_general_metal_q6_artifact_air_path = "/tmp/antfly_q6_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q6_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal -o /tmp/antfly_q6_k_small_batch_msl_v1.air";
-pub const first_general_metal_q6_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q6_k_small_batch.metal -o /tmp/antfly_q6_k_small_batch_msl_v1_artifact.air";
 pub const first_general_metal_q6_bias_kernel_id = "antfly_q6_k_small_batch_bias_msl_v1";
 pub const first_general_metal_q6_bias_source_path = "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal";
-pub const first_general_metal_q6_bias_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q6_k_small_batch_bias.metal";
 pub const first_general_metal_q6_bias_air_path = "/tmp/antfly_q6_k_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q6_bias_artifact_air_path = "/tmp/antfly_q6_k_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q6_bias_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal -o /tmp/antfly_q6_k_small_batch_bias_msl_v1.air";
-pub const first_general_metal_q6_bias_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q6_k_small_batch_bias.metal -o /tmp/antfly_q6_k_small_batch_bias_msl_v1_artifact.air";
 pub const first_general_metal_q6_bias_gelu_kernel_id = "antfly_q6_k_small_batch_bias_gelu_msl_v1";
 pub const first_general_metal_q6_bias_gelu_source_path = "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias_gelu.metal";
-pub const first_general_metal_q6_bias_gelu_artifact_source_path = "src/ops/metal/artifacts/quant_kernel_q6_k_small_batch_bias_gelu.metal";
 pub const first_general_metal_q6_bias_gelu_air_path = "/tmp/antfly_q6_k_small_batch_bias_gelu_msl_v1.air";
-pub const first_general_metal_q6_bias_gelu_artifact_air_path = "/tmp/antfly_q6_k_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_general_metal_q6_bias_gelu_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias_gelu.metal -o /tmp/antfly_q6_k_small_batch_bias_gelu_msl_v1.air";
-pub const first_general_metal_q6_bias_gelu_artifact_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q6_k_small_batch_bias_gelu.metal -o /tmp/antfly_q6_k_small_batch_bias_gelu_msl_v1_artifact.air";
 pub const first_metal_runtime_evidence_path = "/private/tmp/antfly-quant-metal-evidence.json";
 pub const first_metal_runtime_evidence_command = "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out " ++ first_metal_runtime_evidence_path ++ " --repeat-runs " ++ metal_promotion_repeat_runs_text;
 pub const first_metal_local_check_command = "zig build quant-kernel-metal-local-check -Dmetal=true -Dcuda=false";
@@ -2164,10 +2082,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = first_lazy_benchmark.row_bucket,
         .epilogue = first_lazy_benchmark.epilogue,
         .kernel_id = first_lazy_metal_kernel_id,
-        .source_path = first_lazy_metal_artifact_source_path,
-        .check_command = first_lazy_metal_artifact_check_command,
-        .generated_source_path = first_lazy_metal_source_path,
-        .generated_check_command = first_lazy_metal_check_command,
+        .source_path = first_lazy_metal_source_path,
+        .check_command = first_lazy_metal_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_lazy_metal_promotion_evidence_command,
         .promotion_check_command = first_lazy_metal_promotion_check_command,
@@ -2192,10 +2108,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q4_1_kernel_id,
-        .source_path = first_general_metal_q4_1_artifact_source_path,
-        .check_command = first_general_metal_q4_1_artifact_check_command,
-        .generated_source_path = first_general_metal_q4_1_source_path,
-        .generated_check_command = first_general_metal_q4_1_check_command,
+        .source_path = first_general_metal_q4_1_source_path,
+        .check_command = first_general_metal_q4_1_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q4_1_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q4_1_promotion_check_command,
@@ -2207,10 +2121,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q5_0_kernel_id,
-        .source_path = first_general_metal_q5_0_artifact_source_path,
-        .check_command = first_general_metal_q5_0_artifact_check_command,
-        .generated_source_path = first_general_metal_q5_0_source_path,
-        .generated_check_command = first_general_metal_q5_0_check_command,
+        .source_path = first_general_metal_q5_0_source_path,
+        .check_command = first_general_metal_q5_0_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q5_0_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q5_0_promotion_check_command,
@@ -2222,10 +2134,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q5_1_kernel_id,
-        .source_path = first_general_metal_q5_1_artifact_source_path,
-        .check_command = first_general_metal_q5_1_artifact_check_command,
-        .generated_source_path = first_general_metal_q5_1_source_path,
-        .generated_check_command = first_general_metal_q5_1_check_command,
+        .source_path = first_general_metal_q5_1_source_path,
+        .check_command = first_general_metal_q5_1_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q5_1_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q5_1_promotion_check_command,
@@ -2237,10 +2147,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q2_kernel_id,
-        .source_path = first_general_metal_q2_artifact_source_path,
-        .check_command = first_general_metal_q2_artifact_check_command,
-        .generated_source_path = first_general_metal_q2_source_path,
-        .generated_check_command = first_general_metal_q2_check_command,
+        .source_path = first_general_metal_q2_source_path,
+        .check_command = first_general_metal_q2_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q2_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q2_promotion_check_command,
@@ -2278,10 +2186,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q3_kernel_id,
-        .source_path = first_general_metal_q3_artifact_source_path,
-        .check_command = first_general_metal_q3_artifact_check_command,
-        .generated_source_path = first_general_metal_q3_source_path,
-        .generated_check_command = first_general_metal_q3_check_command,
+        .source_path = first_general_metal_q3_source_path,
+        .check_command = first_general_metal_q3_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q3_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q3_promotion_check_command,
@@ -2319,10 +2225,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias,
         .kernel_id = first_general_metal_q4_bias_kernel_id,
-        .source_path = first_general_metal_q4_bias_artifact_source_path,
-        .check_command = first_general_metal_q4_bias_artifact_check_command,
-        .generated_source_path = first_general_metal_q4_bias_source_path,
-        .generated_check_command = first_general_metal_q4_bias_check_command,
+        .source_path = first_general_metal_q4_bias_source_path,
+        .check_command = first_general_metal_q4_bias_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q4_bias_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q4_bias_promotion_check_command,
@@ -2334,10 +2238,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q4_kernel_id,
-        .source_path = first_general_metal_q4_artifact_source_path,
-        .check_command = first_general_metal_q4_artifact_check_command,
-        .generated_source_path = first_general_metal_q4_source_path,
-        .generated_check_command = first_general_metal_q4_check_command,
+        .source_path = first_general_metal_q4_source_path,
+        .check_command = first_general_metal_q4_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q4_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q4_promotion_check_command,
@@ -2349,10 +2251,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q8_kernel_id,
-        .source_path = first_general_metal_q8_artifact_source_path,
-        .check_command = first_general_metal_q8_artifact_check_command,
-        .generated_source_path = first_general_metal_q8_source_path,
-        .generated_check_command = first_general_metal_q8_check_command,
+        .source_path = first_general_metal_q8_source_path,
+        .check_command = first_general_metal_q8_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_promotion_check_command,
@@ -2364,10 +2264,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias,
         .kernel_id = first_general_metal_q8_bias_kernel_id,
-        .source_path = first_general_metal_q8_bias_artifact_source_path,
-        .check_command = first_general_metal_q8_bias_artifact_check_command,
-        .generated_source_path = first_general_metal_q8_bias_source_path,
-        .generated_check_command = first_general_metal_q8_bias_check_command,
+        .source_path = first_general_metal_q8_bias_source_path,
+        .check_command = first_general_metal_q8_bias_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_bias_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_bias_promotion_check_command,
@@ -2379,10 +2277,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias_gelu,
         .kernel_id = first_general_metal_q8_bias_gelu_kernel_id,
-        .source_path = first_general_metal_q8_bias_gelu_artifact_source_path,
-        .check_command = first_general_metal_q8_bias_gelu_artifact_check_command,
-        .generated_source_path = first_general_metal_q8_bias_gelu_source_path,
-        .generated_check_command = first_general_metal_q8_bias_gelu_check_command,
+        .source_path = first_general_metal_q8_bias_gelu_source_path,
+        .check_command = first_general_metal_q8_bias_gelu_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_bias_gelu_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_bias_gelu_promotion_check_command,
@@ -2407,10 +2303,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q8_1_kernel_id,
-        .source_path = first_general_metal_q8_1_artifact_source_path,
-        .check_command = first_general_metal_q8_1_artifact_check_command,
-        .generated_source_path = first_general_metal_q8_1_source_path,
-        .generated_check_command = first_general_metal_q8_1_check_command,
+        .source_path = first_general_metal_q8_1_source_path,
+        .check_command = first_general_metal_q8_1_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_1_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_1_promotion_check_command,
@@ -2422,10 +2316,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q8_k_kernel_id,
-        .source_path = first_general_metal_q8_k_artifact_source_path,
-        .check_command = first_general_metal_q8_k_artifact_check_command,
-        .generated_source_path = first_general_metal_q8_k_source_path,
-        .generated_check_command = first_general_metal_q8_k_check_command,
+        .source_path = first_general_metal_q8_k_source_path,
+        .check_command = first_general_metal_q8_k_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q8_k_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q8_k_promotion_check_command,
@@ -2437,10 +2329,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q5_kernel_id,
-        .source_path = first_general_metal_q5_artifact_source_path,
-        .check_command = first_general_metal_q5_artifact_check_command,
-        .generated_source_path = first_general_metal_q5_source_path,
-        .generated_check_command = first_general_metal_q5_check_command,
+        .source_path = first_general_metal_q5_source_path,
+        .check_command = first_general_metal_q5_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q5_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q5_promotion_check_command,
@@ -2452,10 +2342,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias,
         .kernel_id = first_general_metal_q5_bias_kernel_id,
-        .source_path = first_general_metal_q5_bias_artifact_source_path,
-        .check_command = first_general_metal_q5_bias_artifact_check_command,
-        .generated_source_path = first_general_metal_q5_bias_source_path,
-        .generated_check_command = first_general_metal_q5_bias_check_command,
+        .source_path = first_general_metal_q5_bias_source_path,
+        .check_command = first_general_metal_q5_bias_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q5_bias_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q5_bias_promotion_check_command,
@@ -2467,10 +2355,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias_gelu,
         .kernel_id = first_general_metal_q5_bias_gelu_kernel_id,
-        .source_path = first_general_metal_q5_bias_gelu_artifact_source_path,
-        .check_command = first_general_metal_q5_bias_gelu_artifact_check_command,
-        .generated_source_path = first_general_metal_q5_bias_gelu_source_path,
-        .generated_check_command = first_general_metal_q5_bias_gelu_check_command,
+        .source_path = first_general_metal_q5_bias_gelu_source_path,
+        .check_command = first_general_metal_q5_bias_gelu_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q5_bias_gelu_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q5_bias_gelu_promotion_check_command,
@@ -2482,10 +2368,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .none,
         .kernel_id = first_general_metal_q6_kernel_id,
-        .source_path = first_general_metal_q6_artifact_source_path,
-        .check_command = first_general_metal_q6_artifact_check_command,
-        .generated_source_path = first_general_metal_q6_source_path,
-        .generated_check_command = first_general_metal_q6_check_command,
+        .source_path = first_general_metal_q6_source_path,
+        .check_command = first_general_metal_q6_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q6_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q6_promotion_check_command,
@@ -2497,10 +2381,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias,
         .kernel_id = first_general_metal_q6_bias_kernel_id,
-        .source_path = first_general_metal_q6_bias_artifact_source_path,
-        .check_command = first_general_metal_q6_bias_artifact_check_command,
-        .generated_source_path = first_general_metal_q6_bias_source_path,
-        .generated_check_command = first_general_metal_q6_bias_check_command,
+        .source_path = first_general_metal_q6_bias_source_path,
+        .check_command = first_general_metal_q6_bias_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q6_bias_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q6_bias_promotion_check_command,
@@ -2512,10 +2394,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_2_8,
         .epilogue = .bias_gelu,
         .kernel_id = first_general_metal_q6_bias_gelu_kernel_id,
-        .source_path = first_general_metal_q6_bias_gelu_artifact_source_path,
-        .check_command = first_general_metal_q6_bias_gelu_artifact_check_command,
-        .generated_source_path = first_general_metal_q6_bias_gelu_source_path,
-        .generated_check_command = first_general_metal_q6_bias_gelu_check_command,
+        .source_path = first_general_metal_q6_bias_gelu_source_path,
+        .check_command = first_general_metal_q6_bias_gelu_check_command,
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q6_bias_gelu_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q6_bias_gelu_promotion_check_command,
@@ -2527,10 +2407,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_1,
         .epilogue = .none,
         .kernel_id = first_general_cuda_q4_0_mmv_kernel_id,
-        .source_path = first_general_cuda_q4_0_mmv_artifact_source_path,
-        .check_command = first_general_cuda_q4_0_mmv_artifact_check_command,
-        .generated_source_path = first_general_cuda_q4_0_mmv_source_path,
-        .generated_check_command = first_general_cuda_q4_0_mmv_check_command,
+        .source_path = first_general_cuda_q4_0_mmv_source_path,
+        .check_command = first_general_cuda_q4_0_mmv_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_mmv_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_mmv_benchmark_command,
         .production_enabled = true,
@@ -2541,10 +2419,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_9_64,
         .epilogue = .none,
         .kernel_id = first_general_cuda_q4_0_mm_kernel_id,
-        .source_path = first_general_cuda_q4_0_mm_artifact_source_path,
-        .check_command = first_general_cuda_q4_0_mm_artifact_check_command,
-        .generated_source_path = first_general_cuda_q4_0_mm_source_path,
-        .generated_check_command = first_general_cuda_q4_0_mm_check_command,
+        .source_path = first_general_cuda_q4_0_mm_source_path,
+        .check_command = first_general_cuda_q4_0_mm_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_mm_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_mm_benchmark_command,
         .production_enabled = true,
@@ -2555,10 +2431,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_1,
         .epilogue = .pair,
         .kernel_id = first_general_cuda_q4_0_pair_kernel_id,
-        .source_path = first_general_cuda_q4_0_pair_artifact_source_path,
-        .check_command = first_general_cuda_q4_0_pair_artifact_check_command,
-        .generated_source_path = first_general_cuda_q4_0_pair_source_path,
-        .generated_check_command = first_general_cuda_q4_0_pair_check_command,
+        .source_path = first_general_cuda_q4_0_pair_source_path,
+        .check_command = first_general_cuda_q4_0_pair_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_pair_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_pair_benchmark_command,
         .production_enabled = true,
@@ -2569,10 +2443,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_1,
         .epilogue = .pair_activation,
         .kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
-        .source_path = first_general_cuda_q4_0_pair_q8_artifact_source_path,
-        .check_command = first_general_cuda_q4_0_pair_q8_artifact_check_command,
-        .generated_source_path = first_general_cuda_q4_0_pair_q8_source_path,
-        .generated_check_command = first_general_cuda_q4_0_pair_q8_check_command,
+        .source_path = first_general_cuda_q4_0_pair_q8_source_path,
+        .check_command = first_general_cuda_q4_0_pair_q8_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
         .production_enabled = true,
@@ -2583,10 +2455,8 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .row_bucket = .rows_1,
         .epilogue = .gated_down,
         .kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
-        .source_path = first_general_cuda_q4_0_down_q8_artifact_source_path,
-        .check_command = first_general_cuda_q4_0_down_q8_artifact_check_command,
-        .generated_source_path = first_general_cuda_q4_0_down_q8_source_path,
-        .generated_check_command = first_general_cuda_q4_0_down_q8_check_command,
+        .source_path = first_general_cuda_q4_0_down_q8_source_path,
+        .check_command = first_general_cuda_q4_0_down_q8_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .production_enabled = true,
@@ -6316,9 +6186,9 @@ fn metalProductionBenchmarkCaseForArtifactShape(comptime artifact: GeneratedArti
         .threads_per_threadgroup = metalGeneratedThreadsPerThreadgroup(artifact.format, artifact.row_bucket, artifact.epilogue),
         .cols_per_threadgroup = metalGeneratedColsPerThreadgroup(artifact.format, artifact.row_bucket, artifact.epilogue),
         .tolerance_abs = dims.tolerance_abs,
-        .generated_source_path = generatedSourcePathForArtifact(artifact),
+        .generated_source_path = artifact.source_path,
         .generated_source_fingerprint = artifactSourceFingerprint(artifact),
-        .check_command = generatedCheckCommandForArtifact(artifact),
+        .check_command = artifact.check_command,
         .production_kernel_id = artifact.kernel_id,
         .benchmark_command = first_metal_production_regression_evidence_command,
     };
@@ -6460,11 +6330,8 @@ fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_co
         .epilogue = @tagName(artifact.epilogue),
         .kernel_id = artifact.kernel_id,
         .source_path = artifact.source_path,
-        .generated_source_path = generatedSourcePathForArtifact(artifact),
-        .artifact_source_path = if (artifact.backend == .metal) metalArtifactSourcePathForKernel(artifact.kernel_id) orelse "" else "",
         .generated_source_fingerprint = artifactSourceFingerprint(artifact),
         .check_command = artifact.check_command,
-        .generated_check_command = generatedCheckCommandForArtifact(artifact),
         .runtime_evidence_command = artifact.runtime_evidence_command,
         .runtime_route_evidence_command = runtime_route_evidence_command,
         .promotion_evidence_command = artifact.promotion_evidence_command,
@@ -6867,14 +6734,6 @@ pub fn generatedArtifactForKernel(backend: Backend, kernel_id: []const u8) ?Gene
     return null;
 }
 
-fn generatedSourcePathForArtifact(artifact: GeneratedArtifact) []const u8 {
-    return if (artifact.generated_source_path.len != 0) artifact.generated_source_path else artifact.source_path;
-}
-
-fn generatedCheckCommandForArtifact(artifact: GeneratedArtifact) []const u8 {
-    return if (artifact.generated_check_command.len != 0) artifact.generated_check_command else artifact.check_command;
-}
-
 pub fn loweringFor(
     backend: Backend,
     format: quant_matmul.Format,
@@ -7117,7 +6976,7 @@ pub fn metalRuntimeRouteSummaryJson(allocator: std.mem.Allocator) ![]u8 {
         if (!first) try out.append(allocator, ',');
         first = false;
         const runtime_gate_env = if (artifactRuntimeGateEnv(artifact)) |env| std.mem.span(env) else "";
-        const generated_source_path = generatedMetalSourcePathForKernel(artifact.kernel_id) orelse artifact.generated_source_path;
+        const generated_source_path = artifact.source_path;
         try appendFmt(
             allocator,
             &out,
@@ -7322,8 +7181,7 @@ fn promotedLoweringForArtifact(lowering: QuantKernelLowering, artifact: Generate
         artifact.format != lowering.format or
         artifact.row_bucket != lowering.row_bucket or
         artifact.epilogue != lowering.epilogue or
-        !std.mem.eql(u8, artifact.kernel_id, lowering.kernel_id) or
-        isDevGeneratedSourcePath(artifact.source_path))
+        !std.mem.eql(u8, artifact.kernel_id, lowering.kernel_id))
     {
         return null;
     }
@@ -7344,7 +7202,6 @@ pub fn artifactHasPromotionEvidence(artifact: GeneratedArtifact) bool {
 
 fn artifactPromotionBlocker(artifact: GeneratedArtifact) []const u8 {
     if (!artifact.production_enabled) return disabledArtifactPromotionBlocker(artifact);
-    if (isDevGeneratedSourcePath(artifact.source_path)) return "dev_generated_source";
     return switch (artifact.backend) {
         .cuda => blk: {
             const bench = benchmarkForArtifact(artifact) orelse return "missing_benchmark_record";
@@ -7409,7 +7266,7 @@ fn metalArtifactPromotionBlockerWithEvidence(artifact: GeneratedArtifact, eviden
     if (artifactSourceFingerprint(artifact) == 0) return "missing_source_fingerprint";
     if (!commandFirstTokenEquals(artifact.check_command, "xcrun") or !commandHasToken(artifact.check_command, "metal")) return "missing_xcrun_metal_command";
     if (!commandHasArgValue(artifact.check_command, "-c", artifact.source_path)) return "metal_check_missing_source";
-    if (!commandHasArgValue(artifact.check_command, "-o", metalArtifactAirPathForKernel(artifact.kernel_id) orelse return "missing_metal_air_path")) return "metal_check_missing_output";
+    if (!commandHasArgValue(artifact.check_command, "-o", metalAirPathForKernel(artifact.kernel_id) orelse return "missing_metal_air_path")) return "metal_check_missing_output";
     if (!commandHasToken(artifact.runtime_evidence_command, "quant-kernel-metal-runtime-check")) return "missing_metal_runtime_evidence_command";
     if (!commandHasToken(artifact.runtime_evidence_command, "--evidence-out")) return "missing_metal_evidence_out_arg";
     if (!commandHasArgValue(artifact.runtime_evidence_command, "--repeat-runs", metal_promotion_repeat_runs_text)) return "missing_metal_repeat_runs";
@@ -7508,7 +7365,6 @@ fn benchmarkPromotionBlocker(bench: BenchmarkCase) []const u8 {
 fn benchmarkPromotionBlockerWithEvidence(bench: BenchmarkCase, evidence_records: []const BenchmarkEvidence) []const u8 {
     if (!bench.production_enabled) return "production_disabled";
     if (bench.backend != .cuda) return "non_cuda_benchmark";
-    if (isDevGeneratedSourcePath(bench.generated_source_path)) return "dev_generated_source";
     if (bench.generated_kernel_id.len == 0) return "missing_kernel_id";
     if (bench.generated_source_path.len == 0) return "missing_source_path";
     if (bench.generated_source_fingerprint == 0) return "missing_source_fingerprint";
@@ -7634,16 +7490,9 @@ fn benchmarkEvidenceFor(bench: BenchmarkCase, evidence_records: []const Benchmar
 
 fn metalRuntimeEvidenceFor(artifact: GeneratedArtifact, evidence_records: []const MetalRuntimeEvidence) ?MetalRuntimeEvidence {
     const expected_source_path = generatedMetalSourcePathForKernel(artifact.kernel_id) orelse return null;
-    const expected_artifact_source_path = metalArtifactSourcePathForKernel(artifact.kernel_id);
     const expected_check_command = generatedMetalCheckCommandForKernel(artifact.kernel_id) orelse return null;
     for (evidence_records) |evidence| {
-        if (expected_artifact_source_path) |artifact_source_path| {
-            if (!std.mem.eql(u8, evidence.artifact_source_path, artifact_source_path)) continue;
-        } else if (evidence.artifact_source_path.len != 0) {
-            continue;
-        }
         if (std.mem.eql(u8, evidence.kernel_id, artifact.kernel_id) and
-            // Promotion evidence is usually collected before copying identical source into artifacts/.
             std.mem.eql(u8, evidence.source_path, expected_source_path) and
             evidence.source_fingerprint == artifactSourceFingerprint(artifact) and
             std.mem.eql(u8, evidence.check_command, expected_check_command) and
@@ -7659,7 +7508,6 @@ fn metalRuntimeEvidenceFor(artifact: GeneratedArtifact, evidence_records: []cons
 fn checkedInMetalEvidenceForKernel(kernel_id: []const u8) ?MetalRuntimeEvidence {
     for (first_metal_runtime_evidence) |evidence| {
         if (std.mem.eql(u8, evidence.kernel_id, kernel_id) and
-            evidence.artifact_source_path.len != 0 and
             evidence.correctness_passed and
             evidence.source_fingerprint != 0)
         {
@@ -7669,60 +7517,14 @@ fn checkedInMetalEvidenceForKernel(kernel_id: []const u8) ?MetalRuntimeEvidence 
     return null;
 }
 
-pub fn metalArtifactSourcePathForKernel(kernel_id: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, kernel_id, first_lazy_metal_kernel_id)) return first_lazy_metal_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q4_kernel_id)) return first_general_metal_q4_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q3_kernel_id)) return first_general_metal_q3_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q4_bias_kernel_id)) return first_general_metal_q4_bias_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_kernel_id)) return first_general_metal_q8_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_bias_kernel_id)) return first_general_metal_q8_bias_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_bias_gelu_kernel_id)) return first_general_metal_q8_bias_gelu_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_kernel_id)) return first_general_metal_q5_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_bias_kernel_id)) return first_general_metal_q5_bias_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_bias_gelu_kernel_id)) return first_general_metal_q5_bias_gelu_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_1_kernel_id)) return first_general_metal_q5_1_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_0_kernel_id)) return first_general_metal_q5_0_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q6_kernel_id)) return first_general_metal_q6_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_kernel_id)) return first_general_metal_q6_bias_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_gelu_kernel_id)) return first_general_metal_q6_bias_gelu_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q2_kernel_id)) return first_general_metal_q2_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q4_1_kernel_id)) return first_general_metal_q4_1_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_1_kernel_id)) return first_general_metal_q8_1_artifact_source_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_k_kernel_id)) return first_general_metal_q8_k_artifact_source_path;
-    return null;
-}
-
-fn metalArtifactAirPathForKernel(kernel_id: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, kernel_id, first_lazy_metal_kernel_id)) return first_lazy_metal_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q4_kernel_id)) return first_general_metal_q4_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q3_kernel_id)) return first_general_metal_q3_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q4_bias_kernel_id)) return first_general_metal_q4_bias_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_kernel_id)) return first_general_metal_q8_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_bias_kernel_id)) return first_general_metal_q8_bias_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_bias_gelu_kernel_id)) return first_general_metal_q8_bias_gelu_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_kernel_id)) return first_general_metal_q5_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_bias_kernel_id)) return first_general_metal_q5_bias_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_bias_gelu_kernel_id)) return first_general_metal_q5_bias_gelu_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_1_kernel_id)) return first_general_metal_q5_1_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q5_0_kernel_id)) return first_general_metal_q5_0_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q6_kernel_id)) return first_general_metal_q6_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_kernel_id)) return first_general_metal_q6_bias_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_gelu_kernel_id)) return first_general_metal_q6_bias_gelu_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q2_kernel_id)) return first_general_metal_q2_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q4_1_kernel_id)) return first_general_metal_q4_1_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_1_kernel_id)) return first_general_metal_q8_1_artifact_air_path;
-    if (std.mem.eql(u8, kernel_id, first_general_metal_q8_k_kernel_id)) return first_general_metal_q8_k_artifact_air_path;
-    return metalAirPathForKernel(kernel_id);
-}
-
 pub fn generatedMetalSourcePathForKernel(kernel_id: []const u8) ?[]const u8 {
     const artifact = generatedArtifactForKernel(.metal, kernel_id) orelse return null;
-    return generatedSourcePathForArtifact(artifact);
+    return artifact.source_path;
 }
 
 pub fn generatedMetalCheckCommandForKernel(kernel_id: []const u8) ?[]const u8 {
     const artifact = generatedArtifactForKernel(.metal, kernel_id) orelse return null;
-    return generatedCheckCommandForArtifact(artifact);
+    return artifact.check_command;
 }
 
 fn metalRuntimeEvidenceCommandMatchesArtifact(evidence: MetalRuntimeEvidence, artifact: GeneratedArtifact) bool {
@@ -7747,13 +7549,6 @@ fn benchmarkForArtifact(artifact: GeneratedArtifact) ?BenchmarkCase {
     return null;
 }
 
-fn isDevGeneratedSourcePath(path: []const u8) bool {
-    @setEvalBranchQuota(10_000);
-    return std.mem.containsAtLeast(u8, path, 1, "src/ops/cuda/generated/") or
-        std.mem.containsAtLeast(u8, path, 1, "src/ops/metal/generated/") or
-        std.mem.startsWith(u8, path, "generated/");
-}
-
 fn isPtxPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".ptx");
 }
@@ -7769,10 +7564,6 @@ pub fn compileQuantKernelSource(request: QuantKernelCompileRequest) ?QuantKernel
     const artifact = generatedArtifactForCandidate(request.backend, request.format, request.row_bucket, request.epilogue) orelse return null;
     const source = generatedSourceForArtifact(artifact) orelse return null;
     const lowering = registryLoweringFor(request.backend, request.format, request.row_bucket, request.epilogue, ir.dispatch);
-    const artifact_source_path = if (request.backend == .metal)
-        metalArtifactSourcePathForKernel(artifact.kernel_id) orelse ""
-    else
-        "";
     const runtime_gate_env = if (request.backend == .metal)
         artifactRuntimeGateEnv(artifact)
     else
@@ -7784,9 +7575,8 @@ pub fn compileQuantKernelSource(request: QuantKernelCompileRequest) ?QuantKernel
         .lowering = lowering,
         .artifact = artifact,
         .source = source,
-        .source_path = generatedSourcePathForArtifact(artifact),
-        .artifact_source_path = artifact_source_path,
-        .check_command = generatedCheckCommandForArtifact(artifact),
+        .source_path = artifact.source_path,
+        .check_command = artifact.check_command,
         .runtime_gate_env = runtime_gate_env,
         .production_enabled = artifact.production_enabled,
     };
@@ -7804,19 +7594,17 @@ pub fn compiledSourceMatchesRoute(compiled: QuantKernelCompiledSource) bool {
     }
     const expected_source = generatedSourceForArtifact(compiled.artifact) orelse return false;
     if (!std.mem.eql(u8, compiled.source, expected_source) or
-        !std.mem.eql(u8, compiled.source_path, generatedSourcePathForArtifact(compiled.artifact)) or
-        !std.mem.eql(u8, compiled.check_command, generatedCheckCommandForArtifact(compiled.artifact)) or
+        !std.mem.eql(u8, compiled.source_path, compiled.artifact.source_path) or
+        !std.mem.eql(u8, compiled.check_command, compiled.artifact.check_command) or
         compiled.production_enabled != compiled.artifact.production_enabled)
     {
         return false;
     }
     if (compiled.request.backend == .metal) {
-        const expected_artifact_source_path = metalArtifactSourcePathForKernel(compiled.artifact.kernel_id) orelse "";
-        if (!std.mem.eql(u8, compiled.artifact_source_path, expected_artifact_source_path)) return false;
         const expected_gate = artifactRuntimeGateEnv(compiled.artifact);
         if (!optionalCStringEquals(compiled.runtime_gate_env, expected_gate)) return false;
     } else {
-        if (compiled.artifact_source_path.len != 0 or compiled.runtime_gate_env != null) return false;
+        if (compiled.runtime_gate_env != null) return false;
     }
     if (compiled.spec.format != compiled.request.format or
         compiled.ir.format != compiled.request.format or
@@ -11428,15 +11216,13 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_benchmark_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len, "\"generated_source_fingerprint\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_metal_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_metal_artifact_check_command));
-    try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"generated_source_path\":"));
-    try std.testing.expectEqual(first_generated_artifacts.len + first_metal_runtime_evidence.len, std.mem.count(u8, manifest, "\"artifact_source_path\":"));
-    try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"generated_check_command\":"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"generated_source_path\": \"" ++ first_general_metal_q5_1_source_path ++ "\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"artifact_source_path\": \"" ++ first_general_metal_q5_1_artifact_source_path ++ "\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"generated_check_command\": \"" ++ first_general_metal_q5_1_check_command ++ "\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"generated_source_path\": \"" ++ first_lazy_benchmark.generated_source_path ++ "\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"artifact_source_path\": \"\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_metal_check_command));
+    try std.testing.expectEqual(first_generated_artifacts.len + first_metal_runtime_evidence.len, std.mem.count(u8, manifest, "\"source_path\":"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, manifest, "\"artifact_source_path\":"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, manifest, "\"generated_check_command\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"source_path\": \"" ++ first_general_metal_q5_1_source_path ++ "\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"check_command\": \"" ++ first_general_metal_q5_1_check_command ++ "\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"source_path\": \"" ++ first_lazy_benchmark.generated_source_path ++ "\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_0_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_0_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_1_kernel_id));
@@ -11446,23 +11232,23 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_1_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_1_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_gelu_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_gelu_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_gelu_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_relu_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_relu_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_gelu_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_gelu_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_bias_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_bias_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_bias_gelu_kernel_id));
@@ -11472,17 +11258,17 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_k_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_k_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_gelu_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_gelu_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_gelu_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_kernel_id));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_artifact_check_command));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, runtime_evidence_count, "\"runtime_evidence_command\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, runtime_route_evidence_count, "\"runtime_route_evidence_command\": \"zig build quant-kernel-metal-runtime-check"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, runtime_route_evidence_count, "--runtime-route-kernel"));
@@ -11524,9 +11310,9 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_1_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_promotion_evidence_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_gelu_promotion_evidence_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_gelu_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_bias_gelu_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_relu_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q2_bias_promotion_evidence_command));
@@ -11535,19 +11321,19 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_bias_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q3_bias_gelu_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_promotion_evidence_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q4_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_1_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_k_promotion_evidence_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q8_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_promotion_evidence_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q5_bias_gelu_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_promotion_evidence_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_artifact_source_path));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_artifact_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_source_path));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_source_path));
     const blocked_metal_promotion_count = first_metal_promotion_blocker_evidence_count;
     const dev_only_candidate_count = first_generated_artifacts.len - first_metal_runtime_evidence_count - blocked_metal_promotion_count - 5;
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, dev_only_candidate_count, "\"candidate_status\": \"dev_only_candidate\""));
@@ -11640,8 +11426,8 @@ test "quant kernel compiler checked-in Metal evidence matches generated source" 
         try std.testing.expect(evidence.production_enabled);
         try std.testing.expect(evidence.promotion_ready);
 
-        const artifact_source_path = metalArtifactSourcePathForKernel(evidence.kernel_id) orelse return error.MissingMetalArtifactPath;
-        try std.testing.expectEqualStrings(artifact_source_path, evidence.artifact_source_path);
+        const source_path = generatedMetalSourcePathForKernel(evidence.kernel_id) orelse return error.MissingMetalSourcePath;
+        try std.testing.expectEqualStrings(source_path, evidence.source_path);
 
         var found = false;
         for (first_generated_artifacts) |artifact| {
@@ -11692,12 +11478,11 @@ test "quant kernel compiler Metal promotion requires route evidence where routed
     }
     try std.testing.expect(found_artifact);
     artifact.production_enabled = true;
-    artifact.source_path = first_general_metal_q6_artifact_source_path;
-    artifact.check_command = first_general_metal_q6_artifact_check_command;
+    artifact.source_path = first_general_metal_q6_source_path;
+    artifact.check_command = first_general_metal_q6_check_command;
     const evidence = MetalRuntimeEvidence{
         .kernel_id = first_general_metal_q6_kernel_id,
         .source_path = first_general_metal_q6_source_path,
-        .artifact_source_path = first_general_metal_q6_artifact_source_path,
         .source_fingerprint = artifactSourceFingerprint(artifact),
         .check_command = first_general_metal_q6_check_command,
         .runtime_evidence_command = first_general_metal_q6_promotion_evidence_command,
@@ -12159,7 +11944,7 @@ test "quant kernel compiler benchmark manifest maps to conformance rows" {
                     try std.testing.expectEqual(LoweringRoute.generated_production, conf.cuda_route);
                     try std.testing.expectEqual(LoweringRoute.unsupported, conf.cuda_candidate_route);
                     try std.testing.expectEqual(FallbackReason.none, conf.cuda_fallback_reason);
-                    try std.testing.expect(!isDevGeneratedSourcePath(bench.generated_source_path));
+                    try std.testing.expect(std.mem.startsWith(u8, bench.generated_source_path, "src/ops/cuda/generated/"));
                     try std.testing.expect(bench.correctness_evidence_path.len != 0);
                     try std.testing.expectEqualStrings(bench.correctness_evidence_path, bench.benchmark_evidence_path);
                     try std.testing.expectEqualStrings("sequential", bench.benchmark_mode);
@@ -12286,7 +12071,7 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
 
     bench.production_enabled = true;
     try std.testing.expect(!benchmarkHasPromotionEvidence(bench));
-    try std.testing.expectEqualStrings("dev_generated_source", benchmarkPromotionBlocker(bench));
+    try std.testing.expectEqualStrings("missing_correctness_evidence", benchmarkPromotionBlocker(bench));
 
     bench.generated_source_path = "src/ops/cuda/artifacts/inference_cuda_kernels.cu";
     try std.testing.expect(!benchmarkHasPromotionEvidence(bench));
@@ -12494,7 +12279,6 @@ test "quant kernel compiler production artifacts require promotion evidence" {
     const metal_evidence = [_]MetalRuntimeEvidence{.{
         .kernel_id = metal_artifact.kernel_id,
         .source_path = first_general_metal_q6_bias_source_path,
-        .artifact_source_path = first_general_metal_q6_bias_artifact_source_path,
         .source_fingerprint = artifactSourceFingerprint(metal_artifact),
         .check_command = first_general_metal_q6_bias_check_command,
         .runtime_evidence_command = metal_artifact.promotion_evidence_command,
@@ -12611,13 +12395,6 @@ test "quant kernel compiler generated artifacts have unique ids and paths" {
         try std.testing.expectEqualStrings(artifact.source_path, lookup.source_path);
         const kernel_lookup = generatedArtifactForKernel(artifact.backend, artifact.kernel_id) orelse return error.MissingGeneratedArtifactLookup;
         try std.testing.expectEqualStrings(artifact.source_path, kernel_lookup.source_path);
-        if (artifact.generated_source_path.len == 0) {
-            try std.testing.expectEqualStrings(artifact.source_path, generatedSourcePathForArtifact(artifact));
-            try std.testing.expectEqualStrings(artifact.check_command, generatedCheckCommandForArtifact(artifact));
-        } else {
-            try std.testing.expectEqualStrings(artifact.generated_source_path, generatedSourcePathForArtifact(artifact));
-            try std.testing.expectEqualStrings(artifact.generated_check_command, generatedCheckCommandForArtifact(artifact));
-        }
         for (first_generated_artifacts[i + 1 ..]) |other| {
             try std.testing.expect(!std.mem.eql(u8, artifact.source_path, other.source_path));
             try std.testing.expect(!std.mem.eql(u8, artifact.kernel_id, other.kernel_id));
@@ -12629,17 +12406,6 @@ test "quant kernel compiler generated artifacts have unique ids and paths" {
     }
 }
 
-test "quant kernel compiler promoted artifacts keep generated evidence metadata" {
-    var promoted = first_generated_artifacts[1];
-    promoted.source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal";
-    promoted.check_command = "xcrun --toolchain Metal metal -c src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal -o src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.air";
-    promoted.generated_source_path = first_lazy_metal_source_path;
-    promoted.generated_check_command = first_lazy_metal_check_command;
-
-    try std.testing.expectEqualStrings(first_lazy_metal_source_path, generatedSourcePathForArtifact(promoted));
-    try std.testing.expectEqualStrings(first_lazy_metal_check_command, generatedCheckCommandForArtifact(promoted));
-}
-
 test "quant kernel compiler generated artifact manifest maps to route candidates" {
     for (first_generated_artifacts) |artifact| {
         try std.testing.expect(artifactSourceFingerprint(artifact) != 0);
@@ -12648,12 +12414,6 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
 
         const route = loweringFor(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue);
         if (artifact.production_enabled) {
-            try std.testing.expect(!isDevGeneratedSourcePath(artifact.source_path));
-            if (artifact.backend == .metal) {
-                try std.testing.expect(artifact.generated_source_path.len != 0);
-                try std.testing.expect(isDevGeneratedSourcePath(artifact.generated_source_path));
-                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.generated_check_command, 1, artifact.generated_source_path));
-            }
             try std.testing.expectEqual(LoweringRoute.generated_production, route.production_route);
             try std.testing.expectEqual(LoweringRoute.unsupported, route.candidate_route);
             try std.testing.expectEqual(FallbackReason.none, route.fallback_reason);
@@ -12663,13 +12423,6 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
             const promoted = promotedArtifactFor(route) orelse return error.MissingPromotedArtifact;
             try std.testing.expectEqualStrings(artifact.source_path, promoted.source_path);
         } else {
-            if (artifact.generated_source_path.len == 0) {
-                try std.testing.expect(isDevGeneratedSourcePath(artifact.source_path));
-            } else {
-                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, artifact.source_path));
-                try std.testing.expect(isDevGeneratedSourcePath(artifact.generated_source_path));
-                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.generated_check_command, 1, artifact.generated_source_path));
-            }
             try std.testing.expectEqual(LoweringRoute.handwritten_production, route.production_route);
             try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, route.candidate_route);
             const expected_fallback: FallbackReason = if (artifact.backend == .metal and checkedInMetalEvidenceForKernel(artifact.kernel_id) != null)
@@ -12740,7 +12493,7 @@ test "quant kernel compiler generated production routes require promoted artifac
         try std.testing.expectEqual(LoweringRoute.unsupported, entry.candidate_route);
         try std.testing.expectEqual(FallbackReason.none, entry.fallback_reason);
         const artifact = promotedArtifactFor(entry) orelse return error.MissingPromotedArtifact;
-        try std.testing.expect(!isDevGeneratedSourcePath(artifact.source_path));
+        try std.testing.expect(artifactHasPromotionEvidence(artifact));
     }
 
     var unpromoted = loweringFor(.cuda, .q4_k, .rows_2_8, .bias_gelu);
@@ -12757,8 +12510,7 @@ test "quant kernel compiler generated production routes require promoted artifac
     dev_route.fallback_reason = .generated_artifact_missing;
     dev_route.kernel_id = first_lazy_metal_kernel_id;
     dev_route.candidate_source_path = first_lazy_metal_source_path;
-    var promoted_artifact = first_generated_artifacts[1];
-    promoted_artifact.source_path = "src/ops/metal/artifacts/quant_kernel_q4_k_small_batch_bias_gelu.metal";
+    const promoted_artifact = first_generated_artifacts[1];
     const promoted = promotedLoweringForArtifact(dev_route, promoted_artifact).?;
     try std.testing.expectEqual(LoweringRoute.generated_production, promoted.production_route);
     try std.testing.expectEqual(LoweringRoute.unsupported, promoted.candidate_route);
@@ -12767,9 +12519,9 @@ test "quant kernel compiler generated production routes require promoted artifac
     try std.testing.expectEqualStrings("", promoted.kernel_id);
     try std.testing.expectEqualStrings("", promoted.candidate_source_path);
 
-    var dev_artifact = promoted_artifact;
-    dev_artifact.source_path = first_lazy_metal_source_path;
-    try std.testing.expect(promotedLoweringForArtifact(dev_route, dev_artifact) == null);
+    var mismatched_artifact = promoted_artifact;
+    mismatched_artifact.kernel_id = "antfly_other_kernel";
+    try std.testing.expect(promotedLoweringForArtifact(dev_route, mismatched_artifact) == null);
 }
 
 test "quant kernel compiler registry helper is the dispatch-facing route source" {
@@ -12791,7 +12543,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q4_1.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q4_1.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q4_1_kernel_id, metal_q4_1.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q4_1_artifact_source_path, metal_q4_1.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q4_1_source_path, metal_q4_1.candidate_source_path);
 
     const metal_q5_0 = registryLoweringFor(.metal, .q5_0, .rows_2_8, .none, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q5_0.production_route);
@@ -12799,7 +12551,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q5_0.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q5_0.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_0_kernel_id, metal_q5_0.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q5_0_artifact_source_path, metal_q5_0.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q5_0_source_path, metal_q5_0.candidate_source_path);
 
     const metal_q5_1 = registryLoweringFor(.metal, .q5_1, .rows_2_8, .none, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q5_1.production_route);
@@ -12807,7 +12559,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q5_1.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q5_1.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_1_kernel_id, metal_q5_1.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q5_1_artifact_source_path, metal_q5_1.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q5_1_source_path, metal_q5_1.candidate_source_path);
 
     const metal_q4 = registryLoweringFor(.metal, .q4_k, .rows_2_8, .none, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q4.production_route);
@@ -12815,7 +12567,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q4.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q4.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q4_kernel_id, metal_q4.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q4_artifact_source_path, metal_q4.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q4_source_path, metal_q4.candidate_source_path);
 
     const metal_q4_bias = registryLoweringFor(.metal, .q4_k, .rows_2_8, .bias, .small_batch);
     try std.testing.expectEqual(LoweringRoute.generated_production, metal_q4_bias.production_route);
@@ -12846,7 +12598,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, metal_q8_bias_gelu.candidate_route);
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q8_bias_gelu.fallback_reason);
     try std.testing.expectEqualStrings(first_general_metal_q8_bias_gelu_kernel_id, metal_q8_bias_gelu.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q8_bias_gelu_artifact_source_path, metal_q8_bias_gelu.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q8_bias_gelu_source_path, metal_q8_bias_gelu.candidate_source_path);
 
     const metal_q8_relu = registryLoweringFor(.metal, .q8_0, .rows_2_8, .relu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q8_relu.production_route);
@@ -12905,7 +12657,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q8_1.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q8_1.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q8_1_kernel_id, metal_q8_1.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q8_1_artifact_source_path, metal_q8_1.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q8_1_source_path, metal_q8_1.candidate_source_path);
 
     const metal_q8_k = registryLoweringFor(.metal, .q8_k, .rows_2_8, .none, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q8_k.production_route);
@@ -12913,7 +12665,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q8_k.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q8_k.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q8_k_kernel_id, metal_q8_k.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q8_k_artifact_source_path, metal_q8_k.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q8_k_source_path, metal_q8_k.candidate_source_path);
 
     const metal_q5 = registryLoweringFor(.metal, .q5_k, .rows_2_8, .none, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q5.production_route);
@@ -12921,7 +12673,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q5.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q5.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_kernel_id, metal_q5.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q5_artifact_source_path, metal_q5.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q5_source_path, metal_q5.candidate_source_path);
 
     const metal_q5_bias = registryLoweringFor(.metal, .q5_k, .rows_2_8, .bias, .small_batch);
     try std.testing.expectEqual(LoweringRoute.generated_production, metal_q5_bias.production_route);
@@ -12940,7 +12692,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q5_bias_gelu.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q5_bias_gelu.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q5_bias_gelu_kernel_id, metal_q5_bias_gelu.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q5_bias_gelu_artifact_source_path, metal_q5_bias_gelu.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q5_bias_gelu_source_path, metal_q5_bias_gelu.candidate_source_path);
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_gelu_source, 1, "threadgroup float partial[32];"));
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_gelu_source, 1, "if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q5_bias_gelu_source, 1, "simdgroup_index_in_threadgroup"));
@@ -12970,7 +12722,7 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q6_bias_gelu.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q6_bias_gelu.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_kernel_id, metal_q6_bias_gelu.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_artifact_source_path, metal_q6_bias_gelu.candidate_source_path);
+    try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_source_path, metal_q6_bias_gelu.candidate_source_path);
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "threadgroup float partial[32];"));
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "simdgroup_index_in_threadgroup"));
@@ -13032,7 +12784,7 @@ test "quant kernel compiler first Metal lazy target stays blocked by timing drif
     try std.testing.expectEqual(FallbackReason.generated_artifact_missing, route.fallback_reason);
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", route.production_kernel_id);
     try std.testing.expectEqualStrings(first_lazy_metal_kernel_id, route.kernel_id);
-    try std.testing.expectEqualStrings(first_lazy_metal_artifact_source_path, route.candidate_source_path);
+    try std.testing.expectEqualStrings(first_lazy_metal_source_path, route.candidate_source_path);
 
     const artifact = generatedArtifactForKernel(.metal, first_lazy_metal_kernel_id).?;
     try std.testing.expect(artifactRuntimeWired(artifact));
@@ -13069,7 +12821,6 @@ test "quant kernel compiler compiles promoted Metal source from descriptor route
     try std.testing.expectEqualSlices(IROp, &ir_ops_bias, compiled.ir.ops);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_kernel_id, compiled.artifact.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_source_path, compiled.source_path);
-    try std.testing.expectEqualStrings(first_general_metal_q6_bias_artifact_source_path, compiled.artifact_source_path);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_check_command, compiled.check_command);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_source, compiled.source);
     try std.testing.expect(compiled.production_enabled);
@@ -13385,7 +13136,7 @@ test "quant kernel compiler docs describe compile API guardrail" {
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Drift returns"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "compileMetalKernelSource(.q6_k, .rows_2_8, .bias_gelu)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "emitCompiledSource(allocator, compiled)"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "artifact_source_path, check_command, runtime_gate_env"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "compiled.source_path, check_command, runtime_gate_env"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Repeated promotion and production-regression checks run two unrecorded warmup"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`warmup_repeat_runs`"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`metal_promotion_warmup_repeat_runs`"));
@@ -13443,7 +13194,7 @@ fn metalRuntimeGeneratedEpilogueConstant(epilogue: Epilogue) ?[]const u8 {
 }
 
 // Production Metal compiles the inline kernel copies embedded in
-// metal_kernels.m, not the checked-in generated/artifact sources; some inline
+// metal_kernels.m, not the checked-in generated sources; some inline
 // copies are deliberately tuned differently (e.g. two-column schedules). This
 // pin table couples the two copies for review: each entry records the hash of
 // the runtime-embedded kernel body AND the fingerprint of the compiler's
