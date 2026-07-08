@@ -16,7 +16,15 @@ The dispatch-facing API is still the existing graph planning contract:
 - `src/graph/quant_matmul.zig`: format, row bucket, dispatch bucket, and generic
   quant matmul planning vocabulary.
 - `src/graph/quant_kernel_compiler.zig`: compiler descriptors, IR, generated
-  artifacts, route registry, benchmark manifests, and promotion evidence policy.
+  artifacts, route registry, benchmark manifests, promotion evidence policy, and
+  the `metal_production_schedules` table (the single source for each generated
+  Metal route's dispatch schedule: threads/cols/reduction).
+- `src/graph/quant_kernel_metal_renderer.zig`: the descriptor-driven Metal
+  renderer. `renderKernel(kernel_id, decoder, schedule, epilogue)` builds a full
+  standalone MSL kernel from one canonical small-batch skeleton parametrized by
+  the schedule, with per-format dequant math supplied as `FormatDecoder` leaf
+  fragments over a shared `antfly_qk_*` vocabulary. This is what makes a route's
+  body a function of its schedule rather than frozen text.
 - `src/backends/metal_kernels.m`: native Metal runtime and provider lowering.
 
 Production Metal compiles the inline kernel copies embedded in
@@ -150,6 +158,59 @@ so the fallback path remains covered.
    The generic `quant-kernel-local-check` stays usable on non-macOS for
    generated-source freshness and CUDA source-policy checks. On macOS it also
    depends on the Metal local gate.
+
+## Schedule Autotuning And Promotion Workflow
+
+A generated Metal route's dispatch schedule (threads per threadgroup, columns
+per threadgroup, reduction strategy) lives in `metal_production_schedules`, and
+the renderer emits the kernel body from it. That makes schedules tunable:
+`quant-kernel-metal-sweep` renders every valid schedule variant for a route,
+benchmarks each on-device against the current production kernel, and reports the
+best worst-shape winner as `antfly.quant_kernel_metal_sweep.v1` evidence.
+
+```sh
+# Sweep all routes (or one) — read-only, changes nothing:
+zig build quant-kernel-metal-sweep -Dmetal=true -Dcuda=false -- \
+  --measure-iters 300 --repeat-runs 3 --sweep-evidence-out /private/tmp/sweep.json
+zig build quant-kernel-metal-sweep -Dmetal=true -Dcuda=false -- --sweep-route q6_k/bias
+```
+
+**Critical caveat — the sweep is a directional filter, not a magnitude oracle.**
+It times kernels through the standalone one-shot-command-buffer harness, whose
+large fixed per-iteration overhead compresses (and can mis-rank) speedups. It
+massively under-reports the real win — a route the sweep rates 1.03x can be ~2.5x
+faster in the decode runtime. Always confirm a candidate schedule with a
+decode-runtime measurement before promoting:
+
+```sh
+# Probe a route's real decode-runtime speedup vs handwritten (evidence path
+# MUST contain the kernel_id):
+zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- \
+  --promotion-ready-kernel <kernel_id> --repeat-runs 5 --measure-iters 500 \
+  --evidence-out /private/tmp/probe-<kernel_id>.json
+```
+
+**Re-tuning an already-promoted route** (change its schedule, keep it promoted):
+edit its `metal_production_schedules` entry, render the new body at that schedule
+(`quant-kernel-metal-check` writes each route's rendered v2 to `/tmp`), paste it
+into the route's `metal_rt_body_*` constant keeping the kernel_id and
+dequant-helper names (identical math, so wiring is untouched), update the
+schedule-marker guardrail tests (e.g. the hybrid reduction's `lane_id >= {N}u`
+where `N = threads/32`), `--write`, then run the production-regression gate. The
+gate's decode-runtime timing is the real arbiter — verify a genuine improvement
+via a before/after A/B (`git stash` the change, re-run the gate), not the sweep.
+
+**Promoting a candidate to production** additionally requires: flip the
+`GeneratedArtifact.production_enabled` to true and update the source constant's
+header; add a `first_metal_runtime_evidence` entry and remove the
+`first_metal_promotion_blocker_evidence` entry (the production-regression suite
+then auto-includes the route via `artifactHasPromotionEvidence`); swap the
+`metal_kernels.m` dispatch gate from `candidate_gate(ENABLE_*)` to
+`promoted_gate(DISABLE_*)` (encoder-family routes) or drop the candidate gate
+(slot-device bias routes, which are pipeline-nil-gated when promoted); and
+update the guardrail count tests (evidence/blocker/route-summary counts, the
+manifest `runtime_gate_env` ENABLE→DISABLE, the route-lowering pins, and the
+`ENABLE`/`DISABLE` env occurrence counts).
 
 ## Promotion Policy
 
@@ -285,11 +346,20 @@ and stays dev-only with blocker evidence, as designed.
 
 ## Current Metal State
 
-The current checked-in state has 8 promoted generated Metal production routes:
-`Q2_K none`, `Q3_K none`, `Q4_K bias`, `Q5_K bias`, `Q6_K none`,
-`Q6_K bias`, `Q8_0 none`, and `Q8_0 bias`.
-The production-regression gate covers 16 generated-vs-handwritten benchmark
+The current checked-in state has 11 promoted generated Metal production routes:
+`Q2_K none`, `Q3_K none`, `Q4_K none`, `Q4_K bias`, `Q5_K none`, `Q5_K bias`,
+`Q6_K none`, `Q6_K bias`, `Q8_0 none`, `Q8_0 bias`, and `Q8_K none`.
+The production-regression gate covers 22 generated-vs-handwritten benchmark
 cases for those routes.
+
+Several of these were re-tuned or newly promoted via the schedule-autotuning
+workflow above: the sweep found that 256-value k-quant routes want a
+higher-thread hybrid-simd reduction (rather than the original simd_sum /
+threadgroup-tree), which the decode-runtime gate confirmed at 2–5x kernel
+speedups vs handwritten. `Q4_K none`, `Q5_K none`, and `Q8_K none` were dev
+candidates that only crossed the promotion bar after that re-tune. `Q4_K
+bias_gelu` clears the bar too but is intentionally left as a dev candidate: it
+is the `first_lazy_*` route that anchors the blocked-candidate test coverage.
 
 Runtime-wired generated candidates that are not promoted stay on handwritten
 production dispatch by default. They remain opt-in through
@@ -468,3 +538,22 @@ The minimal path is:
 
 Do not add a general compiler abstraction unless it removes real duplicated
 format/schedule work in this file and the backend lowering.
+
+## Extension Points
+
+**CUDA renderer.** The `KernelSchedule` / `FormatDecoder` data model in
+`quant_kernel_metal_renderer.zig` is backend-neutral by design. A CUDA renderer
+would add a `lane_decode_cuda` fragment per `FormatDecoder` and a CUDA skeleton
+that consumes the same `KernelSchedule`, reusing the sweep and promotion
+machinery unchanged (the sweep harness already benchmarks any kernel from source
+text). Only the Metal renderer exists today; the CUDA generated kernels remain
+the checked-in hand-written `.cu` templates.
+
+**Further single-sourcing.** The renderer currently produces v2 kernels that are
+checked in as the `metal_rt_body_*` constants (re-tuned routes paste the
+renderer's output into the constant). A future step is to have the codegen tool
+render the `metal_runtime_quant_sections` bodies directly from
+`metal_production_schedules` at `--write` time, so the frozen body constants go
+away entirely and a schedule edit fully regenerates the kernel. That is a larger
+refactor of the comptime source path and is deliberately deferred; the current
+in-place body-swap workflow is documented above.
