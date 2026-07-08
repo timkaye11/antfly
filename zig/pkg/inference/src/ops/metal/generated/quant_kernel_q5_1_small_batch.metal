@@ -24,64 +24,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float antfly_half_le_to_float(const device uchar *p) {
-    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    return (float)as_type<half>(bits);
-}
-
-static inline uint antfly_u32_le(const device uchar *p) {
-    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-}
-
-static inline float antfly_q5_1_dequant_lane(const device uchar *block, int lane) {
-    const float d = antfly_half_le_to_float(block);
-    const float m = antfly_half_le_to_float(block + 2);
-    const uint qh = antfly_u32_le(block + 4);
-    const int packed_index = lane & 15;
-    const uchar packed = block[8 + packed_index];
-    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    const int high = (int)((qh >> (uint)lane) & 1u);
-    return d * (float)(low4 | (high << 4)) + m;
-}
-
-kernel void antfly_q5_1_small_batch_msl_v1(
-    const device float *input [[buffer(0)]],
-    const device uchar *weight_q5_1 [[buffer(1)]],
-    device float *output [[buffer(2)]],
-    constant int &rows [[buffer(3)]],
-    constant int &in_dim [[buffer(4)]],
-    constant int &out_dim [[buffer(5)]],
-    uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
-) {
-    const uint tid = thread_pos.x;
-    const int col0 = (int)(group_pos.x << 1);
-    const int col1 = col0 + 1;
-    const int row = (int)group_pos.y;
-    if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return;
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const int block_count = in_dim >> 5;
-    const int lane = (int)tid;
-    const device float *row_input = input + row * in_dim;
-    const device uchar *col0_weight = weight_q5_1 + col0 * block_count * 24;
-    const bool has_col1 = col1 < out_dim;
-    const device uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;
-    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-        const float x = row_input[(block_idx << 5) + lane];
-        const device uchar *block0 = col0_weight + block_idx * 24;
-        acc0 += x * antfly_q5_1_dequant_lane(block0, lane);
-        if (has_col1) {
-            const device uchar *block1 = col1_weight + block_idx * 24;
-            acc1 += x * antfly_q5_1_dequant_lane(block1, lane);
-        }
-    }
-
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
-    if (tid == 0) {
-        output[row * out_dim + col0] = acc0;
-        if (has_col1) output[row * out_dim + col1] = acc1;
-    }
+inline float antfly_q5_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
+inline uint antfly_q5_1_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
+inline float antfly_q5_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q5_1_half_le_to_float(block); float m = antfly_q5_1_half_le_to_float(block + 2); uint qh = antfly_q5_1_u32_le(block + 4); int packed_index = lane & 15; uchar packed = block[8 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float(low4 | (high << 4)) + m; }
+kernel void antfly_q5_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
+    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q5_1 + col0 * block_count * 24; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;
+    for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 24; acc0 += x * antfly_q5_1_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 24; acc1 += x * antfly_q5_1_dequant_lane(block1, lane); } }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = acc0; if (has_col1) output[row * out_dim + col1] = acc1; }
 }

@@ -3521,7 +3521,18 @@ const first_general_cuda_q4_0_down_q8_source =
     \\
 ;
 
-const first_lazy_metal_source =
+// ---------------------------------------------------------------------------
+// Codegen-owned Metal small-batch quant kernel region.
+//
+// The MSL text below is the single source of truth for both the checked-in
+// generated sources under src/ops/metal/generated/ and the runtime-embedded
+// copy in src/backends/metal_kernels.m (the marker-delimited region that
+// `zig build quant-kernel-codegen -- --write` rewrites). Production Metal
+// compiles the metal_kernels.m region, which is assembled verbatim from the
+// section table below, so the two copies cannot drift by construction.
+// ---------------------------------------------------------------------------
+
+const metal_generated_source_license_header =
     \\// Copyright 2026 Antfly, Inc.
     \\//
     \\// Licensed under the Apache License, Version 2.0 (the "License");
@@ -3535,2202 +3546,848 @@ const first_lazy_metal_source =
     \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
     \\// See the License for the specific language governing permissions and
     \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q4_k/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q4_k_small_batch_bias_gelu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_gelu(float x) {
-    \\    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    \\    return 0.5f * x * (1.0f + fast::tanh(inner));
-    \\}
-    \\
-    \\static inline void antfly_q4_k_unpack_scale_min(
-    \\    const device uchar *scales,
-    \\    int sub,
-    \\    thread float &scale,
-    \\    thread float &min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        scale = (float)(scales[sub] & 63u);
-    \\        min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static inline float antfly_q4_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const device uchar *d = block;
-    \\    const device uchar *dmin = block + 2;
-    \\    const device uchar *scales = block + 4;
-    \\    const device uchar *qs = block + 16;
-    \\    const int sub = lane >> 5;
-    \\    const int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    const uchar packed = qs[q_index];
-    \\    const uchar q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return antfly_half_le_to_float(d) * raw_scale * (float)q - antfly_half_le_to_float(dmin) * raw_min;
-    \\}
-    \\
-    \\kernel void antfly_q4_k_small_batch_bias_gelu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q4_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 64) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144);
-    \\            const int base = block_idx << 8;
-    \\            for (int lane = (int)tid; lane < 256; lane += 64) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[64];
-    \\    if (tid < 64) partial[tid] = acc;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = 32; stride > 0; stride >>= 1) {
-    \\        if (tid < stride) partial[tid] += partial[tid + stride];
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    if (tid == 0) output[row * out_dim + col] = antfly_gelu(partial[0] + bias[col]);
-    \\}
-    \\
 ;
 
-const first_general_metal_q4_0_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q4_0/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q4_0_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q4_0_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const int packed_index = lane & 15;
-    \\    const uchar packed = block[2 + packed_index];
-    \\    const int q = lane < 16 ? (int)(packed & 0x0fu) - 8 : (int)(packed >> 4) - 8;
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q4_0_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q4_0 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q4_0 + ((col * block_count + block_idx) * 18);
-    \\            const int lane = (int)tid;
-    \\            acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q4_0_dequant_lane(block, lane);
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q4_0_half_le_to_float =
+    \\inline float antfly_q4_0_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q4_1_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q4_1/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q4_1_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q4_1_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const float m = antfly_half_le_to_float(block + 2);
-    \\    const int packed_index = lane & 15;
-    \\    const uchar packed = block[4 + packed_index];
-    \\    const int q = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    \\    return d * (float)q + m;
-    \\}
-    \\
-    \\kernel void antfly_q4_1_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q4_1 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col0 = (int)(group_pos.x << 1);
-    \\    const int col1 = col0 + 1;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc0 = 0.0f;
-    \\    float acc1 = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    const int lane = (int)tid;
-    \\    const device float *row_input = input + row * in_dim;
-    \\    const device uchar *col0_weight = weight_q4_1 + col0 * block_count * 20;
-    \\    const bool has_col1 = col1 < out_dim;
-    \\    const device uchar *col1_weight = has_col1 ? weight_q4_1 + col1 * block_count * 20 : col0_weight;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\        const float x = row_input[(block_idx << 5) + lane];
-    \\        const device uchar *block0 = col0_weight + block_idx * 20;
-    \\        acc0 += x * antfly_q4_1_dequant_lane(block0, lane);
-    \\        if (has_col1) {
-    \\            const device uchar *block1 = col1_weight + block_idx * 20;
-    \\            acc1 += x * antfly_q4_1_dequant_lane(block1, lane);
-    \\        }
-    \\    }
-    \\
-    \\    acc0 = simd_sum(acc0);
-    \\    acc1 = simd_sum(acc1);
-    \\    if (tid == 0) {
-    \\        output[row * out_dim + col0] = acc0;
-    \\        if (has_col1) output[row * out_dim + col1] = acc1;
-    \\    }
-    \\}
-    \\
+const metal_rt_helper_antfly_q4_0_dequant_lane =
+    \\inline float antfly_q4_0_dequant_lane(device const uchar *block, int lane) { float d = antfly_q4_0_half_le_to_float(block); int packed_index = lane & 15; uchar packed = block[2 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) - 8 : int(packed >> 4) - 8; return d * float(q); }
 ;
 
-const first_general_metal_q5_0_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q5_0/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q5_0_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// Route metadata is checked in, but production dispatch stays on the
-    \\// handwritten Metal path until this candidate clears correctness and
-    \\// benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline uint antfly_u32_le(const device uchar *p) {
-    \\    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-    \\}
-    \\
-    \\static inline float antfly_q5_0_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const uint qh = antfly_u32_le(block + 2);
-    \\    const int packed_index = lane & 15;
-    \\    const uchar packed = block[6 + packed_index];
-    \\    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    \\    const int high = (int)((qh >> (uint)lane) & 1u);
-    \\    return d * (float)((low4 | (high << 4)) - 16);
-    \\}
-    \\
-    \\kernel void antfly_q5_0_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q5_0 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q5_0 + ((col * block_count + block_idx) * 22);
-    \\            const int lane = (int)tid;
-    \\            acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q5_0_dequant_lane(block, lane);
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q4_1_half_le_to_float =
+    \\inline float antfly_q4_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q5_1_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q5_1/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q5_1_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// Route metadata is checked in, but production dispatch stays on the
-    \\// handwritten Metal path until this candidate clears correctness and
-    \\// benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline uint antfly_u32_le(const device uchar *p) {
-    \\    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-    \\}
-    \\
-    \\static inline float antfly_q5_1_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const float m = antfly_half_le_to_float(block + 2);
-    \\    const uint qh = antfly_u32_le(block + 4);
-    \\    const int packed_index = lane & 15;
-    \\    const uchar packed = block[8 + packed_index];
-    \\    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    \\    const int high = (int)((qh >> (uint)lane) & 1u);
-    \\    return d * (float)(low4 | (high << 4)) + m;
-    \\}
-    \\
-    \\kernel void antfly_q5_1_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q5_1 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col0 = (int)(group_pos.x << 1);
-    \\    const int col1 = col0 + 1;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc0 = 0.0f;
-    \\    float acc1 = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    const int lane = (int)tid;
-    \\    const device float *row_input = input + row * in_dim;
-    \\    const device uchar *col0_weight = weight_q5_1 + col0 * block_count * 24;
-    \\    const bool has_col1 = col1 < out_dim;
-    \\    const device uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\        const float x = row_input[(block_idx << 5) + lane];
-    \\        const device uchar *block0 = col0_weight + block_idx * 24;
-    \\        acc0 += x * antfly_q5_1_dequant_lane(block0, lane);
-    \\        if (has_col1) {
-    \\            const device uchar *block1 = col1_weight + block_idx * 24;
-    \\            acc1 += x * antfly_q5_1_dequant_lane(block1, lane);
-    \\        }
-    \\    }
-    \\
-    \\    acc0 = simd_sum(acc0);
-    \\    acc1 = simd_sum(acc1);
-    \\    if (tid == 0) {
-    \\        output[row * out_dim + col0] = acc0;
-    \\        if (has_col1) output[row * out_dim + col1] = acc1;
-    \\    }
-    \\}
-    \\
+const metal_rt_helper_antfly_q4_1_dequant_lane =
+    \\inline float antfly_q4_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q4_1_half_le_to_float(block); float m = antfly_q4_1_half_le_to_float(block + 2); int packed_index = lane & 15; uchar packed = block[4 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); return d * float(q) + m; }
 ;
 
-const first_general_metal_q4_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q4_k/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q4_k_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline void antfly_q4_k_unpack_scale_min(
-    \\    const device uchar *scales,
-    \\    int sub,
-    \\    thread float &scale,
-    \\    thread float &min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        scale = (float)(scales[sub] & 63u);
-    \\        min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static inline float antfly_q4_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const device uchar *d = block;
-    \\    const device uchar *dmin = block + 2;
-    \\    const device uchar *scales = block + 4;
-    \\    const device uchar *qs = block + 16;
-    \\    const int sub = lane >> 5;
-    \\    const int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    const uchar packed = qs[q_index];
-    \\    const uchar q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return antfly_half_le_to_float(d) * raw_scale * (float)q - antfly_half_le_to_float(dmin) * raw_min;
-    \\}
-    \\
-    \\kernel void antfly_q4_k_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q4_k [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    threadgroup float partial[64];
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 64) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144);
-    \\            const int base = block_idx << 8;
-    \\            for (int lane = (int)tid; lane < 256; lane += 64) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    if (tid < 64) partial[tid] = acc;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = 32; stride > 0; stride >>= 1) {
-    \\        if (tid < stride) partial[tid] += partial[tid + stride];
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    if (tid == 0) output[row * out_dim + col] = partial[0];
-    \\}
-    \\
+const metal_rt_helper_antfly_q5_0_half_le_to_float =
+    \\inline float antfly_q5_0_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q4_bias_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q4_k/rows_2_8/bias/small_batch
-    \\// kernel_id=antfly_q4_k_small_batch_bias_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline void antfly_q4_k_unpack_scale_min(
-    \\    const device uchar *scales,
-    \\    int sub,
-    \\    thread float &scale,
-    \\    thread float &min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        scale = (float)(scales[sub] & 63u);
-    \\        min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static inline float antfly_q4_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const device uchar *d = block;
-    \\    const device uchar *dmin = block + 2;
-    \\    const device uchar *scales = block + 4;
-    \\    const device uchar *qs = block + 16;
-    \\    const int sub = lane >> 5;
-    \\    const int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    const uchar packed = qs[q_index];
-    \\    const uchar q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return antfly_half_le_to_float(d) * raw_scale * (float)q - antfly_half_le_to_float(dmin) * raw_min;
-    \\}
-    \\
-    \\kernel void antfly_q4_k_small_batch_bias_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q4_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]],
-    \\    ushort lane_id [[thread_index_in_simdgroup]],
-    \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 64) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144);
-    \\            const int base = block_idx << 8;
-    \\            for (int lane = (int)tid; lane < 256; lane += 64) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[64];
-    \\    if (tid < 64) partial[tid] = acc;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = 32; stride > 0; stride >>= 1) {
-    \\        if (tid < stride) partial[tid] += partial[tid + stride];
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    if (tid == 0) output[row * out_dim + col] = partial[0] + bias[col];
-    \\}
-    \\
+const metal_rt_helper_antfly_q5_0_u32_le =
+    \\inline uint antfly_q5_0_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
 ;
 
-const first_general_metal_q8_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q8_0/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q8_0_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const int q = (int)as_type<char>(block[2 + lane]);
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q8_0_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q8_0 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    const int lane = (int)tid;
-    \\    const device float *row_input = input + row * in_dim;
-    \\    const device uchar *col_weight = weight_q8_0 + col * block_count * 34;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\        const device uchar *block = col_weight + block_idx * 34;
-    \\        acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane);
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q5_0_dequant_lane =
+    \\inline float antfly_q5_0_dequant_lane(device const uchar *block, int lane) { float d = antfly_q5_0_half_le_to_float(block); uint qh = antfly_q5_0_u32_le(block + 2); int packed_index = lane & 15; uchar packed = block[6 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float((low4 | (high << 4)) - 16); }
 ;
 
-const first_general_metal_q8_bias_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q8_0/rows_2_8/bias/small_batch
-    \\// kernel_id=antfly_q8_0_small_batch_bias_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const int q = (int)as_type<char>(block[2 + lane]);
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q8_0_small_batch_bias_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q8_0 [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]],
-    \\    ushort lane_id [[thread_index_in_simdgroup]],
-    \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    const int lane = (int)tid;
-    \\    const device float *row_input = input + row * in_dim;
-    \\    const device uchar *col_weight = weight_q8_0 + col * block_count * 34;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\        const device uchar *block = col_weight + block_idx * 34;
-    \\        acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane);
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc + bias[col];
-    \\}
-    \\
+const metal_rt_helper_antfly_q5_1_half_le_to_float =
+    \\inline float antfly_q5_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q8_bias_gelu_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q8_0/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q8_0_small_batch_bias_gelu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const int q = (int)as_type<char>(block[2 + lane]);
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\static inline float antfly_gelu(float x) {
-    \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\}
-    \\
-    \\kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q8_0 [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    const int lane = (int)tid;
-    \\    const device float *row_input = input + row * in_dim;
-    \\    const device uchar *col_weight = weight_q8_0 + col * block_count * 34;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\        const float x = row_input[(block_idx << 5) + lane];
-    \\        const device uchar *block = col_weight + block_idx * 34;
-    \\        acc += x * antfly_q8_0_dequant_lane(block, lane);
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) {
-    \\        output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
-    \\    }
-    \\}
-    \\
+const metal_rt_helper_antfly_q5_1_u32_le =
+    \\inline uint antfly_q5_1_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
 ;
 
-const first_general_metal_q8_relu_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q8_0/rows_2_8/relu/small_batch
-    \\// kernel_id=antfly_q8_0_small_batch_relu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const int q = (int)as_type<char>(block[2 + lane]);
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q8_0_small_batch_relu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q8_0 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q8_0 + ((col * block_count + block_idx) * 34);
-    \\            const int lane = (int)tid;
-    \\            acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane);
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = max(acc, 0.0f);
-    \\}
-    \\
+const metal_rt_helper_antfly_q5_1_dequant_lane =
+    \\inline float antfly_q5_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q5_1_half_le_to_float(block); float m = antfly_q5_1_half_le_to_float(block + 2); uint qh = antfly_q5_1_u32_le(block + 4); int packed_index = lane & 15; uchar packed = block[8 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float(low4 | (high << 4)) + m; }
 ;
 
-const first_general_metal_q2_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q2_k/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q2_k_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q2_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const uint sub = (uint)lane >> 4;
-    \\    const uint i = (uint)lane & 15u;
-    \\    const uchar scale_byte = block[sub];
-    \\    const float dsc = antfly_half_le_to_float(block + 16) * (float)(scale_byte & 0x0Fu);
-    \\    const float dmn = antfly_half_le_to_float(block + 18) * (float)(scale_byte >> 4);
-    \\    const uint chunk = sub >> 3;
-    \\    const uint group = (sub & 7u) >> 1;
-    \\    const uint l_base = (sub & 1u) << 4;
-    \\    const uint q_base = chunk << 5;
-    \\    const uint shift = group << 1;
-    \\    const uint q = ((uint)block[20 + q_base + l_base + i] >> shift) & 0x03u;
-    \\    return dsc * (float)q - dmn;
-    \\}
-    \\
-    \\kernel void antfly_q2_k_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q2_k [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q2_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q8_1_half_le_to_float =
+    \\inline float antfly_q8_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q2_bias_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q2_k/rows_2_8/bias/small_batch
-    \\// kernel_id=antfly_q2_k_small_batch_bias_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q2_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const uint sub = (uint)lane >> 4;
-    \\    const uint i = (uint)lane & 15u;
-    \\    const uchar scale_byte = block[sub];
-    \\    const float dsc = antfly_half_le_to_float(block + 16) * (float)(scale_byte & 0x0Fu);
-    \\    const float dmn = antfly_half_le_to_float(block + 18) * (float)(scale_byte >> 4);
-    \\    const uint chunk = sub >> 3;
-    \\    const uint group = (sub & 7u) >> 1;
-    \\    const uint l_base = (sub & 1u) << 4;
-    \\    const uint q_base = chunk << 5;
-    \\    const uint shift = group << 1;
-    \\    const uint q = ((uint)block[20 + q_base + l_base + i] >> shift) & 0x03u;
-    \\    return dsc * (float)q - dmn;
-    \\}
-    \\
-    \\kernel void antfly_q2_k_small_batch_bias_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q2_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q2_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc + bias[col];
-    \\}
-    \\
+const metal_rt_helper_antfly_q8_1_dequant_lane =
+    \\inline float antfly_q8_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q8_1_half_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }
 ;
 
-const first_general_metal_q2_bias_gelu_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q2_k/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q2_k_small_batch_bias_gelu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_gelu(float x) {
-    \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\}
-    \\
-    \\static inline float antfly_q2_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const uint sub = (uint)lane >> 4;
-    \\    const uint i = (uint)lane & 15u;
-    \\    const uchar scale_byte = block[sub];
-    \\    const float dsc = antfly_half_le_to_float(block + 16) * (float)(scale_byte & 0x0Fu);
-    \\    const float dmn = antfly_half_le_to_float(block + 18) * (float)(scale_byte >> 4);
-    \\    const uint chunk = sub >> 3;
-    \\    const uint group = (sub & 7u) >> 1;
-    \\    const uint l_base = (sub & 1u) << 4;
-    \\    const uint q_base = chunk << 5;
-    \\    const uint shift = group << 1;
-    \\    const uint q = ((uint)block[20 + q_base + l_base + i] >> shift) & 0x03u;
-    \\    return dsc * (float)q - dmn;
-    \\}
-    \\
-    \\kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q2_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q2_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
-    \\}
-    \\
+const metal_rt_helper_antfly_q8_k_f32_le_to_float =
+    \\inline float antfly_q8_k_f32_le_to_float(device const uchar *p) { uint bits = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); return as_type<float>(bits); }
 ;
 
-const first_general_metal_q3_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q3_k/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q3_k_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline int antfly_q3_k_raw_scale(const device uchar *scale_data, uint sub) {
-    \\    const uint i = sub & 3u;
-    \\    uint low = 0u;
-    \\    uint high = 0u;
-    \\    if (sub < 4u) {
-    \\        low = (uint)(scale_data[i] & 0x0Fu);
-    \\        high = (uint)(scale_data[8 + i] & 0x03u);
-    \\    } else if (sub < 8u) {
-    \\        low = (uint)(scale_data[4 + i] & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 2) & 0x03u);
-    \\    } else if (sub < 12u) {
-    \\        low = (uint)((scale_data[i] >> 4) & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 4) & 0x03u);
-    \\    } else {
-    \\        low = (uint)((scale_data[4 + i] >> 4) & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 6) & 0x03u);
-    \\    }
-    \\    return (int)(low | (high << 4)) - 32;
-    \\}
-    \\
-    \\static inline float antfly_q3_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const uint sub = (uint)lane >> 4;
-    \\    const uint i = (uint)lane & 15u;
-    \\    const uint chunk = sub >> 3;
-    \\    const uint group = (sub & 7u) >> 1;
-    \\    const uint l_base = (sub & 1u) << 4;
-    \\    const uint l = l_base + i;
-    \\    const uint q_base = chunk << 5;
-    \\    const uint shift = group << 1;
-    \\    const uint hm_bit = (chunk << 2) + group;
-    \\    const int low2 = (int)(((uint)block[32 + q_base + l] >> shift) & 0x03u);
-    \\    const int high1 = (int)(((uint)block[l] >> hm_bit) & 0x01u);
-    \\    const int q = low2 + high1 * 4 - 4;
-    \\    const float scale = antfly_half_le_to_float(block + 108) * (float)antfly_q3_k_raw_scale(block + 96, sub);
-    \\    return scale * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q3_k_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q3_k [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q3_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q8_k_dequant_lane =
+    \\inline float antfly_q8_k_dequant_lane(device const uchar *block, int lane) { float d = antfly_q8_k_f32_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }
 ;
 
-const first_general_metal_q3_bias_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q3_k/rows_2_8/bias/small_batch
-    \\// kernel_id=antfly_q3_k_small_batch_bias_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline int antfly_q3_k_raw_scale(const device uchar *scale_data, uint sub) {
-    \\    const uint i = sub & 3u;
-    \\    uint low = 0u;
-    \\    uint high = 0u;
-    \\    if (sub < 4u) {
-    \\        low = (uint)(scale_data[i] & 0x0Fu);
-    \\        high = (uint)(scale_data[8 + i] & 0x03u);
-    \\    } else if (sub < 8u) {
-    \\        low = (uint)(scale_data[4 + i] & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 2) & 0x03u);
-    \\    } else if (sub < 12u) {
-    \\        low = (uint)((scale_data[i] >> 4) & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 4) & 0x03u);
-    \\    } else {
-    \\        low = (uint)((scale_data[4 + i] >> 4) & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 6) & 0x03u);
-    \\    }
-    \\    return (int)(low | (high << 4)) - 32;
-    \\}
-    \\
-    \\static inline float antfly_q3_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const uint sub = (uint)lane >> 4;
-    \\    const uint i = (uint)lane & 15u;
-    \\    const uint chunk = sub >> 3;
-    \\    const uint group = (sub & 7u) >> 1;
-    \\    const uint l_base = (sub & 1u) << 4;
-    \\    const uint l = l_base + i;
-    \\    const uint q_base = chunk << 5;
-    \\    const uint shift = group << 1;
-    \\    const uint hm_bit = (chunk << 2) + group;
-    \\    const int low2 = (int)(((uint)block[32 + q_base + l] >> shift) & 0x03u);
-    \\    const int high1 = (int)(((uint)block[l] >> hm_bit) & 0x01u);
-    \\    const int q = low2 + high1 * 4 - 4;
-    \\    const float scale = antfly_half_le_to_float(block + 108) * (float)antfly_q3_k_raw_scale(block + 96, sub);
-    \\    return scale * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q3_k_small_batch_bias_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q3_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q3_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc + bias[col];
-    \\}
-    \\
+const metal_rt_helper_antfly_q2_k_half_le_to_float =
+    \\inline float antfly_q2_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q3_bias_gelu_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q3_k/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q3_k_small_batch_bias_gelu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=false
-    \\// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-    \\// Production Metal dispatch stays on native handwritten MSL until this
-    \\// candidate clears correctness and benchmark gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
+const metal_rt_helper_antfly_q2_k_dequant_lane =
+    \\inline float antfly_q2_k_dequant_lane(device const uchar *block, int lane) {
+    \\    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uchar scale_byte = block[sub]; float dsc = antfly_q2_k_half_le_to_float(block + 16) * float(scale_byte & 0x0fu); float dmn = antfly_q2_k_half_le_to_float(block + 18) * float(scale_byte >> 4);
+    \\    uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;
+    \\    return dsc * float(q) - dmn;
     \\}
-    \\
-    \\static inline float antfly_gelu(float x) {
-    \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\}
-    \\
-    \\static inline int antfly_q3_k_raw_scale(const device uchar *scale_data, uint sub) {
-    \\    const uint i = sub & 3u;
-    \\    uint low = 0u;
-    \\    uint high = 0u;
-    \\    if (sub < 4u) {
-    \\        low = (uint)(scale_data[i] & 0x0Fu);
-    \\        high = (uint)(scale_data[8 + i] & 0x03u);
-    \\    } else if (sub < 8u) {
-    \\        low = (uint)(scale_data[4 + i] & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 2) & 0x03u);
-    \\    } else if (sub < 12u) {
-    \\        low = (uint)((scale_data[i] >> 4) & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 4) & 0x03u);
-    \\    } else {
-    \\        low = (uint)((scale_data[4 + i] >> 4) & 0x0Fu);
-    \\        high = (uint)((scale_data[8 + i] >> 6) & 0x03u);
-    \\    }
-    \\    return (int)(low | (high << 4)) - 32;
-    \\}
-    \\
-    \\static inline float antfly_q3_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const uint sub = (uint)lane >> 4;
-    \\    const uint i = (uint)lane & 15u;
-    \\    const uint chunk = sub >> 3;
-    \\    const uint group = (sub & 7u) >> 1;
-    \\    const uint l_base = (sub & 1u) << 4;
-    \\    const uint l = l_base + i;
-    \\    const uint q_base = chunk << 5;
-    \\    const uint shift = group << 1;
-    \\    const uint hm_bit = (chunk << 2) + group;
-    \\    const int low2 = (int)(((uint)block[32 + q_base + l] >> shift) & 0x03u);
-    \\    const int high1 = (int)(((uint)block[l] >> hm_bit) & 0x01u);
-    \\    const int q = low2 + high1 * 4 - 4;
-    \\    const float scale = antfly_half_le_to_float(block + 108) * (float)antfly_q3_k_raw_scale(block + 96, sub);
-    \\    return scale * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q3_k_small_batch_bias_gelu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q3_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q3_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
-    \\}
-    \\
 ;
 
-const first_general_metal_q8_1_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q8_1/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q8_1_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q8_1_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_half_le_to_float(block);
-    \\    const int q = (int)as_type<char>(block[4 + lane]);
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q8_1_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q8_1 [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 5;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q8_1 + ((col * block_count + block_idx) * 36);
-    \\            const int lane = (int)tid;
-    \\            acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q8_1_dequant_lane(block, lane);
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q2_k_gelu =
+    \\inline float antfly_q2_k_gelu(float x) { return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
 ;
 
-const first_general_metal_q8_k_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q8_k/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q8_k_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_f32_le_to_float(const device uchar *p) {
-    \\    const uint bits = (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-    \\    return as_type<float>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q8_k_dequant_lane(const device uchar *block, int lane) {
-    \\    const float d = antfly_f32_le_to_float(block);
-    \\    const int q = (int)as_type<char>(block[4 + lane]);
-    \\    return d * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q8_k_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q8_k [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 32) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q8_k + ((col * block_count + block_idx) * 292);
-    \\            for (int lane = (int)tid; lane < 256; lane += 32) {
-    \\                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q8_k_dequant_lane(block, lane);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    acc = simd_sum(acc);
-    \\    if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-    \\
+const metal_rt_helper_antfly_q3_k_half_le_to_float =
+    \\inline float antfly_q3_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q5_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q5_k/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q5_k_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
+const metal_rt_helper_antfly_q3_k_raw_scale =
+    \\inline int antfly_q3_k_raw_scale(device const uchar *scale_data, uint sub) {
+    \\    uint i = sub & 3u; uint low = 0u; uint high = 0u;
+    \\    if (sub < 4u) { low = uint(scale_data[i] & 0x0fu); high = uint(scale_data[8u + i] & 0x03u); }
+    \\    else if (sub < 8u) { low = uint(scale_data[4u + i] & 0x0fu); high = uint((scale_data[8u + i] >> 2) & 0x03u); }
+    \\    else if (sub < 12u) { low = uint((scale_data[i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 4) & 0x03u); }
+    \\    else { low = uint((scale_data[4u + i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 6) & 0x03u); }
+    \\    return int(low | (high << 4)) - 32;
     \\}
-    \\
-    \\static inline void antfly_q5_k_unpack_scale_min(
-    \\    const device uchar *scales,
-    \\    int sub,
-    \\    thread float &scale,
-    \\    thread float &min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        scale = (float)(scales[sub] & 63u);
-    \\        min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin) {
-    \\    const device uchar *scales = block + 4;
-    \\    const device uchar *qh = block + 16;
-    \\    const device uchar *ql = block + 48;
-    \\    const int sub = lane >> 5;
-    \\    const int i = lane & 31;
-    \\    const int q_index = (sub >> 1) * 32 + i;
-    \\    const uchar packed = ql[q_index];
-    \\    const int low = (sub & 1) == 0 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    \\    const int high = (int)((qh[i] >> sub) & 1u);
-    \\    const int q = low + high * 16;
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return d * raw_scale * (float)q - dmin * raw_min;
-    \\}
-    \\
-    \\kernel void antfly_q5_k_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q5_k [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 64) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176);
-    \\            const int base = block_idx << 8;
-    \\            const float d = antfly_half_le_to_float(block);
-    \\            const float dmin = antfly_half_le_to_float(block + 2);
-    \\            for (int lane = (int)tid; lane < 256; lane += 64) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane, d, dmin);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[64];
-    \\    if (tid < 64) partial[tid] = acc;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = 32; stride > 0; stride >>= 1) {
-    \\        if (tid < stride) partial[tid] += partial[tid + stride];
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    if (tid == 0) output[row * out_dim + col] = partial[0];
-    \\}
-    \\
 ;
 
-const first_general_metal_q5_bias_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q5_k/rows_2_8/bias/small_batch
-    \\// kernel_id=antfly_q5_k_small_batch_bias_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
+const metal_rt_helper_antfly_q3_k_dequant_lane =
+    \\inline float antfly_q3_k_dequant_lane(device const uchar *block, int lane) {
+    \\    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l = ((sub & 1u) << 4) + i; uint q_base = chunk << 5; uint shift = group << 1; uint hm_bit = (chunk << 2) + group;
+    \\    int low2 = int((uint(block[32u + q_base + l]) >> shift) & 0x03u); int high1 = int((uint(block[l]) >> hm_bit) & 0x01u); int q = low2 + high1 * 4 - 4;
+    \\    return antfly_q3_k_half_le_to_float(block + 108) * float(antfly_q3_k_raw_scale(block + 96, sub)) * float(q);
     \\}
-    \\
-    \\static inline void antfly_q5_k_unpack_scale_min(
-    \\    const device uchar *scales,
-    \\    int sub,
-    \\    thread float &scale,
-    \\    thread float &min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        scale = (float)(scales[sub] & 63u);
-    \\        min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin) {
-    \\    const device uchar *scales = block + 4;
-    \\    const device uchar *qh = block + 16;
-    \\    const device uchar *ql = block + 48;
-    \\    const int sub = lane >> 5;
-    \\    const int i = lane & 31;
-    \\    const int q_index = (sub >> 1) * 32 + i;
-    \\    const uchar packed = ql[q_index];
-    \\    const int low = (sub & 1) == 0 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    \\    const int high = (int)((qh[i] >> sub) & 1u);
-    \\    const int q = low + high * 16;
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return d * raw_scale * (float)q - dmin * raw_min;
-    \\}
-    \\
-    \\kernel void antfly_q5_k_small_batch_bias_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q5_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]],
-    \\    ushort lane_id [[thread_index_in_simdgroup]],
-    \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 128) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176);
-    \\            const int base = block_idx << 8;
-    \\            const float d = antfly_half_le_to_float(block);
-    \\            const float dmin = antfly_half_le_to_float(block + 2);
-    \\            for (int lane = (int)tid; lane < 256; lane += 128) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane, d, dmin);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[32];
-    \\    acc = simd_sum(acc);
-    \\    if (lane_id == 0u) partial[simdgroup_id] = acc;
-    \\    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    const float total = simd_sum(partial[lane_id]);
-    \\    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
-    \\}
-    \\
 ;
 
-const first_general_metal_q5_bias_gelu_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q5_k/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q5_k_small_batch_bias_gelu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_gelu(float x) {
-    \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\}
-    \\
-    \\static inline void antfly_q5_k_unpack_scale_min(
-    \\    const device uchar *scales,
-    \\    int sub,
-    \\    thread float &scale,
-    \\    thread float &min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        scale = (float)(scales[sub] & 63u);
-    \\        min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin) {
-    \\    const device uchar *scales = block + 4;
-    \\    const device uchar *qh = block + 16;
-    \\    const device uchar *ql = block + 48;
-    \\    const int sub = lane >> 5;
-    \\    const int i = lane & 31;
-    \\    const int q_index = (sub >> 1) * 32 + i;
-    \\    const uchar packed = ql[q_index];
-    \\    const int low = (sub & 1) == 0 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-    \\    const int high = (int)((qh[i] >> sub) & 1u);
-    \\    const int q = low + high * 16;
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return d * raw_scale * (float)q - dmin * raw_min;
-    \\}
-    \\
-    \\kernel void antfly_q5_k_small_batch_bias_gelu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q5_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]],
-    \\    ushort lane_id [[thread_index_in_simdgroup]],
-    \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 128) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176);
-    \\            const int base = block_idx << 8;
-    \\            const float d = antfly_half_le_to_float(block);
-    \\            const float dmin = antfly_half_le_to_float(block + 2);
-    \\            for (int lane = (int)tid; lane < 256; lane += 128) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane, d, dmin);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[32];
-    \\    acc = simd_sum(acc);
-    \\    if (lane_id == 0u) partial[simdgroup_id] = acc;
-    \\    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    const float total = simd_sum(partial[lane_id]);
-    \\    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_gelu(total + bias[col]);
-    \\}
-    \\
+const metal_rt_helper_antfly_q3_k_gelu =
+    \\inline float antfly_q3_k_gelu(float x) { return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
 ;
 
-const first_general_metal_q6_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q6_k/rows_2_8/none/small_batch
-    \\// kernel_id=antfly_q6_k_small_batch_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
-    \\}
-    \\
-    \\static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {
-    \\    const device uchar *ql = block;
-    \\    const device uchar *qh = block + 128;
-    \\    const device uchar *scales = block + 192;
-    \\    const int sub = lane >> 4;
-    \\    const int i = lane & 15;
-    \\    const int half_idx = sub >> 3;
-    \\    const int group = (sub & 7) >> 1;
-    \\    const int l = ((sub & 1) << 4) + i;
-    \\    const int ql_off = half_idx * 64 + (group & 1) * 32;
-    \\    const int qh_off = half_idx * 32;
-    \\    const int qh_shift = group * 2;
-    \\    const int nibble_shift = (group >> 1) * 4;
-    \\    const int low4 = (int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-    \\    const int high2 = (int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-    \\    const int q = (low4 | (high2 << 4)) - 32;
-    \\    const int scale_u = (int)scales[sub];
-    \\    const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-    \\    return d * (float)scale * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q6_k_small_batch_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q6_k [[buffer(1)]],
-    \\    device float *output [[buffer(2)]],
-    \\    constant int &rows [[buffer(3)]],
-    \\    constant int &in_dim [[buffer(4)]],
-    \\    constant int &out_dim [[buffer(5)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 128) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210);
-    \\            const int base = block_idx << 8;
-    \\            const float d = antfly_half_le_to_float(block + 208);
-    \\            for (int lane = (int)tid; lane < 256; lane += 128) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[128];
-    \\    if (tid < 128) partial[tid] = acc;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = 64; stride > 0; stride >>= 1) {
-    \\        if (tid < stride) partial[tid] += partial[tid + stride];
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    if (tid == 0) output[row * out_dim + col] = partial[0];
-    \\}
-    \\
+const metal_rt_helper_antfly_q4_k_half_le_to_float =
+    \\inline float antfly_q4_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 ;
 
-const first_general_metal_q6_bias_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q6_k/rows_2_8/bias/small_batch
-    \\// kernel_id=antfly_q6_k_small_batch_bias_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
+const metal_rt_helper_antfly_q4_k_unpack_scale_min =
+    \\inline void antfly_q4_k_unpack_scale_min(device const uchar *scales, int sub, thread float &scale, thread float &min_v) {
+    \\    if (sub < 4) { scale = float(scales[sub] & 63u); min_v = float(scales[sub + 4] & 63u); return; }
+    \\    scale = float((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4)); min_v = float((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
     \\}
-    \\
-    \\static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {
-    \\    const device uchar *ql = block;
-    \\    const device uchar *qh = block + 128;
-    \\    const device uchar *scales = block + 192;
-    \\    const int sub = lane >> 4;
-    \\    const int i = lane & 15;
-    \\    const int half_idx = sub >> 3;
-    \\    const int group = (sub & 7) >> 1;
-    \\    const int l = ((sub & 1) << 4) + i;
-    \\    const int ql_off = half_idx * 64 + (group & 1) * 32;
-    \\    const int qh_off = half_idx * 32;
-    \\    const int qh_shift = group * 2;
-    \\    const int nibble_shift = (group >> 1) * 4;
-    \\    const int low4 = (int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-    \\    const int high2 = (int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-    \\    const int q = (low4 | (high2 << 4)) - 32;
-    \\    const int scale_u = (int)scales[sub];
-    \\    const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-    \\    return d * (float)scale * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q6_k_small_batch_bias_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q6_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]],
-    \\    ushort lane_id [[thread_index_in_simdgroup]],
-    \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 128) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210);
-    \\            const int base = block_idx << 8;
-    \\            const float d = antfly_half_le_to_float(block + 208);
-    \\            for (int lane = (int)tid; lane < 256; lane += 128) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[32];
-    \\    acc = simd_sum(acc);
-    \\    if (lane_id == 0u) partial[simdgroup_id] = acc;
-    \\    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    const float total = simd_sum(partial[lane_id]);
-    \\    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
-    \\}
-    \\
 ;
 
-const first_general_metal_q6_bias_gelu_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-    \\// plan_id=metal/q6_k/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q6_k_small_batch_bias_gelu_msl_v1
-    \\// production_baseline=metal_handwritten_quant_matmul
-    \\// production_enabled=true
-    \\// Promoted after sequential Metal runtime evidence cleared correctness,
-    \\// route, provider-route, and speedup gates.
-    \\
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\
-    \\static inline float antfly_half_le_to_float(const device uchar *p) {
-    \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    \\    return (float)as_type<half>(bits);
+const metal_rt_helper_antfly_q4_k_dequant_lane =
+    \\inline float antfly_q4_k_dequant_lane(device const uchar *block, int lane) {
+    \\    device const uchar *scales = block + 4; device const uchar *qs = block + 16; int sub = lane >> 5; int q_index = (sub >> 1) * 32 + (lane & 31);
+    \\    uchar packed = qs[q_index]; int q = (sub & 1) == 0 ? int(packed & 0x0fu) : int(packed >> 4);
+    \\    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
+    \\    return antfly_q4_k_half_le_to_float(block) * raw_scale * float(q) - antfly_q4_k_half_le_to_float(block + 2) * raw_min;
     \\}
-    \\
-    \\static inline float antfly_gelu(float x) {
-    \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\}
-    \\
-    \\static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {
-    \\    const device uchar *ql = block;
-    \\    const device uchar *qh = block + 128;
-    \\    const device uchar *scales = block + 192;
-    \\    const int sub = lane >> 4;
-    \\    const int i = lane & 15;
-    \\    const int half_idx = sub >> 3;
-    \\    const int group = (sub & 7) >> 1;
-    \\    const int l = ((sub & 1) << 4) + i;
-    \\    const int ql_off = half_idx * 64 + (group & 1) * 32;
-    \\    const int qh_off = half_idx * 32;
-    \\    const int qh_shift = group * 2;
-    \\    const int nibble_shift = (group >> 1) * 4;
-    \\    const int low4 = (int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-    \\    const int high2 = (int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-    \\    const int q = (low4 | (high2 << 4)) - 32;
-    \\    const int scale_u = (int)scales[sub];
-    \\    const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-    \\    return d * (float)scale * (float)q;
-    \\}
-    \\
-    \\kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1(
-    \\    const device float *input [[buffer(0)]],
-    \\    const device uchar *weight_q6_k [[buffer(1)]],
-    \\    const device float *bias [[buffer(2)]],
-    \\    device float *output [[buffer(3)]],
-    \\    constant int &rows [[buffer(4)]],
-    \\    constant int &in_dim [[buffer(5)]],
-    \\    constant int &out_dim [[buffer(6)]],
-    \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-    \\    uint3 group_pos [[threadgroup_position_in_grid]],
-    \\    ushort lane_id [[thread_index_in_simdgroup]],
-    \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-    \\) {
-    \\    const uint tid = thread_pos.x;
-    \\    const int col = (int)group_pos.x;
-    \\    const int row = (int)group_pos.y;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    if (tid < 128) {
-    \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\            const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210);
-    \\            const int base = block_idx << 8;
-    \\            const float d = antfly_half_le_to_float(block + 208);
-    \\            for (int lane = (int)tid; lane < 256; lane += 128) {
-    \\                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    threadgroup float partial[32];
-    \\    acc = simd_sum(acc);
-    \\    if (lane_id == 0u) partial[simdgroup_id] = acc;
-    \\    if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    const float total = simd_sum(partial[lane_id]);
-    \\    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_gelu(total + bias[col]);
-    \\}
-    \\
 ;
+
+const metal_rt_helper_antfly_q4_k_bias_gelu =
+    \\inline float antfly_q4_k_bias_gelu(float x) { float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); return 0.5f * x * (1.0f + fast::tanh(inner)); }
+;
+
+// Shared Metal helper defined in src/backends/metal_kernels.m OUTSIDE the
+// codegen-owned quant kernel region (the termite q8_0 kernels own it there).
+// The runtime-embedded antfly_q8_0_dequant_lane calls it, so standalone
+// generated q8_0 sources duplicate the definition; the codegen tool verifies
+// the metal_kernels.m copy still matches this text byte-for-byte.
+const metal_rt_external_helper_termite_q8_0_block_scale =
+    \\inline float termite_q8_0_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }
+;
+
+// External helpers the codegen tool must find verbatim in metal_kernels.m
+// outside the marker-delimited region.
+pub const metal_runtime_external_helpers = [_][]const u8{
+    metal_rt_external_helper_termite_q8_0_block_scale,
+};
+
+const metal_rt_helper_antfly_q8_0_dequant_lane =
+    \\inline float antfly_q8_0_dequant_lane(device const uchar *block, int lane) { float d = termite_q8_0_block_scale(block, 0u); int q = int(as_type<char>(block[2 + lane])); return d * float(q); }
+;
+
+const metal_rt_helper_antfly_qk_half_le_to_float =
+    \\inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
+;
+
+const metal_rt_helper_antfly_q5_k_unpack_scale_min =
+    \\inline void antfly_q5_k_unpack_scale_min(device const uchar *scales, int sub, thread float &scale, thread float &min_v) {
+    \\    if (sub < 4) { scale = float(scales[sub] & 63u); min_v = float(scales[sub + 4] & 63u); return; }
+    \\    scale = float((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4)); min_v = float((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
+    \\}
+;
+
+const metal_rt_helper_antfly_q5_k_dequant_lane =
+    \\inline float antfly_q5_k_dequant_lane(device const uchar *block, int lane) {
+    \\    device const uchar *scales = block + 4; device const uchar *qh = block + 16; device const uchar *ql = block + 48; int sub = lane >> 5; int i = lane & 31; int q_index = (sub >> 1) * 32 + i;
+    \\    uchar packed = ql[q_index]; int low = (sub & 1) == 0 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh[i] >> sub) & 1u); int q = low + high * 16;
+    \\    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
+    \\    return antfly_qk_half_le_to_float(block) * raw_scale * float(q) - antfly_qk_half_le_to_float(block + 2) * raw_min;
+    \\}
+;
+
+const metal_rt_helper_antfly_q6_k_dequant_lane =
+    \\inline float antfly_q6_k_dequant_lane(device const uchar *block, int lane) {
+    \\    device const uchar *ql = block; device const uchar *qh = block + 128; device const uchar *scales = block + 192; int sub = lane >> 4; int i = lane & 15; int half_idx = sub >> 3; int group = (sub & 7) >> 1; int l = ((sub & 1) << 4) + i;
+    \\    int ql_off = half_idx * 64 + (group & 1) * 32; int qh_off = half_idx * 32; int qh_shift = group * 2; int nibble_shift = (group >> 1) * 4; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u);
+    \\    int scale_u = int(scales[sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; return antfly_qk_half_le_to_float(block + 208) * float(scale) * float((low4 | (high2 << 4)) - 32);
+    \\}
+;
+
+const metal_rt_body_antfly_q4_0_small_batch_msl_v1 =
+    \\kernel void antfly_q4_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_0 + ((col * block_count + block_idx) * 18); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q4_0_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q4_1_small_batch_msl_v1 =
+    \\kernel void antfly_q4_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
+    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q4_1 + col0 * block_count * 20; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q4_1 + col1 * block_count * 20 : col0_weight;
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 20; acc0 += x * antfly_q4_1_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 20; acc1 += x * antfly_q4_1_dequant_lane(block1, lane); } }
+    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = acc0; if (has_col1) output[row * out_dim + col1] = acc1; }
+    \\}
+;
+
+const metal_rt_body_antfly_q5_0_small_batch_msl_v1 =
+    \\kernel void antfly_q5_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_0 + ((col * block_count + block_idx) * 22); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q5_0_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q5_1_small_batch_msl_v1 =
+    \\kernel void antfly_q5_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
+    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q5_1 + col0 * block_count * 24; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 24; acc0 += x * antfly_q5_1_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 24; acc1 += x * antfly_q5_1_dequant_lane(block1, lane); } }
+    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = acc0; if (has_col1) output[row * out_dim + col1] = acc1; }
+    \\}
+;
+
+const metal_rt_body_antfly_q8_1_small_batch_msl_v1 =
+    \\kernel void antfly_q8_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q8_1 + ((col * block_count + block_idx) * 36); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q8_1_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q8_k_small_batch_msl_v1 =
+    \\kernel void antfly_q8_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q8_k + ((col * block_count + block_idx) * 292); for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q8_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q2_k_small_batch_msl_v1 =
+    \\kernel void antfly_q2_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q2_k_small_batch_bias_msl_v1 =
+    \\kernel void antfly_q2_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc + bias[col];
+    \\}
+;
+
+const metal_rt_body_antfly_q2_k_small_batch_bias_gelu_msl_v1 =
+    \\kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = antfly_q2_k_gelu(acc + bias[col]);
+    \\}
+;
+
+const metal_rt_body_antfly_q3_k_small_batch_msl_v1 =
+    \\kernel void antfly_q3_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q3_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q3_k_small_batch_bias_msl_v1 =
+    \\kernel void antfly_q3_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q3_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc + bias[col];
+    \\}
+;
+
+const metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1 =
+    \\kernel void antfly_q3_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q3_k_dequant_lane(block, lane); } }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = antfly_q3_k_gelu(acc + bias[col]);
+    \\}
+;
+
+const metal_rt_body_antfly_q4_k_small_batch_msl_v1 =
+    \\kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
+    \\    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];
+    \\}
+;
+
+const metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1 =
+    \\kernel void antfly_q4_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
+    \\    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0] + bias[col];
+    \\}
+;
+
+const metal_rt_body_antfly_q4_k_small_batch_bias_gelu_msl_v1 =
+    \\kernel void antfly_q4_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
+    \\    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = antfly_q4_k_bias_gelu(partial[0] + bias[col]);
+    \\}
+;
+
+const metal_rt_body_antfly_q8_0_small_batch_msl_v1 =
+    \\kernel void antfly_q8_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col_weight = weight_q8_0 + col * block_count * 34; for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = col_weight + block_idx * 34; acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane); }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\}
+;
+
+const metal_rt_body_antfly_q8_0_small_batch_bias_msl_v1 =
+    \\kernel void antfly_q8_0_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col_weight = weight_q8_0 + col * block_count * 34; for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = col_weight + block_idx * 34; acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane); }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc + bias[col];
+    \\}
+;
+
+const metal_rt_body_antfly_q8_0_small_batch_bias_gelu_msl_v1 =
+    \\kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
+    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q8_0 + col0 * block_count * 34; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q8_0 + col1 * block_count * 34 : col0_weight; for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 34; acc0 += x * antfly_q8_0_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 34; acc1 += x * antfly_q8_0_dequant_lane(block1, lane); } }
+    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = antfly_q4_k_bias_gelu(acc0 + bias[col0]); if (has_col1) output[row * out_dim + col1] = antfly_q4_k_bias_gelu(acc1 + bias[col1]); }
+    \\}
+;
+
+const metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1 =
+    \\kernel void antfly_q8_0_small_batch_relu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col_weight = weight_q8_0 + col * block_count * 34; for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = col_weight + block_idx * 34; acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane); }
+    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = max(acc, 0.0f);
+    \\}
+;
+
+const metal_rt_body_antfly_q5_k_small_batch_msl_v1 =
+    \\kernel void antfly_q5_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }
+    \\    threadgroup float partial[64]; if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];
+    \\}
+;
+
+const metal_rt_body_antfly_q5_k_small_batch_bias_msl_v1 =
+    \\kernel void antfly_q5_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
+    \\}
+;
+
+const metal_rt_body_antfly_q5_k_small_batch_bias_gelu_msl_v1 =
+    \\kernel void antfly_q5_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_q4_k_bias_gelu(total + bias[col]);
+    \\}
+;
+
+const metal_rt_body_antfly_q6_k_small_batch_msl_v1 =
+    \\kernel void antfly_q6_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); } }
+    \\    threadgroup float partial[128]; if (tid < 128) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 64; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];
+    \\}
+;
+
+const metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1 =
+    \\kernel void antfly_q6_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); } }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
+    \\}
+;
+
+const metal_rt_body_antfly_q6_k_small_batch_bias_gelu_msl_v1 =
+    \\kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); } }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_q4_k_bias_gelu(total + bias[col]);
+    \\}
+;
+
+pub const MetalRuntimeQuantSection = struct {
+    name: []const u8,
+    text: []const u8,
+};
+
+// Verbatim section order of the runtime-embedded Metal quant kernel region in
+// src/backends/metal_kernels.m. Rendering this table back into C string
+// fragment lines must reproduce the region byte-for-byte.
+pub const metal_runtime_quant_sections = [_]MetalRuntimeQuantSection{
+    .{ .name = "antfly_q4_0_half_le_to_float", .text = metal_rt_helper_antfly_q4_0_half_le_to_float },
+    .{ .name = "antfly_q4_0_dequant_lane", .text = metal_rt_helper_antfly_q4_0_dequant_lane },
+    .{ .name = "antfly_q4_0_small_batch_msl_v1", .text = metal_rt_body_antfly_q4_0_small_batch_msl_v1 },
+    .{ .name = "antfly_q4_1_half_le_to_float", .text = metal_rt_helper_antfly_q4_1_half_le_to_float },
+    .{ .name = "antfly_q4_1_dequant_lane", .text = metal_rt_helper_antfly_q4_1_dequant_lane },
+    .{ .name = "antfly_q4_1_small_batch_msl_v1", .text = metal_rt_body_antfly_q4_1_small_batch_msl_v1 },
+    .{ .name = "antfly_q5_0_half_le_to_float", .text = metal_rt_helper_antfly_q5_0_half_le_to_float },
+    .{ .name = "antfly_q5_0_u32_le", .text = metal_rt_helper_antfly_q5_0_u32_le },
+    .{ .name = "antfly_q5_0_dequant_lane", .text = metal_rt_helper_antfly_q5_0_dequant_lane },
+    .{ .name = "antfly_q5_0_small_batch_msl_v1", .text = metal_rt_body_antfly_q5_0_small_batch_msl_v1 },
+    .{ .name = "antfly_q5_1_half_le_to_float", .text = metal_rt_helper_antfly_q5_1_half_le_to_float },
+    .{ .name = "antfly_q5_1_u32_le", .text = metal_rt_helper_antfly_q5_1_u32_le },
+    .{ .name = "antfly_q5_1_dequant_lane", .text = metal_rt_helper_antfly_q5_1_dequant_lane },
+    .{ .name = "antfly_q5_1_small_batch_msl_v1", .text = metal_rt_body_antfly_q5_1_small_batch_msl_v1 },
+    .{ .name = "antfly_q8_1_half_le_to_float", .text = metal_rt_helper_antfly_q8_1_half_le_to_float },
+    .{ .name = "antfly_q8_1_dequant_lane", .text = metal_rt_helper_antfly_q8_1_dequant_lane },
+    .{ .name = "antfly_q8_1_small_batch_msl_v1", .text = metal_rt_body_antfly_q8_1_small_batch_msl_v1 },
+    .{ .name = "antfly_q8_k_f32_le_to_float", .text = metal_rt_helper_antfly_q8_k_f32_le_to_float },
+    .{ .name = "antfly_q8_k_dequant_lane", .text = metal_rt_helper_antfly_q8_k_dequant_lane },
+    .{ .name = "antfly_q8_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q8_k_small_batch_msl_v1 },
+    .{ .name = "antfly_q2_k_half_le_to_float", .text = metal_rt_helper_antfly_q2_k_half_le_to_float },
+    .{ .name = "antfly_q2_k_dequant_lane", .text = metal_rt_helper_antfly_q2_k_dequant_lane },
+    .{ .name = "antfly_q2_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q2_k_small_batch_msl_v1 },
+    .{ .name = "antfly_q2_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q2_k_small_batch_bias_msl_v1 },
+    .{ .name = "antfly_q2_k_gelu", .text = metal_rt_helper_antfly_q2_k_gelu },
+    .{ .name = "antfly_q2_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q2_k_small_batch_bias_gelu_msl_v1 },
+    .{ .name = "antfly_q3_k_half_le_to_float", .text = metal_rt_helper_antfly_q3_k_half_le_to_float },
+    .{ .name = "antfly_q3_k_raw_scale", .text = metal_rt_helper_antfly_q3_k_raw_scale },
+    .{ .name = "antfly_q3_k_dequant_lane", .text = metal_rt_helper_antfly_q3_k_dequant_lane },
+    .{ .name = "antfly_q3_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q3_k_small_batch_msl_v1 },
+    .{ .name = "antfly_q3_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q3_k_small_batch_bias_msl_v1 },
+    .{ .name = "antfly_q3_k_gelu", .text = metal_rt_helper_antfly_q3_k_gelu },
+    .{ .name = "antfly_q3_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1 },
+    .{ .name = "antfly_q4_k_half_le_to_float", .text = metal_rt_helper_antfly_q4_k_half_le_to_float },
+    .{ .name = "antfly_q4_k_unpack_scale_min", .text = metal_rt_helper_antfly_q4_k_unpack_scale_min },
+    .{ .name = "antfly_q4_k_dequant_lane", .text = metal_rt_helper_antfly_q4_k_dequant_lane },
+    .{ .name = "antfly_q4_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q4_k_small_batch_msl_v1 },
+    .{ .name = "antfly_q4_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1 },
+    .{ .name = "antfly_q4_k_bias_gelu", .text = metal_rt_helper_antfly_q4_k_bias_gelu },
+    .{ .name = "antfly_q4_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q4_k_small_batch_bias_gelu_msl_v1 },
+    .{ .name = "antfly_q8_0_dequant_lane", .text = metal_rt_helper_antfly_q8_0_dequant_lane },
+    .{ .name = "antfly_q8_0_small_batch_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_msl_v1 },
+    .{ .name = "antfly_q8_0_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_bias_msl_v1 },
+    .{ .name = "antfly_q8_0_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_bias_gelu_msl_v1 },
+    .{ .name = "antfly_q8_0_small_batch_relu_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1 },
+    .{ .name = "antfly_qk_half_le_to_float", .text = metal_rt_helper_antfly_qk_half_le_to_float },
+    .{ .name = "antfly_q5_k_unpack_scale_min", .text = metal_rt_helper_antfly_q5_k_unpack_scale_min },
+    .{ .name = "antfly_q5_k_dequant_lane", .text = metal_rt_helper_antfly_q5_k_dequant_lane },
+    .{ .name = "antfly_q5_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q5_k_small_batch_msl_v1 },
+    .{ .name = "antfly_q5_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q5_k_small_batch_bias_msl_v1 },
+    .{ .name = "antfly_q5_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q5_k_small_batch_bias_gelu_msl_v1 },
+    .{ .name = "antfly_q6_k_dequant_lane", .text = metal_rt_helper_antfly_q6_k_dequant_lane },
+    .{ .name = "antfly_q6_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q6_k_small_batch_msl_v1 },
+    .{ .name = "antfly_q6_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1 },
+    .{ .name = "antfly_q6_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q6_k_small_batch_bias_gelu_msl_v1 },
+};
+
+// Renders the runtime-embedded quant kernel region of
+// src/backends/metal_kernels.m as Objective-C string fragment lines. The
+// codegen tool rewrites the marker-delimited region of that file with this
+// output, so the runtime copy is assembled from the same bytes as the
+// checked-in generated sources.
+pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    for (metal_runtime_quant_sections) |section| {
+        var section_lines = std.mem.splitScalar(u8, section.text, '\n');
+        while (section_lines.next()) |line| {
+            try out.appendSlice(allocator, "           \"");
+            try out.appendSlice(allocator, line);
+            try out.appendSlice(allocator, "\\n\"\n");
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn metalRuntimeQuantSectionFor(name: []const u8) ?MetalRuntimeQuantSection {
+    for (metal_runtime_quant_sections) |section| {
+        if (std.mem.eql(u8, section.name, name)) return section;
+    }
+    return null;
+}
+
+const MetalSmallBatchHeader = struct {
+    source_kind: []const u8,
+    plan_id: []const u8,
+    kernel_id: []const u8,
+    production_baseline: []const u8 = "metal_handwritten_quant_matmul",
+    production_enabled: bool,
+    promotion_comment: []const u8,
+};
+
+// Table-driven assembler for the checked-in generated Metal sources: license
+// header + plan metadata + the exact helper and kernel body bytes from the
+// runtime region above.
+fn metalSmallBatchFileSource(
+    comptime header: MetalSmallBatchHeader,
+    comptime helpers: []const []const u8,
+    comptime body: []const u8,
+) []const u8 {
+    comptime {
+        var out: []const u8 = metal_generated_source_license_header ++ "\n\n" ++
+            "// " ++ header.source_kind ++ " from graph/quant_kernel_compiler.zig.\n" ++
+            "// plan_id=" ++ header.plan_id ++ "\n" ++
+            "// kernel_id=" ++ header.kernel_id ++ "\n" ++
+            "// production_baseline=" ++ header.production_baseline ++ "\n" ++
+            "// production_enabled=" ++ (if (header.production_enabled) "true" else "false") ++ "\n" ++
+            header.promotion_comment ++ "\n" ++
+            "\n" ++
+            "#include <metal_stdlib>\n" ++
+            "using namespace metal;\n" ++
+            "\n";
+        for (helpers) |helper| out = out ++ helper ++ "\n";
+        out = out ++ body ++ "\n";
+        return out;
+    }
+}
+
+const first_lazy_metal_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q4_k/rows_2_8/bias_gelu/small_batch",
+        .kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane, metal_rt_helper_antfly_q4_k_bias_gelu },
+    metal_rt_body_antfly_q4_k_small_batch_bias_gelu_msl_v1,
+);
+
+const first_general_metal_q4_0_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q4_0/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q4_0_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_0_half_le_to_float, metal_rt_helper_antfly_q4_0_dequant_lane },
+    metal_rt_body_antfly_q4_0_small_batch_msl_v1,
+);
+
+const first_general_metal_q4_1_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q4_1/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q4_1_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_1_half_le_to_float, metal_rt_helper_antfly_q4_1_dequant_lane },
+    metal_rt_body_antfly_q4_1_small_batch_msl_v1,
+);
+
+const first_general_metal_q5_0_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q5_0/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q5_0_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q5_0_half_le_to_float, metal_rt_helper_antfly_q5_0_u32_le, metal_rt_helper_antfly_q5_0_dequant_lane },
+    metal_rt_body_antfly_q5_0_small_batch_msl_v1,
+);
+
+const first_general_metal_q5_1_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q5_1/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q5_1_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q5_1_half_le_to_float, metal_rt_helper_antfly_q5_1_u32_le, metal_rt_helper_antfly_q5_1_dequant_lane },
+    metal_rt_body_antfly_q5_1_small_batch_msl_v1,
+);
+
+const first_general_metal_q4_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q4_k/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q4_k_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane },
+    metal_rt_body_antfly_q4_k_small_batch_msl_v1,
+);
+
+const first_general_metal_q4_bias_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q4_k/rows_2_8/bias/small_batch",
+        .kernel_id = "antfly_q4_k_small_batch_bias_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane },
+    metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1,
+);
+
+const first_general_metal_q8_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q8_0/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q8_0_small_batch_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
+    metal_rt_body_antfly_q8_0_small_batch_msl_v1,
+);
+
+const first_general_metal_q8_bias_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q8_0/rows_2_8/bias/small_batch",
+        .kernel_id = "antfly_q8_0_small_batch_bias_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
+    metal_rt_body_antfly_q8_0_small_batch_bias_msl_v1,
+);
+
+const first_general_metal_q8_bias_gelu_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q8_0/rows_2_8/bias_gelu/small_batch",
+        .kernel_id = "antfly_q8_0_small_batch_bias_gelu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_k_bias_gelu, metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
+    metal_rt_body_antfly_q8_0_small_batch_bias_gelu_msl_v1,
+);
+
+const first_general_metal_q8_relu_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q8_0/rows_2_8/relu/small_batch",
+        .kernel_id = "antfly_q8_0_small_batch_relu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
+    metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1,
+);
+
+const first_general_metal_q2_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q2_k/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q2_k_small_batch_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, and speedup gates.",
+    },
+    &.{ metal_rt_helper_antfly_q2_k_half_le_to_float, metal_rt_helper_antfly_q2_k_dequant_lane },
+    metal_rt_body_antfly_q2_k_small_batch_msl_v1,
+);
+
+const first_general_metal_q2_bias_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q2_k/rows_2_8/bias/small_batch",
+        .kernel_id = "antfly_q2_k_small_batch_bias_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q2_k_half_le_to_float, metal_rt_helper_antfly_q2_k_dequant_lane },
+    metal_rt_body_antfly_q2_k_small_batch_bias_msl_v1,
+);
+
+const first_general_metal_q2_bias_gelu_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q2_k/rows_2_8/bias_gelu/small_batch",
+        .kernel_id = "antfly_q2_k_small_batch_bias_gelu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q2_k_half_le_to_float, metal_rt_helper_antfly_q2_k_dequant_lane, metal_rt_helper_antfly_q2_k_gelu },
+    metal_rt_body_antfly_q2_k_small_batch_bias_gelu_msl_v1,
+);
+
+const first_general_metal_q3_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q3_k/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q3_k_small_batch_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_helper_antfly_q3_k_half_le_to_float, metal_rt_helper_antfly_q3_k_raw_scale, metal_rt_helper_antfly_q3_k_dequant_lane },
+    metal_rt_body_antfly_q3_k_small_batch_msl_v1,
+);
+
+const first_general_metal_q3_bias_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q3_k/rows_2_8/bias/small_batch",
+        .kernel_id = "antfly_q3_k_small_batch_bias_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q3_k_half_le_to_float, metal_rt_helper_antfly_q3_k_raw_scale, metal_rt_helper_antfly_q3_k_dequant_lane },
+    metal_rt_body_antfly_q3_k_small_batch_bias_msl_v1,
+);
+
+const first_general_metal_q3_bias_gelu_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q3_k/rows_2_8/bias_gelu/small_batch",
+        .kernel_id = "antfly_q3_k_small_batch_bias_gelu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q3_k_half_le_to_float, metal_rt_helper_antfly_q3_k_raw_scale, metal_rt_helper_antfly_q3_k_dequant_lane, metal_rt_helper_antfly_q3_k_gelu },
+    metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1,
+);
+
+const first_general_metal_q8_1_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q8_1/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q8_1_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q8_1_half_le_to_float, metal_rt_helper_antfly_q8_1_dequant_lane },
+    metal_rt_body_antfly_q8_1_small_batch_msl_v1,
+);
+
+const first_general_metal_q8_k_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Dev-only generated Metal candidate",
+        .plan_id = "metal/q8_k/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q8_k_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q8_k_f32_le_to_float, metal_rt_helper_antfly_q8_k_dequant_lane },
+    metal_rt_body_antfly_q8_k_small_batch_msl_v1,
+);
+
+const first_general_metal_q5_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q5_k/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q5_k_small_batch_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q5_k_unpack_scale_min, metal_rt_helper_antfly_q5_k_dequant_lane },
+    metal_rt_body_antfly_q5_k_small_batch_msl_v1,
+);
+
+const first_general_metal_q5_bias_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q5_k/rows_2_8/bias/small_batch",
+        .kernel_id = "antfly_q5_k_small_batch_bias_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q5_k_unpack_scale_min, metal_rt_helper_antfly_q5_k_dequant_lane },
+    metal_rt_body_antfly_q5_k_small_batch_bias_msl_v1,
+);
+
+const first_general_metal_q5_bias_gelu_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal artifact source",
+        .plan_id = "metal/q5_k/rows_2_8/bias_gelu/small_batch",
+        .kernel_id = "antfly_q5_k_small_batch_bias_gelu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_k_bias_gelu, metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q5_k_unpack_scale_min, metal_rt_helper_antfly_q5_k_dequant_lane },
+    metal_rt_body_antfly_q5_k_small_batch_bias_gelu_msl_v1,
+);
+
+const first_general_metal_q6_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q6_k/rows_2_8/none/small_batch",
+        .kernel_id = "antfly_q6_k_small_batch_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q6_k_dequant_lane },
+    metal_rt_body_antfly_q6_k_small_batch_msl_v1,
+);
+
+const first_general_metal_q6_bias_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q6_k/rows_2_8/bias/small_batch",
+        .kernel_id = "antfly_q6_k_small_batch_bias_msl_v1",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
+            "// route, provider-route, and speedup gates.",
+    },
+    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q6_k_dequant_lane },
+    metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1,
+);
+
+const first_general_metal_q6_bias_gelu_source = metalSmallBatchFileSource(
+    .{
+        .source_kind = "Generated Metal candidate artifact",
+        .plan_id = "metal/q6_k/rows_2_8/bias_gelu/small_batch",
+        .kernel_id = "antfly_q6_k_small_batch_bias_gelu_msl_v1",
+        .production_enabled = false,
+        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
+            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
+            "// candidate clears correctness and benchmark gates.",
+    },
+    &.{ metal_rt_helper_antfly_q4_k_bias_gelu, metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q6_k_dequant_lane },
+    metal_rt_body_antfly_q6_k_small_batch_bias_gelu_msl_v1,
+);
 
 pub const first_coverage = buildFirstCoverage();
 
@@ -7657,126 +6314,10 @@ pub fn compileMetalKernelSource(
 }
 
 pub fn emitCompiledSource(allocator: std.mem.Allocator, compiled: QuantKernelCompiledSource) !EmittedCompiledSource {
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q8_0 and
-        compiled.request.row_bucket == .rows_2_8 and
-        metalQ8SmallBatchEpilogueSupported(compiled.request.epilogue))
-    {
-        return .{
-            .data = try emitMetalQ8SmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        (compiled.request.format == .q8_1 or compiled.request.format == .q8_k) and
-        compiled.request.row_bucket == .rows_2_8 and
-        compiled.request.epilogue == .none)
-    {
-        return .{
-            .data = try emitMetalQ8FamilySmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q4_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        metalQ4KSmallBatchEpilogueSupported(compiled.request.epilogue))
-    {
-        return .{
-            .data = try emitMetalQ4KSmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        (compiled.request.format == .q4_0 or compiled.request.format == .q5_0) and
-        compiled.request.row_bucket == .rows_2_8 and
-        compiled.request.epilogue == .none)
-    {
-        return .{
-            .data = try emitMetalLegacyScalarSmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q4_1 and
-        compiled.request.row_bucket == .rows_2_8 and
-        compiled.request.epilogue == .none)
-    {
-        return .{
-            .data = try emitMetalQ4_1SmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q5_1 and
-        compiled.request.row_bucket == .rows_2_8 and
-        compiled.request.epilogue == .none)
-    {
-        return .{
-            .data = try emitMetalQ5_1SmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q2_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        metalQ2KSmallBatchEpilogueSupported(compiled.request.epilogue))
-    {
-        return .{
-            .data = try emitMetalQ2KSmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q3_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        metalQ3KSmallBatchEpilogueSupported(compiled.request.epilogue))
-    {
-        return .{
-            .data = try emitMetalQ3KSmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q6_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        compiled.request.epilogue == .none)
-    {
-        return .{
-            .data = try emitMetalQ6KSmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q6_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        metalQ6KSmallBatchBiasEpilogueSupported(compiled.request.epilogue))
-    {
-        return .{
-            .data = try emitMetalQ6KSmallBatchBiasSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q5_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        compiled.request.epilogue == .none)
-    {
-        return .{
-            .data = try emitMetalQ5KSmallBatchSource(allocator, compiled),
-            .owned = true,
-        };
-    }
-    if (compiled.request.backend == .metal and
-        compiled.request.format == .q5_k and
-        compiled.request.row_bucket == .rows_2_8 and
-        metalQ5KSmallBatchBiasEpilogueSupported(compiled.request.epilogue))
-    {
-        return .{
-            .data = try emitMetalQ5KSmallBatchBiasSource(allocator, compiled),
-            .owned = true,
-        };
-    }
+    // Metal small-batch sources are assembled from the codegen-owned runtime
+    // region data (metal_runtime_quant_sections); CUDA sources are borrowed
+    // verbatim. Either way compiled.source is already the canonical text.
+    _ = allocator;
     return .{ .data = compiled.source };
 }
 
@@ -7826,2443 +6367,6 @@ fn sourceHeaderMatchesCompiledPlan(
 
     if (!std.mem.containsAtLeast(u8, source, 1, compiled.artifact.kernel_id)) return false;
     return true;
-}
-
-fn metalQ8SmallBatchEpilogueSupported(epilogue: Epilogue) bool {
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu, .relu => true,
-        else => false,
-    };
-}
-
-fn metalQ8SmallBatchSourceKind(epilogue: Epilogue) []const u8 {
-    return switch (epilogue) {
-        .relu => "Dev-only generated Metal candidate",
-        else => "Generated Metal artifact source",
-    };
-}
-
-fn metalQ8SmallBatchPromotionComment(artifact: GeneratedArtifact, epilogue: Epilogue) []const u8 {
-    if (!artifactHasPromotionEvidence(artifact)) {
-        return "// General MSL lowering smoke for descriptor-driven quant matmul epilogues.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.";
-    }
-    return switch (epilogue) {
-        .none, .bias => "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, provider-route, and speedup gates.",
-        .bias_gelu => "// Promoted after active-frame decode-runtime evidence cleared the\n// sequential benchmark and production-regression gates.",
-        .relu => unreachable,
-        else => "",
-    };
-}
-
-fn metalQ4KSmallBatchEpilogueSupported(epilogue: Epilogue) bool {
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu => true,
-        else => false,
-    };
-}
-
-fn metalQ4KSmallBatchPromotionComment(artifact: GeneratedArtifact, epilogue: Epilogue) []const u8 {
-    if (!artifactHasPromotionEvidence(artifact)) {
-        return "// General MSL lowering smoke for descriptor-driven quant matmul epilogues.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.";
-    }
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu => "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, provider-route, and speedup gates.",
-        else => "",
-    };
-}
-
-fn metalLegacyScalarSmallBatchSourceKind(format: quant_matmul.Format) []const u8 {
-    return switch (format) {
-        .q4_0 => "Generated Metal candidate artifact",
-        .q4_1 => "Generated Metal artifact source",
-        .q5_0, .q5_1 => "Dev-only generated Metal candidate",
-        else => "",
-    };
-}
-
-fn metalLegacyScalarSmallBatchPromotionComment(artifact: GeneratedArtifact) []const u8 {
-    if (artifact.production_enabled) {
-        return "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, and speedup gates.";
-    }
-    return "// General MSL lowering smoke for descriptor-driven quant matmul.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.";
-}
-
-fn metalQ2KSmallBatchEpilogueSupported(epilogue: Epilogue) bool {
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu => true,
-        else => false,
-    };
-}
-
-fn metalQ2KSmallBatchPromotionComment(epilogue: Epilogue) []const u8 {
-    return switch (epilogue) {
-        .none => "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, and speedup gates.",
-        .bias, .bias_gelu => "// General MSL lowering smoke for descriptor-driven quant matmul epilogues.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.",
-        else => "",
-    };
-}
-
-fn metalQ3KSmallBatchEpilogueSupported(epilogue: Epilogue) bool {
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu => true,
-        else => false,
-    };
-}
-
-fn metalQ3KSmallBatchSourceKind(epilogue: Epilogue) []const u8 {
-    return switch (epilogue) {
-        .none => "Generated Metal candidate artifact",
-        .bias, .bias_gelu => "Dev-only generated Metal candidate",
-        else => "",
-    };
-}
-
-fn metalQ3KSmallBatchPromotionComment(epilogue: Epilogue) []const u8 {
-    return switch (epilogue) {
-        .none => "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, provider-route, and speedup gates.",
-        .bias, .bias_gelu => "// General MSL lowering smoke for descriptor-driven quant matmul epilogues.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.",
-        else => "",
-    };
-}
-
-fn metalQ6KSmallBatchPromotionComment(artifact: GeneratedArtifact, epilogue: Epilogue) []const u8 {
-    if (!artifactHasPromotionEvidence(artifact)) {
-        return "// General MSL lowering smoke for descriptor-driven quant matmul epilogues.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.";
-    }
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu => "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, provider-route, and speedup gates.",
-        else => "",
-    };
-}
-
-fn metalQ6KSmallBatchBiasEpilogueSupported(epilogue: Epilogue) bool {
-    return switch (epilogue) {
-        .bias, .bias_gelu => true,
-        else => false,
-    };
-}
-
-fn metalQ5KSmallBatchBiasEpilogueSupported(epilogue: Epilogue) bool {
-    return switch (epilogue) {
-        .bias, .bias_gelu => true,
-        else => false,
-    };
-}
-
-fn metalQ5KSmallBatchPromotionComment(artifact: GeneratedArtifact, epilogue: Epilogue) []const u8 {
-    if (!artifactHasPromotionEvidence(artifact)) {
-        return "// General MSL lowering smoke for descriptor-driven quant matmul epilogues.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.";
-    }
-    return switch (epilogue) {
-        .none, .bias, .bias_gelu => "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, provider-route, and speedup gates.",
-        else => "",
-    };
-}
-
-fn blockFieldOffset(spec: QuantKernelSpec, name: []const u8) usize {
-    for (spec.block_fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) return field.offset;
-    }
-    unreachable;
-}
-
-fn blockPointerOffsetExpr(allocator: std.mem.Allocator, offset: usize) ![]u8 {
-    if (offset == 0) return allocator.dupe(u8, "block");
-    return std.fmt.allocPrint(allocator, "block + {d}", .{offset});
-}
-
-fn emitMetalQ8SmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// {s} from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-        \\static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {{
-        \\    const float d = antfly_half_le_to_float(block);
-        \\    const int q = (int)as_type<char>(block[2 + lane]);
-        \\    return d * (float)q;
-        \\}}
-        \\
-    ,
-        .{
-            metalQ8SmallBatchSourceKind(compiled.ir.epilogue),
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ8SmallBatchPromotionComment(compiled.artifact, compiled.ir.epilogue),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_gelu(float x) {{
-            \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    switch (compiled.ir.epilogue) {
-        .none, .relu => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q8_0 [[buffer(1)]],
-            \\    device float *output [[buffer(2)]],
-            \\    constant int &rows [[buffer(3)]],
-            \\    constant int &in_dim [[buffer(4)]],
-            \\    constant int &out_dim [[buffer(5)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\    const uint tid = thread_pos.x;
-            \\    const int col = (int)group_pos.x;
-            \\    const int row = (int)group_pos.y;
-            \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-            \\
-        ,
-            .{
-                compiled.artifact.kernel_id,
-                block_mask,
-            },
-        ),
-        .bias, .bias_gelu => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q8_0 [[buffer(1)]],
-            \\    const device float *bias [[buffer(2)]],
-            \\    device float *output [[buffer(3)]],
-            \\    constant int &rows [[buffer(4)]],
-            \\    constant int &in_dim [[buffer(5)]],
-            \\    constant int &out_dim [[buffer(6)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]{s}
-            \\
-        ,
-            .{
-                compiled.artifact.kernel_id,
-                if (compiled.ir.epilogue == .bias) "," else "",
-            },
-        ),
-        else => return error.UnsupportedQuantKernelEpilogue,
-    }
-
-    if (compiled.ir.epilogue == .bias) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\    ushort lane_id [[thread_index_in_simdgroup]],
-            \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-            \\
-        ,
-            .{},
-        );
-    }
-
-    if (compiled.ir.epilogue == .bias or compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\) {{
-            \\    const uint tid = thread_pos.x;
-            \\    const int col = (int)group_pos.x;
-            \\    const int row = (int)group_pos.y;
-            \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-            \\
-        ,
-            .{block_mask},
-        );
-    }
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .relu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\    float acc = 0.0f;
-            \\    const int block_count = in_dim >> {d};
-            \\    if (tid < {d}) {{
-            \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-            \\            const device uchar *block = weight_q8_0 + ((col * block_count + block_idx) * {d});
-            \\            const int lane = (int)tid;
-            \\            acc += input[row * in_dim + (block_idx << {d}) + lane] * antfly_q8_0_dequant_lane(block, lane);
-            \\        }}
-            \\    }}
-            \\
-            \\    acc = simd_sum(acc);
-            \\    if (tid == 0) output[row * out_dim + col] = max(acc, 0.0f);
-            \\}}
-            \\
-        ,
-            .{
-                block_shift,
-                compiled.spec.block_values,
-                compiled.spec.block_bytes,
-                block_shift,
-            },
-        );
-        return try out.toOwnedSlice(allocator);
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    const int lane = (int)tid;
-        \\    const device float *row_input = input + row * in_dim;
-        \\    const device uchar *col_weight = weight_q8_0 + col * block_count * {d};
-        \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\
-    ,
-        .{
-            block_shift,
-            compiled.spec.block_bytes,
-        },
-    );
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\        const float x = row_input[(block_idx << {d}) + lane];
-            \\        const device uchar *block = col_weight + block_idx * {d};
-            \\        acc += x * antfly_q8_0_dequant_lane(block, lane);
-            \\    }}
-            \\
-            \\    acc = simd_sum(acc);
-            \\    if (tid == 0) {{
-            \\        output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
-            \\    }}
-            \\}}
-            \\
-        ,
-            .{
-                block_shift,
-                compiled.spec.block_bytes,
-            },
-        );
-    } else {
-        const output_expr = switch (compiled.ir.epilogue) {
-            .none => "acc",
-            .bias => "acc + bias[col]",
-            else => unreachable,
-        };
-        try appendFmt(
-            allocator,
-            &out,
-            \\        const device uchar *block = col_weight + block_idx * {d};
-            \\        acc += row_input[(block_idx << {d}) + lane] * antfly_q8_0_dequant_lane(block, lane);
-            \\    }}
-            \\
-            \\    acc = simd_sum(acc);
-            \\    if (tid == 0) output[row * out_dim + col] = {s};
-            \\}}
-            \\
-        ,
-            .{
-                compiled.spec.block_bytes,
-                block_shift,
-                output_expr,
-            },
-        );
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalLegacyScalarSmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const format_suffix = switch (compiled.request.format) {
-        .q4_0 => "q4_0",
-        .q5_0 => "q5_0",
-        .q5_1 => "q5_1",
-        else => return error.UnsupportedQuantKernelFormat,
-    };
-    const weight_name = switch (compiled.request.format) {
-        .q4_0 => "weight_q4_0",
-        .q5_0 => "weight_q5_0",
-        .q5_1 => "weight_q5_1",
-        else => return error.UnsupportedQuantKernelFormat,
-    };
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// {s} from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-    ,
-        .{
-            if (compiled.artifact.production_enabled) "Generated Metal artifact source" else metalLegacyScalarSmallBatchSourceKind(compiled.request.format),
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalLegacyScalarSmallBatchPromotionComment(compiled.artifact),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.request.format == .q5_0 or compiled.request.format == .q5_1) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline uint antfly_u32_le(const device uchar *p) {{
-            \\    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    switch (compiled.request.format) {
-        .q4_0 => try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_q4_0_dequant_lane(const device uchar *block, int lane) {{
-            \\    const float d = antfly_half_le_to_float({s});
-            \\    const int packed_index = lane & 15;
-            \\    const uchar packed = block[{d} + packed_index];
-            \\    const int q = lane < 16 ? (int)(packed & 0x0fu) - 8 : (int)(packed >> 4) - 8;
-            \\    return d * (float)q;
-            \\}}
-            \\
-        ,
-            .{ d_pointer, qs_offset },
-        ),
-        .q5_0 => {
-            const qh_offset = blockFieldOffset(compiled.spec, "qh");
-            const qh_pointer = try blockPointerOffsetExpr(allocator, qh_offset);
-            defer allocator.free(qh_pointer);
-            try appendFmt(
-                allocator,
-                &out,
-                \\static inline float antfly_q5_0_dequant_lane(const device uchar *block, int lane) {{
-                \\    const float d = antfly_half_le_to_float({s});
-                \\    const uint qh = antfly_u32_le({s});
-                \\    const int packed_index = lane & 15;
-                \\    const uchar packed = block[{d} + packed_index];
-                \\    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-                \\    const int high = (int)((qh >> (uint)lane) & 1u);
-                \\    return d * (float)((low4 | (high << 4)) - 16);
-                \\}}
-                \\
-            ,
-                .{ d_pointer, qh_pointer, qs_offset },
-            );
-        },
-        .q5_1 => {
-            const m_offset = blockFieldOffset(compiled.spec, "m");
-            const qh_offset = blockFieldOffset(compiled.spec, "qh");
-            const m_pointer = try blockPointerOffsetExpr(allocator, m_offset);
-            defer allocator.free(m_pointer);
-            const qh_pointer = try blockPointerOffsetExpr(allocator, qh_offset);
-            defer allocator.free(qh_pointer);
-            try appendFmt(
-                allocator,
-                &out,
-                \\static inline float antfly_q5_1_dequant_lane(const device uchar *block, int lane) {{
-                \\    const float d = antfly_half_le_to_float({s});
-                \\    const float m = antfly_half_le_to_float({s});
-                \\    const uint qh = antfly_u32_le({s});
-                \\    const int packed_index = lane & 15;
-                \\    const uchar packed = block[{d} + packed_index];
-                \\    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-                \\    const int high = (int)((qh >> (uint)lane) & 1u);
-                \\    return d * (float)(low4 | (high << 4)) + m;
-                \\}}
-                \\
-            ,
-                .{ d_pointer, m_pointer, qh_pointer, qs_offset },
-            );
-        },
-        else => return error.UnsupportedQuantKernelFormat,
-    }
-    try out.append(allocator, '\n');
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *{s} [[buffer(1)]],
-        \\    device float *output [[buffer(2)]],
-        \\    constant int &rows [[buffer(3)]],
-        \\    constant int &in_dim [[buffer(4)]],
-        \\    constant int &out_dim [[buffer(5)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < 32) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = {s} + ((col * block_count + block_idx) * {d});
-        \\            const int lane = (int)tid;
-        \\            acc += input[row * in_dim + (block_idx << {d}) + lane] * antfly_{s}_dequant_lane(block, lane);
-        \\        }}
-        \\    }}
-        \\
-        \\    acc = simd_sum(acc);
-        \\    if (tid == 0) output[row * out_dim + col] = acc;
-        \\}}
-        \\
-    ,
-        .{
-            compiled.artifact.kernel_id,
-            weight_name,
-            block_mask,
-            block_shift,
-            weight_name,
-            compiled.spec.block_bytes,
-            block_shift,
-            format_suffix,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ4_1SmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const m_offset = blockFieldOffset(compiled.spec, "m");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const m_pointer = try blockPointerOffsetExpr(allocator, m_offset);
-    defer allocator.free(m_pointer);
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// {s} from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-        \\static inline float antfly_q4_1_dequant_lane(const device uchar *block, int lane) {{
-        \\    const float d = antfly_half_le_to_float({s});
-        \\    const float m = antfly_half_le_to_float({s});
-        \\    const int packed_index = lane & 15;
-        \\    const uchar packed = block[{d} + packed_index];
-        \\    const int q = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-        \\    return d * (float)q + m;
-        \\}}
-        \\
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *weight_q4_1 [[buffer(1)]],
-        \\    device float *output [[buffer(2)]],
-        \\    constant int &rows [[buffer(3)]],
-        \\    constant int &in_dim [[buffer(4)]],
-        \\    constant int &out_dim [[buffer(5)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col0 = (int)(group_pos.x << 1);
-        \\    const int col1 = col0 + 1;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc0 = 0.0f;
-        \\    float acc1 = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    const int lane = (int)tid;
-        \\    const device float *row_input = input + row * in_dim;
-        \\    const device uchar *col0_weight = weight_q4_1 + col0 * block_count * {d};
-        \\    const bool has_col1 = col1 < out_dim;
-        \\    const device uchar *col1_weight = has_col1 ? weight_q4_1 + col1 * block_count * {d} : col0_weight;
-        \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\        const float x = row_input[(block_idx << {d}) + lane];
-        \\        const device uchar *block0 = col0_weight + block_idx * {d};
-        \\        acc0 += x * antfly_q4_1_dequant_lane(block0, lane);
-        \\        if (has_col1) {{
-        \\            const device uchar *block1 = col1_weight + block_idx * {d};
-        \\            acc1 += x * antfly_q4_1_dequant_lane(block1, lane);
-        \\        }}
-        \\    }}
-        \\
-        \\    acc0 = simd_sum(acc0);
-        \\    acc1 = simd_sum(acc1);
-        \\    if (tid == 0) {{
-        \\        output[row * out_dim + col0] = acc0;
-        \\        if (has_col1) output[row * out_dim + col1] = acc1;
-        \\    }}
-        \\}}
-        \\
-    ,
-        .{
-            if (compiled.artifact.production_enabled) "Generated Metal artifact source" else metalLegacyScalarSmallBatchSourceKind(compiled.request.format),
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalLegacyScalarSmallBatchPromotionComment(compiled.artifact),
-            d_pointer,
-            m_pointer,
-            qs_offset,
-            compiled.artifact.kernel_id,
-            block_mask,
-            block_shift,
-            compiled.spec.block_bytes,
-            compiled.spec.block_bytes,
-            block_shift,
-            compiled.spec.block_bytes,
-            compiled.spec.block_bytes,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ5_1SmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const m_offset = blockFieldOffset(compiled.spec, "m");
-    const qh_offset = blockFieldOffset(compiled.spec, "qh");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const m_pointer = try blockPointerOffsetExpr(allocator, m_offset);
-    defer allocator.free(m_pointer);
-    const qh_pointer = try blockPointerOffsetExpr(allocator, qh_offset);
-    defer allocator.free(qh_pointer);
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// {s} from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-        \\static inline uint antfly_u32_le(const device uchar *p) {{
-        \\    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-        \\}}
-        \\
-        \\static inline float antfly_q5_1_dequant_lane(const device uchar *block, int lane) {{
-        \\    const float d = antfly_half_le_to_float({s});
-        \\    const float m = antfly_half_le_to_float({s});
-        \\    const uint qh = antfly_u32_le({s});
-        \\    const int packed_index = lane & 15;
-        \\    const uchar packed = block[{d} + packed_index];
-        \\    const int low4 = lane < 16 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-        \\    const int high = (int)((qh >> (uint)lane) & 1u);
-        \\    return d * (float)(low4 | (high << 4)) + m;
-        \\}}
-        \\
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *weight_q5_1 [[buffer(1)]],
-        \\    device float *output [[buffer(2)]],
-        \\    constant int &rows [[buffer(3)]],
-        \\    constant int &in_dim [[buffer(4)]],
-        \\    constant int &out_dim [[buffer(5)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col0 = (int)(group_pos.x << 1);
-        \\    const int col1 = col0 + 1;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc0 = 0.0f;
-        \\    float acc1 = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    const int lane = (int)tid;
-        \\    const device float *row_input = input + row * in_dim;
-        \\    const device uchar *col0_weight = weight_q5_1 + col0 * block_count * {d};
-        \\    const bool has_col1 = col1 < out_dim;
-        \\    const device uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * {d} : col0_weight;
-        \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\        const float x = row_input[(block_idx << {d}) + lane];
-        \\        const device uchar *block0 = col0_weight + block_idx * {d};
-        \\        acc0 += x * antfly_q5_1_dequant_lane(block0, lane);
-        \\        if (has_col1) {{
-        \\            const device uchar *block1 = col1_weight + block_idx * {d};
-        \\            acc1 += x * antfly_q5_1_dequant_lane(block1, lane);
-        \\        }}
-        \\    }}
-        \\
-        \\    acc0 = simd_sum(acc0);
-        \\    acc1 = simd_sum(acc1);
-        \\    if (tid == 0) {{
-        \\        output[row * out_dim + col0] = acc0;
-        \\        if (has_col1) output[row * out_dim + col1] = acc1;
-        \\    }}
-        \\}}
-        \\
-    ,
-        .{
-            if (compiled.artifact.production_enabled) "Generated Metal artifact source" else metalLegacyScalarSmallBatchSourceKind(compiled.request.format),
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalLegacyScalarSmallBatchPromotionComment(compiled.artifact),
-            d_pointer,
-            m_pointer,
-            qh_pointer,
-            qs_offset,
-            compiled.artifact.kernel_id,
-            block_mask,
-            block_shift,
-            compiled.spec.block_bytes,
-            compiled.spec.block_bytes,
-            block_shift,
-            compiled.spec.block_bytes,
-            compiled.spec.block_bytes,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ8FamilySmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const format_suffix = switch (compiled.request.format) {
-        .q8_1 => "q8_1",
-        .q8_k => "q8_k",
-        else => return error.UnsupportedQuantKernelFormat,
-    };
-    const weight_name = switch (compiled.request.format) {
-        .q8_1 => "weight_q8_1",
-        .q8_k => "weight_q8_k",
-        else => return error.UnsupportedQuantKernelFormat,
-    };
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    const source_kind = if (compiled.artifact.production_enabled)
-        "Generated Metal artifact source"
-    else
-        "Dev-only generated Metal candidate";
-    const promotion_comment = if (compiled.artifact.production_enabled)
-        "// Promoted after sequential Metal runtime evidence cleared correctness,\n// route, and speedup gates."
-    else
-        "// General MSL lowering smoke for descriptor-driven quant matmul.\n// Production Metal dispatch stays on native handwritten MSL until this\n// candidate clears correctness and benchmark gates.";
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// {s} from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-    ,
-        .{
-            source_kind,
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            promotion_comment,
-        },
-    );
-    try out.append(allocator, '\n');
-
-    switch (compiled.request.format) {
-        .q8_1 => try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-            \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-            \\    return (float)as_type<half>(bits);
-            \\}}
-            \\
-            \\static inline float antfly_{s}_dequant_lane(const device uchar *block, int lane) {{
-            \\    const float d = antfly_half_le_to_float({s});
-            \\    const int q = (int)as_type<char>(block[{d} + lane]);
-            \\    return d * (float)q;
-            \\}}
-            \\
-        ,
-            .{ format_suffix, d_pointer, qs_offset },
-        ),
-        .q8_k => try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_f32_le_to_float(const device uchar *p) {{
-            \\    const uint bits = (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-            \\    return as_type<float>(bits);
-            \\}}
-            \\
-            \\static inline float antfly_{s}_dequant_lane(const device uchar *block, int lane) {{
-            \\    const float d = antfly_f32_le_to_float({s});
-            \\    const int q = (int)as_type<char>(block[{d} + lane]);
-            \\    return d * (float)q;
-            \\}}
-            \\
-        ,
-            .{ format_suffix, d_pointer, qs_offset },
-        ),
-        else => return error.UnsupportedQuantKernelFormat,
-    }
-    try out.append(allocator, '\n');
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *{s} [[buffer(1)]],
-        \\    device float *output [[buffer(2)]],
-        \\    constant int &rows [[buffer(3)]],
-        \\    constant int &in_dim [[buffer(4)]],
-        \\    constant int &out_dim [[buffer(5)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < 32) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = {s} + ((col * block_count + block_idx) * {d});
-    ,
-        .{
-            compiled.artifact.kernel_id,
-            weight_name,
-            block_mask,
-            block_shift,
-            weight_name,
-            compiled.spec.block_bytes,
-        },
-    );
-
-    if (compiled.spec.block_values == 32) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\
-            \\            const int lane = (int)tid;
-            \\            acc += input[row * in_dim + (block_idx << {d}) + lane] * antfly_{s}_dequant_lane(block, lane);
-        ,
-            .{ block_shift, format_suffix },
-        );
-    } else {
-        try appendFmt(
-            allocator,
-            &out,
-            \\
-            \\            for (int lane = (int)tid; lane < {d}; lane += 32) {{
-            \\                acc += input[row * in_dim + (block_idx << {d}) + lane] * antfly_{s}_dequant_lane(block, lane);
-            \\            }}
-        ,
-            .{ compiled.spec.block_values, block_shift, format_suffix },
-        );
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\
-        \\        }}
-        \\    }}
-        \\
-        \\    acc = simd_sum(acc);
-        \\    if (tid == 0) output[row * out_dim + col] = acc;
-        \\}}
-        \\
-    ,
-        .{},
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ2KSmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const dmin_offset = blockFieldOffset(compiled.spec, "dmin");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const scale_byte_expr = if (scales_offset == 0)
-        try allocator.dupe(u8, "block[sub]")
-    else
-        try std.fmt.allocPrint(allocator, "block[{d} + sub]", .{scales_offset});
-    defer allocator.free(scale_byte_expr);
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const dmin_pointer = try blockPointerOffsetExpr(allocator, dmin_offset);
-    defer allocator.free(dmin_pointer);
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    const output_expr = switch (compiled.ir.epilogue) {
-        .none => "acc",
-        .bias => "acc + bias[col]",
-        .bias_gelu => "antfly_gelu(acc + bias[col])",
-        else => return error.UnsupportedQuantKernelEpilogue,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// Dev-only generated Metal candidate from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-    ,
-        .{
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ2KSmallBatchPromotionComment(compiled.ir.epilogue),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_gelu(float x) {{
-            \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\static inline float antfly_q2_k_dequant_lane(const device uchar *block, int lane) {{
-        \\    const uint sub = (uint)lane >> 4;
-        \\    const uint i = (uint)lane & 15u;
-        \\    const uchar scale_byte = {s};
-        \\    const float dsc = antfly_half_le_to_float({s}) * (float)(scale_byte & 0x0Fu);
-        \\    const float dmn = antfly_half_le_to_float({s}) * (float)(scale_byte >> 4);
-        \\    const uint chunk = sub >> 3;
-        \\    const uint group = (sub & 7u) >> 1;
-        \\    const uint l_base = (sub & 1u) << 4;
-        \\    const uint q_base = chunk << 5;
-        \\    const uint shift = group << 1;
-        \\    const uint q = ((uint)block[{d} + q_base + l_base + i] >> shift) & 0x03u;
-        \\    return dsc * (float)q - dmn;
-        \\}}
-        \\
-    ,
-        .{
-            scale_byte_expr,
-            d_pointer,
-            dmin_pointer,
-            qs_offset,
-        },
-    );
-    try out.append(allocator, '\n');
-
-    switch (compiled.ir.epilogue) {
-        .none => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q2_k [[buffer(1)]],
-            \\    device float *output [[buffer(2)]],
-            \\    constant int &rows [[buffer(3)]],
-            \\    constant int &in_dim [[buffer(4)]],
-            \\    constant int &out_dim [[buffer(5)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        .bias, .bias_gelu => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q2_k [[buffer(1)]],
-            \\    const device float *bias [[buffer(2)]],
-            \\    device float *output [[buffer(3)]],
-            \\    constant int &rows [[buffer(4)]],
-            \\    constant int &in_dim [[buffer(5)]],
-            \\    constant int &out_dim [[buffer(6)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        else => return error.UnsupportedQuantKernelEpilogue,
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < 32) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q2_k + ((col * block_count + block_idx) * {d});
-        \\            for (int lane = (int)tid; lane < {d}; lane += 32) {{
-        \\                acc += input[row * in_dim + (block_idx << {d}) + lane] * antfly_q2_k_dequant_lane(block, lane);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    acc = simd_sum(acc);
-        \\    if (tid == 0) output[row * out_dim + col] = {s};
-        \\}}
-        \\
-    ,
-        .{
-            block_mask,
-            block_shift,
-            compiled.spec.block_bytes,
-            compiled.spec.block_values,
-            block_shift,
-            output_expr,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ3KSmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const hmask_offset = blockFieldOffset(compiled.spec, "hmask");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const hmask_expr = if (hmask_offset == 0)
-        try allocator.dupe(u8, "block[l]")
-    else
-        try std.fmt.allocPrint(allocator, "block[{d} + l]", .{hmask_offset});
-    defer allocator.free(hmask_expr);
-    const scales_pointer = try blockPointerOffsetExpr(allocator, scales_offset);
-    defer allocator.free(scales_pointer);
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    const output_expr = switch (compiled.ir.epilogue) {
-        .none => "acc",
-        .bias => "acc + bias[col]",
-        .bias_gelu => "antfly_gelu(acc + bias[col])",
-        else => return error.UnsupportedQuantKernelEpilogue,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// {s} from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-    ,
-        .{
-            metalQ3KSmallBatchSourceKind(compiled.ir.epilogue),
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ3KSmallBatchPromotionComment(compiled.ir.epilogue),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_gelu(float x) {{
-            \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\static inline int antfly_q3_k_raw_scale(const device uchar *scale_data, uint sub) {{
-        \\    const uint i = sub & 3u;
-        \\    uint low = 0u;
-        \\    uint high = 0u;
-        \\    if (sub < 4u) {{
-        \\        low = (uint)(scale_data[i] & 0x0Fu);
-        \\        high = (uint)(scale_data[8 + i] & 0x03u);
-        \\    }} else if (sub < 8u) {{
-        \\        low = (uint)(scale_data[4 + i] & 0x0Fu);
-        \\        high = (uint)((scale_data[8 + i] >> 2) & 0x03u);
-        \\    }} else if (sub < 12u) {{
-        \\        low = (uint)((scale_data[i] >> 4) & 0x0Fu);
-        \\        high = (uint)((scale_data[8 + i] >> 4) & 0x03u);
-        \\    }} else {{
-        \\        low = (uint)((scale_data[4 + i] >> 4) & 0x0Fu);
-        \\        high = (uint)((scale_data[8 + i] >> 6) & 0x03u);
-        \\    }}
-        \\    return (int)(low | (high << 4)) - 32;
-        \\}}
-        \\
-        \\static inline float antfly_q3_k_dequant_lane(const device uchar *block, int lane) {{
-        \\    const uint sub = (uint)lane >> 4;
-        \\    const uint i = (uint)lane & 15u;
-        \\    const uint chunk = sub >> 3;
-        \\    const uint group = (sub & 7u) >> 1;
-        \\    const uint l_base = (sub & 1u) << 4;
-        \\    const uint l = l_base + i;
-        \\    const uint q_base = chunk << 5;
-        \\    const uint shift = group << 1;
-        \\    const uint hm_bit = (chunk << 2) + group;
-        \\    const int low2 = (int)(((uint)block[{d} + q_base + l] >> shift) & 0x03u);
-        \\    const int high1 = (int)(((uint){s} >> hm_bit) & 0x01u);
-        \\    const int q = low2 + high1 * 4 - 4;
-        \\    const float scale = antfly_half_le_to_float({s}) * (float)antfly_q3_k_raw_scale({s}, sub);
-        \\    return scale * (float)q;
-        \\}}
-        \\
-    ,
-        .{
-            qs_offset,
-            hmask_expr,
-            d_pointer,
-            scales_pointer,
-        },
-    );
-    try out.append(allocator, '\n');
-
-    switch (compiled.ir.epilogue) {
-        .none => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q3_k [[buffer(1)]],
-            \\    device float *output [[buffer(2)]],
-            \\    constant int &rows [[buffer(3)]],
-            \\    constant int &in_dim [[buffer(4)]],
-            \\    constant int &out_dim [[buffer(5)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        .bias, .bias_gelu => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q3_k [[buffer(1)]],
-            \\    const device float *bias [[buffer(2)]],
-            \\    device float *output [[buffer(3)]],
-            \\    constant int &rows [[buffer(4)]],
-            \\    constant int &in_dim [[buffer(5)]],
-            \\    constant int &out_dim [[buffer(6)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        else => return error.UnsupportedQuantKernelEpilogue,
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < 32) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q3_k + ((col * block_count + block_idx) * {d});
-        \\            for (int lane = (int)tid; lane < {d}; lane += 32) {{
-        \\                acc += input[row * in_dim + (block_idx << {d}) + lane] * antfly_q3_k_dequant_lane(block, lane);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    acc = simd_sum(acc);
-        \\    if (tid == 0) output[row * out_dim + col] = {s};
-        \\}}
-        \\
-    ,
-        .{
-            block_mask,
-            block_shift,
-            compiled.spec.block_bytes,
-            compiled.spec.block_values,
-            block_shift,
-            output_expr,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ4KSmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const dmin_offset = blockFieldOffset(compiled.spec, "dmin");
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const qs_offset = blockFieldOffset(compiled.spec, "qs");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const dmin_pointer = try blockPointerOffsetExpr(allocator, dmin_offset);
-    defer allocator.free(dmin_pointer);
-    const thread_count: usize = 64;
-    const reduction_start = thread_count / 2;
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    const output_expr = switch (compiled.ir.epilogue) {
-        .none => "partial[0]",
-        .bias => "partial[0] + bias[col]",
-        .bias_gelu => "antfly_gelu(partial[0] + bias[col])",
-        else => return error.UnsupportedQuantKernelEpilogue,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-    ,
-        .{
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ4KSmallBatchPromotionComment(compiled.artifact, compiled.ir.epilogue),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_gelu(float x) {{
-            \\    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-            \\    return 0.5f * x * (1.0f + fast::tanh(inner));
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\static inline void antfly_q4_k_unpack_scale_min(
-        \\    const device uchar *scales,
-        \\    int sub,
-        \\    thread float &scale,
-        \\    thread float &min_v
-        \\) {{
-        \\    if (sub < 4) {{
-        \\        scale = (float)(scales[sub] & 63u);
-        \\        min_v = (float)(scales[sub + 4] & 63u);
-        \\        return;
-        \\    }}
-        \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-        \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-        \\}}
-        \\
-        \\static inline float antfly_q4_k_dequant_lane(const device uchar *block, int lane) {{
-        \\    const device uchar *d = {s};
-        \\    const device uchar *dmin = {s};
-        \\    const device uchar *scales = block + {d};
-        \\    const device uchar *qs = block + {d};
-        \\    const int sub = lane >> 5;
-        \\    const int q_index = (sub >> 1) * 32 + (lane & 31);
-        \\    const uchar packed = qs[q_index];
-        \\    const uchar q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-        \\    float raw_scale = 0.0f;
-        \\    float raw_min = 0.0f;
-        \\    antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-        \\    return antfly_half_le_to_float(d) * raw_scale * (float)q - antfly_half_le_to_float(dmin) * raw_min;
-        \\}}
-        \\
-    ,
-        .{
-            d_pointer,
-            dmin_pointer,
-            scales_offset,
-            qs_offset,
-        },
-    );
-    try out.append(allocator, '\n');
-
-    switch (compiled.ir.epilogue) {
-        .none => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q4_k [[buffer(1)]],
-            \\    device float *output [[buffer(2)]],
-            \\    constant int &rows [[buffer(3)]],
-            \\    constant int &in_dim [[buffer(4)]],
-            \\    constant int &out_dim [[buffer(5)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        .bias => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q4_k [[buffer(1)]],
-            \\    const device float *bias [[buffer(2)]],
-            \\    device float *output [[buffer(3)]],
-            \\    constant int &rows [[buffer(4)]],
-            \\    constant int &in_dim [[buffer(5)]],
-            \\    constant int &out_dim [[buffer(6)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]],
-            \\    ushort lane_id [[thread_index_in_simdgroup]],
-            \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        .bias_gelu => try appendFmt(
-            allocator,
-            &out,
-            \\kernel void {s}(
-            \\    const device float *input [[buffer(0)]],
-            \\    const device uchar *weight_q4_k [[buffer(1)]],
-            \\    const device float *bias [[buffer(2)]],
-            \\    device float *output [[buffer(3)]],
-            \\    constant int &rows [[buffer(4)]],
-            \\    constant int &in_dim [[buffer(5)]],
-            \\    constant int &out_dim [[buffer(6)]],
-            \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-            \\    uint3 group_pos [[threadgroup_position_in_grid]]
-            \\) {{
-            \\
-        ,
-            .{compiled.artifact.kernel_id},
-        ),
-        else => return error.UnsupportedQuantKernelEpilogue,
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-    ,
-        .{block_mask},
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .none) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\    threadgroup float partial[{d}];
-            \\    float acc = 0.0f;
-            \\
-        ,
-            .{thread_count},
-        );
-    } else {
-        try appendFmt(
-            allocator,
-            &out,
-            \\    float acc = 0.0f;
-            \\
-        ,
-            .{},
-        );
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < {d}) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q4_k + ((col * block_count + block_idx) * {d});
-        \\            const int base = block_idx << {d};
-        \\            for (int lane = (int)tid; lane < {d}; lane += {d}) {{
-        \\                acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-    ,
-        .{
-            block_shift,
-            thread_count,
-            compiled.spec.block_bytes,
-            block_shift,
-            compiled.spec.block_values,
-            thread_count,
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue != .none) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\    threadgroup float partial[{d}];
-            \\
-        ,
-            .{thread_count},
-        );
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\    if (tid < {d}) partial[tid] = acc;
-        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    for (uint stride = {d}; stride > 0; stride >>= 1) {{
-        \\        if (tid < stride) partial[tid] += partial[tid + stride];
-        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    }}
-        \\    if (tid == 0) output[row * out_dim + col] = {s};
-        \\}}
-        \\
-    ,
-        .{
-            thread_count,
-            reduction_start,
-            output_expr,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ5KSmallBatchBiasSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const dmin_offset = blockFieldOffset(compiled.spec, "dmin");
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const qh_offset = blockFieldOffset(compiled.spec, "qh");
-    const ql_offset = blockFieldOffset(compiled.spec, "ql");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const thread_count: usize = 128;
-    const simd_width: usize = 32;
-    const active_simdgroups = thread_count / simd_width;
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    const output_expr = switch (compiled.ir.epilogue) {
-        .bias => "total + bias[col]",
-        .bias_gelu => "antfly_gelu(total + bias[col])",
-        else => return error.UnsupportedQuantKernelEpilogue,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-    ,
-        .{
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ5KSmallBatchPromotionComment(compiled.artifact, compiled.ir.epilogue),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_gelu(float x) {{
-            \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\static inline void antfly_q5_k_unpack_scale_min(
-        \\    const device uchar *scales,
-        \\    int sub,
-        \\    thread float &scale,
-        \\    thread float &min_v
-        \\) {{
-        \\    if (sub < 4) {{
-        \\        scale = (float)(scales[sub] & 63u);
-        \\        min_v = (float)(scales[sub + 4] & 63u);
-        \\        return;
-        \\    }}
-        \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-        \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-        \\}}
-        \\
-        \\static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin) {{
-        \\    const device uchar *scales = block + {d};
-        \\    const device uchar *qh = block + {d};
-        \\    const device uchar *ql = block + {d};
-        \\    const int sub = lane >> 5;
-        \\    const int i = lane & 31;
-        \\    const int q_index = (sub >> 1) * 32 + i;
-        \\    const uchar packed = ql[q_index];
-        \\    const int low = (sub & 1) == 0 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-        \\    const int high = (int)((qh[i] >> sub) & 1u);
-        \\    const int q = low + high * 16;
-        \\    float raw_scale = 0.0f;
-        \\    float raw_min = 0.0f;
-        \\    antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-        \\    return d * raw_scale * (float)q - dmin * raw_min;
-        \\}}
-        \\
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *weight_q5_k [[buffer(1)]],
-        \\    const device float *bias [[buffer(2)]],
-        \\    device float *output [[buffer(3)]],
-        \\    constant int &rows [[buffer(4)]],
-        \\    constant int &in_dim [[buffer(5)]],
-        \\    constant int &out_dim [[buffer(6)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]],
-        \\    ushort lane_id [[thread_index_in_simdgroup]],
-        \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < {d}) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q5_k + ((col * block_count + block_idx) * {d});
-        \\            const int base = block_idx << {d};
-        \\            const float d = antfly_half_le_to_float({s});
-        \\            const float dmin = antfly_half_le_to_float(block + {d});
-        \\            for (int lane = (int)tid; lane < {d}; lane += {d}) {{
-        \\                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane, d, dmin);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    threadgroup float partial[{d}];
-        \\    acc = simd_sum(acc);
-        \\    if (lane_id == 0u) partial[simdgroup_id] = acc;
-        \\    if (simdgroup_id == 0u && lane_id >= {d}u) partial[lane_id] = 0.0f;
-        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    const float total = simd_sum(partial[lane_id]);
-        \\    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = {s};
-        \\}}
-        \\
-    ,
-        .{
-            scales_offset,
-            qh_offset,
-            ql_offset,
-            compiled.artifact.kernel_id,
-            block_mask,
-            block_shift,
-            thread_count,
-            compiled.spec.block_bytes,
-            block_shift,
-            d_pointer,
-            dmin_offset,
-            compiled.spec.block_values,
-            thread_count,
-            simd_width,
-            active_simdgroups,
-            output_expr,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ5KSmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const dmin_offset = blockFieldOffset(compiled.spec, "dmin");
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const qh_offset = blockFieldOffset(compiled.spec, "qh");
-    const ql_offset = blockFieldOffset(compiled.spec, "ql");
-    const d_pointer = try blockPointerOffsetExpr(allocator, d_offset);
-    defer allocator.free(d_pointer);
-    const thread_count: usize = 64;
-    const reduction_start = thread_count / 2;
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-        \\static inline void antfly_q5_k_unpack_scale_min(
-        \\    const device uchar *scales,
-        \\    int sub,
-        \\    thread float &scale,
-        \\    thread float &min_v
-        \\) {{
-        \\    if (sub < 4) {{
-        \\        scale = (float)(scales[sub] & 63u);
-        \\        min_v = (float)(scales[sub + 4] & 63u);
-        \\        return;
-        \\    }}
-        \\    scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-        \\    min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-        \\}}
-        \\
-        \\static inline float antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin) {{
-        \\    const device uchar *scales = block + {d};
-        \\    const device uchar *qh = block + {d};
-        \\    const device uchar *ql = block + {d};
-        \\    const int sub = lane >> 5;
-        \\    const int i = lane & 31;
-        \\    const int q_index = (sub >> 1) * 32 + i;
-        \\    const uchar packed = ql[q_index];
-        \\    const int low = (sub & 1) == 0 ? (int)(packed & 0x0fu) : (int)(packed >> 4);
-        \\    const int high = (int)((qh[i] >> sub) & 1u);
-        \\    const int q = low + high * 16;
-        \\    float raw_scale = 0.0f;
-        \\    float raw_min = 0.0f;
-        \\    antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-        \\    return d * raw_scale * (float)q - dmin * raw_min;
-        \\}}
-        \\
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *weight_q5_k [[buffer(1)]],
-        \\    device float *output [[buffer(2)]],
-        \\    constant int &rows [[buffer(3)]],
-        \\    constant int &in_dim [[buffer(4)]],
-        \\    constant int &out_dim [[buffer(5)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < {d}) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q5_k + ((col * block_count + block_idx) * {d});
-        \\            const int base = block_idx << {d};
-        \\            const float d = antfly_half_le_to_float({s});
-        \\            const float dmin = antfly_half_le_to_float(block + {d});
-        \\            for (int lane = (int)tid; lane < {d}; lane += {d}) {{
-        \\                acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane, d, dmin);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    threadgroup float partial[{d}];
-        \\    if (tid < {d}) partial[tid] = acc;
-        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    for (uint stride = {d}; stride > 0; stride >>= 1) {{
-        \\        if (tid < stride) partial[tid] += partial[tid + stride];
-        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    }}
-        \\    if (tid == 0) output[row * out_dim + col] = partial[0];
-        \\}}
-        \\
-    ,
-        .{
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ5KSmallBatchPromotionComment(compiled.artifact, compiled.ir.epilogue),
-            scales_offset,
-            qh_offset,
-            ql_offset,
-            compiled.artifact.kernel_id,
-            block_mask,
-            block_shift,
-            thread_count,
-            compiled.spec.block_bytes,
-            block_shift,
-            d_pointer,
-            dmin_offset,
-            compiled.spec.block_values,
-            thread_count,
-            thread_count,
-            thread_count,
-            reduction_start,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ6KSmallBatchSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const qh_offset = blockFieldOffset(compiled.spec, "qh");
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const thread_count: usize = 128;
-    const reduction_start = thread_count / 2;
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-        \\static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {{
-        \\    const device uchar *ql = block;
-        \\    const device uchar *qh = block + {d};
-        \\    const device uchar *scales = block + {d};
-        \\    const int sub = lane >> 4;
-        \\    const int i = lane & 15;
-        \\    const int half_idx = sub >> 3;
-        \\    const int group = (sub & 7) >> 1;
-        \\    const int l = ((sub & 1) << 4) + i;
-        \\    const int ql_off = half_idx * 64 + (group & 1) * 32;
-        \\    const int qh_off = half_idx * 32;
-        \\    const int qh_shift = group * 2;
-        \\    const int nibble_shift = (group >> 1) * 4;
-        \\    const int low4 = (int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-        \\    const int high2 = (int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-        \\    const int q = (low4 | (high2 << 4)) - 32;
-        \\    const int scale_u = (int)scales[sub];
-        \\    const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-        \\    return d * (float)scale * (float)q;
-        \\}}
-        \\
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *weight_q6_k [[buffer(1)]],
-        \\    device float *output [[buffer(2)]],
-        \\    constant int &rows [[buffer(3)]],
-        \\    constant int &in_dim [[buffer(4)]],
-        \\    constant int &out_dim [[buffer(5)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < {d}) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * {d});
-        \\            const int base = block_idx << {d};
-        \\            const float d = antfly_half_le_to_float(block + {d});
-        \\            for (int lane = (int)tid; lane < {d}; lane += {d}) {{
-        \\                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    threadgroup float partial[{d}];
-        \\    if (tid < {d}) partial[tid] = acc;
-        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    for (uint stride = {d}; stride > 0; stride >>= 1) {{
-        \\        if (tid < stride) partial[tid] += partial[tid + stride];
-        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    }}
-        \\    if (tid == 0) output[row * out_dim + col] = partial[0];
-        \\}}
-        \\
-    ,
-        .{
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ6KSmallBatchPromotionComment(compiled.artifact, compiled.ir.epilogue),
-            qh_offset,
-            scales_offset,
-            compiled.artifact.kernel_id,
-            block_mask,
-            block_shift,
-            thread_count,
-            compiled.spec.block_bytes,
-            block_shift,
-            d_offset,
-            compiled.spec.block_values,
-            thread_count,
-            thread_count,
-            thread_count,
-            reduction_start,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn emitMetalQ6KSmallBatchBiasSource(
-    allocator: std.mem.Allocator,
-    compiled: QuantKernelCompiledSource,
-) ![]u8 {
-    const plan_name = try planIdName(allocator, compiled.lowering.plan_id);
-    defer allocator.free(plan_name);
-
-    const block_shift = blockValueShift(compiled.spec.block_values);
-    const block_mask = compiled.spec.block_values - 1;
-    const qh_offset = blockFieldOffset(compiled.spec, "qh");
-    const scales_offset = blockFieldOffset(compiled.spec, "scales");
-    const d_offset = blockFieldOffset(compiled.spec, "d");
-    const thread_count: usize = 128;
-    const simd_width: usize = 32;
-    const active_simdgroups = thread_count / simd_width;
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
-    const output_expr = switch (compiled.ir.epilogue) {
-        .bias => "total + bias[col]",
-        .bias_gelu => "antfly_gelu(total + bias[col])",
-        else => return error.UnsupportedQuantKernelEpilogue,
-    };
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendFmt(
-        allocator,
-        &out,
-        \\// Copyright 2026 Antfly, Inc.
-        \\//
-        \\// Licensed under the Apache License, Version 2.0 (the "License");
-        \\// you may not use this file except in compliance with the License.
-        \\// You may obtain a copy of the License at
-        \\//
-        \\//     http://www.apache.org/licenses/LICENSE-2.0
-        \\//
-        \\// Unless required by applicable law or agreed to in writing, software
-        \\// distributed under the License is distributed on an "AS IS" BASIS,
-        \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-        \\// See the License for the specific language governing permissions and
-        \\// limitations under the License.
-        \\
-        \\// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
-        \\// plan_id={s}
-        \\// kernel_id={s}
-        \\// production_baseline={s}
-        \\// production_enabled={}
-        \\{s}
-        \\
-        \\#include <metal_stdlib>
-        \\using namespace metal;
-        \\
-        \\static inline float antfly_half_le_to_float(const device uchar *p) {{
-        \\    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-        \\    return (float)as_type<half>(bits);
-        \\}}
-        \\
-    ,
-        .{
-            plan_name,
-            compiled.artifact.kernel_id,
-            baseline_id,
-            compiled.artifact.production_enabled,
-            metalQ6KSmallBatchPromotionComment(compiled.artifact, compiled.ir.epilogue),
-        },
-    );
-    try out.append(allocator, '\n');
-
-    if (compiled.ir.epilogue == .bias_gelu) {
-        try appendFmt(
-            allocator,
-            &out,
-            \\static inline float antfly_gelu(float x) {{
-            \\    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-            \\}}
-            \\
-        ,
-            .{},
-        );
-        try out.append(allocator, '\n');
-    }
-
-    try appendFmt(
-        allocator,
-        &out,
-        \\static inline float antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d) {{
-        \\    const device uchar *ql = block;
-        \\    const device uchar *qh = block + {d};
-        \\    const device uchar *scales = block + {d};
-        \\    const int sub = lane >> 4;
-        \\    const int i = lane & 15;
-        \\    const int half_idx = sub >> 3;
-        \\    const int group = (sub & 7) >> 1;
-        \\    const int l = ((sub & 1) << 4) + i;
-        \\    const int ql_off = half_idx * 64 + (group & 1) * 32;
-        \\    const int qh_off = half_idx * 32;
-        \\    const int qh_shift = group * 2;
-        \\    const int nibble_shift = (group >> 1) * 4;
-        \\    const int low4 = (int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-        \\    const int high2 = (int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-        \\    const int q = (low4 | (high2 << 4)) - 32;
-        \\    const int scale_u = (int)scales[sub];
-        \\    const int scale = scale_u >= 128 ? scale_u - 256 : scale_u;
-        \\    return d * (float)scale * (float)q;
-        \\}}
-        \\
-        \\kernel void {s}(
-        \\    const device float *input [[buffer(0)]],
-        \\    const device uchar *weight_q6_k [[buffer(1)]],
-        \\    const device float *bias [[buffer(2)]],
-        \\    device float *output [[buffer(3)]],
-        \\    constant int &rows [[buffer(4)]],
-        \\    constant int &in_dim [[buffer(5)]],
-        \\    constant int &out_dim [[buffer(6)]],
-        \\    uint3 thread_pos [[thread_position_in_threadgroup]],
-        \\    uint3 group_pos [[threadgroup_position_in_grid]],
-        \\    ushort lane_id [[thread_index_in_simdgroup]],
-        \\    ushort simdgroup_id [[simdgroup_index_in_threadgroup]]
-        \\) {{
-        \\    const uint tid = thread_pos.x;
-        \\    const int col = (int)group_pos.x;
-        \\    const int row = (int)group_pos.y;
-        \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return;
-        \\
-        \\    float acc = 0.0f;
-        \\    const int block_count = in_dim >> {d};
-        \\    if (tid < {d}) {{
-        \\        for (int block_idx = 0; block_idx < block_count; ++block_idx) {{
-        \\            const device uchar *block = weight_q6_k + ((col * block_count + block_idx) * {d});
-        \\            const int base = block_idx << {d};
-        \\            const float d = antfly_half_le_to_float(block + {d});
-        \\            for (int lane = (int)tid; lane < {d}; lane += {d}) {{
-        \\                acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane, d);
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    threadgroup float partial[{d}];
-        \\    acc = simd_sum(acc);
-        \\    if (lane_id == 0u) partial[simdgroup_id] = acc;
-        \\    if (simdgroup_id == 0u && lane_id >= {d}u) partial[lane_id] = 0.0f;
-        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    const float total = simd_sum(partial[lane_id]);
-        \\    if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = {s};
-        \\}}
-        \\
-    ,
-        .{
-            qh_offset,
-            scales_offset,
-            compiled.artifact.kernel_id,
-            block_mask,
-            block_shift,
-            thread_count,
-            compiled.spec.block_bytes,
-            block_shift,
-            d_offset,
-            compiled.spec.block_values,
-            thread_count,
-            simd_width,
-            active_simdgroups,
-            output_expr,
-        },
-    );
-
-    return try out.toOwnedSlice(allocator);
 }
 
 pub fn generatedSourceForArtifact(artifact: GeneratedArtifact) ?[]const u8 {
@@ -10687,15 +6791,6 @@ fn emptyCandidateSchedule(row_bucket: quant_matmul.RowBucket, dispatch: quant_ma
 fn sourceFingerprint(comptime source: []const u8) u64 {
     @setEvalBranchQuota(131072);
     return std.hash.Wyhash.hash(0, source);
-}
-
-fn blockValueShift(block_values: usize) usize {
-    var value = block_values;
-    var shift: usize = 0;
-    while (value > 1) : (value >>= 1) {
-        shift += 1;
-    }
-    return shift;
 }
 
 fn dispatchForRowBucket(row_bucket: quant_matmul.RowBucket) ?quant_matmul.DispatchKind {
@@ -12806,7 +8901,7 @@ test "quant kernel compiler first Metal lazy target stays blocked by timing drif
     defer emitted.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(emitted.data, contents);
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "for (int lane = (int)tid; lane < 256; lane += 64)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "for (int lane = int(tid); lane < 256; lane += 64)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "threadgroup float partial[64];"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (tid < 64) partial[tid] = acc;"));
 }
@@ -12851,206 +8946,33 @@ test "quant kernel compiler compiles promoted Metal source from descriptor route
     try std.testing.expect(!try sourceHeaderMatchesCompiledPlan(std.testing.allocator, compiled, wrong_kernel_header));
 }
 
-fn expectSameMetalKernelBody(expected: []const u8, actual: []const u8) !void {
-    const marker = "#include <metal_stdlib>";
-    const expected_start = std.mem.indexOf(u8, expected, marker) orelse return error.MissingMetalSourceBody;
-    const actual_start = std.mem.indexOf(u8, actual, marker) orelse return error.MissingMetalSourceBody;
-    try std.testing.expectEqualStrings(expected[expected_start..], actual[actual_start..]);
-}
+test "quant kernel compiler emits single-sourced Metal source for every generated artifact" {
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        const compiled = compileQuantKernelSource(.{
+            .backend = artifact.backend,
+            .format = artifact.format,
+            .row_bucket = artifact.row_bucket,
+            .epilogue = artifact.epilogue,
+        }) orelse return error.MissingGeneratedSource;
+        const emitted = try emitCompiledSource(std.testing.allocator, compiled);
+        defer emitted.deinit(std.testing.allocator);
 
-test "quant kernel compiler emits migrated Metal source from descriptor data" {
-    const q8_cases = [_]struct {
-        epilogue: Epilogue,
-        expected_source: []const u8,
-    }{
-        .{ .epilogue = .none, .expected_source = first_general_metal_q8_source },
-        .{ .epilogue = .bias, .expected_source = first_general_metal_q8_bias_source },
-        .{ .epilogue = .bias_gelu, .expected_source = first_general_metal_q8_bias_gelu_source },
-        .{ .epilogue = .relu, .expected_source = first_general_metal_q8_relu_source },
-    };
+        // Metal sources are borrowed from the assembled canonical constants;
+        // nothing is re-derived at emit time.
+        try std.testing.expect(!emitted.owned);
+        try std.testing.expectEqualStrings(compiled.source, emitted.data);
+        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, compiled, emitted.data));
 
-    for (q8_cases) |case| {
-        const q8 = compileMetalKernelSource(.q8_0, .rows_2_8, case.epilogue).?;
-        const emitted_q8 = try emitCompiledSource(std.testing.allocator, q8);
-        defer emitted_q8.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q8.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q8.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q8, emitted_q8.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q8.data, 1, "const int block_count = in_dim >> 5;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q8.data, 1, "* 34"));
+        // The emitted kernel body is the runtime-region body byte-for-byte,
+        // and the source ends with it (body is the last section of the file).
+        const section = metalRuntimeQuantSectionFor(artifact.kernel_id) orelse return error.MissingRuntimeQuantSection;
+        try std.testing.expect(emitted.data.len > section.text.len + 1);
+        try std.testing.expect(std.mem.endsWith(u8, emitted.data, "\n"));
+        try std.testing.expectEqualStrings(section.text, emitted.data[emitted.data.len - section.text.len - 1 .. emitted.data.len - 1]);
     }
 
-    const q8_family_cases = [_]struct {
-        format: quant_matmul.Format,
-        expected_source: []const u8,
-        expected_block_shift: []const u8,
-        expected_block_bytes: []const u8,
-    }{
-        .{ .format = .q8_1, .expected_source = first_general_metal_q8_1_source, .expected_block_shift = "const int block_count = in_dim >> 5;", .expected_block_bytes = "* 36" },
-        .{ .format = .q8_k, .expected_source = first_general_metal_q8_k_source, .expected_block_shift = "const int block_count = in_dim >> 8;", .expected_block_bytes = "* 292" },
-    };
-
-    for (q8_family_cases) |case| {
-        const q8_family = compileMetalKernelSource(case.format, .rows_2_8, .none).?;
-        const emitted_q8_family = try emitCompiledSource(std.testing.allocator, q8_family);
-        defer emitted_q8_family.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q8_family.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q8_family.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q8_family, emitted_q8_family.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q8_family.data, 1, "block[4 + lane]"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q8_family.data, 1, case.expected_block_shift));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q8_family.data, 1, case.expected_block_bytes));
-    }
-
-    const q2_cases = [_]struct {
-        epilogue: Epilogue,
-        expected_source: []const u8,
-    }{
-        .{ .epilogue = .none, .expected_source = first_general_metal_q2_source },
-        .{ .epilogue = .bias, .expected_source = first_general_metal_q2_bias_source },
-        .{ .epilogue = .bias_gelu, .expected_source = first_general_metal_q2_bias_gelu_source },
-    };
-
-    for (q2_cases) |case| {
-        const q2 = compileMetalKernelSource(.q2_k, .rows_2_8, case.epilogue).?;
-        const emitted_q2 = try emitCompiledSource(std.testing.allocator, q2);
-        defer emitted_q2.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q2.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q2.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q2, emitted_q2.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q2.data, 1, "block + 16"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q2.data, 1, "block + 18"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q2.data, 1, "block[20 +"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q2.data, 1, "const int block_count = in_dim >> 8;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q2.data, 1, "* 84"));
-    }
-
-    const q3_cases = [_]struct {
-        epilogue: Epilogue,
-        expected_source: []const u8,
-    }{
-        .{ .epilogue = .none, .expected_source = first_general_metal_q3_source },
-        .{ .epilogue = .bias, .expected_source = first_general_metal_q3_bias_source },
-        .{ .epilogue = .bias_gelu, .expected_source = first_general_metal_q3_bias_gelu_source },
-    };
-
-    for (q3_cases) |case| {
-        const q3 = compileMetalKernelSource(.q3_k, .rows_2_8, case.epilogue).?;
-        const emitted_q3 = try emitCompiledSource(std.testing.allocator, q3);
-        defer emitted_q3.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q3.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q3.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q3, emitted_q3.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q3.data, 1, "block + 108"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q3.data, 1, "block + 96"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q3.data, 1, "block[32 +"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q3.data, 1, "const int block_count = in_dim >> 8;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q3.data, 1, "* 110"));
-    }
-
-    const q4_cases = [_]struct {
-        epilogue: Epilogue,
-        expected_source: []const u8,
-    }{
-        .{ .epilogue = .none, .expected_source = first_general_metal_q4_source },
-        .{ .epilogue = .bias, .expected_source = first_general_metal_q4_bias_source },
-        .{ .epilogue = .bias_gelu, .expected_source = first_lazy_metal_source },
-    };
-
-    for (q4_cases) |case| {
-        const q4 = compileMetalKernelSource(.q4_k, .rows_2_8, case.epilogue).?;
-        const emitted_q4 = try emitCompiledSource(std.testing.allocator, q4);
-        defer emitted_q4.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q4.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q4.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q4, emitted_q4.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q4.data, 1, "block + 2"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q4.data, 1, "block + 4"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q4.data, 1, "block + 16"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q4.data, 1, "const int block_count = in_dim >> 8;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q4.data, 1, "* 144"));
-    }
-
-    const q5_cases = [_]struct {
-        epilogue: Epilogue,
-        expected_source: []const u8,
-    }{
-        .{ .epilogue = .none, .expected_source = first_general_metal_q5_source },
-        .{ .epilogue = .bias, .expected_source = first_general_metal_q5_bias_source },
-        .{ .epilogue = .bias_gelu, .expected_source = first_general_metal_q5_bias_gelu_source },
-    };
-
-    for (q5_cases) |case| {
-        const q5 = compileMetalKernelSource(.q5_k, .rows_2_8, case.epilogue).?;
-        const emitted_q5 = try emitCompiledSource(std.testing.allocator, q5);
-        defer emitted_q5.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q5.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q5.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q5, emitted_q5.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q5.data, 1, "block + 2"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q5.data, 1, "block + 4"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q5.data, 1, "block + 16"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q5.data, 1, "block + 48"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q5.data, 1, "const int block_count = in_dim >> 8;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q5.data, 1, "* 176"));
-    }
-
-    const q6_cases = [_]struct {
-        epilogue: Epilogue,
-        expected_source: []const u8,
-    }{
-        .{ .epilogue = .none, .expected_source = first_general_metal_q6_source },
-        .{ .epilogue = .bias, .expected_source = first_general_metal_q6_bias_source },
-        .{ .epilogue = .bias_gelu, .expected_source = first_general_metal_q6_bias_gelu_source },
-    };
-
-    for (q6_cases) |case| {
-        const q6 = compileMetalKernelSource(.q6_k, .rows_2_8, case.epilogue).?;
-        const emitted_q6 = try emitCompiledSource(std.testing.allocator, q6);
-        defer emitted_q6.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_q6.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_q6.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, q6, emitted_q6.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q6.data, 1, "block + 128"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q6.data, 1, "block + 192"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q6.data, 1, "block + 208"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q6.data, 1, "const int block_count = in_dim >> 8;"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_q6.data, 1, "* 210"));
-    }
-
-    const legacy_scalar_cases = [_]struct {
-        format: quant_matmul.Format,
-        expected_source: []const u8,
-        expected_qs: []const u8,
-        expected_block_shift: []const u8,
-        expected_block_bytes: []const u8,
-    }{
-        .{ .format = .q4_0, .expected_source = first_general_metal_q4_0_source, .expected_qs = "block[2 + packed_index]", .expected_block_shift = "const int block_count = in_dim >> 5;", .expected_block_bytes = "* 18" },
-        .{ .format = .q4_1, .expected_source = first_general_metal_q4_1_source, .expected_qs = "block[4 + packed_index]", .expected_block_shift = "const int block_count = in_dim >> 5;", .expected_block_bytes = "* 20" },
-        .{ .format = .q5_0, .expected_source = first_general_metal_q5_0_source, .expected_qs = "block[6 + packed_index]", .expected_block_shift = "const int block_count = in_dim >> 5;", .expected_block_bytes = "* 22" },
-        .{ .format = .q5_1, .expected_source = first_general_metal_q5_1_source, .expected_qs = "block[8 + packed_index]", .expected_block_shift = "const int block_count = in_dim >> 5;", .expected_block_bytes = "* 24" },
-    };
-
-    for (legacy_scalar_cases) |case| {
-        const legacy_scalar = compileMetalKernelSource(case.format, .rows_2_8, .none).?;
-        const emitted_legacy_scalar = try emitCompiledSource(std.testing.allocator, legacy_scalar);
-        defer emitted_legacy_scalar.deinit(std.testing.allocator);
-
-        try std.testing.expect(emitted_legacy_scalar.owned);
-        try expectSameMetalKernelBody(case.expected_source, emitted_legacy_scalar.data);
-        try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, legacy_scalar, emitted_legacy_scalar.data));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_legacy_scalar.data, 1, case.expected_qs));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_legacy_scalar.data, 1, case.expected_block_shift));
-        try std.testing.expect(std.mem.containsAtLeast(u8, emitted_legacy_scalar.data, 1, case.expected_block_bytes));
-    }
-
+    // CUDA sources keep their existing borrowed-source path.
     const cuda_q4 = compileQuantKernelSource(.{
         .backend = .cuda,
         .format = .q4_k,
@@ -13159,7 +9081,7 @@ test "quant kernel compiler docs describe compile API guardrail" {
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Unsupported-handwritten-baseline candidates are route-evidence-only"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "cannot be promoted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "by the sequential speedup gate"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "benchmark_manifest=antfly.quant_kernel_benchmarks.v4:34:<fingerprint>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "benchmark_manifest=antfly.quant_kernel_benchmarks.v5:16:<fingerprint>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Runtime Observability"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`fast_path_misses`: the sum of explicit, mutually exclusive fallback reasons"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Actual generated Metal dispatch counters are not treated as handwritten\nfallbacks"));
@@ -13191,168 +9113,6 @@ fn metalRuntimeGeneratedEpilogueConstant(epilogue: Epilogue) ?[]const u8 {
         .relu => "TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU",
         else => null,
     };
-}
-
-// Production Metal compiles the inline kernel copies embedded in
-// metal_kernels.m, not the checked-in generated sources; some inline
-// copies are deliberately tuned differently (e.g. two-column schedules). This
-// pin table couples the two copies for review: each entry records the hash of
-// the runtime-embedded kernel body AND the fingerprint of the compiler's
-// canonical source for the same kernel_id. Changing either side without
-// updating the pin fails the focused compiler test with instructions, so the
-// canonical source and the production copy can no longer drift silently.
-const MetalRuntimeBodyPin = struct {
-    kernel_id: []const u8,
-    runtime_body_hash: u64,
-    canonical_source_hash: u64,
-};
-
-const metal_runtime_body_pins = [_]MetalRuntimeBodyPin{
-    .{ .kernel_id = "antfly_q2_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x1f646ab039ee80, .canonical_source_hash = 0xbffa023173a7ed61 },
-    .{ .kernel_id = "antfly_q2_k_small_batch_bias_msl_v1", .runtime_body_hash = 0x7aed70441dc5327a, .canonical_source_hash = 0xcb651c11e7f20990 },
-    .{ .kernel_id = "antfly_q2_k_small_batch_msl_v1", .runtime_body_hash = 0xc6b06b8074115d04, .canonical_source_hash = 0xe41216c036c7cafb },
-    .{ .kernel_id = "antfly_q3_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0xf99a02b3275eeb62, .canonical_source_hash = 0xd15906a77ce834b6 },
-    .{ .kernel_id = "antfly_q3_k_small_batch_bias_msl_v1", .runtime_body_hash = 0xf7ef7e3515a38880, .canonical_source_hash = 0x4459f6db20cf9734 },
-    .{ .kernel_id = "antfly_q3_k_small_batch_msl_v1", .runtime_body_hash = 0x1e498f08d9f638c6, .canonical_source_hash = 0x217a88179aebe4fc },
-    .{ .kernel_id = "antfly_q4_0_small_batch_msl_v1", .runtime_body_hash = 0xfd47c66f9e009e4, .canonical_source_hash = 0xb49aff4d43a9ffb },
-    .{ .kernel_id = "antfly_q4_1_small_batch_msl_v1", .runtime_body_hash = 0xfd8d38ca3cb6f742, .canonical_source_hash = 0xfff37c5a3c56fd1f },
-    .{ .kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0xd5929148279f4a9f, .canonical_source_hash = 0xad9e8921f92a6293 },
-    .{ .kernel_id = "antfly_q4_k_small_batch_bias_msl_v1", .runtime_body_hash = 0xebf4c466489c9065, .canonical_source_hash = 0xe4f603887fd33bc0 },
-    .{ .kernel_id = "antfly_q4_k_small_batch_msl_v1", .runtime_body_hash = 0xf875059129c9ed14, .canonical_source_hash = 0xbed995ef759808cd },
-    .{ .kernel_id = "antfly_q5_0_small_batch_msl_v1", .runtime_body_hash = 0xf6d30e164ea9cbe1, .canonical_source_hash = 0xae3f7cc1f99a038 },
-    .{ .kernel_id = "antfly_q5_1_small_batch_msl_v1", .runtime_body_hash = 0x1e44fe5ffa62078b, .canonical_source_hash = 0x3f562676efab8fc0 },
-    .{ .kernel_id = "antfly_q5_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x221bfc080ab2bb7, .canonical_source_hash = 0x1c51faf50f75efda },
-    .{ .kernel_id = "antfly_q5_k_small_batch_bias_msl_v1", .runtime_body_hash = 0x6304e67739e20122, .canonical_source_hash = 0xfd608f66208c06e3 },
-    .{ .kernel_id = "antfly_q5_k_small_batch_msl_v1", .runtime_body_hash = 0x466c77f30acb36f3, .canonical_source_hash = 0xa5dfa6d020ea06de },
-    .{ .kernel_id = "antfly_q6_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x917edb325863daaa, .canonical_source_hash = 0xc2e74c7f0ab3a560 },
-    .{ .kernel_id = "antfly_q6_k_small_batch_bias_msl_v1", .runtime_body_hash = 0xbdc01e9dee349384, .canonical_source_hash = 0x103d34b05fe92841 },
-    .{ .kernel_id = "antfly_q6_k_small_batch_msl_v1", .runtime_body_hash = 0xdf66e5f4a4c0248, .canonical_source_hash = 0xe199819fac2bdee5 },
-    .{ .kernel_id = "antfly_q8_0_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x59aeddf61fcf4af3, .canonical_source_hash = 0x2377561ab9366fd2 },
-    .{ .kernel_id = "antfly_q8_0_small_batch_bias_msl_v1", .runtime_body_hash = 0xf1d32add5fcd8a7e, .canonical_source_hash = 0xdcea10376e7af982 },
-    .{ .kernel_id = "antfly_q8_0_small_batch_msl_v1", .runtime_body_hash = 0xd36a5be695d2f220, .canonical_source_hash = 0x1ec14d1228ccb79f },
-    .{ .kernel_id = "antfly_q8_0_small_batch_relu_msl_v1", .runtime_body_hash = 0xc02daa86efe7668b, .canonical_source_hash = 0x1b44125eab1a277b },
-    .{ .kernel_id = "antfly_q8_1_small_batch_msl_v1", .runtime_body_hash = 0x54136dbd447359bc, .canonical_source_hash = 0xc86e59761512fa3f },
-    .{ .kernel_id = "antfly_q8_k_small_batch_msl_v1", .runtime_body_hash = 0xf612c83a498cebe8, .canonical_source_hash = 0xeb33b725acc1fb92 },
-};
-
-fn metalRuntimeBodyPinFor(kernel_id: []const u8) ?MetalRuntimeBodyPin {
-    for (metal_runtime_body_pins) |pin| {
-        if (std.mem.eql(u8, pin.kernel_id, kernel_id)) return pin;
-    }
-    return null;
-}
-
-// Extracts the MSL body of `kernel void <kernel_id>...{...}` from the C string
-// literals in metal_kernels.m and normalizes it (drops quotes and literal \n
-// escapes, collapses whitespace) so formatting-only edits do not churn pins.
-fn extractNormalizedMetalRuntimeKernelBody(
-    allocator: std.mem.Allocator,
-    contents: []const u8,
-    kernel_id: []const u8,
-) ![]u8 {
-    const marker = try std.fmt.allocPrint(allocator, "kernel void {s}", .{kernel_id});
-    defer allocator.free(marker);
-    const start = std.mem.indexOf(u8, contents, marker) orelse return error.RuntimeKernelBodyMissing;
-    var depth: usize = 0;
-    var end: usize = start;
-    var seen_open = false;
-    while (end < contents.len) : (end += 1) {
-        const c = contents[end];
-        if (c == '{') {
-            depth += 1;
-            seen_open = true;
-        } else if (c == '}') {
-            if (depth == 0) return error.RuntimeKernelBodyUnbalanced;
-            depth -= 1;
-            if (seen_open and depth == 0) break;
-        }
-    }
-    if (!seen_open or depth != 0) return error.RuntimeKernelBodyUnbalanced;
-    const raw = contents[start .. end + 1];
-
-    var normalized = try allocator.alloc(u8, raw.len);
-    errdefer allocator.free(normalized);
-    var len: usize = 0;
-    var pending_space = false;
-    var i: usize = 0;
-    while (i < raw.len) : (i += 1) {
-        const c = raw[i];
-        if (c == '"') continue;
-        if (c == '\\' and i + 1 < raw.len and raw[i + 1] == 'n') {
-            i += 1;
-            pending_space = true;
-            continue;
-        }
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
-            pending_space = true;
-            continue;
-        }
-        if (pending_space and len > 0) {
-            normalized[len] = ' ';
-            len += 1;
-        }
-        pending_space = false;
-        normalized[len] = c;
-        len += 1;
-    }
-    return allocator.realloc(normalized, len);
-}
-
-test "quant kernel compiler pins runtime-embedded Metal kernel bodies to canonical sources" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
-    defer std.testing.allocator.free(contents);
-
-    var failed = false;
-    for (first_generated_artifacts) |artifact| {
-        if (artifact.backend != .metal or !artifactRuntimeWired(artifact)) continue;
-        const body = try extractNormalizedMetalRuntimeKernelBody(std.testing.allocator, contents, artifact.kernel_id);
-        defer std.testing.allocator.free(body);
-        const runtime_body_hash = std.hash.Wyhash.hash(0, body);
-        // Same value the promotion-evidence manifests pin for this artifact.
-        const canonical_source_hash = artifactSourceFingerprint(artifact);
-        const pin = metalRuntimeBodyPinFor(artifact.kernel_id) orelse {
-            std.debug.print(
-                "missing metal runtime body pin; add:\n    .{{ .kernel_id = \"{s}\", .runtime_body_hash = 0x{x}, .canonical_source_hash = 0x{x} }},\n",
-                .{ artifact.kernel_id, runtime_body_hash, canonical_source_hash },
-            );
-            failed = true;
-            continue;
-        };
-        if (pin.runtime_body_hash != runtime_body_hash) {
-            std.debug.print(
-                "runtime-embedded Metal kernel body changed for {s} (pin 0x{x} -> actual 0x{x}).\n" ++
-                    "The inline copy in metal_kernels.m is what production compiles. If this change is\n" ++
-                    "intentional, apply the matching change to the compiler canonical source (or record\n" ++
-                    "why the copies diverge) and update this pin.\n",
-                .{ artifact.kernel_id, pin.runtime_body_hash, runtime_body_hash },
-            );
-            failed = true;
-        }
-        if (pin.canonical_source_hash != canonical_source_hash) {
-            std.debug.print(
-                "canonical compiler source changed for {s} (pin 0x{x} -> actual 0x{x}).\n" ++
-                    "Production Metal compiles the inline copy in metal_kernels.m, NOT this source.\n" ++
-                    "Apply the matching change to the inline copy (or record why the copies diverge)\n" ++
-                    "and update this pin.\n",
-                .{ artifact.kernel_id, pin.canonical_source_hash, canonical_source_hash },
-            );
-            failed = true;
-        }
-    }
-    for (metal_runtime_body_pins) |pin| {
-        var found = false;
-        for (first_generated_artifacts) |artifact| {
-            if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, pin.kernel_id)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            std.debug.print("stale metal runtime body pin for unknown kernel {s}; remove it.\n", .{pin.kernel_id});
-            failed = true;
-        }
-    }
-    try std.testing.expect(!failed);
 }
 
 test "quant kernel compiler production Metal source includes only runtime-wired generated kernels" {
@@ -13691,34 +9451,19 @@ test "quant kernel compiler embedded Metal source keeps generated q5 q6 bias red
     }
 }
 
-test "quant kernel compiler generated q5 k source hoists block half scales" {
-    const q5_sources = [_][]const u8{
+test "quant kernel compiler generated q5 k and q6 k sources share the qk half helper" {
+    const qk_sources = [_][]const u8{
         first_general_metal_q5_source,
         first_general_metal_q5_bias_source,
         first_general_metal_q5_bias_gelu_source,
-    };
-
-    for (q5_sources) |source| {
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_q5_k_dequant_lane(const device uchar *block, int lane, float d, float dmin)"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const float d = antfly_half_le_to_float(block);"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const float dmin = antfly_half_le_to_float(block + 2);"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_q5_k_dequant_lane(block, lane, d, dmin)"));
-        try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "return antfly_half_le_to_float(d)"));
-    }
-}
-
-test "quant kernel compiler generated q6 k source hoists block half scale" {
-    const q6_sources = [_][]const u8{
         first_general_metal_q6_source,
         first_general_metal_q6_bias_source,
         first_general_metal_q6_bias_gelu_source,
     };
 
-    for (q6_sources) |source| {
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_q6_k_dequant_lane(const device uchar *block, int lane, float d)"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const float d = antfly_half_le_to_float(block + 208);"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_q6_k_dequant_lane(block, lane, d)"));
-        try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "return antfly_half_le_to_float(d)"));
+    for (qk_sources) |source| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, metal_rt_helper_antfly_qk_half_le_to_float));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_qk_half_le_to_float(block"));
     }
 }
 

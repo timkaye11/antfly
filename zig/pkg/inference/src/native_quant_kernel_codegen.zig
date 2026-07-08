@@ -44,8 +44,98 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .write => try writeSource(allocator, io, source),
         }
     }
+    switch (mode) {
+        .check, .check_metal => try checkMetalRuntimeRegion(allocator, io),
+        .write => try writeMetalRuntimeRegion(allocator, io),
+    }
     if (mode == .check_metal) try checkMetalArtifacts(allocator, io);
-    print("quant kernel generated sources {s}: {d} files\n", .{ @tagName(mode), files.len });
+    print("quant kernel generated sources {s}: {d} files + Metal runtime region\n", .{ @tagName(mode), files.len });
+}
+
+// The runtime-embedded copy of the generated Metal quant kernels lives in
+// metal_kernels.m between these marker lines. The codegen tool owns the
+// markers and everything between them; the compiler's section table renders
+// the region content.
+const metal_runtime_source_path = "src/backends/metal_kernels.m";
+const metal_runtime_region_begin_marker = "           // quant-kernel-codegen:begin generated quant kernels (do not edit; run: zig build quant-kernel-codegen -- --write)";
+const metal_runtime_region_end_marker = "           // quant-kernel-codegen:end generated quant kernels";
+
+const MetalRuntimeRegionSplit = struct {
+    prefix: []const u8,
+    region: []const u8,
+    suffix: []const u8,
+};
+
+fn splitMetalRuntimeRegion(contents: []const u8) !MetalRuntimeRegionSplit {
+    const begin_line = metal_runtime_region_begin_marker ++ "\n";
+    const end_line = metal_runtime_region_end_marker ++ "\n";
+    const begin = std.mem.indexOf(u8, contents, begin_line) orelse return error.MetalRuntimeRegionMarkerMissing;
+    const region_start = begin + begin_line.len;
+    const end = std.mem.indexOfPos(u8, contents, region_start, end_line) orelse return error.MetalRuntimeRegionMarkerMissing;
+    return .{
+        .prefix = contents[0..region_start],
+        .region = contents[region_start..end],
+        .suffix = contents[end..],
+    };
+}
+
+fn readMetalRuntimeSource(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    const path = try existingSourcePath(allocator, io, metal_runtime_source_path);
+    defer if (path.owned) allocator.free(path.value);
+    return std.Io.Dir.cwd().readFileAlloc(io, path.value, allocator, .limited(8 * 1024 * 1024));
+}
+
+fn checkMetalRuntimeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
+    const expected = try quant_kernel_compiler.renderMetalRuntimeQuantRegion(allocator);
+    defer allocator.free(expected);
+    const contents = try readMetalRuntimeSource(allocator, io);
+    defer allocator.free(contents);
+    const split = splitMetalRuntimeRegion(contents) catch |err| {
+        print("quant kernel Metal runtime region markers missing in {s}; run `zig build quant-kernel-codegen -- --write`\n", .{metal_runtime_source_path});
+        return err;
+    };
+    if (!std.mem.eql(u8, split.region, expected)) {
+        print(
+            "quant kernel Metal runtime region stale: path={s} expected_bytes={d} actual_bytes={d}; run `zig build quant-kernel-codegen -- --write`\n",
+            .{ metal_runtime_source_path, expected.len, split.region.len },
+        );
+        return error.GeneratedQuantKernelSourceStale;
+    }
+    try checkMetalRuntimeExternalHelpers(allocator, split);
+}
+
+// Helpers that live in metal_kernels.m outside the codegen-owned region but
+// are duplicated into standalone generated sources must keep matching the
+// compiler's copy byte-for-byte.
+fn checkMetalRuntimeExternalHelpers(allocator: std.mem.Allocator, split: MetalRuntimeRegionSplit) !void {
+    for (quant_kernel_compiler.metal_runtime_external_helpers) |helper| {
+        const fragment = try std.fmt.allocPrint(allocator, "           \"{s}\\n\"\n", .{helper});
+        defer allocator.free(fragment);
+        if (std.mem.indexOf(u8, split.prefix, fragment) == null and
+            std.mem.indexOf(u8, split.suffix, fragment) == null)
+        {
+            print(
+                "quant kernel Metal external helper drifted from compiler copy in {s}: {s}\n",
+                .{ metal_runtime_source_path, helper },
+            );
+            return error.MetalRuntimeExternalHelperDrift;
+        }
+    }
+}
+
+fn writeMetalRuntimeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
+    const expected = try quant_kernel_compiler.renderMetalRuntimeQuantRegion(allocator);
+    defer allocator.free(expected);
+    const contents = try readMetalRuntimeSource(allocator, io);
+    defer allocator.free(contents);
+    const split = try splitMetalRuntimeRegion(contents);
+    try checkMetalRuntimeExternalHelpers(allocator, split);
+    if (std.mem.eql(u8, split.region, expected)) return;
+    const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
+    defer allocator.free(updated);
+    const path = try existingSourcePath(allocator, io, metal_runtime_source_path);
+    defer if (path.owned) allocator.free(path.value);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
 }
 
 fn parseMode(args: []const []const u8) !Mode {
@@ -241,6 +331,29 @@ fn metalCheckOutputPath(command: []const u8) ?[]const u8 {
         return tokens.next();
     }
     return null;
+}
+
+test "quant kernel codegen splits the Metal runtime region on marker lines" {
+    const contents = "prefix\n" ++
+        metal_runtime_region_begin_marker ++ "\n" ++
+        "           \"kernel line\\n\"\n" ++
+        metal_runtime_region_end_marker ++ "\n" ++
+        "suffix\n";
+    const split = try splitMetalRuntimeRegion(contents);
+    try std.testing.expectEqualStrings("           \"kernel line\\n\"\n", split.region);
+    try std.testing.expect(std.mem.startsWith(u8, split.prefix, "prefix\n"));
+    try std.testing.expect(std.mem.startsWith(u8, split.suffix, metal_runtime_region_end_marker));
+    try std.testing.expectError(error.MetalRuntimeRegionMarkerMissing, splitMetalRuntimeRegion("no markers"));
+}
+
+test "quant kernel codegen Metal runtime region matches the checked-in runtime source" {
+    const expected = try quant_kernel_compiler.renderMetalRuntimeQuantRegion(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    const contents = try readMetalRuntimeSource(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(contents);
+    const split = try splitMetalRuntimeRegion(contents);
+    try std.testing.expectEqualStrings(expected, split.region);
+    try checkMetalRuntimeExternalHelpers(std.testing.allocator, split);
 }
 
 test "quant kernel codegen defaults to check mode" {

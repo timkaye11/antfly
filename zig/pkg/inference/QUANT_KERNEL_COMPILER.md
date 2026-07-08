@@ -20,17 +20,20 @@ The dispatch-facing API is still the existing graph planning contract:
 - `src/backends/metal_kernels.m`: native Metal runtime and provider lowering.
 
 Production Metal compiles the inline kernel copies embedded in
-`metal_kernels.m`, not the checked-in generated `.metal` files. Some
-inline copies are deliberately tuned differently from the canonical compiler
-source (for example two-column launch schedules); runtime-route correctness and
-promotion timing evidence are measured against the inline copies, while the
-checked-in sources are the compiler-certified reference that `xcrun` source
-checks compile. The two copies are coupled by the
-`metal_runtime_body_pins` table in `quant_kernel_compiler.zig`: the focused
-compiler test hashes every runtime-embedded kernel body and the canonical
-emitted source for the same kernel id, and fails when either side changes
-without the pin (and therefore the other copy) being reviewed. Single-sourcing
-the inline copies from the compiler is the intended follow-up.
+`metal_kernels.m`. Those copies are codegen-owned: the MSL text lives exactly
+once in `quant_kernel_compiler.zig` as per-kernel body and per-format helper
+constants plus the `metal_runtime_quant_sections` section-order table, and
+`zig build quant-kernel-codegen -- --write` renders that table both into the
+checked-in generated `.metal` files and into the marker-delimited region of
+`metal_kernels.m` (`// quant-kernel-codegen:begin/end generated quant
+kernels`). `--check` verifies both byte-for-byte, so the runtime copy and the
+checked-in generated sources share single-sourced bodies and cannot drift by
+construction (the former `metal_runtime_body_pins` hash table is gone). The
+runtime-validated tuned text is the canonical text: runtime-route correctness
+and promotion timing evidence are measured against the same bytes that `xcrun`
+source checks compile. One shared helper (`termite_q8_0_block_scale`) is owned
+by the handwritten termite kernels outside the region; the codegen check
+verifies the compiler's duplicated copy still matches it.
 
 Generated artifacts are checked in:
 
@@ -48,8 +51,10 @@ Generated artifacts are checked in:
   and Metal.
 
 `zig build quant-kernel-codegen -- --check` verifies the single generated
-source path for every manifested artifact. Stale or missing generated files
-fail the codegen check instead of becoming a packaging surprise during review.
+source path for every manifested artifact plus the marker-delimited runtime
+region of `metal_kernels.m`. Stale or missing generated files or a drifted
+runtime region fail the codegen check instead of becoming a packaging surprise
+during review.
 
 ## Compile Flow
 
@@ -79,16 +84,18 @@ defer emitted.deinit(allocator);
 // and production_enabled describe how that source is checked and routed.
 ```
 
-`emitCompiledSource(...)` is the source emission boundary. Migrated Metal
-families emit source from descriptor data and return owned source text; families
-not yet migrated return the checked-in canonical template. Both paths are
-intentional: generated files stay checked in, production dispatch stays
-artifact-backed, and source changes remain visible in review.
+`emitCompiledSource(...)` is the source emission boundary. Metal small-batch
+families return the canonical assembled source: license header, plan metadata,
+the helper constants the kernel references, and the runtime-region kernel body
+byte-for-byte. CUDA families return the checked-in canonical template. Both
+paths borrow comptime-assembled text: generated files stay checked in,
+production dispatch stays artifact-backed, and source changes remain visible
+in review.
 
 The codegen executable is always built for the build host, not the selected
 runtime target, so source checks still work during Linux/CUDA cross builds.
 
-Current descriptor-emitted Metal families:
+Current single-sourced Metal families:
 
 - `Q2_K` small batch: `none`, `bias`, `bias_gelu`.
 - `Q3_K` small batch: `none`, `bias`, `bias_gelu`.
@@ -103,16 +110,18 @@ Current descriptor-emitted Metal families:
 - `Q8_1` small batch: `none`.
 - `Q8_K` small batch: `none`.
 
-The focused compiler golden test proves emitted source is byte-for-byte equal
-to the checked-in canonical source for these families. It also keeps at least
-one non-Metal borrowed-source case so the fallback path remains covered.
+The focused compiler test proves the emitted source is the canonical assembled
+constant and that every generated Metal source ends with its runtime-region
+kernel body byte-for-byte. It also keeps at least one CUDA borrowed-source case
+so the fallback path remains covered.
 
 1. Add or change a `QuantKernelSpec` in
    `src/graph/quant_kernel_compiler.zig`.
 2. Add or update `GeneratedArtifact` route metadata.
-3. For a migrated family, update `emitCompiledSource(...)` and the small
-   backend-specific emitter. For an unmigrated family, add the canonical
-   checked-in source template.
+3. For a Metal small-batch family, add the kernel body and helper constants,
+   extend the `metal_runtime_quant_sections` section-order table, and assemble
+   the file constant with `metalSmallBatchFileSource`. For CUDA, add the
+   canonical checked-in source template.
 4. From `zig/pkg/inference`, run:
 
    ```sh
@@ -320,10 +329,10 @@ kernels prove correctness and dispatch wiring through route-all, but they do not
 have comparable handwritten baselines. They cannot be promoted by the sequential
 speedup gate until a non-speedup promotion policy or comparable baseline exists.
 
-Current Q4_K/Q5_K/Q6_K/Q8_0 compiler note: their small-batch Metal source is now
-descriptor-emitted where listed above, but promotion remains per-kernel and
-evidence-gated. Descriptor emission is source generation, not production
-selection.
+Current compiler note: every small-batch Metal family listed above is
+single-sourced from the runtime region data, but promotion remains per-kernel
+and evidence-gated. Source single-sourcing is source generation, not
+production selection.
 
 Current local validation snapshot:
 
@@ -387,7 +396,7 @@ evidence file also records the compiler benchmark manifest schema, case count,
 and case fingerprint, and the evidence checker rejects stale or partial case
 sets before trusting benchmark speedups. Successful production-regression checks
 also print the identity in the summary line as:
-`benchmark_manifest=antfly.quant_kernel_benchmarks.v4:34:<fingerprint>`.
+`benchmark_manifest=antfly.quant_kernel_benchmarks.v5:16:<fingerprint>`.
 
 ## Runtime Observability
 
@@ -448,9 +457,9 @@ The minimal path is:
 1. Add the descriptor data: block values, block bytes, fields, decode ops,
    schedules, epilogues, dtype policy, and backend support.
 2. Add generated source/artifact metadata for one schedule.
-3. Add descriptor-driven emission only when it removes real duplicated source
-   work for that family. Keep the emitter backend-specific and byte-for-byte
-   golden-tested against the checked-in source.
+3. For Metal small-batch kernels, add the body and helper constants to the
+   codegen-owned runtime region data so the generated file and the
+   `metal_kernels.m` copy stay byte-for-byte single-sourced.
 4. Add route/conformance expectations.
 5. Regenerate manifests.
 6. Prove CPU/reference correctness and route coverage.

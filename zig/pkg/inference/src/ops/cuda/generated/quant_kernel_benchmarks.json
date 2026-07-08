@@ -7,7 +7,7 @@
   "metal_production_regression_expected_kernel_count": 8,
   "metal_production_regression_expected_case_count": 16,
   "metal_production_regression_expected_route_ready_count": 16,
-  "metal_production_regression_case_fingerprint": 15041979450967320174,
+  "metal_production_regression_case_fingerprint": 11853342078607899837,
   "metal_production_regression_build_command": "zig build quant-kernel-metal-production-regression-check -Dmetal=true -Dcuda=false",
   "metal_production_regression_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check",
   "metal_production_regression_cases": [
@@ -26,7 +26,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal",
-      "generated_source_fingerprint": 16434223005036956411,
+      "generated_source_fingerprint": 11758113296163199783,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q2_k_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -46,7 +46,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0010000000474974513,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal",
-      "generated_source_fingerprint": 16434223005036956411,
+      "generated_source_fingerprint": 11758113296163199783,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q2_k_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -66,7 +66,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal",
-      "generated_source_fingerprint": 2412390185375098108,
+      "generated_source_fingerprint": 18431454158263379044,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal -o /tmp/antfly_q3_k_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q3_k_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -86,7 +86,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0010000000474974513,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal",
-      "generated_source_fingerprint": 2412390185375098108,
+      "generated_source_fingerprint": 18431454158263379044,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal -o /tmp/antfly_q3_k_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q3_k_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -106,7 +106,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.00019999999494757503,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal",
-      "generated_source_fingerprint": 16498378169713376192,
+      "generated_source_fingerprint": 3128766473690891303,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal -o /tmp/antfly_q4_k_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q4_k_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -126,7 +126,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal",
-      "generated_source_fingerprint": 16498378169713376192,
+      "generated_source_fingerprint": 3128766473690891303,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal -o /tmp/antfly_q4_k_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q4_k_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -146,7 +146,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.00019999999494757503,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal",
-      "generated_source_fingerprint": 2216137232032249759,
+      "generated_source_fingerprint": 7568483252132614247,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal -o /tmp/antfly_q8_0_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q8_0_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -166,7 +166,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal",
-      "generated_source_fingerprint": 2216137232032249759,
+      "generated_source_fingerprint": 7568483252132614247,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal -o /tmp/antfly_q8_0_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q8_0_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -186,7 +186,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.00019999999494757503,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal",
-      "generated_source_fingerprint": 15918553663157238146,
+      "generated_source_fingerprint": 7285357451023371434,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal -o /tmp/antfly_q8_0_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q8_0_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -206,7 +206,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal",
-      "generated_source_fingerprint": 15918553663157238146,
+      "generated_source_fingerprint": 7285357451023371434,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal -o /tmp/antfly_q8_0_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q8_0_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -226,7 +226,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.00019999999494757503,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal",
-      "generated_source_fingerprint": 18257750558155474659,
+      "generated_source_fingerprint": 12514016651358834699,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal -o /tmp/antfly_q5_k_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q5_k_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -246,7 +246,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal",
-      "generated_source_fingerprint": 18257750558155474659,
+      "generated_source_fingerprint": 12514016651358834699,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal -o /tmp/antfly_q5_k_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q5_k_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -266,7 +266,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.00019999999494757503,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal",
-      "generated_source_fingerprint": 16256166852758855397,
+      "generated_source_fingerprint": 4298419779625642563,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal -o /tmp/antfly_q6_k_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q6_k_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -286,7 +286,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal",
-      "generated_source_fingerprint": 16256166852758855397,
+      "generated_source_fingerprint": 4298419779625642563,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal -o /tmp/antfly_q6_k_small_batch_msl_v1.air",
       "production_kernel_id": "antfly_q6_k_small_batch_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -306,7 +306,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.00019999999494757503,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal",
-      "generated_source_fingerprint": 1170149410314201153,
+      "generated_source_fingerprint": 2516420602915122533,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal -o /tmp/antfly_q6_k_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q6_k_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -326,7 +326,7 @@
       "cols_per_threadgroup": 1,
       "tolerance_abs": 0.0005000000237487257,
       "generated_source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal",
-      "generated_source_fingerprint": 1170149410314201153,
+      "generated_source_fingerprint": 2516420602915122533,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal -o /tmp/antfly_q6_k_small_batch_bias_msl_v1.air",
       "production_kernel_id": "antfly_q6_k_small_batch_bias_msl_v1",
       "benchmark_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-production-regression-evidence.json --repeat-runs 5 --measure-iters 500 --production-regression-check"
@@ -565,7 +565,7 @@
     {
       "kernel_id": "antfly_q2_k_small_batch_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal",
-      "source_fingerprint": 16434223005036956411,
+      "source_fingerprint": 11758113296163199783,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal -o /tmp/antfly_q2_k_small_batch_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q2_k_small_batch_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q2_k_small_batch_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q2_k_small_batch_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q2_k_small_batch_msl_v1",
@@ -582,7 +582,7 @@
     {
       "kernel_id": "antfly_q3_k_small_batch_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal",
-      "source_fingerprint": 2412390185375098108,
+      "source_fingerprint": 18431454158263379044,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal -o /tmp/antfly_q3_k_small_batch_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q3_k_small_batch_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q3_k_small_batch_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q3_k_small_batch_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q3_k_small_batch_msl_v1",
@@ -599,7 +599,7 @@
     {
       "kernel_id": "antfly_q5_k_small_batch_bias_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal",
-      "source_fingerprint": 18257750558155474659,
+      "source_fingerprint": 12514016651358834699,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal -o /tmp/antfly_q5_k_small_batch_bias_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q5_k_small_batch_bias_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q5_k_small_batch_bias_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q5_k_small_batch_bias_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q5_k_small_batch_bias_msl_v1",
@@ -616,7 +616,7 @@
     {
       "kernel_id": "antfly_q6_k_small_batch_bias_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal",
-      "source_fingerprint": 1170149410314201153,
+      "source_fingerprint": 2516420602915122533,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal -o /tmp/antfly_q6_k_small_batch_bias_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q6_k_small_batch_bias_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q6_k_small_batch_bias_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q6_k_small_batch_bias_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q6_k_small_batch_bias_msl_v1",
@@ -633,7 +633,7 @@
     {
       "kernel_id": "antfly_q6_k_small_batch_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal",
-      "source_fingerprint": 16256166852758855397,
+      "source_fingerprint": 4298419779625642563,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal -o /tmp/antfly_q6_k_small_batch_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q6_k_small_batch_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q6_k_small_batch_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q6_k_small_batch_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q6_k_small_batch_msl_v1",
@@ -650,7 +650,7 @@
     {
       "kernel_id": "antfly_q4_k_small_batch_bias_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal",
-      "source_fingerprint": 16498378169713376192,
+      "source_fingerprint": 3128766473690891303,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal -o /tmp/antfly_q4_k_small_batch_bias_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q4_k_small_batch_bias_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q4_k_small_batch_bias_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q4_k_small_batch_bias_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q4_k_small_batch_bias_msl_v1",
@@ -667,7 +667,7 @@
     {
       "kernel_id": "antfly_q8_0_small_batch_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal",
-      "source_fingerprint": 2216137232032249759,
+      "source_fingerprint": 7568483252132614247,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal -o /tmp/antfly_q8_0_small_batch_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q8_0_small_batch_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q8_0_small_batch_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q8_0_small_batch_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q8_0_small_batch_msl_v1",
@@ -684,7 +684,7 @@
     {
       "kernel_id": "antfly_q8_0_small_batch_bias_msl_v1",
       "source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal",
-      "source_fingerprint": 15918553663157238146,
+      "source_fingerprint": 7285357451023371434,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal -o /tmp/antfly_q8_0_small_batch_bias_msl_v1.air",
       "runtime_evidence_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /private/tmp/antfly-quant-metal-antfly_q8_0_small_batch_bias_msl_v1-promotion-evidence.json --repeat-runs 5 --measure-iters 500 --promotion-ready-kernel antfly_q8_0_small_batch_bias_msl_v1",
       "promotion_check_command": "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --check-evidence /private/tmp/antfly-quant-metal-antfly_q8_0_small_batch_bias_msl_v1-promotion-evidence.json --require-promotion-ready --require-kernel antfly_q8_0_small_batch_bias_msl_v1",

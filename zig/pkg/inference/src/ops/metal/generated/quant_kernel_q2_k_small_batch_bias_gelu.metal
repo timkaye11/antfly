@@ -24,57 +24,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float antfly_half_le_to_float(const device uchar *p) {
-    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    return (float)as_type<half>(bits);
+inline float antfly_q2_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
+inline float antfly_q2_k_dequant_lane(device const uchar *block, int lane) {
+    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uchar scale_byte = block[sub]; float dsc = antfly_q2_k_half_le_to_float(block + 16) * float(scale_byte & 0x0fu); float dmn = antfly_q2_k_half_le_to_float(block + 18) * float(scale_byte >> 4);
+    uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;
+    return dsc * float(q) - dmn;
 }
-
-static inline float antfly_gelu(float x) {
-    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-}
-
-static inline float antfly_q2_k_dequant_lane(const device uchar *block, int lane) {
-    const uint sub = (uint)lane >> 4;
-    const uint i = (uint)lane & 15u;
-    const uchar scale_byte = block[sub];
-    const float dsc = antfly_half_le_to_float(block + 16) * (float)(scale_byte & 0x0Fu);
-    const float dmn = antfly_half_le_to_float(block + 18) * (float)(scale_byte >> 4);
-    const uint chunk = sub >> 3;
-    const uint group = (sub & 7u) >> 1;
-    const uint l_base = (sub & 1u) << 4;
-    const uint q_base = chunk << 5;
-    const uint shift = group << 1;
-    const uint q = ((uint)block[20 + q_base + l_base + i] >> shift) & 0x03u;
-    return dsc * (float)q - dmn;
-}
-
-kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1(
-    const device float *input [[buffer(0)]],
-    const device uchar *weight_q2_k [[buffer(1)]],
-    const device float *bias [[buffer(2)]],
-    device float *output [[buffer(3)]],
-    constant int &rows [[buffer(4)]],
-    constant int &in_dim [[buffer(5)]],
-    constant int &out_dim [[buffer(6)]],
-    uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
-) {
-    const uint tid = thread_pos.x;
-    const int col = (int)group_pos.x;
-    const int row = (int)group_pos.y;
-    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return;
-
-    float acc = 0.0f;
-    const int block_count = in_dim >> 8;
-    if (tid < 32) {
-        for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-            const device uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84);
-            for (int lane = (int)tid; lane < 256; lane += 32) {
-                acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q2_k_dequant_lane(block, lane);
-            }
-        }
-    }
-
-    acc = simd_sum(acc);
-    if (tid == 0) output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
+inline float antfly_q2_k_gelu(float x) { return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
+kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
+    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = antfly_q2_k_gelu(acc + bias[col]);
 }

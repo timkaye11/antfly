@@ -23,42 +23,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float antfly_half_le_to_float(const device uchar *p) {
-    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    return (float)as_type<half>(bits);
-}
-
-static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {
-    const float d = antfly_half_le_to_float(block);
-    const int q = (int)as_type<char>(block[2 + lane]);
-    return d * (float)q;
-}
-
-kernel void antfly_q8_0_small_batch_msl_v1(
-    const device float *input [[buffer(0)]],
-    const device uchar *weight_q8_0 [[buffer(1)]],
-    device float *output [[buffer(2)]],
-    constant int &rows [[buffer(3)]],
-    constant int &in_dim [[buffer(4)]],
-    constant int &out_dim [[buffer(5)]],
-    uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
-) {
-    const uint tid = thread_pos.x;
-    const int col = (int)group_pos.x;
-    const int row = (int)group_pos.y;
-    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-
-    float acc = 0.0f;
-    const int block_count = in_dim >> 5;
-    const int lane = (int)tid;
-    const device float *row_input = input + row * in_dim;
-    const device uchar *col_weight = weight_q8_0 + col * block_count * 34;
-    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-        const device uchar *block = col_weight + block_idx * 34;
-        acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane);
-    }
-
-    acc = simd_sum(acc);
-    if (tid == 0) output[row * out_dim + col] = acc;
+inline float termite_q8_0_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }
+inline float antfly_q8_0_dequant_lane(device const uchar *block, int lane) { float d = termite_q8_0_block_scale(block, 0u); int q = int(as_type<char>(block[2 + lane])); return d * float(q); }
+kernel void antfly_q8_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
+    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col_weight = weight_q8_0 + col * block_count * 34; for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = col_weight + block_idx * 34; acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane); }
+    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
 }

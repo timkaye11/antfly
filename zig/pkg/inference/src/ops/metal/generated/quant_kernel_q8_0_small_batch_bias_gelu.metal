@@ -24,50 +24,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float antfly_half_le_to_float(const device uchar *p) {
-    const ushort bits = (ushort)p[0] | ((ushort)p[1] << 8);
-    return (float)as_type<half>(bits);
-}
-
-static inline float antfly_q8_0_dequant_lane(const device uchar *block, int lane) {
-    const float d = antfly_half_le_to_float(block);
-    const int q = (int)as_type<char>(block[2 + lane]);
-    return d * (float)q;
-}
-
-static inline float antfly_gelu(float x) {
-    return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-}
-
-kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(
-    const device float *input [[buffer(0)]],
-    const device uchar *weight_q8_0 [[buffer(1)]],
-    const device float *bias [[buffer(2)]],
-    device float *output [[buffer(3)]],
-    constant int &rows [[buffer(4)]],
-    constant int &in_dim [[buffer(5)]],
-    constant int &out_dim [[buffer(6)]],
-    uint3 thread_pos [[thread_position_in_threadgroup]],
-    uint3 group_pos [[threadgroup_position_in_grid]]
-) {
-    const uint tid = thread_pos.x;
-    const int col = (int)group_pos.x;
-    const int row = (int)group_pos.y;
-    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return;
-
-    float acc = 0.0f;
-    const int block_count = in_dim >> 5;
-    const int lane = (int)tid;
-    const device float *row_input = input + row * in_dim;
-    const device uchar *col_weight = weight_q8_0 + col * block_count * 34;
-    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-        const float x = row_input[(block_idx << 5) + lane];
-        const device uchar *block = col_weight + block_idx * 34;
-        acc += x * antfly_q8_0_dequant_lane(block, lane);
-    }
-
-    acc = simd_sum(acc);
-    if (tid == 0) {
-        output[row * out_dim + col] = antfly_gelu(acc + bias[col]);
-    }
+inline float antfly_q4_k_bias_gelu(float x) { float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); return 0.5f * x * (1.0f + fast::tanh(inner)); }
+inline float termite_q8_0_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }
+inline float antfly_q8_0_dequant_lane(device const uchar *block, int lane) { float d = termite_q8_0_block_scale(block, 0u); int q = int(as_type<char>(block[2 + lane])); return d * float(q); }
+kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
+    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q8_0 + col0 * block_count * 34; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q8_0 + col1 * block_count * 34 : col0_weight; for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 34; acc0 += x * antfly_q8_0_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 34; acc1 += x * antfly_q8_0_dequant_lane(block1, lane); } }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = antfly_q4_k_bias_gelu(acc0 + bias[col0]); if (has_col1) output[row * out_dim + col1] = antfly_q4_k_bias_gelu(acc1 + bias[col1]); }
 }
