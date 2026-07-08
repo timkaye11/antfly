@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const quant_kernel_compiler = @import("graph/quant_kernel_compiler.zig");
+const quant_kernel_compiler_renderer = @import("graph/quant_kernel_metal_renderer.zig");
 
 const print = std.debug.print;
 
@@ -361,7 +362,53 @@ fn checkMetalArtifacts(allocator: std.mem.Allocator, io: std.Io) !void {
         try checkMetalArtifact(allocator, io, artifact);
         count += 1;
     }
-    print("quant kernel generated Metal check: {d} artifacts\n", .{count});
+    const v2_count = try checkMetalRenderedV2(allocator, io);
+    print("quant kernel generated Metal check: {d} artifacts + {d} rendered v2\n", .{ count, v2_count });
+}
+
+// Renders every metal_production_schedules route through the descriptor-driven
+// renderer and compiles it with `xcrun metal`. Shadow-only: these v2 sources are
+// not checked in; this proves the renderer emits compilable MSL for every route.
+fn checkMetalRenderedV2(allocator: std.mem.Allocator, io: std.Io) !usize {
+    const renderer = quant_kernel_compiler_renderer;
+    var count: usize = 0;
+    for (quant_kernel_compiler.metal_production_schedules) |entry| {
+        const decoder = renderer.decoderFor(entry.format) orelse return error.MissingV2Decoder;
+        const suffix = switch (entry.epilogue) {
+            .none => "",
+            .bias => "_bias",
+            .bias_gelu => "_bias_gelu",
+            .relu => "_relu",
+            else => return error.UnsupportedV2Epilogue,
+        };
+        const kernel_id = try std.fmt.allocPrint(allocator, "antfly_{s}_small_batch{s}_msl_v2", .{ @tagName(entry.format), suffix });
+        defer allocator.free(kernel_id);
+        const body = try renderer.renderKernel(allocator, kernel_id, decoder, entry.schedule, entry.epilogue);
+        defer allocator.free(body);
+        const full = try std.fmt.allocPrint(allocator, "#include <metal_stdlib>\nusing namespace metal;\n{s}", .{body});
+        defer allocator.free(full);
+        const src_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.metal", .{kernel_id});
+        defer allocator.free(src_path);
+        const air_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.air", .{kernel_id});
+        defer allocator.free(air_path);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = full });
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "xcrun", "--toolchain", "Metal", "metal", "-c", src_path, "-o", air_path },
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        const term = try child.wait(io);
+        switch (term) {
+            .exited => |code| if (code != 0) {
+                print("rendered v2 kernel failed to compile: {s}\n", .{kernel_id});
+                return error.MetalV2CheckFailed;
+            },
+            else => return error.MetalV2CheckFailed,
+        }
+        count += 1;
+    }
+    return count;
 }
 
 fn checkMetalArtifact(allocator: std.mem.Allocator, io: std.Io, artifact: quant_kernel_compiler.GeneratedArtifact) !void {
