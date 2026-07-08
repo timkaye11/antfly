@@ -2846,10 +2846,10 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "inline float antfly_q8_k_f32_le_to_float(device const uchar *p) { uint bits = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); return as_type<float>(bits); }\n"
            "inline float antfly_q8_k_dequant_lane(device const uchar *block, int lane) { float d = antfly_q8_k_f32_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }\n"
-           "kernel void antfly_q8_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_q8_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
-           "    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q8_k + ((col * block_count + block_idx) * 292); for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + (block_idx << 8) + lane] * antfly_q8_k_dequant_lane(block, lane); } }\n"
-           "    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;\n"
+           "    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q8_k + ((col * block_count + block_idx) * 292); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q8_k_dequant_lane(block, lane); }\n"
+           "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 2u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;\n"
            "}\n"
            "inline float antfly_q2_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }\n"
            "inline float antfly_q2_k_dequant_lane(device const uchar *block, int lane) {\n"
@@ -7125,7 +7125,7 @@ static const termite_metal_generated_quant_launch_entry termite_metal_generated_
     { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 2u },
     { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q8_1, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
-    { TERMITE_METAL_QUANT_FORMAT_Q8_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 64u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 128u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 1u },
@@ -9605,7 +9605,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH") &&
+        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q8_K_SMALL_BATCH") &&
         runtime->antfly_q8_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q8_0_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
         f32_activation_buffers &&
