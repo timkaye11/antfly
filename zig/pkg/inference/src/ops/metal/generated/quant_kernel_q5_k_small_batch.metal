@@ -16,10 +16,9 @@
 // plan_id=metal/q5_k/rows_2_8/none/small_batch
 // kernel_id=antfly_q5_k_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-// Production Metal dispatch stays on native handwritten MSL until this
-// candidate clears correctness and benchmark gates.
+// production_enabled=true
+// Promoted after the schedule sweep re-tuned this route to 256-thread
+// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.
 
 #include <metal_stdlib>
 using namespace metal;

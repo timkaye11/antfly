@@ -9626,7 +9626,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH") &&
+        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH") &&
         runtime->antfly_q5_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q6_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q6_K &&
         f32_activation_buffers &&
