@@ -312,6 +312,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    const quant_kernel_metal_v2_conformance_step = b.step("quant-kernel-metal-v2-conformance", "Run rendered v2 Metal quant kernels against the CPU reference on device");
     const quant_kernel_metal_runtime_route_all_step = b.step("quant-kernel-metal-runtime-route-all", "Run dev-only generated Metal route-all evidence check");
     const quant_kernel_metal_production_regression_step = b.step("quant-kernel-metal-production-regression-check", "Run promoted Metal quant kernel production regression gate");
     const quant_kernel_metal_blocker_evidence_refresh_step = b.step("quant-kernel-metal-blocker-evidence-refresh", "Refresh local Metal promotion blocker evidence");
@@ -337,6 +338,13 @@ pub fn build(b: *std.Build) void {
             run_quant_kernel_metal_runtime_check.step.dependOn(metal_artifact_check_step);
         }
         quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check.step);
+
+        const run_quant_kernel_metal_v2_conformance = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_kernel_metal_v2_conformance.addArg("--v2-conformance");
+        if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
+            run_quant_kernel_metal_v2_conformance.step.dependOn(metal_artifact_check_step);
+        }
+        quant_kernel_metal_v2_conformance_step.dependOn(&run_quant_kernel_metal_v2_conformance.step);
 
         const route_all_evidence_path = "/private/tmp/antfly-quant-metal-runtime-route-all-evidence.json";
         const run_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
@@ -405,6 +413,7 @@ pub fn build(b: *std.Build) void {
     } else {
         const metal_unavailable_step = quant_kernel_metal_unavailable_step orelse unreachable;
         quant_kernel_metal_runtime_check_step.dependOn(metal_unavailable_step);
+        quant_kernel_metal_v2_conformance_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_runtime_route_all_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_production_regression_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_blocker_evidence_refresh_step.dependOn(metal_unavailable_step);

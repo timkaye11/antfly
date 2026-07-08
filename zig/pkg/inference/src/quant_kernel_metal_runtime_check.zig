@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const quant_kernel_compiler = @import("graph/quant_kernel_compiler.zig");
+const quant_kernel_metal_renderer = @import("graph/quant_kernel_metal_renderer.zig");
 const quant_matmul = @import("graph/quant_matmul.zig");
 const quant_codec = @import("gguf/quant_codec.zig");
 const compat = @import("io/compat.zig");
@@ -813,6 +814,7 @@ const Config = struct {
     runtime_route_kernel: ?[]const u8 = null,
     runtime_route_all: bool = false,
     production_regression_check: bool = false,
+    v2_conformance: bool = false,
     repeat_runs: u32 = 1,
     measure_iters: ?u32 = null,
 };
@@ -847,6 +849,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (termite_metal_device_available() == 0) return error.MetalDeviceUnavailable;
+
+    if (cfg.v2_conformance) {
+        try runV2Conformance(allocator);
+        return;
+    }
 
     if (cfg.refresh_blocker_evidence) {
         const summary = try refreshBlockerEvidence(allocator, cfg.confirm_cleared_blockers);
@@ -1017,6 +1024,9 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--production-regression-check")) {
             if (cfg.production_regression_check) return error.DuplicateProductionRegressionCheck;
             cfg.production_regression_check = true;
+        } else if (std.mem.eql(u8, arg, "--v2-conformance")) {
+            if (cfg.v2_conformance) return error.DuplicateV2Conformance;
+            cfg.v2_conformance = true;
         } else if (std.mem.eql(u8, arg, "--repeat-runs")) {
             if (cfg.repeat_runs != 1) return error.DuplicateRepeatRuns;
             i += 1;
@@ -1260,11 +1270,63 @@ fn repeatGateRank(count: usize) usize {
     return if (count >= quant_kernel_compiler.metal_promotion_repeat_runs) 1 else 0;
 }
 
+// Renders every metal_production_schedules route through the descriptor-driven
+// renderer and runs it on-device against the CPU reference, reusing the v1
+// benchmark shapes/tolerances. Proves the v2 kernels are numerically correct on
+// the GPU (not just that they compile). Non-production: nothing is promoted.
+fn runV2Conformance(allocator: std.mem.Allocator) !void {
+    var checked: usize = 0;
+    var worst_error: f32 = 0.0;
+    for (metal_runtime_checks) |v1_check| {
+        const decoder = quant_kernel_metal_renderer.decoderFor(v1_check.format) orelse return error.MissingV2Decoder;
+        const schedule = quant_kernel_compiler.metalRouteScheduleFor(v1_check.format, .rows_2_8, v1_check.epilogue) orelse return error.MissingV2Schedule;
+        const suffix = switch (v1_check.epilogue) {
+            .none => "",
+            .bias => "_bias",
+            .bias_gelu => "_bias_gelu",
+            .relu => "_relu",
+            else => return error.UnsupportedV2Epilogue,
+        };
+        const kernel_id = try std.fmt.allocPrint(allocator, "antfly_{s}_small_batch{s}_msl_v2", .{ @tagName(v1_check.format), suffix });
+        defer allocator.free(kernel_id);
+        const body = try quant_kernel_metal_renderer.renderKernel(allocator, kernel_id, decoder, schedule, v1_check.epilogue);
+        defer allocator.free(body);
+        const source = try std.fmt.allocPrint(allocator, "#include <metal_stdlib>\nusing namespace metal;\n{s}", .{body});
+        defer allocator.free(source);
+
+        var v2_check = v1_check;
+        v2_check.source = source;
+        v2_check.kernel_name = kernel_id;
+        v2_check.threads_per_threadgroup = schedule.threads_per_threadgroup;
+        v2_check.cols_per_threadgroup = schedule.cols_per_threadgroup;
+        v2_check.measure_iters = 1; // conformance only; timing irrelevant
+
+        const result = runCheckImpl(allocator, v2_check, null, null, true) catch |err| {
+            std.debug.print("quant-kernel-metal-v2-conformance {s} FAILED err={s}\n", .{ v1_check.name, @errorName(err) });
+            return err;
+        };
+        if (result.max_error > worst_error) worst_error = result.max_error;
+        std.debug.print("quant-kernel-metal-v2-conformance {s} ok max_abs_error={d:.7} tolerance={d:.7}\n", .{ v1_check.name, result.max_error, v1_check.tolerance });
+        checked += 1;
+    }
+    std.debug.print("quant-kernel-metal-v2-conformance done: {d} cases, worst_abs_error={d:.7}\n", .{ checked, worst_error });
+}
+
 fn runCheck(
     allocator: std.mem.Allocator,
     check: CheckCase,
     route_kernel: ?[]const u8,
     promotion_ready_kernel: ?[]const u8,
+) !CheckResult {
+    return runCheckImpl(allocator, check, route_kernel, promotion_ready_kernel, false);
+}
+
+fn runCheckImpl(
+    allocator: std.mem.Allocator,
+    check: CheckCase,
+    route_kernel: ?[]const u8,
+    promotion_ready_kernel: ?[]const u8,
+    conformance_only: bool,
 ) !CheckResult {
     const dense_weight = try allocator.alloc(f32, check.in_dim * check.out_dim);
     defer allocator.free(dense_weight);
@@ -1364,6 +1426,12 @@ fn runCheck(
             std.debug.print("generated Metal kernel {s} mismatch at {d}: got={d} want={d} diff={d}\n", .{ check.name, index, got, want, diff });
             return error.GeneratedMetalKernelMismatch;
         }
+    }
+    // Conformance-only callers (rendered v2 kernels) want just the standalone
+    // source-vs-CPU-reference correctness result; skip all baseline/route timing
+    // (which asserts production route selection and would trip on promoted routes).
+    if (conformance_only) {
+        return .{ .max_error = max_error, .measure_iters = check.measure_iters, .elapsed_nanos = elapsed_nanos };
     }
     const selected_for_route = route_kernel != null and std.mem.eql(u8, route_kernel.?, check.kernel_name);
     const selected_for_promotion = promotion_ready_kernel != null and std.mem.eql(u8, promotion_ready_kernel.?, check.kernel_name);
