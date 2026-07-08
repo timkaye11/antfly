@@ -247,7 +247,7 @@ pub const metal_production_schedules = [_]MetalRouteSchedule{
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
-    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
 };
 
@@ -4027,8 +4027,8 @@ const metal_rt_body_antfly_q6_k_small_batch_msl_v1 =
 const metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1 =
     \\kernel void antfly_q6_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
     \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); } }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
     \\}
 ;
 
@@ -8948,7 +8948,8 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("", metal_q6_bias.kernel_id);
     try std.testing.expectEqualStrings("", metal_q6_bias.candidate_source_path);
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "threadgroup float partial[32];"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;"));
+    // q6_k/bias re-tuned to 256 threads (8 simdgroups): `lane_id >= 8u`.
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "simdgroup_index_in_threadgroup"));
 
     const metal_q6_bias_gelu = registryLoweringFor(.metal, .q6_k, .rows_2_8, .bias_gelu, .small_batch);
@@ -9573,7 +9574,10 @@ test "quant kernel compiler embedded Metal source keeps generated q5 q6 bias red
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
-    const optimized_reduction = "threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
+    // The hybrid-simd reduction structure, independent of the simdgroup count
+    // (`lane_id >= {threads/32}u`), which varies with the route's thread count.
+    const optimized_reduction_head = "threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= ";
+    const optimized_reduction_tail = "u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
     const old_reduction = "threadgroup float partial[32]; if (simdgroup_id == 0u) partial[lane_id] = 0.0f; acc = simd_sum(acc); threadgroup_barrier(mem_flags::mem_threadgroup); if (lane_id == 0u) partial[simdgroup_id] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
     const kernels = [_][]const u8{
         "antfly_q5_k_small_batch_bias_msl_v1",
@@ -9586,7 +9590,8 @@ test "quant kernel compiler embedded Metal source keeps generated q5 q6 bias red
         const start = std.mem.indexOf(u8, contents, kernel) orelse return error.MissingEmbeddedQ5Q6BiasKernel;
         const end = std.mem.indexOfPos(u8, contents, start, "\"}\\n\"") orelse return error.MissingEmbeddedQ5Q6BiasKernelEnd;
         const body = contents[start..end];
-        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction_head));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction_tail));
         try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, old_reduction));
     }
 }
@@ -10086,7 +10091,7 @@ test "quant kernel compiler metal_production_schedules reproduces the launch-sha
         .{ .format = .q5_k, .epilogue = .bias, .threads = 128, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
         .{ .format = .q6_k, .epilogue = .none, .threads = 256, .cols = 1 },
-        .{ .format = .q6_k, .epilogue = .bias, .threads = 128, .cols = 1 },
+        .{ .format = .q6_k, .epilogue = .bias, .threads = 256, .cols = 1 },
         .{ .format = .q6_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
     };
     try std.testing.expectEqual(expected.len, metal_production_schedules.len);
