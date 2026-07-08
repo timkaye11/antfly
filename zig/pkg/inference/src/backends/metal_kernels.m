@@ -8332,7 +8332,12 @@ int termite_metal_decode_runtime_apply_quantized_linear_slot_host(
             .failure_code = -9,
         };
         if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor) != 0) return -9;
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -15292,7 +15297,12 @@ int termite_metal_decode_runtime_embed_absolute_position(
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_size * sizeof(float));
+        return 0;
     }
 }
 
@@ -15601,7 +15611,12 @@ int termite_metal_decode_runtime_embedding_lookup_prepared(
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -16642,7 +16657,12 @@ int termite_metal_decode_runtime_apply_rope(
         MTLSize group_size = MTLSizeMake(thread_width, 1, 1);
         [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, input_bytes);
+        return 0;
     }
 }
 
@@ -18434,7 +18454,12 @@ int termite_metal_decode_runtime_apply_rms_norm(
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, bytes);
+        return 0;
     }
 }
 
@@ -19313,7 +19338,12 @@ int termite_metal_decode_runtime_apply_linear(
             [encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         }
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -19443,7 +19473,12 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
             [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         }
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -20910,7 +20945,12 @@ int termite_metal_decode_runtime_apply_i2_s_linear_slot(
         if (thread_width > total && total > 0) thread_width = total;
         [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
+        const int finish_rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
+        if (finish_rc != 0) return finish_rc;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -22803,7 +22843,12 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_slots(
         if (termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor) != 0) return -10;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -11;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -11;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_a_buffer.contents != (void *)output_a) memcpy(output_a, output_a_buffer.contents, output_bytes);
+        if (output_b_buffer.contents != (void *)output_b) memcpy(output_b, output_b_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -22984,7 +23029,12 @@ int termite_metal_decode_runtime_apply_linear_pair_slots(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -13;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_a_buffer.contents != (void *)output_a) memcpy(output_a, output_a_buffer.contents, output_bytes);
+        if (output_b_buffer.contents != (void *)output_b) memcpy(output_b, output_b_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -26428,7 +26478,11 @@ int termite_metal_decode_runtime_apply_activation(
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, bytes);
+        return 0;
     }
 }
 
@@ -27834,7 +27888,11 @@ int termite_metal_decode_runtime_apply_add(
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, bytes);
+        return 0;
     }
 }
 
@@ -28599,7 +28657,11 @@ int termite_metal_decode_runtime_apply_multiply(
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -8;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -8;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, bytes);
+        return 0;
     }
 }
 
@@ -29768,7 +29830,11 @@ int termite_metal_decode_runtime_apply_attention_residual_i2_s_slot(
         if (rc != 0) return rc;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -29803,7 +29869,11 @@ int termite_metal_decode_runtime_apply_attention_residual_q4_k_slot(
         if (rc != 0) return rc;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -29838,7 +29908,11 @@ int termite_metal_decode_runtime_apply_attention_residual_q5_k_slot(
         if (rc != 0) return rc;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -29873,7 +29947,11 @@ int termite_metal_decode_runtime_apply_attention_residual_q8_0_slot(
         if (rc != 0) return rc;
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -30104,6 +30182,9 @@ int termite_metal_decode_runtime_apply_attention_span_residual_tl1(
             [command_buffer waitUntilCompleted];
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (rc == 0 && output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
         return rc;
     }
 }
@@ -30175,6 +30256,9 @@ int termite_metal_decode_runtime_apply_attention_span_residual_tl2(
             [command_buffer waitUntilCompleted];
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (rc == 0 && output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
         return rc;
     }
 }
@@ -30239,6 +30323,9 @@ int termite_metal_decode_runtime_apply_attention_span_residual_i2_s_slot(
             [command_buffer waitUntilCompleted];
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
         }
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (rc == 0 && output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
         return rc;
     }
 }
@@ -30345,6 +30432,9 @@ int termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_0_slot(
             [command_buffer waitUntilCompleted];
             rc = command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -5;
         }
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (rc == 0 && output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
         return rc;
     }
 }
@@ -30502,7 +30592,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -16;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -16;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -30640,7 +30734,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -17;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -17;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -30769,7 +30867,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -20;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -20;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -31033,7 +31135,11 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -14;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -14;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -31111,7 +31217,11 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -15;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -15;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -31279,7 +31389,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_tl2(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -16;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -16;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -31586,7 +31700,11 @@ int termite_metal_decode_runtime_apply_linear_pair_activation_multiply_linear_re
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -24;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -24;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -31927,7 +32045,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -23;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -32087,7 +32209,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -23;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -32283,7 +32409,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -23;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -23;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -33756,7 +33886,11 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -22;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -22;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, hidden_bytes);
+        return 0;
     }
 }
 
@@ -35045,7 +35179,11 @@ int termite_metal_decode_runtime_attention_span(
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -13;
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
+        // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
+        // buffer instead of aliasing it, so results must be copied back after the wait.
+        if (output_buffer.contents != (void *)output) memcpy(output, output_buffer.contents, output_bytes);
+        return 0;
     }
 }
 
@@ -35377,6 +35515,11 @@ static int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_slot(
         if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> normed_buffer = runtime->hot_hidden_buffers[0];
         if (input_buffer == nil || output_buffer == nil || normed_buffer == nil) return -5;
+        // Deferred encode: the caller commits/waits this command buffer, so a
+        // snapshot output buffer (non-page-aligned newBufferWithBytes fallback)
+        // would swallow the GPU write with no copy-back opportunity. Fail so
+        // the caller takes its fallback path instead of reading stale output.
+        if (output_buffer.contents != (void *)output) return -5;
 
         termite_metal_apply_layer_norm_params norm_params = {
             .hidden_size = (uint32_t)hidden_size,
