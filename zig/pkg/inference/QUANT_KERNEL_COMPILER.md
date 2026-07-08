@@ -19,6 +19,19 @@ The dispatch-facing API is still the existing graph planning contract:
   artifacts, route registry, benchmark manifests, and promotion evidence policy.
 - `src/backends/metal_kernels.m`: native Metal runtime and provider lowering.
 
+Production Metal compiles the inline kernel copies embedded in
+`metal_kernels.m`, not the checked-in generated/artifact `.metal` files. Some
+inline copies are deliberately tuned differently from the canonical compiler
+source (for example two-column launch schedules); runtime-route correctness and
+promotion timing evidence are measured against the inline copies, while the
+checked-in sources are the compiler-certified reference that `xcrun` source
+checks compile. The two copies are coupled by the
+`metal_runtime_body_pins` table in `quant_kernel_compiler.zig`: the focused
+compiler test hashes every runtime-embedded kernel body and the canonical
+emitted source for the same kernel id, and fails when either side changes
+without the pin (and therefore the other copy) being reviewed. Single-sourcing
+the inline copies from the compiler is the intended follow-up.
+
 Generated artifacts are checked in:
 
 - `src/ops/metal/generated/*.metal`: generated Metal candidates.

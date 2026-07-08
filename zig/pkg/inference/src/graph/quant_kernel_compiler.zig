@@ -20,6 +20,7 @@
 //! backend artifacts.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backend_contracts = @import("backend_contracts.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
@@ -7190,6 +7191,66 @@ pub fn registryLoweringFor(
     return loweringFor(backend, format, row_bucket, epilogue);
 }
 
+// registryLoweringFor is a linear scan over the full route registry, and the
+// partition executor records plan counters once per planned dispatch. A model
+// run only ever touches a handful of distinct routes, so the counters for the
+// routes seen so far are memoized here. Counters are a pure function of
+// comptime registry data, so the memo never invalidates.
+const PlannedCountersMemoEntry = struct {
+    key: u64,
+    counters: PlanCounters,
+};
+const planned_counters_memo_capacity = 64;
+var planned_counters_memo: [planned_counters_memo_capacity]PlannedCountersMemoEntry = undefined;
+var planned_counters_memo_len = std.atomic.Value(usize).init(0);
+// Spin mutex (std.Thread.Mutex was removed in Zig 0.16). Held only for the
+// memo insert, never across the registry scan.
+var planned_counters_memo_mutex: std.atomic.Mutex = .unlocked;
+
+fn plannedCountersKey(
+    backend: Backend,
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: Epilogue,
+    dispatch: quant_matmul.DispatchKind,
+) u64 {
+    var key: u64 = @intFromEnum(backend);
+    // Format is enum(u16) with an explicit tag at 254, so give it 16 bits.
+    key = (key << 16) | @intFromEnum(format);
+    key = (key << 8) | @intFromEnum(row_bucket);
+    key = (key << 8) | @intFromEnum(epilogue);
+    key = (key << 8) | @intFromEnum(dispatch);
+    return key;
+}
+
+pub fn plannedCountersFor(
+    backend: Backend,
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: Epilogue,
+    dispatch: quant_matmul.DispatchKind,
+) PlanCounters {
+    const key = plannedCountersKey(backend, format, row_bucket, epilogue, dispatch);
+    // Entries [0..len) are fully written before len is release-stored, so the
+    // lock-free read scan only ever sees complete entries.
+    const len = planned_counters_memo_len.load(.acquire);
+    for (planned_counters_memo[0..len]) |entry| {
+        if (entry.key == key) return entry.counters;
+    }
+    const counters = countersForLowering(registryLoweringFor(backend, format, row_bucket, epilogue, dispatch));
+    platform.sync.lockYielding(&planned_counters_memo_mutex);
+    defer planned_counters_memo_mutex.unlock();
+    const locked_len = planned_counters_memo_len.load(.acquire);
+    for (planned_counters_memo[len..locked_len]) |entry| {
+        if (entry.key == key) return counters;
+    }
+    if (locked_len < planned_counters_memo_capacity) {
+        planned_counters_memo[locked_len] = .{ .key = key, .counters = counters };
+        planned_counters_memo_len.store(locked_len + 1, .release);
+    }
+    return counters;
+}
+
 pub fn countersForLowering(lowering: QuantKernelLowering) PlanCounters {
     var counters = PlanCounters{ .quant_kernel_planned_ops = 1 };
     switch (lowering.production_route) {
@@ -13381,6 +13442,168 @@ fn metalRuntimeGeneratedEpilogueConstant(epilogue: Epilogue) ?[]const u8 {
     };
 }
 
+// Production Metal compiles the inline kernel copies embedded in
+// metal_kernels.m, not the checked-in generated/artifact sources; some inline
+// copies are deliberately tuned differently (e.g. two-column schedules). This
+// pin table couples the two copies for review: each entry records the hash of
+// the runtime-embedded kernel body AND the fingerprint of the compiler's
+// canonical source for the same kernel_id. Changing either side without
+// updating the pin fails the focused compiler test with instructions, so the
+// canonical source and the production copy can no longer drift silently.
+const MetalRuntimeBodyPin = struct {
+    kernel_id: []const u8,
+    runtime_body_hash: u64,
+    canonical_source_hash: u64,
+};
+
+const metal_runtime_body_pins = [_]MetalRuntimeBodyPin{
+    .{ .kernel_id = "antfly_q2_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x1f646ab039ee80, .canonical_source_hash = 0xbffa023173a7ed61 },
+    .{ .kernel_id = "antfly_q2_k_small_batch_bias_msl_v1", .runtime_body_hash = 0x7aed70441dc5327a, .canonical_source_hash = 0xcb651c11e7f20990 },
+    .{ .kernel_id = "antfly_q2_k_small_batch_msl_v1", .runtime_body_hash = 0xc6b06b8074115d04, .canonical_source_hash = 0xe41216c036c7cafb },
+    .{ .kernel_id = "antfly_q3_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0xf99a02b3275eeb62, .canonical_source_hash = 0xd15906a77ce834b6 },
+    .{ .kernel_id = "antfly_q3_k_small_batch_bias_msl_v1", .runtime_body_hash = 0xf7ef7e3515a38880, .canonical_source_hash = 0x4459f6db20cf9734 },
+    .{ .kernel_id = "antfly_q3_k_small_batch_msl_v1", .runtime_body_hash = 0x1e498f08d9f638c6, .canonical_source_hash = 0x217a88179aebe4fc },
+    .{ .kernel_id = "antfly_q4_0_small_batch_msl_v1", .runtime_body_hash = 0xfd47c66f9e009e4, .canonical_source_hash = 0xb49aff4d43a9ffb },
+    .{ .kernel_id = "antfly_q4_1_small_batch_msl_v1", .runtime_body_hash = 0xfd8d38ca3cb6f742, .canonical_source_hash = 0xfff37c5a3c56fd1f },
+    .{ .kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0xd5929148279f4a9f, .canonical_source_hash = 0xad9e8921f92a6293 },
+    .{ .kernel_id = "antfly_q4_k_small_batch_bias_msl_v1", .runtime_body_hash = 0xebf4c466489c9065, .canonical_source_hash = 0xe4f603887fd33bc0 },
+    .{ .kernel_id = "antfly_q4_k_small_batch_msl_v1", .runtime_body_hash = 0xf875059129c9ed14, .canonical_source_hash = 0xbed995ef759808cd },
+    .{ .kernel_id = "antfly_q5_0_small_batch_msl_v1", .runtime_body_hash = 0xf6d30e164ea9cbe1, .canonical_source_hash = 0xae3f7cc1f99a038 },
+    .{ .kernel_id = "antfly_q5_1_small_batch_msl_v1", .runtime_body_hash = 0x1e44fe5ffa62078b, .canonical_source_hash = 0x3f562676efab8fc0 },
+    .{ .kernel_id = "antfly_q5_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x221bfc080ab2bb7, .canonical_source_hash = 0x1c51faf50f75efda },
+    .{ .kernel_id = "antfly_q5_k_small_batch_bias_msl_v1", .runtime_body_hash = 0x6304e67739e20122, .canonical_source_hash = 0xfd608f66208c06e3 },
+    .{ .kernel_id = "antfly_q5_k_small_batch_msl_v1", .runtime_body_hash = 0x466c77f30acb36f3, .canonical_source_hash = 0xa5dfa6d020ea06de },
+    .{ .kernel_id = "antfly_q6_k_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x917edb325863daaa, .canonical_source_hash = 0xc2e74c7f0ab3a560 },
+    .{ .kernel_id = "antfly_q6_k_small_batch_bias_msl_v1", .runtime_body_hash = 0xbdc01e9dee349384, .canonical_source_hash = 0x103d34b05fe92841 },
+    .{ .kernel_id = "antfly_q6_k_small_batch_msl_v1", .runtime_body_hash = 0xdf66e5f4a4c0248, .canonical_source_hash = 0xe199819fac2bdee5 },
+    .{ .kernel_id = "antfly_q8_0_small_batch_bias_gelu_msl_v1", .runtime_body_hash = 0x59aeddf61fcf4af3, .canonical_source_hash = 0x2377561ab9366fd2 },
+    .{ .kernel_id = "antfly_q8_0_small_batch_bias_msl_v1", .runtime_body_hash = 0xf1d32add5fcd8a7e, .canonical_source_hash = 0xdcea10376e7af982 },
+    .{ .kernel_id = "antfly_q8_0_small_batch_msl_v1", .runtime_body_hash = 0xd36a5be695d2f220, .canonical_source_hash = 0x1ec14d1228ccb79f },
+    .{ .kernel_id = "antfly_q8_0_small_batch_relu_msl_v1", .runtime_body_hash = 0xc02daa86efe7668b, .canonical_source_hash = 0x1b44125eab1a277b },
+    .{ .kernel_id = "antfly_q8_1_small_batch_msl_v1", .runtime_body_hash = 0x54136dbd447359bc, .canonical_source_hash = 0xc86e59761512fa3f },
+    .{ .kernel_id = "antfly_q8_k_small_batch_msl_v1", .runtime_body_hash = 0xf612c83a498cebe8, .canonical_source_hash = 0xeb33b725acc1fb92 },
+};
+
+fn metalRuntimeBodyPinFor(kernel_id: []const u8) ?MetalRuntimeBodyPin {
+    for (metal_runtime_body_pins) |pin| {
+        if (std.mem.eql(u8, pin.kernel_id, kernel_id)) return pin;
+    }
+    return null;
+}
+
+// Extracts the MSL body of `kernel void <kernel_id>...{...}` from the C string
+// literals in metal_kernels.m and normalizes it (drops quotes and literal \n
+// escapes, collapses whitespace) so formatting-only edits do not churn pins.
+fn extractNormalizedMetalRuntimeKernelBody(
+    allocator: std.mem.Allocator,
+    contents: []const u8,
+    kernel_id: []const u8,
+) ![]u8 {
+    const marker = try std.fmt.allocPrint(allocator, "kernel void {s}", .{kernel_id});
+    defer allocator.free(marker);
+    const start = std.mem.indexOf(u8, contents, marker) orelse return error.RuntimeKernelBodyMissing;
+    var depth: usize = 0;
+    var end: usize = start;
+    var seen_open = false;
+    while (end < contents.len) : (end += 1) {
+        const c = contents[end];
+        if (c == '{') {
+            depth += 1;
+            seen_open = true;
+        } else if (c == '}') {
+            if (depth == 0) return error.RuntimeKernelBodyUnbalanced;
+            depth -= 1;
+            if (seen_open and depth == 0) break;
+        }
+    }
+    if (!seen_open or depth != 0) return error.RuntimeKernelBodyUnbalanced;
+    const raw = contents[start .. end + 1];
+
+    var normalized = try allocator.alloc(u8, raw.len);
+    errdefer allocator.free(normalized);
+    var len: usize = 0;
+    var pending_space = false;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c == '"') continue;
+        if (c == '\\' and i + 1 < raw.len and raw[i + 1] == 'n') {
+            i += 1;
+            pending_space = true;
+            continue;
+        }
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            pending_space = true;
+            continue;
+        }
+        if (pending_space and len > 0) {
+            normalized[len] = ' ';
+            len += 1;
+        }
+        pending_space = false;
+        normalized[len] = c;
+        len += 1;
+    }
+    return allocator.realloc(normalized, len);
+}
+
+test "quant kernel compiler pins runtime-embedded Metal kernel bodies to canonical sources" {
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
+    defer std.testing.allocator.free(contents);
+
+    var failed = false;
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal or !artifactRuntimeWired(artifact)) continue;
+        const body = try extractNormalizedMetalRuntimeKernelBody(std.testing.allocator, contents, artifact.kernel_id);
+        defer std.testing.allocator.free(body);
+        const runtime_body_hash = std.hash.Wyhash.hash(0, body);
+        // Same value the promotion-evidence manifests pin for this artifact.
+        const canonical_source_hash = artifactSourceFingerprint(artifact);
+        const pin = metalRuntimeBodyPinFor(artifact.kernel_id) orelse {
+            std.debug.print(
+                "missing metal runtime body pin; add:\n    .{{ .kernel_id = \"{s}\", .runtime_body_hash = 0x{x}, .canonical_source_hash = 0x{x} }},\n",
+                .{ artifact.kernel_id, runtime_body_hash, canonical_source_hash },
+            );
+            failed = true;
+            continue;
+        };
+        if (pin.runtime_body_hash != runtime_body_hash) {
+            std.debug.print(
+                "runtime-embedded Metal kernel body changed for {s} (pin 0x{x} -> actual 0x{x}).\n" ++
+                    "The inline copy in metal_kernels.m is what production compiles. If this change is\n" ++
+                    "intentional, apply the matching change to the compiler canonical source (or record\n" ++
+                    "why the copies diverge) and update this pin.\n",
+                .{ artifact.kernel_id, pin.runtime_body_hash, runtime_body_hash },
+            );
+            failed = true;
+        }
+        if (pin.canonical_source_hash != canonical_source_hash) {
+            std.debug.print(
+                "canonical compiler source changed for {s} (pin 0x{x} -> actual 0x{x}).\n" ++
+                    "Production Metal compiles the inline copy in metal_kernels.m, NOT this source.\n" ++
+                    "Apply the matching change to the inline copy (or record why the copies diverge)\n" ++
+                    "and update this pin.\n",
+                .{ artifact.kernel_id, pin.canonical_source_hash, canonical_source_hash },
+            );
+            failed = true;
+        }
+    }
+    for (metal_runtime_body_pins) |pin| {
+        var found = false;
+        for (first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, pin.kernel_id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("stale metal runtime body pin for unknown kernel {s}; remove it.\n", .{pin.kernel_id});
+            failed = true;
+        }
+    }
+    try std.testing.expect(!failed);
+}
+
 test "quant kernel compiler production Metal source includes only runtime-wired generated kernels" {
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
@@ -13518,18 +13741,18 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     ));
     const none_encoder = std.mem.indexOf(u8, contents, "static int termite_metal_encode_quant_matmul_generic_none_on_encoder") orelse return error.MissingMetalNoneEncoder;
     const q8_encoder = std.mem.indexOfPos(u8, contents, none_encoder, "static int termite_metal_encode_q8_0_linear(") orelse return error.MissingMetalQ8Encoder;
-    const q8_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH\")") orelse return error.MissingMetalQ8Disable;
-    const q2_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q2_K_SMALL_BATCH\")") orelse return error.MissingMetalQ2Disable;
+    const q8_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH\")") orelse return error.MissingMetalQ8Disable;
+    const q2_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q2_K_SMALL_BATCH\")") orelse return error.MissingMetalQ2Disable;
     const q4_0_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH") orelse return error.MissingMetalQ4_0Enable;
     const q4_1_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH") orelse return error.MissingMetalQ4_1Enable;
     const q5_0_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q5_0_SMALL_BATCH") orelse return error.MissingMetalQ5_0Enable;
     const q5_1_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q5_1_SMALL_BATCH") orelse return error.MissingMetalQ5_1Enable;
     const q8_1_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH") orelse return error.MissingMetalQ8_1Enable;
     const q8_k_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH") orelse return error.MissingMetalQ8_KEnable;
-    const q3_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q3_K_SMALL_BATCH\")") orelse return error.MissingMetalQ3Disable;
+    const q3_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q3_K_SMALL_BATCH\")") orelse return error.MissingMetalQ3Disable;
     const q4_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH") orelse return error.MissingMetalQ4Enable;
     const q5_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH") orelse return error.MissingMetalQ5Enable;
-    const q6_disable = std.mem.indexOf(u8, contents, "getenv(\"TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH\")") orelse return error.MissingMetalQ6Disable;
+    const q6_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH\")") orelse return error.MissingMetalQ6Disable;
     try std.testing.expect(q8_disable > none_encoder and q8_disable < q8_encoder);
     try std.testing.expect(q2_disable > none_encoder and q2_disable < q8_encoder);
     try std.testing.expect(q3_disable > none_encoder and q3_disable < q8_encoder);
@@ -13631,7 +13854,7 @@ fn metalCBespokeRuntimeWrapperHasArtifact(
     const body = contents[start..end];
 
     if (artifactRuntimeGateEnv(artifact)) |env| {
-        const gate = try std.fmt.allocPrint(allocator, "termite_metal_generated_quant_candidate_enabled(\"{s}\")", .{std.mem.span(env)});
+        const gate = try std.fmt.allocPrint(allocator, "termite_metal_runtime_candidate_gate(runtime, \"{s}\")", .{std.mem.span(env)});
         defer allocator.free(gate);
         if (!std.mem.containsAtLeast(u8, body, 1, gate)) return false;
     } else if (artifactCandidateOptInGateEnv(artifact)) |env| {

@@ -6445,7 +6445,30 @@ fn sleepMetalProbeRetry() void {
     _ = std.c.nanosleep(&ts, &ts);
 }
 
+// 0 = unprobed, 1 = last probe unavailable, 2 = available. A positive result
+// is cached for the process lifetime. A negative result only downgrades later
+// calls to a single quick probe (no retry sleeps): the full 10x100ms retry
+// window runs once, repeated callers (test-skip guards, backend-selection
+// fallbacks) no longer stack ~1s stalls, and a device that shows up later can
+// still flip the state back to available.
+var metal_device_probe_state = std.atomic.Value(u8).init(0);
+
 pub fn metalDeviceAvailable() bool {
+    switch (metal_device_probe_state.load(.acquire)) {
+        2 => return true,
+        1 => {
+            const available = termite_metal_device_available() != 0;
+            if (available) metal_device_probe_state.store(2, .release);
+            return available;
+        },
+        else => {},
+    }
+    const available = probeMetalDeviceAvailable();
+    metal_device_probe_state.store(if (available) 2 else 1, .release);
+    return available;
+}
+
+fn probeMetalDeviceAvailable() bool {
     const attempts = 10;
     const trace = metalDeviceProbeTraceEnabled();
     for (0..attempts) |attempt| {

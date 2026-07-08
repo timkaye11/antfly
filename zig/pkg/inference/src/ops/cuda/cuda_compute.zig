@@ -850,6 +850,7 @@ pub const CudaCompute = struct {
     cublaslt: ?cublaslt_mod.CublasLt = null,
     stats: RuntimeStats = .{},
     dispatch_stats: CudaDispatchStats = .{},
+    generated_q4_0_gates: GeneratedQ4_0Gates = .{},
     owned_by_backend: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !CudaCompute {
@@ -877,6 +878,7 @@ pub const CudaCompute = struct {
             .ctx = ctx,
             .kernels = kernels,
             .cublaslt = cublaslt,
+            .generated_q4_0_gates = GeneratedQ4_0Gates.resolve(),
         };
     }
 
@@ -2954,6 +2956,26 @@ fn cudaQ4_0GeneratedDownQ8Enabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8", false)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8", true);
 }
+
+// Resolved once at CudaCompute.init: these gates sit on the per-op linear
+// dispatch path and getenv is a linear scan of environ.
+pub const GeneratedQ4_0Gates = struct {
+    mmv: bool = true,
+    mm: bool = true,
+    pair: bool = true,
+    pair_q8: bool = true,
+    down_q8: bool = true,
+
+    fn resolve() GeneratedQ4_0Gates {
+        return .{
+            .mmv = cudaQ4_0GeneratedMmvEnabled(),
+            .mm = cudaQ4_0GeneratedMmEnabled(),
+            .pair = cudaQ4_0GeneratedPairEnabled(),
+            .pair_q8 = cudaQ4_0GeneratedPairQ8Enabled(),
+            .down_q8 = cudaQ4_0GeneratedDownQ8Enabled(),
+        };
+    }
+};
 
 // Checked-in evidence (src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json)
 // shows the generated rows 9..64 kernel losing to the handwritten baseline at
@@ -7646,7 +7668,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                             error.CudaKernelUnavailable, error.InvalidCudaState => try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                             else => return tile4w4_err,
                         };
-                    } else if (rows == 1 and cudaQ4_0GeneratedMmvEnabled()) {
+                    } else if (rows == 1 and self.generated_q4_0_gates.mmv) {
                         if (self.kernels.launchLinearQ4_0GeneratedMmvF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mmv_hits += 1;
                         } else |generated_err| switch (generated_err) {
@@ -7658,7 +7680,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                         }
                     } else if (rows == 1) {
                         try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
-                    } else if (rows >= 9 and rows <= 64 and in_dim >= cuda_q4_0_generated_mm_min_in_dim and cudaQ4_0GeneratedMmEnabled()) {
+                    } else if (rows >= 9 and rows <= 64 and in_dim >= cuda_q4_0_generated_mm_min_in_dim and self.generated_q4_0_gates.mm) {
                         if (self.kernels.launchLinearQ4_0GeneratedMmF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mm_hits += 1;
                         } else |generated_err| switch (generated_err) {
@@ -9354,7 +9376,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         };
         if (!used_q4_0_q8_1_dp4a and !used_q4_0_tile8) {
             const used_q4_0_generated_pair = blk: {
-                if (rows == 1 and cudaQ4_0GeneratedPairEnabled()) {
+                if (rows == 1 and self.generated_q4_0_gates.pair) {
                     self.kernels.launchLinearQ4_0GeneratedPairF32(
                         &self.ctx,
                         device_a,
@@ -12810,7 +12832,7 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     const pair_prefill_variant = self.kernels.q4_0PairActivationQ8_1Tile32W5E4BPrefillRowsVariant(rows);
     var pair_profile_scope = beginPrefillProfile(self, .q4_pair, rows);
     const used_generated_pair_q8 = blk: {
-        if (rows != 1 or !cudaQ4_0GeneratedPairQ8Enabled()) break :blk false;
+        if (rows != 1 or !self.generated_q4_0_gates.pair_q8) break :blk false;
         self.kernels.launchLinearQ4_0GeneratedPairQ8(
             &self.ctx,
             q8_activated,
@@ -12859,7 +12881,7 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     const down_prefill_variant = self.kernels.q4_0Q8_1Tile4W8PrefillRowsVariant(rows, request.intermediate_size, request.hidden_size);
     var down_profile_scope = beginPrefillProfile(self, .q4_gated_down, rows);
     const used_generated_down_q8 = blk: {
-        if (rows != 1 or !cudaQ4_0GeneratedDownQ8Enabled()) break :blk false;
+        if (rows != 1 or !self.generated_q4_0_gates.down_q8) break :blk false;
         self.kernels.launchLinearQ4_0GeneratedDownQ8(
             &self.ctx,
             projected_device,

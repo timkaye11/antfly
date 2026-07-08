@@ -5235,8 +5235,7 @@ fn recordQuantKernelCompilerPlan(
         else => return,
     };
     const epilogue = quantKernelEpilogueForMetalOp(op);
-    const lowering = quant_kernel_compiler.registryLoweringFor(.metal, plan.format, plan.row_bucket, epilogue, plan.dispatch);
-    const counters = quant_kernel_compiler.countersForLowering(lowering);
+    const counters = quant_kernel_compiler.plannedCountersFor(.metal, plan.format, plan.row_bucket, epilogue, plan.dispatch);
     quant_kernel_compiler.addCountersToStats(stats, counters);
 }
 
