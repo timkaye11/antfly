@@ -815,6 +815,9 @@ const Config = struct {
     runtime_route_all: bool = false,
     production_regression_check: bool = false,
     v2_conformance: bool = false,
+    sweep: bool = false,
+    sweep_route: ?[]const u8 = null,
+    sweep_evidence_out: ?[]const u8 = null,
     repeat_runs: u32 = 1,
     measure_iters: ?u32 = null,
 };
@@ -852,6 +855,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.v2_conformance) {
         try runV2Conformance(allocator);
+        return;
+    }
+
+    if (cfg.sweep) {
+        try runSweep(allocator, cfg);
         return;
     }
 
@@ -1027,6 +1035,19 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--v2-conformance")) {
             if (cfg.v2_conformance) return error.DuplicateV2Conformance;
             cfg.v2_conformance = true;
+        } else if (std.mem.eql(u8, arg, "--sweep")) {
+            if (cfg.sweep) return error.DuplicateSweep;
+            cfg.sweep = true;
+        } else if (std.mem.eql(u8, arg, "--sweep-route")) {
+            if (cfg.sweep_route != null) return error.DuplicateSweepRoute;
+            i += 1;
+            if (i >= args.len) return error.MissingSweepRoute;
+            cfg.sweep_route = args[i];
+        } else if (std.mem.eql(u8, arg, "--sweep-evidence-out")) {
+            if (cfg.sweep_evidence_out != null) return error.DuplicateSweepEvidenceOut;
+            i += 1;
+            if (i >= args.len) return error.MissingSweepEvidenceOut;
+            cfg.sweep_evidence_out = args[i];
         } else if (std.mem.eql(u8, arg, "--repeat-runs")) {
             if (cfg.repeat_runs != 1) return error.DuplicateRepeatRuns;
             i += 1;
@@ -1079,6 +1100,40 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         if (!std.mem.containsAtLeast(u8, cfg.evidence_out_path.?, 1, kernel)) return error.PromotionReadyKernelRequiresKernelEvidencePath;
     }
     return cfg;
+}
+
+test "quant kernel metal runtime check parses sweep flags" {
+    const cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--sweep", "--sweep-route", "q6_k/bias", "--sweep-evidence-out", "/private/tmp/sweep.json" });
+    try std.testing.expect(cfg.sweep);
+    try std.testing.expectEqualStrings("q6_k/bias", cfg.sweep_route.?);
+    try std.testing.expectEqualStrings("/private/tmp/sweep.json", cfg.sweep_evidence_out.?);
+    try std.testing.expectError(error.MissingSweepRoute, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--sweep", "--sweep-route" }));
+    try std.testing.expectError(error.MissingSweepEvidenceOut, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--sweep", "--sweep-evidence-out" }));
+    try std.testing.expectError(error.DuplicateSweep, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--sweep", "--sweep" }));
+
+    // Route filter matching: "<fmt>/<epi>" and format-only.
+    try std.testing.expect(sweepRouteMatches("q6_k/bias", .q6_k, .bias));
+    try std.testing.expect(!sweepRouteMatches("q6_k/bias", .q6_k, .none));
+    try std.testing.expect(sweepRouteMatches("q6_k", .q6_k, .none));
+    try std.testing.expect(!sweepRouteMatches("q6_k", .q5_k, .none));
+}
+
+test "quant kernel metal runtime sweep enumerates valid variants" {
+    var buf: [max_sweep_variants]quant_kernel_compiler.KernelSchedule = undefined;
+    // 32-value format: only single-simdgroup variants (cols 1/2).
+    const q8_0_count = enumerateSweepVariants(.q8_0, .none, &buf);
+    try std.testing.expectEqual(@as(usize, 2), q8_0_count);
+    for (buf[0..q8_0_count]) |schedule| {
+        try std.testing.expectEqual(@as(u16, 32), schedule.threads_per_threadgroup);
+        try schedule.validate(32);
+    }
+    // 256-value format: 32(c1,c2) + 64/128/256(tree,hybrid) = 8 variants.
+    const q6_k_count = enumerateSweepVariants(.q6_k, .none, &buf);
+    try std.testing.expectEqual(@as(usize, 8), q6_k_count);
+    for (buf[0..q6_k_count]) |schedule| {
+        try schedule.validate(256);
+        try std.testing.expect(schedule.threads_per_threadgroup <= 256);
+    }
 }
 
 test "quant kernel metal runtime check parses evidence output flag" {
@@ -1319,6 +1374,327 @@ fn runCheck(
     promotion_ready_kernel: ?[]const u8,
 ) !CheckResult {
     return runCheckImpl(allocator, check, route_kernel, promotion_ready_kernel, false);
+}
+
+const SweepVariantRecord = struct {
+    schedule: quant_kernel_compiler.KernelSchedule,
+    correctness_passed: bool,
+    max_error: f32,
+    min_speedup: f64, // worst-shape speedup vs the production baseline
+    is_baseline_schedule: bool,
+};
+
+const SweepRouteRecord = struct {
+    format: quant_matmul.Format,
+    epilogue: quant_kernel_compiler.Epilogue,
+    baseline_kernel_id: []const u8,
+    baseline_schedule: quant_kernel_compiler.KernelSchedule,
+    variants: []SweepVariantRecord,
+    winner_index: ?usize,
+};
+
+// Runs the schedule sweep for one route (all its benchmark shapes) and returns
+// an owned SweepRouteRecord. Times the production baseline once per shape, then
+// each rendered variant, computing the worst-shape speedup.
+fn runSweepRoute(
+    allocator: std.mem.Allocator,
+    format: quant_matmul.Format,
+    epilogue: quant_kernel_compiler.Epilogue,
+    measure_iters: u32,
+    repeat_runs: u32,
+) !SweepRouteRecord {
+    // Collect the v1 production CheckCases (small + wide) for this route.
+    var shape_checks: [4]CheckCase = undefined;
+    var shape_count: usize = 0;
+    for (metal_runtime_checks) |check| {
+        if (check.format == format and check.epilogue == epilogue) {
+            if (shape_count >= shape_checks.len) break;
+            shape_checks[shape_count] = check;
+            shape_count += 1;
+        }
+    }
+    if (shape_count == 0) return error.SweepRouteHasNoChecks;
+    const baseline_kernel_id = shape_checks[0].kernel_name;
+    const baseline_schedule = quant_kernel_compiler.metalRouteScheduleFor(format, .rows_2_8, epilogue) orelse return error.MissingSweepSchedule;
+
+    // Baseline timing per shape (production source at production schedule).
+    var baseline_ns: [4]u64 = .{ 0, 0, 0, 0 };
+    for (shape_checks[0..shape_count], 0..) |check, si| {
+        const timed = try timeSourceMinNs(allocator, check, check.source, check.kernel_name, baseline_schedule, measure_iters, repeat_runs) orelse return error.BaselineConformanceFailed;
+        baseline_ns[si] = timed.ns;
+    }
+
+    const decoder = quant_kernel_metal_renderer.decoderFor(format) orelse return error.MissingSweepDecoder;
+    var variant_schedules: [max_sweep_variants]quant_kernel_compiler.KernelSchedule = undefined;
+    const variant_count = enumerateSweepVariants(format, epilogue, &variant_schedules);
+
+    var records = try allocator.alloc(SweepVariantRecord, variant_count);
+    var winner_index: ?usize = null;
+    var winner_speedup: f64 = 0.0;
+    const suffix = epilogueIdSuffix(epilogue);
+    for (variant_schedules[0..variant_count], 0..) |schedule, vi| {
+        const kernel_id = try std.fmt.allocPrint(allocator, "antfly_{s}_small_batch{s}_msl_v2_t{d}c{d}_{s}", .{
+            @tagName(format), suffix, schedule.threads_per_threadgroup, schedule.cols_per_threadgroup, reductionName(schedule.reduction),
+        });
+        defer allocator.free(kernel_id);
+        const body = try quant_kernel_metal_renderer.renderKernel(allocator, kernel_id, decoder, schedule, epilogue);
+        defer allocator.free(body);
+        const source = try std.fmt.allocPrint(allocator, "#include <metal_stdlib>\nusing namespace metal;\n{s}", .{body});
+        defer allocator.free(source);
+
+        var ok = true;
+        var max_error: f32 = 0.0;
+        var min_speedup: f64 = std.math.floatMax(f64);
+        for (shape_checks[0..shape_count], 0..) |check, si| {
+            const timed = try timeSourceMinNs(allocator, check, source, kernel_id, schedule, measure_iters, repeat_runs);
+            if (timed == null) {
+                ok = false;
+                break;
+            }
+            if (timed.?.max_error > max_error) max_error = timed.?.max_error;
+            const shape_speedup = @as(f64, @floatFromInt(baseline_ns[si])) / @as(f64, @floatFromInt(@max(timed.?.ns, 1)));
+            if (shape_speedup < min_speedup) min_speedup = shape_speedup;
+        }
+        const is_baseline = schedule.threads_per_threadgroup == baseline_schedule.threads_per_threadgroup and
+            schedule.cols_per_threadgroup == baseline_schedule.cols_per_threadgroup and
+            schedule.reduction == baseline_schedule.reduction;
+        records[vi] = .{
+            .schedule = schedule,
+            .correctness_passed = ok,
+            .max_error = max_error,
+            .min_speedup = if (ok) min_speedup else 0.0,
+            .is_baseline_schedule = is_baseline,
+        };
+        if (ok and min_speedup > winner_speedup) {
+            winner_speedup = min_speedup;
+            winner_index = vi;
+        }
+    }
+
+    return .{
+        .format = format,
+        .epilogue = epilogue,
+        .baseline_kernel_id = baseline_kernel_id,
+        .baseline_schedule = baseline_schedule,
+        .variants = records,
+        .winner_index = winner_index,
+    };
+}
+
+fn epilogueIdSuffix(epilogue: quant_kernel_compiler.Epilogue) []const u8 {
+    return switch (epilogue) {
+        .none => "",
+        .bias => "_bias",
+        .bias_gelu => "_bias_gelu",
+        .relu => "_relu",
+        else => "_x",
+    };
+}
+
+// Drives the sweep across all routes (or a single --sweep-route fmt/epilogue),
+// prints a per-route summary, and optionally writes sweep evidence JSON.
+fn runSweep(allocator: std.mem.Allocator, cfg: Config) !void {
+    const measure_iters = cfg.measure_iters orelse 200;
+    const repeat_runs = cfg.repeat_runs;
+    var route_records = std.ArrayListUnmanaged(SweepRouteRecord).empty;
+    defer {
+        for (route_records.items) |record| allocator.free(record.variants);
+        route_records.deinit(allocator);
+    }
+
+    for (quant_kernel_compiler.metal_production_schedules) |entry| {
+        if (cfg.sweep_route) |filter| {
+            if (!sweepRouteMatches(filter, entry.format, entry.epilogue)) continue;
+        }
+        const record = try runSweepRoute(allocator, entry.format, entry.epilogue, measure_iters, repeat_runs);
+        try route_records.append(allocator, record);
+        const route_name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ @tagName(entry.format), @tagName(entry.epilogue) });
+        defer allocator.free(route_name);
+        if (record.winner_index) |wi| {
+            const w = record.variants[wi];
+            std.debug.print(
+                "quant-kernel-metal-sweep {s} winner threads={d} cols={d} reduction={s} min_speedup={d:.3}{s}\n",
+                .{ route_name, w.schedule.threads_per_threadgroup, w.schedule.cols_per_threadgroup, reductionName(w.schedule.reduction), w.min_speedup, if (w.is_baseline_schedule) " (== current)" else "" },
+            );
+        } else {
+            std.debug.print("quant-kernel-metal-sweep {s} no correct variant\n", .{route_name});
+        }
+    }
+
+    if (cfg.sweep_evidence_out) |path| {
+        try writeSweepEvidence(allocator, path, route_records.items);
+        std.debug.print("quant-kernel-metal-sweep evidence_out={s} routes={d}\n", .{ path, route_records.items.len });
+    }
+    std.debug.print("quant-kernel-metal-sweep done: {d} routes\n", .{route_records.items.len});
+}
+
+fn sweepRouteMatches(filter: []const u8, format: quant_matmul.Format, epilogue: quant_kernel_compiler.Epilogue) bool {
+    // filter form "<format>/<epilogue>" or just "<format>".
+    var it = std.mem.splitScalar(u8, filter, '/');
+    const fmt_part = it.next() orelse return false;
+    if (!std.mem.eql(u8, fmt_part, @tagName(format))) return false;
+    const epi_part = it.next() orelse return true; // format-only matches all epilogues
+    return std.mem.eql(u8, epi_part, @tagName(epilogue));
+}
+
+fn writeSweepEvidence(allocator: std.mem.Allocator, path: []const u8, records: []const SweepRouteRecord) !void {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\n  \"schema\": \"antfly.quant_kernel_metal_sweep.v1\",\n  \"routes\": [\n");
+    for (records, 0..) |record, ri| {
+        try appendSweepRouteJson(allocator, &out, record);
+        try out.appendSlice(allocator, if (ri + 1 == records.len) "\n" else ",\n");
+    }
+    try out.appendSlice(allocator, "  ]\n}\n");
+    try writeFileCreatingParent(compat.io(), path, out.items);
+}
+
+fn appendSweepScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), schedule: quant_kernel_compiler.KernelSchedule) !void {
+    const chunk = try std.fmt.allocPrint(allocator, "{{\"threads\": {d}, \"cols\": {d}, \"reduction\": \"{s}\"}}", .{
+        schedule.threads_per_threadgroup, schedule.cols_per_threadgroup, reductionName(schedule.reduction),
+    });
+    defer allocator.free(chunk);
+    try out.appendSlice(allocator, chunk);
+}
+
+fn appendSweepRouteJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), record: SweepRouteRecord) !void {
+    const header = try std.fmt.allocPrint(allocator, "    {{\n      \"format\": \"{s}\",\n      \"epilogue\": \"{s}\",\n      \"baseline_kernel_id\": \"{s}\",\n      \"baseline_schedule\": ", .{
+        @tagName(record.format), @tagName(record.epilogue), record.baseline_kernel_id,
+    });
+    defer allocator.free(header);
+    try out.appendSlice(allocator, header);
+    try appendSweepScheduleJson(allocator, out, record.baseline_schedule);
+    try out.appendSlice(allocator, ",\n      \"variants\": [\n");
+    for (record.variants, 0..) |variant, vi| {
+        try out.appendSlice(allocator, "        {\"schedule\": ");
+        try appendSweepScheduleJson(allocator, out, variant.schedule);
+        const tail = try std.fmt.allocPrint(allocator, ", \"correctness_passed\": {s}, \"max_abs_error\": {d:.7}, \"min_speedup_vs_baseline\": {d:.6}, \"is_current_schedule\": {s}}}", .{
+            if (variant.correctness_passed) "true" else "false",
+            variant.max_error,
+            variant.min_speedup,
+            if (variant.is_baseline_schedule) "true" else "false",
+        });
+        defer allocator.free(tail);
+        try out.appendSlice(allocator, tail);
+        try out.appendSlice(allocator, if (vi + 1 == record.variants.len) "\n" else ",\n");
+    }
+    try out.appendSlice(allocator, "      ],\n      \"winner\": ");
+    if (record.winner_index) |wi| {
+        try appendSweepScheduleJson(allocator, out, record.variants[wi].schedule);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.appendSlice(allocator, "\n    }");
+}
+
+// ---- Schedule sweep (autotune) ------------------------------------------
+//
+// For each generated Metal route, render every valid schedule variant through
+// the descriptor-driven renderer and benchmark it on-device against the current
+// production kernel for that route, reusing the promotion shapes/tolerances. The
+// winner is the variant with the best worst-shape speedup that also passes CPU-
+// reference correctness. Variants are rendered in memory and never checked in;
+// the winning schedule is fed back by editing metal_production_schedules (a
+// human-reviewed step, Phase 4). Nothing here promotes or changes production.
+
+fn reductionName(reduction: quant_kernel_compiler.ReductionKind) []const u8 {
+    return switch (reduction) {
+        .simd_sum => "simd_sum",
+        .threadgroup_tree => "threadgroup_tree",
+        .hybrid_simd => "hybrid_simd",
+    };
+}
+
+const max_sweep_variants = 16;
+
+// Enumerates the valid schedule variants for a route. Threads are capped at the
+// block value count (more threads than block values only idles lanes), and the
+// reduction/cols rules mirror KernelSchedule.validate + validateEpilogueSchedule.
+fn enumerateSweepVariants(
+    format: quant_matmul.Format,
+    epilogue: quant_kernel_compiler.Epilogue,
+    out: *[max_sweep_variants]quant_kernel_compiler.KernelSchedule,
+) usize {
+    const block_values = format.valuesPerBlock() orelse return 0;
+    var count: usize = 0;
+    const thread_options = [_]u16{ 32, 64, 128, 256 };
+    for (thread_options) |threads| {
+        if (threads > block_values) continue;
+        if (threads == 32) {
+            // Single simdgroup: simd_sum, cols 1 or 2.
+            const cols_options = [_]u8{ 1, 2 };
+            for (cols_options) |cols| {
+                const schedule = quant_kernel_compiler.KernelSchedule{ .threads_per_threadgroup = threads, .cols_per_threadgroup = cols, .reduction = .simd_sum };
+                if (scheduleValidForSweep(schedule, block_values, epilogue)) {
+                    out[count] = schedule;
+                    count += 1;
+                }
+            }
+        } else {
+            // Multiple simdgroups: tree or hybrid, cols 1 only.
+            const reductions = [_]quant_kernel_compiler.ReductionKind{ .threadgroup_tree, .hybrid_simd };
+            for (reductions) |reduction| {
+                const schedule = quant_kernel_compiler.KernelSchedule{ .threads_per_threadgroup = threads, .cols_per_threadgroup = 1, .reduction = reduction };
+                if (scheduleValidForSweep(schedule, block_values, epilogue)) {
+                    out[count] = schedule;
+                    count += 1;
+                }
+            }
+        }
+        if (count >= max_sweep_variants) break;
+    }
+    return count;
+}
+
+fn scheduleValidForSweep(
+    schedule: quant_kernel_compiler.KernelSchedule,
+    block_values: usize,
+    epilogue: quant_kernel_compiler.Epilogue,
+) bool {
+    schedule.validate(block_values) catch return false;
+    // Mirror the renderer's epilogue/schedule guard.
+    if (schedule.cols_per_threadgroup == 2 and schedule.reduction != .simd_sum) return false;
+    _ = epilogue;
+    return true;
+}
+
+const SweepShapeResult = struct {
+    baseline_ns: u64,
+    variant_ns: u64,
+    speedup: f64,
+    max_error: f32,
+};
+
+// Times one source on one CheckCase, repeated `repeat_runs` times, returning the
+// min elapsed nanos (noise floor) and the max abs error. Returns null on a
+// correctness mismatch (variant is dropped from the sweep).
+fn timeSourceMinNs(
+    allocator: std.mem.Allocator,
+    base_check: CheckCase,
+    source: []const u8,
+    kernel_name: []const u8,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    measure_iters: u32,
+    repeat_runs: u32,
+) !?struct { ns: u64, max_error: f32 } {
+    var check = base_check;
+    check.source = source;
+    check.kernel_name = kernel_name;
+    check.threads_per_threadgroup = schedule.threads_per_threadgroup;
+    check.cols_per_threadgroup = schedule.cols_per_threadgroup;
+    check.measure_iters = measure_iters;
+    var min_ns: u64 = std.math.maxInt(u64);
+    var max_error: f32 = 0.0;
+    var run: u32 = 0;
+    while (run < repeat_runs) : (run += 1) {
+        const result = runCheckImpl(allocator, check, null, null, true) catch |err| {
+            if (err == error.GeneratedMetalKernelMismatch or err == error.GeneratedMetalKernelFailed) return null;
+            return err;
+        };
+        if (result.elapsed_nanos < min_ns) min_ns = result.elapsed_nanos;
+        if (result.max_error > max_error) max_error = result.max_error;
+    }
+    return .{ .ns = min_ns, .max_error = max_error };
 }
 
 fn runCheckImpl(
