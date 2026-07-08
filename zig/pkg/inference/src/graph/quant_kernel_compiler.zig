@@ -233,7 +233,7 @@ pub const metal_production_schedules = [_]MetalRouteSchedule{
     .{ .format = .q8_1, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     // 256-value blocks reduced on a single simdgroup (strided lanes).
     .{ .format = .q8_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
-    .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
@@ -3879,11 +3879,14 @@ const metal_rt_body_antfly_q8_k_small_batch_msl_v1 =
     \\}
 ;
 
+// Schedule re-tuned to 128 threads / hybrid-simd (from 32 threads / simd_sum)
+// after the schedule sweep + decode-runtime A/B. Body is the renderer's
+// 128/hybrid output with kernel_id/dequant-helper names kept.
 const metal_rt_body_antfly_q2_k_small_batch_msl_v1 =
-    \\kernel void antfly_q2_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\kernel void antfly_q2_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
     \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
     \\}
 ;
 
@@ -10070,7 +10073,7 @@ test "quant kernel compiler metal_production_schedules reproduces the launch-sha
         .{ .format = .q8_0, .epilogue = .relu, .threads = 32, .cols = 1 },
         .{ .format = .q8_1, .epilogue = .none, .threads = 32, .cols = 1 },
         .{ .format = .q8_k, .epilogue = .none, .threads = 32, .cols = 1 },
-        .{ .format = .q2_k, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q2_k, .epilogue = .none, .threads = 128, .cols = 1 },
         .{ .format = .q2_k, .epilogue = .bias, .threads = 32, .cols = 1 },
         .{ .format = .q2_k, .epilogue = .bias_gelu, .threads = 32, .cols = 1 },
         .{ .format = .q3_k, .epilogue = .none, .threads = 32, .cols = 1 },

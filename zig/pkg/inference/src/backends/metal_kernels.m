@@ -2857,10 +2857,10 @@ static NSString *termite_metal_shader_source(void) {
            "    uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;\n"
            "    return dsc * float(q) - dmn;\n"
            "}\n"
-           "kernel void antfly_q2_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_q2_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
-           "    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }\n"
-           "    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;\n"
+           "    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); }\n"
+           "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;\n"
            "}\n"
            "kernel void antfly_q2_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n"
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
@@ -7125,7 +7125,7 @@ static const termite_metal_generated_quant_launch_entry termite_metal_generated_
     { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q8_1, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q8_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
-    { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 128u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
