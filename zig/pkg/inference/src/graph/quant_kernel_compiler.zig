@@ -241,7 +241,7 @@ pub const metal_production_schedules = [_]MetalRouteSchedule{
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     // 256-value blocks reduced with a threadgroup tree.
     .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
-    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
@@ -3935,11 +3935,17 @@ const metal_rt_body_antfly_q4_k_small_batch_msl_v1 =
     \\}
 ;
 
+// Schedule re-tuned to 256 threads / hybrid-simd reduction (from 64 threads /
+// threadgroup-tree) after the descriptor-driven schedule sweep found a ~1.4x
+// kernel speedup for this route. Body is the renderer's 256/hybrid output with
+// the kernel_id and dequant-helper names kept (identical math) so the existing
+// wiring and helpers are unchanged. Promotion re-confirmed by the
+// production-regression gate (decode-runtime, apples-to-apples).
 const metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q4_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
-    \\    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0] + bias[col];
+    \\kernel void antfly_q4_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
     \\}
 ;
 
@@ -10071,7 +10077,7 @@ test "quant kernel compiler metal_production_schedules reproduces the launch-sha
         .{ .format = .q3_k, .epilogue = .bias, .threads = 32, .cols = 1 },
         .{ .format = .q3_k, .epilogue = .bias_gelu, .threads = 32, .cols = 1 },
         .{ .format = .q4_k, .epilogue = .none, .threads = 64, .cols = 1 },
-        .{ .format = .q4_k, .epilogue = .bias, .threads = 64, .cols = 1 },
+        .{ .format = .q4_k, .epilogue = .bias, .threads = 256, .cols = 1 },
         .{ .format = .q4_k, .epilogue = .bias_gelu, .threads = 64, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .none, .threads = 128, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .bias, .threads = 128, .cols = 1 },
