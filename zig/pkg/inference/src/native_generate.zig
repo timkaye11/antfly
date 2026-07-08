@@ -6583,8 +6583,11 @@ test "metal stats compact json exposes generated quant and fallback counters" {
 test "metal stats compact json derives plan counters from runtime generated dispatches" {
     var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
     const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
+    // q8_0/none is a promoted production route; q5_k/bias_gelu is still a dev
+    // candidate (q5_k/bias was promoted, so it no longer covers the candidate
+    // branch of this test).
     generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 3;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 3;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);

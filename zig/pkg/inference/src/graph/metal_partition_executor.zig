@@ -9706,43 +9706,48 @@ test "metal partition executor command path runs q8 quantized linear" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
-    try expectPlannedQ8LinearOnMetal(9, 32, 2, .mul_mm);
+    try expectPlannedQ8LinearOnMetal(9, 32, 2, .mul_mm, .handwritten_production);
 }
 
 test "metal partition executor planned q8 linear uses tiled mm shape" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
-    try expectPlannedQ8LinearOnMetal(9, 64, 64, .mul_mm);
+    try expectPlannedQ8LinearOnMetal(9, 64, 64, .mul_mm, .handwritten_production);
 }
 
 test "metal partition executor planned q8 linear covers mv and small batch buckets" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
-    try expectPlannedQ8LinearOnMetal(1, 32, 8, .mul_mv);
-    try expectPlannedQ8LinearOnMetal(4, 32, 8, .mul_mv_ext);
+    try expectPlannedQ8LinearOnMetal(1, 32, 8, .mul_mv, .handwritten_production);
+    try expectPlannedQ8LinearOnMetal(4, 32, 8, .mul_mv_ext, .generated_production);
 }
 
 test "metal partition executor planned quant linears stay packed on metal" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
-    try expectPlannedQuantLinearOnMetal(.q1_0, 1, 128, 8, .mul_mv, 2.0, 0.30);
-    try expectPlannedQuantLinearOnMetal(.q2_k, 9, 256, 8, .mul_mm, 2.0, 0.30);
-    try expectPlannedQuantLinearOnMetal(.q3_k, 4, 256, 8, .mul_mv_ext, 1.5, 0.20);
-    try expectPlannedQuantLinearOnMetal(.q4_0, 4, 32, 8, .mul_mv_ext, 1.5, 0.15);
-    try expectPlannedQuantLinearOnMetal(.q4_1, 9, 32, 8, .mul_mm, 1.0, 0.15);
-    try expectPlannedQuantLinearOnMetal(.q5_0, 4, 32, 8, .mul_mv_ext, 1.0, 0.15);
-    try expectPlannedQuantLinearOnMetal(.q5_1, 9, 32, 8, .mul_mm, 1.5, 0.15);
-    try expectPlannedQuantLinearOnMetal(.q5_k, 9, 256, 8, .mul_mm, 0.6, 0.18);
-    try expectPlannedQuantLinearOnMetal(.q8_1, 4, 32, 8, .mul_mv_ext, 0.15, 0.05);
-    try expectPlannedQuantLinearOnMetal(.q8_k, 9, 256, 8, .mul_mm, 0.15, 0.05);
+    try expectPlannedQuantLinearOnMetal(.q1_0, 1, 128, 8, .mul_mv, .handwritten_production, 2.0, 0.30);
+    try expectPlannedQuantLinearOnMetal(.q2_k, 9, 256, 8, .mul_mm, .handwritten_production, 2.0, 0.30);
+    try expectPlannedQuantLinearOnMetal(.q3_k, 4, 256, 8, .mul_mv_ext, .generated_production, 1.5, 0.20);
+    try expectPlannedQuantLinearOnMetal(.q4_0, 4, 32, 8, .mul_mv_ext, .handwritten_with_wired_candidate, 1.5, 0.15);
+    try expectPlannedQuantLinearOnMetal(.q4_1, 9, 32, 8, .mul_mm, .handwritten_production, 1.0, 0.15);
+    try expectPlannedQuantLinearOnMetal(.q5_0, 4, 32, 8, .mul_mv_ext, .handwritten_with_wired_candidate, 1.0, 0.15);
+    try expectPlannedQuantLinearOnMetal(.q5_1, 9, 32, 8, .mul_mm, .handwritten_production, 1.5, 0.15);
+    try expectPlannedQuantLinearOnMetal(.q5_k, 9, 256, 8, .mul_mm, .handwritten_production, 0.6, 0.18);
+    try expectPlannedQuantLinearOnMetal(.q8_1, 4, 32, 8, .mul_mv_ext, .handwritten_with_wired_candidate, 0.15, 0.05);
+    try expectPlannedQuantLinearOnMetal(.q8_k, 9, 256, 8, .mul_mm, .handwritten_production, 0.15, 0.05);
 }
 
-fn expectPlannedQ8LinearOnMetal(rows: usize, in_dim: usize, out_dim: usize, expected_operator: operator_plan_mod.Operator) !void {
-    try expectPlannedQuantLinearOnMetal(.q8_0, rows, in_dim, out_dim, expected_operator, 1e-3, 1e-4);
+fn expectPlannedQ8LinearOnMetal(rows: usize, in_dim: usize, out_dim: usize, expected_operator: operator_plan_mod.Operator, expected_route: ExpectedQuantRoute) !void {
+    try expectPlannedQuantLinearOnMetal(.q8_0, rows, in_dim, out_dim, expected_operator, expected_route, 1e-3, 1e-4);
 }
+
+// handwritten_with_wired_candidate: production dispatch is handwritten but a
+// generated dev candidate is wired for the route, which the plan counters
+// classify as a generated_artifact_missing fast-path miss.
+const ExpectedQuantRoute = enum { handwritten_production, handwritten_with_wired_candidate, generated_production };
 
 fn expectPlannedQuantLinearOnMetal(
     format: @import("quant_matmul.zig").Format,
@@ -9750,6 +9755,7 @@ fn expectPlannedQuantLinearOnMetal(
     in_dim: usize,
     out_dim: usize,
     expected_operator: operator_plan_mod.Operator,
+    expected_route: ExpectedQuantRoute,
     tolerance: f32,
     rel_tolerance: f32,
 ) !void {
@@ -9852,10 +9858,22 @@ fn expectPlannedQuantLinearOnMetal(
     });
     try std.testing.expectEqual(@as(u64, 1), planned_exec_stats.planned_operator_dispatches);
     try std.testing.expectEqual(@as(u64, 1), planned_exec_stats.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(u64, 1), planned_exec_stats.quant_kernel_handwritten_production);
+    // Promoted generated routes (see quant_kernel_compiler promotion policy)
+    // classify as generated_production; everything else stays handwritten.
+    switch (expected_route) {
+        .handwritten_production, .handwritten_with_wired_candidate => {
+            try std.testing.expectEqual(@as(u64, 1), planned_exec_stats.quant_kernel_handwritten_production);
+            try std.testing.expectEqual(@as(u64, 0), planned_exec_stats.quant_kernel_generated_production);
+        },
+        .generated_production => {
+            try std.testing.expectEqual(@as(u64, 0), planned_exec_stats.quant_kernel_handwritten_production);
+            try std.testing.expectEqual(@as(u64, 1), planned_exec_stats.quant_kernel_generated_production);
+        },
+    }
     switch (format) {
         .q1_0, .q2_k, .q3_k, .q4_0, .q4_1, .q5_0, .q5_1, .q4_k, .q5_k, .q6_k, .q8_0, .q8_1, .q8_k => {
-            try std.testing.expectEqual(@as(u64, 0), planned_exec_stats.quant_kernel_fallback_generated_artifact_missing);
+            const expected_candidate_miss: u64 = if (expected_route == .handwritten_with_wired_candidate) 1 else 0;
+            try std.testing.expectEqual(expected_candidate_miss, planned_exec_stats.quant_kernel_fallback_generated_artifact_missing);
             try std.testing.expectEqual(@as(u64, 0), planned_exec_stats.quant_kernel_fallback_unsupported_format);
             try std.testing.expectEqual(@as(u64, 0), planned_exec_stats.quant_kernel_fallback_unsupported);
         },
