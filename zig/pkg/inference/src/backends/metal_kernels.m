@@ -5177,10 +5177,12 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? termite_attention_page_token(block_table, p, ki) : 0xffffffffu; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? k_half[phys * k_row_halfs + kv_head_base + d] : half(0.0f); }\n"
+           "        const bool fast = (p.contiguous_blocks != 0u) && (kc + 32u <= p.kv_tokens);\n"
+           "        if (!fast) { for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? k_half[phys * k_row_halfs + kv_head_base + d] : half(0.0f); } }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
-           "        for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, skv + uint(sgitg) * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); }\n"
+           "        if (fast) { const device half *kbase = k_half + (p.contiguous_base_token + kc + uint(sgitg) * 8u) * k_row_halfs + kv_head_base; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n"
+           "        else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, skv + uint(sgitg) * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n"
            "        simdgroup_store(ms, ss + uint(sgitg) * 8u, 32u, 0, false);\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint jj = 0u; jj < 2u; ++jj) {\n"
@@ -5199,9 +5201,10 @@ static NSString *termite_metal_shader_source(void) {
            "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);\n"
            "        for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? v_half[phys * p.v_row_stride + kv_head_base + d] : half(0.0f); }\n"
+           "        if (!fast) { for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? v_half[phys * p.v_row_stride + kv_head_base + d] : half(0.0f); } }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "        for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n"
+           "        if (fast) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, v_half + (p.contiguous_base_token + kc + kk8 * 8u) * p.v_row_stride + kv_head_base + d8, p.v_row_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; } }\n"
+           "        else { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; } }\n"
            "    }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n"
@@ -11189,6 +11192,13 @@ static bool termite_metal_block_table_contiguous(const uint32_t *block_table, si
     return true;
 }
 
+// Kill switch for the prefill-sg flash-attention direct-device K/V load fast path.
+// When set, forces contiguous_blocks=0 so the kernel falls back to the shmem-gather
+// path (bit-identical results) — used for A/B measuring the direct-load optimization.
+static bool termite_metal_prefill_sg_direct_load_disabled(void) {
+    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD"));
+}
+
 static int termite_metal_encode_paged_attention_slot_on_encoder(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
@@ -11261,7 +11271,8 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         }
     }
     uint32_t contiguous_base_token = 0;
-    const bool contiguous_blocks = termite_metal_block_table_contiguous(block_table, block_count, page_size, &contiguous_base_token);
+    const bool contiguous_blocks = termite_metal_block_table_contiguous(block_table, block_count, page_size, &contiguous_base_token) &&
+        !termite_metal_prefill_sg_direct_load_disabled();
     termite_metal_paged_attention_params params = {
         .q_len = (uint32_t)q_len,
         .kv_tokens = (uint32_t)kv_tokens,
@@ -13915,7 +13926,9 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->attention_f32_prefill_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_attention_f32_prefill_tiled");
         runtime->attention_paged_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv");
         runtime->attention_paged_1x_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_1x");
-        runtime->attention_paged_prefill_sg_pipeline = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION")) ? termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_prefill_sg") : nil;
+        // Default-on: the flash-attention prefill kernel beats the scalar kv_1x path at prefill
+        // (direct-device K/V load, ~13% faster at 1k prompt). Opt out with TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION.
+        runtime->attention_paged_prefill_sg_pipeline = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION")) ? nil : termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_prefill_sg");
         runtime->compressed_attention_store_local_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_store_local");
         runtime->compressed_attention_store_component_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_store_component");
         runtime->compressed_attention_update_component_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_update_component");
@@ -35308,7 +35321,8 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot(
         }
     }
     uint32_t contiguous_base_token = 0;
-    const bool contiguous_blocks = termite_metal_block_table_contiguous(block_table, block_count, page_size, &contiguous_base_token);
+    const bool contiguous_blocks = termite_metal_block_table_contiguous(block_table, block_count, page_size, &contiguous_base_token) &&
+        !termite_metal_prefill_sg_direct_load_disabled();
     termite_metal_paged_attention_params params = {
         .q_len = (uint32_t)q_len,
         .kv_tokens = (uint32_t)kv_tokens,
