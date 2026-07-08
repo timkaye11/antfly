@@ -240,10 +240,10 @@ pub const metal_production_schedules = [_]MetalRouteSchedule{
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     // 256-value blocks reduced with a threadgroup tree.
-    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
-    .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
@@ -1849,6 +1849,23 @@ const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
         .promotion_ready = true,
     },
     .{
+        .kernel_id = first_general_metal_q4_kernel_id,
+        .source_path = first_general_metal_q4_source_path,
+        .source_fingerprint = sourceFingerprint(first_general_metal_q4_source),
+        .check_command = first_general_metal_q4_check_command,
+        .runtime_evidence_command = first_general_metal_q4_promotion_evidence_command,
+        .promotion_check_command = first_general_metal_q4_promotion_check_command,
+        .repeat_runs = metal_promotion_repeat_runs,
+        .correctness_passed = true,
+        .generated_route_checked = true,
+        .provider_route_checked = true,
+        .benchmark_passed = true,
+        .measured_speedup = 2.888,
+        .minimum_repeat_speedup = 2.409,
+        .production_enabled = true,
+        .promotion_ready = true,
+    },
+    .{
         .kernel_id = first_general_metal_q4_bias_kernel_id,
         .source_path = first_general_metal_q4_bias_source_path,
         .source_fingerprint = sourceFingerprint(first_general_metal_q4_bias_source),
@@ -1909,7 +1926,6 @@ pub const first_metal_promotion_blocker_evidence = [_]MetalPromotionBlockerEvide
     .{ .kernel_id = first_general_metal_q5_0_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q5_0_promotion_evidence_path, .requires_production_regression_clear = true },
     .{ .kernel_id = first_general_metal_q5_1_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q5_1_promotion_evidence_path, .requires_production_regression_clear = true },
     .{ .kernel_id = first_lazy_metal_kernel_id, .blocker = "unstable_benchmark_timing", .evidence_path = first_lazy_metal_promotion_evidence_path, .requires_production_regression_clear = true },
-    .{ .kernel_id = first_general_metal_q4_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q4_promotion_evidence_path, .requires_production_regression_clear = true },
     .{ .kernel_id = first_general_metal_q5_kernel_id, .blocker = "unstable_benchmark_timing", .evidence_path = first_general_metal_q5_promotion_evidence_path, .requires_production_regression_clear = true },
     .{ .kernel_id = first_general_metal_q5_bias_gelu_kernel_id, .blocker = "unstable_benchmark_timing", .evidence_path = first_general_metal_q5_bias_gelu_promotion_evidence_path, .requires_production_regression_clear = true },
     .{ .kernel_id = first_general_metal_q8_bias_gelu_kernel_id, .blocker = "speedup_gate_missing", .evidence_path = first_general_metal_q8_bias_gelu_promotion_evidence_path, .requires_production_regression_clear = true },
@@ -2354,7 +2370,7 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .runtime_evidence_command = first_metal_runtime_evidence_command,
         .promotion_evidence_command = first_general_metal_q4_promotion_evidence_command,
         .promotion_check_command = first_general_metal_q4_promotion_check_command,
-        .production_enabled = false,
+        .production_enabled = true,
     },
     .{
         .backend = .metal,
@@ -3931,10 +3947,10 @@ const metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1 =
 ;
 
 const metal_rt_body_antfly_q4_k_small_batch_msl_v1 =
-    \\kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
-    \\    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];
+    \\kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
     \\}
 ;
 
@@ -3994,10 +4010,10 @@ const metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1 =
 ;
 
 const metal_rt_body_antfly_q5_k_small_batch_msl_v1 =
-    \\kernel void antfly_q5_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
+    \\kernel void antfly_q5_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
     \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }
-    \\    threadgroup float partial[64]; if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];
+    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); }
+    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
     \\}
 ;
 
@@ -4295,13 +4311,12 @@ const first_general_metal_q5_1_source = metalSmallBatchFileSource(
 
 const first_general_metal_q4_source = metalSmallBatchFileSource(
     .{
-        .source_kind = "Generated Metal candidate artifact",
+        .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q4_k/rows_2_8/none/small_batch",
         .kernel_id = "antfly_q4_k_small_batch_msl_v1",
-        .production_enabled = false,
-        .promotion_comment = "// General MSL lowering smoke for descriptor-driven quant matmul epilogues." ++ "\n" ++
-            "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
-            "// candidate clears correctness and benchmark gates.",
+        .production_enabled = true,
+        .promotion_comment = "// Promoted after the schedule sweep re-tuned this route to 128-thread" ++ "\n" ++
+            "// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.",
     },
     &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane },
     metal_rt_body_antfly_q4_k_small_batch_msl_v1,
@@ -7629,8 +7644,8 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q8_1_SMALL_BATCH\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH\""));
     try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q8_K_SMALL_BATCH\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH\""));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH\""));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH\""));
     try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH\""));
@@ -7652,7 +7667,7 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
 }
 
 test "quant kernel compiler checked-in Metal evidence matches generated source" {
-    try std.testing.expectEqual(@as(usize, 8), first_metal_runtime_evidence_count);
+    try std.testing.expectEqual(@as(usize, 9), first_metal_runtime_evidence_count);
     for (first_metal_runtime_evidence) |evidence| {
         try std.testing.expectEqual(metal_promotion_repeat_runs, evidence.repeat_runs);
         try std.testing.expect(evidence.correctness_passed);
@@ -7677,12 +7692,12 @@ test "quant kernel compiler checked-in Metal evidence matches generated source" 
 }
 
 test "quant kernel compiler checked-in Metal blocker evidence matches generated candidates" {
-    try std.testing.expectEqual(@as(usize, 17), first_metal_promotion_blocker_evidence_count);
-    try std.testing.expectEqual(@as(usize, 6), metalPromotionBlockerEvidenceCount("speedup_gate_missing"));
+    try std.testing.expectEqual(@as(usize, 16), first_metal_promotion_blocker_evidence_count);
+    try std.testing.expectEqual(@as(usize, 5), metalPromotionBlockerEvidenceCount("speedup_gate_missing"));
     try std.testing.expectEqual(@as(usize, 5), metalPromotionBlockerEvidenceCount("unsupported_handwritten_baseline"));
     try std.testing.expectEqual(@as(usize, 6), metalPromotionBlockerEvidenceCount("unstable_benchmark_timing"));
-    try std.testing.expectEqual(@as(usize, 12), metalPromotionBlockerEvidencePathCount());
-    try std.testing.expectEqual(@as(usize, 24), first_metal_promotion_blocker_evidence_expected_case_count);
+    try std.testing.expectEqual(@as(usize, 11), metalPromotionBlockerEvidencePathCount());
+    try std.testing.expectEqual(@as(usize, 22), first_metal_promotion_blocker_evidence_expected_case_count);
     try std.testing.expectEqual(first_metal_promotion_blocker_evidence_expected_case_count, first_metal_promotion_blocker_evidence_expected_route_ready_count);
     for (first_metal_promotion_blocker_evidence) |evidence| {
         const artifact = generatedArtifactForKernel(.metal, evidence.kernel_id) orelse return error.MissingMetalBlockerArtifact;
@@ -8100,11 +8115,11 @@ test "quant kernel compiler registry route summary is golden" {
 
     const metal = by_backend[@intFromEnum(@as(Backend, .metal))];
     try std.testing.expectEqual(@as(usize, 1232), metal.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(usize, 104), metal.quant_kernel_handwritten_production);
-    try std.testing.expectEqual(@as(usize, 8), metal.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(usize, 103), metal.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 9), metal.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(usize, 1120), metal.quant_kernel_unsupported_routes);
-    try std.testing.expectEqual(@as(usize, 17), metal.quant_kernel_generated_candidates);
-    try std.testing.expectEqual(@as(usize, 17), metal.quant_kernel_fallback_generated_artifact_missing);
+    try std.testing.expectEqual(@as(usize, 16), metal.quant_kernel_generated_candidates);
+    try std.testing.expectEqual(@as(usize, 16), metal.quant_kernel_fallback_generated_artifact_missing);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_generated_runtime_not_wired);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_unsupported_format);
     try std.testing.expectEqual(@as(usize, 0), metal.quant_kernel_fallback_unsupported_shape);
@@ -8223,9 +8238,9 @@ test "quant kernel compiler conformance manifest serializes the route matrix" {
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_unsupported_epilogue", 120);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_planned_ops", 1232);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_production", 8);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_candidates", 17);
-    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_artifact_missing", 17);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_production", 9);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_candidates", 16);
+    try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_artifact_missing", 16);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_fallback_unsupported_epilogue", 460);
     try std.testing.expectEqual(first_conformance.len, std.mem.count(u8, manifest, "\"format\": "));
@@ -8297,7 +8312,7 @@ test "quant kernel compiler conformance fingerprints match generated artifacts" 
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cuda_candidates);
-    try std.testing.expectEqual(@as(usize, 17), metal_candidates);
+    try std.testing.expectEqual(@as(usize, 16), metal_candidates);
 }
 
 test "quant kernel compiler benchmark promotion evidence is complete" {
@@ -8798,12 +8813,12 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings(first_general_metal_q5_1_source_path, metal_q5_1.candidate_source_path);
 
     const metal_q4 = registryLoweringFor(.metal, .q4_k, .rows_2_8, .none, .small_batch);
-    try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q4.production_route);
-    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, metal_q4.candidate_route);
-    try std.testing.expectEqual(FallbackReason.generated_artifact_missing, metal_q4.fallback_reason);
-    try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q4.production_kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q4_kernel_id, metal_q4.kernel_id);
-    try std.testing.expectEqualStrings(first_general_metal_q4_source_path, metal_q4.candidate_source_path);
+    try std.testing.expectEqual(LoweringRoute.generated_production, metal_q4.production_route);
+    try std.testing.expectEqual(LoweringRoute.unsupported, metal_q4.candidate_route);
+    try std.testing.expectEqual(FallbackReason.none, metal_q4.fallback_reason);
+    try std.testing.expectEqualStrings(first_general_metal_q4_kernel_id, metal_q4.production_kernel_id);
+    try std.testing.expectEqualStrings("", metal_q4.kernel_id);
+    try std.testing.expectEqualStrings("", metal_q4.candidate_source_path);
 
     const metal_q4_bias = registryLoweringFor(.metal, .q4_k, .rows_2_8, .bias, .small_batch);
     try std.testing.expectEqual(LoweringRoute.generated_production, metal_q4_bias.production_route);
@@ -9329,8 +9344,8 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q8_1_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q8_K_SMALL_BATCH"));
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH"));
@@ -9403,7 +9418,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     const q8_1_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH") orelse return error.MissingMetalQ8_1Enable;
     const q8_k_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH") orelse return error.MissingMetalQ8_KEnable;
     const q3_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q3_K_SMALL_BATCH\")") orelse return error.MissingMetalQ3Disable;
-    const q4_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH") orelse return error.MissingMetalQ4Enable;
+    const q4_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH\")") orelse return error.MissingMetalQ4Disable;
     const q5_enable = std.mem.indexOf(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH") orelse return error.MissingMetalQ5Enable;
     const q6_disable = std.mem.indexOf(u8, contents, "termite_metal_runtime_promoted_gate(runtime, \"TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH\")") orelse return error.MissingMetalQ6Disable;
     try std.testing.expect(q8_disable > none_encoder and q8_disable < q8_encoder);
@@ -9415,7 +9430,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(q5_1_enable > none_encoder and q5_1_enable < q8_encoder);
     try std.testing.expect(q8_1_enable > none_encoder and q8_1_enable < q8_encoder);
     try std.testing.expect(q8_k_enable > none_encoder and q8_k_enable < q8_encoder);
-    try std.testing.expect(q4_enable > none_encoder and q4_enable < q8_encoder);
+    try std.testing.expect(q4_disable > none_encoder and q4_disable < q8_encoder);
     try std.testing.expect(q5_enable > none_encoder and q5_enable < q8_encoder);
     try std.testing.expect(q6_disable > none_encoder and q6_disable < q8_encoder);
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "strcmp(kernel_name, \"antfly_q4_k_small_batch_msl_v1\") == 0"));
@@ -10085,10 +10100,10 @@ test "quant kernel compiler metal_production_schedules reproduces the launch-sha
         .{ .format = .q3_k, .epilogue = .none, .threads = 32, .cols = 1 },
         .{ .format = .q3_k, .epilogue = .bias, .threads = 32, .cols = 1 },
         .{ .format = .q3_k, .epilogue = .bias_gelu, .threads = 32, .cols = 1 },
-        .{ .format = .q4_k, .epilogue = .none, .threads = 64, .cols = 1 },
+        .{ .format = .q4_k, .epilogue = .none, .threads = 128, .cols = 1 },
         .{ .format = .q4_k, .epilogue = .bias, .threads = 256, .cols = 1 },
         .{ .format = .q4_k, .epilogue = .bias_gelu, .threads = 64, .cols = 1 },
-        .{ .format = .q5_k, .epilogue = .none, .threads = 128, .cols = 1 },
+        .{ .format = .q5_k, .epilogue = .none, .threads = 256, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .bias, .threads = 128, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
         .{ .format = .q6_k, .epilogue = .none, .threads = 256, .cols = 1 },

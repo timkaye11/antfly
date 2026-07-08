@@ -2914,10 +2914,10 @@ static NSString *termite_metal_shader_source(void) {
            "    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);\n"
            "    return antfly_q4_k_half_le_to_float(block) * raw_scale * float(q) - antfly_q4_k_half_le_to_float(block + 2) * raw_min;\n"
            "}\n"
-           "kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n"
-           "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;\n"
-           "    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }\n"
-           "    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];\n"
+           "kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
+           "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
+           "    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); }\n"
+           "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;\n"
            "}\n"
            "kernel void antfly_q4_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
@@ -2963,10 +2963,10 @@ static NSString *termite_metal_shader_source(void) {
            "    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);\n"
            "    return antfly_qk_half_le_to_float(block) * raw_scale * float(q) - antfly_qk_half_le_to_float(block + 2) * raw_min;\n"
            "}\n"
-           "kernel void antfly_q5_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n"
+           "kernel void antfly_q5_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
-           "    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }\n"
-           "    threadgroup float partial[64]; if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];\n"
+           "    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); }\n"
+           "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;\n"
            "}\n"
            "kernel void antfly_q5_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {\n"
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
@@ -7132,10 +7132,10 @@ static const termite_metal_generated_quant_launch_entry termite_metal_generated_
     { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 32u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 1u },
-    { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 64u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 128u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 256u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 64u, 1u },
-    { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 128u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 256u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 128u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 128u, 1u },
     { TERMITE_METAL_QUANT_FORMAT_Q6_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 256u, 1u },
@@ -9619,7 +9619,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH") &&
+        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH") &&
         runtime->antfly_q4_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q5_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q5_K &&
         f32_activation_buffers &&

@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal candidate artifact from graph/quant_kernel_compiler.zig.
+// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q4_k/rows_2_8/none/small_batch
 // kernel_id=antfly_q4_k_small_batch_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=false
-// General MSL lowering smoke for descriptor-driven quant matmul epilogues.
-// Production Metal dispatch stays on native handwritten MSL until this
-// candidate clears correctness and benchmark gates.
+// production_enabled=true
+// Promoted after the schedule sweep re-tuned this route to 128-thread
+// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -35,8 +34,8 @@ inline float antfly_q4_k_dequant_lane(device const uchar *block, int lane) {
     float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
     return antfly_q4_k_half_le_to_float(block) * raw_scale * float(q) - antfly_q4_k_half_le_to_float(block + 2) * raw_min;
 }
-kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
-    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
-    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = partial[0];
+kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
+    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); }
+    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
 }
