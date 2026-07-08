@@ -155,6 +155,117 @@ pub const QuantKernelPlanId = struct {
     dispatch: quant_matmul.DispatchKind,
 };
 
+/// How a small-batch quant kernel reduces the per-thread partial sums into the
+/// final per-column result.
+pub const ReductionKind = enum(u8) {
+    /// Single simdgroup (32 threads); reduce with `simd_sum` only.
+    simd_sum,
+    /// Multiple simdgroups; reduce a `partial[threads]` array with a
+    /// threadgroup-barrier tree.
+    threadgroup_tree,
+    /// Multiple simdgroups; `simd_sum` per simdgroup into `partial[32]`, then a
+    /// final `simd_sum` (needs `lane_id`/`simdgroup_id`).
+    hybrid_simd,
+};
+
+/// The launch/loop schedule of one generated Metal small-batch quant kernel.
+/// This is the single source of truth for the dispatch grid (threads/cols),
+/// replacing the launch-shape switch in metal_kernels.m and the ad-hoc
+/// `metalGeneratedThreadsPerThreadgroup`/`Cols` helpers.
+pub const KernelSchedule = struct {
+    threads_per_threadgroup: u16,
+    cols_per_threadgroup: u8,
+    reduction: ReductionKind,
+
+    /// A block's lanes are processed strided across threads when the block has
+    /// more values than the threadgroup has threads.
+    pub fn strided(self: KernelSchedule, block_values: usize) bool {
+        return block_values > self.threads_per_threadgroup;
+    }
+
+    pub fn validate(self: KernelSchedule, block_values: usize) !void {
+        if (self.threads_per_threadgroup % 32 != 0 or self.threads_per_threadgroup == 0) {
+            return error.InvalidThreadCount;
+        }
+        if (self.cols_per_threadgroup != 1 and self.cols_per_threadgroup != 2) {
+            return error.InvalidColCount;
+        }
+        switch (self.reduction) {
+            .simd_sum => if (self.threads_per_threadgroup != 32) return error.SimdSumNeeds32Threads,
+            .threadgroup_tree, .hybrid_simd => if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads,
+        }
+        if (block_values == 0 or (block_values & (block_values - 1)) != 0) {
+            return error.BlockValuesNotPowerOfTwo;
+        }
+    }
+};
+
+/// One (format, row_bucket, epilogue) -> schedule mapping. The
+/// `metal_production_schedules` table below enumerates every currently
+/// generated Metal small-batch route.
+pub const MetalRouteSchedule = struct {
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: Epilogue,
+    schedule: KernelSchedule,
+};
+
+/// The dispatch schedule of every generated Metal small-batch quant route.
+/// Threads/cols here MUST match the dispatch grid used at runtime; this table
+/// generates both the runtime launch-shape lookup (metal_kernels.m) and the
+/// benchmark CheckCase shapes. Reduction records the body's reduction strategy
+/// (consumed by the renderer; the launch table needs only threads/cols).
+///
+/// Transcribed from the v1 kernel bodies + the launch-shape switch. Note:
+/// `metalGeneratedColsPerThreadgroup` historically reported cols=1 for
+/// q8_0/bias_gelu while the kernel and dispatch use cols=2 — this table carries
+/// the correct cols=2, fixing that latent under-count.
+pub const metal_production_schedules = [_]MetalRouteSchedule{
+    // 32-value blocks, single simdgroup.
+    .{ .format = .q4_0, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q4_1, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 2, .reduction = .simd_sum } },
+    .{ .format = .q5_0, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q5_1, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 2, .reduction = .simd_sum } },
+    .{ .format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 2, .reduction = .simd_sum } },
+    .{ .format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .relu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q8_1, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    // 256-value blocks reduced on a single simdgroup (strided lanes).
+    .{ .format = .q8_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
+    // 256-value blocks reduced with a threadgroup tree.
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
+    .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
+};
+
+/// Look up a route's schedule in `metal_production_schedules`. Returns null for
+/// routes without a generated Metal small-batch kernel.
+pub fn metalRouteScheduleFor(
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: Epilogue,
+) ?KernelSchedule {
+    for (metal_production_schedules) |entry| {
+        if (entry.format == format and entry.row_bucket == row_bucket and entry.epilogue == epilogue) {
+            return entry.schedule;
+        }
+    }
+    return null;
+}
+
 pub const LoweringRoute = enum(u8) {
     generated_production,
     generated_dev_candidate,
@@ -6726,10 +6837,8 @@ pub fn metalGeneratedColsPerThreadgroup(
     row_bucket: quant_matmul.RowBucket,
     epilogue: Epilogue,
 ) usize {
-    if (row_bucket != .rows_2_8) return 1;
-    if (format == .q4_1 and epilogue == .none) return 2;
-    if (format == .q5_1 and epilogue == .none) return 2;
-    return 1;
+    const schedule = metalRouteScheduleFor(format, row_bucket, epilogue) orelse return 1;
+    return schedule.cols_per_threadgroup;
 }
 
 pub fn metalGeneratedThreadsPerThreadgroup(
@@ -6737,41 +6846,8 @@ pub fn metalGeneratedThreadsPerThreadgroup(
     row_bucket: quant_matmul.RowBucket,
     epilogue: Epilogue,
 ) usize {
-    if (metalCandidateUsesThreadgroup64(format, row_bucket, epilogue)) {
-        return 64;
-    }
-    if (metalCandidateUsesThreadgroup32(format, row_bucket, epilogue)) {
-        return 32;
-    }
-    return 128;
-}
-
-fn metalCandidateUsesThreadgroup64(
-    format: quant_matmul.Format,
-    row_bucket: quant_matmul.RowBucket,
-    epilogue: Epilogue,
-) bool {
-    if (row_bucket != .rows_2_8) return false;
-    return switch (format) {
-        .q4_k => epilogue == .none or epilogue == .bias or epilogue == .bias_gelu,
-        else => false,
-    };
-}
-
-fn metalCandidateUsesThreadgroup32(
-    format: quant_matmul.Format,
-    row_bucket: quant_matmul.RowBucket,
-    epilogue: Epilogue,
-) bool {
-    if (row_bucket != .rows_2_8) return false;
-    return switch (format) {
-        .q4_0, .q4_1, .q5_0, .q5_1 => epilogue == .none,
-        .q8_0 => epilogue == .none or epilogue == .bias or epilogue == .bias_gelu or epilogue == .relu,
-        .q2_k => epilogue == .none or epilogue == .bias or epilogue == .bias_gelu,
-        .q3_k => epilogue == .none or epilogue == .bias or epilogue == .bias_gelu,
-        .q8_1, .q8_k => epilogue == .none,
-        else => false,
-    };
+    const schedule = metalRouteScheduleFor(format, row_bucket, epilogue) orelse return 128;
+    return schedule.threads_per_threadgroup;
 }
 
 fn emptyCandidateSchedule(row_bucket: quant_matmul.RowBucket, dispatch: quant_matmul.DispatchKind) QuantKernelSchedule {
@@ -9913,4 +9989,91 @@ test "quant kernel compiler CPU reference covers single-output epilogues" {
 
     var scratch: [rows * out_dim]f32 = undefined;
     try std.testing.expectError(error.UnsupportedEpilogue, referenceMatmulEpilogue(allocator, .q4_k, &.{}, &input, null, rows, in_dim, out_dim, .pair, &scratch));
+}
+
+test "quant kernel compiler metal_production_schedules reproduces the launch-shape switch" {
+    // Authoritative dispatch threads/cols from the hand-written
+    // termite_metal_generated_quant_launch_shape_for switch in metal_kernels.m
+    // (rows 2..8). This locks the table against that behavior before the switch
+    // is regenerated from it. cols=2 for q8_0/bias_gelu is intentional (matches
+    // the kernel body and dispatch; the old Zig cols helper under-counted it).
+    const Expected = struct { format: quant_matmul.Format, epilogue: Epilogue, threads: u16, cols: u8 };
+    const expected = [_]Expected{
+        .{ .format = .q4_0, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q4_1, .epilogue = .none, .threads = 32, .cols = 2 },
+        .{ .format = .q5_0, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q5_1, .epilogue = .none, .threads = 32, .cols = 2 },
+        .{ .format = .q8_0, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q8_0, .epilogue = .bias, .threads = 32, .cols = 1 },
+        .{ .format = .q8_0, .epilogue = .bias_gelu, .threads = 32, .cols = 2 },
+        .{ .format = .q8_0, .epilogue = .relu, .threads = 32, .cols = 1 },
+        .{ .format = .q8_1, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q8_k, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q2_k, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q2_k, .epilogue = .bias, .threads = 32, .cols = 1 },
+        .{ .format = .q2_k, .epilogue = .bias_gelu, .threads = 32, .cols = 1 },
+        .{ .format = .q3_k, .epilogue = .none, .threads = 32, .cols = 1 },
+        .{ .format = .q3_k, .epilogue = .bias, .threads = 32, .cols = 1 },
+        .{ .format = .q3_k, .epilogue = .bias_gelu, .threads = 32, .cols = 1 },
+        .{ .format = .q4_k, .epilogue = .none, .threads = 64, .cols = 1 },
+        .{ .format = .q4_k, .epilogue = .bias, .threads = 64, .cols = 1 },
+        .{ .format = .q4_k, .epilogue = .bias_gelu, .threads = 64, .cols = 1 },
+        .{ .format = .q5_k, .epilogue = .none, .threads = 128, .cols = 1 },
+        .{ .format = .q5_k, .epilogue = .bias, .threads = 128, .cols = 1 },
+        .{ .format = .q5_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
+        .{ .format = .q6_k, .epilogue = .none, .threads = 128, .cols = 1 },
+        .{ .format = .q6_k, .epilogue = .bias, .threads = 128, .cols = 1 },
+        .{ .format = .q6_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
+    };
+    try std.testing.expectEqual(expected.len, metal_production_schedules.len);
+    for (expected) |want| {
+        const schedule = metalRouteScheduleFor(want.format, .rows_2_8, want.epilogue) orelse {
+            std.debug.print("missing schedule for {s}/{s}\n", .{ @tagName(want.format), @tagName(want.epilogue) });
+            return error.MissingSchedule;
+        };
+        try std.testing.expectEqual(want.threads, schedule.threads_per_threadgroup);
+        try std.testing.expectEqual(want.cols, schedule.cols_per_threadgroup);
+        try schedule.validate(want.format.valuesPerBlock().?);
+    }
+    // Every scheduled route must be a valid, in-table entry.
+    for (metal_production_schedules) |entry| {
+        try std.testing.expectEqual(quant_matmul.RowBucket.rows_2_8, entry.row_bucket);
+        try entry.schedule.validate(entry.format.valuesPerBlock().?);
+    }
+}
+
+test "quant kernel compiler v1 bodies carry their schedule cols marker" {
+    // cols==2 kernels compute two output columns per threadgroup via
+    // `group_pos.x << 1`; cols==1 kernels do not. Locks the table's cols column
+    // to the frozen v1 body text.
+    for (metal_production_schedules) |entry| {
+        const section_name = try metalV1SectionNameForTest(std.testing.allocator, entry.format, entry.epilogue);
+        defer std.testing.allocator.free(section_name);
+        const section = metalRuntimeQuantSectionFor(section_name) orelse {
+            std.debug.print("missing v1 body section {s}\n", .{section_name});
+            return error.MissingBodySection;
+        };
+        const has_two_col = std.mem.containsAtLeast(u8, section.text, 1, "group_pos.x << 1");
+        try std.testing.expectEqual(entry.schedule.cols_per_threadgroup == 2, has_two_col);
+        // Reduction primitive must be present in the body.
+        switch (entry.schedule.reduction) {
+            .simd_sum => try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "simd_sum")),
+            .threadgroup_tree => try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "partial[")),
+            .hybrid_simd => {
+                try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "simd_sum"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "simdgroup_id"));
+            },
+        }
+    }
+}
+
+fn metalV1SectionNameForTest(allocator: std.mem.Allocator, format: quant_matmul.Format, epilogue: Epilogue) ![]u8 {
+    const epi_suffix = switch (epilogue) {
+        .none => "",
+        .bias => "_bias",
+        .bias_gelu => "_bias_gelu",
+        .relu => "_relu",
+        else => return error.UnsupportedEpilogueForSection,
+    };
+    return std.fmt.allocPrint(allocator, "antfly_{s}_small_batch{s}_msl_v1", .{ @tagName(format), epi_suffix });
 }

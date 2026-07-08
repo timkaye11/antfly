@@ -12896,7 +12896,7 @@
       "cuda_candidate_tile_cols": 0,
       "cuda_candidate_threads_per_block": 0,
       "metal_candidate_tile_rows": 1,
-      "metal_candidate_tile_cols": 1,
+      "metal_candidate_tile_cols": 2,
       "metal_candidate_threads_per_block": 32,
       "reference_supported": true,
       "reference_tensor_type": "Q8_0",
