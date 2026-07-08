@@ -266,6 +266,83 @@ static const uint16_t TERMITE_METAL_TAIL_STEP_KINDS[TERMITE_METAL_TAIL_STEP_COUN
 #define TERMITE_METAL_QUANT_FORMAT_TL1 29u
 #define TERMITE_METAL_QUANT_FORMAT_TL2 30u
 
+// Dense (format, epilogue) indices for the generated small-batch quant kernel
+// dispatch counters stored in antfly_generated_dispatch_counts[format][epilogue].
+// Order and values must stay in lockstep with
+// quant_matmul.GeneratedQuantFormatIndex / GeneratedQuantEpilogueIndex in
+// src/graph/quant_matmul.zig.
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT 12
+#define TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT 4
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q2_K 0
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q3_K 1
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_0 2
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_1 3
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_K 4
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_0 5
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_1 6
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_K 7
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q6_K 8
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_0 9
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_1 10
+#define TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_K 11
+#define TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE 0
+#define TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS 1
+#define TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU 2
+#define TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_RELU 3
+
+// Legacy per-kernel dispatch counter names, kept as macro aliases into the
+// indexed antfly_generated_dispatch_counts array. Existing increment and
+// call-site source text (pinned by quant_kernel_compiler.zig contract tests)
+// keeps compiling unchanged while the storage lives in one [12][4] array.
+// Kernels added by the quant kernel compiler can index the array directly and
+// do not need a new alias here.
+#define antfly_q8_0_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_0][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q8_0_small_batch_bias_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_0][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS]
+#define antfly_q8_0_small_batch_bias_gelu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_0][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU]
+#define antfly_q8_0_small_batch_relu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_0][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_RELU]
+#define antfly_q8_1_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_1][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q8_k_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q2_k_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q2_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q2_k_small_batch_bias_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q2_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS]
+#define antfly_q2_k_small_batch_bias_gelu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q2_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU]
+#define antfly_q3_k_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q3_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q3_k_small_batch_bias_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q3_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS]
+#define antfly_q3_k_small_batch_bias_gelu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q3_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU]
+#define antfly_q4_0_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_0][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q4_1_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_1][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q5_0_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_0][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q5_1_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_1][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q4_k_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q4_k_small_batch_bias_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS]
+#define antfly_q4_k_small_batch_bias_gelu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU]
+#define antfly_q5_k_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q5_k_small_batch_bias_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS]
+#define antfly_q5_k_small_batch_bias_gelu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU]
+#define antfly_q6_k_small_batch_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q6_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_NONE]
+#define antfly_q6_k_small_batch_bias_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q6_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS]
+#define antfly_q6_k_small_batch_bias_gelu_dispatches antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q6_K][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_INDEX_BIAS_GELU]
+
+// Explicit dense-index mapping for the (sparse, 1-based)
+// TERMITE_METAL_QUANT_FORMAT_* constants; returns -1 for formats without
+// generated small-batch kernels.
+static int termite_metal_generated_quant_format_index(uint32_t format) {
+    switch (format) {
+        case TERMITE_METAL_QUANT_FORMAT_Q2_K: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q2_K;
+        case TERMITE_METAL_QUANT_FORMAT_Q3_K: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q3_K;
+        case TERMITE_METAL_QUANT_FORMAT_Q4_0: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_0;
+        case TERMITE_METAL_QUANT_FORMAT_Q4_1: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_1;
+        case TERMITE_METAL_QUANT_FORMAT_Q4_K: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q4_K;
+        case TERMITE_METAL_QUANT_FORMAT_Q5_0: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_0;
+        case TERMITE_METAL_QUANT_FORMAT_Q5_1: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_1;
+        case TERMITE_METAL_QUANT_FORMAT_Q5_K: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q5_K;
+        case TERMITE_METAL_QUANT_FORMAT_Q6_K: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q6_K;
+        case TERMITE_METAL_QUANT_FORMAT_Q8_0: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_0;
+        case TERMITE_METAL_QUANT_FORMAT_Q8_1: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_1;
+        case TERMITE_METAL_QUANT_FORMAT_Q8_K: return TERMITE_METAL_GENERATED_QUANT_FORMAT_INDEX_Q8_K;
+        default: return -1;
+    }
+}
+
 #define TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 0u
 #define TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 1u
 
@@ -339,31 +416,7 @@ typedef struct termite_metal_provider {
     id<MTLComputePipelineState> tl2_pipeline;
     id<MTLComputePipelineState> polar4_key_scores_pipeline;
     id<MTLComputePipelineState> turbo3_key_scores_pipeline;
-    uint64_t antfly_q8_0_small_batch_dispatches;
-    uint64_t antfly_q8_0_small_batch_bias_dispatches;
-    uint64_t antfly_q8_0_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q8_0_small_batch_relu_dispatches;
-    uint64_t antfly_q8_1_small_batch_dispatches;
-    uint64_t antfly_q8_k_small_batch_dispatches;
-    uint64_t antfly_q2_k_small_batch_dispatches;
-    uint64_t antfly_q2_k_small_batch_bias_dispatches;
-    uint64_t antfly_q2_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q3_k_small_batch_dispatches;
-    uint64_t antfly_q3_k_small_batch_bias_dispatches;
-    uint64_t antfly_q3_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q4_0_small_batch_dispatches;
-    uint64_t antfly_q4_1_small_batch_dispatches;
-    uint64_t antfly_q5_0_small_batch_dispatches;
-    uint64_t antfly_q5_1_small_batch_dispatches;
-    uint64_t antfly_q4_k_small_batch_dispatches;
-    uint64_t antfly_q4_k_small_batch_bias_dispatches;
-    uint64_t antfly_q4_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q5_k_small_batch_dispatches;
-    uint64_t antfly_q5_k_small_batch_bias_dispatches;
-    uint64_t antfly_q5_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q6_k_small_batch_dispatches;
-    uint64_t antfly_q6_k_small_batch_bias_dispatches;
-    uint64_t antfly_q6_k_small_batch_bias_gelu_dispatches;
+    uint64_t antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT];
 } termite_metal_provider;
 
 #define TERMITE_METAL_PLANNED_RANGE_CAPACITY 256u
@@ -938,31 +991,7 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q6_k_linear_reduce_rows_9_64;
     uint64_t q6_k_linear_reduce_rows_65_plus;
     uint64_t q6_k_linear_reduce_f16_input;
-    uint64_t antfly_q8_0_small_batch_dispatches;
-    uint64_t antfly_q8_0_small_batch_bias_dispatches;
-    uint64_t antfly_q8_0_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q8_0_small_batch_relu_dispatches;
-    uint64_t antfly_q8_1_small_batch_dispatches;
-    uint64_t antfly_q8_k_small_batch_dispatches;
-    uint64_t antfly_q2_k_small_batch_dispatches;
-    uint64_t antfly_q2_k_small_batch_bias_dispatches;
-    uint64_t antfly_q2_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q3_k_small_batch_dispatches;
-    uint64_t antfly_q3_k_small_batch_bias_dispatches;
-    uint64_t antfly_q3_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q4_0_small_batch_dispatches;
-    uint64_t antfly_q4_1_small_batch_dispatches;
-    uint64_t antfly_q5_0_small_batch_dispatches;
-    uint64_t antfly_q5_1_small_batch_dispatches;
-    uint64_t antfly_q4_k_small_batch_dispatches;
-    uint64_t antfly_q4_k_small_batch_bias_dispatches;
-    uint64_t antfly_q4_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q5_k_small_batch_dispatches;
-    uint64_t antfly_q5_k_small_batch_bias_dispatches;
-    uint64_t antfly_q5_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q6_k_small_batch_dispatches;
-    uint64_t antfly_q6_k_small_batch_bias_dispatches;
-    uint64_t antfly_q6_k_small_batch_bias_gelu_dispatches;
+    uint64_t antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT];
     uint64_t rms_norm_add_sumsq;
     termite_metal_generated_gate_entry generated_gate_cache[TERMITE_METAL_GENERATED_GATE_CACHE_CAPACITY];
     size_t generated_gate_cache_len;
@@ -1252,31 +1281,7 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t q6_k_linear_reduce_rows_9_64;
     uint64_t q6_k_linear_reduce_rows_65_plus;
     uint64_t q6_k_linear_reduce_f16_input;
-    uint64_t antfly_q8_0_small_batch_dispatches;
-    uint64_t antfly_q8_0_small_batch_bias_dispatches;
-    uint64_t antfly_q8_0_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q8_0_small_batch_relu_dispatches;
-    uint64_t antfly_q8_1_small_batch_dispatches;
-    uint64_t antfly_q8_k_small_batch_dispatches;
-    uint64_t antfly_q2_k_small_batch_dispatches;
-    uint64_t antfly_q2_k_small_batch_bias_dispatches;
-    uint64_t antfly_q2_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q3_k_small_batch_dispatches;
-    uint64_t antfly_q3_k_small_batch_bias_dispatches;
-    uint64_t antfly_q3_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q4_0_small_batch_dispatches;
-    uint64_t antfly_q4_1_small_batch_dispatches;
-    uint64_t antfly_q5_0_small_batch_dispatches;
-    uint64_t antfly_q5_1_small_batch_dispatches;
-    uint64_t antfly_q4_k_small_batch_dispatches;
-    uint64_t antfly_q4_k_small_batch_bias_dispatches;
-    uint64_t antfly_q4_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q5_k_small_batch_dispatches;
-    uint64_t antfly_q5_k_small_batch_bias_dispatches;
-    uint64_t antfly_q5_k_small_batch_bias_gelu_dispatches;
-    uint64_t antfly_q6_k_small_batch_dispatches;
-    uint64_t antfly_q6_k_small_batch_bias_dispatches;
-    uint64_t antfly_q6_k_small_batch_bias_gelu_dispatches;
+    uint64_t antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT];
     uint64_t rms_norm_add_sumsq;
 } termite_metal_decode_runtime_memory_stats;
 
@@ -39669,31 +39674,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->q6_k_linear_reduce_rows_9_64 = runtime->q6_k_linear_reduce_rows_9_64;
     snapshot->q6_k_linear_reduce_rows_65_plus = runtime->q6_k_linear_reduce_rows_65_plus;
     snapshot->q6_k_linear_reduce_f16_input = runtime->q6_k_linear_reduce_f16_input;
-    snapshot->antfly_q8_0_small_batch_dispatches = runtime->antfly_q8_0_small_batch_dispatches;
-    snapshot->antfly_q8_0_small_batch_bias_dispatches = runtime->antfly_q8_0_small_batch_bias_dispatches;
-    snapshot->antfly_q8_0_small_batch_bias_gelu_dispatches = runtime->antfly_q8_0_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q8_0_small_batch_relu_dispatches = runtime->antfly_q8_0_small_batch_relu_dispatches;
-    snapshot->antfly_q8_1_small_batch_dispatches = runtime->antfly_q8_1_small_batch_dispatches;
-    snapshot->antfly_q8_k_small_batch_dispatches = runtime->antfly_q8_k_small_batch_dispatches;
-    snapshot->antfly_q2_k_small_batch_dispatches = runtime->antfly_q2_k_small_batch_dispatches;
-    snapshot->antfly_q2_k_small_batch_bias_dispatches = runtime->antfly_q2_k_small_batch_bias_dispatches;
-    snapshot->antfly_q2_k_small_batch_bias_gelu_dispatches = runtime->antfly_q2_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q3_k_small_batch_dispatches = runtime->antfly_q3_k_small_batch_dispatches;
-    snapshot->antfly_q3_k_small_batch_bias_dispatches = runtime->antfly_q3_k_small_batch_bias_dispatches;
-    snapshot->antfly_q3_k_small_batch_bias_gelu_dispatches = runtime->antfly_q3_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q4_0_small_batch_dispatches = runtime->antfly_q4_0_small_batch_dispatches;
-    snapshot->antfly_q4_1_small_batch_dispatches = runtime->antfly_q4_1_small_batch_dispatches;
-    snapshot->antfly_q5_0_small_batch_dispatches = runtime->antfly_q5_0_small_batch_dispatches;
-    snapshot->antfly_q5_1_small_batch_dispatches = runtime->antfly_q5_1_small_batch_dispatches;
-    snapshot->antfly_q4_k_small_batch_dispatches = runtime->antfly_q4_k_small_batch_dispatches;
-    snapshot->antfly_q4_k_small_batch_bias_dispatches = runtime->antfly_q4_k_small_batch_bias_dispatches;
-    snapshot->antfly_q4_k_small_batch_bias_gelu_dispatches = runtime->antfly_q4_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q5_k_small_batch_dispatches = runtime->antfly_q5_k_small_batch_dispatches;
-    snapshot->antfly_q5_k_small_batch_bias_dispatches = runtime->antfly_q5_k_small_batch_bias_dispatches;
-    snapshot->antfly_q5_k_small_batch_bias_gelu_dispatches = runtime->antfly_q5_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q6_k_small_batch_dispatches = runtime->antfly_q6_k_small_batch_dispatches;
-    snapshot->antfly_q6_k_small_batch_bias_dispatches = runtime->antfly_q6_k_small_batch_bias_dispatches;
-    snapshot->antfly_q6_k_small_batch_bias_gelu_dispatches = runtime->antfly_q6_k_small_batch_bias_gelu_dispatches;
+    memcpy(snapshot->antfly_generated_dispatch_counts, runtime->antfly_generated_dispatch_counts, sizeof(snapshot->antfly_generated_dispatch_counts));
     snapshot->rms_norm_add_sumsq = runtime->rms_norm_add_sumsq;
     return 0;
 }
@@ -39706,31 +39687,7 @@ int termite_metal_provider_generated_quant_snapshot(
     memset(snapshot, 0, sizeof(*snapshot));
     if (provider == NULL) return -2;
 
-    snapshot->antfly_q8_0_small_batch_dispatches = provider->antfly_q8_0_small_batch_dispatches;
-    snapshot->antfly_q8_0_small_batch_bias_dispatches = provider->antfly_q8_0_small_batch_bias_dispatches;
-    snapshot->antfly_q8_0_small_batch_bias_gelu_dispatches = provider->antfly_q8_0_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q8_0_small_batch_relu_dispatches = provider->antfly_q8_0_small_batch_relu_dispatches;
-    snapshot->antfly_q8_1_small_batch_dispatches = provider->antfly_q8_1_small_batch_dispatches;
-    snapshot->antfly_q8_k_small_batch_dispatches = provider->antfly_q8_k_small_batch_dispatches;
-    snapshot->antfly_q2_k_small_batch_dispatches = provider->antfly_q2_k_small_batch_dispatches;
-    snapshot->antfly_q2_k_small_batch_bias_dispatches = provider->antfly_q2_k_small_batch_bias_dispatches;
-    snapshot->antfly_q2_k_small_batch_bias_gelu_dispatches = provider->antfly_q2_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q3_k_small_batch_dispatches = provider->antfly_q3_k_small_batch_dispatches;
-    snapshot->antfly_q3_k_small_batch_bias_dispatches = provider->antfly_q3_k_small_batch_bias_dispatches;
-    snapshot->antfly_q3_k_small_batch_bias_gelu_dispatches = provider->antfly_q3_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q4_0_small_batch_dispatches = provider->antfly_q4_0_small_batch_dispatches;
-    snapshot->antfly_q4_1_small_batch_dispatches = provider->antfly_q4_1_small_batch_dispatches;
-    snapshot->antfly_q5_0_small_batch_dispatches = provider->antfly_q5_0_small_batch_dispatches;
-    snapshot->antfly_q5_1_small_batch_dispatches = provider->antfly_q5_1_small_batch_dispatches;
-    snapshot->antfly_q4_k_small_batch_dispatches = provider->antfly_q4_k_small_batch_dispatches;
-    snapshot->antfly_q4_k_small_batch_bias_dispatches = provider->antfly_q4_k_small_batch_bias_dispatches;
-    snapshot->antfly_q4_k_small_batch_bias_gelu_dispatches = provider->antfly_q4_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q5_k_small_batch_dispatches = provider->antfly_q5_k_small_batch_dispatches;
-    snapshot->antfly_q5_k_small_batch_bias_dispatches = provider->antfly_q5_k_small_batch_bias_dispatches;
-    snapshot->antfly_q5_k_small_batch_bias_gelu_dispatches = provider->antfly_q5_k_small_batch_bias_gelu_dispatches;
-    snapshot->antfly_q6_k_small_batch_dispatches = provider->antfly_q6_k_small_batch_dispatches;
-    snapshot->antfly_q6_k_small_batch_bias_dispatches = provider->antfly_q6_k_small_batch_bias_dispatches;
-    snapshot->antfly_q6_k_small_batch_bias_gelu_dispatches = provider->antfly_q6_k_small_batch_bias_gelu_dispatches;
+    memcpy(snapshot->antfly_generated_dispatch_counts, provider->antfly_generated_dispatch_counts, sizeof(snapshot->antfly_generated_dispatch_counts));
     return 0;
 }
 
@@ -40217,64 +40174,20 @@ static int termite_metal_dispatch(termite_metal_provider *provider, id<MTLComput
 
 static void termite_metal_provider_add_generated_quant_runtime_stats(termite_metal_provider *provider, const termite_metal_decode_runtime *runtime) {
     if (provider == NULL || runtime == NULL) return;
-    provider->antfly_q8_0_small_batch_dispatches += runtime->antfly_q8_0_small_batch_dispatches;
-    provider->antfly_q8_0_small_batch_bias_dispatches += runtime->antfly_q8_0_small_batch_bias_dispatches;
-    provider->antfly_q8_0_small_batch_bias_gelu_dispatches += runtime->antfly_q8_0_small_batch_bias_gelu_dispatches;
-    provider->antfly_q8_0_small_batch_relu_dispatches += runtime->antfly_q8_0_small_batch_relu_dispatches;
-    provider->antfly_q8_1_small_batch_dispatches += runtime->antfly_q8_1_small_batch_dispatches;
-    provider->antfly_q8_k_small_batch_dispatches += runtime->antfly_q8_k_small_batch_dispatches;
-    provider->antfly_q2_k_small_batch_dispatches += runtime->antfly_q2_k_small_batch_dispatches;
-    provider->antfly_q2_k_small_batch_bias_dispatches += runtime->antfly_q2_k_small_batch_bias_dispatches;
-    provider->antfly_q2_k_small_batch_bias_gelu_dispatches += runtime->antfly_q2_k_small_batch_bias_gelu_dispatches;
-    provider->antfly_q3_k_small_batch_dispatches += runtime->antfly_q3_k_small_batch_dispatches;
-    provider->antfly_q3_k_small_batch_bias_dispatches += runtime->antfly_q3_k_small_batch_bias_dispatches;
-    provider->antfly_q3_k_small_batch_bias_gelu_dispatches += runtime->antfly_q3_k_small_batch_bias_gelu_dispatches;
-    provider->antfly_q4_0_small_batch_dispatches += runtime->antfly_q4_0_small_batch_dispatches;
-    provider->antfly_q4_1_small_batch_dispatches += runtime->antfly_q4_1_small_batch_dispatches;
-    provider->antfly_q5_0_small_batch_dispatches += runtime->antfly_q5_0_small_batch_dispatches;
-    provider->antfly_q5_1_small_batch_dispatches += runtime->antfly_q5_1_small_batch_dispatches;
-    provider->antfly_q4_k_small_batch_dispatches += runtime->antfly_q4_k_small_batch_dispatches;
-    provider->antfly_q4_k_small_batch_bias_dispatches += runtime->antfly_q4_k_small_batch_bias_dispatches;
-    provider->antfly_q4_k_small_batch_bias_gelu_dispatches += runtime->antfly_q4_k_small_batch_bias_gelu_dispatches;
-    provider->antfly_q5_k_small_batch_dispatches += runtime->antfly_q5_k_small_batch_dispatches;
-    provider->antfly_q5_k_small_batch_bias_dispatches += runtime->antfly_q5_k_small_batch_bias_dispatches;
-    provider->antfly_q5_k_small_batch_bias_gelu_dispatches += runtime->antfly_q5_k_small_batch_bias_gelu_dispatches;
-    provider->antfly_q6_k_small_batch_dispatches += runtime->antfly_q6_k_small_batch_dispatches;
-    provider->antfly_q6_k_small_batch_bias_dispatches += runtime->antfly_q6_k_small_batch_bias_dispatches;
-    provider->antfly_q6_k_small_batch_bias_gelu_dispatches += runtime->antfly_q6_k_small_batch_bias_gelu_dispatches;
+    for (size_t format_index = 0; format_index < TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT; format_index += 1) {
+        for (size_t epilogue_index = 0; epilogue_index < TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT; epilogue_index += 1) {
+            provider->antfly_generated_dispatch_counts[format_index][epilogue_index] += runtime->antfly_generated_dispatch_counts[format_index][epilogue_index];
+        }
+    }
 }
 
 static void termite_metal_provider_record_generated_quant_dispatch(termite_metal_provider *provider, uint32_t format, termite_metal_generated_quant_epilogue epilogue) {
     if (provider == NULL) return;
-    switch (format) {
-        case TERMITE_METAL_QUANT_FORMAT_Q2_K:
-            if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS) provider->antfly_q2_k_small_batch_bias_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU) provider->antfly_q2_k_small_batch_bias_gelu_dispatches += 1;
-            break;
-        case TERMITE_METAL_QUANT_FORMAT_Q3_K:
-            if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS) provider->antfly_q3_k_small_batch_bias_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU) provider->antfly_q3_k_small_batch_bias_gelu_dispatches += 1;
-            break;
-        case TERMITE_METAL_QUANT_FORMAT_Q4_K:
-            if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS) provider->antfly_q4_k_small_batch_bias_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU) provider->antfly_q4_k_small_batch_bias_gelu_dispatches += 1;
-            break;
-        case TERMITE_METAL_QUANT_FORMAT_Q5_K:
-            if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS) provider->antfly_q5_k_small_batch_bias_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU) provider->antfly_q5_k_small_batch_bias_gelu_dispatches += 1;
-            break;
-        case TERMITE_METAL_QUANT_FORMAT_Q6_K:
-            if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS) provider->antfly_q6_k_small_batch_bias_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU) provider->antfly_q6_k_small_batch_bias_gelu_dispatches += 1;
-            break;
-        case TERMITE_METAL_QUANT_FORMAT_Q8_0:
-            if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS) provider->antfly_q8_0_small_batch_bias_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU) provider->antfly_q8_0_small_batch_bias_gelu_dispatches += 1;
-            else if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU) provider->antfly_q8_0_small_batch_relu_dispatches += 1;
-            break;
-        default:
-            break;
-    }
+    if (epilogue == TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE) return;
+    const int format_index = termite_metal_generated_quant_format_index(format);
+    const int epilogue_index = (int)epilogue;
+    if (format_index < 0 || epilogue_index < 0 || epilogue_index >= TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT) return;
+    provider->antfly_generated_dispatch_counts[format_index][epilogue_index] += 1;
 }
 
 static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *provider, uint32_t format, id<MTLComputePipelineState> fallback_pipeline, const float *input, size_t rows, size_t in_dim, size_t values_per_block, size_t bytes_per_block, const uint8_t *weight_raw, size_t weight_bytes, size_t out_dim, float *output) {

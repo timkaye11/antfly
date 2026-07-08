@@ -2806,36 +2806,21 @@ fn metalStatsCompactJson(
             provider.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
+    // Keys and their order come from the shared counter-name table; the emitted
+    // JSON must stay byte-identical to the historical hand-written key list.
+    try appendFmt(allocator, &out, ",\n\"generated_quant_dispatch\":{{", .{});
+    for (quant_matmul.generated_quant_counter_names, 0..) |counter, counter_index| {
+        const separator: []const u8 = if (counter_index + 1 == quant_matmul.generated_quant_counter_names.len) "" else ",";
+        try appendFmt(allocator, &out, "\n\"{s}\":{d}{s}", .{
+            counter.name,
+            quant_matmul.generatedQuantDispatchCount(&provider.metal_runtime_antfly_generated_dispatch_counts, counter.format, counter.epilogue),
+            separator,
+        });
+    }
     try appendFmt(
         allocator,
         &out,
-        \\,
-        \\"generated_quant_dispatch":{{
-        \\"q8_0_small_batch":{d},
-        \\"q8_0_small_batch_bias":{d},
-        \\"q8_0_small_batch_bias_gelu":{d},
-        \\"q8_0_small_batch_relu":{d},
-        \\"q8_1_small_batch":{d},
-        \\"q8_k_small_batch":{d},
-        \\"q2_k_small_batch":{d},
-        \\"q2_k_small_batch_bias":{d},
-        \\"q2_k_small_batch_bias_gelu":{d},
-        \\"q3_k_small_batch":{d},
-        \\"q3_k_small_batch_bias":{d},
-        \\"q3_k_small_batch_bias_gelu":{d},
-        \\"q4_0_small_batch":{d},
-        \\"q4_1_small_batch":{d},
-        \\"q5_0_small_batch":{d},
-        \\"q5_1_small_batch":{d},
-        \\"q4_k_small_batch":{d},
-        \\"q4_k_small_batch_bias":{d},
-        \\"q4_k_small_batch_bias_gelu":{d},
-        \\"q5_k_small_batch":{d},
-        \\"q5_k_small_batch_bias":{d},
-        \\"q5_k_small_batch_bias_gelu":{d},
-        \\"q6_k_small_batch":{d},
-        \\"q6_k_small_batch_bias":{d},
-        \\"q6_k_small_batch_bias_gelu":{d}
+        \\
         \\}},
         \\"generated_quant_routes":{s},
         \\"metal_generated_quant":{d},
@@ -2844,31 +2829,6 @@ fn metalStatsCompactJson(
         \\"metal_generated_quant_top_count":{d}
     ,
         .{
-            provider.metal_runtime_antfly_q8_0_small_batch_dispatches,
-            provider.metal_runtime_antfly_q8_0_small_batch_bias_dispatches,
-            provider.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches,
-            provider.metal_runtime_antfly_q8_0_small_batch_relu_dispatches,
-            provider.metal_runtime_antfly_q8_1_small_batch_dispatches,
-            provider.metal_runtime_antfly_q8_k_small_batch_dispatches,
-            provider.metal_runtime_antfly_q2_k_small_batch_dispatches,
-            provider.metal_runtime_antfly_q2_k_small_batch_bias_dispatches,
-            provider.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches,
-            provider.metal_runtime_antfly_q3_k_small_batch_dispatches,
-            provider.metal_runtime_antfly_q3_k_small_batch_bias_dispatches,
-            provider.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches,
-            provider.metal_runtime_antfly_q4_0_small_batch_dispatches,
-            provider.metal_runtime_antfly_q4_1_small_batch_dispatches,
-            provider.metal_runtime_antfly_q5_0_small_batch_dispatches,
-            provider.metal_runtime_antfly_q5_1_small_batch_dispatches,
-            provider.metal_runtime_antfly_q4_k_small_batch_dispatches,
-            provider.metal_runtime_antfly_q4_k_small_batch_bias_dispatches,
-            provider.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches,
-            provider.metal_runtime_antfly_q5_k_small_batch_dispatches,
-            provider.metal_runtime_antfly_q5_k_small_batch_bias_dispatches,
-            provider.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches,
-            provider.metal_runtime_antfly_q6_k_small_batch_dispatches,
-            provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
-            provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
             generated_route_json,
             generated_quant.generatedTotal(),
             generated_quant.nonzeroFamilyCount(),
@@ -3014,7 +2974,7 @@ fn metalStatsWithRuntimePlanCounters(
     var stats = graph_stats;
 
     addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_1, .q8_0, .rows_1, .none, .mmv);
-    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q8_0_linear_rows_2_8, provider.metal_runtime_antfly_q8_0_small_batch_dispatches), .q8_0, .rows_2_8, .none, .small_batch);
+    addMetalRuntimeObservedHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q8_0_linear_rows_2_8, quant_matmul.generatedQuantDispatchCount(&provider.metal_runtime_antfly_generated_dispatch_counts, .q8_0, .none)), .q8_0, .rows_2_8, .none, .small_batch);
     addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_9_64, .q8_0, .rows_9_64, .none, .mm);
     addMetalRuntimeObservedHandwrittenPlanCounter(&stats, provider.metal_runtime_q8_0_linear_rows_65_plus, .q8_0, .rows_65_plus, .none, .mm);
 
@@ -3066,31 +3026,14 @@ fn metalStatsWithRuntimePlanCounters(
     addMetalRuntimeHandwrittenPlanCounter(&stats, saturatingSub(provider.metal_runtime_q6_k_linear_reduce, q6_k_linear_reduce_rows));
     addMetalRuntimeHandwrittenPlanCounter(&stats, provider.metal_runtime_q6_k_linear_reduce_f16_input);
 
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_dispatches, .q8_0, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_bias_dispatches, .q8_0, .bias);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches, .q8_0, .bias_gelu);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_0_small_batch_relu_dispatches, .q8_0, .relu);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_1_small_batch_dispatches, .q8_1, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q8_k_small_batch_dispatches, .q8_k, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q2_k_small_batch_dispatches, .q2_k, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q2_k_small_batch_bias_dispatches, .q2_k, .bias);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches, .q2_k, .bias_gelu);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q3_k_small_batch_dispatches, .q3_k, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q3_k_small_batch_bias_dispatches, .q3_k, .bias);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches, .q3_k, .bias_gelu);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_0_small_batch_dispatches, .q4_0, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_1_small_batch_dispatches, .q4_1, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_0_small_batch_dispatches, .q5_0, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_1_small_batch_dispatches, .q5_1, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_k_small_batch_dispatches, .q4_k, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_k_small_batch_bias_dispatches, .q4_k, .bias);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches, .q4_k, .bias_gelu);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_k_small_batch_dispatches, .q5_k, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_k_small_batch_bias_dispatches, .q5_k, .bias);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches, .q5_k, .bias_gelu);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_dispatches, .q6_k, .none);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches, .q6_k, .bias);
-    addMetalRuntimeGeneratedPlanCounter(&stats, provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches, .q6_k, .bias_gelu);
+    inline for (quant_matmul.generated_quant_counter_names) |counter| {
+        addMetalRuntimeGeneratedPlanCounter(
+            &stats,
+            quant_matmul.generatedQuantDispatchCount(&provider.metal_runtime_antfly_generated_dispatch_counts, counter.format, counter.epilogue),
+            @field(quant_matmul.Format, @tagName(counter.format)),
+            @field(graph_mod.quant_kernel_compiler.Epilogue, @tagName(counter.epilogue)),
+        );
+    }
     return stats;
 }
 
@@ -6556,9 +6499,10 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_last_frame_planned_command_operator_counts[1] = 2;
     snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
     snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
-    snapshot.provider.metal_runtime_antfly_q8_0_small_batch_dispatches = 5;
-    snapshot.provider.metal_runtime_antfly_q6_k_small_batch_bias_dispatches = 24;
-    snapshot.provider.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches = 6;
+    const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 5;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 24;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 6;
     snapshot.provider.active_decode_frame_fallbacks = 7;
     snapshot.provider.prefill_frame_execute_successes = 8;
     snapshot.provider.prefill_frame_execute_attempts = 9;
@@ -6638,8 +6582,9 @@ test "metal stats compact json exposes generated quant and fallback counters" {
 
 test "metal stats compact json derives plan counters from runtime generated dispatches" {
     var snapshot = ops.BackendDebugTimingSnapshot{ .native_quant_null = false };
-    snapshot.provider.metal_runtime_antfly_q8_0_small_batch_dispatches = 2;
-    snapshot.provider.metal_runtime_antfly_q5_k_small_batch_bias_dispatches = 3;
+    const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
+    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 3;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);

@@ -18498,31 +18498,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q6_k_linear_reduce_rows_65_plus = runtime_stats.q6_k_linear_reduce_rows_65_plus;
         stats.metal_runtime_q6_k_linear_reduce_f16_input = runtime_stats.q6_k_linear_reduce_f16_input;
         const provider_generated_stats = metal_runtime.providerGeneratedQuantSnapshot(self.provider_impl.raw_provider);
-        stats.metal_runtime_antfly_q8_0_small_batch_dispatches = runtime_stats.antfly_q8_0_small_batch_dispatches + provider_generated_stats.antfly_q8_0_small_batch_dispatches;
-        stats.metal_runtime_antfly_q8_0_small_batch_bias_dispatches = runtime_stats.antfly_q8_0_small_batch_bias_dispatches + provider_generated_stats.antfly_q8_0_small_batch_bias_dispatches;
-        stats.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches = runtime_stats.antfly_q8_0_small_batch_bias_gelu_dispatches + provider_generated_stats.antfly_q8_0_small_batch_bias_gelu_dispatches;
-        stats.metal_runtime_antfly_q8_0_small_batch_relu_dispatches = runtime_stats.antfly_q8_0_small_batch_relu_dispatches + provider_generated_stats.antfly_q8_0_small_batch_relu_dispatches;
-        stats.metal_runtime_antfly_q8_1_small_batch_dispatches = runtime_stats.antfly_q8_1_small_batch_dispatches + provider_generated_stats.antfly_q8_1_small_batch_dispatches;
-        stats.metal_runtime_antfly_q8_k_small_batch_dispatches = runtime_stats.antfly_q8_k_small_batch_dispatches + provider_generated_stats.antfly_q8_k_small_batch_dispatches;
-        stats.metal_runtime_antfly_q2_k_small_batch_dispatches = runtime_stats.antfly_q2_k_small_batch_dispatches + provider_generated_stats.antfly_q2_k_small_batch_dispatches;
-        stats.metal_runtime_antfly_q2_k_small_batch_bias_dispatches = runtime_stats.antfly_q2_k_small_batch_bias_dispatches + provider_generated_stats.antfly_q2_k_small_batch_bias_dispatches;
-        stats.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches = runtime_stats.antfly_q2_k_small_batch_bias_gelu_dispatches + provider_generated_stats.antfly_q2_k_small_batch_bias_gelu_dispatches;
-        stats.metal_runtime_antfly_q3_k_small_batch_dispatches = runtime_stats.antfly_q3_k_small_batch_dispatches + provider_generated_stats.antfly_q3_k_small_batch_dispatches;
-        stats.metal_runtime_antfly_q3_k_small_batch_bias_dispatches = runtime_stats.antfly_q3_k_small_batch_bias_dispatches + provider_generated_stats.antfly_q3_k_small_batch_bias_dispatches;
-        stats.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches = runtime_stats.antfly_q3_k_small_batch_bias_gelu_dispatches + provider_generated_stats.antfly_q3_k_small_batch_bias_gelu_dispatches;
-        stats.metal_runtime_antfly_q4_0_small_batch_dispatches = runtime_stats.antfly_q4_0_small_batch_dispatches + provider_generated_stats.antfly_q4_0_small_batch_dispatches;
-        stats.metal_runtime_antfly_q4_1_small_batch_dispatches = runtime_stats.antfly_q4_1_small_batch_dispatches + provider_generated_stats.antfly_q4_1_small_batch_dispatches;
-        stats.metal_runtime_antfly_q5_0_small_batch_dispatches = runtime_stats.antfly_q5_0_small_batch_dispatches + provider_generated_stats.antfly_q5_0_small_batch_dispatches;
-        stats.metal_runtime_antfly_q5_1_small_batch_dispatches = runtime_stats.antfly_q5_1_small_batch_dispatches + provider_generated_stats.antfly_q5_1_small_batch_dispatches;
-        stats.metal_runtime_antfly_q4_k_small_batch_dispatches = runtime_stats.antfly_q4_k_small_batch_dispatches + provider_generated_stats.antfly_q4_k_small_batch_dispatches;
-        stats.metal_runtime_antfly_q4_k_small_batch_bias_dispatches = runtime_stats.antfly_q4_k_small_batch_bias_dispatches + provider_generated_stats.antfly_q4_k_small_batch_bias_dispatches;
-        stats.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches = runtime_stats.antfly_q4_k_small_batch_bias_gelu_dispatches + provider_generated_stats.antfly_q4_k_small_batch_bias_gelu_dispatches;
-        stats.metal_runtime_antfly_q5_k_small_batch_dispatches = runtime_stats.antfly_q5_k_small_batch_dispatches + provider_generated_stats.antfly_q5_k_small_batch_dispatches;
-        stats.metal_runtime_antfly_q5_k_small_batch_bias_dispatches = runtime_stats.antfly_q5_k_small_batch_bias_dispatches + provider_generated_stats.antfly_q5_k_small_batch_bias_dispatches;
-        stats.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches = runtime_stats.antfly_q5_k_small_batch_bias_gelu_dispatches + provider_generated_stats.antfly_q5_k_small_batch_bias_gelu_dispatches;
-        stats.metal_runtime_antfly_q6_k_small_batch_dispatches = runtime_stats.antfly_q6_k_small_batch_dispatches + provider_generated_stats.antfly_q6_k_small_batch_dispatches;
-        stats.metal_runtime_antfly_q6_k_small_batch_bias_dispatches = runtime_stats.antfly_q6_k_small_batch_bias_dispatches + provider_generated_stats.antfly_q6_k_small_batch_bias_dispatches;
-        stats.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches = runtime_stats.antfly_q6_k_small_batch_bias_gelu_dispatches + provider_generated_stats.antfly_q6_k_small_batch_bias_gelu_dispatches;
+        for (
+            &stats.metal_runtime_antfly_generated_dispatch_counts,
+            runtime_stats.antfly_generated_dispatch_counts,
+            provider_generated_stats.antfly_generated_dispatch_counts,
+        ) |*format_counts, runtime_format_counts, provider_format_counts| {
+            for (format_counts, runtime_format_counts, provider_format_counts) |*count, runtime_count, provider_count| {
+                count.* = runtime_count + provider_count;
+            }
+        }
         stats.metal_runtime_rms_norm_add_sumsq = runtime_stats.rms_norm_add_sumsq;
 
         const provider = self.provider_impl;

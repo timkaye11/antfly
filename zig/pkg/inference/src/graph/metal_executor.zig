@@ -31,6 +31,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const contracts = @import("backend_contracts.zig");
 const model_runtime = @import("model_runtime.zig");
+const quant_matmul = @import("quant_matmul.zig");
 
 const c_std = @cImport(@cInclude("stdlib.h"));
 
@@ -709,36 +710,16 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
-    std.debug.print(
-        "metal_generated_quant_dispatch: q8_0_small_batch={d} q8_0_small_batch_bias={d} q8_0_small_batch_bias_gelu={d} q8_0_small_batch_relu={d} q8_1_small_batch={d} q8_k_small_batch={d} q2_k_small_batch={d} q2_k_small_batch_bias={d} q2_k_small_batch_bias_gelu={d} q3_k_small_batch={d} q3_k_small_batch_bias={d} q3_k_small_batch_bias_gelu={d} q4_0_small_batch={d} q4_1_small_batch={d} q5_0_small_batch={d} q5_1_small_batch={d} q4_k_small_batch={d} q4_k_small_batch_bias={d} q4_k_small_batch_bias_gelu={d} q5_k_small_batch={d} q5_k_small_batch_bias={d} q5_k_small_batch_bias_gelu={d} q6_k_small_batch={d} q6_k_small_batch_bias={d} q6_k_small_batch_bias_gelu={d}\n",
-        .{
-            provider_stats.metal_runtime_antfly_q8_0_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q8_0_small_batch_bias_dispatches,
-            provider_stats.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches,
-            provider_stats.metal_runtime_antfly_q8_0_small_batch_relu_dispatches,
-            provider_stats.metal_runtime_antfly_q8_1_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q8_k_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q2_k_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q2_k_small_batch_bias_dispatches,
-            provider_stats.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches,
-            provider_stats.metal_runtime_antfly_q3_k_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q3_k_small_batch_bias_dispatches,
-            provider_stats.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches,
-            provider_stats.metal_runtime_antfly_q4_0_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q4_1_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q5_0_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q5_1_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q4_k_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q4_k_small_batch_bias_dispatches,
-            provider_stats.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches,
-            provider_stats.metal_runtime_antfly_q5_k_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q5_k_small_batch_bias_dispatches,
-            provider_stats.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches,
-            provider_stats.metal_runtime_antfly_q6_k_small_batch_dispatches,
-            provider_stats.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
-            provider_stats.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
-        },
-    );
+    // Counter names and their order come from the shared table so this line
+    // stays byte-identical to the historical hand-written format string.
+    std.debug.print("metal_generated_quant_dispatch:", .{});
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        std.debug.print(" {s}={d}", .{
+            counter.name,
+            quant_matmul.generatedQuantDispatchCount(&provider_stats.metal_runtime_antfly_generated_dispatch_counts, counter.format, counter.epilogue),
+        });
+    }
+    std.debug.print("\n", .{});
     std.debug.print(
         "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
         .{

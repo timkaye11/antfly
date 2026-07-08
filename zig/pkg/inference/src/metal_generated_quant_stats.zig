@@ -16,6 +16,7 @@ const std = @import("std");
 
 const backends = @import("backends/backends.zig");
 const ops = @import("ops/ops.zig");
+const quant_matmul = @import("graph/quant_matmul.zig");
 const session_factory = @import("architectures/session_factory.zig");
 
 pub const Stats = struct {
@@ -209,32 +210,33 @@ pub const Stats = struct {
     }
 
     pub fn fromProviderStats(stats: ops.NativeQuantTimingStats) Stats {
+        const generated = &stats.metal_runtime_antfly_generated_dispatch_counts;
         return .{
-            .q2_k = stats.metal_runtime_antfly_q2_k_small_batch_dispatches,
-            .q2_k_bias = stats.metal_runtime_antfly_q2_k_small_batch_bias_dispatches,
-            .q2_k_bias_gelu = stats.metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches,
-            .q3_k = stats.metal_runtime_antfly_q3_k_small_batch_dispatches,
-            .q3_k_bias = stats.metal_runtime_antfly_q3_k_small_batch_bias_dispatches,
-            .q3_k_bias_gelu = stats.metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches,
-            .q4_0 = stats.metal_runtime_antfly_q4_0_small_batch_dispatches,
-            .q4_1 = stats.metal_runtime_antfly_q4_1_small_batch_dispatches,
-            .q5_0 = stats.metal_runtime_antfly_q5_0_small_batch_dispatches,
-            .q5_1 = stats.metal_runtime_antfly_q5_1_small_batch_dispatches,
-            .q4_k = stats.metal_runtime_antfly_q4_k_small_batch_dispatches,
-            .q4_k_bias = stats.metal_runtime_antfly_q4_k_small_batch_bias_dispatches,
-            .q4_k_bias_gelu = stats.metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches,
-            .q5_k = stats.metal_runtime_antfly_q5_k_small_batch_dispatches,
-            .q5_k_bias = stats.metal_runtime_antfly_q5_k_small_batch_bias_dispatches,
-            .q5_k_bias_gelu = stats.metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches,
-            .q6_k = stats.metal_runtime_antfly_q6_k_small_batch_dispatches,
-            .q6_k_bias = stats.metal_runtime_antfly_q6_k_small_batch_bias_dispatches,
-            .q6_k_bias_gelu = stats.metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches,
-            .q8_0 = stats.metal_runtime_antfly_q8_0_small_batch_dispatches,
-            .q8_0_bias = stats.metal_runtime_antfly_q8_0_small_batch_bias_dispatches,
-            .q8_0_bias_gelu = stats.metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches,
-            .q8_0_relu = stats.metal_runtime_antfly_q8_0_small_batch_relu_dispatches,
-            .q8_1 = stats.metal_runtime_antfly_q8_1_small_batch_dispatches,
-            .q8_k = stats.metal_runtime_antfly_q8_k_small_batch_dispatches,
+            .q2_k = quant_matmul.generatedQuantDispatchCount(generated, .q2_k, .none),
+            .q2_k_bias = quant_matmul.generatedQuantDispatchCount(generated, .q2_k, .bias),
+            .q2_k_bias_gelu = quant_matmul.generatedQuantDispatchCount(generated, .q2_k, .bias_gelu),
+            .q3_k = quant_matmul.generatedQuantDispatchCount(generated, .q3_k, .none),
+            .q3_k_bias = quant_matmul.generatedQuantDispatchCount(generated, .q3_k, .bias),
+            .q3_k_bias_gelu = quant_matmul.generatedQuantDispatchCount(generated, .q3_k, .bias_gelu),
+            .q4_0 = quant_matmul.generatedQuantDispatchCount(generated, .q4_0, .none),
+            .q4_1 = quant_matmul.generatedQuantDispatchCount(generated, .q4_1, .none),
+            .q5_0 = quant_matmul.generatedQuantDispatchCount(generated, .q5_0, .none),
+            .q5_1 = quant_matmul.generatedQuantDispatchCount(generated, .q5_1, .none),
+            .q4_k = quant_matmul.generatedQuantDispatchCount(generated, .q4_k, .none),
+            .q4_k_bias = quant_matmul.generatedQuantDispatchCount(generated, .q4_k, .bias),
+            .q4_k_bias_gelu = quant_matmul.generatedQuantDispatchCount(generated, .q4_k, .bias_gelu),
+            .q5_k = quant_matmul.generatedQuantDispatchCount(generated, .q5_k, .none),
+            .q5_k_bias = quant_matmul.generatedQuantDispatchCount(generated, .q5_k, .bias),
+            .q5_k_bias_gelu = quant_matmul.generatedQuantDispatchCount(generated, .q5_k, .bias_gelu),
+            .q6_k = quant_matmul.generatedQuantDispatchCount(generated, .q6_k, .none),
+            .q6_k_bias = quant_matmul.generatedQuantDispatchCount(generated, .q6_k, .bias),
+            .q6_k_bias_gelu = quant_matmul.generatedQuantDispatchCount(generated, .q6_k, .bias_gelu),
+            .q8_0 = quant_matmul.generatedQuantDispatchCount(generated, .q8_0, .none),
+            .q8_0_bias = quant_matmul.generatedQuantDispatchCount(generated, .q8_0, .bias),
+            .q8_0_bias_gelu = quant_matmul.generatedQuantDispatchCount(generated, .q8_0, .bias_gelu),
+            .q8_0_relu = quant_matmul.generatedQuantDispatchCount(generated, .q8_0, .relu),
+            .q8_1 = quant_matmul.generatedQuantDispatchCount(generated, .q8_1, .none),
+            .q8_k = quant_matmul.generatedQuantDispatchCount(generated, .q8_k, .none),
             .q4_k_rows_1 = stats.metal_runtime_q4_k_linear_reduce_rows_1,
             .q4_k_rows_2_8 = stats.metal_runtime_q4_k_linear_reduce_rows_2_8,
             .q4_k_rows_9_64 = stats.metal_runtime_q4_k_linear_reduce_rows_9_64,
@@ -270,33 +272,10 @@ fn counterDelta(before: u64, after: u64) u64 {
 }
 
 test "quant kernel compiler metal generated quant stats total covers every generated provider counter" {
-    const provider = ops.NativeQuantTimingStats{
-        .metal_runtime_antfly_q2_k_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q2_k_small_batch_bias_dispatches = 1,
-        .metal_runtime_antfly_q2_k_small_batch_bias_gelu_dispatches = 1,
-        .metal_runtime_antfly_q3_k_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q3_k_small_batch_bias_dispatches = 1,
-        .metal_runtime_antfly_q3_k_small_batch_bias_gelu_dispatches = 1,
-        .metal_runtime_antfly_q4_0_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q4_1_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q5_0_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q5_1_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q4_k_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q4_k_small_batch_bias_dispatches = 1,
-        .metal_runtime_antfly_q4_k_small_batch_bias_gelu_dispatches = 1,
-        .metal_runtime_antfly_q5_k_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q5_k_small_batch_bias_dispatches = 1,
-        .metal_runtime_antfly_q5_k_small_batch_bias_gelu_dispatches = 1,
-        .metal_runtime_antfly_q6_k_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q6_k_small_batch_bias_dispatches = 1,
-        .metal_runtime_antfly_q6_k_small_batch_bias_gelu_dispatches = 1,
-        .metal_runtime_antfly_q8_0_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q8_0_small_batch_bias_dispatches = 1,
-        .metal_runtime_antfly_q8_0_small_batch_bias_gelu_dispatches = 1,
-        .metal_runtime_antfly_q8_0_small_batch_relu_dispatches = 1,
-        .metal_runtime_antfly_q8_1_small_batch_dispatches = 1,
-        .metal_runtime_antfly_q8_k_small_batch_dispatches = 1,
-    };
+    var provider = ops.NativeQuantTimingStats{};
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        provider.metal_runtime_antfly_generated_dispatch_counts[@intFromEnum(counter.format)][@intFromEnum(counter.epilogue)] = 1;
+    }
 
     const stats = Stats.fromProviderStats(provider);
     try std.testing.expectEqual(@as(u64, 25), stats.generatedTotal());

@@ -740,14 +740,37 @@ test "quant kernel metal runtime checks cover generated Metal artifacts" {
 
 test "quant kernel metal runtime generated counter snapshot order matches C" {
     const Stats = metal_runtime.RawRuntimeMemoryStats;
-    const word = @sizeOf(u64);
+    const Counts = @FieldType(Stats, "antfly_generated_dispatch_counts");
 
-    try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_0_small_batch_dispatches") + word, @offsetOf(Stats, "antfly_q8_0_small_batch_bias_dispatches"));
-    try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_0_small_batch_bias_dispatches") + word, @offsetOf(Stats, "antfly_q8_0_small_batch_bias_gelu_dispatches"));
-    try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_0_small_batch_bias_gelu_dispatches") + word, @offsetOf(Stats, "antfly_q8_0_small_batch_relu_dispatches"));
-    try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_0_small_batch_relu_dispatches") + word, @offsetOf(Stats, "antfly_q8_1_small_batch_dispatches"));
-    try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_1_small_batch_dispatches") + word, @offsetOf(Stats, "antfly_q8_k_small_batch_dispatches"));
-    try std.testing.expectEqual(@offsetOf(Stats, "antfly_q8_k_small_batch_dispatches") + word, @offsetOf(Stats, "antfly_q2_k_small_batch_dispatches"));
+    // The snapshot mirror must use the shared [format][epilogue] array shape so
+    // the extern layout matches uint64_t antfly_generated_dispatch_counts[12][4]
+    // in termite_metal_decode_runtime_memory_stats (metal_kernels.m).
+    try std.testing.expectEqual(quant_matmul.GeneratedQuantDispatchCounts, Counts);
+    try std.testing.expectEqual(
+        @as(usize, quant_matmul.generated_quant_format_count * quant_matmul.generated_quant_epilogue_count) * @sizeOf(u64),
+        @sizeOf(Counts),
+    );
+    try std.testing.expectEqual(
+        @offsetOf(Stats, "q6_k_linear_reduce_f16_input") + @sizeOf(u64),
+        @offsetOf(Stats, "antfly_generated_dispatch_counts"),
+    );
+    try std.testing.expectEqual(
+        @offsetOf(Stats, "antfly_generated_dispatch_counts") + @sizeOf(Counts),
+        @offsetOf(Stats, "rms_norm_add_sumsq"),
+    );
+
+    // Every wired counter must map to a unique in-range (format, epilogue) cell.
+    var seen = [_][quant_matmul.generated_quant_epilogue_count]bool{
+        [_]bool{false} ** quant_matmul.generated_quant_epilogue_count,
+    } ** quant_matmul.generated_quant_format_count;
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        const format_index: usize = @intFromEnum(counter.format);
+        const epilogue_index: usize = @intFromEnum(counter.epilogue);
+        try std.testing.expect(format_index < quant_matmul.generated_quant_format_count);
+        try std.testing.expect(epilogue_index < quant_matmul.generated_quant_epilogue_count);
+        try std.testing.expect(!seen[format_index][epilogue_index]);
+        seen[format_index][epilogue_index] = true;
+    }
 }
 
 test "quant kernel metal runtime production benchmark cases match compiler manifest" {
@@ -1808,35 +1831,15 @@ fn runtimeMemorySnapshot(runtime: ?*RawMetalDecodeRuntime) metal_runtime.RawRunt
 
 fn generatedDispatchCount(check: CheckCase, snapshot: metal_runtime.RawRuntimeMemoryStats) ?u64 {
     if (check.rows < 2 or check.rows > 8) return null;
-    if (check.format == .q8_0 and check.epilogue == .bias) return snapshot.antfly_q8_0_small_batch_bias_dispatches;
-    if (check.format == .q8_0 and check.epilogue == .bias_gelu) return snapshot.antfly_q8_0_small_batch_bias_gelu_dispatches;
-    if (check.format == .q8_0 and check.epilogue == .relu) return snapshot.antfly_q8_0_small_batch_relu_dispatches;
-    if (check.format == .q2_k and check.epilogue == .bias) return snapshot.antfly_q2_k_small_batch_bias_dispatches;
-    if (check.format == .q2_k and check.epilogue == .bias_gelu) return snapshot.antfly_q2_k_small_batch_bias_gelu_dispatches;
-    if (check.format == .q3_k and check.epilogue == .bias) return snapshot.antfly_q3_k_small_batch_bias_dispatches;
-    if (check.format == .q3_k and check.epilogue == .bias_gelu) return snapshot.antfly_q3_k_small_batch_bias_gelu_dispatches;
-    if (check.format == .q4_k and check.epilogue == .bias) return snapshot.antfly_q4_k_small_batch_bias_dispatches;
-    if (check.format == .q4_k and check.epilogue == .bias_gelu) return snapshot.antfly_q4_k_small_batch_bias_gelu_dispatches;
-    if (check.format == .q5_k and check.epilogue == .bias) return snapshot.antfly_q5_k_small_batch_bias_dispatches;
-    if (check.format == .q5_k and check.epilogue == .bias_gelu) return snapshot.antfly_q5_k_small_batch_bias_gelu_dispatches;
-    if (check.format == .q6_k and check.epilogue == .bias) return snapshot.antfly_q6_k_small_batch_bias_dispatches;
-    if (check.format == .q6_k and check.epilogue == .bias_gelu) return snapshot.antfly_q6_k_small_batch_bias_gelu_dispatches;
-    if (check.epilogue != .none) return null;
-    return switch (check.format) {
-        .q8_0 => snapshot.antfly_q8_0_small_batch_dispatches,
-        .q2_k => snapshot.antfly_q2_k_small_batch_dispatches,
-        .q3_k => snapshot.antfly_q3_k_small_batch_dispatches,
-        .q4_0 => snapshot.antfly_q4_0_small_batch_dispatches,
-        .q4_1 => snapshot.antfly_q4_1_small_batch_dispatches,
-        .q5_0 => snapshot.antfly_q5_0_small_batch_dispatches,
-        .q5_1 => snapshot.antfly_q5_1_small_batch_dispatches,
-        .q8_1 => snapshot.antfly_q8_1_small_batch_dispatches,
-        .q8_k => snapshot.antfly_q8_k_small_batch_dispatches,
-        .q4_k => snapshot.antfly_q4_k_small_batch_dispatches,
-        .q5_k => snapshot.antfly_q5_k_small_batch_dispatches,
-        .q6_k => snapshot.antfly_q6_k_small_batch_dispatches,
-        else => null,
-    };
+    // Only the wired (format, epilogue) pairs from the shared counter-name
+    // table have a dispatch counter; everything else reports null so callers
+    // can distinguish "no generated route" from "zero dispatches".
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        if (!std.mem.eql(u8, @tagName(counter.format), @tagName(check.format))) continue;
+        if (!std.mem.eql(u8, @tagName(counter.epilogue), @tagName(check.epilogue))) continue;
+        return quant_matmul.generatedQuantDispatchCount(&snapshot.antfly_generated_dispatch_counts, counter.format, counter.epilogue);
+    }
+    return null;
 }
 
 fn generatedRouteSupported(check: CheckCase) bool {

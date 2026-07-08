@@ -22,6 +22,7 @@ const ops = @import("../ops/ops.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const metal_command_planner = @import("../graph/metal_command_planner.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
+const quant_matmul = @import("../graph/quant_matmul.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
@@ -6406,31 +6407,10 @@ pub const RawRuntimeMemoryStats = extern struct {
     q6_k_linear_reduce_rows_9_64: u64 = 0,
     q6_k_linear_reduce_rows_65_plus: u64 = 0,
     q6_k_linear_reduce_f16_input: u64 = 0,
-    antfly_q8_0_small_batch_dispatches: u64 = 0,
-    antfly_q8_0_small_batch_bias_dispatches: u64 = 0,
-    antfly_q8_0_small_batch_bias_gelu_dispatches: u64 = 0,
-    antfly_q8_0_small_batch_relu_dispatches: u64 = 0,
-    antfly_q8_1_small_batch_dispatches: u64 = 0,
-    antfly_q8_k_small_batch_dispatches: u64 = 0,
-    antfly_q2_k_small_batch_dispatches: u64 = 0,
-    antfly_q2_k_small_batch_bias_dispatches: u64 = 0,
-    antfly_q2_k_small_batch_bias_gelu_dispatches: u64 = 0,
-    antfly_q3_k_small_batch_dispatches: u64 = 0,
-    antfly_q3_k_small_batch_bias_dispatches: u64 = 0,
-    antfly_q3_k_small_batch_bias_gelu_dispatches: u64 = 0,
-    antfly_q4_0_small_batch_dispatches: u64 = 0,
-    antfly_q4_1_small_batch_dispatches: u64 = 0,
-    antfly_q5_0_small_batch_dispatches: u64 = 0,
-    antfly_q5_1_small_batch_dispatches: u64 = 0,
-    antfly_q4_k_small_batch_dispatches: u64 = 0,
-    antfly_q4_k_small_batch_bias_dispatches: u64 = 0,
-    antfly_q4_k_small_batch_bias_gelu_dispatches: u64 = 0,
-    antfly_q5_k_small_batch_dispatches: u64 = 0,
-    antfly_q5_k_small_batch_bias_dispatches: u64 = 0,
-    antfly_q5_k_small_batch_bias_gelu_dispatches: u64 = 0,
-    antfly_q6_k_small_batch_dispatches: u64 = 0,
-    antfly_q6_k_small_batch_bias_dispatches: u64 = 0,
-    antfly_q6_k_small_batch_bias_gelu_dispatches: u64 = 0,
+    // Mirrors `uint64_t antfly_generated_dispatch_counts[12][4]` in
+    // termite_metal_decode_runtime_memory_stats (metal_kernels.m); the extern
+    // layout must stay in lockstep with the C struct.
+    antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
     rms_norm_add_sumsq: u64 = 0,
 };
 

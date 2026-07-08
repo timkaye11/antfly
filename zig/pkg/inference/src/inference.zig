@@ -120,6 +120,7 @@ test {
     _ = native_rerank;
     _ = native_transcribe;
     _ = native_read;
+    _ = @import("metal_generated_quant_stats.zig");
     _ = native_recognize;
     _ = native_extract;
     _ = compare_generate;
