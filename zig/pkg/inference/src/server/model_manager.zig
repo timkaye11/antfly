@@ -727,7 +727,12 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_text_prefix,
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
+            // ModernBERT has an 8192-token context; padding every input to
+            // max_position_embeddings makes each forward ~20x slower than
+            // padding to the batch max. The native modernbert session accepts
+            // dynamic sequence lengths, so trim like jina-style models do.
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                std.mem.eql(u8, self.manifest.config_model_arch, "modernbert"),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {

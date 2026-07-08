@@ -37,6 +37,7 @@ const clap_mod = @import("../models/clap.zig");
 const deberta_mod = @import("../models/deberta.zig");
 const layoutlmv3_mod = @import("../models/layoutlmv3.zig");
 const bert_arch = @import("bert.zig");
+const modern_bert_arch = @import("modern_bert.zig");
 const layoutlmv3_arch = @import("layoutlmv3.zig");
 const t5_arch = @import("t5.zig");
 const gpt_arch = @import("gpt.zig");
@@ -271,6 +272,7 @@ fn shardedSafetensorsTotalBytes(allocator: std.mem.Allocator, index_path: []cons
 /// Supported model architecture families.
 const ArchType = enum {
     bert,
+    modernbert,
     deberta,
     t5,
     gpt,
@@ -285,6 +287,7 @@ const ArchType = enum {
 /// Architecture-specific config, tagged union.
 const ArchConfig = union(ArchType) {
     bert: bert.Config,
+    modernbert: modern_bert_arch.Config,
     deberta: deberta_mod.Config,
     t5: t5_mod.Config,
     gpt: gpt_mod.Config,
@@ -407,6 +410,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 
     const prefix = switch (arch_config) {
         .bert => |cfg| cfg.effectivePrefix(),
+        .modernbert => "", // ModernBERT keys are canonicalized to model.* in normalizeWeightKey
         .deberta => "deberta",
         .t5 => "", // T5 weights use full names (encoder.block.0.*, decoder.block.0.*)
         .gpt => "", // GPT weights use full names (model.layers.0.*, h.0.*)
@@ -573,6 +577,9 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         if (arch_config == .gpt and arch_config.gpt.family == .gpt2) {
             try transposeGpt2Conv1dWeights(allocator, &resident_weights);
         }
+        if (arch_config == .modernbert) {
+            try splitModernBertQkvWeights(allocator, &resident_weights);
+        }
         try applyJinaV5RetrievalAdapterIfPresent(allocator, model_path, mf, &resident_weights);
     }
 
@@ -669,6 +676,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
     const prefix = switch (arch_config) {
         .bert => |cfg| cfg.effectivePrefix(),
+        .modernbert => "",
         .deberta => "deberta",
         .t5 => "",
         .gpt => "",
@@ -827,6 +835,9 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     }
 
     if (store.kind() == .safetensors) {
+        if (arch_config == .modernbert) {
+            try splitModernBertQkvWeights(allocator, &resident_weights);
+        }
         try applyJinaV5RetrievalAdapterIfPresent(allocator, model_path, mf, &resident_weights);
     }
 
@@ -1037,7 +1048,7 @@ fn loadSafetensorsIntoResident(
         try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
     }
     return switch (arch_config) {
-        .t5, .gpt, .whisper, .florence, .clip, .clap => "",
+        .t5, .gpt, .whisper, .florence, .clip, .clap, .modernbert => "",
         .gliner => "encoder",
         .deberta => "deberta",
         .layoutlmv3 => "layoutlmv3",
@@ -1193,6 +1204,11 @@ fn createGpuHostedSessionWithTaskOverride(
                     .placement = runtime.tier.planner.planForContext(plan_context, key, tensor_ref.byte_len),
                     .prefer_dense = shouldKeepGpuHostedLazyWeightDense(backend_type, arch_config, key),
                 });
+                if (arch_config == .modernbert and isModernBertFusedQkvKey(key)) {
+                    var fused_loaded = source.getTensor(full_name) catch continue;
+                    defer fused_loaded.deinit();
+                    try insertModernBertQkvHostSplits(allocator, &lazy_weights, key, fused_loaded);
+                }
             }
             if (tensor_store.?.kind() != .gguf) {
                 try refineArchConfigFromStore(allocator, tensor_store.?, all_names, &arch_config);
@@ -1327,6 +1343,9 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
             if (std.mem.eql(u8, model_type, "layoutlmv3")) {
                 return .{ .layoutlmv3 = try layoutlmv3_mod.parseConfig(allocator, config_bytes) };
             }
+            if (std.mem.eql(u8, model_type, "modernbert")) {
+                return .{ .modernbert = try parseModernBertConfig(allocator, config_bytes) };
+            }
         }
     } else |_| {}
 
@@ -1338,6 +1357,48 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
 
     // Default: BERT
     return .{ .bert = makeBertConfig(mf) };
+}
+
+/// Parse a HuggingFace ModernBERT config.json into a modern_bert.Config.
+/// Unknown fields keep the ModernBERT-base defaults.
+fn parseModernBertConfig(allocator: std.mem.Allocator, config_bytes: []const u8) !modern_bert_arch.Config {
+    var cfg = modern_bert_arch.Config{};
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{}) catch return cfg;
+    defer parsed.deinit();
+    if (parsed.value != .object) return cfg;
+    const obj = parsed.value.object;
+
+    const uint_fields = .{
+        .{ "vocab_size", "vocab_size" },
+        .{ "hidden_size", "hidden_size" },
+        .{ "num_hidden_layers", "num_hidden_layers" },
+        .{ "num_attention_heads", "num_attention_heads" },
+        .{ "intermediate_size", "intermediate_size" },
+        .{ "max_position_embeddings", "max_position_embeddings" },
+        .{ "global_attn_every_n_layers", "global_attn_every_n_layers" },
+        .{ "local_attention", "local_attention_window" },
+    };
+    inline for (uint_fields) |field| {
+        if (obj.get(field[0])) |v| {
+            if (v == .integer and v.integer > 0) @field(cfg, field[1]) = @intCast(v.integer);
+        }
+    }
+    const float_fields = .{
+        .{ "global_rope_theta", "global_rope_theta" },
+        .{ "local_rope_theta", "local_rope_theta" },
+        .{ "norm_eps", "layer_norm_eps" },
+        .{ "layer_norm_eps", "layer_norm_eps" },
+    };
+    inline for (float_fields) |field| {
+        if (obj.get(field[0])) |v| {
+            switch (v) {
+                .float => @field(cfg, field[1]) = @floatCast(v.float),
+                .integer => @field(cfg, field[1]) = @floatFromInt(v.integer),
+                else => {},
+            }
+        }
+    }
+    return cfg;
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
@@ -2088,6 +2149,16 @@ fn ensureGgufInspectionCompatible(report: GgufInspectionReport, gguf_path: []con
 }
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
+    // ModernBERT checkpoints ship either with a "model." prefix (full-model
+    // exports) or without (encoder-only exports like nomic modernbert-embed).
+    // The modern_bert forward addresses weights with the "model." prefix, so
+    // canonicalize unprefixed encoder tensor names here.
+    if (arch_config == .modernbert) {
+        if (!std.mem.startsWith(u8, key, "model.")) {
+            return std.fmt.bufPrint(buf, "model.{s}", .{key}) catch return error.NameTooLong;
+        }
+        return key;
+    }
     if (store_kind != .gguf) return key;
     return switch (arch_config) {
         .gpt => |cfg| normalizeGgufGptWeightKey(cfg, key, buf) orelse key,
@@ -3131,6 +3202,116 @@ fn refineGptConfigFromWeights(config: *gpt_mod.Config, weights: *const std.Strin
     }
 }
 
+/// ModernBERT safetensors exports store fused attention projections as
+/// model.layers.N.attn.Wqkv.weight [3H, H]. The modern_bert forward addresses
+/// the split projections (query_proj/key_proj/value_proj), so materialize the
+/// three [H, H] slices as additional resident weights.
+fn splitModernBertQkvWeights(
+    allocator: std.mem.Allocator,
+    weights: *std.StringHashMapUnmanaged(LoadedWeight),
+) !void {
+    const prefix = "model.layers.";
+    const suffix = ".attn.Wqkv.weight";
+    const projections = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
+
+    var fused_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer fused_keys.deinit(allocator);
+    var it = weights.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.startsWith(u8, key, prefix) and std.mem.endsWith(u8, key, suffix) and key.len > prefix.len + suffix.len) {
+            try fused_keys.append(allocator, key);
+        }
+    }
+
+    for (fused_keys.items) |key| {
+        const fused = weights.get(key) orelse continue;
+        const t = fused.tensor;
+        if (t.dtype != .f32 or t.shape.len != 2) continue;
+        const rows: usize = @intCast(t.shape[0]);
+        const hidden: usize = @intCast(t.shape[1]);
+        if (rows != hidden * 3) continue;
+        const layer = key[prefix.len .. key.len - suffix.len];
+        const values = std.mem.bytesAsSlice(f32, t.data);
+
+        for (projections, 0..) |projection, part| {
+            const split_name = try std.fmt.allocPrint(allocator, "model.layers.{s}.attn.{s}.weight", .{ layer, projection });
+            errdefer allocator.free(split_name);
+            if (weights.contains(split_name)) {
+                allocator.free(split_name);
+                continue;
+            }
+            const elems = hidden * hidden;
+            const part_values = values[part * elems .. (part + 1) * elems];
+            const shape = [_]i64{ @intCast(hidden), @intCast(hidden) };
+            const owned = try allocator.alloc(f32, elems);
+            errdefer allocator.free(owned);
+            @memcpy(owned, part_values);
+            var tensor = try Tensor.initFloat32(allocator, split_name, &shape, owned);
+            allocator.free(owned);
+            errdefer tensor.deinit();
+            try weights.put(allocator, split_name, .{ .tensor = tensor });
+        }
+    }
+}
+
+fn isModernBertFusedQkvKey(key: []const u8) bool {
+    const prefix = "model.layers.";
+    const suffix = ".attn.Wqkv.weight";
+    return std.mem.startsWith(u8, key, prefix) and std.mem.endsWith(u8, key, suffix) and key.len > prefix.len + suffix.len;
+}
+
+/// GPU-hosted (lazy) variant of splitModernBertQkvWeights: insert the three
+/// [H, H] projection slices as host-resident lazy entries so the metal
+/// backend's getWeight resolves query_proj/key_proj/value_proj by name.
+fn insertModernBertQkvHostSplits(
+    allocator: std.mem.Allocator,
+    lazy_weights: *std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry),
+    fused_key: []const u8,
+    loaded: LoadedWeight,
+) !void {
+    if (!isModernBertFusedQkvKey(fused_key)) return;
+    const t = loaded.tensor;
+    if (t.dtype != .f32 or t.shape.len != 2) return;
+    const rows: usize = @intCast(t.shape[0]);
+    const hidden: usize = @intCast(t.shape[1]);
+    if (rows != hidden * 3) return;
+    const layer_prefix = "model.layers.";
+    const fused_suffix = ".attn.Wqkv.weight";
+    const layer = fused_key[layer_prefix.len .. fused_key.len - fused_suffix.len];
+    const values = std.mem.bytesAsSlice(f32, t.data);
+    const projections = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
+    for (projections, 0..) |projection, part| {
+        const split_name = try std.fmt.allocPrint(allocator, "model.layers.{s}.attn.{s}.weight", .{ layer, projection });
+        if (lazy_weights.contains(split_name)) {
+            allocator.free(split_name);
+            continue;
+        }
+        errdefer allocator.free(split_name);
+        const elems = hidden * hidden;
+        const part_values = values[part * elems .. (part + 1) * elems];
+        const owned = try allocator.alloc(f32, elems);
+        defer allocator.free(owned);
+        @memcpy(owned, part_values);
+        const shape = [_]i64{ @intCast(hidden), @intCast(hidden) };
+        var tensor = try Tensor.initFloat32(allocator, split_name, &shape, owned);
+        errdefer tensor.deinit();
+        const ref_name = try allocator.dupe(u8, split_name);
+        errdefer allocator.free(ref_name);
+        try lazy_weights.put(allocator, split_name, .{
+            .tensor_ref = .{ .name = ref_name, .byte_len = tensor.data.len },
+            .host_loaded = .{ .tensor = tensor },
+            .active_tier = .host,
+            .loaded_bytes = tensor.data.len,
+            .placement = .{
+                .class = .other,
+                .preferred_tier = .host,
+                .spill_tier = .host,
+            },
+        });
+    }
+}
+
 /// GPT-2 safetensors uses Conv1D for linear layers, storing weights as
 /// [in_features, out_features] instead of the standard [out_features, in_features].
 /// This function transposes those 2D weight tensors in-place so the rest of
@@ -3413,6 +3594,54 @@ test "makeBertConfig carries num_labels from manifest" {
     const cfg = makeBertConfig(mf);
     try std.testing.expectEqual(@as(bert.ModelType, .roberta), cfg.model_type);
     try std.testing.expectEqual(@as(u32, 3), cfg.num_labels);
+}
+
+test "parseModernBertConfig overrides defaults from config.json fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"model_type":"modernbert","vocab_size":50368,"hidden_size":768,
+        \\ "num_hidden_layers":22,"num_attention_heads":12,"intermediate_size":1152,
+        \\ "max_position_embeddings":8192,"global_attn_every_n_layers":3,
+        \\ "local_attention":128,"global_rope_theta":160000.0,"local_rope_theta":10000.0,
+        \\ "norm_eps":1e-5}
+    ;
+    const cfg = try parseModernBertConfig(allocator, json);
+    try std.testing.expectEqual(@as(u32, 50368), cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 22), cfg.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 128), cfg.local_attention_window);
+    try std.testing.expectEqual(@as(u32, 3), cfg.global_attn_every_n_layers);
+    try std.testing.expectApproxEqAbs(@as(f32, 160000.0), cfg.global_rope_theta, 1.0);
+}
+
+test "splitModernBertQkvWeights materializes q/k/v projections from fused Wqkv" {
+    const allocator = std.testing.allocator;
+    var weights = std.StringHashMapUnmanaged(LoadedWeight){};
+    defer {
+        var it = weights.iterator();
+        while (it.next()) |entry| {
+            var w = entry.value_ptr.*;
+            w.deinit();
+            allocator.free(entry.key_ptr.*);
+        }
+        weights.deinit(allocator);
+    }
+
+    // Fused Wqkv [3H, H] with H=2: rows 0-1 = Q, 2-3 = K, 4-5 = V.
+    const h = 2;
+    const fused = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const key = try allocator.dupe(u8, "model.layers.0.attn.Wqkv.weight");
+    const shape = [_]i64{ 3 * h, h };
+    const tensor = try Tensor.initFloat32(allocator, key, &shape, &fused);
+    try weights.put(allocator, key, .{ .tensor = tensor });
+
+    try splitModernBertQkvWeights(allocator, &weights);
+
+    const q = weights.get("model.layers.0.attn.query_proj.weight") orelse return error.MissingQ;
+    const k = weights.get("model.layers.0.attn.key_proj.weight") orelse return error.MissingK;
+    const v = weights.get("model.layers.0.attn.value_proj.weight") orelse return error.MissingV;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, q.tensor.asFloat32());
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8 }, k.tensor.asFloat32());
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10, 11, 12 }, v.tensor.asFloat32());
 }
 
 test "sessionTaskForModelType maps classifier and recognizer tasks" {
@@ -4319,6 +4548,26 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
 
             const H = cfg.hidden_size;
             const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(H) };
+            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
+            errdefer output_tensor.deinit();
+
+            const result = try allocator.alloc(Tensor, 1);
+            result[0] = output_tensor;
+            return result;
+        },
+        .modernbert => |cfg| {
+            if (inputs.len < 2) return error.MissingInputs;
+            const input_ids_tensor = inputs[0];
+            if (input_ids_tensor.shape.len != 2) return error.InvalidInputShape;
+            const batch: usize = @intCast(input_ids_tensor.shape[0]);
+            const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
+            const input_ids = input_ids_tensor.asInt64();
+            const attention_mask = inputs[1].asInt64();
+            if (self.task != .generic) return error.UnsupportedTask;
+            const hidden = try modern_bert_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            defer allocator.free(hidden);
+
+            const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(cfg.hidden_size) };
             var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
             errdefer output_tensor.deinit();
 
