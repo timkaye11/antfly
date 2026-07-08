@@ -7106,6 +7106,42 @@ typedef enum termite_metal_generated_quant_epilogue {
     TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU = 3,
 } termite_metal_generated_quant_epilogue;
 
+// quant-kernel-codegen:begin generated launch-shape table (do not edit; run: zig build quant-kernel-codegen -- --write)
+typedef struct termite_metal_generated_quant_launch_entry {
+    uint32_t format;
+    termite_metal_generated_quant_epilogue epilogue;
+    NSUInteger threads_per_threadgroup;
+    NSUInteger cols_per_threadgroup;
+} termite_metal_generated_quant_launch_entry;
+
+static const termite_metal_generated_quant_launch_entry termite_metal_generated_quant_launch_table[] = {
+    { TERMITE_METAL_QUANT_FORMAT_Q4_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q4_1, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 2u },
+    { TERMITE_METAL_QUANT_FORMAT_Q5_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q5_1, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 2u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 2u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_1, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q8_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q2_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q3_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 32u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 64u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 64u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 64u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 128u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 128u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 128u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q6_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, 128u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q6_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, 128u, 1u },
+    { TERMITE_METAL_QUANT_FORMAT_Q6_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU, 128u, 1u },
+};
+
 static bool termite_metal_generated_quant_launch_shape_for(
     uint32_t format,
     termite_metal_generated_quant_epilogue epilogue,
@@ -7113,81 +7149,18 @@ static bool termite_metal_generated_quant_launch_shape_for(
     termite_metal_generated_quant_launch_shape *shape
 ) {
     if (shape == NULL || rows < 2u || rows > 8u) return false;
-    shape->threads_per_threadgroup = 128u;
-    shape->cols_per_threadgroup = 1u;
-    switch (epilogue) {
-        case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE:
-            switch (format) {
-                case TERMITE_METAL_QUANT_FORMAT_Q4_1:
-                    shape->threads_per_threadgroup = 32u;
-                    shape->cols_per_threadgroup = 2u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q2_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q3_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q4_0:
-                case TERMITE_METAL_QUANT_FORMAT_Q5_0:
-                case TERMITE_METAL_QUANT_FORMAT_Q5_1:
-                case TERMITE_METAL_QUANT_FORMAT_Q8_0:
-                case TERMITE_METAL_QUANT_FORMAT_Q8_1:
-                case TERMITE_METAL_QUANT_FORMAT_Q8_K:
-                    shape->threads_per_threadgroup = 32u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q4_K:
-                    shape->threads_per_threadgroup = 64u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q5_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q6_K:
-                    return true;
-                default:
-                    return false;
-            }
-        case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS:
-            switch (format) {
-                case TERMITE_METAL_QUANT_FORMAT_Q2_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q3_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q8_0:
-                    shape->threads_per_threadgroup = 32u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q4_K:
-                    shape->threads_per_threadgroup = 64u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q5_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q6_K:
-                    return true;
-                default:
-                    return false;
-            }
-        case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU:
-            switch (format) {
-                case TERMITE_METAL_QUANT_FORMAT_Q8_0:
-                    shape->threads_per_threadgroup = 32u;
-                    shape->cols_per_threadgroup = 2u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q2_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q3_K:
-                    shape->threads_per_threadgroup = 32u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q4_K:
-                    shape->threads_per_threadgroup = 64u;
-                    return true;
-                case TERMITE_METAL_QUANT_FORMAT_Q5_K:
-                case TERMITE_METAL_QUANT_FORMAT_Q6_K:
-                    return true;
-                default:
-                    return false;
-            }
-        case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU:
-            switch (format) {
-                case TERMITE_METAL_QUANT_FORMAT_Q8_0:
-                    shape->threads_per_threadgroup = 32u;
-                    return true;
-                default:
-                    return false;
-            }
-        default:
-            return false;
+    const size_t entry_count = sizeof(termite_metal_generated_quant_launch_table) / sizeof(termite_metal_generated_quant_launch_table[0]);
+    for (size_t i = 0; i < entry_count; ++i) {
+        const termite_metal_generated_quant_launch_entry *entry = &termite_metal_generated_quant_launch_table[i];
+        if (entry->format == format && entry->epilogue == epilogue) {
+            shape->threads_per_threadgroup = entry->threads_per_threadgroup;
+            shape->cols_per_threadgroup = entry->cols_per_threadgroup;
+            return true;
+        }
     }
+    return false;
 }
+// quant-kernel-codegen:end generated launch-shape table
 
 static uint8_t termite_metal_quant_matmul_descriptor_planned_dispatch(const termite_metal_quant_matmul_descriptor *descriptor);
 

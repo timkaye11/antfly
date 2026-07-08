@@ -45,8 +45,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
     }
     switch (mode) {
-        .check, .check_metal => try checkMetalRuntimeRegion(allocator, io),
-        .write => try writeMetalRuntimeRegion(allocator, io),
+        .check, .check_metal => {
+            try checkMetalRuntimeRegion(allocator, io);
+            try checkMetalLaunchShapeRegion(allocator, io);
+        },
+        .write => {
+            try writeMetalRuntimeRegion(allocator, io);
+            try writeMetalLaunchShapeRegion(allocator, io);
+        },
     }
     if (mode == .check_metal) try checkMetalArtifacts(allocator, io);
     print("quant kernel generated sources {s}: {d} files + Metal runtime region\n", .{ @tagName(mode), files.len });
@@ -130,6 +136,57 @@ fn writeMetalRuntimeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
     defer allocator.free(contents);
     const split = try splitMetalRuntimeRegion(contents);
     try checkMetalRuntimeExternalHelpers(allocator, split);
+    if (std.mem.eql(u8, split.region, expected)) return;
+    const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
+    defer allocator.free(updated);
+    const path = try existingSourcePath(allocator, io, metal_runtime_source_path);
+    defer if (path.owned) allocator.free(path.value);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
+}
+
+// The generated launch-shape table + lookup in metal_kernels.m lives between
+// these markers (file scope, no indentation). Rendered from the compiler's
+// metal_production_schedules table.
+const metal_launch_region_begin_marker = "// quant-kernel-codegen:begin generated launch-shape table (do not edit; run: zig build quant-kernel-codegen -- --write)";
+const metal_launch_region_end_marker = "// quant-kernel-codegen:end generated launch-shape table";
+
+fn splitMetalLaunchRegion(contents: []const u8) !MetalRuntimeRegionSplit {
+    const begin_line = metal_launch_region_begin_marker ++ "\n";
+    const end_line = metal_launch_region_end_marker ++ "\n";
+    const begin = std.mem.indexOf(u8, contents, begin_line) orelse return error.MetalLaunchRegionMarkerMissing;
+    const region_start = begin + begin_line.len;
+    const end = std.mem.indexOfPos(u8, contents, region_start, end_line) orelse return error.MetalLaunchRegionMarkerMissing;
+    return .{
+        .prefix = contents[0..region_start],
+        .region = contents[region_start..end],
+        .suffix = contents[end..],
+    };
+}
+
+fn checkMetalLaunchShapeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
+    const expected = try quant_kernel_compiler.renderMetalLaunchShapeRegion(allocator);
+    defer allocator.free(expected);
+    const contents = try readMetalRuntimeSource(allocator, io);
+    defer allocator.free(contents);
+    const split = splitMetalLaunchRegion(contents) catch |err| {
+        print("quant kernel Metal launch-shape region markers missing in {s}; run `zig build quant-kernel-codegen -- --write`\n", .{metal_runtime_source_path});
+        return err;
+    };
+    if (!std.mem.eql(u8, split.region, expected)) {
+        print(
+            "quant kernel Metal launch-shape region stale: path={s} expected_bytes={d} actual_bytes={d}; run `zig build quant-kernel-codegen -- --write`\n",
+            .{ metal_runtime_source_path, expected.len, split.region.len },
+        );
+        return error.GeneratedQuantKernelSourceStale;
+    }
+}
+
+fn writeMetalLaunchShapeRegion(allocator: std.mem.Allocator, io: std.Io) !void {
+    const expected = try quant_kernel_compiler.renderMetalLaunchShapeRegion(allocator);
+    defer allocator.free(expected);
+    const contents = try readMetalRuntimeSource(allocator, io);
+    defer allocator.free(contents);
+    const split = try splitMetalLaunchRegion(contents);
     if (std.mem.eql(u8, split.region, expected)) return;
     const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
     defer allocator.free(updated);
@@ -354,6 +411,27 @@ test "quant kernel codegen Metal runtime region matches the checked-in runtime s
     const split = try splitMetalRuntimeRegion(contents);
     try std.testing.expectEqualStrings(expected, split.region);
     try checkMetalRuntimeExternalHelpers(std.testing.allocator, split);
+}
+
+test "quant kernel codegen splits the Metal launch-shape region on marker lines" {
+    const contents = "prefix\n" ++
+        metal_launch_region_begin_marker ++ "\n" ++
+        "static const int x = 1;\n" ++
+        metal_launch_region_end_marker ++ "\n" ++
+        "suffix\n";
+    const split = try splitMetalLaunchRegion(contents);
+    try std.testing.expectEqualStrings("static const int x = 1;\n", split.region);
+    try std.testing.expect(std.mem.startsWith(u8, split.suffix, metal_launch_region_end_marker));
+    try std.testing.expectError(error.MetalLaunchRegionMarkerMissing, splitMetalLaunchRegion("no markers"));
+}
+
+test "quant kernel codegen Metal launch-shape region matches the checked-in runtime source" {
+    const expected = try quant_kernel_compiler.renderMetalLaunchShapeRegion(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    const contents = try readMetalRuntimeSource(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(contents);
+    const split = try splitMetalLaunchRegion(contents);
+    try std.testing.expectEqualStrings(expected, split.region);
 }
 
 test "quant kernel codegen defaults to check mode" {

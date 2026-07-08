@@ -4123,6 +4123,61 @@ pub fn metalRuntimeQuantSectionFor(name: []const u8) ?MetalRuntimeQuantSection {
     return null;
 }
 
+/// Renders the C launch-shape table + lookup for metal_kernels.m from
+/// `metal_production_schedules`. Single source of truth for the dispatch grid:
+/// the generated `termite_metal_generated_quant_launch_shape_for` replaces the
+/// hand-written switch. Indented 8 spaces to match the surrounding @autoreleasepool
+/// scope style is unnecessary — this is file scope, no indentation.
+pub fn renderMetalLaunchShapeRegion(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\typedef struct termite_metal_generated_quant_launch_entry {
+        \\    uint32_t format;
+        \\    termite_metal_generated_quant_epilogue epilogue;
+        \\    NSUInteger threads_per_threadgroup;
+        \\    NSUInteger cols_per_threadgroup;
+        \\} termite_metal_generated_quant_launch_entry;
+        \\
+        \\static const termite_metal_generated_quant_launch_entry termite_metal_generated_quant_launch_table[] = {
+        \\
+    );
+    for (metal_production_schedules) |entry| {
+        const format_c = metalRuntimeQuantFormatConstant(entry.format) orelse return error.MissingMetalFormatConstant;
+        const epilogue_c = metalRuntimeGeneratedEpilogueConstant(entry.epilogue) orelse return error.MissingMetalEpilogueConstant;
+        try appendFmt(allocator, &out, "    {{ {s}, {s}, {d}u, {d}u }},\n", .{
+            format_c,
+            epilogue_c,
+            entry.schedule.threads_per_threadgroup,
+            entry.schedule.cols_per_threadgroup,
+        });
+    }
+    try out.appendSlice(allocator,
+        \\};
+        \\
+        \\static bool termite_metal_generated_quant_launch_shape_for(
+        \\    uint32_t format,
+        \\    termite_metal_generated_quant_epilogue epilogue,
+        \\    size_t rows,
+        \\    termite_metal_generated_quant_launch_shape *shape
+        \\) {
+        \\    if (shape == NULL || rows < 2u || rows > 8u) return false;
+        \\    const size_t entry_count = sizeof(termite_metal_generated_quant_launch_table) / sizeof(termite_metal_generated_quant_launch_table[0]);
+        \\    for (size_t i = 0; i < entry_count; ++i) {
+        \\        const termite_metal_generated_quant_launch_entry *entry = &termite_metal_generated_quant_launch_table[i];
+        \\        if (entry->format == format && entry->epilogue == epilogue) {
+        \\            shape->threads_per_threadgroup = entry->threads_per_threadgroup;
+        \\            shape->cols_per_threadgroup = entry->cols_per_threadgroup;
+        \\            return true;
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
 const MetalSmallBatchHeader = struct {
     source_kind: []const u8,
     plan_id: []const u8,
@@ -9362,27 +9417,27 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "uint32_t threads_per_threadgroup,\n    uint32_t cols_per_threadgroup,"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "const NSUInteger threads_per_threadgroup_size = (NSUInteger)threads_per_threadgroup;"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "const NSUInteger threads_per_threadgroup = (use_antfly_q2_k_small_batch || use_antfly_q3_k_small_batch"));
+    // The launch-shape lookup is now a codegen-generated table (from
+    // metal_production_schedules), not a hand-written switch. Validate the
+    // generated region: the table + the table-scan lookup function.
+    const launch_table = std.mem.indexOf(u8, contents, "termite_metal_generated_quant_launch_table[] = {") orelse return error.MissingMetalGeneratedLaunchTable;
     const launch_helper = std.mem.indexOf(u8, contents, "static bool termite_metal_generated_quant_launch_shape_for") orelse return error.MissingMetalGeneratedLaunchShapeHelper;
     const launch_helper_end = std.mem.indexOfPos(u8, contents, launch_helper, "static uint8_t termite_metal_quant_matmul_descriptor_planned_dispatch") orelse return error.MissingMetalGeneratedLaunchShapeHelperEnd;
+    try std.testing.expect(launch_table < launch_helper);
     try std.testing.expect(launch_helper < none_encoder);
-    const launch_helper_body = contents[launch_helper..launch_helper_end];
+    const launch_region_body = contents[launch_table..launch_helper_end];
     for (first_generated_artifacts) |artifact| {
         if (artifact.backend != .metal or artifact.row_bucket != .rows_2_8) continue;
         const format_constant = metalRuntimeQuantFormatConstant(artifact.format) orelse continue;
         const epilogue_constant = metalRuntimeGeneratedEpilogueConstant(artifact.epilogue) orelse continue;
-        try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, format_constant));
-        try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, epilogue_constant));
+        try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, format_constant));
+        try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, epilogue_constant));
     }
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS_GELU:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_GENERATED_QUANT_EPILOGUE_RELU:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_QUANT_FORMAT_Q4_1:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_QUANT_FORMAT_Q5_1:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "shape->cols_per_threadgroup = 2u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_QUANT_FORMAT_Q4_K:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_QUANT_FORMAT_Q5_K:\n                case TERMITE_METAL_QUANT_FORMAT_Q6_K:\n                    return true;"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, launch_helper_body, 1, "case TERMITE_METAL_QUANT_FORMAT_Q6_K:\n                    shape->threads_per_threadgroup = 32u;"));
+    // The table encodes the two-column routes as `32u, 2u` entries and scans by
+    // (format, epilogue).
+    try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, ", 32u, 2u },"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, "entry->format == format && entry->epilogue == epilogue"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, "shape->cols_per_threadgroup = entry->cols_per_threadgroup;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "termite_metal_generated_quant_launch_shape_for(descriptor->format, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, descriptor->rows, &launch_shape)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "launch_shape.threads_per_threadgroup"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "launch_shape.cols_per_threadgroup"));
