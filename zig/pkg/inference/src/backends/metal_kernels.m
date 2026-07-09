@@ -507,6 +507,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> paged_f32_kv_seed_pipeline;
     id<MTLComputePipelineState> paged_f16_kv_seed_pipeline;
     id<MTLComputePipelineState> paged_f32_v_seed_pipeline;
+    id<MTLComputePipelineState> copy_bytes_pipeline;
     id<MTLComputePipelineState> slice_last_dim_f32_2d_pipeline;
     id<MTLComputePipelineState> gather_axis0_f32_2d_pipeline;
     id<MTLComputePipelineState> concat_lastdim_f32_2d_pipeline;
@@ -5056,6 +5057,12 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_slice_last_dim_f32_2d(device const float *src [[buffer(0)]], device float *dst [[buffer(1)]], constant termite_metal_slice_last_dim_f32_2d_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint out_cols = p.out_cols; if (out_cols == 0u) return; uint row = gid / out_cols; uint col = gid - row * out_cols; if (row >= p.rows) return;\n"
            "    dst[row * out_cols + col] = src[row * p.cols + p.start + col];\n"
+           "}\n"
+           "// Raw byte copy used to migrate grown buffers while the frame's planned\n"
+           "// compute encoder is open (a blit encoder on the same command buffer would\n"
+           "// corrupt the open compute encoder).\n"
+           "kernel void termite_copy_bytes(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]], constant uint &count [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid < count) dst[gid] = src[gid];\n"
            "}\n"
            "kernel void termite_gather_axis0_f32_2d(device const float *input [[buffer(0)]], device const float *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_gather_axis0_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.index_count * p.cols; if (gid >= total || p.rows == 0u || p.cols == 0u) return;\n"
@@ -14485,6 +14492,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->paged_f32_kv_seed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_f32_kv_seed");
         runtime->paged_f16_kv_seed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_f16_kv_seed");
         runtime->paged_f32_v_seed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_paged_f32_v_seed");
+        runtime->copy_bytes_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_copy_bytes");
         runtime->slice_last_dim_f32_2d_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_slice_last_dim_f32_2d");
         runtime->gather_axis0_f32_2d_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gather_axis0_f32_2d");
         runtime->concat_lastdim_f32_2d_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_concat_lastdim_f32_2d");
@@ -14989,6 +14997,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->paged_f32_kv_seed_pipeline = nil;
     runtime->paged_f16_kv_seed_pipeline = nil;
     runtime->paged_f32_v_seed_pipeline = nil;
+    runtime->copy_bytes_pipeline = nil;
     runtime->slice_last_dim_f32_2d_pipeline = nil;
     runtime->gather_axis0_f32_2d_pipeline = nil;
     runtime->concat_lastdim_f32_2d_pipeline = nil;
@@ -18893,6 +18902,58 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder(
     return 0;
 }
 
+// Copy an old (smaller) buffer's contents into its grown replacement.
+//
+// When the frame's planned compute encoder is OPEN, opening a blit encoder on
+// the same command buffer is illegal (two open encoders) and corrupts the
+// planned encoder — the next [encoder setComputePipelineState:] on it crashes
+// inside the AGX driver. This was the MTP speculative-decode k=2 segfault: the
+// donated-KV span buffer grew mid-frame inside the paged KV seed encode, whose
+// caller holds the open planned encoder. In that case encode the copy as a
+// compute dispatch on the SAME planned encoder (ordering + hazards handled by
+// the planned-range tracker). Without an open planned encoder the original
+// blit path is legal and preserved.
+static int termite_metal_decode_runtime_copy_grown_buffer(
+    termite_metal_decode_runtime *runtime,
+    id<MTLBuffer> old_buffer,
+    id<MTLBuffer> new_buffer,
+    size_t old_capacity,
+    int failure_code
+) {
+    if (runtime->active_frame_cb != nil && runtime->active_planned_compute_encoder != nil) {
+        if (runtime->copy_bytes_pipeline == nil || old_capacity > UINT32_MAX) return failure_code;
+        termite_metal_planned_encoder_range accesses[2];
+        if (termite_metal_planned_range_make(old_buffer, 0, old_capacity, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], failure_code) != 0 ||
+            termite_metal_planned_range_make(new_buffer, 0, old_capacity, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[1], failure_code) != 0 ||
+            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 2, failure_code) != 0)
+        {
+            return failure_code;
+        }
+        // The runtime's reference to old_buffer is replaced by the caller; the
+        // frame must keep it alive until the copy executes at frame drain.
+        if (termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return failure_code;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        const uint32_t count = (uint32_t)old_capacity;
+        [encoder setComputePipelineState:runtime->copy_bytes_pipeline];
+        [encoder setBuffer:old_buffer offset:0 atIndex:0];
+        [encoder setBuffer:new_buffer offset:0 atIndex:1];
+        [encoder setBytes:&count length:sizeof(count) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(old_capacity, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->copy_bytes_pipeline, old_capacity), 1, 1)];
+        return 0;
+    }
+    bool frame_owned = false;
+    id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+    if (command_buffer == nil) return failure_code;
+    if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return failure_code;
+    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+    if (blit == nil) return failure_code;
+    [blit copyFromBuffer:old_buffer sourceOffset:0 toBuffer:new_buffer destinationOffset:0 size:old_capacity];
+    [blit endEncoding];
+    if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, failure_code) != 0) return failure_code;
+    return 0;
+}
+
 static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -18910,15 +18971,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
             id<MTLBuffer> buffer = [runtime->device newBufferWithLength:encoded_bytes options:MTLResourceStorageModePrivate];
             if (buffer == nil) return -5;
             if (old_buffer != nil && old_capacity > 0) {
-                bool frame_owned = false;
-                id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
-                if (command_buffer == nil) return -7;
-                if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return -8;
-                id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-                if (blit == nil) return -9;
-                [blit copyFromBuffer:old_buffer sourceOffset:0 toBuffer:buffer destinationOffset:0 size:old_capacity];
-                [blit endEncoding];
-                if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10) != 0) return -10;
+                if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -10) != 0) return -10;
             }
             runtime->attention_span_encoded_key_buffers[slot] = buffer;
             runtime->attention_span_encoded_key_capacities[slot] = encoded_bytes;
@@ -18931,15 +18984,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
             id<MTLBuffer> buffer = [runtime->device newBufferWithLength:v_bytes options:MTLResourceStorageModePrivate];
             if (buffer == nil) return -6;
             if (old_buffer != nil && old_capacity > 0) {
-                bool frame_owned = false;
-                id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
-                if (command_buffer == nil) return -11;
-                if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return -12;
-                id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-                if (blit == nil) return -13;
-                [blit copyFromBuffer:old_buffer sourceOffset:0 toBuffer:buffer destinationOffset:0 size:old_capacity];
-                [blit endEncoding];
-                if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -14) != 0) return -14;
+                if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -14) != 0) return -14;
             }
             runtime->attention_span_v_buffers[slot] = buffer;
             runtime->attention_span_v_capacities[slot] = v_bytes;
