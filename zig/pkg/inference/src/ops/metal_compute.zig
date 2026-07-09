@@ -19079,27 +19079,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (buf.metal_tensor) |*metal_tensor| {
             if (metal_tensor.isDevice()) {
-                for (tokens, 0..) |*token, row_idx| {
-                    const row = row_start + row_idx;
-                    const elem_offset = std.math.mul(usize, row, dim) catch return error.InvalidTensorShape;
-                    const byte_offset = std.math.mul(usize, elem_offset, @sizeOf(f32)) catch return error.InvalidTensorShape;
-                    const byte_len = std.math.mul(usize, dim, @sizeOf(f32)) catch return error.InvalidTensorShape;
-                    const shape = [_]i32{ 1, @intCast(dim) };
-                    var row_view = try metal_tensor.retainedView(byte_offset, byte_len, &shape);
-                    defer row_view.deinit();
-                    const selected = if (suppress_token_ids.len == 0)
-                        try metal_runtime.argmaxLogitsDevice(self.provider_impl, row_view, dim)
-                    else
-                        try metal_runtime.argmaxLogitsSuppressDevice(self.provider_impl, row_view, dim, suppress_token_ids);
-                    if (selected) |token_id| {
-                        token.* = @intCast(token_id);
-                    } else {
-                        if (strictFlorence2ResidentMetal()) return error.UnsupportedFlorence2ResidentMetal;
-                        break;
-                    }
-                } else {
+                // Batched: all rows argmaxed in one command buffer with one
+                // sync + one download (the per-row path flushed and rebuilt
+                // the decoder frame per row). All-or-nothing: on failure fall
+                // through to the host path below.
+                if (try metal_runtime.argmaxLogitsRowsSuppressDevice(
+                    self.provider_impl,
+                    metal_tensor.*,
+                    row_start,
+                    dim,
+                    suppress_token_ids,
+                    tokens,
+                )) {
                     return tokens;
                 }
+                if (strictFlorence2ResidentMetal()) return error.UnsupportedFlorence2ResidentMetal;
             }
         }
 

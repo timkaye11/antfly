@@ -18722,12 +18722,21 @@ static int termite_metal_decode_runtime_ensure_sample_topk_buffers(
     }
 }
 
-static int termite_metal_encode_argmax_logits_on_encoder(
+// Offset-parameterized argmax encode: writes the winning token id to
+// token_buffer[token_offset] using topk scratch at partials_offset. The
+// offsets exist so a BATCH of rows can be encoded into one command buffer
+// with disjoint per-row output/scratch ranges (one sync for k+1 verify rows
+// instead of one sync + frame teardown per row). Callers must pre-size
+// token_buffer/topk scratch when using nonzero offsets — growth mid-encode
+// would strand earlier rows' dispatches on a replaced buffer.
+static int termite_metal_encode_argmax_logits_on_encoder_at(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
     id<MTLBuffer> logits_buffer,
     size_t logits_offset,
     size_t out_dim,
+    size_t token_offset,
+    size_t partials_offset,
     int failure_code
 ) {
     if (runtime == NULL || encoder == nil || logits_buffer == nil) return failure_code;
@@ -18735,11 +18744,15 @@ static int termite_metal_encode_argmax_logits_on_encoder(
     if (out_dim == 0 || out_dim > UINT32_MAX) return failure_code;
     size_t logits_bytes = 0;
     if (!termite_metal_size_mul(out_dim, sizeof(float), &logits_bytes)) return failure_code;
-    if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        if (token == nil) return failure_code;
-        runtime->token_buffer = token;
-        runtime->token_capacity = sizeof(uint32_t);
+    if (token_offset == 0) {
+        if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
+            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            if (token == nil) return failure_code;
+            runtime->token_buffer = token;
+            runtime->token_capacity = sizeof(uint32_t);
+        }
+    } else if (runtime->token_buffer == nil || runtime->token_capacity < token_offset + sizeof(uint32_t)) {
+        return failure_code;
     }
 
     const uint32_t out_dim_u32 = (uint32_t)out_dim;
@@ -18753,7 +18766,7 @@ static int termite_metal_encode_argmax_logits_on_encoder(
                 logits_offset,
                 logits_bytes,
                 runtime->token_buffer,
-                0,
+                token_offset,
                 sizeof(uint32_t),
                 failure_code) != 0)
         {
@@ -18761,7 +18774,7 @@ static int termite_metal_encode_argmax_logits_on_encoder(
         }
         [encoder setComputePipelineState:runtime->argmax_logits_pipeline];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:0];
-        [encoder setBuffer:runtime->token_buffer offset:0 atIndex:1];
+        [encoder setBuffer:runtime->token_buffer offset:token_offset atIndex:1];
         [encoder setBytes:&out_dim_u32 length:sizeof(out_dim_u32) atIndex:2];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         return 0;
@@ -18771,12 +18784,12 @@ static int termite_metal_encode_argmax_logits_on_encoder(
     const size_t block_count = (out_dim + block_size - 1u) / block_size;
     if (block_count == 0 || block_count > UINT32_MAX) return failure_code;
     const size_t partial_bytes = block_count * sizeof(float);
-    if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, partial_bytes) != 0) return failure_code;
+    if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, partials_offset + partial_bytes) != 0) return failure_code;
     if (runtime->sample_topk_values_buffer == nil || runtime->sample_topk_ids_buffer == nil) return failure_code;
     termite_metal_planned_encoder_range partial_accesses[3];
     if (termite_metal_planned_range_make(logits_buffer, logits_offset, logits_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &partial_accesses[0], failure_code) != 0 ||
-        termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[1], failure_code) != 0 ||
-        termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[2], failure_code) != 0 ||
+        termite_metal_planned_range_make(runtime->sample_topk_values_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[1], failure_code) != 0 ||
+        termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[2], failure_code) != 0 ||
         termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, partial_accesses, 3, failure_code) != 0)
     {
         return failure_code;
@@ -18784,8 +18797,8 @@ static int termite_metal_encode_argmax_logits_on_encoder(
 
     [encoder setComputePipelineState:runtime->argmax_logits_partials_pipeline];
     [encoder setBuffer:logits_buffer offset:logits_offset atIndex:0];
-    [encoder setBuffer:runtime->sample_topk_values_buffer offset:0 atIndex:1];
-    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:2];
+    [encoder setBuffer:runtime->sample_topk_values_buffer offset:partials_offset atIndex:1];
+    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:partials_offset atIndex:2];
     [encoder setBytes:&out_dim_u32 length:sizeof(out_dim_u32) atIndex:3];
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
@@ -18793,9 +18806,9 @@ static int termite_metal_encode_argmax_logits_on_encoder(
 
     if (runtime->active_planned_compute_encoder == encoder) {
         termite_metal_planned_encoder_range reduce_accesses[3];
-        if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
-            termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[1], failure_code) != 0 ||
-            termite_metal_planned_range_make(runtime->token_buffer, 0, sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_WRITE, &reduce_accesses[2], failure_code) != 0 ||
+        if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
+            termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[1], failure_code) != 0 ||
+            termite_metal_planned_range_make(runtime->token_buffer, token_offset, sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_WRITE, &reduce_accesses[2], failure_code) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, reduce_accesses, 3, failure_code) != 0)
         {
             return failure_code;
@@ -18806,15 +18819,26 @@ static int termite_metal_encode_argmax_logits_on_encoder(
 
     const uint32_t block_count_u32 = (uint32_t)block_count;
     [encoder setComputePipelineState:runtime->argmax_logits_reduce_pipeline];
-    [encoder setBuffer:runtime->sample_topk_values_buffer offset:0 atIndex:0];
-    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:1];
-    [encoder setBuffer:runtime->token_buffer offset:0 atIndex:2];
+    [encoder setBuffer:runtime->sample_topk_values_buffer offset:partials_offset atIndex:0];
+    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:partials_offset atIndex:1];
+    [encoder setBuffer:runtime->token_buffer offset:token_offset atIndex:2];
     [encoder setBytes:&block_count_u32 length:sizeof(block_count_u32) atIndex:3];
     [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     return 0;
 }
 
-static int termite_metal_encode_argmax_logits_suppress_on_encoder(
+static int termite_metal_encode_argmax_logits_on_encoder(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> logits_buffer,
+    size_t logits_offset,
+    size_t out_dim,
+    int failure_code
+) {
+    return termite_metal_encode_argmax_logits_on_encoder_at(runtime, encoder, logits_buffer, logits_offset, out_dim, 0, 0, failure_code);
+}
+
+static int termite_metal_encode_argmax_logits_suppress_on_encoder_at(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
     id<MTLBuffer> logits_buffer,
@@ -18822,35 +18846,41 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder(
     size_t out_dim,
     id<MTLBuffer> suppress_buffer,
     size_t suppress_count,
+    size_t token_offset,
+    size_t partials_offset,
     int failure_code
 ) {
     if (runtime == NULL || encoder == nil || logits_buffer == nil) return failure_code;
-    if (suppress_count == 0) return termite_metal_encode_argmax_logits_on_encoder(runtime, encoder, logits_buffer, logits_offset, out_dim, failure_code);
+    if (suppress_count == 0) return termite_metal_encode_argmax_logits_on_encoder_at(runtime, encoder, logits_buffer, logits_offset, out_dim, token_offset, partials_offset, failure_code);
     if (runtime->argmax_logits_suppress_partials_pipeline == nil || runtime->argmax_logits_reduce_pipeline == nil) return failure_code;
     if (suppress_buffer == nil || out_dim == 0 || out_dim > UINT32_MAX || suppress_count > UINT32_MAX) return failure_code;
     size_t logits_bytes = 0;
     if (!termite_metal_size_mul(out_dim, sizeof(float), &logits_bytes)) return failure_code;
     size_t suppress_bytes = 0;
     if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return failure_code;
-    if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        if (token == nil) return failure_code;
-        runtime->token_buffer = token;
-        runtime->token_capacity = sizeof(uint32_t);
+    if (token_offset == 0) {
+        if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
+            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            if (token == nil) return failure_code;
+            runtime->token_buffer = token;
+            runtime->token_capacity = sizeof(uint32_t);
+        }
+    } else if (runtime->token_buffer == nil || runtime->token_capacity < token_offset + sizeof(uint32_t)) {
+        return failure_code;
     }
 
     const size_t block_size = 1024u;
     const size_t block_count = (out_dim + block_size - 1u) / block_size;
     if (block_count == 0 || block_count > UINT32_MAX) return failure_code;
     const size_t partial_bytes = block_count * sizeof(float);
-    if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, partial_bytes) != 0) return failure_code;
+    if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, partials_offset + partial_bytes) != 0) return failure_code;
     if (runtime->sample_topk_values_buffer == nil || runtime->sample_topk_ids_buffer == nil) return failure_code;
 
     termite_metal_planned_encoder_range partial_accesses[4];
     if (termite_metal_planned_range_make(logits_buffer, logits_offset, logits_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &partial_accesses[0], failure_code) != 0 ||
         termite_metal_planned_range_make(suppress_buffer, 0, suppress_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &partial_accesses[1], failure_code) != 0 ||
-        termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[2], failure_code) != 0 ||
-        termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[3], failure_code) != 0 ||
+        termite_metal_planned_range_make(runtime->sample_topk_values_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[2], failure_code) != 0 ||
+        termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &partial_accesses[3], failure_code) != 0 ||
         termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, partial_accesses, 4, failure_code) != 0)
     {
         return failure_code;
@@ -18872,8 +18902,8 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder(
     [encoder setComputePipelineState:runtime->argmax_logits_suppress_partials_pipeline];
     [encoder setBuffer:logits_buffer offset:logits_offset atIndex:0];
     [encoder setBuffer:suppress_buffer offset:0 atIndex:1];
-    [encoder setBuffer:runtime->sample_topk_values_buffer offset:0 atIndex:2];
-    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:3];
+    [encoder setBuffer:runtime->sample_topk_values_buffer offset:partials_offset atIndex:2];
+    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:partials_offset atIndex:3];
     [encoder setBytes:&params length:sizeof(params) atIndex:4];
     [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
     [encoder setThreadgroupMemoryLength:256u * sizeof(uint32_t) atIndex:1];
@@ -18881,9 +18911,9 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder(
 
     if (runtime->active_planned_compute_encoder == encoder) {
         termite_metal_planned_encoder_range reduce_accesses[3];
-        if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
-            termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, 0, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[1], failure_code) != 0 ||
-            termite_metal_planned_range_make(runtime->token_buffer, 0, sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_WRITE, &reduce_accesses[2], failure_code) != 0 ||
+        if (termite_metal_planned_range_make(runtime->sample_topk_values_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[0], failure_code) != 0 ||
+            termite_metal_planned_range_make(runtime->sample_topk_ids_buffer, partials_offset, partial_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &reduce_accesses[1], failure_code) != 0 ||
+            termite_metal_planned_range_make(runtime->token_buffer, token_offset, sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_WRITE, &reduce_accesses[2], failure_code) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, reduce_accesses, 3, failure_code) != 0)
         {
             return failure_code;
@@ -18894,12 +18924,126 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder(
 
     const uint32_t block_count_u32 = (uint32_t)block_count;
     [encoder setComputePipelineState:runtime->argmax_logits_reduce_pipeline];
-    [encoder setBuffer:runtime->sample_topk_values_buffer offset:0 atIndex:0];
-    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:0 atIndex:1];
-    [encoder setBuffer:runtime->token_buffer offset:0 atIndex:2];
+    [encoder setBuffer:runtime->sample_topk_values_buffer offset:partials_offset atIndex:0];
+    [encoder setBuffer:runtime->sample_topk_ids_buffer offset:partials_offset atIndex:1];
+    [encoder setBuffer:runtime->token_buffer offset:token_offset atIndex:2];
     [encoder setBytes:&block_count_u32 length:sizeof(block_count_u32) atIndex:3];
     [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     return 0;
+}
+
+static int termite_metal_encode_argmax_logits_suppress_on_encoder(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> logits_buffer,
+    size_t logits_offset,
+    size_t out_dim,
+    id<MTLBuffer> suppress_buffer,
+    size_t suppress_count,
+    int failure_code
+) {
+    return termite_metal_encode_argmax_logits_suppress_on_encoder_at(runtime, encoder, logits_buffer, logits_offset, out_dim, suppress_buffer, suppress_count, 0, 0, failure_code);
+}
+
+// Batched multi-row argmax: one command buffer, one wait, one download for all
+// rows (the per-row entry points flush + cancel + re-begin the decoder frame
+// PER ROW, which dominated MTP verify wall time at k+1 rows per verify).
+// Row i reads logits at logits_offset + i*out_dim*4 and writes its token id to
+// token_buffer[i*4] with topk scratch at i*partial_bytes; ranges are disjoint
+// so rows may interleave on the GPU.
+int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
+    termite_metal_decode_runtime *runtime,
+    void *logits_handle,
+    size_t logits_offset,
+    size_t rows,
+    size_t out_dim,
+    const int32_t *suppress_token_ids,
+    size_t suppress_count,
+    uint32_t *output_token_ids
+) {
+    if (runtime == NULL || logits_handle == NULL || output_token_ids == NULL) return -1;
+    if (rows == 0 || out_dim == 0 || out_dim > UINT32_MAX || suppress_count > UINT32_MAX) return -2;
+    if (suppress_count > 0 && suppress_token_ids == NULL) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> logits_buffer = (__bridge id<MTLBuffer>)logits_handle;
+        size_t row_bytes = 0;
+        size_t logits_bytes = 0;
+        if (!termite_metal_size_mul(out_dim, sizeof(float), &row_bytes)) return -4;
+        if (!termite_metal_size_mul(row_bytes, rows, &logits_bytes)) return -4;
+        if (logits_offset > logits_buffer.length || logits_bytes > logits_buffer.length - logits_offset) return -5;
+
+        // Pre-size shared output + scratch so nothing reallocates mid-encode.
+        const size_t token_bytes = rows * sizeof(uint32_t);
+        if (runtime->token_capacity < token_bytes || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
+            id<MTLBuffer> token = [runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared];
+            if (token == nil) return -6;
+            runtime->token_buffer = token;
+            runtime->token_capacity = token_bytes;
+        }
+        const size_t block_count = (out_dim + 1023u) / 1024u;
+        const size_t partial_bytes = block_count * sizeof(float);
+        if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, rows * partial_bytes) != 0) return -7;
+
+        id<MTLBuffer> suppress_buffer = nil;
+        if (suppress_count > 0) {
+            size_t suppress_bytes = 0;
+            if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return -8;
+            suppress_buffer = [runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared];
+            if (suppress_buffer == nil) return -8;
+        }
+
+        const bool restore_active_frame = (runtime->active_frame_cb != nil);
+        if (restore_active_frame) {
+            if (!termite_metal_decode_runtime_active_frame_empty(runtime)) {
+                int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
+                if (flush_rc != 0) return -10;
+            }
+            if (runtime->active_frame_cb != nil) {
+                if (!termite_metal_decode_runtime_active_frame_empty(runtime)) return -10;
+                int cancel_rc = termite_metal_decode_runtime_cancel_frame(runtime);
+                if (cancel_rc != 0) return -10;
+            }
+        }
+
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -11;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -12;
+        int encode_rc = 0;
+        for (size_t row = 0; row < rows; ++row) {
+            encode_rc = termite_metal_encode_argmax_logits_suppress_on_encoder_at(
+                runtime,
+                encoder,
+                logits_buffer,
+                logits_offset + row * row_bytes,
+                out_dim,
+                suppress_buffer,
+                suppress_count,
+                row * sizeof(uint32_t),
+                row * partial_bytes,
+                -13);
+            if (encode_rc != 0) break;
+        }
+        [encoder endEncoding];
+        if (encode_rc != 0) return encode_rc;
+        if (!frame_owned) {
+            int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
+            if (flush_rc != 0) return -14;
+        } else {
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            if (command_buffer.status != MTLCommandBufferStatusCompleted) return -15;
+        }
+        const uint32_t *result = (const uint32_t *)runtime->token_buffer.contents;
+        if (result == NULL) return -16;
+        for (size_t row = 0; row < rows; ++row) output_token_ids[row] = result[row];
+        if (restore_active_frame) {
+            int begin_rc = termite_metal_decode_runtime_begin_frame(runtime);
+            if (begin_rc != 0) return -17;
+        }
+        return 0;
+    }
 }
 
 // Copy an old (smaller) buffer's contents into its grown replacement.

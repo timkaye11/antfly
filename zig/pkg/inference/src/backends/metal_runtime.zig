@@ -2426,6 +2426,46 @@ pub fn argmaxLogitsSuppressDevice(self: anytype, input: MetalTensor, out_dim: us
     return token_id;
 }
 
+/// Batched multi-row argmax over a device-resident [rows_total, dim] logits
+/// tensor: rows [row_start, row_start+out.len) are argmaxed (with optional
+/// suppression) in ONE command buffer with ONE sync and ONE download. The
+/// per-row `argmaxLogitsDevice` path flushes + cancels + re-begins the decoder
+/// frame per row, which dominated MTP verify wall time. Returns false (no
+/// tokens written) on any unsupported condition so callers can fall back
+/// all-or-nothing.
+pub fn argmaxLogitsRowsSuppressDevice(
+    self: anytype,
+    input: MetalTensor,
+    row_start: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    out: []u32,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!input.isDevice()) return false;
+    if (dim == 0 or out.len == 0) return false;
+    if (input.ndim() != 2) return false;
+    if (@as(usize, @intCast(input.dim(1))) != dim) return false;
+    const rows_total: usize = @intCast(input.dim(0));
+    const row_end = std.math.add(usize, row_start, out.len) catch return false;
+    if (row_end > rows_total) return false;
+    const row_bytes = std.math.mul(usize, dim, @sizeOf(f32)) catch return false;
+    const start_bytes = std.math.mul(usize, row_start, row_bytes) catch return false;
+
+    const rc = termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset() + start_bytes,
+        out.len,
+        dim,
+        if (suppress_token_ids.len == 0) null else suppress_token_ids.ptr,
+        suppress_token_ids.len,
+        out.ptr,
+    );
+    return rc == 0;
+}
+
 pub fn encodeArgmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
@@ -8272,6 +8312,16 @@ pub extern fn termite_metal_decode_runtime_argmax_from_logits_suppress_device(
     suppress_token_ids: [*c]const i32,
     suppress_count: usize,
     output_token_id: [*c]u32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    rows: usize,
+    out_dim: usize,
+    suppress_token_ids: [*c]const i32,
+    suppress_count: usize,
+    output_token_ids: [*c]u32,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_encode_argmax_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -26741,6 +26791,66 @@ test "metal native decoder runtime argmax suppress stays device resident" {
 
     const suppress_two = [_]i32{ 3001, 17 };
     try std.testing.expectEqual(@as(usize, 1025), (try argmaxLogitsSuppressDevice(&provider, logits_tensor, out_dim, &suppress_two)) orelse return error.UnexpectedNull);
+}
+
+test "metal native decoder runtime batched multi-row argmax matches per-row" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    // dim >= 2048 exercises the parallel partials+reduce path; each row has a
+    // distinct maximum so a scratch/token offset bug cross-contaminates rows.
+    const dim: usize = 4096;
+    const rows: usize = 5;
+    const maxima = [_]usize{ 7, 4095, 1234, 2048, 0 };
+    const logits = try std.testing.allocator.alloc(f32, rows * dim);
+    defer std.testing.allocator.free(logits);
+    for (0..rows) |row| {
+        const row_data = logits[row * dim ..][0..dim];
+        for (row_data, 0..) |*v, i| v.* = -100.0 - @as(f32, @floatFromInt(i % 97));
+        row_data[maxima[row]] = 50.0 + @as(f32, @floatFromInt(row));
+        // A decoy second-best for the suppression check.
+        row_data[(maxima[row] + 11) % dim] = 40.0;
+    }
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ @intCast(rows), @intCast(dim) });
+    defer logits_tensor.deinit();
+
+    // All rows, no suppression.
+    var tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 0, dim, &.{}, tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast(maxima[row])), tokens[row]);
+
+    // Nonzero row_start: rows 2..5 only.
+    var tail_tokens: [3]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 2, dim, &.{}, tail_tokens[0..3]));
+    for (0..3) |i| try std.testing.expectEqual(@as(u32, @intCast(maxima[2 + i])), tail_tokens[i]);
+
+    // Suppression: suppress every row's max -> each row falls to its decoy.
+    const suppress = [_]i32{ 7, 4095, 1234, 2048, 0 };
+    var suppressed: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 0, dim, &suppress, suppressed[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), suppressed[row]);
+
+    // Small dim exercises the serial single-thread kernel path.
+    const small_dim: usize = 64;
+    const small_rows: usize = 3;
+    const small_maxima = [_]usize{ 5, 63, 31 };
+    var small_logits: [small_rows * small_dim]f32 = undefined;
+    for (0..small_rows) |row| {
+        const row_data = small_logits[row * small_dim ..][0..small_dim];
+        for (row_data) |*v| v.* = -5.0;
+        row_data[small_maxima[row]] = 9.0;
+    }
+    var small_tensor = try testDeviceTensorFromSlice(runtime, &small_logits, &[_]i32{ @intCast(small_rows), @intCast(small_dim) });
+    defer small_tensor.deinit();
+    var small_tokens: [small_rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, small_tensor, 0, small_dim, &.{}, small_tokens[0..small_rows]));
+    for (0..small_rows) |row| try std.testing.expectEqual(@as(u32, @intCast(small_maxima[row])), small_tokens[row]);
 }
 
 test "metal native decoder runtime can prepare bf16 linear without copying model-owned bytes" {
