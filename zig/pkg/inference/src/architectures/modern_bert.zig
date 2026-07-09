@@ -121,6 +121,13 @@ pub const Config = struct {
     /// interleaved convention scrambles attention and roughly halves retrieval
     /// quality, so the native embedder session sets this to `false`.
     rope_interleaved: bool = true,
+    /// Layer-0 pre-attention norm behavior. HF ModernBERT sets the first
+    /// layer's `attn_norm` to `nn.Identity()` because `embeddings.norm`
+    /// already applied a (learned) LayerNorm; re-normalizing at layer 0 would
+    /// discard that learned affine. `false` (default) keeps the historical
+    /// LayerNorm(ones,zeros) the gopeft-trained fused chunker expects; `true`
+    /// makes layer 0 a true identity, matching stock HF / nomic weights.
+    attn_norm0_identity: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -749,11 +756,17 @@ fn preAttentionNorm(
     config: Config,
     hidden: CT,
     layer_idx: usize,
-    _: usize,
+    total: usize,
     hidden_size: usize,
     name_buf: *[256]u8,
 ) !CT {
     if (layer_idx == 0) {
+        if (config.attn_norm0_identity) {
+            // HF ModernBERT layer 0 uses nn.Identity: embeddings.norm already
+            // normalized, so pass the hidden state through unchanged (an owned
+            // copy, since the caller frees the returned tensor).
+            return cloneHiddenForNormSkip(cb, allocator, hidden, total, hidden_size);
+        }
         const attn_ln_w = try oneWeightTensor(cb, allocator, hidden_size);
         defer cb.free(attn_ln_w);
         const attn_ln_b = try zeroBiasTensor(cb, allocator, hidden_size);

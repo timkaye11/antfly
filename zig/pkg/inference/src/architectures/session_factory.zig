@@ -1366,7 +1366,7 @@ fn parseModernBertConfig(allocator: std.mem.Allocator, config_bytes: []const u8)
     // RoPE, not the interleaved convention the gopeft-trained fused chunker
     // expects. The native embedder session serves these frozen HF weights, so
     // it must use HF's split-half pairing to match the reference embeddings.
-    var cfg = modern_bert_arch.Config{ .rope_interleaved = false };
+    var cfg = modern_bert_arch.Config{ .rope_interleaved = false, .attn_norm0_identity = true };
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{}) catch return cfg;
     defer parsed.deinit();
     if (parsed.value != .object) return cfg;
@@ -3618,6 +3618,8 @@ test "parseModernBertConfig overrides defaults from config.json fields" {
     // Frozen HF ModernBERT weights (nomic modernbert-embed-base) require the
     // rotate_half RoPE convention, not the interleaved fused-chunker one.
     try std.testing.expectEqual(false, cfg.rope_interleaved);
+    // HF ModernBERT layer 0 attn_norm is nn.Identity, not a re-norm.
+    try std.testing.expectEqual(true, cfg.attn_norm0_identity);
 }
 
 test "splitModernBertQkvWeights materializes q/k/v projections from fused Wqkv" {
