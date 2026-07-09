@@ -92,10 +92,14 @@ extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
     const unsigned char *q8_input,
     const unsigned char *weight_gate,
     const unsigned char *weight_up,
-    unsigned int activation
+    unsigned int activation,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
 ) {
-    const unsigned int row_blocks = 80u;
-    const unsigned int out_row_blocks = 320u;
+    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int out_row_blocks = out_dim >> 5;
     const unsigned int group_cols = 4u;
     const unsigned int groups_per_wave = 4u;
     const unsigned int waves = 2u;
@@ -108,7 +112,7 @@ extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
     const unsigned int warp = tid >> 5u;
     const unsigned int group = warp / 5u;
     const unsigned int group_warp = warp - group * 5u;
-    if (blockDim.x != 640u) return;
+    if (blockDim.x != 640u || row >= rows) return;
 
     __shared__ float gate_partial[4][4][5];
     __shared__ float up_partial[4][4][5];

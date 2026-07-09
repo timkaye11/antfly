@@ -67,15 +67,21 @@ static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
 extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
     float *dst,
     const unsigned char *q8_input,
-    const unsigned char *weight
+    const unsigned char *weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
 ) {
     const unsigned int cols = 4u;
-    const unsigned int row_blocks = 320u;
-    const unsigned int col_tile = blockIdx.x * cols;
+    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int row = blockIdx.x / col_tiles;
+    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid & 31u;
     const unsigned int warp = tid >> 5u;
-    if (blockDim.x != 256u) return;
+    if (blockDim.x != 256u || row >= rows) return;
 
     __shared__ float warp_partial[4][8];
     float acc[4];
@@ -84,7 +90,7 @@ extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
 
     const unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
-        const unsigned char *q8_bp = q8_input + block * 36u;
+        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
         const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
         const signed char *q8_values = (const signed char *)(q8_bp + 4u);
         const unsigned int q8_base0 = iqs * 4u;
@@ -97,8 +103,10 @@ extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
             const unsigned int col = col_tile + c;
-            const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-            acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            if (col < out_dim) {
+                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
+                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            }
         }
     }
 
@@ -112,6 +120,7 @@ extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
         float y = 0.0f;
         #pragma unroll
         for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
-        dst[col_tile + tid] = y;
+        const unsigned int col = col_tile + tid;
+        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
     }
 }

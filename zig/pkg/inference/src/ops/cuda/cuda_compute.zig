@@ -127,7 +127,6 @@ const CudaDispatchEpilogue = enum {
     pair_inputs,
 };
 
-
 const CudaDispatchFallback = enum {
     none,
     tc_not_requested,
@@ -476,6 +475,7 @@ pub const RuntimeStats = struct {
     launch_rope: usize = 0,
     launch_attention: usize = 0,
     launch_attention_gqa_decode: usize = 0,
+    launch_attention_gqa_decode_generated: usize = 0,
     launch_attention_gqa_decode_fast: usize = 0,
     launch_attention_gqa_decode_fast_fallbacks: usize = 0,
     launch_attention_gqa_prefill_fast: usize = 0,
@@ -506,6 +506,8 @@ pub const RuntimeStats = struct {
     device_kv_attempts: usize = 0,
     device_kv_successes: usize = 0,
     device_kv_fail_batch: usize = 0,
+    device_kv_batch_steps: usize = 0,
+    device_kv_batch_items: usize = 0,
     device_kv_fail_no_cache: usize = 0,
     device_kv_fail_no_storage: usize = 0,
     device_kv_fail_no_hook: usize = 0,
@@ -2977,11 +2979,6 @@ pub const GeneratedQ4_0Gates = struct {
     }
 };
 
-// Checked-in evidence (src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json)
-// shows the generated rows 9..64 kernel losing to the handwritten baseline at
-// in_dim=256, so the runtime route only claims wider shapes.
-const cuda_q4_0_generated_mm_min_in_dim: usize = 512;
-
 fn launchLinearQ4_0Tile4ThenBaseF32(
     self: *CudaCompute,
     dst: buffer_mod.DeviceBuffer,
@@ -3211,6 +3208,7 @@ fn cudaQ4_0GateUpActivationPrecomputeEnabled() bool {
 }
 
 fn cudaQ4_0GateUpActivationQ8_1PrecomputeEnabled() bool {
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE", false)) return false;
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE", false);
 }
 
@@ -6329,7 +6327,7 @@ fn recordQuantKernelCompilerPlan(
     plan: quant_matmul.Plan,
     epilogue: quant_kernel_compiler.Epilogue,
 ) void {
-    const lowering = quant_kernel_compiler.registryLoweringFor(.cuda, plan.format, plan.row_bucket, epilogue, plan.dispatch);
+    const lowering = quant_kernel_compiler.registryLoweringForPlan(.cuda, plan, epilogue);
     const counters = quant_kernel_compiler.countersForLowering(lowering);
     quant_kernel_compiler.addCountersToStats(&self.stats, counters);
 }
@@ -7680,7 +7678,11 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                         }
                     } else if (rows == 1) {
                         try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
-                    } else if (rows >= 9 and rows <= 64 and in_dim >= cuda_q4_0_generated_mm_min_in_dim and self.generated_q4_0_gates.mm) {
+                    } else if (rows >= 9 and rows <= 64 and self.generated_q4_0_gates.mm and quant_kernel_compiler.generatedArtifactSupportsPlan(
+                        .cuda,
+                        quant_matmul.plan(.{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .format = .q4_0 }),
+                        .none,
+                    )) {
                         if (self.kernels.launchLinearQ4_0GeneratedMmF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mm_hits += 1;
                         } else |generated_err| switch (generated_err) {
@@ -11158,6 +11160,11 @@ fn gqaDenseAttention(
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_decode += 1;
         },
+        .decode_generated => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+        },
         .decode_fast => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_decode += 1;
@@ -11478,6 +11485,11 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_decode += 1;
         },
+        .decode_generated => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+        },
         .decode_fast => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_decode += 1;
@@ -11530,8 +11542,23 @@ fn gqaPagedAttentionWithDeviceKv(
     num_kv_heads: usize,
     head_dim: usize,
 ) anyerror!CT {
+    if (attention.kv_batch) |kv_batch| {
+        return gqaPagedAttentionBatchWithDeviceKv(
+            self,
+            q_ct,
+            k_ct,
+            v_ct,
+            attn_bias_ct,
+            attention,
+            kv_batch,
+            batch,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+    }
     self.stats.device_kv_attempts += 1;
-    if (batch != 1 or attention.kv_batch != null) {
+    if (batch != 1) {
         self.stats.device_kv_fail_batch += 1;
         return error.CudaPagedKvBatchUnsupported;
     }
@@ -11707,6 +11734,122 @@ fn gqaPagedAttentionWithDeviceKv(
     );
     self.stats.device_kv_successes += 1;
     return result;
+}
+
+/// Correctness-first CUDA batch path. Quantized projections and the rest of
+/// the transformer execute as one row batch; paged KV ownership remains per
+/// sequence and each item uses the same generated decode-attention route as a
+/// singleton. This is also the reference path for the packed descriptor
+/// kernel, and avoids all host tensor materialization.
+fn gqaPagedAttentionBatchWithDeviceKv(
+    self: *CudaCompute,
+    q_ct: CT,
+    k_ct: CT,
+    v_ct: CT,
+    attn_bias_ct: ?CT,
+    attention: ops.AttentionContext,
+    kv_batch: []const ops.KvBatchView,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) anyerror!CT {
+    self.stats.device_kv_attempts += 1;
+    if (batch < 2 or kv_batch.len != batch) {
+        self.stats.device_kv_fail_batch += 1;
+        return error.InvalidPagedKvBatch;
+    }
+    if (attention.attn_or_mask != null or attn_bias_ct != null) {
+        return error.AttentionOrMaskBatchUnsupported;
+    }
+
+    const q_tensor = tensorFromCt(q_ct);
+    const k_tensor = tensorFromCt(k_ct);
+    const v_tensor = tensorFromCt(v_ct);
+    try ensureF32(q_tensor);
+    try ensureF32(k_tensor);
+    try ensureF32(v_tensor);
+
+    const max_q_len = attention.query_sequence_len;
+    const h_q = try checkedMul(num_heads, head_dim);
+    const h_kv = try checkedMul(num_kv_heads, head_dim);
+    const q_rows = try checkedMul(batch, max_q_len);
+    try ensureCount(q_tensor, try checkedMul(q_rows, h_q));
+    try ensureCount(k_tensor, try checkedMul(q_rows, h_kv));
+    try ensureCount(v_tensor, try checkedMul(q_rows, h_kv));
+
+    const output_count = try checkedMul(q_rows, h_q);
+    const output_shape = try dupeShape(self.allocator, q_tensor.shape);
+    errdefer self.allocator.free(output_shape);
+    var output = try allocDeviceBuffer(self, try checkedMul(output_count, @sizeOf(f32)));
+    errdefer output.free(&self.ctx);
+    try self.kernels.launchFillF32(&self.ctx, output, output_count, 0.0);
+
+    for (kv_batch, 0..) |view, batch_index| {
+        const item_q_len = view.per_item_query_len orelse max_q_len;
+        const item_total_len = view.per_item_total_len orelse attention.total_sequence_len;
+        const item_kv_len = view.per_item_kv_len orelse attention.kv_sequence_len;
+        const item_kv_position_offset = view.per_item_kv_position_offset orelse attention.kv_position_offset;
+        if (item_q_len == 0 or item_q_len > max_q_len or item_total_len < item_q_len or item_kv_len < item_q_len) {
+            self.stats.device_kv_fail_shape += 1;
+            return error.InvalidShape;
+        }
+
+        const row_offset = try checkedMul(batch_index, max_q_len);
+        const item_q = try sliceRows2DOp(self, q_ct, row_offset, item_q_len, h_q);
+        defer freeTensor(self, item_q);
+        const item_k = try sliceRows2DOp(self, k_ct, row_offset, item_q_len, h_kv);
+        defer freeTensor(self, item_k);
+        const item_v = try sliceRows2DOp(self, v_ct, row_offset, item_q_len, h_kv);
+        defer freeTensor(self, item_v);
+
+        const item_attention = ops.AttentionContext{
+            .mode = view.per_item_mode orelse attention.mode,
+            .total_sequence_len = item_total_len,
+            .query_sequence_len = item_q_len,
+            .kv_sequence_len = item_kv_len,
+            .kv_position_offset = item_kv_position_offset,
+            .decoder_runtime_resident_kv_sequence_len = attention.decoder_runtime_resident_kv_sequence_len,
+            .decoder_runtime_resident_kv_position_offset = attention.decoder_runtime_resident_kv_position_offset,
+            .sliding_window = attention.sliding_window,
+            .kv_cache = view.kv_cache,
+            .kv_manager = view.kv_manager,
+            .kv_storage = view.kv_storage,
+            .kv_batch = null,
+            .layer_index = attention.layer_index,
+            .skip_kv_write = attention.skip_kv_write,
+            .attention_sink = attention.attention_sink,
+        };
+        const item_output = try gqaPagedAttentionWithDeviceKv(
+            self,
+            item_q,
+            item_k,
+            item_v,
+            null,
+            item_attention,
+            1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+        defer freeTensor(self, item_output);
+
+        const item_output_tensor = tensorFromCt(item_output);
+        const item_count = try checkedMul(item_q_len, h_q);
+        try ensureCount(item_output_tensor, item_count);
+        const byte_offset = try checkedMul(try checkedMul(row_offset, h_q), @sizeOf(f32));
+        const byte_len = try checkedMul(item_count, @sizeOf(f32));
+        const dst = buffer_mod.DeviceBuffer{
+            .ptr = output.ptr + @as(u64, @intCast(byte_offset)),
+            .len = byte_len,
+        };
+        try copyFromDeviceTracked(self, dst, item_output_tensor.buffer, byte_len);
+    }
+
+    self.stats.device_kv_batch_steps += 1;
+    self.stats.device_kv_batch_items += batch;
+    self.stats.device_kv_successes += 1;
+    return createTensor(self, output, output_shape, output_count);
 }
 fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -12758,8 +12901,11 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!cudaQ4_0GateUpActivationQ8_1PrecomputeEnabled()) return null;
     if (rows == 0 or request.post_gate_rms_norm_slot != null) return null;
-    // Keep this tied to Gemma4 E4B FFN shapes until the matching CUDA kernel is generalized.
-    if (request.hidden_size != 2560 or request.intermediate_size != 10240) return null;
+    if (request.hidden_size == 0 or request.intermediate_size == 0 or
+        request.hidden_size % 32 != 0 or request.intermediate_size % 32 != 0)
+    {
+        return null;
+    }
 
     const gate_slot = self.decoder_runtime_linear_slots.getPtr(request.gate_linear_slot) orelse return null;
     const up_slot = self.decoder_runtime_linear_slots.getPtr(request.up_linear_slot) orelse return null;

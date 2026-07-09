@@ -23,6 +23,7 @@ const cuda_artifact = if (build_options.enable_cuda) @import("../ops/cuda/artifa
 };
 const native_embed = @import("../native_embed.zig");
 const quant_kernel_compiler = @import("../graph/quant_kernel_compiler.zig");
+const quant_matmul = @import("../graph/quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const compat = @import("../io/compat.zig");
 
@@ -833,6 +834,7 @@ fn benchQuantCompilerQ4_0Target(
 
     var worst_speedup: f64 = std.math.inf(f64);
     var speedup_log_sum: f64 = 0.0;
+    var eligible_shape_count: usize = 0;
     var shape_details = std.ArrayListUnmanaged(u8).empty;
     defer shape_details.deinit(allocator);
     for (dims_list.items, 0..) |dims, shape_index| {
@@ -900,8 +902,16 @@ fn benchQuantCompilerQ4_0Target(
         if (has_cpu_reference and cpu_max_abs_diff > correctness_tolerance_abs) return error.GeneratedCandidateMismatch;
 
         const candidate_speedup = speedup(baseline_ns, generated_ns);
-        worst_speedup = @min(worst_speedup, candidate_speedup);
-        speedup_log_sum += @log(candidate_speedup);
+        const production_route_eligible = quant_kernel_compiler.generatedArtifactSupportsPlan(
+            .cuda,
+            quant_matmul.plan(.{ .rows = shape.rows, .in_dim = shape.in_dim, .out_dim = shape.out_dim, .format = .q4_0 }),
+            .none,
+        );
+        if (production_route_eligible) {
+            worst_speedup = @min(worst_speedup, candidate_speedup);
+            speedup_log_sum += @log(candidate_speedup);
+            eligible_shape_count += 1;
+        }
         print("shape={s} rows={d} in={d} out={d} baseline_ns={d} generated_ns={d} speedup={d:.6} cpu_reference={} baseline_cpu_max_abs_diff={d:.6} generated_cpu_max_abs_diff={d:.6} generated_baseline_max_abs_diff={d:.6}\n", .{
             shape.label,
             shape.rows,
@@ -916,7 +926,7 @@ fn benchQuantCompilerQ4_0Target(
             baseline_max_abs_diff,
         });
         try appendJsonFmt(allocator, &shape_details,
-            \\{s}{{"label":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"baseline_ns":{d},"generated_ns":{d},"speedup":{d:.6},"cpu_reference":{},"baseline_cpu_max_abs_diff":{d:.6},"generated_cpu_max_abs_diff":{d:.6},"generated_baseline_max_abs_diff":{d:.6}}}
+            \\{s}{{"label":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"baseline_ns":{d},"generated_ns":{d},"speedup":{d:.6},"production_route_eligible":{},"cpu_reference":{},"baseline_cpu_max_abs_diff":{d:.6},"generated_cpu_max_abs_diff":{d:.6},"generated_baseline_max_abs_diff":{d:.6}}}
         , .{
             if (shape_index == 0) "" else ",",
             std.json.fmt(shape.label, .{}),
@@ -926,14 +936,16 @@ fn benchQuantCompilerQ4_0Target(
             baseline_ns,
             generated_ns,
             candidate_speedup,
+            production_route_eligible,
             has_cpu_reference,
             baseline_cpu_max_abs_diff,
             cpu_max_abs_diff,
             baseline_max_abs_diff,
         });
     }
-    const geomean_speedup = @exp(speedup_log_sum / @as(f64, @floatFromInt(dims_list.items.len)));
-    print("q4_0 {s} summary: geomean_speedup={d:.6} worst_speedup={d:.6} shapes={d}\n", .{ @tagName(kind), geomean_speedup, worst_speedup, dims_list.items.len });
+    if (eligible_shape_count == 0) return error.NoProductionEligibleBenchmarkShapes;
+    const geomean_speedup = @exp(speedup_log_sum / @as(f64, @floatFromInt(eligible_shape_count)));
+    print("q4_0 {s} summary: geomean_speedup={d:.6} worst_speedup={d:.6} eligible_shapes={d} measured_shapes={d}\n", .{ @tagName(kind), geomean_speedup, worst_speedup, eligible_shape_count, dims_list.items.len });
     if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
         try writeQuantCompilerQ4_0Evidence(allocator, io, evidence_path, bench, cfg, geomean_speedup, worst_speedup, shape_details.items);
         print("wrote quant compiler evidence: {s}\n", .{evidence_path});
@@ -1181,7 +1193,7 @@ fn benchQuantCompilerQ4_0PairQ8Target(
 
     try poisonDeviceBytes(allocator, ctx, dst_q8, out_blocks * q8_1_block_bytes);
 
-    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0PairQ8, .{ generated.function, ctx, dst_q8, q8_input, weight_gate, weight_up, out_blocks });
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchGeneratedQ4_0PairQ8, .{ generated.function, ctx, dst_q8, q8_input, weight_gate, weight_up, 1, in_dim, out_dim, out_blocks });
     const generated_q8_host = try allocator.alloc(u8, out_blocks * q8_1_block_bytes);
     defer allocator.free(generated_q8_host);
     try dst_q8.copyToHost(ctx, generated_q8_host);
@@ -1293,7 +1305,7 @@ fn benchQuantCompilerQ4_0DownQ8Target(
 
     try poisonDeviceOutput(allocator, ctx, output, out_dim);
 
-    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0DownQ8, .{ generated.function, ctx, output, q8_input, weight, out_dim });
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchGeneratedQ4_0DownQ8, .{ generated.function, ctx, output, q8_input, weight, 1, in_dim, out_dim });
     const generated_host = try allocator.alloc(f32, out_dim);
     defer allocator.free(generated_host);
     try output.copyToHost(ctx, std.mem.sliceAsBytes(generated_host));
@@ -1353,6 +1365,33 @@ fn launchQ4_0DownQ8(
     try launchBlocks(ctx, function, out_dim / 4, 256, &params);
 }
 
+fn launchGeneratedQ4_0DownQ8(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    q8_input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    var dst_ptr = output.ptr;
+    var input_ptr = q8_input.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32: u32 = @intCast(rows);
+    var in_dim_u32: u32 = @intCast(in_dim);
+    var out_dim_u32: u32 = @intCast(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launchBlocks(ctx, function, rows * ((out_dim + 3) / 4), 256, &params);
+}
+
 fn launchQ4_0PairQ8(
     function: cuda_driver.CUfunction,
     ctx: *cuda_context.CudaContext,
@@ -1375,6 +1414,39 @@ fn launchQ4_0PairQ8(
         @ptrCast(&activation_u32),
     };
     try launchBlocks(ctx, function, out_blocks, 640, &params);
+}
+
+fn launchGeneratedQ4_0PairQ8(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    dst_q8: cuda_buffer.DeviceBuffer,
+    q8_input: cuda_buffer.DeviceBuffer,
+    weight_gate: cuda_buffer.DeviceBuffer,
+    weight_up: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_blocks: usize,
+) cuda_driver.Error!void {
+    var dst_ptr = dst_q8.ptr;
+    var input_ptr = q8_input.ptr;
+    var weight_gate_ptr = weight_gate.ptr;
+    var weight_up_ptr = weight_up.ptr;
+    var activation_u32: u32 = quant_compiler_q4_0_pair_q8_activation;
+    var rows_u32: u32 = @intCast(rows);
+    var in_dim_u32: u32 = @intCast(in_dim);
+    var out_dim_u32: u32 = @intCast(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_gate_ptr),
+        @ptrCast(&weight_up_ptr),
+        @ptrCast(&activation_u32),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launchBlocks(ctx, function, rows * out_blocks, 640, &params);
 }
 
 fn poisonDeviceBytes(
@@ -1469,7 +1541,8 @@ fn writeQuantCompilerQ4_0Evidence(
     worst_speedup: f64,
     shape_details_json: []const u8,
 ) !void {
-    const benchmark_passed = std.math.isFinite(geomean_speedup) and geomean_speedup >= bench.minimum_speedup;
+    const benchmark_passed = std.math.isFinite(geomean_speedup) and std.math.isFinite(worst_speedup) and geomean_speedup >= bench.minimum_speedup and worst_speedup >= bench.minimum_speedup;
+    const runtime_shape = (quant_kernel_compiler.generatedArtifactForKernel(.cuda, bench.generated_kernel_id) orelse return error.MissingGeneratedArtifact).runtime_shape;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
     try appendJsonFmt(allocator, &out,
@@ -1485,6 +1558,7 @@ fn writeQuantCompilerQ4_0Evidence(
         \\"benchmark_evidence_path":{f},
         \\"benchmark_mode":"sequential",
         \\"repeat_runs":{d},
+        \\"runtime_min_in_dim":{d},
         \\"timing_aggregation":"median",
         \\"production_enabled":{},
         \\"correctness_passed":true,
@@ -1510,6 +1584,7 @@ fn writeQuantCompilerQ4_0Evidence(
         std.json.fmt(bench.correctness_evidence_path, .{}),
         std.json.fmt(bench.benchmark_evidence_path, .{}),
         cfg.quant_compiler_repeat_runs,
+        runtime_shape.min_in_dim,
         bench.production_enabled,
         benchmark_passed,
         benchmark_passed,

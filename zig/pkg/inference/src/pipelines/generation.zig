@@ -1818,6 +1818,7 @@ pub fn buildOwnedBatchDecodeContext(
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage orelse ctx.kv_cache.?.kv_storage,
         };
     }
 
@@ -1899,6 +1900,7 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage orelse ctx.kv_cache.?.kv_storage,
             .per_item_query_len = item.query_sequence_len,
             .per_item_total_len = item.total_sequence_len,
             .per_item_kv_len = item.kv_sequence_len,
@@ -2057,6 +2059,9 @@ pub const NativeGenerationPipeline = struct {
     decode_state: ?*NativeDecodeState = null,
     scheduler: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     scheduler_lease: ?*runtime.scheduler.native_generate.Lease = null,
+    /// Serializes the shared model backend for one claimed scheduler step.
+    /// Request-local tokenization and sampling remain outside this lock.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional smaller draft model for speculative decoding. When set
     /// together with `GenerationConfig.draft_model`, the generate loop
     /// proposes K tokens with the draft and verifies them against the
@@ -3141,13 +3146,17 @@ pub const NativeGenerationPipeline = struct {
         var prefill_last_hidden: ?ops.CT = null;
         var prefill_last_hidden_rows: usize = 0;
         errdefer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
-        const use_cuda_prefill_greedy_token = shouldUseCudaPrefillGreedyToken(
-            self.cb.kind(),
-            config,
-            allow_resident_greedy_token,
-            self.gpt_config.suppressTokenIds().len > 0,
-            enableCudaPrefillGreedyToken(),
-        );
+        const has_batching_peers = if (self.scheduler) |scheduler| scheduler.shouldBatchCurrentRequests() else false;
+        // A sole request keeps the device-greedy fast path. If a peer arrives
+        // after this check, execution_lock still serializes the direct forward.
+        const use_cuda_prefill_greedy_token = (self.execution_lock == null or !has_batching_peers) and
+            shouldUseCudaPrefillGreedyToken(
+                self.cb.kind(),
+                config,
+                allow_resident_greedy_token,
+                self.gpt_config.suppressTokenIds().len > 0,
+                enableCudaPrefillGreedyToken(),
+            );
         debugGenerationStage(
             "executePrefill enter seq_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -3271,6 +3280,11 @@ pub const NativeGenerationPipeline = struct {
                         if (self.io) |io| scheduler.awaitTurn(lease, .prefill, io);
                     }
                 }
+                const direct_execution_mutex = if (use_cuda_prefill_greedy_token) self.execution_lock else null;
+                if (direct_execution_mutex) |mutex| {
+                    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+                }
+                defer if (direct_execution_mutex) |mutex| mutex.unlock();
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
                 if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
@@ -3641,24 +3655,26 @@ pub const NativeGenerationPipeline = struct {
             "standardDecode enter seq_len={d} max_tokens={d} prefill_cached={}",
             .{ seq_len.*, max_tokens, prefill_last_logits.* != null },
         );
-        if (try self.standardDecodeCudaPendingTokenReadback(
-            token_ids,
-            seq_len,
-            decode_state,
-            config,
-            prefill_last_logits,
-            prefill_greedy_token,
-            penalty_state,
-            token_table,
-            json_grammar,
-            gbnf_grammar,
-            max_tokens,
-            prompt_token_count,
-            on_token_fn,
-            on_token_ctx,
-            emitted_text,
-        )) |pending_result| {
-            return pending_result;
+        if (self.execution_lock == null) {
+            if (try self.standardDecodeCudaPendingTokenReadback(
+                token_ids,
+                seq_len,
+                decode_state,
+                config,
+                prefill_last_logits,
+                prefill_greedy_token,
+                penalty_state,
+                token_table,
+                json_grammar,
+                gbnf_grammar,
+                max_tokens,
+                prompt_token_count,
+                on_token_fn,
+                on_token_ctx,
+                emitted_text,
+            )) |pending_result| {
+                return pending_result;
+            }
         }
 
         while (tokens_generated < max_tokens) {
@@ -3695,18 +3711,27 @@ pub const NativeGenerationPipeline = struct {
                 }
 
                 const has_cached_prefill_logits = tokens_generated == 0 and prefill_last_logits.* != null;
-                if (!has_cached_prefill_logits) {
-                    if (try self.forwardGreedyDeviceDecodeToken(
-                        token_ids,
-                        seq_len.*,
-                        tokens_generated,
-                        decode_state,
-                        config,
-                        token_table,
-                        json_grammar,
-                        gbnf_grammar,
-                        device_token_tensor,
-                    )) |token| {
+                const allow_direct_device_decode = self.execution_lock == null or
+                    (if (self.scheduler) |scheduler| !scheduler.shouldBatchCurrentRequests() else true);
+                if (!has_cached_prefill_logits and allow_direct_device_decode) {
+                    const direct_token = direct_token_blk: {
+                        if (self.execution_lock) |mutex| {
+                            while (!mutex.tryLock()) std.atomic.spinLoopHint();
+                        }
+                        defer if (self.execution_lock) |mutex| mutex.unlock();
+                        break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
+                            token_ids,
+                            seq_len.*,
+                            tokens_generated,
+                            decode_state,
+                            config,
+                            token_table,
+                            json_grammar,
+                            gbnf_grammar,
+                            device_token_tensor,
+                        );
+                    };
+                    if (direct_token) |token| {
                         next_device_token_tensor = token.token_tensor;
                         break :blk .{ .token = token.token, .grammar_complete = false };
                     }
@@ -7087,6 +7112,12 @@ pub const NativeGenerationPipeline = struct {
         notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .decode, 1);
         notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .decode);
 
+        const coalesce_delay_us = scheduler.decodeCoalesceDelayUs(lease.*);
+        if (coalesce_delay_us > 0) {
+            scheduler.noteDecodeCoalesceWait(coalesce_delay_us);
+            io.sleep(std.Io.Duration.fromMicroseconds(coalesce_delay_us), .awake) catch {};
+        }
+
         var driver = DecodeStepDriver{
             .pipeline = self,
             .scheduler = scheduler,
@@ -7126,6 +7157,12 @@ pub const NativeGenerationPipeline = struct {
         defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
         notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .prefill, query_seq_len);
         notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .prefill);
+        if (self.execution_lock != null) {
+            // CUDA row-batched prefill is not response-equivalent yet. Keep
+            // prefill under the scheduler/execution lock, but as a singleton;
+            // decode tokens remain eligible for continuous batching.
+            scheduler.notePendingExclusiveStep(@ptrCast(&work), .prefill, true);
+        }
 
         var driver = PrefillStepDriver{
             .pipeline = self,
@@ -7255,6 +7292,11 @@ pub const NativeGenerationPipeline = struct {
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
+        if (self.execution_lock) |mutex| {
+            while (!mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+
         const result = self.forwardScheduledStep(claimed) catch |err| {
             markStepFailed(claimed, err);
             scheduler.completeStep(lease, claimed);

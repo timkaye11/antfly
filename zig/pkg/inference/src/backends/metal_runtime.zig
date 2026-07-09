@@ -6318,6 +6318,9 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_gemm_calls: u64 = 0,
     deberta_attention_gemm_fallbacks: u64 = 0,
     paged_attention_1x_calls: u64 = 0,
+    generated_attention_decode_1x_calls: u64 = 0,
+    generated_attention_flash_prefill_calls: u64 = 0,
+    generated_rms_norm_calls: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -6413,6 +6416,18 @@ pub const RawRuntimeMemoryStats = extern struct {
     antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
     rms_norm_add_sumsq: u64 = 0,
 };
+
+test "metal generated attention and RMS opt-ins are fail-closed and execution-counted" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "BOOL missing_requested_generated_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "missing_requested_generated_pipeline || missing_quant_reduce_pipeline"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_decode_1x_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->generated_rms_norm_calls += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_encode_rms_norm_generated("));
+}
 
 pub extern fn termite_metal_device_available() c_int;
 

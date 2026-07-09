@@ -28,6 +28,8 @@ The dispatch-facing API is still the existing graph planning contract:
 
 - `src/graph/quant_matmul.zig`: format, row bucket, dispatch bucket, and generic
   quant matmul planning vocabulary.
+- `src/graph/quant_kernel_op.zig`: dependency-light operation and epilogue tags
+  shared by the compiler and backend renderers.
 - `src/graph/quant_kernel_compiler.zig`: compiler descriptors, IR, generated
   artifacts, route registry, benchmark manifests, promotion evidence policy, and
   the `metal_production_schedules` table (the single source for each generated
@@ -38,6 +40,12 @@ The dispatch-facing API is still the existing graph planning contract:
   the schedule, with per-format dequant math supplied as `FormatDecoder` leaf
   fragments over a shared `antfly_qk_*` vocabulary. This is what makes a route's
   body a function of its schedule rather than frozen text.
+- `src/graph/quant_kernel_cuda_renderer.zig`: the typed CUDA renderer. Each
+  artifact selects a validated `KernelLowering` and exact launch contract (grid
+  mapping, output tile, threads, static/dynamic shared memory, and dimension
+  constraints). The Q4_0 MMV/MM/pair family shares one parameterized projection
+  skeleton; fixed fused-FFN bodies remain explicit specializations behind exact
+  640-thread/256-thread and model-dimension contracts.
 - `src/backends/metal_kernels.m`: native Metal runtime and provider lowering.
 
 Production Metal compiles the inline kernel copies embedded in
@@ -67,9 +75,11 @@ Generated artifacts are checked in:
   kernels included; promotion is recorded in the manifest, not by a separate
   file copy).
 - `src/ops/cuda/generated/quant_kernel_*.cu`: generated CUDA candidates.
+  These files are rendered from typed plans rather than stored source templates.
   Promoted CUDA kernels are additionally embedded in the production
   `src/ops/cuda/artifacts/inference_cuda_kernels.{cu,ptx,fatbin,_sm89.cubin}`
-  bundle via `scripts/regen-cuda-artifacts.sh`.
+  bundle via `scripts/regen-cuda-artifacts.sh`. Compiler tests validate every
+  renderer-owned helper fragment and complete kernel body against that bundle.
 - `src/ops/cuda/generated/evidence/*.json`: checked-in CUDA promotion
   benchmark evidence.
 - `src/ops/cuda/generated/quant_kernel_*.json`: spec, artifact, benchmark, and
@@ -93,12 +103,12 @@ are keyed by `kernel_id` and are op-agnostic; `op_kind` lives on the shared
 and microkernels do not reuse them.
 
 Key design rule: **keep the matmul path byte-identical.** Non-matmul routes live
-in a separate `first_generated_microkernel_artifacts` list, not mixed into
-`first_generated_artifacts`, so every matmul manifest/evidence/benchmark loop and
-the 22-case production-regression gate are untouched (no `op_kind` guards sprinkled
-through dozens of matmul-assuming loops, no evidence-schema bump). The codegen
-routing seam is `compiledSourceForArtifact` (`native_quant_kernel_codegen.zig`),
-which switches on `artifact.op_kind`.
+in the authoritative `first_generated_artifacts` registry as a tagged
+`GeneratedOp`. Matmul promotion and benchmark code consumes the derived
+`first_generated_matmul_artifacts` compatibility view; attention and microkernel
+views are derived from the same registry. The codegen routing seam is
+`compiledSourceForArtifact` (`native_quant_kernel_codegen.zig`), which switches
+on `artifact.opKind()`.
 
 Rendering: `RegionKernel` is op-kind-aware (defaulted fields keep matmul
 construction byte-identical); `renderRuntimeRegion` dispatches body rendering per
@@ -111,17 +121,26 @@ constant.
 **First non-matmul route (landed): RMSNorm** (`op_kind = .microkernel`, kernel
 `antfly_rms_norm_generated_msl_v1`, `src/ops/metal/generated/microkernel_rms_norm.metal`).
 Pure f32, one threadgroup per row, threadgroup-tree reduction. It is opt-in
-(`TERMITE_METAL_ENABLE_RMS_NORM_GENERATED`); the hand-written
-`termite_apply_rms_norm_rows` stays the production baseline. Conformance runs on
+(`TERMITE_METAL_ENABLE_RMS_NORM_GENERATED`); when requested, the regular rows
+encoder routes through the generated kernel and records `generated_rms_norm`.
+Pipeline creation fails closed if the requested function cannot be built. The
+hand-written `termite_apply_rms_norm_rows` stays the default production
+baseline. Conformance runs on
 device via a sister FFI (`termite_metal_run_generated_microkernel_check`) against
 a self-contained CPU reference (validated bit-identical vs the hand-written kernel,
 `max_abs_error ≤ ~3e-6` across `n∈{1,2,3,4} × d∈{64,128,512,2048,4096}`).
 
-**Attention (next).** Attention routes plug in as `op_kind = .attention` with an
-`AttentionSchedule` and a `renderAttention` skeleton, gated the same way. Because
-attention feeds the whole model, its correctness gate is **bit-identical model
-tokens** (`scripts/compare_metal_gemma4_e4b_qat.sh` oracle text + greedy token-id
-prefix), not raw-float conformance — argmax is robust to summation-order drift.
+**Attention (landed, opt-in).** Metal decode-1x paged attention and flash prefill
+use `op_kind = .attention`, `AttentionSchedule`, and the shared Metal attention
+renderer. CUDA now also has a typed `AttentionRenderPlan` for dense GQA decode,
+specialized to `q_seq_len=1`, `head_dim=256`, and the nullable device-scalar ABI.
+Its standalone `.cu`, manifest launch contract, and runtime-bundle body are
+drift-checked from the same renderer. The CUDA route is gated by
+`ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1`, fails closed when its
+symbol is missing, and records `launch_attention_gqa_decode_generated`. Since
+attention feeds the whole model, promotion requires token parity plus reviewed
+performance evidence across representative models, context lengths, masks, and
+sliding windows.
 
 ## Compile Flow
 
@@ -154,10 +173,10 @@ defer emitted.deinit(allocator);
 `emitCompiledSource(...)` is the source emission boundary. Metal small-batch
 families return the canonical assembled source: license header, plan metadata,
 the helper constants the kernel references, and the runtime-region kernel body
-byte-for-byte. CUDA families return the checked-in canonical template. Both
-paths borrow comptime-assembled text: generated files stay checked in,
-production dispatch stays artifact-backed, and source changes remain visible
-in review.
+byte-for-byte. CUDA families render allocator-owned source from the artifact's
+typed backend plan. Generated files stay checked in, production dispatch stays
+artifact-backed, and full-file golden checks keep source fingerprints and
+promotion evidence stable.
 
 The codegen executable is always built for the build host, not the selected
 runtime target, so source checks still work during Linux/CUDA cross builds.
@@ -177,10 +196,11 @@ Current single-sourced Metal families:
 - `Q8_1` small batch: `none`.
 - `Q8_K` small batch: `none`.
 
-The focused compiler test proves the emitted source is the canonical assembled
-constant and that every generated Metal source ends with its runtime-region
-kernel body byte-for-byte. It also keeps at least one CUDA borrowed-source case
-so the fallback path remains covered.
+The focused compiler test proves every emitted source matches its checked-in
+full-file golden. Every generated Metal source ends with its runtime-region
+kernel body byte-for-byte; every CUDA source is freshly rendered and owned by
+the emission result. A separate CUDA production-bundle test validates route
+metadata, every helper fragment, and every complete promoted body.
 
 1. Add or change a `QuantKernelSpec` in
    `src/graph/quant_kernel_compiler.zig`.
@@ -188,7 +208,9 @@ so the fallback path remains covered.
 3. For a Metal small-batch family, add a `FormatDecoder` + a
    `metal_production_schedules` entry; the renderer generates the body at
    `--write` time (no hand-written body/helper constants, no section table). For
-   CUDA, add the canonical checked-in source template.
+   CUDA, add a typed `KernelKind`/`KernelLowering`, its exact launch contract,
+   and a renderer body family or specialization. Do not add a whole-source
+   template.
 4. From `zig/pkg/inference`, run:
 
    ```sh
@@ -297,9 +319,11 @@ Cleared blocker evidence is not enough by itself. It is only a signal to
 investigate. Production promotion requires checked-in evidence plus the
 production-regression gate.
 
-CUDA promotion uses the same shape with CUDA-specific mechanics: the promoted
-source copy must live outside `src/ops/cuda/generated/`, the benchmark command
-is sequential `bench-cuda` with `--warmup-iters 5 --measure-iters 50
+CUDA promotion uses the same shape with CUDA-specific mechanics: the canonical
+generated source remains under `src/ops/cuda/generated/`, while the production
+artifact source and compiled bundle remain under `src/ops/cuda/artifacts/` and
+are checked byte-for-byte against the promoted generated bodies. The benchmark
+command is sequential `bench-cuda` with `--warmup-iters 5 --measure-iters 50
 --quant-compiler-repeat-runs 3` and an `--quant-compiler-evidence-out` path, the
 measured geomean speedup must clear `minimum_speedup` (1.0) against the named
 handwritten baseline with CPU-reference correctness inside tolerance, and a
@@ -318,7 +342,7 @@ all Q4_0, promoted on sequential benchmark evidence measured on an NVIDIA L4
 | kernel | plan | handwritten baseline | measured speedup (geomean) |
 |---|---|---|---|
 | `antfly_q4_0_mmv_f32_v1` | `cuda/q4_0/rows_1/none/mmv` | `termite_linear_q4_0_f32_tile4` | 1.18 (worst shape 1.02, LM head 1.30) |
-| `antfly_q4_0_mm_f32_v1` | `cuda/q4_0/rows_9_64/none/mm` | `termite_linear_q4_0_f32` | 3.53 (up to 10.23 on FFN-down; 0.75 at in_dim=256, runtime-gated) |
+| `antfly_q4_0_mm_f32_v1` | `cuda/q4_0/rows_9_64/none/mm` | `termite_linear_q4_0_f32` | 5.91 eligible-shape geomean (worst 2.62; 0.75 at in_dim=256 is excluded) |
 | `antfly_q4_0_pair_mmv_f32_v1` | `cuda/q4_0/rows_1/pair/mmv` | `termite_linear_q4_0_pair_nobias_f32_tile4_w4` | 1.29 |
 | `antfly_q4_0_pair_activation_q8_1_mmv_v1` | `cuda/q4_0/rows_1/pair_activation/mmv` | `termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn` | 1.28 |
 | `antfly_q4_0_down_q8_1_mmv_v1` | `cuda/q4_0/rows_1/gated_down/mmv` | `termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down` | 1.31 |
@@ -344,7 +368,7 @@ Speedups are geomeans across the Gemma4 E2B QAT dispatch shapes recorded in the
 bench targets (`bench-cuda --quant-compiler-q4-0-{mmv,mm,pair}-ptx`), with
 CPU-reference and baseline-output max-abs-diff at or below 3e-6. The mm
 evidence also records a losing shape: `in_dim=256` (E2B PLE projection) runs at
-about 0.73x the handwritten baseline, so the runtime route only claims rows
+about 0.75x the handwritten baseline, so the runtime route only claims rows
 9..64 shapes with `in_dim >= 512` (`cuda_q4_0_generated_mm_min_in_dim` in
 `cuda_compute.zig`); narrower shapes stay on the handwritten kernel. The mmv
 bench additionally cross-checks the Gemma4 LM-head shape (`1536 -> 262144`)
@@ -391,12 +415,13 @@ set `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR=1`. The plain
 tile4_w4 experiment envs (default off) still take precedence over the
 generated mmv kernel when explicitly enabled.
 
-Local reproduction note: the manifest-pinned `nvcc -ptx -arch=compute_75`
-check commands emit PTX ISA matched to the pinned CUDA 13.2 toolkit. Drivers
-older than the toolkit (for example 580.x = CUDA 13.0) cannot JIT that PTX;
-compile `-cubin -arch=sm_89` to the pinned `/tmp/*.ptx` paths instead when
-running the benchmark/evidence commands locally. The production runtime is
-unaffected: it loads the checked-in fatbin/cubin artifacts.
+Local reproduction note: the manifest-pinned commands build benchmark modules
+as fatbins containing `sm_75`, `sm_80`, `sm_89`, and `sm_90` cubins plus a
+`compute_75` PTX fallback. An L4 therefore loads `sm_89` SASS even when its R580
+driver cannot JIT PTX ISA emitted by CUDA 13.2. The benchmark CLI option names
+still end in `-ptx` for compatibility, but their paths are CUDA module images and
+accept PTX, cubin, or fatbin through `cuModuleLoadDataEx`. Use the exact
+manifest command and `.fatbin` path when refreshing evidence.
 
 The remaining non-promoted CUDA candidate is the first lazy Q4_K
 `rows_2_8`/`bias_gelu` kernel, which loses to its handwritten baseline (0.74x)
@@ -432,11 +457,10 @@ counts for non-promoted candidates may vary with timing noise; production
 promotion does not rely on route-all speedup alone.
 
 The dedicated blocker evidence table remains intentionally stricter than
-route-all: 17 candidate kernels are guarded, 12 have benchmark-evidence paths
-(`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q4_K none, Q6_K bias+GELU, and
-Q8_0 bias+GELU; `unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU,
-Q5_K none, Q5_K bias+GELU, Q8_1 none, and Q8_K none), and 5 are
-route-evidence-only
+route-all: 14 candidate kernels are guarded, 9 have benchmark-evidence paths
+(`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q6_K bias+GELU, and Q8_0
+bias+GELU; `unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU, Q5_K
+bias+GELU, and Q8_1 none), and 5 are route-evidence-only
 because their handwritten baseline is unsupported. Cleared one-off evidence for
 these kernels is production-regression guarded and does not promote the kernel
 by itself.
@@ -445,12 +469,11 @@ This is intentional. A slow or noisy candidate is useful for compiler coverage,
 route testing, and future tuning, but it must not silently become the production
 route.
 
-Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K none/bias+GELU, Q5_K none/bias+GELU,
-Q6_K bias+GELU, Q8_0 bias+GELU, Q8_1 none, and Q8_K none note: these
-generated kernels are correct and useful for route coverage, but they are not
-production defaults. Their blocker evidence is production-regression guarded; a
-one-off local promotion-ready result is a signal to investigate, not enough to
-promote.
+Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K bias+GELU, Q5_K bias+GELU, Q6_K
+bias+GELU, Q8_0 bias+GELU, and Q8_1 none note: these generated kernels are
+correct and useful for route coverage, but they are not production defaults.
+Their blocker evidence is production-regression guarded; a one-off local
+promotion-ready result is a signal to investigate, not enough to promote.
 
 Current Q2_K/Q3_K bias and bias+GELU plus Q8_0 relu note: these generated
 kernels prove correctness and dispatch wiring through route-all, but they do not
@@ -470,8 +493,8 @@ Current local validation snapshot:
 - `zig build quant-kernel-codegen -- --check-metal` compiles the generated and
   promoted Metal sources through `xcrun`.
 - `zig build quant-kernel-metal-production-regression-check -Dmetal=true -Dcuda=false`
-  runs the 8 promoted kernels across 16 generated-vs-handwritten cases.
-  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 16
+  runs the 11 promoted kernels across 22 generated-vs-handwritten cases.
+  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 22
   Metal production-regression cases with shape, dims, tolerance, source
   fingerprint, and benchmark command metadata. The target fails on hard route
   blockers such as missing generated/provider routes, unsupported production
@@ -524,7 +547,7 @@ evidence file also records the compiler benchmark manifest schema, case count,
 and case fingerprint, and the evidence checker rejects stale or partial case
 sets before trusting benchmark speedups. Successful production-regression checks
 also print the identity in the summary line as:
-`benchmark_manifest=antfly.quant_kernel_benchmarks.v5:16:<fingerprint>`.
+`benchmark_manifest=antfly.quant_kernel_benchmarks.v5:22:<fingerprint>`.
 
 ## Runtime Observability
 
@@ -599,16 +622,23 @@ The minimal path for a matmul format/epilogue is:
 To add a **microkernel op-kind** (worked example — RMSNorm is the reference
 implementation):
 
-1. Add a `renderMicrokernel` skeleton (self-contained MSL; no `FormatDecoder`,
-   no epilogue) and a comptime `renderMetalMicrokernelSource` source constant.
-2. Add a `GeneratedArtifact` with `op_kind = .microkernel` to the separate
-   `first_generated_microkernel_artifacts` list (keeps the matmul machinery
-   byte-identical), and append its `RegionKernel` to the runtime region.
-3. Wire the `.microkernel` arm of `compiledSourceForArtifact`.
-4. Add a conformance case: a CPU reference and (if the buffer layout differs from
+1. Add the operation identity to `quant_kernel_op.zig` and a
+   `renderMicrokernel` skeleton (self-contained MSL; no `FormatDecoder` or
+   matmul epilogue) to the backend renderer.
+2. Add one `GeneratedArtifact` to the authoritative
+   `first_generated_artifacts` registry. Its tagged `.op.microkernel` payload
+   carries the operation kind and schedule; do not add placeholder quant format,
+   row-bucket, or epilogue fields.
+3. Wire its standalone source renderer. The codegen tool and Metal runtime
+   region both iterate the unified registry, while operation-specific harness
+   views are derived at comptime.
+4. Run `zig build quant-kernel-codegen -- --write`, then `--check`. Registry
+   validation rejects missing sources, empty identities, and duplicate global
+   kernel IDs or source paths in normal codegen builds.
+5. Add a conformance case: a CPU reference and (if the buffer layout differs from
    matmul) a sister on-device FFI runner. Validate bit-identical vs the
    hand-written baseline.
-5. Add an opt-in kill switch + pipeline/dispatch in `metal_kernels.m`; keep the
+6. Add an opt-in kill switch + pipeline/dispatch in `metal_kernels.m`; keep the
    hand-written kernel as the production baseline until the route is promoted.
 
 Do not add a general compiler abstraction unless it removes real duplicated
@@ -623,14 +653,12 @@ frozen `metal_rt_body_*` constants and the `metal_runtime_quant_sections` table
 are gone. A schedule edit + `--write` fully regenerates the kernel — no hand-paste.
 See Source Of Truth above.
 
-**Attention family.** The op-kind framework is in place (RMSNorm is the first
-non-matmul route). The main remaining value is a *family* of narrowly-routed
-attention kernels — decode hot paths (fixed Gemma/Qwen head layouts, paged,
-GQA/MQA, causal/windowed), paged/quantized-KV read, and the prefill flash kernel
-as a `--sweep`-tunable route (key-chunk 32/64, SG count, gather-vs-direct,
-rescale-skip) — plus more fused microkernels (head-rope, KV write/read). Each is a
-`renderAttention`/`renderMicrokernel` skeleton + conformance case + dispatch +
-evidence, gated on bit-identical model tokens.
+**Attention family.** Decode-1x paged attention and sweep-tunable flash prefill
+are now generated routes. The remaining value is broader route coverage:
+fixed-layout Gemma/Qwen decode variants, quantized-KV read/write, and more fused
+microkernels such as head-rope and KV write/read. Each addition still needs a
+`renderAttention`/`renderMicrokernel` skeleton, conformance case, dispatch
+evidence, and a model-level token/coherence gate.
 
 **Autotune automation.** `--sweep` is a directional filter followed by a manual
 decode-runtime A/B before promotion. A closer-to-automated
@@ -638,10 +666,23 @@ sweep → conformance → decode-runtime-gate → promote loop (with the existin
 machine-load-aware timing discipline) would make exploiting the new op-kinds
 cheap.
 
-**CUDA renderer.** The `KernelSchedule` / `FormatDecoder` data model is
-backend-neutral by design. A CUDA renderer would add a `lane_decode_cuda` fragment
-per `FormatDecoder` and a CUDA skeleton consuming the same `KernelSchedule`,
-reusing the sweep and promotion machinery unchanged. Only the Metal renderer
-exists today; the CUDA generated kernels remain the checked-in hand-written `.cu`
-templates. Bringing single-sourcing + the op-kind framework to CUDA is the
-remaining *multi-backend* industry-grade gap.
+**CUDA renderer (FIRST FAMILIES DONE).** The first six quant CUDA artifacts render
+from typed backend plans. Q4_0 MMV, 8-row MM, and paired MMV share one projection
+lowering; Q4_K small batch and the two fixed q8_1 FFN routes are tagged families
+with validated launch contracts. A seventh, operation-typed CUDA artifact covers
+the first GQA decode-attention specialization without placeholder quant route
+fields. Artifact manifest v4 serializes exact CUDA launch metadata, and checked-in
+`.cu` files are full-byte goldens. Remaining work is broader quant and attention
+coverage, schedule variants/autotuning, and making the marker-delimited
+production CUDA region codegen-owned rather than separately deployed with strict
+fragment drift validation.
+
+The Q4_0 Q8_1 pair-activation and gated-down CUDA families now use runtime
+`rows`, `in_dim`, and `out_dim` launch parameters instead of Gemma E4B constants.
+They are therefore valid candidates for E2B and future compatible shapes, but
+shape generality is not promotion evidence: the E2B long-decode comparison
+currently keeps Q8_1 FFN precompute default-off. The generated online-softmax
+GQA decode route is independently gated and remains covered by exact-token and
+paired llama.cpp benchmarks. Continuous batching uses the same rule: all
+multi-row CUDA execution remains experimental until the long-run KV
+page-boundary, response-equivalence, and throughput gates pass.

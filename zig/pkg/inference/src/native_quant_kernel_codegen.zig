@@ -214,30 +214,13 @@ fn printUsage() void {
 }
 
 fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
+    try quant_kernel_compiler.validateGeneratedArtifactRegistry();
     const source_count = generatedSourceFileCount();
     const files = try allocator.alloc(GeneratedFile, source_count + 4);
     @memset(files, .{ .path = "", .data = "" });
     errdefer freeGeneratedFiles(allocator, files);
     var index: usize = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
-        const source = try compiledSourceForArtifact(allocator, artifact);
-        files[index] = .{
-            .path = artifact.source_path,
-            .data = source.data,
-            .owned = source.owned,
-        };
-        index += 1;
-    }
-    for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
-        const source = try compiledSourceForArtifact(allocator, artifact);
-        files[index] = .{
-            .path = artifact.source_path,
-            .data = source.data,
-            .owned = source.owned,
-        };
-        index += 1;
-    }
-    for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
         const source = try compiledSourceForArtifact(allocator, artifact);
         files[index] = .{
             .path = artifact.source_path,
@@ -283,7 +266,7 @@ fn compiledSourceForArtifact(
     // (decode-1x paged) render their self-contained body via the renderer's
     // op-kind paths — no dequant decoder, no matmul lowering. Both return the
     // comptime-rendered source constant directly.
-    switch (artifact.op_kind) {
+    switch (artifact.opKind()) {
         .small_batch_matmul => {},
         .microkernel, .attention => {
             const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
@@ -291,11 +274,12 @@ fn compiledSourceForArtifact(
             return .{ .data = source, .owned = false };
         },
     }
+    const op = artifact.matmulOp() orelse return error.InvalidGeneratedArtifactOp;
     const compiled = quant_kernel_compiler.compileQuantKernelSource(.{
         .backend = artifact.backend,
-        .format = artifact.format,
-        .row_bucket = artifact.row_bucket,
-        .epilogue = artifact.epilogue,
+        .format = op.format,
+        .row_bucket = op.row_bucket,
+        .epilogue = op.epilogue,
     }) orelse return error.MissingGeneratedQuantKernelSource;
     if (!std.mem.eql(u8, compiled.artifact.kernel_id, artifact.kernel_id)) {
         return error.MissingGeneratedQuantKernelSource;
@@ -309,9 +293,7 @@ fn compiledSourceForArtifact(
 }
 
 fn generatedSourceFileCount() usize {
-    return quant_kernel_compiler.first_generated_artifacts.len +
-        quant_kernel_compiler.first_generated_microkernel_artifacts.len +
-        quant_kernel_compiler.first_generated_attention_artifacts.len;
+    return quant_kernel_compiler.first_generated_artifacts.len;
 }
 
 fn freeGeneratedFiles(allocator: std.mem.Allocator, files: []GeneratedFile) void {
@@ -391,16 +373,6 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
 fn checkMetalArtifacts(allocator: std.mem.Allocator, io: std.Io) !void {
     var count: usize = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
-        if (artifact.backend != .metal) continue;
-        try checkMetalArtifact(allocator, io, artifact);
-        count += 1;
-    }
-    for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
-        if (artifact.backend != .metal) continue;
-        try checkMetalArtifact(allocator, io, artifact);
-        count += 1;
-    }
-    for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         try checkMetalArtifact(allocator, io, artifact);
         count += 1;
@@ -539,6 +511,11 @@ test "quant kernel codegen sources map to compiler artifacts" {
     for (quant_kernel_compiler.first_generated_artifacts, sources[0..quant_kernel_compiler.first_generated_artifacts.len]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
+        if (artifact.backend == .cuda and artifact.opKind() == .small_batch_matmul) {
+            try std.testing.expect(source.owned);
+        } else {
+            try std.testing.expect(!source.owned);
+        }
     }
 
     const spec_manifest = sources[sources.len - 4];
@@ -553,15 +530,20 @@ test "quant kernel codegen sources map to compiler artifacts" {
     const artifact_manifest = sources[sources.len - 3];
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_artifact_manifest_path, artifact_manifest.path);
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, quant_kernel_compiler.first_artifact_manifest_schema));
-    const artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"artifact_count\": {d}", .{quant_kernel_compiler.first_generated_artifacts.len});
+    const artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"artifact_count\": {d}", .{quant_kernel_compiler.first_generated_matmul_artifacts.len});
     defer std.testing.allocator.free(artifact_count);
     try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, artifact_count));
+    const registry_artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"registry_artifact_count\": {d}", .{quant_kernel_compiler.first_generated_artifacts.len});
+    defer std.testing.allocator.free(registry_artifact_count);
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, registry_artifact_count));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, "\"op_kind\": \"microkernel\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, "\"op_kind\": \"attention\""));
     var runtime_evidence_count: usize = 0;
     var runtime_route_evidence_count: usize = 0;
     var promotion_evidence_count: usize = 0;
     var promotion_check_count: usize = 0;
     var metal_evidence_count: usize = 0;
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, artifact.kernel_id));
         try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, artifact.source_path));
         try std.testing.expect(std.mem.containsAtLeast(u8, artifact_manifest.data, 1, artifact.check_command));
@@ -634,7 +616,7 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
     const sources = try generatedFiles(std.testing.allocator);
     defer freeGeneratedFiles(std.testing.allocator, sources);
 
-    const matmul_count = quant_kernel_compiler.first_generated_artifacts.len;
+    const matmul_count = quant_kernel_compiler.first_generated_matmul_artifacts.len;
     const micro_count = quant_kernel_compiler.first_generated_microkernel_artifacts.len;
     const attn_count = quant_kernel_compiler.first_generated_attention_artifacts.len;
     try std.testing.expect(micro_count > 0);
@@ -648,16 +630,28 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, kernel_decl));
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <metal_stdlib>"));
     }
-    // Attention sources follow the microkernels; each is self-contained MSL.
+    // Attention sources follow the microkernels; each is self-contained for
+    // its backend and is emitted from the typed attention renderer plan.
     for (quant_kernel_compiler.first_generated_attention_artifacts, sources[matmul_count + micro_count .. matmul_count + micro_count + attn_count]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
-        const kernel_decl = try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id});
+        const kernel_decl = switch (artifact.backend) {
+            .metal => try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id}),
+            .cuda => try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{artifact.kernel_id}),
+        };
         defer std.testing.allocator.free(kernel_decl);
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, kernel_decl));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <metal_stdlib>"));
-        // Self-contained: its own params struct + paging helper travel with it.
-        try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "struct antfly_paged_attention_1x_params {"));
+        switch (artifact.backend) {
+            .metal => {
+                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <metal_stdlib>"));
+                // Self-contained: its own params struct + paging helper travel with it.
+                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "struct antfly_paged_attention_1x_params {"));
+            },
+            .cuda => {
+                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <math.h>"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned int* decode_scalars"));
+            },
+        }
     }
     // Manifests stay the trailing 4 files.
     try std.testing.expectEqualStrings(quant_kernel_compiler.first_spec_manifest_path, sources[sources.len - 4].path);

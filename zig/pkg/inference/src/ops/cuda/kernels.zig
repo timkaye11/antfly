@@ -35,6 +35,14 @@ fn fastGqaDecodeDisabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FAST_GQA_DECODE", false);
 }
 
+fn generatedGqaDecodeEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE", false);
+}
+
+fn generatedGqaDecodeShapeEligible(q_seq_len: usize, head_dim: usize, num_heads: usize, num_kv_heads: usize) bool {
+    return q_seq_len == 1 and head_dim == 256 and num_kv_heads > 0 and num_heads % num_kv_heads == 0;
+}
+
 fn fastGqaPrefillEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST", false);
 }
@@ -81,6 +89,7 @@ fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_
 pub const GqaAttentionLaunchKind = enum {
     none,
     decode,
+    decode_generated,
     decode_fast,
     decode_fast_fallback,
     prefill_fast,
@@ -210,6 +219,7 @@ pub const KernelModule = struct {
     gqa_attention_decode_scalars_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_scalars_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_scalars_generated_hd256_f32: driver_mod.CUfunction = null,
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_fast_f32: driver_mod.CUfunction = null,
@@ -500,6 +510,10 @@ pub const KernelModule = struct {
         const gqa_attention_decode_scalars_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_fast_f32");
         const gqa_attention_prefill_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_fast_f32");
         const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
+        const gqa_attention_decode_scalars_generated_hd256_f32 = loadOptionalFunction(ctx, module, "antfly_gqa_attention_decode_scalars_hd256_f32_v1");
+        if (generatedGqaDecodeEnabled() and gqa_attention_decode_scalars_generated_hd256_f32 == null) {
+            return error.CudaKernelUnavailable;
+        }
         const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
         const gqa_attention_decode_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_fast_f32");
         const gqa_attention_prefill_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_fast_f32");
@@ -786,6 +800,7 @@ pub const KernelModule = struct {
             .gqa_attention_decode_scalars_fast_f32 = gqa_attention_decode_scalars_fast_f32,
             .gqa_attention_prefill_fast_f32 = gqa_attention_prefill_fast_f32,
             .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
+            .gqa_attention_decode_scalars_generated_hd256_f32 = gqa_attention_decode_scalars_generated_hd256_f32,
             .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
             .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
             .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
@@ -1031,6 +1046,7 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_scalars_fast_f32 = null;
             self.gqa_attention_prefill_fast_f32 = null;
             self.gqa_attention_decode_scalars_f32 = null;
+            self.gqa_attention_decode_scalars_generated_hd256_f32 = null;
             self.kv_write_suffix_decode_scalars_f32 = null;
             self.gqa_attention_decode_turboquant_fast_f32 = null;
             self.gqa_attention_prefill_turboquant_fast_f32 = null;
@@ -5371,6 +5387,48 @@ pub const KernelModule = struct {
                 bias_mode_u32,
             });
         }
+        if (generatedGqaDecodeEnabled() and generatedGqaDecodeShapeEligible(q_seq_len, head_dim, num_heads, num_kv_heads)) {
+            const generated_function = self.gqa_attention_decode_scalars_generated_hd256_f32 orelse return error.CudaKernelUnavailable;
+            var decode_scalars_ptr: driver_mod.CUdeviceptr = 0;
+            var generated_params = [_]?*anyopaque{
+                @ptrCast(&dst_ptr),
+                @ptrCast(&q_ptr),
+                @ptrCast(&k_ptr),
+                @ptrCast(&v_ptr),
+                @ptrCast(&mask_ptr),
+                @ptrCast(&bias_ptr),
+                @ptrCast(&batch_u32),
+                @ptrCast(&q_seq_len_u32),
+                @ptrCast(&kv_seq_len_u32),
+                @ptrCast(&num_heads_u32),
+                @ptrCast(&num_kv_heads_u32),
+                @ptrCast(&head_dim_u32),
+                @ptrCast(&query_position_offset_u32),
+                @ptrCast(&kv_position_offset_u32),
+                @ptrCast(&sliding_window_u32),
+                @ptrCast(&total_sequence_len_u32),
+                @ptrCast(&mask_len_u32),
+                @ptrCast(&bias_mode_u32),
+                @ptrCast(&decode_scalars_ptr),
+            };
+            const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+            try ctx.makeCurrent();
+            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                generated_function,
+                grid,
+                1,
+                1,
+                128,
+                1,
+                1,
+                0,
+                ctx.stream,
+                &generated_params,
+                null,
+            ));
+            ctx.noteKernelLaunch();
+            return .decode_generated;
+        }
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
             if (fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
@@ -5500,7 +5558,14 @@ pub const KernelModule = struct {
         };
         var function = fallback_function;
         var launch_kind: GqaAttentionLaunchKind = .decode;
-        if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+        if (generatedGqaDecodeEnabled() and generatedGqaDecodeShapeEligible(q_seq_len, head_dim, num_heads, num_kv_heads)) {
+            if (self.gqa_attention_decode_scalars_generated_hd256_f32) |generated_function| {
+                function = generated_function;
+                launch_kind = .decode_generated;
+            } else {
+                return error.CudaKernelUnavailable;
+            }
+        } else if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
             launch_kind = .decode_fast_fallback;
             if (!fastGqaDecodeDisabled()) {
                 if (self.gqa_attention_decode_scalars_fast_f32) |fast_function| {
@@ -5510,7 +5575,11 @@ pub const KernelModule = struct {
             }
         }
         if (captureParamTraceIndex(ctx)) |trace_index| {
-            const kernel_name = if (launch_kind == .decode_fast) "gqa_attention_decode_scalars_fast" else "gqa_attention_decode_scalars";
+            const kernel_name = switch (launch_kind) {
+                .decode_generated => "gqa_attention_decode_scalars_generated_hd256",
+                .decode_fast => "gqa_attention_decode_scalars_fast",
+                else => "gqa_attention_decode_scalars",
+            };
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} fallback_query_position_offset={d} fallback_kv_seq_len={d} fallback_total_sequence_len={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
@@ -5525,7 +5594,7 @@ pub const KernelModule = struct {
                 total_sequence_len_u32,
             });
         }
-        const block: c_uint = if (head_dim <= 256) 256 else 512;
+        const block: c_uint = if (launch_kind == .decode_generated) 128 else if (head_dim <= 256) 256 else 512;
         const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
@@ -9165,8 +9234,7 @@ pub const KernelModule = struct {
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
-    // E4B FFN-specific: the CUDA body bakes in 2560 input columns and
-    // 10240 activated columns to keep row-aware Q8_1 prefill fast.
+    // Generated Q8_1 gated-down projection for decode and small batches.
     pub fn launchLinearQ4_0GeneratedDownQ8(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -9178,21 +9246,27 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_generated_down_q8 orelse return error.CudaKernelUnavailable;
-        if (rows != 1 or in_dim != 10240 or out_dim != 2560) return error.InvalidCudaState;
+        if (rows == 0 or in_dim == 0 or in_dim % q8_1_values_per_block != 0 or out_dim == 0) return error.InvalidCudaState;
         const input_row_blocks = in_dim / q8_1_values_per_block;
-        try checkBytes(dst, out_dim);
-        try checkRawBytes(input_q8_1, try checkedTensorElements(input_row_blocks, q8_1_block_bytes));
+        try checkBytes(dst, try checkedTensorElements(rows, out_dim));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes));
 
         var dst_ptr = dst.ptr;
         var input_ptr = input_q8_1.ptr;
         var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&input_ptr),
             @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
         };
-        try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile), q4_0_tiled_threads, &params);
     }
 
     pub fn launchLinearQ4_0GeneratedPairQ8(
@@ -9208,12 +9282,12 @@ pub const KernelModule = struct {
         activation: u8,
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_generated_pair_q8 orelse return error.CudaKernelUnavailable;
-        if (rows != 1 or in_dim != 2560 or out_dim != 10240) return error.InvalidCudaState;
+        if (rows == 0 or in_dim == 0 or in_dim % q8_1_values_per_block != 0 or out_dim == 0 or out_dim % q8_1_values_per_block != 0) return error.InvalidCudaState;
         const input_row_blocks = in_dim / q8_1_values_per_block;
         const out_row_blocks = out_dim / q8_1_values_per_block;
         const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes);
-        try checkRawBytes(dst_q8_1, try checkedTensorElements(out_row_blocks, q8_1_block_bytes));
-        try checkRawBytes(input_q8_1, try checkedTensorElements(input_row_blocks, q8_1_block_bytes));
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(try checkedTensorElements(rows, out_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
         try checkRawBytes(weight_gate, weight_bytes);
         try checkRawBytes(weight_up, weight_bytes);
 
@@ -9222,14 +9296,20 @@ pub const KernelModule = struct {
         var weight_gate_ptr = weight_gate.ptr;
         var weight_up_ptr = weight_up.ptr;
         var activation_u32: u32 = activation;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&input_ptr),
             @ptrCast(&weight_gate_ptr),
             @ptrCast(&weight_up_ptr),
             @ptrCast(&activation_u32),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
         };
-        try launchBlocks(function, ctx, out_row_blocks, q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
     }
 
     pub fn launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
@@ -12958,6 +13038,15 @@ fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32)
             return error.CudaSmokeMismatch;
         }
     }
+}
+
+test "generated CUDA GQA decode shape is exact" {
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 256, 8, 4));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 256, 32, 4));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(2, 256, 8, 4));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 128, 8, 4));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 512, 8, 4));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 256, 12, 1));
 }
 
 test "cuda kernel launch helper bounds" {

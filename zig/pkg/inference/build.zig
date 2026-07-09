@@ -1045,6 +1045,13 @@ pub fn build(b: *std.Build) void {
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
         quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);
     }
+    const run_quant_kernel_metal_renderer_tests = b.addRunArtifact(tests);
+    run_quant_kernel_metal_renderer_tests.addArg("--test-filter");
+    run_quant_kernel_metal_renderer_tests.addArg("metal renderer");
+    if (targetRunsOnBuildHost(b, target)) {
+        quant_kernel_local_check_step.dependOn(&run_quant_kernel_metal_renderer_tests.step);
+        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_metal_renderer_tests.step);
+    }
     const run_quant_kernel_cuda_microbench_tests = b.addRunArtifact(tests);
     run_quant_kernel_cuda_microbench_tests.addArg("--test-filter");
     run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
@@ -1053,6 +1060,7 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&quant_kernel_codegen_test_check.step);
+    test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
     const install_tests = b.addInstallArtifact(tests, .{

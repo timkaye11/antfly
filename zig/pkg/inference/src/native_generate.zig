@@ -1343,9 +1343,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_generated={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
                         .{
                             generate_stats.launch_attention_gqa_decode,
+                            generate_stats.launch_attention_gqa_decode_generated,
                             generate_stats.launch_attention_gqa_decode_fast,
                             generate_stats.launch_attention_gqa_decode_fast_fallbacks,
                             generate_stats.launch_attention_gqa_prefill_fast,
@@ -1602,9 +1603,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_generated={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
                     .{
                         cuda_stats.launch_attention_gqa_decode,
+                        cuda_stats.launch_attention_gqa_decode_generated,
                         cuda_stats.launch_attention_gqa_decode_fast,
                         cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                         cuda_stats.launch_attention_gqa_prefill_fast,
@@ -3410,6 +3412,7 @@ fn writeJsonTiming(
                 \\"launch_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_generated":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
@@ -3430,6 +3433,7 @@ fn writeJsonTiming(
                     cuda_stats.launch_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_generated,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
@@ -4060,6 +4064,7 @@ fn writeJsonTiming(
                 \\"launch_norm_head_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_generated":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
@@ -4093,6 +4098,7 @@ fn writeJsonTiming(
                     cuda_stats.launch_norm_head_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_generated,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
@@ -4422,8 +4428,13 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_attention_dispatch: paged_1x={d}\n",
-        .{metal_snapshot.provider.metal_runtime_paged_attention_1x_calls},
+        "metal_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_rms_norm={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_paged_attention_1x_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_decode_1x_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls,
+            metal_snapshot.provider.metal_runtime_generated_rms_norm_calls,
+        },
     );
     print(
         "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",

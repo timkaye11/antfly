@@ -113,6 +113,41 @@ pub const NodeConfig = struct {
     max_concurrent_requests: usize = 32,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
+    generation_batching: GenerationBatchingConfig = .{},
+};
+
+pub const GenerationBatchingMode = enum {
+    off,
+    auto,
+    on,
+};
+
+pub const GenerationBatchingConfig = struct {
+    // Opt-in until the L4 correctness and performance gates are recorded.
+    mode: GenerationBatchingMode = .off,
+    max_step_items: usize = 1,
+    max_step_query_tokens: usize = 512,
+    max_decode_wait_us: u32 = 1_000,
+
+    pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING")) return false;
+        if (backend != .cuda) return false;
+        return self.mode != .off;
+    }
+
+    pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
+        const experimental_batch_rows = platform.env.getenvBoolDefault(
+            "ANTFLY_INFERENCE_CUDA_EXPERIMENTAL_BATCH_ROWS",
+            false,
+        );
+        const validated_max_items: usize = if (experimental_batch_rows) 2 else 1;
+        return .{
+            .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
+            .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
+            .max_decode_wait_us = self.max_decode_wait_us,
+            .max_active_requests_for_batching = validated_max_items,
+        };
+    }
 };
 
 pub const WarmModelKind = enum {
@@ -2552,8 +2587,10 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+        const continuous_batching = self.config.generation_batching.enabledForBackend(model.session.backend());
         model.lockNativeGeneration();
-        defer model.unlockNativeGeneration();
+        var generation_lock_held = true;
+        defer if (generation_lock_held) model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
@@ -2562,6 +2599,7 @@ pub const Node = struct {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
         if (model.native_generate_coordinator) |coordinator| {
+            coordinator.setPolicy(self.config.generation_batching.schedulerPolicy());
             native_generate_lease = try coordinator.acquire(.{
                 .requested_units = queue_units,
                 .prompt_bytes = prompt_bytes,
@@ -2617,7 +2655,11 @@ pub const Node = struct {
 
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
-        defer if (draft_cb) |*cb_value| cb_value.deinit();
+        defer if (draft_cb) |*cb_value| {
+            if (continuous_batching) model.lockNativeGeneration();
+            defer if (continuous_batching) model.unlockNativeGeneration();
+            cb_value.deinit();
+        };
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
         var pjrt_client: ?pjrt_lib.pjrt.Client = null;
         defer if (pjrt_client) |*client| client.deinit();
@@ -2708,7 +2750,11 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
-        defer cb.deinit();
+        defer {
+            if (continuous_batching) model.lockNativeGeneration();
+            defer if (continuous_batching) model.unlockNativeGeneration();
+            cb.deinit();
+        }
         const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
             null
         else if (gpt_config.sliding_window > 0)
@@ -2737,14 +2783,26 @@ pub const Node = struct {
             .sliding_window_size = sliding_window_size,
         }) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        defer kv_storage.deinit();
+        defer {
+            if (continuous_batching) model.lockNativeGeneration();
+            defer if (continuous_batching) model.unlockNativeGeneration();
+            kv_storage.deinit();
+        }
         cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
         decode_state.kv_storage = &kv_storage;
-        defer decode_state.deinit();
+        defer {
+            if (continuous_batching) model.lockNativeGeneration();
+            defer if (continuous_batching) model.unlockNativeGeneration();
+            decode_state.deinit();
+        }
         var draft_decode_state: ?generation.NativeDecodeState = null;
-        defer if (draft_decode_state) |*state| state.deinit();
+        defer if (draft_decode_state) |*state| {
+            if (continuous_batching) model.lockNativeGeneration();
+            defer if (continuous_batching) model.unlockNativeGeneration();
+            state.deinit();
+        };
 
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
@@ -2819,6 +2877,7 @@ pub const Node = struct {
             .decode_state = &decode_state,
             .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
+            .execution_lock = if (continuous_batching and use_scheduler) model.nativeGenerationMutex() else null,
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
@@ -2827,6 +2886,11 @@ pub const Node = struct {
             .compiled_attachment_target = backend_selection.compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
+
+        if (continuous_batching and use_scheduler) {
+            model.unlockNativeGeneration();
+            generation_lock_held = false;
+        }
 
         if (want_stream) {
             return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
@@ -4849,6 +4913,12 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_waits_total", "counter", "Decode steps intentionally delayed to form a batch", aggregate.stats.decode_coalesce_waits_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_wait_us_total", "counter", "Configured microseconds spent waiting to coalesce decode work", aggregate.stats.decode_coalesce_wait_us_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_2_total", "counter", "Unified scheduler steps containing two items", aggregate.stats.step_batch_size_2_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_3_4_total", "counter", "Unified scheduler steps containing three or four items", aggregate.stats.step_batch_size_3_4_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
         try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());

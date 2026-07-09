@@ -56,6 +56,7 @@ const RunConfig = struct {
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
     pool_size: ?usize = null,
+    generation_batching: ?inference.server.GenerationBatchingConfig = null,
 };
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
@@ -314,6 +315,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
+        if (cfg.generation_batching) |value| node_cfg.generation_batching = value;
     }
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
@@ -499,7 +501,13 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\  ],
         \\  "max_loaded_models": 8,
-        \\  "pool_size": 4
+        \\  "pool_size": 4,
+        \\  "generation_batching": {
+        \\    "mode": "on",
+        \\    "max_step_items": 8,
+        \\    "max_step_query_tokens": 256,
+        \\    "max_decode_wait_us": 750
+        \\  }
         \\}
     ;
     const parsed = try std.json.parseFromSlice(RunConfig, std.testing.allocator, raw, .{
@@ -520,6 +528,10 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
+    try std.testing.expectEqual(inference.server.GenerationBatchingMode.on, parsed.value.generation_batching.?.mode);
+    try std.testing.expectEqual(@as(usize, 8), parsed.value.generation_batching.?.max_step_items);
+    try std.testing.expectEqual(@as(usize, 256), parsed.value.generation_batching.?.max_step_query_tokens);
+    try std.testing.expectEqual(@as(u32, 750), parsed.value.generation_batching.?.max_decode_wait_us);
 }
 
 test "run max concurrent request parser rejects zero" {

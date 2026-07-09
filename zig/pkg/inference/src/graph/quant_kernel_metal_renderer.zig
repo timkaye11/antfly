@@ -28,41 +28,16 @@
 
 const std = @import("std");
 const compiler = @import("quant_kernel_compiler.zig");
+const quant_kernel_op = @import("quant_kernel_op.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
 const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
 const ReductionKind = compiler.ReductionKind;
-const OpKind = compiler.OpKind;
+const OpKind = quant_kernel_op.OpKind;
 
-/// The non-matmul fused microkernels the renderer can emit. Each carries its own
-/// self-contained body renderer (no dequant decoder, no epilogue). Today only
-/// RMSNorm is wired; head-rope / KV read-write land here as they are brought
-/// under the compiler.
-pub const MicrokernelKind = enum {
-    rms_norm,
-};
-
-/// The paged-attention kernels the renderer can emit. Each is a self-contained
-/// body (its own params struct + paging helper, no dequant decoder, no epilogue)
-/// that references the query/key/value/block_table/output buffer layout shared
-/// with the hand-written `termite_paged_attention_*` family.
-pub const AttentionKind = enum {
-    /// `termite_paged_attention_kv_1x`: one threadgroup per (query, head), f16
-    /// paged KV, GQA, causal + sliding-window masking, no sinks, no softcap.
-    decode_1x,
-    /// `termite_paged_attention_kv_prefill_sg`: the simdgroup-MMA flash prefill
-    /// kernel. 8-query tile per threadgroup, 4 simdgroups / 128 threads, online
-    /// softmax, direct-device K/V load for contiguous chunks. Same f16-KV /
-    /// GQA / causal+sliding contract as decode_1x (no sinks, no softcap). Two
-    /// schedule knobs tune it (see `KernelSchedule`): `key_chunk` (32 or 64 KV
-    /// tokens per flash chunk) and `skip_rescale` (skip the online-softmax
-    /// O-accumulator rescale when no row's running max changed this chunk). The
-    /// `key_chunk=32, skip_rescale=false` schedule renders byte-identical to the
-    /// hand-written kernel (modulo the self-contained params/helper renames), so
-    /// it is the model-token acceptance baseline.
-    prefill_flash,
-};
+pub const MicrokernelKind = quant_kernel_op.MicrokernelKind;
+pub const AttentionKind = quant_kernel_op.AttentionKind;
 
 /// A shared MSL vocabulary helper (dedup of the per-format v1 copies).
 pub const HelperFragment = struct {
@@ -296,9 +271,9 @@ pub const decoder_q6_k = FormatDecoder{
 };
 
 pub const all_decoders = [_]FormatDecoder{
-    decoder_q4_0, decoder_q4_1, decoder_q5_0,  decoder_q5_1,
-    decoder_q8_0, decoder_q8_1, decoder_q8_k,  decoder_q2_k,
-    decoder_q3_k, decoder_q4_k, decoder_q5_k,  decoder_q6_k,
+    decoder_q4_0, decoder_q4_1, decoder_q5_0, decoder_q5_1,
+    decoder_q8_0, decoder_q8_1, decoder_q8_k, decoder_q2_k,
+    decoder_q3_k, decoder_q4_k, decoder_q5_k, decoder_q6_k,
 };
 
 pub fn decoderFor(format: quant_matmul.Format) ?FormatDecoder {
@@ -418,24 +393,12 @@ fn renderRmsNormBody(
     schedule: KernelSchedule,
 ) !void {
     const threads = schedule.threads_per_threadgroup;
-    try appendFmt(allocator, out,
-        "kernel void {s}(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &hidden_size [[buffer(4)]], constant float &eps [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {{\n",
-        .{kernel_id});
-    try appendFmt(allocator, out,
-        "    uint tid = thread_pos.x; int row = int(group_pos.x); if (row >= rows || hidden_size < 1) return; device const float *row_input = input + row * hidden_size; float sq = 0.0f;\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    for (int i = int(tid); i < hidden_size; i += {d}) {{ float x = row_input[i]; sq += x * x; }}\n",
-        .{threads});
-    try appendFmt(allocator, out,
-        "    threadgroup float partial[{d}]; partial[tid] = sq; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = {d}u; stride > 0u; stride >>= 1) {{ if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }}\n",
-        .{ threads, threads / 2 });
-    try appendFmt(allocator, out,
-        "    float inv_rms = rsqrt(partial[0] / float(hidden_size) + eps);\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    for (int i = int(tid); i < hidden_size; i += {d}) output[row * hidden_size + i] = row_input[i] * inv_rms * weight[i];\n",
-        .{threads});
+    try appendFmt(allocator, out, "kernel void {s}(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &hidden_size [[buffer(4)]], constant float &eps [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
+    try appendFmt(allocator, out, "    uint tid = thread_pos.x; int row = int(group_pos.x); if (row >= rows || hidden_size < 1) return; device const float *row_input = input + row * hidden_size; float sq = 0.0f;\n", .{});
+    try appendFmt(allocator, out, "    for (int i = int(tid); i < hidden_size; i += {d}) {{ float x = row_input[i]; sq += x * x; }}\n", .{threads});
+    try appendFmt(allocator, out, "    threadgroup float partial[{d}]; partial[tid] = sq; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = {d}u; stride > 0u; stride >>= 1) {{ if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }}\n", .{ threads, threads / 2 });
+    try appendFmt(allocator, out, "    float inv_rms = rsqrt(partial[0] / float(hidden_size) + eps);\n", .{});
+    try appendFmt(allocator, out, "    for (int i = int(tid); i < hidden_size; i += {d}) output[row * hidden_size + i] = row_input[i] * inv_rms * weight[i];\n", .{threads});
     try out.appendSlice(allocator, "}\n");
 }
 
@@ -563,30 +526,14 @@ fn renderPagedAttention1xBody(
 ) !void {
     const nt = schedule.threads_per_threadgroup;
     const nsg = nt / 32;
-    try appendFmt(allocator, out,
-        "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n",
-        .{kernel_id});
-    try appendFmt(allocator, out,
-        "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    const uint NT = {d}u; const uint NW = 32u; const uint NSG = {d}u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + {d}u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n",
-        .{ nt, nsg, nt });
-    try appendFmt(allocator, out,
-        "    for (uint base = 0u; base < p.kv_tokens; base += NSG) {{ uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) {{ uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }} uint physical_token = allowed ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) {{ const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); }} float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) {{ scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); }} }}\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; local_best = score > local_best ? score : local_best; }} partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) {{ float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; }} threadgroup_barrier(mem_flags::mem_threadgroup); }} float best = partials[0];\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float e = exp(scores[ki] - best); e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n",
-        .{});
-    try appendFmt(allocator, out,
-        "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); }} output[out_base + d] = value; }}\n",
-        .{});
+    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
+    try appendFmt(allocator, out, "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n", .{});
+    try appendFmt(allocator, out, "    const uint NT = {d}u; const uint NW = 32u; const uint NSG = {d}u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + {d}u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n", .{ nt, nsg, nt });
+    try appendFmt(allocator, out, "    for (uint base = 0u; base < p.kv_tokens; base += NSG) {{ uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) {{ uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }} uint physical_token = allowed ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) {{ const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); }} float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) {{ scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); }} }}\n", .{});
+    try appendFmt(allocator, out, "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; local_best = score > local_best ? score : local_best; }} partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) {{ float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; }} threadgroup_barrier(mem_flags::mem_threadgroup); }} float best = partials[0];\n", .{});
+    try appendFmt(allocator, out, "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f; e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n", .{});
+    try appendFmt(allocator, out, "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n", .{});
+    try appendFmt(allocator, out, "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); }} output[out_base + d] = value; }}\n", .{});
     try out.appendSlice(allocator, "}\n");
 }
 
@@ -638,11 +585,9 @@ fn renderPrefillFlashBody(
     // ---- signature + prologue (byte-identical to the hand-written kernel at
     // KC=32; the layout offsets are the symbolic form that evaluates to the
     // hand-written literals there). ----
-    try appendFmt(allocator, out,
-        "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n",
-        .{kernel_id});
+    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
     try out.appendSlice(allocator, "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n");
-    try out.appendSlice(allocator, "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u || hd % 32u != 0u) return;\n");
+    try out.appendSlice(allocator, "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u || hd % 32u != 0u || hd > 256u) return;\n");
     try out.appendSlice(allocator, "    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n");
     try out.appendSlice(allocator, "    const uint q_stride = p.num_heads * hd; const uint k_row_halfs = p.key_row_bytes / 2u;\n");
     try out.appendSlice(allocator, "    threadgroup half *sq = (threadgroup half *)shmem;\n");
@@ -653,7 +598,7 @@ fn renderPrefillFlashBody(
     try appendFmt(allocator, out, "    threadgroup uint *sphys = (threadgroup uint *)(fb + {d}u);\n", .{sphys_off});
     try appendFmt(allocator, out, "    threadgroup float *sM = (threadgroup float *)(fb + {d}u);\n", .{sm_off});
     try appendFmt(allocator, out, "    threadgroup float *sS = (threadgroup float *)(fb + {d}u);\n", .{ss_off});
-    if (skip) try appendFmt(allocator, out, "    threadgroup uint *schanged = (threadgroup uint *)(fb + {d}u);\n", .{changed_off});
+    if (skip) try appendFmt(allocator, out, "    threadgroup atomic_uint *schanged = (threadgroup atomic_uint *)(fb + {d}u);\n", .{changed_off});
     try appendFmt(allocator, out, "    threadgroup float *sdiag = (threadgroup float *)(fb + {d}u);\n", .{diag_off});
     try out.appendSlice(allocator, "    const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n");
     try out.appendSlice(allocator, "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key);\n");
@@ -669,7 +614,7 @@ fn renderPrefillFlashBody(
     try appendFmt(allocator, out, "    for (uint kc = 0u; kc < p.kv_tokens; kc += {d}u) {{\n", .{kc});
     try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
     try appendFmt(allocator, out, "        if (tid < {d}u) {{ uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }}\n", .{kc});
-    if (skip) try out.appendSlice(allocator, "        if (tid == 0u) schanged[0] = 0u;\n");
+    if (skip) try out.appendSlice(allocator, "        if (tid == 0u) atomic_store_explicit(schanged, 0u, memory_order_relaxed);\n");
     try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
     try appendFmt(allocator, out, "        const bool fast = (p.contiguous_blocks != 0u) && (kc + {d}u <= p.kv_tokens);\n", .{kc});
     try appendFmt(allocator, out, "        if (!fast) {{ for (uint i = uint(tid); i < {d}u * hd; i += 128u) {{ uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? k_half[phys * k_row_halfs + kv_head_base + d] : half(0.0f); }} }}\n", .{kc});
@@ -707,7 +652,7 @@ fn renderPrefillFlashBody(
         try out.appendSlice(allocator, "            sp[j * 32u + kk] = half(e);\n");
         try out.appendSlice(allocator, "            float row_sum = simd_sum(e);\n");
         if (skip) {
-            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) schanged[0] = 1u; }\n");
+            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) atomic_fetch_or_explicit(schanged, 1u, memory_order_relaxed); }\n");
         } else {
             try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }\n");
         }
@@ -732,7 +677,7 @@ fn renderPrefillFlashBody(
         try out.appendSlice(allocator, "            }\n");
         try out.appendSlice(allocator, "            float row_sum = simd_sum(row_sum_local);\n");
         if (skip) {
-            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) schanged[0] = 1u; }\n");
+            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) atomic_fetch_or_explicit(schanged, 1u, memory_order_relaxed); }\n");
         } else {
             try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }\n");
         }
@@ -746,7 +691,7 @@ fn renderPrefillFlashBody(
     // did not). The load + multiply are simdgroup-uniform, and `schanged[0]` is
     // threadgroup-uniform after the barrier above, so the branch is coherent.
     if (skip) {
-        try out.appendSlice(allocator, "        if (schanged[0] != 0u) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; } }\n");
+        try out.appendSlice(allocator, "        if (atomic_load_explicit(schanged, memory_order_relaxed) != 0u) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; } }\n");
     } else {
         try out.appendSlice(allocator, "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);\n");
         try out.appendSlice(allocator, "        for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n");
@@ -917,9 +862,7 @@ fn renderBody(
         ", ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]"
     else
         "";
-    try appendFmt(allocator, out,
-        "kernel void {s}(device const float *input [[buffer(0)]], device const uchar *{s} [[buffer(1)]], {s}device float *output [[buffer({d})]], constant int &rows [[buffer({d})]], constant int &in_dim [[buffer({d})]], constant int &out_dim [[buffer({d})]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]{s}) {{\n",
-        .{ kernel_id, decoder.weight_param, bias_param, out_idx, out_idx + 1, out_idx + 2, out_idx + 3, simd_params });
+    try appendFmt(allocator, out, "kernel void {s}(device const float *input [[buffer(0)]], device const uchar *{s} [[buffer(1)]], {s}device float *output [[buffer({d})]], constant int &rows [[buffer({d})]], constant int &in_dim [[buffer({d})]], constant int &out_dim [[buffer({d})]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]{s}) {{\n", .{ kernel_id, decoder.weight_param, bias_param, out_idx, out_idx + 1, out_idx + 2, out_idx + 3, simd_params });
 
     if (two_col) {
         try renderTwoColBody(allocator, out, decoder, schedule, epilogue, mask, shift, block_values, block_bytes);
@@ -951,13 +894,9 @@ fn renderSingleColBody(
     block_values: usize,
     block_bytes: usize,
 ) !void {
-    try appendFmt(allocator, out,
-        "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return; float acc = 0.0f; int block_count = in_dim >> {d};\n",
-        .{ mask, shift });
+    try appendFmt(allocator, out, "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & {d}) != 0) return; float acc = 0.0f; int block_count = in_dim >> {d};\n", .{ mask, shift });
     // Accumulation: strided lane loop covers block_values with `threads` threads.
-    try appendFmt(allocator, out,
-        "    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{ device const uchar *block = {s} + ((col * block_count + block_idx) * {d}); int base = block_idx << {d}; for (int lane = int(tid); lane < {d}; lane += {d}) acc += input[row * in_dim + base + lane] * {s}(block, lane); }}\n",
-        .{ decoder.weight_param, block_bytes, shift, block_values, threads, decoder.lane_decode_fn });
+    try appendFmt(allocator, out, "    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{ device const uchar *block = {s} + ((col * block_count + block_idx) * {d}); int base = block_idx << {d}; for (int lane = int(tid); lane < {d}; lane += {d}) acc += input[row * in_dim + base + lane] * {s}(block, lane); }}\n", .{ decoder.weight_param, block_bytes, shift, block_values, threads, decoder.lane_decode_fn });
     try renderReductionAndWrite(allocator, out, schedule, epilogue, threads);
 }
 
@@ -971,15 +910,9 @@ fn renderReductionAndWrite(
     const write = try writeExpr(allocator, reductionResultName(schedule.reduction), "col", epilogue);
     defer allocator.free(write);
     switch (schedule.reduction) {
-        .simd_sum => try appendFmt(allocator, out,
-            "    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = {s};\n",
-            .{write}),
-        .threadgroup_tree => try appendFmt(allocator, out,
-            "    threadgroup float partial[{d}]; partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = {d}u; stride > 0u; stride >>= 1) {{ if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} if (tid == 0) output[row * out_dim + col] = {s};\n",
-            .{ threads, threads / 2, write }),
-        .hybrid_simd => try appendFmt(allocator, out,
-            "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= {d}u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = {s};\n",
-            .{ threads / 32, write }),
+        .simd_sum => try appendFmt(allocator, out, "    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = {s};\n", .{write}),
+        .threadgroup_tree => try appendFmt(allocator, out, "    threadgroup float partial[{d}]; partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = {d}u; stride > 0u; stride >>= 1) {{ if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} if (tid == 0) output[row * out_dim + col] = {s};\n", .{ threads, threads / 2, write }),
+        .hybrid_simd => try appendFmt(allocator, out, "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= {d}u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = {s};\n", .{ threads / 32, write }),
     }
 }
 
@@ -1003,22 +936,14 @@ fn renderTwoColBody(
     block_bytes: usize,
 ) !void {
     _ = schedule; // two-col is always simd_sum (validated)
-    try appendFmt(allocator, out,
-        "    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & {d}) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> {d};\n",
-        .{ mask, shift });
-    try appendFmt(allocator, out,
-        "    device const float *row_input = input + row * in_dim; device const uchar *col0_weight = {s} + col0 * block_count * {d}; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? {s} + col1 * block_count * {d} : col0_weight;\n",
-        .{ decoder.weight_param, block_bytes, decoder.weight_param, block_bytes });
-    try appendFmt(allocator, out,
-        "    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{ device const uchar *block0 = col0_weight + block_idx * {d}; device const uchar *block1 = col1_weight + block_idx * {d}; int base = block_idx << {d}; for (int lane = int(tid); lane < {d}; lane += {d}) {{ float x = row_input[base + lane]; acc0 += x * {s}(block0, lane); if (has_col1) acc1 += x * {s}(block1, lane); }} }}\n",
-        .{ block_bytes, block_bytes, shift, block_values, @as(u16, 32), decoder.lane_decode_fn, decoder.lane_decode_fn });
+    try appendFmt(allocator, out, "    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & {d}) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> {d};\n", .{ mask, shift });
+    try appendFmt(allocator, out, "    device const float *row_input = input + row * in_dim; device const uchar *col0_weight = {s} + col0 * block_count * {d}; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? {s} + col1 * block_count * {d} : col0_weight;\n", .{ decoder.weight_param, block_bytes, decoder.weight_param, block_bytes });
+    try appendFmt(allocator, out, "    for (int block_idx = 0; block_idx < block_count; ++block_idx) {{ device const uchar *block0 = col0_weight + block_idx * {d}; device const uchar *block1 = col1_weight + block_idx * {d}; int base = block_idx << {d}; for (int lane = int(tid); lane < {d}; lane += {d}) {{ float x = row_input[base + lane]; acc0 += x * {s}(block0, lane); if (has_col1) acc1 += x * {s}(block1, lane); }} }}\n", .{ block_bytes, block_bytes, shift, block_values, @as(u16, 32), decoder.lane_decode_fn, decoder.lane_decode_fn });
     const w0 = try writeExpr(allocator, "acc0", "col0", epilogue);
     defer allocator.free(w0);
     const w1 = try writeExpr(allocator, "acc1", "col1", epilogue);
     defer allocator.free(w1);
-    try appendFmt(allocator, out,
-        "    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) {{ output[row * out_dim + col0] = {s}; if (has_col1) output[row * out_dim + col1] = {s}; }}\n",
-        .{ w0, w1 });
+    try appendFmt(allocator, out, "    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) {{ output[row * out_dim + col0] = {s}; if (has_col1) output[row * out_dim + col1] = {s}; }}\n", .{ w0, w1 });
 }
 
 // ---- Tests ---------------------------------------------------------------
@@ -1145,7 +1070,7 @@ test "metal renderer renders the decode-1x paged attention kernel self-contained
     // f16 paged KV + causal/sliding mask + softmax structure markers.
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (qi >= p.q_len || h >= p.num_heads || p.format != 3u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simd_sum(acc) * scale"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = exp(scores[ki] - best)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride])"));
     // NT/NSG parametrized to the schedule (256 threads -> 8 simdgroups).
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 256u; const uint NW = 32u; const uint NSG = 8u;"));
@@ -1224,11 +1149,11 @@ test "metal renderer skip_rescale guards the flash O-accumulator rescale behind 
     const source = try renderPrefillFlashKernel(allocator, "antfly_flash_skip", schedule);
     defer allocator.free(source);
     // The reserved layout word becomes the "did any row's max move" flag.
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup uint *schanged = (threadgroup uint *)(fb + 1728u);"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (tid == 0u) schanged[0] = 0u;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (m_new > m_old) schanged[0] = 1u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup atomic_uint *schanged = (threadgroup atomic_uint *)(fb + 1728u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (tid == 0u) atomic_store_explicit(schanged, 0u, memory_order_relaxed);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (m_new > m_old) atomic_fetch_or_explicit(schanged, 1u, memory_order_relaxed);"));
     // Rescale is now guarded (identity multiply skipped when unset).
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (schanged[0] != 0u) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (atomic_load_explicit(schanged, memory_order_relaxed) != 0u) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);"));
     // Layout total is unchanged (flag reuses the reserved word before sdiag).
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sdiag = (threadgroup float *)(fb + 1760u);"));
     var depth: i32 = 0;

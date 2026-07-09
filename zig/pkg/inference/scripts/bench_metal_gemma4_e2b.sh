@@ -355,6 +355,9 @@ TOGGLE_NAMES = [
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT",
     "TERMITE_METAL_Q4_0_LINEAR_RMS_ADD_F16_PROJECT_EXPERIMENT",
     "TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS",
+    "TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED",
+    "TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED",
+    "TERMITE_METAL_ENABLE_RMS_NORM_GENERATED",
     "ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO",
     "ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL",
     "ANTFLY_INFERENCE_GEMMA4_RAW_PROMPT",
@@ -669,6 +672,9 @@ for path in sorted(out_dir.glob("*.txt")):
     q4_0_ple_linear_reduce_in_f16 = grab(r"metal_q4_0_ple_dispatch:.*\blinear_reduce_in_f16=(\d+)", text, default=0)
     rms_norm_add_sumsq = grab(r"metal_q4_0_dispatch:.*\brms_norm_add_sumsq=(\d+)", text, default=0)
     paged_attention_1x = grab(r"metal_attention_dispatch:.*\bpaged_1x=(\d+)", text, default=0)
+    generated_attention_decode_1x = grab(r"metal_attention_dispatch:.*\bgenerated_decode_1x=(\d+)", text, default=0)
+    generated_attention_flash_prefill = grab(r"metal_attention_dispatch:.*\bgenerated_flash_prefill=(\d+)", text, default=0)
+    generated_rms_norm = grab(r"metal_attention_dispatch:.*\bgenerated_rms_norm=(\d+)", text, default=0)
     q4_0_pair_reduce = grab(r"metal_q4_0_dispatch:.*\bpair_reduce=(\d+)", text, default=0)
     q4_0_pair = grab(r"metal_q4_0_dispatch:.*\bpair=(\d+)", text, default=0)
     q4_0_linear_reduce_encode_us = grab(r"metal_q4_0_encode_us:.*\blinear_reduce=(\d+)", text, default=0)
@@ -830,6 +836,9 @@ for path in sorted(out_dir.glob("*.txt")):
         "q4_0_ple_linear_reduce_in_f16": q4_0_ple_linear_reduce_in_f16,
         "rms_norm_add_sumsq": rms_norm_add_sumsq,
         "paged_attention_1x": paged_attention_1x,
+        "generated_attention_decode_1x": generated_attention_decode_1x,
+        "generated_attention_flash_prefill": generated_attention_flash_prefill,
+        "generated_rms_norm": generated_rms_norm,
         "q4_0_pair_reduce": q4_0_pair_reduce,
         "q4_0_pair": q4_0_pair,
         "q4_0_linear_reduce_encode_us": q4_0_linear_reduce_encode_us,
@@ -1135,6 +1144,10 @@ missing_rms_norm_add_sumsq = [r for r in measured if r["rms_norm_add_sumsq"] < m
 excess_q4_0_linear_sumsq = [r for r in measured if max_q4_0_linear_sumsq >= 0 and r["q4_0_linear_reduce_sumsq"] > max_q4_0_linear_sumsq]
 excess_rms_norm_add_sumsq = [r for r in measured if max_rms_norm_add_sumsq >= 0 and r["rms_norm_add_sumsq"] > max_rms_norm_add_sumsq]
 missing_paged_attention_1x = [r for r in measured if r["paged_attention_1x"] < min_paged_attention_1x]
+env_enabled = lambda name: os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+missing_generated_attention_decode_1x = [r for r in measured if r["generated_attention_decode_1x"] == 0]
+missing_generated_attention_flash_prefill = [r for r in measured if r["generated_attention_flash_prefill"] == 0]
+missing_generated_rms_norm = [r for r in measured if r["generated_rms_norm"] == 0]
 missing_q4_f16 = [r for r in measured if r["q4_pair_act_reduce_out_f16"] < min_q4_pair_act_f16]
 missing_q6_f16 = [r for r in measured if r["q6_linear_reduce_in_f16"] < min_q6_f16]
 missing_generated_q4 = [r for r in measured if r["gen_q4_small_batch"] < min_generated_q4_small_batch]
@@ -1225,6 +1238,12 @@ if excess_rms_norm_add_sumsq:
     raise SystemExit(f"RMS/add sumsq dispatch above gate in measured runs: {[(r['label'], r['rms_norm_add_sumsq']) for r in excess_rms_norm_add_sumsq]}")
 if min_paged_attention_1x and missing_paged_attention_1x:
     raise SystemExit(f"paged attention 1x dispatch below gate in measured runs: {[r['label'] for r in missing_paged_attention_1x]}")
+if env_enabled("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED") and missing_generated_attention_decode_1x:
+    raise SystemExit(f"generated decode attention was requested but not dispatched: {[r['label'] for r in missing_generated_attention_decode_1x]}")
+if env_enabled("TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED") and missing_generated_attention_flash_prefill:
+    raise SystemExit(f"generated flash prefill was requested but not dispatched: {[r['label'] for r in missing_generated_attention_flash_prefill]}")
+if env_enabled("TERMITE_METAL_ENABLE_RMS_NORM_GENERATED") and missing_generated_rms_norm:
+    raise SystemExit(f"generated RMSNorm was requested but not dispatched: {[r['label'] for r in missing_generated_rms_norm]}")
 if min_q4_pair_act_f16 and missing_q4_f16:
     raise SystemExit(f"Q4_K pair activation f16-output dispatch below gate in measured runs: {[r['label'] for r in missing_q4_f16]}")
 if min_q6_f16 and missing_q6_f16:

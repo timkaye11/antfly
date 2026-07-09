@@ -175,6 +175,10 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      - name: Check inference kernel generator
+        working-directory: zig/pkg/inference
+        run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         env:

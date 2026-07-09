@@ -163,8 +163,12 @@ Compatibility floor:
 | H100 | `sm_90` | High-end validation target |
 
 Checked-in CUDA artifacts are generated with the pinned CUDA `13.2` toolkit.
-The portable artifact is PTX ISA `9.2` for `compute_75` / `.target sm_75`, so
-the NVIDIA driver can JIT it on later devices. The default artifact is a fatbin
+The portable artifact is PTX ISA `9.2` for `compute_75` / `.target sm_75`.
+CUDA 13.2 PTX does not load on the tested R580 driver API 13.0
+(`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`), so that configuration must use the
+default fatbin until portable PTX is generated with a genuinely compatible
+toolkit. Rewriting only the `.version` header is not safe: it loaded but failed
+the q4_0 smoke tolerance. The default artifact is a fatbin
 with cubins for the current validation targets and a `compute_75` PTX fallback:
 
 - `sm_75` baseline cubin for T4 startup latency.
@@ -221,24 +225,27 @@ The equivalent Linux CUDA 13.2 build target is
 Quant matmul codegen is a build/dev-time lane, not runtime JIT. The compiler
 spec lives in `pkg/inference/src/graph/quant_kernel_compiler.zig`; generated
 dev candidates and manifests live under `pkg/inference/src/ops/cuda/generated`
-and `pkg/inference/src/ops/metal/generated`. Generated MSL currently covers the
-first `Q4_K` `bias_gelu` target, a `Q4_K` bias epilogue target, plus `Q4_K`,
-`Q8_0`, `Q5_K`, and `Q6_K` no-epilogue small-batch candidates. `Q8_0`,
-`Q5_K`, and `Q6_K` no-epilogue small batch are promoted Metal artifacts; the
-remaining generated kernels stay dev-only until they have promotion evidence.
+and `pkg/inference/src/ops/metal/generated`. The Metal lane now covers 25
+small-batch quant routes across Q2/Q3/Q4/Q5/Q6/Q8 families, with 11 promoted
+routes, plus opt-in generated RMSNorm, decode-1x paged attention, and flash
+prefill attention. `QUANT_KERNEL_COMPILER.md` is the authoritative route and
+evidence inventory.
 
 Use `zig build quant-kernel-codegen -- --check` to verify generated sources and
 manifests, or `zig build quant-kernel-codegen -- --write` after intentionally
-changing the spec. Generated CUDA candidates must stay out of
-`pkg/inference/src/ops/cuda/artifacts` until they have correctness evidence,
-sequential benchmark evidence, and reviewed promotion into the checked-in
-artifact flow.
+changing the spec. Generated CUDA source files are never direct production
+artifact inputs. Promotion requires correctness and sequential benchmark
+evidence, then a reviewed copy of the generated body into the canonical
+`artifacts/inference_cuda_kernels.cu` bundle and CUDA 13.2 artifact regeneration.
 
-Use `zig build quant-kernel-local-check -Dmetal=true -Dcuda=false` for the
-local compiler gate: generated-source freshness, route/manifest unit tests,
-CUDA evidence unit tests, promoted/dev Metal compile, dev-only Metal runtime
-correctness, and CUDA artifact source-policy checks. This does not replace the
-Linux CUDA 13.2 `zig build cuda-artifacts-check` gate.
+Use `zig build quant-kernel-local-check -Dmetal=false -Dcuda=false` for the
+cross-platform compiler gate: generated-source freshness, compiler/renderer and
+CUDA evidence unit tests, and CUDA artifact source-policy checks. Pull-request
+Zig CI runs this host-only gate explicitly, and the ordinary package `test` step
+also enforces source freshness and source policy. On macOS, use
+`quant-kernel-metal-local-check -Dmetal=true -Dcuda=false` for generated Metal
+compile and on-device evidence. Neither replaces the Linux CUDA 13.2
+`zig build cuda-artifacts-check` gate.
 
 Use `zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false` for
 the dev-only generated MSL runtime correctness check; add
@@ -246,7 +253,7 @@ the dev-only generated MSL runtime correctness check; add
 same sequential correctness and handwritten-baseline timing evidence as JSON.
 Add `--repeat-runs N` to aggregate sequential timings by median. Metal promotion
 evidence requires at least 5 repeats, records `minimum_speedup`, and currently
-requires median generated speedup of at least `1.05` over the handwritten
+requires median generated speedup of at least `1.10` over the handwritten
 baseline for every promoted-kernel case.
 Use `-- --check-evidence PATH --require-promotion-ready --require-kernel KERNEL`
 to fail a promotion attempt for one candidate when the evidence is still
@@ -256,18 +263,23 @@ the generated artifact manifest pins the exact evidence and check commands for
 each Metal candidate.
 
 From `pkg/inference`, the first lazy target evidence uses the manifest-pinned
-PTX and benchmark commands:
+portable fatbin and benchmark commands:
 
 ```sh
-nvcc -ptx -arch=compute_75 \
+nvcc -fatbin \
+  -gencode=arch=compute_75,code=sm_75 \
+  -gencode=arch=compute_80,code=sm_80 \
+  -gencode=arch=compute_89,code=sm_89 \
+  -gencode=arch=compute_90,code=sm_90 \
+  -gencode=arch=compute_75,code=compute_75 \
   src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu \
-  -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx
+  -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin
 
 zig-out/bin/antfly-inference bench-cuda \
   --warmup-iters 5 \
   --measure-iters 50 \
   --quant-compiler-lazy-target \
-  --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx \
+  --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin \
   --quant-compiler-repeat-runs 3 \
   --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json
 
@@ -275,6 +287,12 @@ zig-out/bin/antfly-inference bench-cuda \
   --quant-compiler-check-evidence src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json \
   --quant-compiler-require-promotion-ready
 ```
+
+The `--quant-compiler-*-ptx` option names are retained for CLI compatibility,
+but the loader accepts any CUDA module image. Generated benchmark fatbins carry
+`sm_75`, `sm_80`, `sm_89`, and `sm_90` SASS plus a `compute_75` PTX fallback, so
+the evidence command runs on those architectures without asking an older driver
+to JIT CUDA 13.2 PTX ISA.
 
 That final check is intentionally a promotion gate: it fails while the CUDA
 candidate is still dev-only.
@@ -465,6 +483,14 @@ by ClipClap, GLiNER2, and DeBERTa reranker sessions:
   9-64, FFN gate+up pair, and the q8_1/DP4A E4B fused-FFN pair+down),
   default-on with per-kernel disable envs; see `QUANT_KERNEL_COMPILER.md`
   (Current CUDA State) for measured speedups and promotion evidence
+- an opt-in generated GQA decode-attention candidate specialized for
+  `q_seq_len=1`, `head_dim=256`, and the nullable device-scalar ABI. Enable it
+  with `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1`; module loading
+  fails closed if the generated symbol is missing. On an NVIDIA L4 with Gemma 4
+  E2B QAT `UD-Q4_K_XL`, three 128-token runs measured a median 64.91 tok/s
+  versus 63.18 tok/s for the hand-written route (+2.7%), with 3,556/4,480
+  attention launches generated and exact 32-token ID parity. It remains opt-in
+  pending broader model, context-length, and masking coverage.
 - GLiNER-oriented DeBERTa attention/head helper kernels
 
 Required common kernels are loaded eagerly when the CUDA module is loaded. If a
@@ -726,7 +752,50 @@ CUDA-present tests:
 - real GGUF generation with fixed prompt/settings and CUDA counters
 - GKE L4 container smoke
 
-Correctness rules:
+## Generated Decode And Continuous Batching
+
+Gemma 4 CUDA decode can opt into the generated head-dimension-256 online
+softmax attention kernel with
+`ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1`. The generated Q4_0
+Q8_1 pair/down FFN kernels accept runtime row, input, and output dimensions,
+but the fused Q8_1 precompute route remains experimental because its long-run
+E2B throughput gate is slower than the established FFN route. Enable it with
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1`; force it
+off with `ANTFLY_INFERENCE_CUDA_DISABLE_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE=1`.
+
+Server continuous batching is typed configuration and defaults off:
+
+```json
+{
+  "generation_batching": {
+    "mode": "on",
+    "max_step_items": 1,
+    "max_step_query_tokens": 512,
+    "max_decode_wait_us": 1000
+  }
+}
+```
+
+The CUDA production rollout is deliberately serialized because the two-row
+decode path still fails the long-run KV page-boundary gate. Prefill is
+singleton, and the coordinator plus CUDA resource teardown are thread-safe.
+Developers can exercise homogeneous two-row decode with
+`ANTFLY_INFERENCE_CUDA_EXPERIMENTAL_BATCH_ROWS=1`; it is not a production
+setting. Set
+`ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING=1` for the global rollback.
+
+Run the hardware gate with:
+
+```sh
+python3 scripts/benchmark_gemma4_cuda_batching.py
+```
+
+The gate records response fingerprints, latency and aggregate throughput by
+concurrency, scheduler metrics, and the c1/c4 acceptance decision. A wider
+batch must not be promoted merely because it is faster: response equivalence
+and the single-request p95 bound are mandatory.
+
+## Correctness Rules
 
 - Dense f32 matmul: tight absolute/relative tolerance.
 - Quantized matmul: compare against CPU dequantized or native quant reference

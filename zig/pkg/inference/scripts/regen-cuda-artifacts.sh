@@ -165,6 +165,7 @@ required_symbols=(
   termite_gqa_attention_decode_scalars_fast_f32
   termite_gqa_attention_prefill_fast_f32
   termite_gqa_attention_decode_scalars_f32
+  antfly_gqa_attention_decode_scalars_hd256_f32_v1
   termite_kv_write_suffix_decode_scalars_f32
   termite_gqa_attention_decode_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_fast_f32
