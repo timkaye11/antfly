@@ -113,6 +113,14 @@ pub const Config = struct {
     /// after token gather and before embedding layer norm during training.
     neftune_alpha: f32 = 0.0,
     neftune_seed: u64 = 0,
+    /// RoPE pairing convention. `true` (default) rotates interleaved adjacent
+    /// pairs (2j, 2j+1) - the convention the gopeft-trained fused chunker
+    /// weights expect. `false` uses HF ModernBERT's `rotate_half` split-half
+    /// pairing (j, j+head_dim/2), which the stock nomic modernbert-embed-base
+    /// checkpoint was trained with. Serving the frozen nomic weights with the
+    /// interleaved convention scrambles attention and roughly halves retrieval
+    /// quality, so the native embedder session sets this to `false`.
+    rope_interleaved: bool = true,
 };
 
 // ---------------------------------------------------------------------------
@@ -415,12 +423,13 @@ fn encoderLayer(
     }
 
     // Apply RoPE to Q and K.
-    // consecutive_pairs=true: ModernBERT uses interleaved rotation pairs
-    // (matching gopeft fused_chunker_embedder.go convention).
+    // RoPE pairing is config.rope_interleaved: interleaved (2j,2j+1) for the
+    // gopeft-trained fused chunker, or HF rotate_half (j, j+head_dim/2) for the
+    // stock nomic modernbert-embed-base checkpoint.
     // rope_dim == head_dim: the full head dimension is rotated.
-    const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
+    const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(Q);
-    const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
+    const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
     if (trace_timing) {
         printModernBertTiming(layer_idx, "rope", elapsedNs(stage_start_ns));
@@ -1808,9 +1817,9 @@ fn encoderLayerWithNormedAttn(
     }
 
     // RoPE
-    const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
+    const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(Q);
-    const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
+    const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
     if (trace_timing) {
         printModernBertTiming(layer_idx, "capture_rope", elapsedNs(stage_start_ns));
@@ -1996,12 +2005,13 @@ fn encoderLayerCapturing(
     defer cb.free(V);
 
     // Apply RoPE to Q and K.
-    // consecutive_pairs=true: ModernBERT uses interleaved rotation pairs
-    // (matching gopeft fused_chunker_embedder.go convention).
+    // RoPE pairing is config.rope_interleaved: interleaved (2j,2j+1) for the
+    // gopeft-trained fused chunker, or HF rotate_half (j, j+head_dim/2) for the
+    // stock nomic modernbert-embed-base checkpoint.
     // rope_dim == head_dim: the full head dimension is rotated.
-    const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
+    const Q = try cb.rope(Q_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(Q);
-    const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, true);
+    const K = try cb.rope(K_raw, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
     // Bidirectional scaled dot-product attention (encoder, no causal mask).

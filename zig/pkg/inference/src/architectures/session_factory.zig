@@ -1362,7 +1362,11 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
 /// Parse a HuggingFace ModernBERT config.json into a modern_bert.Config.
 /// Unknown fields keep the ModernBERT-base defaults.
 fn parseModernBertConfig(allocator: std.mem.Allocator, config_bytes: []const u8) !modern_bert_arch.Config {
-    var cfg = modern_bert_arch.Config{};
+    // Stock HF ModernBERT (incl. nomic modernbert-embed-base) uses rotate_half
+    // RoPE, not the interleaved convention the gopeft-trained fused chunker
+    // expects. The native embedder session serves these frozen HF weights, so
+    // it must use HF's split-half pairing to match the reference embeddings.
+    var cfg = modern_bert_arch.Config{ .rope_interleaved = false };
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{}) catch return cfg;
     defer parsed.deinit();
     if (parsed.value != .object) return cfg;
@@ -3611,6 +3615,9 @@ test "parseModernBertConfig overrides defaults from config.json fields" {
     try std.testing.expectEqual(@as(u32, 128), cfg.local_attention_window);
     try std.testing.expectEqual(@as(u32, 3), cfg.global_attn_every_n_layers);
     try std.testing.expectApproxEqAbs(@as(f32, 160000.0), cfg.global_rope_theta, 1.0);
+    // Frozen HF ModernBERT weights (nomic modernbert-embed-base) require the
+    // rotate_half RoPE convention, not the interleaved fused-chunker one.
+    try std.testing.expectEqual(false, cfg.rope_interleaved);
 }
 
 test "splitModernBertQkvWeights materializes q/k/v projections from fused Wqkv" {
