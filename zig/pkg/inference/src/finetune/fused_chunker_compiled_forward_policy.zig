@@ -57,6 +57,44 @@ pub fn normalizedLayersPerSegment(layers_per_segment: u32) u32 {
     return if (layers_per_segment == 0) 1 else layers_per_segment;
 }
 
+// ---------------------------------------------------------------------------
+// Serving (fused_chunking pipeline) policy
+// ---------------------------------------------------------------------------
+
+/// Serving kill-switch parse for ANTFLY_FUSED_CHUNKER_SERVING_COMPILED_FORWARD.
+///
+/// Serving defaults the compiled segment forward ON when the pipeline runs on
+/// the Metal backend, so the env var is a kill switch: unset means enabled,
+/// and "0" / "false" / "no" / "off" / empty force the eager forward. Mirrors
+/// platform.env.getenvBoolDefault(_, true) semantics without the import so it
+/// stays testable in this standalone target.
+pub fn servingCompiledForwardEnabled(env_value: ?[]const u8) bool {
+    const value = env_value orelse return true;
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    return true;
+}
+
+/// Whether one serving forward window should take the compiled path.
+///
+/// Serving runs batch=1 windows of exactly max_seq_len tokens, plus one
+/// ragged final window. Segment sessions are compiled for a fixed
+/// [1, max_seq_len] geometry, so the ragged window runs the eager forward
+/// instead (same session-recompile-thrash rule as eval's partial trailing
+/// batches). The first-failure latch always wins.
+pub fn shouldUseCompiledForServingWindow(
+    failed: bool,
+    window_tokens: usize,
+    max_seq_len: usize,
+) bool {
+    if (failed) return false;
+    if (window_tokens == 0) return false;
+    return window_tokens == max_seq_len;
+}
+
 test "headDimForHiddenSize matches ModernBERT-base and rejects bad sizes" {
     try std.testing.expectEqual(@as(u32, 64), try headDimForHiddenSize(768));
     try std.testing.expectEqual(@as(u32, 32), try headDimForHiddenSize(384));
@@ -80,4 +118,34 @@ test "normalizedLayersPerSegment maps zero to one" {
     try std.testing.expectEqual(@as(u32, 1), normalizedLayersPerSegment(0));
     try std.testing.expectEqual(@as(u32, 1), normalizedLayersPerSegment(1));
     try std.testing.expectEqual(@as(u32, 4), normalizedLayersPerSegment(4));
+}
+
+test "servingCompiledForwardEnabled defaults on and honors the kill switch" {
+    // Unset -> default ON.
+    try std.testing.expect(servingCompiledForwardEnabled(null));
+    // Explicit truthy values keep it on.
+    try std.testing.expect(servingCompiledForwardEnabled("1"));
+    try std.testing.expect(servingCompiledForwardEnabled("true"));
+    try std.testing.expect(servingCompiledForwardEnabled("on"));
+    // Kill-switch spellings force the eager forward.
+    try std.testing.expect(!servingCompiledForwardEnabled("0"));
+    try std.testing.expect(!servingCompiledForwardEnabled(""));
+    try std.testing.expect(!servingCompiledForwardEnabled("false"));
+    try std.testing.expect(!servingCompiledForwardEnabled("FALSE"));
+    try std.testing.expect(!servingCompiledForwardEnabled("no"));
+    try std.testing.expect(!servingCompiledForwardEnabled("off"));
+    try std.testing.expect(!servingCompiledForwardEnabled("Off"));
+}
+
+test "shouldUseCompiledForServingWindow gates on latch and full windows" {
+    // Full window, no prior failure: compiled.
+    try std.testing.expect(shouldUseCompiledForServingWindow(false, 384, 384));
+    // First-failure latch wins.
+    try std.testing.expect(!shouldUseCompiledForServingWindow(true, 384, 384));
+    // Ragged final window -> eager (fixed-geometry sessions).
+    try std.testing.expect(!shouldUseCompiledForServingWindow(false, 383, 384));
+    try std.testing.expect(!shouldUseCompiledForServingWindow(false, 1, 384));
+    try std.testing.expect(!shouldUseCompiledForServingWindow(false, 0, 384));
+    // Oversized windows never happen, but must not take the compiled path.
+    try std.testing.expect(!shouldUseCompiledForServingWindow(false, 385, 384));
 }

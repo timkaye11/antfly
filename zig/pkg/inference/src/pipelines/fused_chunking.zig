@@ -42,6 +42,21 @@
 // forward passes are serialized through an inference lock (the same pattern
 // as model_manager.LoadedModel.lockRerankingSession) so concurrent requests
 // never interleave GPU command submission or weight-store access.
+//
+// Compiled forward (Metal only): the per-window encoder forward defaults to
+// the parity-validated compiled MPSGraph segment sessions
+// (src/finetune/fused_chunker_compiled_forward.zig, constructed over the
+// merged base weights with no LoRA injection), replacing the eager forward
+// whose dense linears run on host CPU. Segment sessions are compiled once at
+// load for the single serving geometry [batch=1, seq=max_seq_len]; only
+// exactly-full windows take the compiled path (the ragged final window runs
+// eager, avoiding session recompiles). Any compiled failure latches an eager
+// fallback for the pipeline's lifetime and is logged once. Kill switch:
+// ANTFLY_FUSED_CHUNKER_SERVING_COMPILED_FORWARD=0 forces the eager forward.
+// The native CPU backend is unchanged. Boundary scores under the compiled
+// path sit within the established compiled-vs-eager cross-kernel noise
+// (~2e-3 feature-level); boundary decisions are identical in practice and
+// must be A/B-validated on GPU per the serving runbook.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -61,8 +76,27 @@ const ops_mod = @import("../ops/ops.zig");
 const safetensors = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 
+// Pure decision logic (kill-switch parse + full-window gating); import-free,
+// so it is safe in non-Metal builds and unit-testable CPU-side.
+const compiled_forward_policy = @import("../finetune/fused_chunker_compiled_forward_policy.zig");
+// The compiled segment forward executes through MPSGraph externs that only
+// link when metal_kernels.m is compiled in, so everything referencing it is
+// comptime-gated on -Dmetal.
+const fused_chunker_compiled_forward = if (build_options.enable_metal)
+    @import("../finetune/fused_chunker_compiled_forward.zig")
+else
+    struct {};
+const fused_chunker_lora = if (build_options.enable_metal)
+    @import("../finetune/lora_adapter_set.zig")
+else
+    struct {};
+
 const ComputeBackend = ops_mod.ComputeBackend;
 const MetalComputeT = if (build_options.enable_metal) metal_compute.MetalCompute else void;
+const CompiledForwardT = if (build_options.enable_metal)
+    fused_chunker_compiled_forward.CompiledEvalForward
+else
+    void;
 
 /// Upper bound on tokens processed per request. Text beyond this many tokens
 /// is not chunked (the tokenizer truncates); at max_seq_len=384 this allows
@@ -140,6 +174,10 @@ pub const FusedChunkerPipeline = struct {
     native_backend: native_compute.NativeCompute,
     metal_store: fused_chunker_weights.MetalWeightStore = undefined,
     metal_backend: MetalComputeT = undefined,
+    /// Compiled MPSGraph segment forward over the merged base weights (Metal
+    /// only; null when disabled, unsupported, or failed to compile at load).
+    /// Its `failed` flag latches the eager fallback after a first failure.
+    compiled_forward: ?CompiledForwardT = null,
     /// Lazily materialized f32 SPLADE projection [vocab_size * hidden_size].
     splade_weight: ?[]f32 = null,
     /// Serializes forward passes (GPU command submission / weight residency).
@@ -222,6 +260,10 @@ pub const FusedChunkerPipeline = struct {
                 self.metal_backend = try metal_compute.MetalCompute.init(allocator, &self.metal_store, null);
                 errdefer self.metal_backend.deinit();
                 _ = try fused_chunker_weights.loadSafetensorsIntoMetalStore(allocator, &self.metal_store, st_path);
+                // Compiled segment forward, default ON for Metal. Cold-compiles
+                // the segment sessions here so the first request doesn't pay
+                // the compile; failure is non-fatal (eager forward serves).
+                self.initServingCompiledForward();
             } else {
                 return error.MetalBackendUnavailable;
             }
@@ -232,11 +274,63 @@ pub const FusedChunkerPipeline = struct {
         return self;
     }
 
+    /// Construct + warm the compiled MPSGraph segment forward for the single
+    /// serving geometry (batch=1, seq=max_seq_len) over the merged export
+    /// (no LoRA injection). Compiling at load trades a few seconds of model
+    /// load time for predictable first-request latency. Never fails the
+    /// load: on any error the pipeline logs once and serves the eager
+    /// forward. Honors the ANTFLY_FUSED_CHUNKER_SERVING_COMPILED_FORWARD
+    /// kill switch (evaluated once, here).
+    fn initServingCompiledForward(self: *FusedChunkerPipeline) void {
+        if (comptime !build_options.enable_metal) return;
+        if (!fused_chunker_compiled_forward.servingEnvEnabled()) {
+            std.log.info(
+                "fused chunker: compiled serving forward disabled via {s}; using eager forward",
+                .{fused_chunker_compiled_forward.serving_env_flag},
+            );
+            return;
+        }
+        const graph_config = fused_chunker_compiled_forward.graphConfigFromBertConfig(
+            self.config.modernBertConfig(),
+        ) catch |err| {
+            std.log.warn(
+                "fused chunker: compiled serving forward unsupported for this config ({s}); using eager forward",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        var cef = fused_chunker_compiled_forward.CompiledEvalForward.initMergedBase(
+            self.allocator,
+            graph_config,
+            1, // one layer per segment: the segmentation eval/training validated
+        ) catch |err| {
+            std.log.warn(
+                "fused chunker: compiled serving forward init failed ({s}); using eager forward",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        cef.warmup(1, self.max_seq_len) catch |err| {
+            cef.deinit();
+            std.log.warn(
+                "fused chunker: compiled serving forward failed to compile ({s}); using eager forward",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        self.compiled_forward = cef;
+        std.log.info(
+            "fused chunker: compiled serving segment forward enabled (batch=1 seq={d}, merged base weights; eager fallback on failure; set {s}=0 to disable)",
+            .{ self.max_seq_len, fused_chunker_compiled_forward.serving_env_flag },
+        );
+    }
+
     pub fn deinit(self: *FusedChunkerPipeline) void {
         const allocator = self.allocator;
         if (self.splade_weight) |w| allocator.free(w);
         if (self.use_metal) {
             if (comptime build_options.enable_metal) {
+                if (self.compiled_forward) |*cef| cef.deinit();
                 fused_chunker_weights.deinitMetalWeightStore(allocator, &self.metal_store);
                 self.metal_backend.deinit();
             }
@@ -264,6 +358,83 @@ pub const FusedChunkerPipeline = struct {
         const w = try cb.toFloat32(ct, self.allocator);
         self.splade_weight = w;
         return w;
+    }
+
+    /// Run one exactly-full serving window through the compiled segment
+    /// forward, writing boundary logits (and token embeddings when
+    /// requested) into the caller's per-document buffers. Must be called
+    /// with inference_lock held and self.compiled_forward non-null.
+    ///
+    /// Returns false when the compiled path fails; the first failure latches
+    /// `compiled_forward.failed` (logged once) so this window — and every
+    /// later one — runs the eager forward instead. The compiled encoder
+    /// output feeds the same eager boundary/embedding head ops the eager
+    /// forward uses (fused_chunker.forwardFromHidden), so head numerics are
+    /// shared between both paths.
+    fn forwardWindowCompiled(
+        self: *FusedChunkerPipeline,
+        allocator: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        cfg: fused_chunker.Config,
+        ids_i64: []const i64,
+        mask_i64: []const i64,
+        n: usize,
+        need_token_outputs: bool,
+        boundary_dst: []f32,
+        embedding_dst: []f32,
+    ) bool {
+        if (comptime !build_options.enable_metal) return false;
+        const cef = &self.compiled_forward.?;
+
+        // Merged export: adapters are folded into the base weights, so the
+        // compiled segments run base-only with an empty LoRA layer set.
+        var no_lora: [0]fused_chunker_lora.LoRALayer = .{};
+        const hidden = cef.forward(
+            cb,
+            cfg.modernBertConfig(),
+            ids_i64,
+            mask_i64,
+            1,
+            n,
+            &no_lora,
+        ) catch |err| {
+            cef.failed = true;
+            std.log.warn(
+                "fused chunker: compiled serving forward failed ({s}); falling back to eager forward",
+                .{@errorName(err)},
+            );
+            return false;
+        };
+        // cef.forward allocates its result from the pipeline allocator (the
+        // one it was constructed with), not the per-request allocator.
+        defer self.allocator.free(hidden);
+
+        if (need_token_outputs) {
+            const emb_dim: usize = @intCast(cfg.embedding_dim);
+            var result = fused_chunker.forwardFromHidden(cb, allocator, cfg, hidden, 1, n) catch |err| {
+                cef.failed = true;
+                std.log.warn(
+                    "fused chunker: head forward over compiled features failed ({s}); falling back to eager forward",
+                    .{@errorName(err)},
+                );
+                return false;
+            };
+            defer result.deinit(allocator);
+            @memcpy(boundary_dst, result.boundary_logits[0 .. n * 2]);
+            @memcpy(embedding_dst, result.token_embeddings[0 .. n * emb_dim]);
+        } else {
+            const logits = fused_chunker.forwardBoundaryOnlyFromHidden(cb, allocator, cfg, hidden, 1, n) catch |err| {
+                cef.failed = true;
+                std.log.warn(
+                    "fused chunker: head forward over compiled features failed ({s}); falling back to eager forward",
+                    .{@errorName(err)},
+                );
+                return false;
+            };
+            defer allocator.free(logits);
+            @memcpy(boundary_dst, logits[0 .. n * 2]);
+        }
+        return true;
     }
 
     /// Chunk a text document. Returned chunks (and their owned embeddings)
@@ -359,18 +530,46 @@ pub const FusedChunkerPipeline = struct {
                 defer allocator.free(mask_i64);
                 @memset(mask_i64, 1);
 
-                if (need_token_outputs) {
-                    var result = try fused_chunker.forward(&cb, allocator, cfg, ids_i64, mask_i64, 1, n);
-                    defer result.deinit(allocator);
-                    @memcpy(boundary_logits[start * 2 .. end * 2], result.boundary_logits[0 .. n * 2]);
-                    @memcpy(
-                        token_embeddings[start * emb_dim .. end * emb_dim],
-                        result.token_embeddings[0 .. n * emb_dim],
-                    );
-                } else {
-                    const logits = try fused_chunker.forwardBoundaryOnly(&cb, allocator, cfg, ids_i64, mask_i64, 1, n);
-                    defer allocator.free(logits);
-                    @memcpy(boundary_logits[start * 2 .. end * 2], logits[0 .. n * 2]);
+                // Compiled MPSGraph segment forward for exactly-full windows
+                // (Metal, default ON). Failure latches the eager fallback for
+                // this pipeline's lifetime and falls through below.
+                var window_done = false;
+                if (comptime build_options.enable_metal) {
+                    if (self.compiled_forward != null and
+                        compiled_forward_policy.shouldUseCompiledForServingWindow(
+                            self.compiled_forward.?.failed,
+                            n,
+                            msl,
+                        ))
+                    {
+                        window_done = self.forwardWindowCompiled(
+                            allocator,
+                            &cb,
+                            cfg,
+                            ids_i64,
+                            mask_i64,
+                            n,
+                            need_token_outputs,
+                            boundary_logits[start * 2 .. end * 2],
+                            if (need_token_outputs) token_embeddings[start * emb_dim .. end * emb_dim] else &.{},
+                        );
+                    }
+                }
+
+                if (!window_done) {
+                    if (need_token_outputs) {
+                        var result = try fused_chunker.forward(&cb, allocator, cfg, ids_i64, mask_i64, 1, n);
+                        defer result.deinit(allocator);
+                        @memcpy(boundary_logits[start * 2 .. end * 2], result.boundary_logits[0 .. n * 2]);
+                        @memcpy(
+                            token_embeddings[start * emb_dim .. end * emb_dim],
+                            result.token_embeddings[0 .. n * emb_dim],
+                        );
+                    } else {
+                        const logits = try fused_chunker.forwardBoundaryOnly(&cb, allocator, cfg, ids_i64, mask_i64, 1, n);
+                        defer allocator.free(logits);
+                        @memcpy(boundary_logits[start * 2 .. end * 2], logits[0 .. n * 2]);
+                    }
                 }
             }
             phase.forward_ns = nowNs() - forward_start;
@@ -765,6 +964,133 @@ pub fn sparseFromDense(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test {
+    // The serving compiled-forward gating logic (kill-switch parse +
+    // full-window policy) lives in the import-free policy module; run its
+    // tests wherever this pipeline's tests run.
+    _ = compiled_forward_policy;
+}
+
+/// Insert a synthetic resident f32 weight into a native store. The key is
+/// owned by the store (freed by deinitNativeWeightStore); the tensor borrows
+/// the key as its name.
+fn putTestWeight(
+    allocator: std.mem.Allocator,
+    store: *native_compute.WeightStore,
+    name: []const u8,
+    shape: []const i64,
+    data: []const f32,
+) !void {
+    const tensor_mod = @import("../backends/tensor.zig");
+    const weight_source_mod = @import("../models/weight_source.zig");
+    const key = try allocator.dupe(u8, name);
+    errdefer allocator.free(key);
+    var tensor = try tensor_mod.Tensor.initFloat32(allocator, key, shape, data);
+    errdefer tensor.deinit();
+    try store.resident_weights.put(allocator, key, weight_source_mod.LoadedWeight{ .tensor = tensor });
+}
+
+test "forwardFromHidden matches the eager heads deterministically (zero MLP)" {
+    const allocator = std.testing.allocator;
+
+    var store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer fused_chunker_weights.deinitNativeWeightStore(allocator, &store);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    const cb = compute.computeBackend();
+
+    // hidden=4, mlp=3, labels=2; identity embedding head (emb_dim == hidden).
+    const cfg = fused_chunker.Config{
+        .hidden_size = 4,
+        .boundary_mlp_dim = 3,
+        .embedding_dim = 4,
+    };
+
+    // dense1 == 0 -> gelu(0) == 0 exactly -> logits == dense2 bias exactly,
+    // regardless of the backend's gelu implementation.
+    const zeros_w1 = [_]f32{0.0} ** (3 * 4);
+    const zeros_b1 = [_]f32{0.0} ** 3;
+    const w2 = [_]f32{ 1.0, -2.0, 3.0, 0.5, 0.25, -0.75 };
+    const b2 = [_]f32{ 0.25, -0.5 };
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense1/weight", &.{ 3, 4 }, &zeros_w1);
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense1/bias", &.{3}, &zeros_b1);
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense2/weight", &.{ 2, 3 }, &w2);
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense2/bias", &.{2}, &b2);
+
+    // batch=1, seq=2 precomputed encoder features.
+    const hidden = [_]f32{ 0.1, -0.2, 0.3, -0.4, 1.0, 2.0, -3.0, 0.5 };
+
+    var result = try fused_chunker.forwardFromHidden(&cb, allocator, cfg, &hidden, 1, 2);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), result.boundary_logits.len);
+    for (0..2) |t| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0.25), result.boundary_logits[t * 2 + 0], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, -0.5), result.boundary_logits[t * 2 + 1], 1e-6);
+    }
+    // Identity embedding head: token embeddings are the input features.
+    try std.testing.expectEqualSlices(f32, &hidden, result.token_embeddings);
+
+    // Boundary-only variant produces the identical logits.
+    const logits = try fused_chunker.forwardBoundaryOnlyFromHidden(&cb, allocator, cfg, &hidden, 1, 2);
+    defer allocator.free(logits);
+    try std.testing.expectEqualSlices(f32, result.boundary_logits, logits);
+
+    // Shape validation guards the seam.
+    try std.testing.expectError(
+        error.UnexpectedHiddenShape,
+        fused_chunker.forwardFromHidden(&cb, allocator, cfg, hidden[0..7], 1, 2),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHiddenShape,
+        fused_chunker.forwardBoundaryOnlyFromHidden(&cb, allocator, cfg, hidden[0..7], 1, 2),
+    );
+}
+
+test "forwardFromHidden and forwardBoundaryOnlyFromHidden share head numerics" {
+    const allocator = std.testing.allocator;
+
+    var store = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
+    defer fused_chunker_weights.deinitNativeWeightStore(allocator, &store);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    const cb = compute.computeBackend();
+
+    const cfg = fused_chunker.Config{
+        .hidden_size = 4,
+        .boundary_mlp_dim = 3,
+        .embedding_dim = 4,
+    };
+
+    const w1 = [_]f32{ 0.5, -1.0, 2.0, 0.25, 1.5, 0.25, -0.5, -1.25, -0.75, 0.1, 0.9, 0.3 };
+    const b1 = [_]f32{ 0.1, -0.2, 0.05 };
+    const w2 = [_]f32{ 1.0, -2.0, 3.0, 0.5, 0.25, -0.75 };
+    const b2 = [_]f32{ -0.3, 0.4 };
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense1/weight", &.{ 3, 4 }, &w1);
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense1/bias", &.{3}, &b1);
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense2/weight", &.{ 2, 3 }, &w2);
+    try putTestWeight(allocator, &store, "fused_chunker_embedder/boundary_head/mlp_dense2/bias", &.{2}, &b2);
+
+    const hidden = [_]f32{ 0.7, -1.1, 0.2, 0.9, -0.4, 0.6, 1.3, -0.8, 0.05, -0.15, 0.25, -0.35 };
+
+    var full = try fused_chunker.forwardFromHidden(&cb, allocator, cfg, &hidden, 1, 3);
+    defer full.deinit(allocator);
+    const boundary_only = try fused_chunker.forwardBoundaryOnlyFromHidden(&cb, allocator, cfg, &hidden, 1, 3);
+    defer allocator.free(boundary_only);
+
+    // Both entry points run the identical boundary head ops over the same
+    // features, so the serving pipeline's boundary decisions cannot depend
+    // on which one handled a window.
+    try std.testing.expectEqualSlices(f32, full.boundary_logits, boundary_only);
+    try std.testing.expectEqualSlices(f32, &hidden, full.token_embeddings);
+}
 
 test "numWindows covers exact and ragged sequence lengths" {
     try std.testing.expectEqual(@as(usize, 0), numWindows(0, 384));

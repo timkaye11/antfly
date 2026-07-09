@@ -31,6 +31,15 @@
 //! (or the corresponding CLI flags), defaults OFF, and callers fall back to
 //! the eager `modern_bert.forward` on any failure.
 //!
+//! SERVING (src/pipelines/fused_chunking.zig) reuses the same forward over a
+//! MERGED export: LoRA is already folded into the base weights, so serving
+//! constructs via `initMergedBase` (rank 0 -> plain base-weight segment
+//! graphs, no adapter injection) and calls `forward` with an empty
+//! `lora_layers` slice. Serving defaults the compiled path ON for the Metal
+//! backend behind the ANTFLY_FUSED_CHUNKER_SERVING_COMPILED_FORWARD kill
+//! switch (see `servingEnvEnabled`), again with the eager forward as the
+//! first-failure fallback.
+//!
 //! Numerical note: the compiled and eager forwards intentionally run
 //! different f32 kernel implementations of the same math; final features
 //! differ by cross-kernel noise (measured ~2e-3 max-rel at depth 22).
@@ -52,6 +61,15 @@ pub const env_flag = "ANTFLY_FUSED_CHUNKER_COMPILED_SEGMENT_FORWARD";
 
 pub fn envEnabled() bool {
     return platform.env.getenvBoolDefault(env_flag, false);
+}
+
+/// Serving kill switch: the fused_chunking pipeline defaults the compiled
+/// segment forward ON when running on the Metal backend; set this to "0"
+/// (or "false"/"no"/"off") to force the eager per-window forward.
+pub const serving_env_flag = "ANTFLY_FUSED_CHUNKER_SERVING_COMPILED_FORWARD";
+
+pub fn servingEnvEnabled() bool {
+    return policy.servingCompiledForwardEnabled(platform.env.getenv(serving_env_flag));
 }
 
 /// ModernBERT-base head count; the fused chunker encoder is not configurable
@@ -86,9 +104,42 @@ pub fn graphConfigForEval(
     };
 }
 
+/// Build the graph-side ModernBERT config for SERVING from the eager config
+/// the pipeline derived from the export's config.json. Unlike
+/// `graphConfigForEval` (which mirrors eval-CLI defaults), every geometry and
+/// attention/RoPE hyperparameter comes from the export so the compiled
+/// segments match the eager `modern_bert.forwardCT` the pipeline would
+/// otherwise run.
+pub fn graphConfigFromBertConfig(bert: modern_bert.Config) !modern_bert_graph.Config {
+    if (bert.num_attention_heads == 0 or
+        bert.hidden_size == 0 or
+        bert.hidden_size % bert.num_attention_heads != 0)
+    {
+        return error.InvalidHeadDim;
+    }
+    return .{
+        .vocab_size = bert.vocab_size,
+        .hidden_size = bert.hidden_size,
+        .num_hidden_layers = bert.num_hidden_layers,
+        .num_attention_heads = bert.num_attention_heads,
+        .head_dim = bert.hidden_size / bert.num_attention_heads,
+        .intermediate_size = bert.intermediate_size,
+        .max_position_embeddings = bert.max_position_embeddings,
+        .layer_norm_eps = bert.layer_norm_eps,
+        .rope_theta = bert.global_rope_theta,
+        .local_rope_theta = bert.local_rope_theta,
+        .local_attention_window = bert.local_attention_window,
+        .global_attn_every_n_layers = bert.global_attn_every_n_layers,
+    };
+}
+
 /// Whether a given eval batch should take the compiled path.
 /// See fused_chunker_compiled_forward_policy.zig for the rules and tests.
 pub const shouldUseCompiledForBatch = policy.shouldUseCompiledForBatch;
+
+/// Whether a serving forward window should take the compiled path.
+/// See fused_chunker_compiled_forward_policy.zig for the rules and tests.
+pub const shouldUseCompiledForServingWindow = policy.shouldUseCompiledForServingWindow;
 
 /// Capture-free compiled segmented eval forward.
 ///
@@ -115,6 +166,30 @@ pub const CompiledEvalForward = struct {
         lora_alpha: f32,
     ) !CompiledEvalForward {
         if (lora_rank == 0) return error.LoRARankRequired;
+        return initInternal(allocator, graph_config, layers_per_segment, lora_rank, lora_alpha);
+    }
+
+    /// Construction over a MERGED export (serving): LoRA is already folded
+    /// into the base weights, so segment graphs compile WITHOUT adapter
+    /// injection and `forward` must be called with an empty `lora_layers`
+    /// slice. Do not gate calls through `shouldUse` (that is the eval
+    /// adapter-checkpoint policy, which rejects rank 0); serving gates with
+    /// `shouldUseCompiledForServingWindow` instead.
+    pub fn initMergedBase(
+        allocator: std.mem.Allocator,
+        graph_config: modern_bert_graph.Config,
+        layers_per_segment: u32,
+    ) !CompiledEvalForward {
+        return initInternal(allocator, graph_config, layers_per_segment, 0, 0.0);
+    }
+
+    fn initInternal(
+        allocator: std.mem.Allocator,
+        graph_config: modern_bert_graph.Config,
+        layers_per_segment: u32,
+        lora_rank: u32,
+        lora_alpha: f32,
+    ) !CompiledEvalForward {
         if (graph_config.num_hidden_layers == 0) return error.InvalidLayerRange;
         const sessions = try allocator.alloc(
             ?segmented_encoder.ModernBertSegmentForwardSession,
@@ -143,6 +218,58 @@ pub const CompiledEvalForward = struct {
         return shouldUseCompiledForBatch(self.failed, self.lora_rank, batch_count, full_batch_size);
     }
 
+    /// Build (or rebuild on geometry change) the compiled session for one
+    /// segment, returning a stable pointer into the session slot.
+    fn ensureSession(
+        self: *CompiledEvalForward,
+        segment_start: u32,
+        segment_end: u32,
+        actual_batch: usize,
+        max_seq: usize,
+    ) !*segmented_encoder.ModernBertSegmentForwardSession {
+        const session_slot = &self.sessions[@intCast(segment_start)];
+        if (session_slot.*) |*session| {
+            if (session.batch != actual_batch or
+                session.seq_len != max_seq or
+                session.start_layer != segment_start or
+                session.end_layer != segment_end or
+                session.config.hidden_size != self.graph_config.hidden_size or
+                session.config.intermediate_size != self.graph_config.intermediate_size)
+            {
+                session.deinit();
+                session_slot.* = null;
+            }
+        }
+        if (session_slot.* == null) {
+            session_slot.* = try segmented_encoder.ModernBertSegmentForwardSession.init(
+                self.allocator,
+                self.graph_config,
+                @intCast(actual_batch),
+                @intCast(max_seq),
+                segment_start,
+                segment_end,
+                self.lora_rank,
+                self.lora_alpha,
+                false, // eval/serving forwards need no activation captures
+            );
+        }
+        if (session_slot.*) |*session| return session;
+        return error.MissingCompiledForwardSessions;
+    }
+
+    /// Pre-compile every segment session for one [batch, seq] geometry so the
+    /// first forward doesn't pay the cold MPSGraph compile. Serving calls
+    /// this at pipeline load with its only geometry (batch=1, max_seq_len).
+    pub fn warmup(self: *CompiledEvalForward, actual_batch: usize, max_seq: usize) !void {
+        const num_layers = self.graph_config.num_hidden_layers;
+        var segment_start: u32 = 0;
+        while (segment_start < num_layers) {
+            const segment_end = @min(segment_start + self.layers_per_segment, num_layers);
+            _ = try self.ensureSession(segment_start, segment_end, actual_batch, max_seq);
+            segment_start = segment_end;
+        }
+    }
+
     /// Run the eval forward through the compiled segment sessions.
     /// Returns the owned final feature buffer `[batch * seq * hidden]`,
     /// matching the shape and semantics of `modern_bert.forward`.
@@ -150,7 +277,11 @@ pub const CompiledEvalForward = struct {
     /// `bert_config` drives the eager embedding stage and the final
     /// LayerNorm; eval callers must not set NEFTune fields (eval has no
     /// embedding noise). LoRA comes exclusively from `lora_layers` host
-    /// buffers, never from weight-store lora_a/lora_b tensors.
+    /// buffers, never from weight-store lora_a/lora_b tensors; merged-base
+    /// construction (`initMergedBase`) takes an empty `lora_layers` slice.
+    ///
+    /// The returned buffer is allocated from the CompiledEvalForward's own
+    /// allocator (the one passed at init), not a per-call allocator.
     pub fn forward(
         self: *CompiledEvalForward,
         cb: *const ComputeBackend,
@@ -205,35 +336,7 @@ pub const CompiledEvalForward = struct {
         while (segment_start < num_layers) {
             const segment_end = @min(segment_start + self.layers_per_segment, num_layers);
 
-            const session_slot = &self.sessions[@intCast(segment_start)];
-            var rebuild_session = session_slot.* == null;
-            if (session_slot.*) |*session| {
-                if (session.batch != actual_batch or
-                    session.seq_len != max_seq or
-                    session.start_layer != segment_start or
-                    session.end_layer != segment_end or
-                    session.config.hidden_size != self.graph_config.hidden_size or
-                    session.config.intermediate_size != self.graph_config.intermediate_size)
-                {
-                    session.deinit();
-                    session_slot.* = null;
-                    rebuild_session = true;
-                }
-            }
-            if (rebuild_session) {
-                session_slot.* = try segmented_encoder.ModernBertSegmentForwardSession.init(
-                    allocator,
-                    self.graph_config,
-                    @intCast(actual_batch),
-                    @intCast(max_seq),
-                    segment_start,
-                    segment_end,
-                    self.lora_rank,
-                    self.lora_alpha,
-                    false, // eval needs no activation captures
-                );
-            }
-            const session = &(session_slot.* orelse return error.MissingCompiledForwardSessions);
+            const session = try self.ensureSession(segment_start, segment_end, actual_batch, max_seq);
 
             var result = try session.execute(cb, hidden_owned, attn_mask_f32, lora_layers, &shared_bias);
             defer result.deinit();
@@ -312,4 +415,61 @@ test "CompiledEvalForward init requires LoRA rank and normalizes segment size" {
     var cef = try CompiledEvalForward.init(allocator, cfg, 0, 4, 8.0);
     defer cef.deinit();
     try std.testing.expectEqual(@as(u32, 1), cef.layers_per_segment);
+}
+
+test "initMergedBase builds a rank-0 (no-LoRA) forward for merged exports" {
+    const allocator = std.testing.allocator;
+    const cfg = try graphConfigForEval(768, 22, 1152);
+    var cef = try CompiledEvalForward.initMergedBase(allocator, cfg, 1);
+    defer cef.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cef.lora_rank);
+    try std.testing.expectEqual(@as(usize, 22), cef.sessions.len);
+    for (cef.sessions) |slot| try std.testing.expect(slot == null);
+    // The eval adapter-batch policy rejects rank 0 by design; serving gates
+    // through shouldUseCompiledForServingWindow instead.
+    try std.testing.expect(!cef.shouldUse(32, 32));
+    try std.testing.expect(shouldUseCompiledForServingWindow(cef.failed, 384, 384));
+    cef.failed = true;
+    try std.testing.expect(!shouldUseCompiledForServingWindow(cef.failed, 384, 384));
+}
+
+test "graphConfigFromBertConfig maps the export's eager config" {
+    const bert = modern_bert.Config{
+        .vocab_size = 50368,
+        .hidden_size = 768,
+        .num_hidden_layers = 22,
+        .num_attention_heads = 12,
+        .intermediate_size = 1152,
+        .max_position_embeddings = 8192,
+        .global_rope_theta = 160000.0,
+        .local_rope_theta = 10000.0,
+        .global_attn_every_n_layers = 3,
+        .local_attention_window = 128,
+        .layer_norm_eps = 1e-5,
+    };
+    const cfg = try graphConfigFromBertConfig(bert);
+    try std.testing.expectEqual(bert.vocab_size, cfg.vocab_size);
+    try std.testing.expectEqual(bert.hidden_size, cfg.hidden_size);
+    try std.testing.expectEqual(bert.num_hidden_layers, cfg.num_hidden_layers);
+    try std.testing.expectEqual(bert.num_attention_heads, cfg.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 64), cfg.head_dim);
+    try std.testing.expectEqual(bert.intermediate_size, cfg.intermediate_size);
+    try std.testing.expectEqual(bert.max_position_embeddings, cfg.max_position_embeddings);
+    try std.testing.expectEqual(bert.global_rope_theta, cfg.rope_theta);
+    try std.testing.expectEqual(bert.local_rope_theta, cfg.local_rope_theta);
+    try std.testing.expectEqual(bert.local_attention_window, cfg.local_attention_window);
+    try std.testing.expectEqual(bert.global_attn_every_n_layers, cfg.global_attn_every_n_layers);
+
+    // Non-default head counts flow through instead of the eval-CLI fixed 12.
+    var wide = bert;
+    wide.num_attention_heads = 16;
+    const wide_cfg = try graphConfigFromBertConfig(wide);
+    try std.testing.expectEqual(@as(u32, 16), wide_cfg.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 48), wide_cfg.head_dim);
+
+    var bad = bert;
+    bad.num_attention_heads = 7;
+    try std.testing.expectError(error.InvalidHeadDim, graphConfigFromBertConfig(bad));
+    bad.num_attention_heads = 0;
+    try std.testing.expectError(error.InvalidHeadDim, graphConfigFromBertConfig(bad));
 }

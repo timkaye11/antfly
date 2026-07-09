@@ -185,6 +185,73 @@ pub fn forwardBoundaryOnly(
     return cb.toFloat32(bl_ct, allocator);
 }
 
+/// Full forward from precomputed FINAL encoder hidden states (i.e. the
+/// encoder output after the final LayerNorm, matching what
+/// `modern_bert.forward` returns). Runs only the boundary and embedding
+/// heads; used by the serving pipeline when the compiled MPSGraph segment
+/// forward has already produced the encoder features. Given identical hidden
+/// states, the outputs are identical to `forward`'s (same head ops, same
+/// backend kernels).
+///
+/// final_hidden — [batch * seq_len * hidden_size] f32
+pub fn forwardFromHidden(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    final_hidden: []const f32,
+    batch: usize,
+    seq_len: usize,
+) !ForwardResult {
+    const total = batch * seq_len;
+    const H: usize = @intCast(config.hidden_size);
+    if (final_hidden.len != total * H) return error.UnexpectedHiddenShape;
+
+    const hidden_ct = try cb.fromFloat32Shape(final_hidden, &.{ @intCast(total), @intCast(H) });
+    defer cb.free(hidden_ct);
+
+    const bl_ct = try boundaryHeadCT(cb, config, hidden_ct, total, H);
+    defer cb.free(bl_ct);
+
+    const emb_ct = try embeddingHeadCT(cb, allocator, config, hidden_ct, total, H);
+    defer cb.free(emb_ct);
+
+    const boundary_logits = try cb.toFloat32(bl_ct, allocator);
+    errdefer allocator.free(boundary_logits);
+
+    const token_embeddings = try cb.toFloat32(emb_ct, allocator);
+    errdefer allocator.free(token_embeddings);
+
+    return .{
+        .boundary_logits = boundary_logits,
+        .token_embeddings = token_embeddings,
+    };
+}
+
+/// Boundary-only forward from precomputed FINAL encoder hidden states.
+/// See `forwardFromHidden`.
+///
+/// Returns owned [batch * seq_len * num_boundary_labels] f32.
+pub fn forwardBoundaryOnlyFromHidden(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    final_hidden: []const f32,
+    batch: usize,
+    seq_len: usize,
+) ![]f32 {
+    const total = batch * seq_len;
+    const H: usize = @intCast(config.hidden_size);
+    if (final_hidden.len != total * H) return error.UnexpectedHiddenShape;
+
+    const hidden_ct = try cb.fromFloat32Shape(final_hidden, &.{ @intCast(total), @intCast(H) });
+    defer cb.free(hidden_ct);
+
+    const bl_ct = try boundaryHeadCT(cb, config, hidden_ct, total, H);
+    defer cb.free(bl_ct);
+
+    return cb.toFloat32(bl_ct, allocator);
+}
+
 // ---------------------------------------------------------------------------
 // Boundary head (ComputeBackend)
 // ---------------------------------------------------------------------------

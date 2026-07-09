@@ -1643,6 +1643,11 @@ pub const SegmentForwardResult = struct {
 /// (so a compiled forward matches the forward recompute the VJP graphs
 /// already perform), with LoRA injected via the same target patterns.
 ///
+/// `lora_rank == 0` builds the plain base-weight-only segment graph (no LoRA
+/// injection at all) for callers serving MERGED exports where the adapters
+/// are already folded into the base weights; `execute` is then called with an
+/// empty `lora_layers` slice.
+///
 /// Executes through the MPSGraph runtime only; init fails when the segment
 /// graph cannot be lowered, letting callers fall back to the eager forward.
 pub const ModernBertSegmentForwardSession = struct {
@@ -1675,7 +1680,6 @@ pub const ModernBertSegmentForwardSession = struct {
         lora_alpha: f32,
         emit_captures: bool,
     ) !ModernBertSegmentForwardSession {
-        if (lora_rank == 0) return error.LoRARankRequired;
         if (start_layer >= end_layer or end_layer > config.num_hidden_layers) return error.InvalidLayerRange;
         const segment_len = end_layer - start_layer;
 
@@ -1765,22 +1769,28 @@ pub const ModernBertSegmentForwardSession = struct {
             try g.markOutput(nodes.hidden_out_node);
         }
 
-        var lora_result = try graph_lora.injectLoRA(allocator, &g, .{
-            .rank = lora_rank,
-            .alpha = lora_alpha,
-            .target_patterns = segment_lora_targets[0..],
-        });
-        defer lora_result.deinit();
+        // lora_rank == 0: skip adapter injection entirely and compile the
+        // plain base-weight segment graph (merged-export serving).
+        var lora_result_opt: ?graph_lora.LoRAResult = null;
+        defer if (lora_result_opt) |*lr| lr.deinit();
+        if (lora_rank > 0) {
+            lora_result_opt = try graph_lora.injectLoRA(allocator, &g, .{
+                .rank = lora_rank,
+                .alpha = lora_alpha,
+                .target_patterns = segment_lora_targets[0..],
+            });
+        }
+        const final_graph: *const Graph = if (lora_result_opt) |*lr| &lr.graph else &g;
 
         var base_params_list: std.ArrayListUnmanaged(ParamBinding) = .empty;
         errdefer {
             for (base_params_list.items) |*p| p.deinit(allocator);
             base_params_list.deinit(allocator);
         }
-        for (lora_result.graph.parameters.items) |param_id| {
-            const n = lora_result.graph.node(param_id);
+        for (final_graph.parameters.items) |param_id| {
+            const n = final_graph.node(param_id);
             if (n.op != .parameter) continue;
-            const name = lora_result.graph.parameterName(n);
+            const name = final_graph.parameterName(n);
             if (std.mem.startsWith(u8, name, "__")) continue;
             if (std.mem.indexOf(u8, name, ".lora_A") != null or
                 std.mem.indexOf(u8, name, ".lora_B") != null)
@@ -1800,35 +1810,37 @@ pub const ModernBertSegmentForwardSession = struct {
             for (adapter_list.items) |*a| a.deinit(allocator);
             adapter_list.deinit(allocator);
         }
-        for (lora_result.adapter.adapterNames()) |info| {
-            const stable_base_name = stripLoRASuffix(info.lora_a_name) orelse info.base_name;
-            const mapped = moduleFromModernBertBaseName(stable_base_name) catch continue;
-            const base_name = try allocator.dupe(u8, stable_base_name);
-            errdefer allocator.free(base_name);
-            const a_name = try allocator.dupe(u8, info.lora_a_name);
-            errdefer allocator.free(a_name);
-            const b_name = try allocator.dupe(u8, info.lora_b_name);
-            errdefer allocator.free(b_name);
-            const module_name = try allocator.dupe(u8, mapped.module_name);
-            errdefer allocator.free(module_name);
-            const a_shape = lora_result.graph.node(info.lora_a_id).output_shape;
-            const b_shape = lora_result.graph.node(info.lora_b_id).output_shape;
-            try adapter_list.append(allocator, .{
-                .base_name = base_name,
-                .lora_a_name = a_name,
-                .lora_b_name = b_name,
-                .lora_a_id = info.lora_a_id,
-                .lora_b_id = info.lora_b_id,
-                .lora_a_rows = @intCast(a_shape.dim(0)),
-                .lora_a_cols = @intCast(a_shape.dim(1)),
-                .lora_b_rows = @intCast(b_shape.dim(0)),
-                .lora_b_cols = @intCast(b_shape.dim(1)),
-                .layer_idx = mapped.layer_idx,
-                .module_name = module_name,
-            });
+        if (lora_result_opt) |*lora_result| {
+            for (lora_result.adapter.adapterNames()) |info| {
+                const stable_base_name = stripLoRASuffix(info.lora_a_name) orelse info.base_name;
+                const mapped = moduleFromModernBertBaseName(stable_base_name) catch continue;
+                const base_name = try allocator.dupe(u8, stable_base_name);
+                errdefer allocator.free(base_name);
+                const a_name = try allocator.dupe(u8, info.lora_a_name);
+                errdefer allocator.free(a_name);
+                const b_name = try allocator.dupe(u8, info.lora_b_name);
+                errdefer allocator.free(b_name);
+                const module_name = try allocator.dupe(u8, mapped.module_name);
+                errdefer allocator.free(module_name);
+                const a_shape = lora_result.graph.node(info.lora_a_id).output_shape;
+                const b_shape = lora_result.graph.node(info.lora_b_id).output_shape;
+                try adapter_list.append(allocator, .{
+                    .base_name = base_name,
+                    .lora_a_name = a_name,
+                    .lora_b_name = b_name,
+                    .lora_a_id = info.lora_a_id,
+                    .lora_b_id = info.lora_b_id,
+                    .lora_a_rows = @intCast(a_shape.dim(0)),
+                    .lora_a_cols = @intCast(a_shape.dim(1)),
+                    .lora_b_rows = @intCast(b_shape.dim(0)),
+                    .lora_b_cols = @intCast(b_shape.dim(1)),
+                    .layer_idx = mapped.layer_idx,
+                    .module_name = module_name,
+                });
+            }
         }
 
-        var compiled = try mpsgraph_executor.CompiledGraph.compile(allocator, &lora_result.graph);
+        var compiled = try mpsgraph_executor.CompiledGraph.compile(allocator, final_graph);
         errdefer compiled.deinit();
 
         return .{
