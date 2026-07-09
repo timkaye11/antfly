@@ -307,11 +307,17 @@ fn fusedSplitEncoderActive(config: lib_chunker.FixedChunkConfig, has_embedding_m
 }
 
 /// Fused-path feature rejections when an embedding_model is supplied.
-/// SPLADE-on-frozen-base is still training, so sparse output cannot yet be
-/// served consistently with split-encoder dense embeddings (follow-up).
+///
+/// include_sparse together with embedding_model is served in SPLIT-ENCODER mode
+/// (include_embeddings): a SPLADE-capable frozen embedder produces sparse
+/// vectors from the same per-token hidden states that back the dense vector
+/// (see embedFusedChunksSplitEncoder). Without include_embeddings there is no
+/// split-encoder forward to attach a SPLADE head to, so reject. Whether the
+/// resolved embedder actually carries a SPLADE head is checked later, once it
+/// is loaded, with a clear 400 for dense-only embedders.
 fn fusedChunkerSplitEncoderUnsupportedFeature(config: lib_chunker.FixedChunkConfig, has_embedding_model: bool) ?[]const u8 {
-    if (has_embedding_model and config.include_sparse) {
-        return "include_sparse is not yet supported together with embedding_model on a model-backed chunker; drop include_sparse or omit embedding_model";
+    if (has_embedding_model and config.include_sparse and !config.include_embeddings) {
+        return "include_sparse with embedding_model requires include_embeddings (split-encoder SPLADE serving); set include_embeddings or drop include_sparse";
     }
     return null;
 }
@@ -327,7 +333,9 @@ fn fusedChunkRequestOptions(config: lib_chunker.FixedChunkConfig, split_encoder:
         .threshold = config.threshold,
         .max_chunks = config.max_chunks,
         .include_embeddings = config.include_embeddings and !split_encoder,
-        .include_sparse = config.include_sparse,
+        // In split-encoder mode the SPLADE head runs on the frozen embedder, not
+        // the fused model, so keep the fused boundary-only forward sparse-free.
+        .include_sparse = config.include_sparse and !split_encoder,
         .output_dimension = if (split_encoder) null else config.output_dimension,
         .sparse_top_k = config.sparse_top_k,
     };
@@ -726,6 +734,21 @@ pub const Node = struct {
         model.ensureEmbeddingAssets(true, false, false) catch |err|
             return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
 
+        // SPLADE sparse serving: only when the resolved embedder carries a
+        // packaged SPLADE head. Dense-only embedders get a clear 400 (the 400
+        // that split-encoder mode lifted only for SPLADE-capable embedders). The
+        // head must be materialized BEFORE embeddingPipeline snapshots it.
+        if (config.include_sparse) {
+            if (!model.manifest.has_splade) {
+                return try ctx.status(400).json(.{
+                    .@"error" = "SPARSE_EMBEDDINGS_UNSUPPORTED",
+                    .message = "embedding_model has no SPLADE head; drop include_sparse or choose a SPLADE-capable embedder",
+                });
+            }
+            model.ensureSpladeHead() catch |err|
+                return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+        }
+
         var pipeline = model.embeddingPipeline(ctx.allocator);
         multimodal_chunk_embedding_mod.embedTextChunks(ctx.allocator, &pipeline, chunks, .{
             .output_dimension = config.output_dimension,
@@ -741,6 +764,22 @@ pub const Node = struct {
             }),
             else => return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
         };
+
+        if (config.include_sparse) {
+            multimodal_chunk_embedding_mod.embedTextChunksSparse(ctx.allocator, &pipeline, chunks, .{
+                .sparse_top_k = config.sparse_top_k,
+            }) catch |err| switch (err) {
+                error.UnsupportedModality, error.UnknownModality, error.MissingChunkPayload => return try ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "embedding_model on a model-backed chunker supports text chunks only",
+                }),
+                error.SpladeWeightUnavailable, error.SpladeUnsupportedEmbedder, error.SpladeWeightShapeMismatch => return try ctx.status(400).json(.{
+                    .@"error" = "SPARSE_EMBEDDINGS_UNSUPPORTED",
+                    .message = "embedding_model cannot produce SPLADE sparse vectors (no compatible SPLADE head)",
+                }),
+                else => return try ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            };
+        }
         return null;
     }
 
@@ -1870,16 +1909,21 @@ pub const Node = struct {
                     });
                 }
 
-                if (config.include_sparse and !pipeline.has_splade) {
+                // SPLIT-ENCODER: fused boundaries + frozen embed-base chunk
+                // embeddings; see fusedSplitEncoderActive for the rationale.
+                const split_encoder = fusedSplitEncoderActive(config, embedding_model != null);
+
+                // In split-encoder mode the SPLADE head lives on the frozen
+                // embedder, not the fused model, so the fused model's own SPLADE
+                // availability is irrelevant (checked against the embedder inside
+                // embedFusedChunksSplitEncoder). Only require the fused model's
+                // SPLADE head for fused-native sparse (no split-encoder).
+                if (!split_encoder and config.include_sparse and !pipeline.has_splade) {
                     return ctx.status(400).json(.{
                         .@"error" = "SPARSE_EMBEDDINGS_UNSUPPORTED",
                         .message = "selected chunker model has no SPLADE head; disable include_sparse or choose a SPLADE-enabled chunker",
                     });
                 }
-
-                // SPLIT-ENCODER: fused boundaries + frozen embed-base chunk
-                // embeddings; see fusedSplitEncoderActive for the rationale.
-                const split_encoder = fusedSplitEncoderActive(config, embedding_model != null);
 
                 served_by_fused = true;
                 const fused_chunks = pipeline.chunkText(
@@ -6817,10 +6861,15 @@ test "fused split-encoder dispatch activates only with embedding_model + include
     try std.testing.expect(!fusedSplitEncoderActive(.{}, true));
 }
 
-test "fused split-encoder rejects include_sparse with embedding_model" {
-    try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, true) != null);
+test "fused split-encoder allows include_sparse only in split-encoder (include_embeddings) mode" {
+    // Split-encoder mode (embedding_model + include_embeddings): SPLADE sparse
+    // is served from the frozen embedder, so the feature gate allows it. Whether
+    // the embedder actually carries a SPLADE head is checked later, on load.
+    try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, true) == null);
+    // embedding_model + include_sparse but WITHOUT include_embeddings: no
+    // split-encoder forward to attach a SPLADE head to → rejected.
     try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_sparse = true }, true) != null);
-    // Without an embedding_model the fused SPLADE path is untouched.
+    // Without an embedding_model the fused-native SPLADE path is untouched.
     try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true, .include_sparse = true }, false) == null);
     try std.testing.expect(fusedChunkerSplitEncoderUnsupportedFeature(.{ .include_embeddings = true }, true) == null);
 }
@@ -6849,6 +6898,12 @@ test "fused chunk options run boundary-only under split-encoder and are unchange
     try std.testing.expectEqual(@as(?u32, null), split.output_dimension);
     try std.testing.expectEqual(@as(?f32, 0.42), split.threshold);
     try std.testing.expectEqual(@as(usize, 12), split.max_chunks);
+
+    // Split-encoder also strips include_sparse from the fused forward: the
+    // SPLADE head runs on the frozen embedder, not the fused model.
+    const sparse_cfg = lib_chunker.FixedChunkConfig{ .include_embeddings = true, .include_sparse = true };
+    try std.testing.expect(fusedChunkRequestOptions(sparse_cfg, false).include_sparse);
+    try std.testing.expect(!fusedChunkRequestOptions(sparse_cfg, true).include_sparse);
 }
 
 test "split-encoder document prefix prefers request override then manifest knob" {

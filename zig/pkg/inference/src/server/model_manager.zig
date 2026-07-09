@@ -24,6 +24,8 @@ const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const safetensors_mod = @import("../models/safetensors.zig");
+const fused_chunker_splade = @import("../finetune/fused_chunker_splade.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
@@ -657,6 +659,11 @@ pub const LoadedModel = struct {
     resident_projection_stats: embedding_mod.AtomicResidentProjectionStats = .{},
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
+    /// Lazily materialized SPLADE projection weight [splade_vocab_size *
+    /// hidden_size] f32 for a SPLADE-capable dense embedder (split-encoder
+    /// /chunk sparse serving). Loaded once from manifest.splade_weight_path and
+    /// cached under embedding_session_lock.
+    splade_weight: ?[]f32 = null,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -715,6 +722,32 @@ pub const LoadedModel = struct {
         }
     }
 
+    /// Load and cache the packaged SPLADE projection weight as f32. Idempotent;
+    /// safe to call before embeddingPipeline when include_sparse is requested.
+    /// Returns error.SpladeHeadUnavailable when the embedder has no SPLADE head.
+    pub fn ensureSpladeHead(self: *LoadedModel) !void {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        if (self.splade_weight != null) return;
+        const path = self.manifest.splade_weight_path orelse return error.SpladeHeadUnavailable;
+
+        var reader = try safetensors_mod.MMapReader.openFileAbsolute(self.allocator, path);
+        defer reader.deinit();
+        // Accept both the standalone training checkpoint key (splade_proj_weight)
+        // and the fused-export serving key.
+        var tensor = reader.readTensor("splade_proj_weight") catch
+            try reader.readTensor(fused_chunker_splade.SPLADE_WEIGHT_KEY);
+        defer tensor.deinit();
+
+        const src = tensor.asFloat32();
+        const expected = @as(usize, self.manifest.splade_vocab_size) * @as(usize, self.manifest.hidden_size);
+        if (src.len != expected) {
+            std.log.warn("splade head {s} has {d} f32 elements, expected {d} (vocab {d} x hidden {d})", .{ path, src.len, expected, self.manifest.splade_vocab_size, self.manifest.hidden_size });
+            return error.SpladeWeightShapeMismatch;
+        }
+        self.splade_weight = try self.allocator.dupe(f32, src);
+    }
+
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
@@ -753,6 +786,8 @@ pub const LoadedModel = struct {
         pipeline.visual_projection = self.visual_projection;
         pipeline.audio_projection = self.audio_projection;
         pipeline.resident_projection_stats = &self.resident_projection_stats;
+        pipeline.splade_weight = self.splade_weight;
+        pipeline.splade_vocab_size = self.manifest.splade_vocab_size;
         return pipeline;
     }
 
@@ -903,6 +938,7 @@ pub const LoadedModel = struct {
             head.deinit();
             self.allocator.destroy(head);
         }
+        if (self.splade_weight) |w| self.allocator.free(w);
         self.manifest.deinit();
         self.allocator.free(self.model_dir);
     }

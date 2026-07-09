@@ -242,6 +242,60 @@ pub fn embedTextChunks(
     });
 }
 
+pub const SparseChunkOptions = struct {
+    /// Keep only the top-k SPLADE activations per chunk (by weight); null keeps
+    /// every positive activation. Indices are always emitted ascending.
+    sparse_top_k: ?usize = null,
+};
+
+/// Split-encoder SPLADE serving: produce a sparse vocabulary-space vector for
+/// each TEXT chunk from the SAME frozen embed-base that supplies the dense
+/// vector, via its packaged SPLADE head (pipeline.embedSplade). Results are
+/// written into `chunk.sparse_embedding` in the original chunk order.
+///
+/// Unlike the dense path, SPLADE is fed the RAW chunk text (no nomic
+/// "search_document: " retrieval prefix): SPLADE max-pools over content tokens,
+/// so a retrieval prefix would inject spurious "search"/"document" vocabulary
+/// dimensions into every vector. The embedder's own unconditional manifest
+/// text_prefix (empty for nomic) still applies inside the forward, matching the
+/// dense path's non-stacking behavior.
+///
+/// `pipeline` is duck-typed (anytype) so tests can substitute a synthetic
+/// implementation exposing `embedSplade` without a real forward pass.
+pub fn embedTextChunksSparse(
+    allocator: std.mem.Allocator,
+    pipeline: anytype,
+    chunks: []Chunk,
+    opts: SparseChunkOptions,
+) !void {
+    if (chunks.len == 0) return;
+
+    for (chunks) |chunk| {
+        if (try classifyChunk(chunk) != .text) return error.UnsupportedModality;
+    }
+
+    const texts = try allocator.alloc([]const u8, chunks.len);
+    defer allocator.free(texts);
+    for (chunks, texts) |chunk, *out| out.* = chunk.text.?;
+
+    const dense = try pipeline.embedSplade(texts);
+    defer {
+        for (dense) |vec| allocator.free(vec);
+        allocator.free(dense);
+    }
+    if (dense.len != chunks.len) return error.UnexpectedOutputShape;
+
+    for (chunks, 0..) |*chunk, i| {
+        // Sparsify the dense SPLADE activation (positive-only, top_k, ascending
+        // indices) via the shared chunker helper. Order is preserved because
+        // dense[i] corresponds to chunks[i].
+        var sparse = try fused_chunking.sparseFromDense(allocator, dense[i], opts.sparse_top_k);
+        if (chunk.sparse_embedding) |*old| old.deinit(allocator);
+        chunk.sparse_embedding = sparse;
+        sparse = undefined;
+    }
+}
+
 /// Take ownership of `embeddings` (an owned `[][]f32` returned by a tower) and
 /// write each vector into the chunk at the matching original index. Applies
 /// output_dimension truncation+renormalization when requested. Preserves order
@@ -541,4 +595,114 @@ test "embedTextChunks rejects non-text chunks" {
     try std.testing.expectError(error.UnsupportedModality, embedTextChunks(alloc, &pipeline, &chunks, .{}));
     // The pipeline was never invoked for a rejected batch.
     try std.testing.expectEqual(@as(usize, 0), pipeline.calls);
+}
+
+// ---------------------------------------------------------------------------
+// Split-encoder SPLADE serving tests (mock SPLADE embedder, no forward pass).
+// The mock returns a synthetic dense vocab activation per chunk so the tests
+// exercise the sparsify+top_k+order-preservation dispatch without a real
+// encoder/projection.
+// ---------------------------------------------------------------------------
+
+/// Stand-in exposing `embedSplade`. Each chunk i gets a dense vocab vector with
+/// a distinct activation pattern so tests can assert order preservation and
+/// top_k selection. Records the texts seen (raw, un-prefixed) for assertion.
+const MockSpladePipeline = struct {
+    allocator: std.mem.Allocator,
+    vocab: usize = 6,
+    calls: usize = 0,
+    seen_texts: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *MockSpladePipeline) void {
+        for (self.seen_texts.items) |t| self.allocator.free(t);
+        self.seen_texts.deinit(self.allocator);
+    }
+
+    pub fn embedSplade(self: *MockSpladePipeline, texts: []const []const u8) ![][]f32 {
+        self.calls += 1;
+        for (texts) |t| try self.seen_texts.append(self.allocator, try self.allocator.dupe(u8, t));
+        const out = try self.allocator.alloc([]f32, texts.len);
+        errdefer self.allocator.free(out);
+        for (out, 0..) |*v, i| {
+            v.* = try self.allocator.alloc(f32, self.vocab);
+            @memset(v.*, 0);
+            // Distinct positive activations per chunk: dims (i % vocab) and
+            // ((i+2) % vocab) plus a small negative that must be dropped.
+            v.*[i % self.vocab] = 3.0 + @as(f32, @floatFromInt(i));
+            v.*[(i + 2) % self.vocab] = 1.0;
+            v.*[(i + 4) % self.vocab] = -5.0; // dropped by log1p(relu)
+        }
+        return out;
+    }
+};
+
+test "embedTextChunksSparse writes ascending-index sparse vectors in chunk order" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{
+        Chunk.initText(0, "alpha", 0, 5),
+        Chunk.initText(1, "beta", 5, 9),
+        Chunk.initText(2, "gamma", 9, 14),
+    };
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockSpladePipeline{ .allocator = alloc };
+    defer pipeline.deinit();
+    try embedTextChunksSparse(alloc, &pipeline, &chunks, .{});
+
+    try std.testing.expectEqual(@as(usize, 1), pipeline.calls);
+    // SPLADE is fed RAW chunk text (no document prefix).
+    try std.testing.expectEqualStrings("alpha", pipeline.seen_texts.items[0]);
+    try std.testing.expectEqualStrings("gamma", pipeline.seen_texts.items[2]);
+
+    // Every chunk carries a sparse vector: 2 positive dims, ascending indices,
+    // and the negative dim dropped.
+    for (&chunks) |c| {
+        const sv = c.sparse_embedding orelse return error.TestMissingSparse;
+        try std.testing.expectEqual(@as(usize, 2), sv.indices.len);
+        try std.testing.expect(sv.indices[0] < sv.indices[1]);
+        for (sv.values) |val| try std.testing.expect(val > 0);
+    }
+    // Order preserved, and sparseFromDense keeps the already-activated value
+    // verbatim (log1p(relu) was applied inside embedSplade, mocked here as the
+    // dense activation directly): chunk 0 peaks at dim 0 (3.0), chunk 1 (4.0).
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), maxSparseValue(chunks[0].sparse_embedding.?), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), maxSparseValue(chunks[1].sparse_embedding.?), 1e-6);
+}
+
+test "embedTextChunksSparse honors sparse_top_k cap" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{Chunk.initText(0, "alpha", 0, 5)};
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockSpladePipeline{ .allocator = alloc };
+    defer pipeline.deinit();
+    // Chunk 0 has 2 positive dims; cap to 1 keeps the largest (dim 0).
+    try embedTextChunksSparse(alloc, &pipeline, &chunks, .{ .sparse_top_k = 1 });
+
+    const sv = chunks[0].sparse_embedding orelse return error.TestMissingSparse;
+    try std.testing.expectEqual(@as(usize, 1), sv.indices.len);
+    try std.testing.expectEqual(@as(i32, 0), sv.indices[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), sv.values[0], 1e-6);
+}
+
+test "embedTextChunksSparse rejects non-text chunks without invoking the head" {
+    const alloc = std.testing.allocator;
+    var chunks = [_]Chunk{
+        Chunk.initText(0, "text", 0, 4),
+        Chunk.initBinary(1, "image/png", "img"),
+    };
+    defer for (&chunks) |*c| c.deinit(alloc);
+
+    var pipeline = MockSpladePipeline{ .allocator = alloc };
+    defer pipeline.deinit();
+    try std.testing.expectError(error.UnsupportedModality, embedTextChunksSparse(alloc, &pipeline, &chunks, .{}));
+    try std.testing.expectEqual(@as(usize, 0), pipeline.calls);
+}
+
+fn maxSparseValue(sv: chunker.types.SparseVector) f32 {
+    var m: f32 = 0;
+    for (sv.values) |v| {
+        if (v > m) m = v;
+    }
+    return m;
 }

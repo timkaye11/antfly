@@ -34,6 +34,7 @@ const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
+const fused_chunker_splade = @import("../finetune/fused_chunker_splade.zig");
 
 const qwen3_embedding_resident_override_level = 4;
 
@@ -176,6 +177,14 @@ pub const EmbeddingPipeline = struct {
     audio_projection: ?backends.Session = null,
     /// Optional caller-owned resident path counters for benchmark/service use.
     resident_projection_stats: ?*AtomicResidentProjectionStats = null,
+    /// Optional SPLADE projection weight [splade_vocab_size, hidden_size] f32,
+    /// borrowed (owned by the LoadedModel). When set, `embedSplade` runs the
+    /// encoder and projects raw per-token hidden states into vocab-space sparse
+    /// activations. Only valid for a raw-hidden-state embedder (no
+    /// text_projection); packaged with a frozen embed-base for split-encoder
+    /// /chunk SPLADE serving.
+    splade_weight: ?[]const f32 = null,
+    splade_vocab_size: u32 = 50368,
     /// Print phase timings for CLI/debug callers. TERMITE_EMBED_TIMING still
     /// enables the same logs for server and legacy workflows.
     print_timing: bool = false,
@@ -314,6 +323,187 @@ pub const EmbeddingPipeline = struct {
         }
 
         return embeddings;
+    }
+
+    /// Raw per-token hidden states from a single encoder forward, owned by the
+    /// caller. Used by `embedSplade` (SPLADE pools raw hidden states, so it
+    /// cannot go through pool3D). This mirrors the encoder-run portion of
+    /// `embed` but stops before pooling; `embed` is intentionally left untouched
+    /// so the dense path is byte-for-byte unchanged.
+    const HiddenBatch = struct {
+        /// [batch * seq_len * hidden] row-major last_hidden_state, f32.
+        data: []f32,
+        /// [batch * seq_len] attention mask (1 = real token).
+        mask: []i32,
+        batch: usize,
+        seq_len: usize,
+        hidden: usize,
+
+        fn deinit(self: *HiddenBatch, alloc: std.mem.Allocator) void {
+            alloc.free(self.data);
+            alloc.free(self.mask);
+            self.* = undefined;
+        }
+    };
+
+    fn forwardTextHidden(self: *EmbeddingPipeline, texts: []const []const u8) !HiddenBatch {
+        // SPLADE operates on the encoder's raw hidden states. A text_projection
+        // (CLIP-style) or resident-qwen3 embedder returns projected/pooled
+        // vectors, not a 3D last_hidden_state, so it cannot back a SPLADE head.
+        if (self.text_projection != null) return error.SpladeUnsupportedEmbedder;
+
+        const alloc = self.allocator;
+        const text_session = self.textEncodingSession();
+        const input_info = text_session.inputInfo();
+        const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
+        const fixed_len = hasFixedTextSequenceLength(input_info);
+        const batch = texts.len;
+
+        const encoded = try alloc.alloc(EncodeResult, batch);
+        defer alloc.free(encoded);
+        var encoded_count: usize = 0;
+        defer {
+            for (encoded[0..encoded_count]) |*result| result.deinit();
+        }
+
+        var effective_len: usize = if (self.config.trim_padding_to_batch_max and !fixed_len) 1 else max_len;
+        for (texts, 0..) |text, i| {
+            const token_text = if (self.config.text_prefix.len > 0)
+                try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.config.text_prefix, text })
+            else
+                text;
+            defer if (self.config.text_prefix.len > 0) alloc.free(token_text);
+
+            encoded[i] = try self.tok.encodeForModel(alloc, token_text, max_len);
+            encoded_count += 1;
+            if (self.config.trim_padding_to_batch_max and !fixed_len) {
+                effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
+            }
+        }
+
+        const all_mask = try alloc.alloc(i32, batch * effective_len);
+        errdefer alloc.free(all_mask);
+        const all_ids = try alloc.alloc(i32, batch * effective_len);
+        defer alloc.free(all_ids);
+        for (encoded[0..batch], 0..) |result, i| {
+            @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], result.ids[0..effective_len]);
+            @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], result.attention_mask[0..effective_len]);
+        }
+
+        const ids_i64 = try alloc.alloc(i64, batch * effective_len);
+        defer alloc.free(ids_i64);
+        const mask_i64 = try alloc.alloc(i64, batch * effective_len);
+        defer alloc.free(mask_i64);
+        for (0..batch * effective_len) |j| {
+            ids_i64[j] = @intCast(all_ids[j]);
+            mask_i64[j] = @intCast(all_mask[j]);
+        }
+
+        const shape = [_]i64{ @intCast(batch), @intCast(effective_len) };
+        var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, ids_i64);
+        defer input_ids_tensor.deinit();
+        var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
+        defer attention_mask_tensor.deinit();
+
+        var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
+        defer input_set.deinit();
+
+        var outputs = try text_session.run(input_set.slice(), alloc);
+        defer {
+            for (outputs) |*o| o.deinit();
+            alloc.free(outputs);
+        }
+        if (outputs.len == 0) return error.NoOutputTensors;
+
+        const output = &outputs[0];
+        if (output.shape.len != 3) return error.SpladeUnsupportedEmbedder;
+        const hidden: usize = @intCast(output.shape[2]);
+        const src = output.asFloat32();
+        if (src.len != batch * effective_len * hidden) return error.UnexpectedOutputShape;
+
+        const data = try alloc.dupe(f32, src);
+        return .{ .data = data, .mask = all_mask, .batch = batch, .seq_len = effective_len, .hidden = hidden };
+    }
+
+    /// SPLADE sparse activations for a batch of texts, one dense
+    /// [splade_vocab_size] vector per input (post log1p(relu) + max-pool over the
+    /// masked tokens). Requires a packaged SPLADE weight (`splade_weight`). The
+    /// caller sparsifies (threshold + top_k) — see multimodal_chunk_embedding
+    /// embedTextChunksSparse. Caller owns and frees the returned slices.
+    ///
+    /// The projection reuses fused_chunker_splade.computeSpladeActivation, whose
+    /// hidden->vocab matmul runs through the tiled/multithreaded SGEMM (NOT a
+    /// scalar triple loop — that was the 97s/step regression).
+    pub fn embedSplade(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        const weight = self.splade_weight orelse return error.SpladeWeightUnavailable;
+        const V: usize = @intCast(self.splade_vocab_size);
+        const alloc = self.allocator;
+        if (texts.len == 0) return try alloc.alloc([]f32, 0);
+
+        // ONNX batching quirks (stale symbolic dims) are avoided in `embed` via
+        // per-text serial runs; mirror that here for correctness.
+        if (self.textEncodingSession().backend() == .onnx and texts.len > 1) {
+            const out = try alloc.alloc([]f32, texts.len);
+            var done: usize = 0;
+            errdefer {
+                for (out[0..done]) |v| alloc.free(v);
+                alloc.free(out);
+            }
+            for (texts, 0..) |_, i| {
+                const single = try self.embedSplade(texts[i .. i + 1]);
+                defer alloc.free(single);
+                out[i] = single[0];
+                done += 1;
+            }
+            return out;
+        }
+
+        var hb = try self.forwardTextHidden(texts);
+        defer hb.deinit(alloc);
+        if (hb.hidden * V != weight.len) return error.SpladeWeightShapeMismatch;
+
+        const out = try alloc.alloc([]f32, hb.batch);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |v| alloc.free(v);
+            alloc.free(out);
+        }
+
+        // Scratch: contiguous hidden states of one item's active tokens.
+        const scratch = try alloc.alloc(f32, hb.seq_len * hb.hidden);
+        defer alloc.free(scratch);
+
+        for (0..hb.batch) |b| {
+            const dense = try alloc.alloc(f32, V);
+            errdefer alloc.free(dense);
+            @memset(dense, 0);
+
+            // Gather this item's active (masked) token hidden states contiguously.
+            var n_tokens: usize = 0;
+            for (0..hb.seq_len) |s| {
+                if (hb.mask[b * hb.seq_len + s] == 0) continue;
+                const src_base = (b * hb.seq_len + s) * hb.hidden;
+                const dst_base = n_tokens * hb.hidden;
+                @memcpy(scratch[dst_base .. dst_base + hb.hidden], hb.data[src_base .. src_base + hb.hidden]);
+                n_tokens += 1;
+            }
+
+            try fused_chunker_splade.computeSpladeActivation(
+                alloc,
+                scratch[0 .. n_tokens * hb.hidden],
+                weight,
+                dense,
+                n_tokens,
+                hb.hidden,
+                self.splade_vocab_size,
+                .max,
+            );
+
+            out[b] = dense;
+            initialized += 1;
+        }
+
+        return out;
     }
 
     fn textEncodingSession(self: *const EmbeddingPipeline) backends.Session {

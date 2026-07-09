@@ -151,6 +151,16 @@ pub const ModelManifest = struct {
     visual_projection_path: ?[]const u8 = null,
     audio_projection_path: ?[]const u8 = null,
 
+    // SPLADE sparse head packaged alongside a dense text embedder (split-encoder
+    // serving). When `splade_head.safetensors` (tensor `splade_proj_weight`,
+    // [vocab_size, hidden_size]) is present in the model dir, the embedder can
+    // produce SPLADE sparse vectors from its raw per-token hidden states in
+    // addition to its pooled dense embedding. See pipelines/embedding.zig
+    // embedSplade + server split-encoder /chunk path.
+    splade_weight_path: ?[]const u8 = null,
+    has_splade: bool = false,
+    splade_vocab_size: u32 = 50368,
+
     // Architecture (from config.json)
     hidden_size: u32 = 768,
     intermediate_size: u32 = 3072,
@@ -233,6 +243,7 @@ pub const ModelManifest = struct {
         if (self.text_projection_path) |p| self.allocator.free(p);
         if (self.visual_projection_path) |p| self.allocator.free(p);
         if (self.audio_projection_path) |p| self.allocator.free(p);
+        if (self.splade_weight_path) |p| self.allocator.free(p);
         if (self.id2label) |labels| {
             for (labels) |l| {
                 if (l.len > 0) self.allocator.free(l);
@@ -470,6 +481,11 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, model_dir_path, &safetensors_index_candidates, &.{""});
     if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, model_dir_path, &.{"gliner_head.gguf"}, &.{""});
     if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, model_dir_path, &.{"gliner_head.safetensors"}, &.{""});
+    // A packaged SPLADE head (splade_head.safetensors) makes a dense embedder
+    // SPLADE-capable for split-encoder /chunk serving. File presence is
+    // authoritative for has_splade so packaging is a pure filesystem step.
+    if (manifest.splade_weight_path == null) manifest.splade_weight_path = try findFileInSubdirs(allocator, model_dir_path, &.{"splade_head.safetensors"}, &.{""});
+    if (manifest.splade_weight_path != null) manifest.has_splade = true;
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, model_dir_path, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, model_dir_path, &.{"tokenizer.json"}, &.{""});
@@ -584,6 +600,11 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, model_dir_path, &safetensors_index_candidates, &.{""});
     if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, model_dir_path, &.{"gliner_head.gguf"}, &.{""});
     if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, model_dir_path, &.{"gliner_head.safetensors"}, &.{""});
+    // A packaged SPLADE head (splade_head.safetensors) makes a dense embedder
+    // SPLADE-capable for split-encoder /chunk serving. File presence is
+    // authoritative for has_splade so packaging is a pure filesystem step.
+    if (manifest.splade_weight_path == null) manifest.splade_weight_path = try findFileInSubdirs(allocator, model_dir_path, &.{"splade_head.safetensors"}, &.{""});
+    if (manifest.splade_weight_path != null) manifest.has_splade = true;
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, model_dir_path, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, model_dir_path, &.{"tokenizer.json"}, &.{""});
@@ -1280,6 +1301,15 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
     } else if (obj.get("sparse_output_layout")) |v| {
         if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
+    }
+
+    // Optional SPLADE vocab dimension for a packaged sparse head. Defaults to
+    // the ModernBERT vocab (50368); file discovery drives has_splade.
+    if (obj.get("splade_vocab_size")) |v| {
+        if (jsonU32(v)) |val| manifest.splade_vocab_size = val;
+    }
+    if (obj.get("has_splade")) |v| {
+        if (v == .bool) manifest.has_splade = v.bool;
     }
 
     // Retrieval prefixes for prefix-conditioned embedders (e.g. nomic).
@@ -2618,6 +2648,47 @@ test "manifest gguf discovery separates decoder and projector files" {
 
     try std.testing.expect(std.mem.endsWith(u8, decoder, "gemma-4-e2b-it-Q8_0.gguf"));
     try std.testing.expect(std.mem.endsWith(u8, projector, "mmproj-gemma-4-e2b-it-f16.gguf"));
+}
+
+test "manifest discovers packaged splade head and sets has_splade" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A dense embed-base with a packaged SPLADE head sidecar. File presence is
+    // authoritative for has_splade (split-encoder SPLADE serving).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "weights" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "splade_head.safetensors", .data = "splade" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.has_splade);
+    try std.testing.expect(manifest.splade_weight_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.splade_weight_path.?, "splade_head.safetensors"));
+    try std.testing.expectEqual(@as(u32, 50368), manifest.splade_vocab_size);
+}
+
+test "manifest without splade head leaves has_splade false" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "weights" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(!manifest.has_splade);
+    try std.testing.expect(manifest.splade_weight_path == null);
 }
 
 test "manifest does not treat projector-only gguf as decoder weights" {
