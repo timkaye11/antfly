@@ -25,6 +25,7 @@ const backend_contracts = @import("backend_contracts.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_types = @import("../gguf/tensor_types.zig");
+const metal_renderer = @import("quant_kernel_metal_renderer.zig");
 
 pub const metal_promotion_min_speedup: f64 = 1.10;
 pub const metal_promotion_speedup_tolerance: f64 = 0.001;
@@ -4160,16 +4161,47 @@ pub const metal_runtime_quant_sections = [_]MetalRuntimeQuantSection{
 // codegen tool rewrites the marker-delimited region of that file with this
 // output, so the runtime copy is assembled from the same bytes as the
 // checked-in generated sources.
+/// Stable kernel name for a small-batch route (matches the wired dispatch names).
+pub fn metalRuntimeKernelId(allocator: std.mem.Allocator, format: quant_matmul.Format, epilogue: Epilogue) ![]u8 {
+    const epi_suffix = switch (epilogue) {
+        .none => "",
+        .bias => "_bias",
+        .bias_gelu => "_bias_gelu",
+        .relu => "_relu",
+        else => return error.UnsupportedEpilogueForSection,
+    };
+    return std.fmt.allocPrint(allocator, "antfly_{s}_small_batch{s}_msl_v1", .{ @tagName(format), epi_suffix });
+}
+
+/// Renders the runtime-embedded quant kernel region of metal_kernels.m as
+/// Objective-C string fragment lines. Single-sourced: the MSL is produced by the
+/// descriptor-driven renderer from `metal_production_schedules` (schedule +
+/// FormatDecoder + epilogue), not from frozen body constants.
 pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var kernels = std.ArrayListUnmanaged(metal_renderer.RegionKernel).empty;
+    for (metal_production_schedules) |route| {
+        const decoder = metal_renderer.decoderFor(route.format) orelse return error.MissingDecoder;
+        try kernels.append(arena, .{
+            .kernel_id = try metalRuntimeKernelId(arena, route.format, route.epilogue),
+            .decoder = decoder,
+            .schedule = route.schedule,
+            .epilogue = route.epilogue,
+        });
+    }
+    const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
+
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    for (metal_runtime_quant_sections) |section| {
-        var section_lines = std.mem.splitScalar(u8, section.text, '\n');
-        while (section_lines.next()) |line| {
-            try out.appendSlice(allocator, "           \"");
-            try out.appendSlice(allocator, line);
-            try out.appendSlice(allocator, "\\n\"\n");
-        }
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try out.appendSlice(allocator, "           \"");
+        try out.appendSlice(allocator, line);
+        try out.appendSlice(allocator, "\\n\"\n");
     }
     return out.toOwnedSlice(allocator);
 }
@@ -9465,7 +9497,9 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(q6_disable > none_encoder and q6_disable < q8_encoder);
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "strcmp(kernel_name, \"antfly_q4_k_small_batch_msl_v1\") == 0"));
     const q5_1_kernel = std.mem.indexOf(u8, contents, "kernel void antfly_q5_1_small_batch_msl_v1") orelse return error.MissingMetalQ5_1Kernel;
-    const q5_1_kernel_end = std.mem.indexOfPos(u8, contents, q5_1_kernel, "inline float antfly_q8_1_half_le_to_float") orelse return error.MissingMetalQ5_1KernelEnd;
+    // Single-sourced region: helpers are emitted once up top, kernel bodies
+    // together after. Bound the q5_1 body by the next generated kernel.
+    const q5_1_kernel_end = std.mem.indexOfPos(u8, contents, q5_1_kernel + 1, "kernel void antfly_") orelse return error.MissingMetalQ5_1KernelEnd;
     const q5_1_kernel_body = contents[q5_1_kernel..q5_1_kernel_end];
     try std.testing.expect(std.mem.containsAtLeast(u8, q5_1_kernel_body, 1, "int col0 = int(group_pos.x << 1); int col1 = col0 + 1;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, q5_1_kernel_body, 1, "device const uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;"));

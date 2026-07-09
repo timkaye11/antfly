@@ -287,6 +287,48 @@ pub fn renderKernel(
     return out.toOwnedSlice(allocator);
 }
 
+/// One generated Metal kernel to emit into the shared runtime region: its
+/// stable kernel name plus the descriptor/schedule/epilogue it renders from.
+pub const RegionKernel = struct {
+    kernel_id: []const u8,
+    decoder: FormatDecoder,
+    schedule: KernelSchedule,
+    epilogue: Epilogue,
+};
+
+/// Renders the shared runtime region (all routes in one Metal compilation unit):
+/// the union of vocabulary helpers + per-format dequant fragments (each emitted
+/// exactly once, in first-use order), followed by every kernel body. This is the
+/// single source of truth for both the `.metal` files and the metal_kernels.m
+/// runtime region — the renderer, not any frozen constant.
+pub fn renderRuntimeRegion(
+    allocator: std.mem.Allocator,
+    kernels: []const RegionKernel,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    // Pass 1: emit the deduped helper vocabulary + dequant fragments once each,
+    // in the order they are first referenced across the routes.
+    var emitted_names = std.ArrayListUnmanaged([]const u8).empty;
+    defer emitted_names.deinit(allocator);
+    for (kernels) |k| {
+        try k.schedule.validate(k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues);
+        try validateEpilogueSchedule(k.schedule, k.epilogue);
+        for (k.decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
+        if (k.epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
+        try emitHelper(allocator, &out, &emitted_names, .{ .name = k.decoder.lane_decode_fn, .msl = k.decoder.lane_decode_msl });
+    }
+
+    // Pass 2: emit every kernel body.
+    for (kernels) |k| {
+        const block_values = k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues;
+        const block_bytes = k.decoder.format.bytesPerBlock() orelse return error.MissingBlockBytes;
+        try renderBody(allocator, &out, k.kernel_id, k.decoder, k.schedule, k.epilogue, block_values, block_bytes);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn emitHelper(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
