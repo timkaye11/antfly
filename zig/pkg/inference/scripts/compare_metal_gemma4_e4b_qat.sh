@@ -55,6 +55,10 @@ if [[ -z "$ORACLE_EXPECTED" ]]; then
   ORACLE_EXPECTED="Here's a thinking"
 fi
 SHORT_COMPARE="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT:-0}"
+# Policy-only mode: run ONLY the MTP identity gates (plain-target golden vs
+# auto/force/force-k1 token ids) and exit. Fast hard-gate for speculative-decode
+# changes; skips the llama oracle, benchmarks, and variant runs.
+POLICY_ONLY_COMPARE="${ANTFLY_INFERENCE_GEMMA4_COMPARE_POLICY_ONLY:-0}"
 SHORT_TOKENS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_TOKENS:-32}"
 SHORT_PROMPT="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_PROMPT:-$ORACLE_RENDERED_PROMPT}"
 SHORT_EXPECTED_TOKEN_IDS="${ANTFLY_INFERENCE_GEMMA4_COMPARE_SHORT_EXPECTED_TOKEN_IDS-}"
@@ -660,6 +664,22 @@ fi
 
 if flag_enabled "$SHORT_COMPARE"; then
   run_short_compare "$QAT_MODEL"
+  echo "raw output: $ROOT_OUT_DIR"
+  exit 0
+fi
+
+if flag_enabled "$POLICY_ONLY_COMPARE"; then
+  # A hard gate must not pass vacuously: require the draft model and the check.
+  if [[ "$RUN_MTP_POLICY_CHECK" == "0" ]]; then
+    echo "policy-only mode requires RUN_MTP_POLICY_CHECK enabled" >&2
+    exit 2
+  fi
+  if [[ -z "$MTP_POLICY_DRAFT_MODEL" || ! -e "$MTP_POLICY_DRAFT_MODEL" ]]; then
+    echo "policy-only mode requires the MTP draft model (missing: '$MTP_POLICY_DRAFT_MODEL')" >&2
+    exit 2
+  fi
+  run_mtp_policy_check "$QAT_MODEL" "$MTP_POLICY_DRAFT_MODEL"
+  echo "mtp policy-only gates passed"
   echo "raw output: $ROOT_OUT_DIR"
   exit 0
 fi
