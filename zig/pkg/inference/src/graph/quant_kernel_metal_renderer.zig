@@ -33,6 +33,15 @@ const quant_matmul = @import("quant_matmul.zig");
 const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
 const ReductionKind = compiler.ReductionKind;
+const OpKind = compiler.OpKind;
+
+/// The non-matmul fused microkernels the renderer can emit. Each carries its own
+/// self-contained body renderer (no dequant decoder, no epilogue). Today only
+/// RMSNorm is wired; head-rope / KV read-write land here as they are brought
+/// under the compiler.
+pub const MicrokernelKind = enum {
+    rms_norm,
+};
 
 /// A shared MSL vocabulary helper (dedup of the per-format v1 copies).
 pub const HelperFragment = struct {
@@ -286,13 +295,112 @@ pub fn renderKernel(
     return out.toOwnedSlice(allocator);
 }
 
+// ---- Microkernels (non-matmul fused ops) ---------------------------------
+
+/// Renders the full standalone MSL for a fused microkernel. Microkernels are
+/// pure-f32 (no dequant decoder, no epilogue, no shared vocabulary today), so
+/// this is just the kernel body — the same bytes emitted into the runtime
+/// region, so the checked-in `.metal` and the runtime-embedded copy stay
+/// single-sourced.
+pub fn renderMicrokernel(
+    allocator: std.mem.Allocator,
+    kernel_id: []const u8,
+    kind: MicrokernelKind,
+    schedule: KernelSchedule,
+) ![]u8 {
+    try validateMicrokernelSchedule(kind, schedule);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try renderMicrokernelBody(allocator, &out, kernel_id, kind, schedule);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Convenience wrapper for the RMSNorm microkernel.
+pub fn renderRmsNormKernel(
+    allocator: std.mem.Allocator,
+    kernel_id: []const u8,
+    schedule: KernelSchedule,
+) ![]u8 {
+    return renderMicrokernel(allocator, kernel_id, .rms_norm, schedule);
+}
+
+fn validateMicrokernelSchedule(kind: MicrokernelKind, schedule: KernelSchedule) !void {
+    switch (kind) {
+        // RMSNorm parallelises the per-row `d` reduction with a threadgroup
+        // tree, so it needs a power-of-two thread count of at least 2 (the
+        // reduction halves each step). One threadgroup handles one row.
+        .rms_norm => {
+            const t = schedule.threads_per_threadgroup;
+            if (t == 0 or (t & (t - 1)) != 0) return error.MicrokernelThreadsNotPowerOfTwo;
+            if (t < 2) return error.MicrokernelThreadsTooFew;
+            if (schedule.cols_per_threadgroup != 1) return error.MicrokernelColsMustBeOne;
+        },
+    }
+}
+
+fn renderMicrokernelBody(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+    kind: MicrokernelKind,
+    schedule: KernelSchedule,
+) !void {
+    try validateMicrokernelSchedule(kind, schedule);
+    switch (kind) {
+        .rms_norm => try renderRmsNormBody(allocator, out, kernel_id, schedule),
+    }
+}
+
+/// RMSNorm: `out[r,i] = in[r,i] * rsqrt(mean_r(in^2) + eps) * weight[i]`.
+/// One threadgroup per row; `threads` threads cooperatively sum the squares
+/// with a strided lane loop, reduce with a threadgroup tree, then rescale.
+/// Self-contained scalar params (input=0, weight=1, output=2, rows=3,
+/// hidden_size=4, eps=5) so the source compiles standalone and inside the
+/// precise runtime library alike. Matches `activations.rmsNorm` (the CPU
+/// oracle) up to f32 summation order.
+fn renderRmsNormBody(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+    schedule: KernelSchedule,
+) !void {
+    const threads = schedule.threads_per_threadgroup;
+    try appendFmt(allocator, out,
+        "kernel void {s}(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &hidden_size [[buffer(4)]], constant float &eps [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {{\n",
+        .{kernel_id});
+    try appendFmt(allocator, out,
+        "    uint tid = thread_pos.x; int row = int(group_pos.x); if (row >= rows || hidden_size < 1) return; device const float *row_input = input + row * hidden_size; float sq = 0.0f;\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    for (int i = int(tid); i < hidden_size; i += {d}) {{ float x = row_input[i]; sq += x * x; }}\n",
+        .{threads});
+    try appendFmt(allocator, out,
+        "    threadgroup float partial[{d}]; partial[tid] = sq; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = {d}u; stride > 0u; stride >>= 1) {{ if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }}\n",
+        .{ threads, threads / 2 });
+    try appendFmt(allocator, out,
+        "    float inv_rms = rsqrt(partial[0] / float(hidden_size) + eps);\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    for (int i = int(tid); i < hidden_size; i += {d}) output[row * hidden_size + i] = row_input[i] * inv_rms * weight[i];\n",
+        .{threads});
+    try out.appendSlice(allocator, "}\n");
+}
+
 /// One generated Metal kernel to emit into the shared runtime region: its
 /// stable kernel name plus the descriptor/schedule/epilogue it renders from.
+///
+/// `op_kind` selects which body renderer runs. The matmul fields
+/// (`decoder`/`epilogue`) are only read for `.small_batch_matmul`; the
+/// `microkernel` field only for `.microkernel`. Both carry inert defaults so a
+/// caller only fills the ones its op-kind needs — existing matmul construction
+/// sites (which set `decoder`/`schedule`/`epilogue`) stay byte-identical.
 pub const RegionKernel = struct {
     kernel_id: []const u8,
-    decoder: FormatDecoder,
+    op_kind: OpKind = .small_batch_matmul,
+    decoder: FormatDecoder = decoder_q4_0,
     schedule: KernelSchedule,
-    epilogue: Epilogue,
+    epilogue: Epilogue = .none,
+    microkernel: MicrokernelKind = .rms_norm,
 };
 
 /// Renders the shared runtime region (all routes in one Metal compilation unit):
@@ -308,21 +416,35 @@ pub fn renderRuntimeRegion(
     errdefer out.deinit(allocator);
 
     // Pass 1: emit the deduped helper vocabulary + dequant fragments once each,
-    // in the order they are first referenced across the routes.
+    // in the order they are first referenced across the routes. Microkernels
+    // carry no dequant decoder; they share the same dedup set so any future
+    // microkernel helper joins the matmul vocabulary without duplication.
     var emitted_names = EmittedNames{};
     for (kernels) |k| {
-        try k.schedule.validate(k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues);
-        try validateEpilogueSchedule(k.schedule, k.epilogue);
-        for (k.decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
-        if (k.epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
-        try emitHelper(allocator, &out, &emitted_names, .{ .name = k.decoder.lane_decode_fn, .msl = k.decoder.lane_decode_msl });
+        switch (k.op_kind) {
+            .small_batch_matmul => {
+                try k.schedule.validate(k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues);
+                try validateEpilogueSchedule(k.schedule, k.epilogue);
+                for (k.decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
+                if (k.epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
+                try emitHelper(allocator, &out, &emitted_names, .{ .name = k.decoder.lane_decode_fn, .msl = k.decoder.lane_decode_msl });
+            },
+            .microkernel => try validateMicrokernelSchedule(k.microkernel, k.schedule),
+            .attention => return error.UnsupportedRegionOpKind,
+        }
     }
 
     // Pass 2: emit every kernel body.
     for (kernels) |k| {
-        const block_values = k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues;
-        const block_bytes = k.decoder.format.bytesPerBlock() orelse return error.MissingBlockBytes;
-        try renderBody(allocator, &out, k.kernel_id, k.decoder, k.schedule, k.epilogue, block_values, block_bytes);
+        switch (k.op_kind) {
+            .small_batch_matmul => {
+                const block_values = k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues;
+                const block_bytes = k.decoder.format.bytesPerBlock() orelse return error.MissingBlockBytes;
+                try renderBody(allocator, &out, k.kernel_id, k.decoder, k.schedule, k.epilogue, block_values, block_bytes);
+            },
+            .microkernel => try renderMicrokernelBody(allocator, &out, k.kernel_id, k.microkernel, k.schedule),
+            .attention => return error.UnsupportedRegionOpKind,
+        }
     }
     return out.toOwnedSlice(allocator);
 }
@@ -575,4 +697,34 @@ fn epilogueSuffixForTest(epilogue: Epilogue) []const u8 {
         .relu => "_relu",
         else => "_x",
     };
+}
+
+test "metal renderer renders the RMSNorm microkernel with a balanced parallel reduction" {
+    const allocator = std.testing.allocator;
+    const schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+    const source = try renderRmsNormKernel(allocator, "antfly_rms_norm_generated_msl_v1", schedule);
+    defer allocator.free(source);
+
+    // Entrypoint + self-contained scalar params (no dequant decoder, no epilogue).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kernel void antfly_rms_norm_generated_msl_v1("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "constant float &eps [[buffer(5)]]"));
+    // rsqrt(mean(x^2)+eps) rescale, matching activations.rmsNorm.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rsqrt(partial[0] / float(hidden_size) + eps)"));
+    // Reduction sized/strided to the schedule's thread count.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup float partial[256]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint stride = 128u"));
+    // No matmul artefacts leak into the microkernel.
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "weight_q4_0"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "out_dim"));
+    // Balanced braces.
+    var depth: i32 = 0;
+    for (source) |c| {
+        if (c == '{') depth += 1 else if (c == '}') depth -= 1;
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "metal renderer rejects invalid microkernel schedules" {
+    try std.testing.expectError(error.MicrokernelThreadsNotPowerOfTwo, validateMicrokernelSchedule(.rms_norm, .{ .threads_per_threadgroup = 96, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }));
+    try std.testing.expectError(error.MicrokernelColsMustBeOne, validateMicrokernelSchedule(.rms_norm, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 2, .reduction = .threadgroup_tree }));
 }

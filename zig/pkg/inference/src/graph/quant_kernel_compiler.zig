@@ -2034,6 +2034,22 @@ pub const first_lazy_metal_kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1
 pub const first_lazy_metal_source_path = "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal";
 pub const first_lazy_metal_air_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1.air";
 pub const first_lazy_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal -o /tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1.air";
+
+// ---- Microkernel (non-matmul fused op) artifacts -------------------------
+// First non-matmul route brought under the compiler: RMSNorm. Uses op_kind
+// `.microkernel` and the descriptor renderer's microkernel path. Dev-only
+// candidate (opt-in kill switch) — the hand-written `termite_apply_rms_norm_rows`
+// stays the production baseline until this clears its conformance gate.
+pub const first_rms_norm_metal_kernel_id = "antfly_rms_norm_generated_msl_v1";
+pub const first_rms_norm_metal_source_path = "src/ops/metal/generated/microkernel_rms_norm.metal";
+pub const first_rms_norm_metal_air_path = "/tmp/antfly_rms_norm_generated_msl_v1.air";
+pub const first_rms_norm_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/microkernel_rms_norm.metal -o /tmp/antfly_rms_norm_generated_msl_v1.air";
+/// Launch schedule for the RMSNorm microkernel: one threadgroup per row,
+/// `threads_per_threadgroup` threads cooperatively reduce the `d` sum-of-squares
+/// with a threadgroup tree. 256 threads covers d up to a few thousand well; the
+/// strided lane loop scales to any d.
+pub const first_rms_norm_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+
 pub const first_general_metal_q4_0_kernel_id = "antfly_q4_0_small_batch_msl_v1";
 pub const first_general_metal_q4_0_source_path = "src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal";
 pub const first_general_metal_q4_0_air_path = "/tmp/antfly_q4_0_small_batch_msl_v1.air";
@@ -2635,6 +2651,28 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .runtime_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .production_enabled = true,
+    },
+};
+
+/// Generated non-matmul (op_kind `.microkernel`) artifacts. Kept in a distinct
+/// list from `first_generated_artifacts` so the matmul manifest / evidence /
+/// benchmark / production-regression machinery — all of which assumes matmul
+/// dims and a hand-written matmul baseline — stays byte-identical. The codegen
+/// (`.metal` files + runtime region) and the on-device conformance harness
+/// consume both lists; the op_kind framework seam is exercised end-to-end. As
+/// microkernel routes gain promotion evidence they can graduate into the shared
+/// list, but they start here as dev-only candidates.
+pub const first_generated_microkernel_artifacts = [_]GeneratedArtifact{
+    .{
+        .backend = .metal,
+        .op_kind = .microkernel,
+        .format = .f32,
+        .row_bucket = .rows_2_8,
+        .epilogue = .none,
+        .kernel_id = first_rms_norm_metal_kernel_id,
+        .source_path = first_rms_norm_metal_source_path,
+        .check_command = first_rms_norm_metal_check_command,
+        .production_enabled = false,
     },
 };
 
@@ -3775,6 +3813,14 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
             .epilogue = route.epilogue,
         });
     }
+    // Microkernel (non-matmul) routes share the region so their bodies compile
+    // into the same precise runtime library, single-sourced from the renderer.
+    try kernels.append(arena, .{
+        .kernel_id = first_rms_norm_metal_kernel_id,
+        .op_kind = .microkernel,
+        .microkernel = .rms_norm,
+        .schedule = first_rms_norm_metal_schedule,
+    });
     const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -3890,6 +3936,63 @@ fn renderMetalSmallBatchSource(
             kernel;
     };
 }
+
+const MetalMicrokernelHeader = struct {
+    source_kind: []const u8,
+    plan_id: []const u8,
+    kernel_id: []const u8,
+    production_baseline: []const u8,
+    production_enabled: bool,
+    promotion_comment: []const u8,
+};
+
+// Renders a checked-in generated Metal microkernel source: the license header +
+// plan/promotion metadata comment block, then the descriptor-driven microkernel
+// body from the same renderer that emits the runtime-embedded region. Mirrors
+// `renderMetalSmallBatchSource` so the microkernel `.metal` is single-sourced
+// the same way (comptime render -> source constant), keeping the fingerprint /
+// evidence machinery intact.
+fn renderMetalMicrokernelSource(
+    comptime header: MetalMicrokernelHeader,
+    comptime kind: metal_renderer.MicrokernelKind,
+    comptime schedule: KernelSchedule,
+) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(50_000_000);
+        var buf: [1 << 16]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const rendered = metal_renderer.renderMicrokernel(fba.allocator(), header.kernel_id, kind, schedule) catch
+            @compileError("renderMicrokernel failed for " ++ header.kernel_id);
+        const kernel: [rendered.len]u8 = rendered[0..rendered.len].*;
+        break :blk metal_generated_source_license_header ++ "\n\n" ++
+            "// " ++ header.source_kind ++ " from graph/quant_kernel_compiler.zig.\n" ++
+            "// plan_id=" ++ header.plan_id ++ "\n" ++
+            "// kernel_id=" ++ header.kernel_id ++ "\n" ++
+            "// production_baseline=" ++ header.production_baseline ++ "\n" ++
+            "// production_enabled=" ++ (if (header.production_enabled) "true" else "false") ++ "\n" ++
+            header.promotion_comment ++ "\n" ++
+            "\n" ++
+            "#include <metal_stdlib>\n" ++
+            "using namespace metal;\n" ++
+            "\n" ++
+            kernel;
+    };
+}
+
+const first_rms_norm_metal_source = renderMetalMicrokernelSource(
+    .{
+        .source_kind = "Generated Metal microkernel artifact",
+        .plan_id = "metal/microkernel/rms_norm",
+        .kernel_id = first_rms_norm_metal_kernel_id,
+        .production_baseline = "termite_apply_rms_norm_rows",
+        .production_enabled = false,
+        .promotion_comment = "// Descriptor-driven RMSNorm microkernel (first non-matmul route)." ++ "\n" ++
+            "// Production RMSNorm stays on the hand-written termite_apply_rms_norm_rows" ++ "\n" ++
+            "// until this candidate clears its on-device conformance gate.",
+    },
+    .rms_norm,
+    first_rms_norm_metal_schedule,
+);
 
 const first_lazy_metal_source = renderMetalSmallBatchSource(
     .{
@@ -6228,6 +6331,9 @@ pub fn generatedSourceForArtifact(artifact: GeneratedArtifact) ?[]const u8 {
     }
     if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_down_q8_kernel_id)) {
         return first_general_cuda_q4_0_down_q8_source;
+    }
+    if (artifact.backend == .metal and artifact.op_kind == .microkernel and std.mem.eql(u8, artifact.kernel_id, first_rms_norm_metal_kernel_id)) {
+        return first_rms_norm_metal_source;
     }
     if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, first_lazy_metal_kernel_id)) {
         return first_lazy_metal_source;
@@ -8754,12 +8860,35 @@ test "quant kernel compiler compiles promoted Metal source from descriptor route
 }
 
 test "quant kernel compiler generated artifacts are all small_batch_matmul op_kind" {
-    // The op-kind routing dimension exists; every artifact generated today is a
-    // small-batch matmul. When an attention/microkernel route is added, wire its
-    // codegen arm in compiledSourceForArtifact and update this invariant.
+    // The shared matmul list stays op_kind-homogeneous: non-matmul routes live
+    // in `first_generated_microkernel_artifacts` so the matmul manifest /
+    // evidence / benchmark machinery is never handed a non-matmul artifact.
     for (first_generated_artifacts) |artifact| {
         try std.testing.expectEqual(OpKind.small_batch_matmul, artifact.op_kind);
     }
+}
+
+test "quant kernel compiler microkernel artifacts are all microkernel op_kind with a single-sourced Metal body" {
+    try std.testing.expect(first_generated_microkernel_artifacts.len > 0);
+    for (first_generated_microkernel_artifacts) |artifact| {
+        try std.testing.expectEqual(OpKind.microkernel, artifact.op_kind);
+        try std.testing.expectEqual(Backend.metal, artifact.backend);
+        try std.testing.expect(!artifact.production_enabled);
+        const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
+        // Header carries the artifact identity; body is the rendered kernel.
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, artifact.kernel_id));
+        const kernel_decl = try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id});
+        defer std.testing.allocator.free(kernel_decl);
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, kernel_decl));
+    }
+}
+
+test "quant kernel compiler runtime region embeds the RMSNorm microkernel body" {
+    const region = try renderMetalRuntimeQuantRegion(std.testing.allocator);
+    defer std.testing.allocator.free(region);
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "kernel void antfly_rms_norm_generated_msl_v1("));
+    // Single-sourced from the same renderer as the matmul routes.
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "antfly_q4_k_small_batch"));
 }
 
 test "quant kernel compiler emits single-sourced Metal source for every generated artifact" {

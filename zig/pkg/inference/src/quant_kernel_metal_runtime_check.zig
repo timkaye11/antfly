@@ -602,6 +602,24 @@ extern fn termite_metal_run_generated_quant_kernel_check(
     measure_iters: u32,
     elapsed_nanos: *u64,
 ) c_int;
+extern fn termite_metal_run_generated_microkernel_check(
+    source: [*]const u8,
+    source_len: usize,
+    kernel_name: [*:0]const u8,
+    input: [*]const f32,
+    input_count: usize,
+    weight: [*]const f32,
+    weight_count: usize,
+    output: [*]f32,
+    output_count: usize,
+    rows: c_int,
+    hidden_size: c_int,
+    eps: f32,
+    threads_per_threadgroup: u32,
+    warmup_iters: u32,
+    measure_iters: u32,
+    elapsed_nanos: *u64,
+) c_int;
 
 const CheckCase = struct {
     name: []const u8,
@@ -615,6 +633,13 @@ const CheckCase = struct {
     threads_per_threadgroup: u32,
     cols_per_threadgroup: u32,
     tolerance: f32,
+    // Op-kind routing. Defaults keep every matmul CheckCase construction (and the
+    // whole route/evidence/production machinery) byte-identical; the microkernel
+    // fields below are only read when `op_kind == .microkernel`.
+    op_kind: quant_kernel_compiler.OpKind = .small_batch_matmul,
+    // Microkernel params (RMSNorm): rows=n rows, in_dim=out_dim=d hidden size,
+    // eps epsilon. `eps` is meaningless for matmul routes.
+    eps: f32 = 0,
     warmup_iters: u32 = default_warmup_iters,
     measure_iters: u32 = default_measure_iters,
 };
@@ -628,6 +653,162 @@ const RuntimeCheckDims = quant_kernel_compiler.MetalBenchmarkDims;
 
 const metal_runtime_check_count = metalRuntimeCheckCount();
 const metal_runtime_checks = buildMetalRuntimeChecks();
+
+// ---- Microkernel (non-matmul) conformance --------------------------------
+// Microkernel checks live in their own array + their own correctness pass so
+// the matmul `metal_runtime_checks`, its coverage test, the evidence writer,
+// and every route/production filter stay byte-identical. Each generated
+// microkernel artifact is exercised across a representative shape set; the
+// CPU oracle is the same `activations.rmsNorm` used by native inference.
+
+const RmsNormShape = struct { n: usize, d: usize };
+
+/// Representative (n, d) shapes: n small (decode-ish batch) x d spanning the
+/// tiny-to-large hidden sizes real models use. d values need not be powers of
+/// two — the kernel's strided lane loop handles any d.
+const rms_norm_shapes = [_]RmsNormShape{
+    .{ .n = 1, .d = 64 },
+    .{ .n = 2, .d = 128 },
+    .{ .n = 4, .d = 512 },
+    .{ .n = 3, .d = 2048 },
+    .{ .n = 2, .d = 4096 },
+};
+
+const microkernel_runtime_check_count = microkernelRuntimeCheckCount();
+const microkernel_runtime_checks = buildMicrokernelRuntimeChecks();
+
+fn microkernelRuntimeCheckCount() comptime_int {
+    var count: comptime_int = 0;
+    for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
+        if (artifact.backend == .metal) count += rms_norm_shapes.len;
+    }
+    return count;
+}
+
+fn buildMicrokernelRuntimeChecks() [microkernel_runtime_check_count]CheckCase {
+    var checks: [microkernel_runtime_check_count]CheckCase = undefined;
+    var index: usize = 0;
+    inline for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        inline for (rms_norm_shapes) |shape| {
+            checks[index] = microkernelRuntimeCheck(artifact, shape);
+            index += 1;
+        }
+    }
+    return checks;
+}
+
+fn microkernelRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RmsNormShape) CheckCase {
+    return .{
+        .name = std.fmt.comptimePrint("{s}_n{d}_d{d}", .{ artifact.kernel_id, shape.n, shape.d }),
+        .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated microkernel source"),
+        .kernel_name = artifact.kernel_id,
+        .format = artifact.format,
+        .epilogue = artifact.epilogue,
+        .op_kind = artifact.op_kind,
+        // rows=n, in_dim=out_dim=d so input/output are both n*d and the weight is d.
+        .rows = shape.n,
+        .in_dim = shape.d,
+        .out_dim = shape.d,
+        .threads_per_threadgroup = @intCast(quant_kernel_compiler.first_rms_norm_metal_schedule.threads_per_threadgroup),
+        .cols_per_threadgroup = 1,
+        // f32 RMSNorm: near bit-exact vs the CPU oracle; the only divergence is
+        // GPU tree-reduction vs CPU sequential summation order. Measured on-device
+        // max_abs_error grows with d: ~0 at d=64 up to ~3.3e-6 at d=4096. 1e-4 abs
+        // keeps a ~30x safety margin (outputs are O(1)) without being flaky.
+        .eps = 1e-6,
+        .tolerance = 1e-4,
+    };
+}
+
+/// CPU oracle for the RMSNorm microkernel. Self-contained (the runtime-check exe
+/// does not link the `inference_linalg` module `backends/activations.zig` needs)
+/// but computes exactly what `activations.rmsNorm` does — the reference native
+/// inference uses: `out[i] = in[i] * (1/sqrt(mean(in^2)+eps)) * weight[i]`, sum
+/// of squares accumulated in f32, no mean subtraction, plain (non-Gemma) weight.
+fn referenceRmsNorm(allocator: std.mem.Allocator, input: []const f32, weight: []const f32, n: usize, d: usize, eps: f32, out: []f32) !void {
+    _ = allocator;
+    if (input.len != n * d or out.len != n * d or weight.len != d) return error.InvalidArgument;
+    for (0..n) |row| {
+        const base = row * d;
+        var sum_sq: f32 = 0;
+        for (0..d) |i| {
+            const x = input[base + i];
+            sum_sq += x * x;
+        }
+        const rms = @sqrt(sum_sq / @as(f32, @floatFromInt(d)) + eps);
+        const inv_rms: f32 = 1.0 / rms;
+        for (0..d) |i| {
+            out[base + i] = input[base + i] * inv_rms * weight[i];
+        }
+    }
+}
+
+fn runMicrokernelCheck(allocator: std.mem.Allocator, check: CheckCase) !CheckResult {
+    const n = check.rows;
+    const d = check.in_dim;
+
+    const input = try allocator.alloc(f32, n * d);
+    defer allocator.free(input);
+    for (input, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 19)) - 9)) / 48.0;
+    }
+
+    const weight = try allocator.alloc(f32, d);
+    defer allocator.free(weight);
+    for (weight, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 3) % 23)) - 11)) / 16.0;
+    }
+
+    const expected = try allocator.alloc(f32, n * d);
+    defer allocator.free(expected);
+    try referenceRmsNorm(allocator, input, weight, n, d, check.eps, expected);
+
+    const actual = try allocator.alloc(f32, n * d);
+    defer allocator.free(actual);
+    @memset(actual, 0);
+
+    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    defer allocator.free(kernel_name_z);
+    var elapsed_nanos: u64 = 0;
+    const rc = termite_metal_run_generated_microkernel_check(
+        check.source.ptr,
+        check.source.len,
+        kernel_name_z.ptr,
+        input.ptr,
+        input.len,
+        weight.ptr,
+        weight.len,
+        actual.ptr,
+        actual.len,
+        @intCast(n),
+        @intCast(d),
+        check.eps,
+        check.threads_per_threadgroup,
+        check.warmup_iters,
+        check.measure_iters,
+        &elapsed_nanos,
+    );
+    if (rc != 0) {
+        std.debug.print("generated Metal microkernel {s} failed rc={d}\n", .{ check.name, rc });
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    var max_error: f32 = 0.0;
+    for (actual, expected, 0..) |got, want, index| {
+        if (!std.math.isFinite(got)) {
+            std.debug.print("generated Metal microkernel {s} nonfinite at {d}: got={d} want={d}\n", .{ check.name, index, got, want });
+            return error.GeneratedMetalKernelMismatch;
+        }
+        const diff = @abs(got - want);
+        max_error = @max(max_error, diff);
+        if (diff > check.tolerance) {
+            std.debug.print("generated Metal microkernel {s} mismatch at {d}: got={d} want={d} diff={d}\n", .{ check.name, index, got, want, diff });
+            return error.GeneratedMetalKernelMismatch;
+        }
+    }
+    return .{ .max_error = max_error, .measure_iters = check.measure_iters, .elapsed_nanos = elapsed_nanos };
+}
 
 fn metalRuntimeCheckCount() comptime_int {
     var count: comptime_int = 0;
@@ -736,6 +917,61 @@ test "quant kernel metal runtime checks cover generated Metal artifacts" {
             try std.testing.expectEqualStrings(quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource, check.source);
         }
         try std.testing.expect(found);
+    }
+}
+
+test "quant kernel metal runtime microkernel checks cover generated microkernel artifacts" {
+    // The matmul array stays microkernel-free; microkernel checks are their own
+    // set (one per shape) and never leak into `metal_runtime_checks`.
+    for (metal_runtime_checks) |check| {
+        try std.testing.expectEqual(quant_kernel_compiler.OpKind.small_batch_matmul, check.op_kind);
+    }
+    try std.testing.expect(microkernel_runtime_checks.len > 0);
+    try std.testing.expectEqual(
+        quant_kernel_compiler.first_generated_microkernel_artifacts.len * rms_norm_shapes.len,
+        microkernel_runtime_checks.len,
+    );
+    for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        var match_count: usize = 0;
+        for (microkernel_runtime_checks) |check| {
+            if (!std.mem.eql(u8, artifact.kernel_id, check.kernel_name)) continue;
+            match_count += 1;
+            try std.testing.expectEqual(quant_kernel_compiler.OpKind.microkernel, check.op_kind);
+            // rows=n, in_dim=out_dim=d so input/output are both n*d and weight is d.
+            try std.testing.expectEqual(check.in_dim, check.out_dim);
+            try std.testing.expect(check.threads_per_threadgroup >= 2);
+            try std.testing.expectEqual(@as(u32, 1), check.cols_per_threadgroup);
+            try std.testing.expect(check.eps > 0.0);
+            try std.testing.expectEqualStrings(
+                quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource,
+                check.source,
+            );
+        }
+        try std.testing.expectEqual(rms_norm_shapes.len, match_count);
+    }
+}
+
+test "quant kernel metal runtime RMSNorm CPU oracle matches activations.rmsNorm" {
+    const allocator = std.testing.allocator;
+    const n: usize = 2;
+    const d: usize = 8;
+    var input = [_]f32{ 0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3 };
+    const weight = [_]f32{ 1.0, 0.5, 2.0, 1.5, 0.25, 1.25, 0.75, 1.75 };
+    const eps: f32 = 1e-6;
+
+    var out = [_]f32{0} ** (n * d);
+    try referenceRmsNorm(allocator, &input, &weight, n, d, eps, &out);
+
+    // Independent scalar reference: out[r,i] = in[r,i] * rsqrt(mean(in^2)+eps) * w[i].
+    for (0..n) |r| {
+        var sum_sq: f32 = 0;
+        for (0..d) |i| sum_sq += input[r * d + i] * input[r * d + i];
+        const inv = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(d)) + eps);
+        for (0..d) |i| {
+            const want = input[r * d + i] * inv * weight[i];
+            try std.testing.expectApproxEqAbs(want, out[r * d + i], 1e-6);
+        }
     }
 }
 
@@ -919,6 +1155,23 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(
                 "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} measure_iters={d} generated_avg_us={d:.3} handwritten_baseline={s}\n",
                 .{ check.name, result.max_error, result.measure_iters, avg_us, handwrittenBaselineFallbackReason(check) },
+            );
+        }
+    }
+
+    // Microkernel (non-matmul) conformance runs in the plain correctness mode
+    // only — it is a distinct concern from the matmul route/evidence/production
+    // machinery, so it is skipped whenever a matmul route/promotion/evidence
+    // selection is active (those flags never target a microkernel).
+    if (cfg.evidence_out_path == null and !cfg.runtime_route_all and !cfg.production_regression_check and selected_kernel == null) {
+        for (microkernel_runtime_checks) |check| {
+            var micro_check = check;
+            if (cfg.measure_iters) |measure_iters| micro_check.measure_iters = measure_iters;
+            const result = try runMicrokernelCheck(allocator, micro_check);
+            const avg_us = @as(f64, @floatFromInt(result.elapsed_nanos)) / @as(f64, @floatFromInt(result.measure_iters)) / 1000.0;
+            std.debug.print(
+                "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} measure_iters={d} generated_avg_us={d:.3} op_kind=microkernel\n",
+                .{ micro_check.name, result.max_error, result.measure_iters, avg_us },
             );
         }
     }

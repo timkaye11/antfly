@@ -228,6 +228,15 @@ fn generatedFiles(allocator: std.mem.Allocator) ![]GeneratedFile {
         };
         index += 1;
     }
+    for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
+        const source = try compiledSourceForArtifact(allocator, artifact);
+        files[index] = .{
+            .path = artifact.source_path,
+            .data = source.data,
+            .owned = source.owned,
+        };
+        index += 1;
+    }
     if (index != source_count) return error.GeneratedQuantKernelSourceCountMismatch;
     var manifest_index = index;
     files[manifest_index] = .{
@@ -260,12 +269,18 @@ fn compiledSourceForArtifact(
     allocator: std.mem.Allocator,
     artifact: quant_kernel_compiler.GeneratedArtifact,
 ) !CompiledSourceData {
-    // Routing seam for the op-kind framework. Only the small-batch matmul path
-    // is generated today; attention/microkernel op-kinds render through their
-    // own path (wired in a later phase).
+    // Routing seam for the op-kind framework. Small-batch matmul flows through
+    // the quant-kernel compile path; microkernels (RMSNorm today) render their
+    // self-contained body via the renderer's microkernel path — no dequant
+    // decoder, no matmul lowering. Attention lands in a later phase.
     switch (artifact.op_kind) {
         .small_batch_matmul => {},
-        .attention, .microkernel => return error.UnsupportedGeneratedOpKind,
+        .microkernel => {
+            const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
+                return error.MissingGeneratedQuantKernelSource;
+            return .{ .data = source, .owned = false };
+        },
+        .attention => return error.UnsupportedGeneratedOpKind,
     }
     const compiled = quant_kernel_compiler.compileQuantKernelSource(.{
         .backend = artifact.backend,
@@ -285,7 +300,8 @@ fn compiledSourceForArtifact(
 }
 
 fn generatedSourceFileCount() usize {
-    return quant_kernel_compiler.first_generated_artifacts.len;
+    return quant_kernel_compiler.first_generated_artifacts.len +
+        quant_kernel_compiler.first_generated_microkernel_artifacts.len;
 }
 
 fn freeGeneratedFiles(allocator: std.mem.Allocator, files: []GeneratedFile) void {
@@ -365,6 +381,11 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
 fn checkMetalArtifacts(allocator: std.mem.Allocator, io: std.Io) !void {
     var count: usize = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        try checkMetalArtifact(allocator, io, artifact);
+        count += 1;
+    }
+    for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         try checkMetalArtifact(allocator, io, artifact);
         count += 1;
@@ -592,6 +613,26 @@ test "quant kernel codegen sources map to compiler artifacts" {
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"format\": \"q4_k\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"cuda_fallback_reason\": \"generated_artifact_missing\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, conformance_manifest.data, 1, "\"metal_fallback_reason\": \"generated_artifact_missing\""));
+}
+
+test "quant kernel codegen emits a self-contained microkernel source per microkernel artifact" {
+    const sources = try generatedFiles(std.testing.allocator);
+    defer freeGeneratedFiles(std.testing.allocator, sources);
+
+    const matmul_count = quant_kernel_compiler.first_generated_artifacts.len;
+    const micro_count = quant_kernel_compiler.first_generated_microkernel_artifacts.len;
+    try std.testing.expect(micro_count > 0);
+    // Microkernel sources sit between the matmul artifacts and the 4 manifests.
+    for (quant_kernel_compiler.first_generated_microkernel_artifacts, sources[matmul_count .. matmul_count + micro_count]) |artifact, source| {
+        try std.testing.expectEqualStrings(artifact.source_path, source.path);
+        try std.testing.expect(source.data.len != 0);
+        const kernel_decl = try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id});
+        defer std.testing.allocator.free(kernel_decl);
+        try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, kernel_decl));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <metal_stdlib>"));
+    }
+    // Manifests stay the trailing 4 files.
+    try std.testing.expectEqualStrings(quant_kernel_compiler.first_spec_manifest_path, sources[sources.len - 4].path);
 }
 
 test "quant kernel codegen resolves package-root source paths" {

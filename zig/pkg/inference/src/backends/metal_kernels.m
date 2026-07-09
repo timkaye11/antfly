@@ -538,6 +538,10 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> rms_norm_add_f16_input_pipeline;
     id<MTLComputePipelineState> rms_norm_add_scale_pipeline;
     id<MTLComputePipelineState> rms_norm_add_scale_rows_pipeline;
+    // Generated (descriptor-rendered) RMSNorm microkernel candidate. Opt-in via
+    // TERMITE_METAL_ENABLE_RMS_NORM_GENERATED; nil (unused) until promoted. The
+    // hand-written termite_apply_rms_norm_rows above stays the production path.
+    id<MTLComputePipelineState> rms_norm_generated_pipeline;
     id<MTLComputePipelineState> linear_pipeline;
     id<MTLComputePipelineState> linear_reduce_pipeline;
     id<MTLComputePipelineState> linear_bf16_pipeline;
@@ -1843,6 +1847,101 @@ int termite_metal_run_generated_quant_kernel_check(
     }
 }
 
+// Sister on-device conformance runner for generated fused microkernels (non
+// matmul). Compiles the standalone MSL source, binds the microkernel buffer
+// order (input, weight, output, rows, hidden_size, eps), dispatches one
+// threadgroup per row, and returns the output for host comparison against the
+// CPU reference. Modeled on termite_metal_run_generated_quant_kernel_check but
+// with the pure-f32 RMSNorm layout instead of the quantized matmul layout.
+int termite_metal_run_generated_microkernel_check(
+    const char *source,
+    size_t source_len,
+    const char *kernel_name,
+    const float *input,
+    size_t input_count,
+    const float *weight,
+    size_t weight_count,
+    float *output,
+    size_t output_count,
+    int rows,
+    int hidden_size,
+    float eps,
+    uint32_t threads_per_threadgroup,
+    uint32_t warmup_iters,
+    uint32_t measure_iters,
+    uint64_t *elapsed_nanos
+) {
+    if (source == NULL || source_len == 0 || kernel_name == NULL || input == NULL || weight == NULL || output == NULL) return -1;
+    if (rows < 1 || hidden_size < 1) return -2;
+    if (input_count != (size_t)rows * (size_t)hidden_size || output_count != input_count) return -3;
+    if (weight_count != (size_t)hidden_size) return -4;
+    if (threads_per_threadgroup == 0) return -16;
+    if (measure_iters == 0) return -15;
+
+    @autoreleasepool {
+        id<MTLDevice> device = termite_metal_shared_device();
+        if (device == nil) return -5;
+
+        NSString *source_string = [[NSString alloc] initWithBytes:source length:source_len encoding:NSUTF8StringEncoding];
+        if (source_string == nil) return -6;
+        NSError *error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:source_string options:nil error:&error];
+        if (library == nil) {
+            fprintf(stderr, "generated Metal microkernel library compile failed for %s: %s\n", kernel_name, error.localizedDescription.UTF8String ?: "unknown");
+            return -7;
+        }
+        NSString *kernel = [NSString stringWithUTF8String:kernel_name];
+        id<MTLFunction> function = kernel == nil ? nil : [library newFunctionWithName:kernel];
+        if (function == nil) return -8;
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (pipeline == nil) {
+            fprintf(stderr, "generated Metal microkernel pipeline compile failed for %s: %s\n", kernel_name, error.localizedDescription.UTF8String ?: "unknown");
+            return -9;
+        }
+        const NSUInteger threads_per_threadgroup_size = (NSUInteger)threads_per_threadgroup;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_threadgroup_size) return -10;
+
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (queue == nil) return -11;
+        id<MTLBuffer> input_buffer = [device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight_buffer = [device newBufferWithBytes:weight length:weight_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = [device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -12;
+        memset(output_buffer.contents, 0, output_count * sizeof(float));
+
+        const int rows_i = rows;
+        const int hidden_size_i = hidden_size;
+        const float eps_f = eps;
+        uint64_t start_nanos = 0;
+        const uint32_t total_iters = warmup_iters + measure_iters;
+        for (uint32_t iter = 0; iter < total_iters; ++iter) {
+            if (iter == warmup_iters) start_nanos = termite_metal_clock_monotonic_nanos();
+            id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (command_buffer == nil || encoder == nil) return -13;
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input_buffer offset:0 atIndex:0];
+            [encoder setBuffer:weight_buffer offset:0 atIndex:1];
+            [encoder setBuffer:output_buffer offset:0 atIndex:2];
+            [encoder setBytes:&rows_i length:sizeof(rows_i) atIndex:3];
+            [encoder setBytes:&hidden_size_i length:sizeof(hidden_size_i) atIndex:4];
+            [encoder setBytes:&eps_f length:sizeof(eps_f) atIndex:5];
+            [encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup_size, 1, 1)];
+            [encoder endEncoding];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            if (command_buffer.status == MTLCommandBufferStatusError) {
+                fprintf(stderr, "generated Metal microkernel command failed for %s: %s\n", kernel_name, command_buffer.error.localizedDescription.UTF8String ?: "unknown");
+                return -14;
+            }
+        }
+        if (elapsed_nanos != NULL) *elapsed_nanos = termite_metal_clock_monotonic_nanos() - start_nanos;
+        memcpy(output, output_buffer.contents, output_count * sizeof(float));
+        return 0;
+    }
+}
+
 typedef struct termite_metal_linear_params {
     uint32_t rows;
     uint32_t in_dim;
@@ -2983,6 +3082,13 @@ static NSString *termite_metal_shader_source(void) {
            "    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;\n"
            "    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane_v2(block, lane); }\n"
            "    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_qk_gelu(total + bias[col]);\n"
+           "}\n"
+           "kernel void antfly_rms_norm_generated_msl_v1(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &hidden_size [[buffer(4)]], constant float &eps [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n"
+           "    uint tid = thread_pos.x; int row = int(group_pos.x); if (row >= rows || hidden_size < 1) return; device const float *row_input = input + row * hidden_size; float sq = 0.0f;\n"
+           "    for (int i = int(tid); i < hidden_size; i += 256) { float x = row_input[i]; sq += x * x; }\n"
+           "    threadgroup float partial[256]; partial[tid] = sq; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 128u; stride > 0u; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float inv_rms = rsqrt(partial[0] / float(hidden_size) + eps);\n"
+           "    for (int i = int(tid); i < hidden_size; i += 256) output[row * hidden_size + i] = row_input[i] * inv_rms * weight[i];\n"
            "}\n"
            // quant-kernel-codegen:end generated quant kernels
            "inline void termite_q4_0_linear_r_ext_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
@@ -13524,6 +13630,54 @@ static int termite_metal_encode_rms_norm_rows(
     return 0;
 }
 
+// Dispatch the generated RMSNorm microkernel candidate. Binds the descriptor
+// renderer's self-contained scalar layout (input, weight, output, rows,
+// hidden_size, eps) and launches one threadgroup per row with the schedule's
+// fixed 256-thread reduction. Only usable when the opt-in pipeline was built
+// (kill switch on); production dispatch stays on termite_metal_encode_rms_norm_rows
+// until this candidate is promoted, so this is provided for completeness and not
+// yet wired into a hot path.
+__attribute__((unused))
+static int termite_metal_encode_rms_norm_generated(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t hidden_size,
+    float eps,
+    int failure_code
+) {
+    if (runtime == NULL || command_buffer == nil || input_buffer == nil || weight_buffer == nil || output_buffer == nil) return failure_code;
+    if (runtime->rms_norm_generated_pipeline == nil) return failure_code;
+    if (rows == 0 || hidden_size == 0 || rows > INT32_MAX || hidden_size > INT32_MAX) return failure_code;
+    const NSUInteger reduction_threads = 256;
+    if (runtime->rms_norm_generated_pipeline.maxTotalThreadsPerThreadgroup < reduction_threads) return failure_code;
+    const int rows_i = (int)rows;
+    const int hidden_size_i = (int)hidden_size;
+    const float eps_f = eps;
+    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+    const BOOL planned_encoder = (encoder != nil);
+    if (!planned_encoder) {
+        encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
+        if (encoder == nil) return failure_code;
+    }
+    [encoder setComputePipelineState:runtime->rms_norm_generated_pipeline];
+    [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+    [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
+    [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+    [encoder setBytes:&rows_i length:sizeof(rows_i) atIndex:3];
+    [encoder setBytes:&hidden_size_i length:sizeof(hidden_size_i) atIndex:4];
+    [encoder setBytes:&eps_f length:sizeof(eps_f) atIndex:5];
+    [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(reduction_threads, 1, 1)];
+    if (!planned_encoder) [encoder endEncoding];
+    return 0;
+}
+
 static int termite_metal_encode_add(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -13969,6 +14123,12 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->rms_norm_add_f16_input_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_1x_f16_input");
         runtime->rms_norm_add_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_scale_1x");
         runtime->rms_norm_add_scale_rows_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_scale_rows");
+        // Generated RMSNorm microkernel: opt-in candidate, built from the precise
+        // (exact-math) library so it matches the CPU oracle. Left nil unless the
+        // kill switch is on, so production dispatch is unaffected until promoted.
+        if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_RMS_NORM_GENERATED"))) {
+            runtime->rms_norm_generated_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_rms_norm_generated_msl_v1");
+        }
         runtime->linear_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_1x");
         runtime->linear_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_1x_reduce");
         runtime->linear_bf16_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_linear_bf16_1x");
@@ -14459,6 +14619,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->rms_norm_reduce_pipeline = nil;
     runtime->rms_inv_scale_pipeline = nil;
     runtime->rms_norm_rows_pipeline = nil;
+    runtime->rms_norm_generated_pipeline = nil;
     runtime->rms_norm_add_pipeline = nil;
     runtime->rms_norm_add_sumsq_pipeline = nil;
     runtime->rms_norm_add_scale_sumsq_pipeline = nil;
