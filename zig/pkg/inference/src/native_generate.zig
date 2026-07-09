@@ -3171,6 +3171,8 @@ fn writeJsonTiming(
             \\"materialization_hidden_only_fallbacks":{d},
             \\"correction_materializations":{d},
             \\"bonus_materializations":{d},
+            \\"deferred_materializations":{d},
+            \\"pending_flushes":{d},
             \\"bonus_skips":{d},
             \\"fallback_calls":{d},
             \\"draft_embedding_cache_hits":{d},
@@ -3204,6 +3206,8 @@ fn writeJsonTiming(
                 profile.materialization_hidden_only_fallbacks,
                 profile.correction_materializations,
                 profile.bonus_materializations,
+                profile.deferred_materializations,
+                profile.pending_flushes,
                 profile.bonus_skips,
                 profile.fallback_calls,
                 profile.draft_embedding_cache_hits,
@@ -6117,7 +6121,7 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
     const profile = stats.mtp_profile;
     if (profile.enabled) {
         print(
-            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} bonus_skips={d} fallback_calls={d}",
+            "mtp_profile: sync={} draft_steps={d} resident_draft_steps={d} host_draft_steps={d} target_verify_calls={d} target_verify_rows={d} target_verify_argmax_calls={d} target_verify_argmax_rows={d} target_verify_argmax_batched_calls={d} target_verify_argmax_syncs={d} dedicated_runtime_hits={d} dedicated_runtime_fallbacks={d} device_verify_commit_hits={d} device_verify_commit_fallbacks={d} device_verify_commit_result_downloads={d} target_choice_downloads={d} commit_forwards_required={d} commit_forwards_avoided={d} accepted_hidden_reuse_rows={d} activation_copies={d} materializations={d} hidden_only_materializations={d} hidden_only_fallbacks={d} correction_materializations={d} bonus_materializations={d} deferred_materializations={d} pending_flushes={d} bonus_skips={d} fallback_calls={d}",
             .{
                 profile.sync_enabled,
                 profile.draft_steps,
@@ -6144,6 +6148,8 @@ fn printSpeculativeStats(result: *const generation.GenerationResult) void {
                 profile.materialization_hidden_only_fallbacks,
                 profile.correction_materializations,
                 profile.bonus_materializations,
+                profile.deferred_materializations,
+                profile.pending_flushes,
                 profile.bonus_skips,
                 profile.fallback_calls,
             },

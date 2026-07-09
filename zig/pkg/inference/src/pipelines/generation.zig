@@ -335,6 +335,8 @@ pub const MtpProfileStats = struct {
     materialization_hidden_only_fallbacks: usize = 0,
     correction_materializations: usize = 0,
     bonus_materializations: usize = 0,
+    deferred_materializations: usize = 0,
+    pending_flushes: usize = 0,
     bonus_skips: usize = 0,
     fallback_calls: usize = 0,
     draft_embedding_cache_hits: usize = 0,
@@ -939,6 +941,13 @@ fn gemma4MtpVerifyDeviceResultEnabled() bool {
 
 fn gemma4MtpMaterializeReplayEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_MATERIALIZE_REPLAY", false);
+}
+
+/// Fold the correction/bonus materialize forward into the next verify: the
+/// committed token stays pending (KV unwritten) and the next round's verify
+/// prepends it as row 0, whose suffix write materializes the KV.
+fn gemma4MtpDeferMaterializeEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE");
 }
 
 fn gemma4MtpDraftEmbeddingCacheSize() usize {
@@ -2885,6 +2894,14 @@ pub const NativeGenerationPipeline = struct {
                                 mtp_auto_min_accepted_per_round_milli,
                             },
                         );
+                        try self.flushPendingGemma4MtpMaterialize(
+                            token_ids,
+                            seq_len,
+                            decode_state,
+                            &mtp_activation,
+                            mtp_hidden_source,
+                            &speculative_stats.mtp_profile,
+                        );
                         var fallback_prefill_logits: ?[]f32 = null;
                         defer if (fallback_prefill_logits) |logits| allocator.free(logits);
                         var fallback_greedy_token: ?usize = null;
@@ -2918,6 +2935,14 @@ pub const NativeGenerationPipeline = struct {
                     if (use_gemma4_mtp and speculation_policy == .auto and mtp_effective_zero_match_fallback_rounds > 0 and mtp_zero_match_rounds >= mtp_effective_zero_match_fallback_rounds and tokens_generated < max_tokens) {
                         speculative_stats.adaptive_fallbacks += 1;
                         speculative_stats.speculation_policy_decision = .disabled_zero_match;
+                        try self.flushPendingGemma4MtpMaterialize(
+                            token_ids,
+                            seq_len,
+                            decode_state,
+                            &mtp_activation,
+                            mtp_hidden_source,
+                            &speculative_stats.mtp_profile,
+                        );
                         var fallback_prefill_logits: ?[]f32 = null;
                         defer if (fallback_prefill_logits) |logits| allocator.free(logits);
                         var fallback_greedy_token: ?usize = null;
@@ -4627,6 +4652,11 @@ pub const NativeGenerationPipeline = struct {
         host: ?[]f32 = null,
         device: ?ops.CT = null,
         cached_target_choice: ?u32 = null,
+        /// Defer-materialize fold: a committed token (already counted by
+        /// seq_len and present in token_ids) whose target forward/KV write is
+        /// deferred to the next verify round. Invariant at every round
+        /// boundary: decode_state.total_tokens + pendingCount() == seq_len.
+        pending_unmaterialized: bool = false,
         draft_embedding_cache: std.ArrayListUnmanaged(DraftEmbeddingCacheEntry) = .empty,
 
         fn deinit(self: *Gemma4MtpActivationState) void {
@@ -4655,6 +4685,24 @@ pub const NativeGenerationPipeline = struct {
 
         fn residentReady(self: *const Gemma4MtpActivationState) bool {
             return self.device != null;
+        }
+
+        fn pendingCount(self: *const Gemma4MtpActivationState) usize {
+            return @intFromBool(self.pending_unmaterialized);
+        }
+
+        /// Every committed token except the pending one must have KV written.
+        fn assertKvTokensInSync(self: *const Gemma4MtpActivationState, decode_state: *const NativeDecodeState, seq_len: usize) void {
+            std.debug.assert(decode_state.total_tokens + self.pendingCount() == seq_len);
+        }
+
+        fn notePendingUnmaterialized(self: *Gemma4MtpActivationState) void {
+            std.debug.assert(!self.pending_unmaterialized);
+            self.pending_unmaterialized = true;
+        }
+
+        fn notePendingKvWritten(self: *Gemma4MtpActivationState) void {
+            self.pending_unmaterialized = false;
         }
 
         fn cachedDraftEmbedding(self: *const Gemma4MtpActivationState, token_id: i64) ?ops.CT {
@@ -5570,6 +5618,10 @@ pub const NativeGenerationPipeline = struct {
         var round_penalties = try penalty_state.clone(allocator);
         defer round_penalties.deinit(allocator);
 
+        const defer_materialize = gemma4MtpDeferMaterializeEnabled();
+        const entry_pending = mtp_activation.pendingCount();
+        mtp_activation.assertKvTokensInSync(decode_state, seq_len.*);
+
         var draft_tokens: [16]i64 = undefined;
         var draft_logits: [16]?[]f32 = [_]?[]f32{null} ** 16;
         defer for (draft_logits) |maybe_logits| {
@@ -5590,6 +5642,9 @@ pub const NativeGenerationPipeline = struct {
             mtp_activation.cached_target_choice
         else
             null;
+        // A pending round must take the full non-cached verify shape: its row 0
+        // is the pending token, which the cached fast path would never forward.
+        if (entry_pending != 0 and cached_first_target_choice != null) return error.InvalidSpeculativeState;
         const use_resident_draft =
             mtp_activation.residentReady() and
             gemma4_mtp.deviceResidentDraftAllowed(mtp_top_k) and
@@ -5598,9 +5653,25 @@ pub const NativeGenerationPipeline = struct {
         if (!use_resident_draft and mtp_activation.host == null) return error.MissingGemma4MtpActivation;
 
         var host_chain_activation: ?[]f32 = null;
-        defer if (host_chain_activation) |activation| allocator.free(activation);
+        defer if (!defer_materialize) {
+            if (host_chain_activation) |activation| allocator.free(activation);
+        };
         var device_chain_activation: ?ops.CT = null;
-        defer if (device_chain_activation) |activation| draft_pipeline.cb.free(activation);
+        defer if (!defer_materialize) {
+            if (device_chain_activation) |activation| draft_pipeline.cb.free(activation);
+        };
+        // Defer-materialize keeps every draft step's projected activation (the
+        // chain vars above become borrows of these slots) so a correction or
+        // bonus round can adopt the committed position's chain activation
+        // instead of running the materialize forward.
+        var draft_step_device_activations: [16]?ops.CT = [_]?ops.CT{null} ** 16;
+        defer for (&draft_step_device_activations) |*slot| {
+            if (slot.*) |tensor| draft_pipeline.cb.free(tensor);
+        };
+        var draft_step_host_activations: [16]?[]f32 = [_]?[]f32{null} ** 16;
+        defer for (&draft_step_host_activations) |*slot| {
+            if (slot.*) |activation| allocator.free(activation);
+        };
         const DraftStep = struct {
             token: usize,
             logits: ?[]f32,
@@ -5636,7 +5707,11 @@ pub const NativeGenerationPipeline = struct {
                     .profile_sync = mtp_profile.sync_enabled,
                 });
                 if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(draft_result.projected_activation) catch {};
-                if (device_chain_activation) |old| draft_pipeline.cb.free(old);
+                if (defer_materialize) {
+                    draft_step_device_activations[draft_count] = draft_result.projected_activation;
+                } else if (device_chain_activation) |old| {
+                    draft_pipeline.cb.free(old);
+                }
                 device_chain_activation = draft_result.projected_activation;
                 break :blk .{
                     .token = draft_result.token,
@@ -5659,7 +5734,11 @@ pub const NativeGenerationPipeline = struct {
                     .profile_enabled = mtp_profile.enabled,
                     .profile_sync = mtp_profile.sync_enabled,
                 });
-                if (host_chain_activation) |old| allocator.free(old);
+                if (defer_materialize) {
+                    draft_step_host_activations[draft_count] = draft_result.projected_activation;
+                } else if (host_chain_activation) |old| {
+                    allocator.free(old);
+                }
                 host_chain_activation = draft_result.projected_activation;
                 break :blk .{
                     .token = draft_result.token,
@@ -5732,7 +5811,13 @@ pub const NativeGenerationPipeline = struct {
 
         const verify_len = draft_count + 1;
         const verify_seq = seq_len.* + draft_count;
-        _ = try decode_runtime.appendGeneratedTokens(draft_count);
+        // Reserve KV slots for the drafted tokens plus the pending
+        // unmaterialized token: the verify's suffix write covers its query
+        // rows, so row 0 writes the pending token's KV. The KV layer cannot
+        // detect a miscounted append (the suffix write would silently shift),
+        // hence the assert.
+        _ = try decode_runtime.appendGeneratedTokens(draft_count + entry_pending);
+        std.debug.assert(decode_state.total_tokens == verify_seq);
         mtp_activation.cached_target_choice = null;
         const target_forward_len = if (cached_first_target_choice != null) draft_count else verify_len;
         const target_query_len: usize = if (decode_runtime.kvView() != null) target_forward_len else verify_seq;
@@ -5775,10 +5860,11 @@ pub const NativeGenerationPipeline = struct {
                     hidden_source,
                     "gpt.mtp_verify_final_hidden",
                 ) catch |err| {
-                    decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+                    decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                     return err;
                 };
                 defer target_hidden.deinit();
+                mtp_activation.notePendingKvWritten();
 
                 const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
                 const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
@@ -6026,10 +6112,11 @@ pub const NativeGenerationPipeline = struct {
                     verify_seq,
                     &target_ctx,
                 ) catch |err| {
-                    decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+                    decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                     return err;
                 };
                 defer target_result.deinit();
+                mtp_activation.notePendingKvWritten();
 
                 verify_result = try self.acceptVerifiedDraftTokensGreedyDevice(
                     token_ids,
@@ -6081,10 +6168,11 @@ pub const NativeGenerationPipeline = struct {
                 verify_seq,
                 &target_ctx,
             ) catch |err| {
-                decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+                decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                 return err;
             };
             defer target_result.deinit();
+            mtp_activation.notePendingKvWritten();
 
             const parity_trace: ?MtpParityTrace = if (mtp_top_k > 0)
                 .{
@@ -6155,55 +6243,85 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (verify_result.correction_added or verify_result.had_bonus) {
-            const accepted_seq_len = seq_len.* + accepted;
-            const materialization_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-            const hidden_only_materialize = gemma4MtpHiddenOnlyMaterializeEnabled();
-            const have_predictor_activation = next_device_activation != null or next_host_activation != null;
-            if (have_predictor_activation) {
-                next_cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, accepted_seq_len, decode_state, hidden_source);
-            } else {
+            if (defer_materialize) {
+                // Fold: leave the committed token un-forwarded. The next
+                // round's verify prepends it as row 0 (the non-cached verify
+                // shape) and the suffix write materializes its KV. Draft
+                // quality only (the verify still decides every token): the
+                // next round drafts without the committed token's donor KV
+                // row, and its step 1 consumes the assistant's chained
+                // projection instead of the target hidden — positionally
+                // exact for corrections (slot[m] sits at the committed
+                // position), one chain position short for bonus (no k+1-th
+                // step exists; the bonus token enters via the embedding).
+                const step_index = if (verify_result.correction_added) matched_drafts else draft_count - 1;
                 if (use_resident_draft) {
-                    const materialized = try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
-                        token_ids,
-                        accepted_seq_len,
-                        decode_state,
-                        hidden_source,
-                        &draft_pipeline.cb,
-                    );
-                    const materialized_hidden = materialized.activation orelse return error.UnsupportedBackend;
-                    if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(materialized_hidden) catch {};
+                    const retained = draft_step_device_activations[step_index] orelse return error.MissingGemma4MtpActivation;
+                    draft_step_device_activations[step_index] = null;
                     if (next_device_activation) |old| draft_pipeline.cb.free(old);
-                    next_device_activation = materialized_hidden;
-                    next_cached_target_choice = materialized.next_target_choice;
-                    if (next_host_activation) |old| {
-                        allocator.free(old);
-                        next_host_activation = null;
-                    }
+                    next_device_activation = retained;
                 } else {
-                    const materialized = try self.materializeAcceptedTokenKvAndReturnHidden(
-                        token_ids,
-                        accepted_seq_len,
-                        decode_state,
-                        hidden_source,
-                    );
+                    const retained = draft_step_host_activations[step_index] orelse return error.MissingGemma4MtpActivation;
+                    draft_step_host_activations[step_index] = null;
                     if (next_host_activation) |old| allocator.free(old);
-                    next_host_activation = materialized.activation;
-                    next_cached_target_choice = materialized.next_target_choice;
+                    next_host_activation = retained;
                 }
-            }
-            if (mtp_profile.enabled) {
-                mtp_profile.materializations += 1;
-                if (verify_result.correction_added) {
-                    mtp_profile.correction_materializations += 1;
-                } else if (verify_result.had_bonus) {
-                    mtp_profile.bonus_materializations += 1;
+                next_cached_target_choice = null;
+                mtp_activation.notePendingUnmaterialized();
+                if (mtp_profile.enabled) {
+                    mtp_profile.deferred_materializations += 1;
                 }
-                if (hidden_only_materialize) {
-                    mtp_profile.materialization_hidden_only_hits += 1;
+            } else {
+                const accepted_seq_len = seq_len.* + accepted;
+                const materialization_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                const hidden_only_materialize = gemma4MtpHiddenOnlyMaterializeEnabled();
+                const have_predictor_activation = next_device_activation != null or next_host_activation != null;
+                if (have_predictor_activation) {
+                    next_cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, accepted_seq_len, decode_state, hidden_source);
                 } else {
-                    mtp_profile.materialization_hidden_only_fallbacks += 1;
+                    if (use_resident_draft) {
+                        const materialized = try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
+                            token_ids,
+                            accepted_seq_len,
+                            decode_state,
+                            hidden_source,
+                            &draft_pipeline.cb,
+                        );
+                        const materialized_hidden = materialized.activation orelse return error.UnsupportedBackend;
+                        if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(materialized_hidden) catch {};
+                        if (next_device_activation) |old| draft_pipeline.cb.free(old);
+                        next_device_activation = materialized_hidden;
+                        next_cached_target_choice = materialized.next_target_choice;
+                        if (next_host_activation) |old| {
+                            allocator.free(old);
+                            next_host_activation = null;
+                        }
+                    } else {
+                        const materialized = try self.materializeAcceptedTokenKvAndReturnHidden(
+                            token_ids,
+                            accepted_seq_len,
+                            decode_state,
+                            hidden_source,
+                        );
+                        if (next_host_activation) |old| allocator.free(old);
+                        next_host_activation = materialized.activation;
+                        next_cached_target_choice = materialized.next_target_choice;
+                    }
                 }
-                mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, materialization_started_at);
+                if (mtp_profile.enabled) {
+                    mtp_profile.materializations += 1;
+                    if (verify_result.correction_added) {
+                        mtp_profile.correction_materializations += 1;
+                    } else if (verify_result.had_bonus) {
+                        mtp_profile.bonus_materializations += 1;
+                    }
+                    if (hidden_only_materialize) {
+                        mtp_profile.materialization_hidden_only_hits += 1;
+                    } else {
+                        mtp_profile.materialization_hidden_only_fallbacks += 1;
+                    }
+                    mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, materialization_started_at);
+                }
             }
         }
 
@@ -6216,6 +6334,7 @@ pub const NativeGenerationPipeline = struct {
         }
         mtp_activation.cached_target_choice = next_cached_target_choice;
         seq_len.* += accepted;
+        mtp_activation.assertKvTokensInSync(decode_state, seq_len.*);
         try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
 
         return .{
@@ -6911,6 +7030,32 @@ pub const NativeGenerationPipeline = struct {
         );
         defer result.deinit();
         return try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
+    }
+
+    /// Flush a pending unmaterialized token (defer-materialize fold) before
+    /// entering any decode path that assumes decode_state.total_tokens ==
+    /// seq_len — e.g. the mid-generation standardDecode fallbacks. Restores
+    /// exactly the fold-off state: the token's KV written via a one-row
+    /// materialize forward.
+    fn flushPendingGemma4MtpMaterialize(
+        self: *NativeGenerationPipeline,
+        token_ids: []const i64,
+        seq_len: usize,
+        decode_state: *NativeDecodeState,
+        mtp_activation: *Gemma4MtpActivationState,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        mtp_profile: *MtpProfileStats,
+    ) !void {
+        if (mtp_activation.pendingCount() == 0) return;
+        mtp_activation.assertKvTokensInSync(decode_state, seq_len);
+        const flush_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+        mtp_activation.cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, seq_len, decode_state, hidden_source);
+        mtp_activation.notePendingKvWritten();
+        mtp_activation.assertKvTokensInSync(decode_state, seq_len);
+        if (mtp_profile.enabled) {
+            mtp_profile.pending_flushes += 1;
+            mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, flush_started_at);
+        }
     }
 
     const MtpMaterializedHostActivation = struct {
@@ -8846,6 +8991,108 @@ test "Gemma4 MTP bonus default is conservative on Metal" {
 
 test "Gemma4 MTP active materialization is default" {
     try std.testing.expectEqual(true, gemma4MtpActiveMaterializeEnabled());
+}
+
+test "Gemma4 MTP defer materialize is opt-in" {
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled());
+}
+
+test "gemma4 mtp pending token bookkeeping holds kv invariant across round shapes" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 2,
+        .head_dim = 8,
+    });
+    var decode = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer decode.deinit();
+
+    var mtp_activation = NativeGenerationPipeline.Gemma4MtpActivationState{
+        .allocator = allocator,
+        .draft_cb = undefined, // no device tensors touched in this test
+    };
+    defer mtp_activation.deinit();
+
+    // Prefill + materialized first token: nothing pending, total == seq_len.
+    try decode.notePrefill(8);
+    var seq_len: usize = 8;
+    try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
+    try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+
+    // Round A: k=2, mismatch at draft index 1 -> correction committed, fold
+    // leaves it pending instead of materializing.
+    {
+        const draft_count: usize = 2;
+        const matched_drafts: usize = 1;
+        try decode.appendGeneratedTokens(draft_count + mtp_activation.pendingCount());
+        mtp_activation.notePendingKvWritten(); // verify forward succeeded
+        try decode.truncateTokens(draft_count - matched_drafts);
+        mtp_activation.notePendingUnmaterialized();
+        seq_len += matched_drafts + 1;
+        try std.testing.expectEqual(@as(usize, 1), mtp_activation.pendingCount());
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+        mtp_activation.assertKvTokensInSync(&decode, seq_len);
+    }
+
+    // Round B: enters pending; k=2 pure accept. The verify appends k+1 slots
+    // (row 0 writes the pending token's KV) and rolls back only the tail.
+    {
+        const draft_count: usize = 2;
+        const entry_pending = mtp_activation.pendingCount();
+        try std.testing.expectEqual(@as(usize, 1), entry_pending);
+        try decode.appendGeneratedTokens(draft_count + entry_pending);
+        try std.testing.expectEqual(seq_len + draft_count, decode.total_tokens);
+        mtp_activation.notePendingKvWritten();
+        const matched_drafts: usize = 2;
+        try decode.truncateTokens(draft_count - matched_drafts);
+        seq_len += matched_drafts;
+        try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    }
+
+    // Round C: k=2 all matched + bonus -> bonus token pending.
+    {
+        const draft_count: usize = 2;
+        try decode.appendGeneratedTokens(draft_count + mtp_activation.pendingCount());
+        mtp_activation.notePendingKvWritten();
+        mtp_activation.notePendingUnmaterialized();
+        seq_len += draft_count + 1;
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+        mtp_activation.assertKvTokensInSync(&decode, seq_len);
+    }
+
+    // Round D: verify forward fails while pending -> roll back the entire
+    // reservation (drafts + pending slot); the pending token stays pending.
+    {
+        const draft_count: usize = 2;
+        const entry_pending = mtp_activation.pendingCount();
+        try std.testing.expectEqual(@as(usize, 1), entry_pending);
+        try decode.appendGeneratedTokens(draft_count + entry_pending);
+        try decode.truncateTokens(draft_count + mtp_activation.pendingCount());
+        try std.testing.expectEqual(@as(usize, 1), mtp_activation.pendingCount());
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    }
+
+    // Fallback flush: one-token materialize restores total == seq_len before
+    // standardDecode runs.
+    try decode.appendGeneratedTokens(1);
+    mtp_activation.notePendingKvWritten();
+    try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
+    try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+
+    // Final round ends with a correction (pending) and generation stops:
+    // deinit with a pending token is a clean exit.
+    try decode.appendGeneratedTokens(1 + mtp_activation.pendingCount());
+    mtp_activation.notePendingKvWritten();
+    try decode.truncateTokens(1);
+    mtp_activation.notePendingUnmaterialized();
+    seq_len += 1;
+    try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
 }
 
 test "Gemma4 MTP cached first choice requires multi draft" {
