@@ -620,6 +620,78 @@ extern fn termite_metal_run_generated_microkernel_check(
     measure_iters: u32,
     elapsed_nanos: *u64,
 ) c_int;
+// Sister runner for generated `op_kind = .attention` kernels. Binds the paged
+// attention buffer layout (q f32, encoded_key f16, v f16, block_table, output),
+// constructs the params struct for the "simplest case" (f16 KV / format==3, no
+// sinks, softcap 0, single contiguous block), dispatches grid (q_len, num_heads)
+// x threads, and returns the output for host comparison. f16 buffers are passed
+// as raw u16 bits so the host and GPU read identical half values.
+extern fn termite_metal_run_generated_attention_check(
+    source: [*]const u8,
+    source_len: usize,
+    kernel_name: [*:0]const u8,
+    q: [*]const f32,
+    q_count: usize,
+    encoded_key: [*]const u16,
+    encoded_key_count: usize,
+    v_bytes: [*]const u16,
+    v_bytes_count: usize,
+    block_table: [*]const u32,
+    block_count: usize,
+    output: [*]f32,
+    output_count: usize,
+    q_len: u32,
+    kv_tokens: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    query_position_offset: u32,
+    kv_position_offset: u32,
+    sliding_window: u32,
+    page_size: u32,
+    contiguous_base_token: u32,
+    contiguous_blocks: u32,
+    threads_per_threadgroup: u32,
+    warmup_iters: u32,
+    measure_iters: u32,
+    elapsed_nanos: *u64,
+) c_int;
+
+// Sister runner for the generated flash-prefill attention route. Same buffer
+// order + f16-KV / single-contiguous-block simplest case as the decode-1x runner,
+// but dispatches the flash grid ((q_len+7)/8, num_heads) with 128 threads and the
+// `key_chunk`-parameterized flash threadgroup-memory layout. Returns the output
+// (host comparison vs the multi-query prefill oracle) + elapsed nanos (sweep A/B).
+extern fn termite_metal_run_generated_flash_prefill_check(
+    source: [*]const u8,
+    source_len: usize,
+    kernel_name: [*:0]const u8,
+    q: [*]const f32,
+    q_count: usize,
+    encoded_key: [*]const u16,
+    encoded_key_count: usize,
+    v_bytes: [*]const u16,
+    v_bytes_count: usize,
+    block_table: [*]const u32,
+    block_count: usize,
+    output: [*]f32,
+    output_count: usize,
+    q_len: u32,
+    kv_tokens: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    query_position_offset: u32,
+    kv_position_offset: u32,
+    sliding_window: u32,
+    page_size: u32,
+    contiguous_base_token: u32,
+    contiguous_blocks: u32,
+    key_chunk: u32,
+    warmup_iters: u32,
+    measure_iters: u32,
+    elapsed_nanos: *u64,
+) c_int;
 
 const CheckCase = struct {
     name: []const u8,
@@ -810,6 +882,522 @@ fn runMicrokernelCheck(allocator: std.mem.Allocator, check: CheckCase) !CheckRes
     return .{ .max_error = max_error, .measure_iters = check.measure_iters, .elapsed_nanos = elapsed_nanos };
 }
 
+// ---- Attention (paged decode) conformance --------------------------------
+// Like the microkernel checks, attention checks live in their own array + pass
+// so the matmul machinery is untouched. This isolated float compare is a fast
+// pre-check for compile/dispatch/gross-logic errors ONLY — softmax is too
+// summation-sensitive for a tight isolated gate, so the real acceptance gate is
+// bit-identical *model tokens* (scripts/compare_metal_gemma4_e4b_qat.sh with the
+// generated route enabled). Every case is the "simplest case": q_len=1 decode,
+// f16 KV, single contiguous block, no sinks, softcap 0 — exercising GQA and the
+// causal + sliding-window masks against a self-contained CPU oracle.
+
+const AttentionShape = struct {
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    /// Position of the (single) decode query. Set to `kv_tokens - 1` so the
+    /// query is causally after every KV token (the real decode invariant).
+    query_position_offset: usize,
+    /// 0 = full causal attention; W>0 masks KV tokens older than W (iSWA).
+    sliding_window: usize,
+};
+
+/// Representative decode shapes: GQA ratios (MHA, 2:1, 4:1), head_dims spanning
+/// 64/128/256, with and without a sliding window. All single contiguous block.
+const attention_shapes = [_]AttentionShape{
+    .{ .kv_tokens = 8, .num_heads = 2, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 7, .sliding_window = 0 },
+    .{ .kv_tokens = 16, .num_heads = 4, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 15, .sliding_window = 0 },
+    .{ .kv_tokens = 32, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 31, .sliding_window = 8 },
+    .{ .kv_tokens = 64, .num_heads = 8, .num_kv_heads = 8, .head_dim = 128, .query_position_offset = 63, .sliding_window = 0 },
+    .{ .kv_tokens = 48, .num_heads = 4, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 47, .sliding_window = 16 },
+};
+
+const AttentionCheckCase = struct {
+    name: []const u8,
+    source: []const u8,
+    kernel_name: []const u8,
+    threads_per_threadgroup: u32,
+    tolerance: f32,
+    shape: AttentionShape,
+    warmup_iters: u32 = default_warmup_iters,
+    measure_iters: u32 = default_measure_iters,
+};
+
+const attention_runtime_check_count = attentionRuntimeCheckCount();
+const attention_runtime_checks = buildAttentionRuntimeChecks();
+
+/// The decode-1x conformance harness handles only the scalar decode route: its
+/// oracle assumes q_len=1 and its runner dispatches the decode grid / 256 threads
+/// / decode shmem. The flash-prefill route (different grid / 128 threads / shmem)
+/// has its own oracle + runner, so it is excluded here.
+fn isDecodeAttentionArtifact(comptime artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+    return artifact.backend == .metal and artifact.op_kind == .attention and
+        std.mem.eql(u8, artifact.kernel_id, quant_kernel_compiler.first_decode_attention_1x_metal_kernel_id);
+}
+
+fn attentionRuntimeCheckCount() comptime_int {
+    var count: comptime_int = 0;
+    for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+        if (isDecodeAttentionArtifact(artifact)) count += attention_shapes.len;
+    }
+    return count;
+}
+
+fn buildAttentionRuntimeChecks() [attention_runtime_check_count]AttentionCheckCase {
+    var checks: [attention_runtime_check_count]AttentionCheckCase = undefined;
+    var index: usize = 0;
+    inline for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+        if (!isDecodeAttentionArtifact(artifact)) continue;
+        inline for (attention_shapes) |shape| {
+            checks[index] = attentionRuntimeCheck(artifact, shape);
+            index += 1;
+        }
+    }
+    return checks;
+}
+
+fn attentionRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: AttentionShape) AttentionCheckCase {
+    return .{
+        .name = std.fmt.comptimePrint("{s}_kv{d}_h{d}_kvh{d}_hd{d}_sw{d}", .{ artifact.kernel_id, shape.kv_tokens, shape.num_heads, shape.num_kv_heads, shape.head_dim, shape.sliding_window }),
+        .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated attention source"),
+        .kernel_name = artifact.kernel_id,
+        .threads_per_threadgroup = @intCast(quant_kernel_compiler.first_decode_attention_1x_metal_schedule.threads_per_threadgroup),
+        // f16 KV + f32 accumulation: kernel and oracle read the same half values,
+        // so only GPU tree-reduction vs sequential summation order differs. This
+        // is a loose sanity gate (the model-token gate is the real one); 2e-2 abs
+        // keeps a wide margin above the ~1e-3 summation-order noise on O(1)
+        // outputs while still catching NaNs / masking / paging / GQA bugs.
+        .tolerance = 2e-2,
+        .shape = shape,
+    };
+}
+
+fn halfBitsToF32(bits: u16) f32 {
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+fn f32ToHalfBits(value: f32) u16 {
+    return @bitCast(@as(f16, @floatCast(value)));
+}
+
+/// Self-contained CPU oracle for the decode-1x paged attention kernel, for the
+/// simplest case (single contiguous block => physical_token == logical_token).
+/// Computes exactly what the kernel computes: per (query, head), a causal +
+/// sliding-window masked, GQA-mapped, f16-KV dot-product score scaled by
+/// 1/sqrt(head_dim), a numerically-stable softmax, then the P·V combination.
+fn referenceGqaAttention1x(
+    allocator: std.mem.Allocator,
+    q: []const f32,
+    encoded_key: []const u16,
+    v_bytes: []const u16,
+    shape: AttentionShape,
+    out: []f32,
+) !void {
+    const q_len: usize = 1;
+    const kv = shape.kv_tokens;
+    const nh = shape.num_heads;
+    const nkv = shape.num_kv_heads;
+    const hd = shape.head_dim;
+    if (nkv == 0 or nh % nkv != 0) return error.InvalidArgument;
+    if (q.len != q_len * nh * hd or out.len != q_len * nh * hd) return error.InvalidArgument;
+    if (encoded_key.len != kv * nkv * hd or v_bytes.len != kv * nkv * hd) return error.InvalidArgument;
+    const heads_per_group = nh / nkv;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const neg_inf: f32 = -3.402823466e+38;
+
+    var scores = try allocator.alloc(f32, kv);
+    defer allocator.free(scores);
+
+    const qi: usize = 0;
+    const query_pos = shape.query_position_offset + qi;
+    for (0..nh) |h| {
+        const kv_h = h / heads_per_group;
+        const q_base = qi * nh * hd + h * hd;
+        const kv_head_base = kv_h * hd;
+
+        var best: f32 = neg_inf;
+        for (0..kv) |ki| {
+            const key_pos = ki; // kv_position_offset = 0
+            var allowed = key_pos <= query_pos;
+            if (shape.sliding_window != 0 and allowed) allowed = (query_pos - key_pos) < shape.sliding_window;
+            if (!allowed) {
+                scores[ki] = neg_inf;
+                continue;
+            }
+            const key_row = ki * nkv * hd + kv_head_base;
+            var acc: f32 = 0;
+            for (0..hd) |d| acc += q[q_base + d] * halfBitsToF32(encoded_key[key_row + d]);
+            const score = acc * scale;
+            scores[ki] = if (std.math.isFinite(score)) score else neg_inf;
+            if (scores[ki] > best) best = scores[ki];
+        }
+
+        var sum: f32 = 0;
+        for (0..kv) |ki| {
+            var e = @exp(scores[ki] - best);
+            if (!std.math.isFinite(e)) e = 0;
+            scores[ki] = e;
+            sum += e;
+        }
+        const inv_sum: f32 = if (sum > 0) 1.0 / sum else 0;
+        for (0..hd) |d| {
+            var value: f32 = 0;
+            for (0..kv) |ki| {
+                const v_index = ki * nkv * hd + kv_head_base + d; // v_row_stride = nkv*hd
+                value += scores[ki] * inv_sum * halfBitsToF32(v_bytes[v_index]);
+            }
+            out[q_base + d] = value;
+        }
+    }
+}
+
+fn runAttentionCheck(allocator: std.mem.Allocator, check: AttentionCheckCase) !CheckResult {
+    const shape = check.shape;
+    const q_len: usize = 1;
+    const nh = shape.num_heads;
+    const nkv = shape.num_kv_heads;
+    const hd = shape.head_dim;
+    const kv = shape.kv_tokens;
+
+    const q = try allocator.alloc(f32, q_len * nh * hd);
+    defer allocator.free(q);
+    for (q, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 17)) - 8)) / 32.0;
+    }
+
+    // Key/value are f16 (format==3): quantize deterministic small f32 patterns to
+    // half so the host oracle and the GPU read identical values.
+    const key = try allocator.alloc(u16, kv * nkv * hd);
+    defer allocator.free(key);
+    for (key, 0..) |*value, i| {
+        value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 1) % 23)) - 11)) / 40.0);
+    }
+    const v = try allocator.alloc(u16, kv * nkv * hd);
+    defer allocator.free(v);
+    for (v, 0..) |*value, i| {
+        value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 3 + 5) % 19)) - 9)) / 24.0);
+    }
+
+    // Single contiguous block: block_table = {0}, page_size >= kv_tokens.
+    var block_table = [_]u32{0};
+
+    const expected = try allocator.alloc(f32, q_len * nh * hd);
+    defer allocator.free(expected);
+    try referenceGqaAttention1x(allocator, q, key, v, shape, expected);
+
+    const actual = try allocator.alloc(f32, q_len * nh * hd);
+    defer allocator.free(actual);
+    @memset(actual, 0);
+
+    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    defer allocator.free(kernel_name_z);
+    var elapsed_nanos: u64 = 0;
+    const rc = termite_metal_run_generated_attention_check(
+        check.source.ptr,
+        check.source.len,
+        kernel_name_z.ptr,
+        q.ptr,
+        q.len,
+        key.ptr,
+        key.len,
+        v.ptr,
+        v.len,
+        &block_table,
+        block_table.len,
+        actual.ptr,
+        actual.len,
+        @intCast(q_len),
+        @intCast(kv),
+        @intCast(nh),
+        @intCast(nkv),
+        @intCast(hd),
+        @intCast(shape.query_position_offset),
+        0, // kv_position_offset
+        @intCast(shape.sliding_window),
+        @intCast(kv), // page_size (single block spans all kv tokens)
+        0, // contiguous_base_token
+        1, // contiguous_blocks
+        check.threads_per_threadgroup,
+        check.warmup_iters,
+        check.measure_iters,
+        &elapsed_nanos,
+    );
+    if (rc != 0) {
+        std.debug.print("generated Metal attention {s} failed rc={d}\n", .{ check.name, rc });
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    var max_error: f32 = 0.0;
+    for (actual, expected, 0..) |got, want, index| {
+        if (!std.math.isFinite(got)) {
+            std.debug.print("generated Metal attention {s} nonfinite at {d}: got={d} want={d}\n", .{ check.name, index, got, want });
+            return error.GeneratedMetalKernelMismatch;
+        }
+        const diff = @abs(got - want);
+        max_error = @max(max_error, diff);
+        if (diff > check.tolerance) {
+            std.debug.print("generated Metal attention {s} mismatch at {d}: got={d} want={d} diff={d}\n", .{ check.name, index, got, want, diff });
+            return error.GeneratedMetalKernelMismatch;
+        }
+    }
+    return .{ .max_error = max_error, .measure_iters = check.measure_iters, .elapsed_nanos = elapsed_nanos };
+}
+
+// ---- Flash-prefill (multi-query) attention conformance -------------------
+// The flash-prefill route dispatches a different grid / thread count / shmem
+// layout than decode-1x, so it has its own oracle + runner + shape set. Every
+// case is the simplest case: f16 KV, single contiguous block, no sinks, softcap
+// 0 — exercising a multi-query prefill tile against the causal + sliding-window
+// masks. Isolated float parity is a loose compile/dispatch sanity check (the
+// flash online-softmax + f16 Q/P rounding diverge from a plain-f32 reference);
+// the real gate is bit-identical model tokens with the generated route enabled.
+
+const FlashPrefillShape = struct {
+    q_len: usize,
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    /// Position of the first query in the tile; query qi sits at qpo+qi.
+    query_position_offset: usize,
+    /// 0 = full causal; W>0 masks KV tokens older than W (iSWA).
+    sliding_window: usize,
+};
+
+/// Representative prefill tiles: causal prompts (q_len == kv, qpo 0), a GQA/MHA
+/// spread of head_dims (64/128/256, all valid at the checked-in key_chunk=32),
+/// plus extend-with-sliding cases (qpo>0, kv includes the ragged tail so both the
+/// direct-load and gather paths fire). head_dim=256 stays under the 32 KB
+/// threadgroup limit at key_chunk=32 (80*256+2016 = 22496 bytes).
+const flash_prefill_shapes = [_]FlashPrefillShape{
+    .{ .q_len = 8, .kv_tokens = 8, .num_heads = 2, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 0, .sliding_window = 0 },
+    .{ .q_len = 16, .kv_tokens = 16, .num_heads = 4, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 0, .sliding_window = 0 },
+    .{ .q_len = 8, .kv_tokens = 32, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 24, .sliding_window = 8 },
+    .{ .q_len = 32, .kv_tokens = 32, .num_heads = 8, .num_kv_heads = 8, .head_dim = 128, .query_position_offset = 0, .sliding_window = 0 },
+    .{ .q_len = 12, .kv_tokens = 48, .num_heads = 4, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 36, .sliding_window = 16 },
+};
+
+const FlashPrefillCheckCase = struct {
+    name: []const u8,
+    source: []const u8,
+    kernel_name: []const u8,
+    key_chunk: u32,
+    tolerance: f32,
+    shape: FlashPrefillShape,
+    warmup_iters: u32 = default_warmup_iters,
+    measure_iters: u32 = default_measure_iters,
+};
+
+const flash_prefill_check_count = flashPrefillRuntimeCheckCount();
+const flash_prefill_checks = buildFlashPrefillRuntimeChecks();
+
+fn isFlashPrefillArtifact(comptime artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+    return artifact.backend == .metal and artifact.op_kind == .attention and
+        std.mem.eql(u8, artifact.kernel_id, quant_kernel_compiler.first_prefill_flash_metal_kernel_id);
+}
+
+fn flashPrefillRuntimeCheckCount() comptime_int {
+    var count: comptime_int = 0;
+    for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+        if (isFlashPrefillArtifact(artifact)) count += flash_prefill_shapes.len;
+    }
+    return count;
+}
+
+fn buildFlashPrefillRuntimeChecks() [flash_prefill_check_count]FlashPrefillCheckCase {
+    var checks: [flash_prefill_check_count]FlashPrefillCheckCase = undefined;
+    var index: usize = 0;
+    inline for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+        if (!isFlashPrefillArtifact(artifact)) continue;
+        inline for (flash_prefill_shapes) |shape| {
+            checks[index] = flashPrefillRuntimeCheck(artifact, shape);
+            index += 1;
+        }
+    }
+    return checks;
+}
+
+fn flashPrefillRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: FlashPrefillShape) FlashPrefillCheckCase {
+    return .{
+        .name = std.fmt.comptimePrint("{s}_q{d}_kv{d}_h{d}_kvh{d}_hd{d}_sw{d}", .{ artifact.kernel_id, shape.q_len, shape.kv_tokens, shape.num_heads, shape.num_kv_heads, shape.head_dim, shape.sliding_window }),
+        .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated flash prefill source"),
+        .kernel_name = artifact.kernel_id,
+        .key_chunk = @intCast(quant_kernel_compiler.first_prefill_flash_metal_schedule.key_chunk),
+        // Loose sanity bound: the flash online softmax rounds Q and the P weights
+        // through f16 and accumulates in a different order than the f32 reference,
+        // so the divergence on O(0.3) outputs runs a few 1e-2. 5e-2 keeps a wide
+        // margin above that while still catching NaNs / masking / paging / GQA
+        // bugs (the real gate is bit-identical model tokens).
+        .tolerance = 5e-2,
+        .shape = shape,
+    };
+}
+
+/// Self-contained CPU oracle for the flash-prefill kernel (single contiguous
+/// block => physical_token == logical_token). Mirrors the kernel's numerics that
+/// matter: Q is pre-scaled by 1/sqrt(head_dim) and rounded to f16 (the kernel
+/// stages `half(q*scale)` in shmem), K/V are read as f16; the softmax runs in f32
+/// (the online running-max form is algebraically the same up to f32 rounding).
+fn referenceFlashPrefill(
+    allocator: std.mem.Allocator,
+    q: []const f32,
+    encoded_key: []const u16,
+    v_bytes: []const u16,
+    shape: FlashPrefillShape,
+    out: []f32,
+) !void {
+    const q_len = shape.q_len;
+    const kv = shape.kv_tokens;
+    const nh = shape.num_heads;
+    const nkv = shape.num_kv_heads;
+    const hd = shape.head_dim;
+    if (nkv == 0 or nh % nkv != 0) return error.InvalidArgument;
+    if (q.len != q_len * nh * hd or out.len != q_len * nh * hd) return error.InvalidArgument;
+    if (encoded_key.len != kv * nkv * hd or v_bytes.len != kv * nkv * hd) return error.InvalidArgument;
+    const heads_per_group = nh / nkv;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const neg_inf: f32 = -3.402823466e+38;
+
+    var scores = try allocator.alloc(f32, kv);
+    defer allocator.free(scores);
+
+    for (0..q_len) |qi| {
+        const query_pos = shape.query_position_offset + qi;
+        for (0..nh) |h| {
+            const kv_h = h / heads_per_group;
+            const q_base = qi * nh * hd + h * hd;
+            const kv_head_base = kv_h * hd;
+
+            var best: f32 = neg_inf;
+            for (0..kv) |ki| {
+                const key_pos = ki; // kv_position_offset = 0
+                var allowed = key_pos <= query_pos;
+                if (shape.sliding_window != 0 and allowed) allowed = (query_pos - key_pos) < shape.sliding_window;
+                if (!allowed) {
+                    scores[ki] = neg_inf;
+                    continue;
+                }
+                const key_row = ki * nkv * hd + kv_head_base;
+                var acc: f32 = 0;
+                for (0..hd) |d| {
+                    // Q pre-scaled then rounded to f16 in shmem; K already f16.
+                    const qh = halfBitsToF32(f32ToHalfBits(q[q_base + d] * scale));
+                    acc += qh * halfBitsToF32(encoded_key[key_row + d]);
+                }
+                scores[ki] = if (std.math.isFinite(acc)) acc else neg_inf;
+                if (scores[ki] > best) best = scores[ki];
+            }
+
+            var sum: f32 = 0;
+            for (0..kv) |ki| {
+                var e = @exp(scores[ki] - best);
+                if (!std.math.isFinite(e)) e = 0;
+                scores[ki] = e;
+                sum += e;
+            }
+            const inv_sum: f32 = if (sum > 0) 1.0 / sum else 0;
+            for (0..hd) |d| {
+                var value: f32 = 0;
+                for (0..kv) |ki| {
+                    const v_index = ki * nkv * hd + kv_head_base + d;
+                    value += scores[ki] * inv_sum * halfBitsToF32(v_bytes[v_index]);
+                }
+                out[q_base + d] = value;
+            }
+        }
+    }
+}
+
+fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCase) !CheckResult {
+    const shape = check.shape;
+    const q_len = shape.q_len;
+    const nh = shape.num_heads;
+    const nkv = shape.num_kv_heads;
+    const hd = shape.head_dim;
+    const kv = shape.kv_tokens;
+
+    const q = try allocator.alloc(f32, q_len * nh * hd);
+    defer allocator.free(q);
+    for (q, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 17)) - 8)) / 32.0;
+    }
+    const key = try allocator.alloc(u16, kv * nkv * hd);
+    defer allocator.free(key);
+    for (key, 0..) |*value, i| {
+        value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 1) % 23)) - 11)) / 40.0);
+    }
+    const v = try allocator.alloc(u16, kv * nkv * hd);
+    defer allocator.free(v);
+    for (v, 0..) |*value, i| {
+        value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 3 + 5) % 19)) - 9)) / 24.0);
+    }
+
+    var block_table = [_]u32{0};
+
+    const expected = try allocator.alloc(f32, q_len * nh * hd);
+    defer allocator.free(expected);
+    try referenceFlashPrefill(allocator, q, key, v, shape, expected);
+
+    const actual = try allocator.alloc(f32, q_len * nh * hd);
+    defer allocator.free(actual);
+    @memset(actual, 0);
+
+    const kernel_name_z = try allocator.dupeZ(u8, check.kernel_name);
+    defer allocator.free(kernel_name_z);
+    var elapsed_nanos: u64 = 0;
+    const rc = termite_metal_run_generated_flash_prefill_check(
+        check.source.ptr,
+        check.source.len,
+        kernel_name_z.ptr,
+        q.ptr,
+        q.len,
+        key.ptr,
+        key.len,
+        v.ptr,
+        v.len,
+        &block_table,
+        block_table.len,
+        actual.ptr,
+        actual.len,
+        @intCast(q_len),
+        @intCast(kv),
+        @intCast(nh),
+        @intCast(nkv),
+        @intCast(hd),
+        @intCast(shape.query_position_offset),
+        0, // kv_position_offset
+        @intCast(shape.sliding_window),
+        @intCast(kv), // page_size (single block spans all kv tokens)
+        0, // contiguous_base_token
+        1, // contiguous_blocks
+        check.key_chunk,
+        check.warmup_iters,
+        check.measure_iters,
+        &elapsed_nanos,
+    );
+    if (rc != 0) {
+        std.debug.print("generated Metal flash prefill {s} failed rc={d}\n", .{ check.name, rc });
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    var max_error: f32 = 0.0;
+    for (actual, expected, 0..) |got, want, index| {
+        if (!std.math.isFinite(got)) {
+            std.debug.print("generated Metal flash prefill {s} nonfinite at {d}: got={d} want={d}\n", .{ check.name, index, got, want });
+            return error.GeneratedMetalKernelMismatch;
+        }
+        const diff = @abs(got - want);
+        max_error = @max(max_error, diff);
+        if (diff > check.tolerance) {
+            std.debug.print("generated Metal flash prefill {s} mismatch at {d}: got={d} want={d} diff={d}\n", .{ check.name, index, got, want, diff });
+            return error.GeneratedMetalKernelMismatch;
+        }
+    }
+    return .{ .max_error = max_error, .measure_iters = check.measure_iters, .elapsed_nanos = elapsed_nanos };
+}
+
 fn metalRuntimeCheckCount() comptime_int {
     var count: comptime_int = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
@@ -972,6 +1560,139 @@ test "quant kernel metal runtime RMSNorm CPU oracle matches activations.rmsNorm"
             const want = input[r * d + i] * inv * weight[i];
             try std.testing.expectApproxEqAbs(want, out[r * d + i], 1e-6);
         }
+    }
+}
+
+test "quant kernel metal runtime attention checks cover generated decode attention artifacts" {
+    try std.testing.expect(attention_runtime_checks.len > 0);
+    const decode_artifacts = comptime blk: {
+        var count: usize = 0;
+        for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+            if (isDecodeAttentionArtifact(artifact)) count += 1;
+        }
+        break :blk count;
+    };
+    // The decode harness covers only the decode-1x route; flash-prefill is covered
+    // by the separate flash harness (different grid / threads / shmem).
+    try std.testing.expectEqual(decode_artifacts * attention_shapes.len, attention_runtime_checks.len);
+    inline for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+        if (comptime isDecodeAttentionArtifact(artifact)) {
+            var match_count: usize = 0;
+            for (attention_runtime_checks) |check| {
+                if (!std.mem.eql(u8, artifact.kernel_id, check.kernel_name)) continue;
+                match_count += 1;
+                // NT must match the schedule (and the hand-written dispatch); the
+                // shape must be GQA-valid and never all-masked (query after all KV).
+                try std.testing.expectEqual(@as(u32, 256), check.threads_per_threadgroup);
+                try std.testing.expect(check.shape.num_kv_heads > 0);
+                try std.testing.expectEqual(@as(usize, 0), check.shape.num_heads % check.shape.num_kv_heads);
+                try std.testing.expect(check.shape.query_position_offset + 1 >= check.shape.kv_tokens);
+                try std.testing.expectEqualStrings(
+                    quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource,
+                    check.source,
+                );
+            }
+            try std.testing.expectEqual(attention_shapes.len, match_count);
+        }
+    }
+}
+
+test "quant kernel metal runtime flash prefill checks cover the generated flash artifact" {
+    try std.testing.expect(flash_prefill_checks.len > 0);
+    const flash_artifacts = comptime blk: {
+        var count: usize = 0;
+        for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
+            if (isFlashPrefillArtifact(artifact)) count += 1;
+        }
+        break :blk count;
+    };
+    try std.testing.expectEqual(flash_artifacts * flash_prefill_shapes.len, flash_prefill_checks.len);
+    for (flash_prefill_checks) |check| {
+        // Every case is a valid multi-query GQA prefill tile that never masks all
+        // KV (the first query at qpo must see at least token 0).
+        try std.testing.expect(check.shape.num_kv_heads > 0);
+        try std.testing.expectEqual(@as(usize, 0), check.shape.num_heads % check.shape.num_kv_heads);
+        try std.testing.expect(check.shape.head_dim % 32 == 0);
+        try std.testing.expectEqual(@as(u32, 32), check.key_chunk); // checked-in baseline
+    }
+}
+
+test "quant kernel metal runtime GQA attention CPU oracle matches an independent reference" {
+    const allocator = std.testing.allocator;
+    // 4 query heads share 2 KV heads (GQA 2:1), head_dim 4, 3 KV tokens, causal.
+    const shape = AttentionShape{ .kv_tokens = 3, .num_heads = 4, .num_kv_heads = 2, .head_dim = 4, .query_position_offset = 2, .sliding_window = 0 };
+    const nh = shape.num_heads;
+    const nkv = shape.num_kv_heads;
+    const hd = shape.head_dim;
+    const kv = shape.kv_tokens;
+
+    var q: [nh * hd]f32 = undefined;
+    for (&q, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) / 8.0;
+    var key: [3 * 2 * 4]u16 = undefined;
+    for (&key, 0..) |*value, i| value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 10.0);
+    var v: [3 * 2 * 4]u16 = undefined;
+    for (&v, 0..) |*value, i| value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast(i % 6)) - 3)) / 6.0);
+
+    var out: [nh * hd]f32 = undefined;
+    try referenceGqaAttention1x(allocator, &q, &key, &v, shape, &out);
+
+    // Independent recomputation (softmax over causal-allowed KV, GQA-mapped, f16).
+    const heads_per_group = nh / nkv;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    for (0..nh) |h| {
+        const kv_h = h / heads_per_group;
+        var s: [kv]f32 = undefined;
+        var best: f32 = -3.402823466e+38;
+        for (0..kv) |ki| {
+            var acc: f32 = 0;
+            for (0..hd) |d| acc += q[h * hd + d] * halfBitsToF32(key[ki * nkv * hd + kv_h * hd + d]);
+            s[ki] = acc * scale; // all causally allowed (query_pos = kv-1 >= every key_pos)
+            best = @max(best, s[ki]);
+        }
+        var sum: f32 = 0;
+        for (0..kv) |ki| {
+            s[ki] = @exp(s[ki] - best);
+            sum += s[ki];
+        }
+        for (0..hd) |d| {
+            var want: f32 = 0;
+            for (0..kv) |ki| want += (s[ki] / sum) * halfBitsToF32(v[ki * nkv * hd + kv_h * hd + d]);
+            try std.testing.expectApproxEqAbs(want, out[h * hd + d], 1e-5);
+        }
+    }
+}
+
+test "quant kernel metal runtime GQA attention CPU oracle honours the sliding window" {
+    const allocator = std.testing.allocator;
+    // Window of 2 over 5 KV tokens with the query at position 4: only tokens
+    // 3 and 4 are in-window (query_pos - key_pos < 2), so 0..2 are masked out.
+    const shape = AttentionShape{ .kv_tokens = 5, .num_heads = 1, .num_kv_heads = 1, .head_dim = 2, .query_position_offset = 4, .sliding_window = 2 };
+    var q = [_]f32{ 0.5, -0.25 };
+    var key: [5 * 2]u16 = undefined;
+    for (&key, 0..) |*value, i| value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast(i)) - 5)) / 8.0);
+    var v: [5 * 2]u16 = undefined;
+    for (&v, 0..) |*value, i| value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast(i)) - 5)) / 4.0);
+
+    var out: [2]f32 = undefined;
+    try referenceGqaAttention1x(allocator, &q, &key, &v, shape, &out);
+
+    // Only ki in {3,4} contribute.
+    const scale: f32 = 1.0 / @sqrt(@as(f32, 2.0));
+    var s3: f32 = 0;
+    var s4: f32 = 0;
+    for (0..2) |d| {
+        s3 += q[d] * halfBitsToF32(key[3 * 2 + d]);
+        s4 += q[d] * halfBitsToF32(key[4 * 2 + d]);
+    }
+    s3 *= scale;
+    s4 *= scale;
+    const best = @max(s3, s4);
+    const e3 = @exp(s3 - best);
+    const e4 = @exp(s4 - best);
+    const sum = e3 + e4;
+    for (0..2) |d| {
+        const want = (e3 / sum) * halfBitsToF32(v[3 * 2 + d]) + (e4 / sum) * halfBitsToF32(v[4 * 2 + d]);
+        try std.testing.expectApproxEqAbs(want, out[d], 1e-5);
     }
 }
 
@@ -1172,6 +1893,33 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(
                 "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} measure_iters={d} generated_avg_us={d:.3} op_kind=microkernel\n",
                 .{ micro_check.name, result.max_error, result.measure_iters, avg_us },
+            );
+        }
+    }
+
+    // Attention (non-matmul) conformance — same isolation as the microkernel
+    // pass. This is the fast compile/dispatch/gross-logic pre-check only; the
+    // real gate is bit-identical model tokens with the generated route enabled.
+    if (cfg.evidence_out_path == null and !cfg.runtime_route_all and !cfg.production_regression_check and selected_kernel == null) {
+        for (attention_runtime_checks) |check| {
+            var attn_check = check;
+            if (cfg.measure_iters) |measure_iters| attn_check.measure_iters = measure_iters;
+            const result = try runAttentionCheck(allocator, attn_check);
+            const avg_us = @as(f64, @floatFromInt(result.elapsed_nanos)) / @as(f64, @floatFromInt(result.measure_iters)) / 1000.0;
+            std.debug.print(
+                "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} measure_iters={d} generated_avg_us={d:.3} op_kind=attention\n",
+                .{ attn_check.name, result.max_error, result.measure_iters, avg_us },
+            );
+        }
+        // Flash-prefill conformance (multi-query prefill tile, flash grid/shmem).
+        for (flash_prefill_checks) |check| {
+            var flash_check = check;
+            if (cfg.measure_iters) |measure_iters| flash_check.measure_iters = measure_iters;
+            const result = try runFlashPrefillCheck(allocator, flash_check);
+            const avg_us = @as(f64, @floatFromInt(result.elapsed_nanos)) / @as(f64, @floatFromInt(result.measure_iters)) / 1000.0;
+            std.debug.print(
+                "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} measure_iters={d} generated_avg_us={d:.3} op_kind=attention_flash\n",
+                .{ flash_check.name, result.max_error, result.measure_iters, avg_us },
             );
         }
     }
@@ -1774,11 +2522,34 @@ fn runSweep(allocator: std.mem.Allocator, cfg: Config) !void {
         }
     }
 
-    if (cfg.sweep_evidence_out) |path| {
-        try writeSweepEvidence(allocator, path, route_records.items);
-        std.debug.print("quant-kernel-metal-sweep evidence_out={s} routes={d}\n", .{ path, route_records.items.len });
+    // Attention `op_kind` route(s): swept on a parallel path (flash knobs / flash
+    // runner) but folded into the same evidence. Runs when no route filter is set
+    // or the filter selects the attention family.
+    var attention_records = std.ArrayListUnmanaged(AttentionSweepRouteRecord).empty;
+    defer {
+        for (attention_records.items) |record| allocator.free(record.variants);
+        attention_records.deinit(allocator);
     }
-    std.debug.print("quant-kernel-metal-sweep done: {d} routes\n", .{route_records.items.len});
+    const run_attention = cfg.sweep_route == null or sweepRouteMatchesAttention(cfg.sweep_route.?);
+    if (run_attention) {
+        const record = try runAttentionSweepRoute(allocator, measure_iters, repeat_runs);
+        try attention_records.append(allocator, record);
+        if (record.winner_index) |wi| {
+            const w = record.variants[wi];
+            std.debug.print(
+                "quant-kernel-metal-sweep {s} winner key_chunk={d} skip_rescale={s} min_speedup={d:.3}{s}\n",
+                .{ record.route_name, w.schedule.key_chunk, if (w.schedule.skip_rescale) "true" else "false", w.min_speedup, if (w.is_baseline_schedule) " (== current)" else "" },
+            );
+        } else {
+            std.debug.print("quant-kernel-metal-sweep {s} no correct variant\n", .{record.route_name});
+        }
+    }
+
+    if (cfg.sweep_evidence_out) |path| {
+        try writeSweepEvidence(allocator, path, route_records.items, attention_records.items);
+        std.debug.print("quant-kernel-metal-sweep evidence_out={s} routes={d}\n", .{ path, route_records.items.len + attention_records.items.len });
+    }
+    std.debug.print("quant-kernel-metal-sweep done: {d} matmul routes + {d} attention routes\n", .{ route_records.items.len, attention_records.items.len });
 }
 
 fn sweepRouteMatches(filter: []const u8, format: quant_matmul.Format, epilogue: quant_kernel_compiler.Epilogue) bool {
@@ -1790,13 +2561,29 @@ fn sweepRouteMatches(filter: []const u8, format: quant_matmul.Format, epilogue: 
     return std.mem.eql(u8, epi_part, @tagName(epilogue));
 }
 
-fn writeSweepEvidence(allocator: std.mem.Allocator, path: []const u8, records: []const SweepRouteRecord) !void {
+fn writeSweepEvidence(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    records: []const SweepRouteRecord,
+    attention_records: []const AttentionSweepRouteRecord,
+) !void {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
     try out.appendSlice(allocator, "{\n  \"schema\": \"antfly.quant_kernel_metal_sweep.v1\",\n  \"routes\": [\n");
-    for (records, 0..) |record, ri| {
+    const total = records.len + attention_records.len;
+    var emitted: usize = 0;
+    for (records) |record| {
         try appendSweepRouteJson(allocator, &out, record);
-        try out.appendSlice(allocator, if (ri + 1 == records.len) "\n" else ",\n");
+        emitted += 1;
+        try out.appendSlice(allocator, if (emitted == total) "\n" else ",\n");
+    }
+    // Attention routes ride in the same "routes" array; each object self-describes
+    // its schedule (the flash key_chunk/skip_rescale knobs distinguish variants
+    // that share the matmul threads/cols/reduction fields).
+    for (attention_records) |record| {
+        try appendAttentionSweepRouteJson(allocator, &out, record);
+        emitted += 1;
+        try out.appendSlice(allocator, if (emitted == total) "\n" else ",\n");
     }
     try out.appendSlice(allocator, "  ]\n}\n");
     try writeFileCreatingParent(compat.io(), path, out.items);
@@ -1808,6 +2595,46 @@ fn appendSweepScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnma
     });
     defer allocator.free(chunk);
     try out.appendSlice(allocator, chunk);
+}
+
+// Flash schedule JSON carries the attention knobs the matmul schedule JSON omits.
+fn appendFlashScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), schedule: quant_kernel_compiler.KernelSchedule) !void {
+    const chunk = try std.fmt.allocPrint(allocator, "{{\"threads\": {d}, \"cols\": {d}, \"reduction\": \"{s}\", \"key_chunk\": {d}, \"skip_rescale\": {s}}}", .{
+        schedule.threads_per_threadgroup, schedule.cols_per_threadgroup, reductionName(schedule.reduction),
+        schedule.key_chunk, if (schedule.skip_rescale) "true" else "false",
+    });
+    defer allocator.free(chunk);
+    try out.appendSlice(allocator, chunk);
+}
+
+fn appendAttentionSweepRouteJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), record: AttentionSweepRouteRecord) !void {
+    const header = try std.fmt.allocPrint(allocator, "    {{\n      \"format\": \"{s}\",\n      \"epilogue\": \"none\",\n      \"baseline_kernel_id\": \"{s}\",\n      \"baseline_schedule\": ", .{
+        record.route_name, record.baseline_kernel_id,
+    });
+    defer allocator.free(header);
+    try out.appendSlice(allocator, header);
+    try appendFlashScheduleJson(allocator, out, record.baseline_schedule);
+    try out.appendSlice(allocator, ",\n      \"variants\": [\n");
+    for (record.variants, 0..) |variant, vi| {
+        try out.appendSlice(allocator, "        {\"schedule\": ");
+        try appendFlashScheduleJson(allocator, out, variant.schedule);
+        const tail = try std.fmt.allocPrint(allocator, ", \"correctness_passed\": {s}, \"max_abs_error\": {d:.7}, \"min_speedup_vs_baseline\": {d:.6}, \"is_current_schedule\": {s}}}", .{
+            if (variant.correctness_passed) "true" else "false",
+            variant.max_error,
+            variant.min_speedup,
+            if (variant.is_baseline_schedule) "true" else "false",
+        });
+        defer allocator.free(tail);
+        try out.appendSlice(allocator, tail);
+        try out.appendSlice(allocator, if (vi + 1 == record.variants.len) "\n" else ",\n");
+    }
+    try out.appendSlice(allocator, "      ],\n      \"winner\": ");
+    if (record.winner_index) |wi| {
+        try appendFlashScheduleJson(allocator, out, record.variants[wi].schedule);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    try out.appendSlice(allocator, "\n    }");
 }
 
 fn appendSweepRouteJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), record: SweepRouteRecord) !void {
@@ -1909,6 +2736,218 @@ fn scheduleValidForSweep(
     if (schedule.cols_per_threadgroup == 2 and schedule.reduction != .simd_sum) return false;
     _ = epilogue;
     return true;
+}
+
+// ---- Attention schedule sweep (autotune) ---------------------------------
+//
+// The attention `op_kind` routes have their own knobs (flash `key_chunk` /
+// `skip_rescale`) and their own on-device runner (flash grid / 128 threads /
+// key_chunk-sized shmem), so they sweep on a parallel path to the matmul routes
+// but emit into the same `antfly.quant_kernel_metal_sweep.v1` evidence. Like the
+// matmul sweep, this is a directional filter only: variants are rendered in
+// memory, benchmarked against the checked-in baseline, and never promoted here.
+// The real arbiter is a prefill decode-runtime A/B on the model (the sweep
+// under-reports — it times an isolated dispatch, not a full-layer prefill).
+
+const max_attention_sweep_variants = 4;
+
+/// Prefill tiles used to benchmark the flash sweep. head_dim is kept at 128/64 so
+/// EVERY variant fits the 32 KB threadgroup limit — key_chunk=64 needs
+/// `144*hd+3680` bytes (36 KB at hd=256, so it is excluded from the model but
+/// valid here). Larger kv_tokens exercise the chunk-count lever (key_chunk=64
+/// halves the flash chunks + their barriers/gathers).
+const flash_sweep_shapes = [_]FlashPrefillShape{
+    .{ .q_len = 128, .kv_tokens = 256, .num_heads = 8, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 128, .sliding_window = 0 },
+    .{ .q_len = 256, .kv_tokens = 256, .num_heads = 8, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 0, .sliding_window = 0 },
+    .{ .q_len = 128, .kv_tokens = 512, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 384, .sliding_window = 0 },
+};
+
+const flash_sweep_tolerance: f32 = 5e-2;
+
+const AttentionSweepVariantRecord = struct {
+    schedule: quant_kernel_compiler.KernelSchedule,
+    correctness_passed: bool,
+    max_error: f32,
+    min_speedup: f64, // worst-shape speedup vs the checked-in baseline schedule
+    is_baseline_schedule: bool,
+};
+
+const AttentionSweepRouteRecord = struct {
+    route_name: []const u8,
+    baseline_kernel_id: []const u8,
+    baseline_schedule: quant_kernel_compiler.KernelSchedule,
+    variants: []AttentionSweepVariantRecord,
+    winner_index: ?usize,
+};
+
+/// Enumerates the attention sweep variants for a route. Flash-prefill sweeps the
+/// `key_chunk ∈ {32,64}` × `skip_rescale ∈ {false,true}` grid (4 variants); the
+/// structural 128-thread / 4-simdgroup / 8-query-tile shape is fixed. decode-1x
+/// has no tunable knob wired (its 256/NSG shape is structural), so it sweeps to 0.
+fn enumerateAttentionSweepVariants(
+    kind: quant_kernel_metal_renderer.AttentionKind,
+    out: *[max_attention_sweep_variants]quant_kernel_compiler.KernelSchedule,
+) usize {
+    switch (kind) {
+        .decode_1x => return 0,
+        .prefill_flash => {
+            var count: usize = 0;
+            const key_chunks = [_]u16{ 32, 64 };
+            const skips = [_]bool{ false, true };
+            for (key_chunks) |kc| {
+                for (skips) |sk| {
+                    out[count] = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = kc, .skip_rescale = sk };
+                    count += 1;
+                }
+            }
+            return count;
+        },
+    }
+}
+
+// Times one rendered flash source on one prefill shape, repeated `repeat_runs`
+// times, returning the min elapsed nanos (noise floor) + max abs error. Returns
+// null on a correctness mismatch or dispatch failure (variant dropped from the
+// sweep — e.g. key_chunk=64 that overflows shmem for the shape's head_dim).
+fn timeFlashSourceMinNs(
+    allocator: std.mem.Allocator,
+    shape: FlashPrefillShape,
+    source: []const u8,
+    kernel_id: []const u8,
+    key_chunk: u32,
+    measure_iters: u32,
+    repeat_runs: u32,
+) !?struct { ns: u64, max_error: f32 } {
+    var min_ns: u64 = std.math.maxInt(u64);
+    var max_error: f32 = 0.0;
+    var run: u32 = 0;
+    while (run < repeat_runs) : (run += 1) {
+        const check = FlashPrefillCheckCase{
+            .name = "flash_sweep",
+            .source = source,
+            .kernel_name = kernel_id,
+            .key_chunk = key_chunk,
+            .tolerance = flash_sweep_tolerance,
+            .shape = shape,
+            .measure_iters = measure_iters,
+        };
+        const result = runFlashPrefillCheck(allocator, check) catch |err| {
+            if (err == error.GeneratedMetalKernelMismatch or err == error.GeneratedMetalKernelFailed) return null;
+            return err;
+        };
+        if (result.elapsed_nanos < min_ns) min_ns = result.elapsed_nanos;
+        if (result.max_error > max_error) max_error = result.max_error;
+    }
+    return .{ .ns = min_ns, .max_error = max_error };
+}
+
+// Runs the flash-prefill schedule sweep (all `flash_sweep_shapes`) and returns an
+// owned AttentionSweepRouteRecord. Times the checked-in baseline (key_chunk=32,
+// skip_rescale=false) once per shape, then each rendered variant, computing the
+// worst-shape speedup and dropping variants that fail correctness on any shape.
+fn runAttentionSweepRoute(
+    allocator: std.mem.Allocator,
+    measure_iters: u32,
+    repeat_runs: u32,
+) !AttentionSweepRouteRecord {
+    const kind = quant_kernel_metal_renderer.AttentionKind.prefill_flash;
+    var variant_schedules: [max_attention_sweep_variants]quant_kernel_compiler.KernelSchedule = undefined;
+    const variant_count = enumerateAttentionSweepVariants(kind, &variant_schedules);
+    if (variant_count == 0) return error.AttentionSweepNoVariants;
+    const baseline_schedule = variant_schedules[0]; // key_chunk=32, skip_rescale=false
+
+    // Baseline timing per shape (rendered baseline schedule).
+    const baseline_kernel_id = "antfly_paged_attention_prefill_flash_sweep_baseline";
+    const baseline_body = try quant_kernel_metal_renderer.renderPrefillFlashKernel(allocator, baseline_kernel_id, baseline_schedule);
+    defer allocator.free(baseline_body);
+    const baseline_source = try std.fmt.allocPrint(allocator, "#include <metal_stdlib>\nusing namespace metal;\n{s}", .{baseline_body});
+    defer allocator.free(baseline_source);
+    var baseline_ns: [flash_sweep_shapes.len]u64 = undefined;
+    for (flash_sweep_shapes, 0..) |shape, si| {
+        const timed = try timeFlashSourceMinNs(allocator, shape, baseline_source, baseline_kernel_id, @intCast(baseline_schedule.key_chunk), measure_iters, repeat_runs) orelse return error.AttentionSweepBaselineFailed;
+        baseline_ns[si] = timed.ns;
+    }
+
+    var records = try allocator.alloc(AttentionSweepVariantRecord, variant_count);
+    var winner_index: ?usize = null;
+    var winner_speedup: f64 = 0.0;
+    for (variant_schedules[0..variant_count], 0..) |schedule, vi| {
+        const kernel_id = try std.fmt.allocPrint(allocator, "antfly_paged_attention_prefill_flash_sweep_kc{d}_{s}", .{
+            schedule.key_chunk, if (schedule.skip_rescale) "skip" else "rescale",
+        });
+        defer allocator.free(kernel_id);
+        const body = try quant_kernel_metal_renderer.renderPrefillFlashKernel(allocator, kernel_id, schedule);
+        defer allocator.free(body);
+        const source = try std.fmt.allocPrint(allocator, "#include <metal_stdlib>\nusing namespace metal;\n{s}", .{body});
+        defer allocator.free(source);
+
+        var ok = true;
+        var max_error: f32 = 0.0;
+        var min_speedup: f64 = std.math.floatMax(f64);
+        for (flash_sweep_shapes, 0..) |shape, si| {
+            const timed = try timeFlashSourceMinNs(allocator, shape, source, kernel_id, @intCast(schedule.key_chunk), measure_iters, repeat_runs);
+            if (timed == null) {
+                ok = false;
+                break;
+            }
+            if (timed.?.max_error > max_error) max_error = timed.?.max_error;
+            const shape_speedup = @as(f64, @floatFromInt(baseline_ns[si])) / @as(f64, @floatFromInt(@max(timed.?.ns, 1)));
+            if (shape_speedup < min_speedup) min_speedup = shape_speedup;
+        }
+        const is_baseline = schedule.key_chunk == baseline_schedule.key_chunk and schedule.skip_rescale == baseline_schedule.skip_rescale;
+        records[vi] = .{
+            .schedule = schedule,
+            .correctness_passed = ok,
+            .max_error = max_error,
+            .min_speedup = if (ok) min_speedup else 0.0,
+            .is_baseline_schedule = is_baseline,
+        };
+        if (ok and min_speedup > winner_speedup) {
+            winner_speedup = min_speedup;
+            winner_index = vi;
+        }
+    }
+
+    return .{
+        .route_name = "attention/prefill_flash",
+        .baseline_kernel_id = quant_kernel_compiler.first_prefill_flash_metal_kernel_id,
+        .baseline_schedule = baseline_schedule,
+        .variants = records,
+        .winner_index = winner_index,
+    };
+}
+
+fn sweepRouteMatchesAttention(filter: []const u8) bool {
+    // filter form "attention" or "attention/prefill_flash".
+    var it = std.mem.splitScalar(u8, filter, '/');
+    const head = it.next() orelse return false;
+    if (!std.mem.eql(u8, head, "attention")) return false;
+    const tail = it.next() orelse return true; // "attention" matches the whole family
+    return std.mem.eql(u8, tail, "prefill_flash");
+}
+
+test "quant kernel metal attention sweep enumerates the flash key_chunk x skip_rescale grid" {
+    var out: [max_attention_sweep_variants]quant_kernel_compiler.KernelSchedule = undefined;
+    const n = enumerateAttentionSweepVariants(.prefill_flash, &out);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    // The baseline (key_chunk=32, skip_rescale=false) leads so the sweep times it first.
+    try std.testing.expectEqual(@as(u16, 32), out[0].key_chunk);
+    try std.testing.expect(!out[0].skip_rescale);
+    var seen_kc64_skip = false;
+    for (out[0..n]) |s| {
+        // The structural flash shape is fixed; only the two knobs vary.
+        try std.testing.expectEqual(@as(u16, 128), s.threads_per_threadgroup);
+        try std.testing.expectEqual(@as(u8, 1), s.cols_per_threadgroup);
+        try std.testing.expect(s.key_chunk == 32 or s.key_chunk == 64);
+        if (s.key_chunk == 64 and s.skip_rescale) seen_kc64_skip = true;
+    }
+    try std.testing.expect(seen_kc64_skip);
+    // decode-1x has no tunable knob wired.
+    try std.testing.expectEqual(@as(usize, 0), enumerateAttentionSweepVariants(.decode_1x, &out));
+    // Route filter selects the attention family.
+    try std.testing.expect(sweepRouteMatchesAttention("attention"));
+    try std.testing.expect(sweepRouteMatchesAttention("attention/prefill_flash"));
+    try std.testing.expect(!sweepRouteMatchesAttention("q4_k/none"));
 }
 
 const SweepShapeResult = struct {

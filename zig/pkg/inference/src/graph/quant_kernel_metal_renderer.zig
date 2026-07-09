@@ -43,6 +43,27 @@ pub const MicrokernelKind = enum {
     rms_norm,
 };
 
+/// The paged-attention kernels the renderer can emit. Each is a self-contained
+/// body (its own params struct + paging helper, no dequant decoder, no epilogue)
+/// that references the query/key/value/block_table/output buffer layout shared
+/// with the hand-written `termite_paged_attention_*` family.
+pub const AttentionKind = enum {
+    /// `termite_paged_attention_kv_1x`: one threadgroup per (query, head), f16
+    /// paged KV, GQA, causal + sliding-window masking, no sinks, no softcap.
+    decode_1x,
+    /// `termite_paged_attention_kv_prefill_sg`: the simdgroup-MMA flash prefill
+    /// kernel. 8-query tile per threadgroup, 4 simdgroups / 128 threads, online
+    /// softmax, direct-device K/V load for contiguous chunks. Same f16-KV /
+    /// GQA / causal+sliding contract as decode_1x (no sinks, no softcap). Two
+    /// schedule knobs tune it (see `KernelSchedule`): `key_chunk` (32 or 64 KV
+    /// tokens per flash chunk) and `skip_rescale` (skip the online-softmax
+    /// O-accumulator rescale when no row's running max changed this chunk). The
+    /// `key_chunk=32, skip_rescale=false` schedule renders byte-identical to the
+    /// hand-written kernel (modulo the self-contained params/helper renames), so
+    /// it is the model-token acceptance baseline.
+    prefill_flash,
+};
+
 /// A shared MSL vocabulary helper (dedup of the per-format v1 copies).
 pub const HelperFragment = struct {
     name: []const u8,
@@ -106,6 +127,38 @@ pub const helper_q3_k_raw_scale = HelperFragment{
     \\    return int(low | (high << 4)) - 32;
     \\}
     ,
+};
+
+// ---- Attention helper fragments ------------------------------------------
+// The generated decode-attention kernel is self-contained: it emits its own
+// params struct + paging helper rather than referencing the hand-written
+// `termite_metal_paged_attention_params` / `termite_attention_page_token` in
+// metal_kernels.m. This is mandatory, not stylistic — the runtime region
+// (`quant-kernel-codegen:begin..end`) and the hand-written attention kernels
+// compile into the SAME Metal library, and the hand-written `page_token` is
+// defined *after* the region, so a runtime-region body referencing it would be
+// a use-before-declaration error. Renaming (`antfly_paged_attention_1x_*`) also
+// avoids redefining the struct that is declared before the region. Both copies
+// (checked-in `.metal` and runtime region) emit these fragments identically, so
+// the generated kernel stays byte-identical across the two, exactly like the
+// RMSNorm microkernel.
+//
+// `paged_attention_params_field_body` is the single source of truth for the
+// struct layout. The compiler pins the hand-written MSL copy in metal_kernels.m
+// to this same body via a `metal_runtime_external_helpers` drift guard, so the
+// generated struct (which the dispatch's `termite_metal_paged_attention_params`
+// bytes are reinterpret-cast into at buffer(6)) can never silently diverge in
+// layout from what the runtime binds.
+pub const paged_attention_params_field_body = "uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap;";
+
+pub const helper_paged_attention_1x_params = HelperFragment{
+    .name = "antfly_paged_attention_1x_params",
+    .msl = "struct antfly_paged_attention_1x_params { " ++ paged_attention_params_field_body ++ " };",
+};
+
+pub const helper_paged_attention_1x_page_token = HelperFragment{
+    .name = "antfly_paged_attention_1x_page_token",
+    .msl = "inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant antfly_paged_attention_1x_params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }",
 };
 
 // ---- Per-format decoders (v2 fragments) ----------------------------------
@@ -386,14 +439,349 @@ fn renderRmsNormBody(
     try out.appendSlice(allocator, "}\n");
 }
 
+// ---- Attention (paged decode) --------------------------------------------
+
+/// Renders the full standalone MSL for a paged-attention kernel: the
+/// self-contained params struct + paging helper (deduped) followed by the
+/// kernel body. The same bytes are emitted into the runtime region, so the
+/// checked-in `.metal` and the runtime-embedded copy stay single-sourced (and
+/// byte-identical) exactly like the matmul and RMSNorm routes.
+pub fn renderAttention(
+    allocator: std.mem.Allocator,
+    kernel_id: []const u8,
+    kind: AttentionKind,
+    schedule: KernelSchedule,
+) ![]u8 {
+    try validateAttentionSchedule(kind, schedule);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var emitted_names = EmittedNames{};
+    for (attentionHelpers(kind)) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
+    try renderAttentionBody(allocator, &out, kernel_id, kind, schedule);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Convenience wrapper for the scalar decode-1x paged-attention kernel.
+pub fn renderPagedAttention1xKernel(
+    allocator: std.mem.Allocator,
+    kernel_id: []const u8,
+    schedule: KernelSchedule,
+) ![]u8 {
+    return renderAttention(allocator, kernel_id, .decode_1x, schedule);
+}
+
+/// Convenience wrapper for the flash-prefill paged-attention kernel.
+pub fn renderPrefillFlashKernel(
+    allocator: std.mem.Allocator,
+    kernel_id: []const u8,
+    schedule: KernelSchedule,
+) ![]u8 {
+    return renderAttention(allocator, kernel_id, .prefill_flash, schedule);
+}
+
+/// The self-contained helper fragments an attention kernel references, in
+/// dependency order (the paging helper takes the params struct by reference, so
+/// the struct must be emitted first). The flash-prefill kernel binds and
+/// reinterprets the same `termite_metal_paged_attention_params` bytes at
+/// buffer(6) as decode_1x, so it emits the same two self-contained fragments.
+fn attentionHelpers(kind: AttentionKind) []const HelperFragment {
+    return switch (kind) {
+        .decode_1x, .prefill_flash => &.{ helper_paged_attention_1x_params, helper_paged_attention_1x_page_token },
+    };
+}
+
+fn validateAttentionSchedule(kind: AttentionKind, schedule: KernelSchedule) !void {
+    switch (kind) {
+        // decode-1x runs NT = NSG*32 threads: NSG simdgroups each own a strided
+        // subset of KV tokens (32 lanes reduce the head_dim dot with simd_sum),
+        // then the whole threadgroup runs a power-of-two tree over `partials`
+        // for the softmax max/sum. So NT must be a positive multiple of the
+        // 32-lane simdgroup width AND a power of two, and one threadgroup owns
+        // one (query, head) — never more than one column.
+        .decode_1x => {
+            const t = schedule.threads_per_threadgroup;
+            if (t == 0 or t % 32 != 0) return error.AttentionThreadsNotSimdgroupMultiple;
+            if ((t & (t - 1)) != 0) return error.AttentionThreadsNotPowerOfTwo;
+            if (schedule.cols_per_threadgroup != 1) return error.AttentionColsMustBeOne;
+        },
+        // flash-prefill is structurally a 128-thread / 4-simdgroup / 8-query-tile
+        // kernel: the gather loops stride by 128, the query tile is 8, and each
+        // simdgroup owns 2 of the 8 query rows. Those are fixed, so only the two
+        // sweep knobs vary. `key_chunk` is the KV tokens per flash chunk and must
+        // be a positive multiple of the 32-lane simdgroup width (each lane owns
+        // key_chunk/32 keys in the score pass; the 4 simdgroups tile key_chunk/8
+        // MMA tiles, key_chunk/32 per simdgroup — always integral for a multiple
+        // of 32). It must also be <= 128: the per-chunk `sphys` populate is a
+        // single-pass `if (tid < key_chunk)` write over the 128 threads (kept a
+        // straight write, not a strided loop, so the key_chunk=32 baseline stays
+        // byte-identical to the hand-written kernel), so a chunk wider than the
+        // thread count would leave sphys[128..] unwritten. 32 and 64 are the swept
+        // values. head_dim (a runtime value, must be a multiple of 32) is guarded
+        // inside the kernel body.
+        .prefill_flash => {
+            if (schedule.threads_per_threadgroup != 128) return error.AttentionFlashThreadsMustBe128;
+            if (schedule.cols_per_threadgroup != 1) return error.AttentionColsMustBeOne;
+            const kc = schedule.key_chunk;
+            if (kc == 0 or kc % 32 != 0) return error.AttentionFlashKeyChunkNotSimdgroupMultiple;
+            if (kc > 128) return error.AttentionFlashKeyChunkTooWide;
+        },
+    }
+}
+
+fn renderAttentionBody(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+    kind: AttentionKind,
+    schedule: KernelSchedule,
+) !void {
+    try validateAttentionSchedule(kind, schedule);
+    switch (kind) {
+        .decode_1x => try renderPagedAttention1xBody(allocator, out, kernel_id, schedule),
+        .prefill_flash => try renderPrefillFlashBody(allocator, out, kernel_id, schedule),
+    }
+}
+
+/// Paged decode attention (`termite_paged_attention_kv_1x`): one threadgroup per
+/// (query, head). Grid `(q_len, num_heads)`, NT threads. NSG = NT/32 simdgroups
+/// each score a strided subset of KV tokens (32 lanes reduce the head_dim dot
+/// with `simd_sum`); a threadgroup tree finds the softmax max, a second tree the
+/// normaliser, then the head_dim outputs are accumulated strided over `P·V`.
+/// f16 paged KV (`format==3`), GQA via `heads_per_group`, causal + sliding
+/// masking; no sinks, no softcap (the dispatch gates those to the scalar path).
+///
+/// This is a verbatim transcription of the hand-written kernel body with NT/NSG
+/// parametrized and the params struct / paging helper renamed to the generated
+/// self-contained copies — so the generated route is behaviourally byte-for-byte
+/// the hand-written one, which is what the model-token acceptance gate checks.
+fn renderPagedAttention1xBody(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+    schedule: KernelSchedule,
+) !void {
+    const nt = schedule.threads_per_threadgroup;
+    const nsg = nt / 32;
+    try appendFmt(allocator, out,
+        "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n",
+        .{kernel_id});
+    try appendFmt(allocator, out,
+        "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    const uint NT = {d}u; const uint NW = 32u; const uint NSG = {d}u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + {d}u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n",
+        .{ nt, nsg, nt });
+    try appendFmt(allocator, out,
+        "    for (uint base = 0u; base < p.kv_tokens; base += NSG) {{ uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) {{ uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }} uint physical_token = allowed ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) {{ const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); }} float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) {{ scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); }} }}\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; local_best = score > local_best ? score : local_best; }} partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) {{ float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; }} threadgroup_barrier(mem_flags::mem_threadgroup); }} float best = partials[0];\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float e = exp(scores[ki] - best); e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        .{});
+    try appendFmt(allocator, out,
+        "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); }} output[out_base + d] = value; }}\n",
+        .{});
+    try out.appendSlice(allocator, "}\n");
+}
+
+/// Flash-style paged prefill attention (`termite_paged_attention_kv_prefill_sg`):
+/// an 8-query tile per threadgroup, 4 simdgroups / 128 threads, simdgroup-MMA for
+/// Q·Kᵀ and P·V with an online (running max/sum) softmax. f16 paged KV
+/// (`format==3`), GQA, causal + sliding masking; no sinks, no softcap. For
+/// contiguous chunks it loads K/V directly from device memory (skipping the
+/// shmem gather); ragged/non-contiguous chunks fall back to the gather path.
+///
+/// Two schedule knobs tune it:
+///  - `key_chunk` (KC): the KV tokens staged + scored per flash chunk. The shmem
+///    layout, the number of Q·Kᵀ MMA tiles per simdgroup (KC/32), the keys each
+///    lane scores (KC/32), and the P·V inner tile count (KC/8) all derive from it.
+///    KC=32 renders byte-for-byte the hand-written kernel (modulo the
+///    params-struct / paging-helper renames), so it is the model-token baseline.
+///    KC=64 restructures the Q·Kᵀ and score passes (2 tiles/simdgroup, 2
+///    keys/lane); its shmem footprint is `(8+KC)*hd*2 + 52*KC + 352` bytes, which
+///    exceeds the 32 KB threadgroup limit for head_dim≥224, so KC=64 is a
+///    small-head / directional sweep lever (the host dispatch tracks the size).
+///  - `skip_rescale`: guard the online-softmax O-accumulator rescale (an identity
+///    `simdgroup_multiply` when no row's running max moved this chunk) behind a
+///    threadgroup flag. ALU-only; the flag lives in the layout's reserved word so
+///    the footprint is unchanged.
+///
+/// Shmem layout (bytes, from `shmem`): `sq` 8*hd half, `skv` KC*hd half, then the
+/// float block `fb` at `(8+KC)*hd*2`: `ss` 8×KC f32 (0), `sp` 8×KC half (32*KC),
+/// `sphys` KC u32 (48*KC), `sM` 8 f32 (52*KC), `sS` 8 f32 (52*KC+32), a reserved
+/// word (52*KC+64, the `skip_rescale` flag), `sdiag` 8×8 f32 (52*KC+96). At KC=32
+/// these are exactly the hand-written `1024/1536/1664/1696/1760` offsets.
+fn renderPrefillFlashBody(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+    schedule: KernelSchedule,
+) !void {
+    const kc: usize = schedule.key_chunk;
+    const skip = schedule.skip_rescale;
+    const sp_off = 32 * kc;
+    const sphys_off = 48 * kc;
+    const sm_off = 52 * kc;
+    const ss_off = 52 * kc + 32;
+    const changed_off = 52 * kc + 64;
+    const diag_off = 52 * kc + 96;
+    const pv_tiles = kc / 8;
+    const tiles_per_sg = kc / 32;
+    const keys_per_lane = kc / 32;
+
+    // ---- signature + prologue (byte-identical to the hand-written kernel at
+    // KC=32; the layout offsets are the symbolic form that evaluates to the
+    // hand-written literals there). ----
+    try appendFmt(allocator, out,
+        "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n",
+        .{kernel_id});
+    try out.appendSlice(allocator, "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n");
+    try out.appendSlice(allocator, "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u || hd % 32u != 0u) return;\n");
+    try out.appendSlice(allocator, "    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n");
+    try out.appendSlice(allocator, "    const uint q_stride = p.num_heads * hd; const uint k_row_halfs = p.key_row_bytes / 2u;\n");
+    try out.appendSlice(allocator, "    threadgroup half *sq = (threadgroup half *)shmem;\n");
+    try out.appendSlice(allocator, "    threadgroup half *skv = sq + 8u * hd;\n");
+    try appendFmt(allocator, out, "    threadgroup char *fb = shmem + (8u + {d}u) * hd * 2u;\n", .{kc});
+    try out.appendSlice(allocator, "    threadgroup float *ss = (threadgroup float *)fb;\n");
+    try appendFmt(allocator, out, "    threadgroup half *sp = (threadgroup half *)(fb + {d}u);\n", .{sp_off});
+    try appendFmt(allocator, out, "    threadgroup uint *sphys = (threadgroup uint *)(fb + {d}u);\n", .{sphys_off});
+    try appendFmt(allocator, out, "    threadgroup float *sM = (threadgroup float *)(fb + {d}u);\n", .{sm_off});
+    try appendFmt(allocator, out, "    threadgroup float *sS = (threadgroup float *)(fb + {d}u);\n", .{ss_off});
+    if (skip) try appendFmt(allocator, out, "    threadgroup uint *schanged = (threadgroup uint *)(fb + {d}u);\n", .{changed_off});
+    try appendFmt(allocator, out, "    threadgroup float *sdiag = (threadgroup float *)(fb + {d}u);\n", .{diag_off});
+    try out.appendSlice(allocator, "    const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n");
+    try out.appendSlice(allocator, "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key);\n");
+    try out.appendSlice(allocator, "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * hd + d] * scale) : half(0.0f); }\n");
+    try out.appendSlice(allocator, "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; }\n");
+    try out.appendSlice(allocator, "    if (tid < 64u) sdiag[tid] = 0.0f;\n");
+    try out.appendSlice(allocator, "    const uint dslice = uint(sgitg) * (hd / 4u);\n");
+    try out.appendSlice(allocator, "    simdgroup_float8x8 mo[8];\n");
+    try out.appendSlice(allocator, "    for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n");
+    try out.appendSlice(allocator, "    const uint d_tiles = hd / 32u;\n");
+
+    // ---- per-chunk online-softmax loop ----
+    try appendFmt(allocator, out, "    for (uint kc = 0u; kc < p.kv_tokens; kc += {d}u) {{\n", .{kc});
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    try appendFmt(allocator, out, "        if (tid < {d}u) {{ uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }}\n", .{kc});
+    if (skip) try out.appendSlice(allocator, "        if (tid == 0u) schanged[0] = 0u;\n");
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    try appendFmt(allocator, out, "        const bool fast = (p.contiguous_blocks != 0u) && (kc + {d}u <= p.kv_tokens);\n", .{kc});
+    try appendFmt(allocator, out, "        if (!fast) {{ for (uint i = uint(tid); i < {d}u * hd; i += 128u) {{ uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? k_half[phys * k_row_halfs + kv_head_base + d] : half(0.0f); }} }}\n", .{kc});
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+
+    // Q·Kᵀ: KC=32 is the literal (1 tile / simdgroup); KC>32 tiles KC/32 per SG.
+    if (kc == 32) {
+        try out.appendSlice(allocator, "        simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n");
+        try out.appendSlice(allocator, "        if (fast) { const device half *kbase = k_half + (p.contiguous_base_token + kc + uint(sgitg) * 8u) * k_row_halfs + kv_head_base; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n");
+        try out.appendSlice(allocator, "        else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, skv + uint(sgitg) * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n");
+        try out.appendSlice(allocator, "        simdgroup_store(ms, ss + uint(sgitg) * 8u, 32u, 0, false);\n");
+    } else {
+        try appendFmt(allocator, out, "        for (uint kt = 0u; kt < {d}u; ++kt) {{\n", .{tiles_per_sg});
+        try out.appendSlice(allocator, "            uint ktile = uint(sgitg) + kt * 4u;\n");
+        try out.appendSlice(allocator, "            simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);\n");
+        try out.appendSlice(allocator, "            if (fast) { const device half *kbase = k_half + (p.contiguous_base_token + kc + ktile * 8u) * k_row_halfs + kv_head_base; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n");
+        try out.appendSlice(allocator, "            else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, skv + ktile * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }\n");
+        try appendFmt(allocator, out, "            simdgroup_store(ms, ss + ktile * 8u, {d}u, 0, false);\n", .{kc});
+        try out.appendSlice(allocator, "        }\n");
+    }
+
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+
+    // Score + online-softmax update. KC=32: 1 key per lane (byte-identical
+    // literal). KC>32: KC/32 keys per lane, pre-combined before the simd reduce.
+    if (kc == 32) {
+        try out.appendSlice(allocator, "        for (uint jj = 0u; jj < 2u; ++jj) {\n");
+        try out.appendSlice(allocator, "            uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk;\n");
+        try out.appendSlice(allocator, "            bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu;\n");
+        try out.appendSlice(allocator, "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n");
+        try out.appendSlice(allocator, "            float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n");
+        try out.appendSlice(allocator, "            float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max);\n");
+        try out.appendSlice(allocator, "            float e = 0.0f; float corr = 1.0f;\n");
+        try out.appendSlice(allocator, "            if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; }\n");
+        try out.appendSlice(allocator, "            sp[j * 32u + kk] = half(e);\n");
+        try out.appendSlice(allocator, "            float row_sum = simd_sum(e);\n");
+        if (skip) {
+            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) schanged[0] = 1u; }\n");
+        } else {
+            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }\n");
+        }
+        try out.appendSlice(allocator, "        }\n");
+    } else {
+        try out.appendSlice(allocator, "        for (uint jj = 0u; jj < 2u; ++jj) {\n");
+        try out.appendSlice(allocator, "            uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi;\n");
+        try appendFmt(allocator, out, "            float m_old = sM[j]; float row_max = -3.402823466e+38f; float scs[{d}];\n", .{keys_per_lane});
+        try appendFmt(allocator, out, "            for (uint kl = 0u; kl < {d}u; ++kl) {{\n", .{keys_per_lane});
+        try out.appendSlice(allocator, "                uint kk = uint(lane) + kl * 32u; uint ki = kc + kk;\n");
+        try out.appendSlice(allocator, "                bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu;\n");
+        try out.appendSlice(allocator, "                if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n");
+        try appendFmt(allocator, out, "                float sc = allowed ? ss[j * {d}u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n", .{kc});
+        try out.appendSlice(allocator, "                scs[kl] = sc; row_max = max(row_max, sc);\n");
+        try out.appendSlice(allocator, "            }\n");
+        try out.appendSlice(allocator, "            row_max = simd_max(row_max); float m_new = max(m_old, row_max); float corr = 1.0f;\n");
+        try out.appendSlice(allocator, "            if (m_new > -3.0e+38f) corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f;\n");
+        try out.appendSlice(allocator, "            float row_sum_local = 0.0f;\n");
+        try appendFmt(allocator, out, "            for (uint kl = 0u; kl < {d}u; ++kl) {{\n", .{keys_per_lane});
+        try out.appendSlice(allocator, "                uint kk = uint(lane) + kl * 32u; float sc = scs[kl]; float e = (m_new > -3.0e+38f && sc > -3.0e+38f) ? exp(sc - m_new) : 0.0f;\n");
+        try appendFmt(allocator, out, "                sp[j * {d}u + kk] = half(e); row_sum_local += e;\n", .{kc});
+        try out.appendSlice(allocator, "            }\n");
+        try out.appendSlice(allocator, "            float row_sum = simd_sum(row_sum_local);\n");
+        if (skip) {
+            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) schanged[0] = 1u; }\n");
+        } else {
+            try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }\n");
+        }
+        try out.appendSlice(allocator, "        }\n");
+    }
+
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+
+    // O-accumulator diagonal rescale. `skip_rescale` guards it behind the
+    // per-chunk "any row's running max moved" flag (an identity multiply when it
+    // did not). The load + multiply are simdgroup-uniform, and `schanged[0]` is
+    // threadgroup-uniform after the barrier above, so the branch is coherent.
+    if (skip) {
+        try out.appendSlice(allocator, "        if (schanged[0] != 0u) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; } }\n");
+    } else {
+        try out.appendSlice(allocator, "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);\n");
+        try out.appendSlice(allocator, "        for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n");
+    }
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+
+    // V staging (gather path only) + P·V accumulation (KC/8 inner tiles).
+    try appendFmt(allocator, out, "        if (!fast) {{ for (uint i = uint(tid); i < {d}u * hd; i += 128u) {{ uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? v_half[phys * p.v_row_stride + kv_head_base + d] : half(0.0f); }} }}\n", .{kc});
+    try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    try appendFmt(allocator, out, "        if (fast) {{ for (uint dt = 0u; dt < d_tiles; ++dt) {{ uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < {d}u; ++kk8) {{ simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, {d}u); simdgroup_load(mv, v_half + (p.contiguous_base_token + kc + kk8 * 8u) * p.v_row_stride + kv_head_base + d8, p.v_row_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); }} mo[dt] = acc; }} }}\n", .{ pv_tiles, kc });
+    try appendFmt(allocator, out, "        else {{ for (uint dt = 0u; dt < d_tiles; ++dt) {{ uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < {d}u; ++kk8) {{ simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, {d}u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); }} mo[dt] = acc; }} }}\n", .{ pv_tiles, kc });
+    try out.appendSlice(allocator, "    }\n");
+
+    // ---- epilogue: final inverse-sum normalise + strided store (byte-identical
+    // to the hand-written kernel; no KC dependence). ----
+    try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    try out.appendSlice(allocator, "    if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; }\n");
+    try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    try out.appendSlice(allocator, "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u);\n");
+    try out.appendSlice(allocator, "    threadgroup float *so = (threadgroup float *)skv;\n");
+    try out.appendSlice(allocator, "    for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); simdgroup_store(scaled, so + uint(sgitg) * (8u * (hd / 4u)) + dt * 8u, hd / 4u, 0, false); }\n");
+    try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    try out.appendSlice(allocator, "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n");
+    try out.appendSlice(allocator, "}\n");
+}
+
 /// One generated Metal kernel to emit into the shared runtime region: its
 /// stable kernel name plus the descriptor/schedule/epilogue it renders from.
 ///
 /// `op_kind` selects which body renderer runs. The matmul fields
 /// (`decoder`/`epilogue`) are only read for `.small_batch_matmul`; the
-/// `microkernel` field only for `.microkernel`. Both carry inert defaults so a
-/// caller only fills the ones its op-kind needs — existing matmul construction
-/// sites (which set `decoder`/`schedule`/`epilogue`) stay byte-identical.
+/// `microkernel` field only for `.microkernel`; the `attention` field only for
+/// `.attention`. All carry inert defaults so a caller only fills the ones its
+/// op-kind needs — existing matmul construction sites (which set
+/// `decoder`/`schedule`/`epilogue`) stay byte-identical.
 pub const RegionKernel = struct {
     kernel_id: []const u8,
     op_kind: OpKind = .small_batch_matmul,
@@ -401,6 +789,7 @@ pub const RegionKernel = struct {
     schedule: KernelSchedule,
     epilogue: Epilogue = .none,
     microkernel: MicrokernelKind = .rms_norm,
+    attention: AttentionKind = .decode_1x,
 };
 
 /// Renders the shared runtime region (all routes in one Metal compilation unit):
@@ -430,7 +819,13 @@ pub fn renderRuntimeRegion(
                 try emitHelper(allocator, &out, &emitted_names, .{ .name = k.decoder.lane_decode_fn, .msl = k.decoder.lane_decode_msl });
             },
             .microkernel => try validateMicrokernelSchedule(k.microkernel, k.schedule),
-            .attention => return error.UnsupportedRegionOpKind,
+            // Attention kernels are self-contained: their params struct + paging
+            // helper join the shared dedup set (emitted once each), so the
+            // runtime region and the standalone `.metal` carry identical bytes.
+            .attention => {
+                try validateAttentionSchedule(k.attention, k.schedule);
+                for (attentionHelpers(k.attention)) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
+            },
         }
     }
 
@@ -443,7 +838,7 @@ pub fn renderRuntimeRegion(
                 try renderBody(allocator, &out, k.kernel_id, k.decoder, k.schedule, k.epilogue, block_values, block_bytes);
             },
             .microkernel => try renderMicrokernelBody(allocator, &out, k.kernel_id, k.microkernel, k.schedule),
-            .attention => return error.UnsupportedRegionOpKind,
+            .attention => try renderAttentionBody(allocator, &out, k.kernel_id, k.attention, k.schedule),
         }
     }
     return out.toOwnedSlice(allocator);
@@ -727,4 +1122,152 @@ test "metal renderer renders the RMSNorm microkernel with a balanced parallel re
 test "metal renderer rejects invalid microkernel schedules" {
     try std.testing.expectError(error.MicrokernelThreadsNotPowerOfTwo, validateMicrokernelSchedule(.rms_norm, .{ .threads_per_threadgroup = 96, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }));
     try std.testing.expectError(error.MicrokernelColsMustBeOne, validateMicrokernelSchedule(.rms_norm, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 2, .reduction = .threadgroup_tree }));
+}
+
+test "metal renderer renders the decode-1x paged attention kernel self-contained" {
+    const allocator = std.testing.allocator;
+    const schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+    const source = try renderPagedAttention1xKernel(allocator, "antfly_paged_attention_1x_generated_msl_v1", schedule);
+    defer allocator.free(source);
+
+    // Entrypoint + the shared attention buffer layout (q/key/v/block_table/sinks/output/params).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kernel void antfly_paged_attention_1x_generated_msl_v1("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "device const uint *block_table [[buffer(3)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "constant antfly_paged_attention_1x_params &p [[buffer(6)]]"));
+    // Self-contained: emits its own params struct + paging helper (no external
+    // dependency on the hand-written termite_* copies), each exactly once.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "struct antfly_paged_attention_1x_params {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "inline uint antfly_paged_attention_1x_page_token("));
+    // Never references the hand-written names (would collide in the shared library
+    // and would use-before-declaration in the runtime region).
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_metal_paged_attention_params"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_attention_page_token"));
+    // f16 paged KV + causal/sliding mask + softmax structure markers.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (qi >= p.q_len || h >= p.num_heads || p.format != 3u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simd_sum(acc) * scale"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = exp(scores[ki] - best)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride])"));
+    // NT/NSG parametrized to the schedule (256 threads -> 8 simdgroups).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 256u; const uint NW = 32u; const uint NSG = 8u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + 256u"));
+    // No matmul artefacts leak into the attention kernel.
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "weight_q4_0"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "out_dim"));
+    // Balanced braces.
+    var depth: i32 = 0;
+    for (source) |c| {
+        if (c == '{') depth += 1 else if (c == '}') depth -= 1;
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "metal renderer parametrizes the decode-1x attention NSG from the thread count" {
+    const allocator = std.testing.allocator;
+    const schedule = KernelSchedule{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+    const source = try renderPagedAttention1xKernel(allocator, "antfly_attn_test", schedule);
+    defer allocator.free(source);
+    // 128 threads -> 4 simdgroups, partials array sized to NT.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 128u; const uint NW = 32u; const uint NSG = 4u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + 128u"));
+}
+
+test "metal renderer rejects invalid attention schedules" {
+    // Not a multiple of the 32-lane simdgroup width.
+    try std.testing.expectError(error.AttentionThreadsNotSimdgroupMultiple, validateAttentionSchedule(.decode_1x, .{ .threads_per_threadgroup = 48, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }));
+    // Multiple of 32 but not a power of two (the softmax tree halves each step).
+    try std.testing.expectError(error.AttentionThreadsNotPowerOfTwo, validateAttentionSchedule(.decode_1x, .{ .threads_per_threadgroup = 96, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }));
+    // One threadgroup owns exactly one (query, head).
+    try std.testing.expectError(error.AttentionColsMustBeOne, validateAttentionSchedule(.decode_1x, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 2, .reduction = .threadgroup_tree }));
+}
+
+const flash_baseline_schedule = KernelSchedule{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32, .skip_rescale = false };
+
+test "metal renderer renders the flash-prefill baseline self-contained with the hand-written shmem layout" {
+    const allocator = std.testing.allocator;
+    const source = try renderPrefillFlashKernel(allocator, "antfly_paged_attention_prefill_flash_generated_msl_v1", flash_baseline_schedule);
+    defer allocator.free(source);
+
+    // Entrypoint + shared self-contained params/paging helper (reused from decode_1x).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kernel void antfly_paged_attention_prefill_flash_generated_msl_v1("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "constant antfly_paged_attention_1x_params &p [[buffer(6)]]"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "struct antfly_paged_attention_1x_params {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "inline uint antfly_paged_attention_1x_page_token("));
+    // Never references the hand-written names.
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_metal_paged_attention_params"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_attention_page_token"));
+    // At KC=32 the symbolic layout offsets evaluate to the hand-written literals.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup char *fb = shmem + (8u + 32u) * hd * 2u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sp = (threadgroup half *)(fb + 1024u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sphys = (threadgroup uint *)(fb + 1536u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sM = (threadgroup float *)(fb + 1664u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sS = (threadgroup float *)(fb + 1696u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sdiag = (threadgroup float *)(fb + 1760u);"));
+    // Flash structure: 32-key chunk, simdgroup MMA for Q·Kᵀ and P·V, online softmax.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_multiply_accumulate(ms, mq, mk, ms)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kk8 = 0u; kk8 < 4u; ++kk8)"));
+    // Baseline: rescale is unconditional (no skip flag).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "schanged"));
+    // Balanced braces.
+    var depth: i32 = 0;
+    for (source) |c| {
+        if (c == '{') depth += 1 else if (c == '}') depth -= 1;
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "metal renderer skip_rescale guards the flash O-accumulator rescale behind a per-chunk flag" {
+    const allocator = std.testing.allocator;
+    var schedule = flash_baseline_schedule;
+    schedule.skip_rescale = true;
+    const source = try renderPrefillFlashKernel(allocator, "antfly_flash_skip", schedule);
+    defer allocator.free(source);
+    // The reserved layout word becomes the "did any row's max move" flag.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup uint *schanged = (threadgroup uint *)(fb + 1728u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (tid == 0u) schanged[0] = 0u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (m_new > m_old) schanged[0] = 1u;"));
+    // Rescale is now guarded (identity multiply skipped when unset).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (schanged[0] != 0u) { simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);"));
+    // Layout total is unchanged (flag reuses the reserved word before sdiag).
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sdiag = (threadgroup float *)(fb + 1760u);"));
+    var depth: i32 = 0;
+    for (source) |c| {
+        if (c == '{') depth += 1 else if (c == '}') depth -= 1;
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "metal renderer restructures the flash Q·Kᵀ and score passes for key_chunk=64" {
+    const allocator = std.testing.allocator;
+    var schedule = flash_baseline_schedule;
+    schedule.key_chunk = 64;
+    const source = try renderPrefillFlashKernel(allocator, "antfly_flash_kc64", schedule);
+    defer allocator.free(source);
+    // Layout offsets double.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup char *fb = shmem + (8u + 64u) * hd * 2u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sp = (threadgroup half *)(fb + 2048u);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sdiag = (threadgroup float *)(fb + 3424u);"));
+    // 64-token chunk; 4 simdgroups tile 2 MMA k-tiles each; 2 keys per lane; P·V 8 inner tiles.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kc = 0u; kc < p.kv_tokens; kc += 64u) {"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kt = 0u; kt < 2u; ++kt) {"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "uint ktile = uint(sgitg) + kt * 4u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float scs[2];"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kk8 = 0u; kk8 < 8u; ++kk8)"));
+    var depth: i32 = 0;
+    for (source) |c| {
+        if (c == '{') depth += 1 else if (c == '}') depth -= 1;
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "metal renderer rejects invalid flash-prefill schedules" {
+    // Flash is structurally 128 threads / 4 simdgroups.
+    try std.testing.expectError(error.AttentionFlashThreadsMustBe128, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32 }));
+    // key_chunk must be a positive multiple of the 32-lane simdgroup width.
+    try std.testing.expectError(error.AttentionFlashKeyChunkNotSimdgroupMultiple, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 48 }));
+    // key_chunk must fit the single-pass sphys write (<= 128 threads).
+    try std.testing.expectError(error.AttentionFlashKeyChunkTooWide, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 160 }));
+    // One threadgroup owns one 8-query tile.
+    try std.testing.expectError(error.AttentionColsMustBeOne, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 2, .reduction = .threadgroup_tree, .key_chunk = 32 }));
 }

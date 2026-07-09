@@ -190,6 +190,18 @@ pub const KernelSchedule = struct {
     cols_per_threadgroup: u8,
     reduction: ReductionKind,
 
+    /// Attention-only schedule knobs (`op_kind == .attention`). Defaulted so
+    /// every matmul/microkernel `KernelSchedule` literal (which omits them) stays
+    /// byte-identical and the matmul renderer/validate/fingerprint paths ignore
+    /// them entirely. Read only by the flash-prefill attention body:
+    ///  - `key_chunk`: KV tokens staged + scored per flash chunk (32 or 64). The
+    ///    shmem layout and the Q·K^T/score/P·V tile counts derive from this.
+    ///  - `skip_rescale`: guard the online-softmax O-accumulator rescale behind a
+    ///    "did any row's running max change this chunk" flag (an identity multiply
+    ///    otherwise). ALU-only; layout-neutral.
+    key_chunk: u16 = 32,
+    skip_rescale: bool = false,
+
     /// A block's lanes are processed strided across threads when the block has
     /// more values than the threadgroup has threads.
     pub fn strided(self: KernelSchedule, block_values: usize) bool {
@@ -2050,6 +2062,45 @@ pub const first_rms_norm_metal_check_command = "xcrun --toolchain Metal metal -c
 /// strided lane loop scales to any d.
 pub const first_rms_norm_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
 
+// ---- Attention (paged decode) artifacts ----------------------------------
+// First `op_kind = .attention` route brought under the compiler: the scalar
+// decode-1x paged-attention hot path (`termite_paged_attention_kv_1x`). Uses the
+// descriptor renderer's self-contained attention path (its own params struct +
+// paging helper) so the standalone `.metal` compiles alone AND the runtime
+// region embeds byte-identical bytes. Dev-only candidate (opt-in kill switch
+// TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED) — the hand-written
+// `termite_paged_attention_kv_1x` stays the production baseline until the
+// generated route clears its model-token acceptance gate.
+pub const first_decode_attention_1x_metal_kernel_id = "antfly_paged_attention_1x_generated_msl_v1";
+pub const first_decode_attention_1x_metal_source_path = "src/ops/metal/generated/attention_decode_1x.metal";
+pub const first_decode_attention_1x_metal_air_path = "/tmp/antfly_paged_attention_1x_generated_msl_v1.air";
+pub const first_decode_attention_1x_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/attention_decode_1x.metal -o /tmp/antfly_paged_attention_1x_generated_msl_v1.air";
+/// Launch schedule for the decode-1x paged-attention kernel: one threadgroup per
+/// (query, head), NT threads split into NT/32 simdgroups. NT is pinned to 256 to
+/// match the hand-written dispatch (threadgroup memory + grid), so the generated
+/// route is byte-for-byte the hand-written one; the flash-prefill slice is where
+/// NT/NSG become a `--sweep` knob.
+pub const first_decode_attention_1x_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+
+// Second `op_kind = .attention` route: the simdgroup-MMA flash prefill kernel
+// (`termite_paged_attention_kv_prefill_sg`), brought under the compiler as a
+// `--sweep`-tunable route. The checked-in schedule below is the baseline
+// (`key_chunk=32, skip_rescale=false`), which renders byte-for-byte the
+// hand-written kernel (modulo the self-contained params/helper renames) so the
+// generated route is bit-identical model tokens. The sweep enumerates the
+// `key_chunk ∈ {32,64}` × `skip_rescale ∈ {false,true}` variants in memory; only
+// the baseline is checked in / runtime-embedded / model-gated. Dev-only candidate
+// (opt-in kill switch TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED) until it
+// clears the prefill model-token acceptance gate.
+pub const first_prefill_flash_metal_kernel_id = "antfly_paged_attention_prefill_flash_generated_msl_v1";
+pub const first_prefill_flash_metal_source_path = "src/ops/metal/generated/attention_prefill_flash.metal";
+pub const first_prefill_flash_metal_air_path = "/tmp/antfly_paged_attention_prefill_flash_generated_msl_v1.air";
+pub const first_prefill_flash_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/attention_prefill_flash.metal -o /tmp/antfly_paged_attention_prefill_flash_generated_msl_v1.air";
+/// Baseline flash-prefill schedule: 128 threads / 4 simdgroups (structural),
+/// `key_chunk=32` + `skip_rescale=false` (byte-identical to the hand-written
+/// dispatch: grid ((q_len+7)/8, heads), threadgroup memory 80*hd + 2016 bytes).
+pub const first_prefill_flash_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32, .skip_rescale = false };
+
 pub const first_general_metal_q4_0_kernel_id = "antfly_q4_0_small_batch_msl_v1";
 pub const first_general_metal_q4_0_source_path = "src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal";
 pub const first_general_metal_q4_0_air_path = "/tmp/antfly_q4_0_small_batch_msl_v1.air";
@@ -2672,6 +2723,40 @@ pub const first_generated_microkernel_artifacts = [_]GeneratedArtifact{
         .kernel_id = first_rms_norm_metal_kernel_id,
         .source_path = first_rms_norm_metal_source_path,
         .check_command = first_rms_norm_metal_check_command,
+        .production_enabled = false,
+    },
+};
+
+/// Generated `op_kind = .attention` artifacts. Distinct list for the same reason
+/// as `first_generated_microkernel_artifacts`: the matmul manifest / evidence /
+/// benchmark / production-regression machinery assumes matmul dims + a matmul
+/// baseline, so attention routes (which the correctness gate validates by
+/// bit-identical *model tokens*, not an isolated float compare) must never be
+/// handed to it. The codegen (`.metal` files + runtime region) and the on-device
+/// conformance harness consume this list too. `format`/`row_bucket`/`epilogue`
+/// are inert sentinels (attention has no dequant decoder / epilogue), matching
+/// the microkernel convention.
+pub const first_generated_attention_artifacts = [_]GeneratedArtifact{
+    .{
+        .backend = .metal,
+        .op_kind = .attention,
+        .format = .f32,
+        .row_bucket = .rows_2_8,
+        .epilogue = .none,
+        .kernel_id = first_decode_attention_1x_metal_kernel_id,
+        .source_path = first_decode_attention_1x_metal_source_path,
+        .check_command = first_decode_attention_1x_metal_check_command,
+        .production_enabled = false,
+    },
+    .{
+        .backend = .metal,
+        .op_kind = .attention,
+        .format = .f32,
+        .row_bucket = .rows_2_8,
+        .epilogue = .none,
+        .kernel_id = first_prefill_flash_metal_kernel_id,
+        .source_path = first_prefill_flash_metal_source_path,
+        .check_command = first_prefill_flash_metal_check_command,
         .production_enabled = false,
     },
 };
@@ -3771,10 +3856,24 @@ const metal_rt_external_helper_termite_q8_0_block_scale =
     \\inline float termite_q8_0_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }
 ;
 
-// External helpers the codegen tool must find verbatim in metal_kernels.m
-// outside the marker-delimited region.
+// Layout drift guard for the generated decode-attention kernel. The generated
+// kernel emits its OWN `antfly_paged_attention_1x_params` struct (renderer helper
+// fragment) and the dispatch reinterpret-casts the bytes it binds at buffer(6) —
+// a `termite_metal_paged_attention_params` value — into it. Both structs share
+// `paged_attention_params_field_body`, so this pins the hand-written MSL struct
+// in metal_kernels.m (outside the region) to that same field body: if a field is
+// added/reordered/retyped there without updating the shared body, the codegen
+// `--check` fails, catching a would-be silent reinterpret-cast layout corruption.
+// (This is a text drift guard, not a helper the runtime region references.)
+const metal_rt_external_helper_paged_attention_params =
+    "struct termite_metal_paged_attention_params { " ++ metal_renderer.paged_attention_params_field_body ++ " };";
+
+// Text the codegen tool must find verbatim in metal_kernels.m outside the
+// marker-delimited region: shared helpers duplicated into standalone sources,
+// plus layout drift guards for structs the generated kernels reinterpret.
 pub const metal_runtime_external_helpers = [_][]const u8{
     metal_rt_external_helper_termite_q8_0_block_scale,
+    metal_rt_external_helper_paged_attention_params,
 };
 
 // Renders the runtime-embedded quant kernel region of
@@ -3820,6 +3919,22 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
         .op_kind = .microkernel,
         .microkernel = .rms_norm,
         .schedule = first_rms_norm_metal_schedule,
+    });
+    // Attention routes likewise share the region: the self-contained params
+    // struct + paging helper join the dedup set (emitted once, shared by both
+    // attention kernels), then each body is emitted, so the runtime region carries
+    // byte-identical bytes to the checked-in `.metal`.
+    try kernels.append(arena, .{
+        .kernel_id = first_decode_attention_1x_metal_kernel_id,
+        .op_kind = .attention,
+        .attention = .decode_1x,
+        .schedule = first_decode_attention_1x_metal_schedule,
+    });
+    try kernels.append(arena, .{
+        .kernel_id = first_prefill_flash_metal_kernel_id,
+        .op_kind = .attention,
+        .attention = .prefill_flash,
+        .schedule = first_prefill_flash_metal_schedule,
     });
     const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
 
@@ -3992,6 +4107,82 @@ const first_rms_norm_metal_source = renderMetalMicrokernelSource(
     },
     .rms_norm,
     first_rms_norm_metal_schedule,
+);
+
+const MetalAttentionHeader = struct {
+    source_kind: []const u8,
+    plan_id: []const u8,
+    kernel_id: []const u8,
+    production_baseline: []const u8,
+    production_enabled: bool,
+    promotion_comment: []const u8,
+};
+
+// Renders a checked-in generated Metal attention source: the license header +
+// plan/promotion metadata, then the self-contained attention kernel (its own
+// params struct + paging helper + body) from the same renderer that emits the
+// runtime-embedded region. Mirrors `renderMetalMicrokernelSource` so the
+// attention `.metal` is single-sourced the same way (comptime render -> source
+// constant). Unlike the microkernel path, the rendered kernel here carries
+// helper fragments, so the standalone `.metal` compiles under `xcrun` with no
+// external dependency on metal_kernels.m.
+fn renderMetalAttentionSource(
+    comptime header: MetalAttentionHeader,
+    comptime kind: metal_renderer.AttentionKind,
+    comptime schedule: KernelSchedule,
+) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(50_000_000);
+        var buf: [1 << 16]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const rendered = metal_renderer.renderAttention(fba.allocator(), header.kernel_id, kind, schedule) catch
+            @compileError("renderAttention failed for " ++ header.kernel_id);
+        const kernel: [rendered.len]u8 = rendered[0..rendered.len].*;
+        break :blk metal_generated_source_license_header ++ "\n\n" ++
+            "// " ++ header.source_kind ++ " from graph/quant_kernel_compiler.zig.\n" ++
+            "// plan_id=" ++ header.plan_id ++ "\n" ++
+            "// kernel_id=" ++ header.kernel_id ++ "\n" ++
+            "// production_baseline=" ++ header.production_baseline ++ "\n" ++
+            "// production_enabled=" ++ (if (header.production_enabled) "true" else "false") ++ "\n" ++
+            header.promotion_comment ++ "\n" ++
+            "\n" ++
+            "#include <metal_stdlib>\n" ++
+            "using namespace metal;\n" ++
+            "\n" ++
+            kernel;
+    };
+}
+
+const first_decode_attention_1x_metal_source = renderMetalAttentionSource(
+    .{
+        .source_kind = "Generated Metal attention artifact",
+        .plan_id = "metal/attention/decode_1x",
+        .kernel_id = first_decode_attention_1x_metal_kernel_id,
+        .production_baseline = "termite_paged_attention_kv_1x",
+        .production_enabled = false,
+        .promotion_comment = "// Descriptor-driven paged decode attention (first op_kind=.attention route)." ++ "\n" ++
+            "// Production decode attention stays on the hand-written termite_paged_attention_kv_1x" ++ "\n" ++
+            "// until this candidate clears its bit-identical model-token acceptance gate.",
+    },
+    .decode_1x,
+    first_decode_attention_1x_metal_schedule,
+);
+
+const first_prefill_flash_metal_source = renderMetalAttentionSource(
+    .{
+        .source_kind = "Generated Metal attention artifact",
+        .plan_id = "metal/attention/prefill_flash",
+        .kernel_id = first_prefill_flash_metal_kernel_id,
+        .production_baseline = "termite_paged_attention_kv_prefill_sg",
+        .production_enabled = false,
+        .promotion_comment = "// Descriptor-driven simdgroup-MMA flash prefill attention (--sweep-tunable route)." ++ "\n" ++
+            "// This is the key_chunk=32/skip_rescale=false baseline: byte-for-byte the" ++ "\n" ++
+            "// hand-written termite_paged_attention_kv_prefill_sg (modulo the self-contained" ++ "\n" ++
+            "// params/helper renames). Production prefill stays on the hand-written kernel" ++ "\n" ++
+            "// until this candidate clears its bit-identical model-token acceptance gate.",
+    },
+    .prefill_flash,
+    first_prefill_flash_metal_schedule,
 );
 
 const first_lazy_metal_source = renderMetalSmallBatchSource(
@@ -6334,6 +6525,12 @@ pub fn generatedSourceForArtifact(artifact: GeneratedArtifact) ?[]const u8 {
     }
     if (artifact.backend == .metal and artifact.op_kind == .microkernel and std.mem.eql(u8, artifact.kernel_id, first_rms_norm_metal_kernel_id)) {
         return first_rms_norm_metal_source;
+    }
+    if (artifact.backend == .metal and artifact.op_kind == .attention and std.mem.eql(u8, artifact.kernel_id, first_decode_attention_1x_metal_kernel_id)) {
+        return first_decode_attention_1x_metal_source;
+    }
+    if (artifact.backend == .metal and artifact.op_kind == .attention and std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_metal_kernel_id)) {
+        return first_prefill_flash_metal_source;
     }
     if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, first_lazy_metal_kernel_id)) {
         return first_lazy_metal_source;
@@ -8889,6 +9086,60 @@ test "quant kernel compiler runtime region embeds the RMSNorm microkernel body" 
     try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "kernel void antfly_rms_norm_generated_msl_v1("));
     // Single-sourced from the same renderer as the matmul routes.
     try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "antfly_q4_k_small_batch"));
+}
+
+test "quant kernel compiler attention artifacts are all attention op_kind with a single-sourced Metal body" {
+    try std.testing.expect(first_generated_attention_artifacts.len > 0);
+    for (first_generated_attention_artifacts) |artifact| {
+        try std.testing.expectEqual(OpKind.attention, artifact.op_kind);
+        try std.testing.expectEqual(Backend.metal, artifact.backend);
+        // Dev-only candidate until the model-token gate promotes it.
+        try std.testing.expect(!artifact.production_enabled);
+        const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, artifact.kernel_id));
+        const kernel_decl = try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id});
+        defer std.testing.allocator.free(kernel_decl);
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, kernel_decl));
+        // Self-contained: the standalone `.metal` carries its own params struct +
+        // paging helper (so `xcrun` compiles it with no metal_kernels.m dep).
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "struct antfly_paged_attention_1x_params {"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "inline uint antfly_paged_attention_1x_page_token("));
+    }
+}
+
+test "quant kernel compiler runtime region embeds the decode-1x attention body" {
+    const region = try renderMetalRuntimeQuantRegion(std.testing.allocator);
+    defer std.testing.allocator.free(region);
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "kernel void antfly_paged_attention_1x_generated_msl_v1("));
+    // The self-contained helpers ride into the region too.
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "struct antfly_paged_attention_1x_params {"));
+    // Coexists with the matmul + microkernel routes in one region.
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "antfly_q4_k_small_batch"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "antfly_rms_norm_generated_msl_v1"));
+}
+
+test "quant kernel compiler runtime region embeds the flash prefill attention body" {
+    const region = try renderMetalRuntimeQuantRegion(std.testing.allocator);
+    defer std.testing.allocator.free(region);
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "kernel void antfly_paged_attention_prefill_flash_generated_msl_v1("));
+    // Both attention kernels share the single deduped params struct + paging
+    // helper (emitted exactly once across the whole region).
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, region, "struct antfly_paged_attention_1x_params {"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, region, "inline uint antfly_paged_attention_1x_page_token("));
+    // The flash body's simdgroup-MMA markers are present.
+    try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "simdgroup_multiply_accumulate(ms, mq, mk, ms)"));
+}
+
+test "quant kernel compiler pins the paged-attention params layout drift guard" {
+    // The generated struct and the drift-guard entry share the field body, and
+    // the drift-guard entry names the hand-written struct the dispatch binds.
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_rt_external_helper_paged_attention_params, 1, "struct termite_metal_paged_attention_params { "));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_rt_external_helper_paged_attention_params, 1, metal_renderer.paged_attention_params_field_body));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.helper_paged_attention_1x_params.msl, 1, metal_renderer.paged_attention_params_field_body));
+    // Every field the dispatch fills is present in the shared body.
+    inline for (.{ "uint q_len;", "uint kv_tokens;", "uint num_heads;", "uint num_kv_heads;", "uint head_dim;", "uint key_row_bytes;", "uint v_row_stride;", "uint page_size;", "uint block_count;", "uint contiguous_base_token;", "uint contiguous_blocks;", "uint format;", "uint v_element_bytes;", "uint has_sinks;", "float softcap;" }) |field| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.paged_attention_params_field_body, 1, field));
+    }
 }
 
 test "quant kernel compiler emits single-sourced Metal source for every generated artifact" {
