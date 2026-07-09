@@ -739,13 +739,26 @@ pub const LoadedModel = struct {
             try reader.readTensor(fused_chunker_splade.SPLADE_WEIGHT_KEY);
         defer tensor.deinit();
 
-        const src = tensor.asFloat32();
+        // The tensor bytes are an mmap slice whose start offset is 8 + header_len
+        // + data_offset; a raw training checkpoint (e.g. the s3 frozen-base
+        // SPLADE) can land the data section at a non-4-byte-aligned address
+        // (header_len 118 -> data base 126), so asFloat32()'s @alignCast would
+        // panic. Validate the element count from the byte length and copy the
+        // bytes into an owned, f32-aligned buffer (little-endian on all targets).
         const expected = @as(usize, self.manifest.splade_vocab_size) * @as(usize, self.manifest.hidden_size);
-        if (src.len != expected) {
-            std.log.warn("splade head {s} has {d} f32 elements, expected {d} (vocab {d} x hidden {d})", .{ path, src.len, expected, self.manifest.splade_vocab_size, self.manifest.hidden_size });
+        const elem_count = tensor.data.len / @sizeOf(f32);
+        if (elem_count != expected) {
+            std.log.warn("splade head {s} has {d} f32 elements, expected {d} (vocab {d} x hidden {d})", .{ path, elem_count, expected, self.manifest.splade_vocab_size, self.manifest.hidden_size });
             return error.SpladeWeightShapeMismatch;
         }
-        self.splade_weight = try self.allocator.dupe(f32, src);
+        const dst = try self.allocator.alloc(f32, expected);
+        errdefer self.allocator.free(dst);
+        if (tensor.asFloat32IfAligned()) |src| {
+            @memcpy(dst, src);
+        } else {
+            @memcpy(std.mem.sliceAsBytes(dst), tensor.data[0 .. expected * @sizeOf(f32)]);
+        }
+        self.splade_weight = dst;
     }
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
