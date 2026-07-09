@@ -3,11 +3,24 @@
 ## Scope
 
 The quant kernel compiler is a build-time Antfly inference tool for GGUF quant
-matmul kernels. It is deliberately small: descriptors, tiny IR, backend-specific
+kernels. It is deliberately small: descriptors, tiny IR, backend-specific
 lowering metadata, generated source files, route manifests, and evidence gates.
+Its original scope was small-batch quant matmul; it now carries an **op-kind**
+dimension (see below) so the same single-sourcing + conformance-evidence
+discipline covers non-matmul kernels — fused microkernels (RMSNorm today; rope /
+KV read-write next) and, as they land, a family of narrowly-routed attention
+kernels.
 
 It is not a runtime JIT and not a general GPU compiler. Production runtime must
 not depend on Python, Triton, CUDA toolkit, cuBLAS, XLA, or network access.
+
+**Explicit non-goal — general/large dense GEMM.** Large FP16/BF16/f32 GEMM stays
+on vendor libraries (MPS / Accelerate / cuBLASLt / CUTLASS); those are hard to
+beat and are not worth generating. The hand-written `termite_*_linear_mm_sg`
+tensor-core kernels are ggml-port-grade and stay hand-written. Generation targets
+the cases where the shape/layout matrix *explodes* and hand-written code is
+*multiplying*: quant matmul + epilogue coverage, attention route variants, and
+fused attention-adjacent microkernels — not a replacement for library GEMM.
 
 ## Source Of Truth
 
@@ -28,19 +41,24 @@ The dispatch-facing API is still the existing graph planning contract:
 - `src/backends/metal_kernels.m`: native Metal runtime and provider lowering.
 
 Production Metal compiles the inline kernel copies embedded in
-`metal_kernels.m`. Those copies are codegen-owned: the MSL text lives exactly
-once in `quant_kernel_compiler.zig` as per-kernel body and per-format helper
-constants plus the `metal_runtime_quant_sections` section-order table, and
-`zig build quant-kernel-codegen -- --write` renders that table both into the
-checked-in generated `.metal` files and into the marker-delimited region of
-`metal_kernels.m` (`// quant-kernel-codegen:begin/end generated quant
-kernels`). `--check` verifies both byte-for-byte, so the runtime copy and the
-checked-in generated sources share single-sourced bodies and cannot drift by
-construction (the former `metal_runtime_body_pins` hash table is gone). The
-runtime-validated tuned text is the canonical text: runtime-route correctness
-and promotion timing evidence are measured against the same bytes that `xcrun`
-source checks compile. One shared helper (`termite_q8_0_block_scale`) is owned
-by the handwritten termite kernels outside the region; the codegen check
+`metal_kernels.m`. Those copies are **single-sourced from the renderer**: there
+are no hand-pasted body constants. `renderMetalRuntimeQuantRegion` builds the
+region by rendering each route from `metal_production_schedules` (schedule +
+`FormatDecoder` + epilogue) via `renderRuntimeRegion`, and the checked-in
+`.metal` files render from the *same* renderer at comptime
+(`renderMetalSmallBatchSource`, and `renderMetalMicrokernelSource` for
+microkernels). `zig build quant-kernel-codegen -- --write` writes both the
+`.metal` files and the marker-delimited region of `metal_kernels.m`
+(`// quant-kernel-codegen:begin/end generated quant kernels`); `--check` verifies
+both byte-for-byte. So a schedule edit fully regenerates the kernel text and the
+runtime copy, the checked-in sources, and the source fingerprints cannot drift by
+construction — re-tuning a route is a table edit + `--write`, never a hand-paste.
+(The former frozen `metal_rt_body_*`/`metal_rt_helper_*` constants,
+`metal_runtime_quant_sections` table, and `metal_runtime_body_pins` hash table are
+all gone.) The runtime-validated tuned text is the canonical text: runtime-route
+correctness and promotion timing evidence are measured against the same bytes that
+`xcrun` source checks compile. One shared helper (`termite_q8_0_block_scale`) is
+owned by the handwritten termite kernels outside the region; the codegen check
 verifies the compiler's duplicated copy still matches it.
 
 Generated artifacts are checked in:
@@ -63,6 +81,47 @@ source path for every manifested artifact plus the marker-delimited runtime
 region of `metal_kernels.m`. Stale or missing generated files or a drifted
 runtime region fail the codegen check instead of becoming a packaging surprise
 during review.
+
+## Op-Kind Framework
+
+`OpKind { small_batch_matmul, attention, microkernel }` (`quant_kernel_compiler.zig`)
+is the routing dimension that selects which skeleton, conformance reference, and
+dispatch a generated route uses. The renderer, evidence, and manifest machinery
+are keyed by `kernel_id` and are op-agnostic; `op_kind` lives on the shared
+`GeneratedArtifact`. Matmul-specific descriptors (`QuantKernelSpec`,
+`QuantKernelLowering`) are deliberately *not* threaded with op-kind — attention
+and microkernels do not reuse them.
+
+Key design rule: **keep the matmul path byte-identical.** Non-matmul routes live
+in a separate `first_generated_microkernel_artifacts` list, not mixed into
+`first_generated_artifacts`, so every matmul manifest/evidence/benchmark loop and
+the 22-case production-regression gate are untouched (no `op_kind` guards sprinkled
+through dozens of matmul-assuming loops, no evidence-schema bump). The codegen
+routing seam is `compiledSourceForArtifact` (`native_quant_kernel_codegen.zig`),
+which switches on `artifact.op_kind`.
+
+Rendering: `RegionKernel` is op-kind-aware (defaulted fields keep matmul
+construction byte-identical); `renderRuntimeRegion` dispatches body rendering per
+op-kind while still globally deduping the shared helper vocabulary across all
+op-kinds. `renderMicrokernel` / `renderRmsNormKernel` are self-contained (no
+`FormatDecoder`, no epilogue). The `.metal` file for a microkernel is single-
+sourced the same way as matmul, via a comptime `renderMetalMicrokernelSource`
+constant.
+
+**First non-matmul route (landed): RMSNorm** (`op_kind = .microkernel`, kernel
+`antfly_rms_norm_generated_msl_v1`, `src/ops/metal/generated/microkernel_rms_norm.metal`).
+Pure f32, one threadgroup per row, threadgroup-tree reduction. It is opt-in
+(`TERMITE_METAL_ENABLE_RMS_NORM_GENERATED`); the hand-written
+`termite_apply_rms_norm_rows` stays the production baseline. Conformance runs on
+device via a sister FFI (`termite_metal_run_generated_microkernel_check`) against
+a self-contained CPU reference (validated bit-identical vs the hand-written kernel,
+`max_abs_error ≤ ~3e-6` across `n∈{1,2,3,4} × d∈{64,128,512,2048,4096}`).
+
+**Attention (next).** Attention routes plug in as `op_kind = .attention` with an
+`AttentionSchedule` and a `renderAttention` skeleton, gated the same way. Because
+attention feeds the whole model, its correctness gate is **bit-identical model
+tokens** (`scripts/compare_metal_gemma4_e4b_qat.sh` oracle text + greedy token-id
+prefix), not raw-float conformance — argmax is robust to summation-order drift.
 
 ## Compile Flow
 
@@ -126,10 +185,10 @@ so the fallback path remains covered.
 1. Add or change a `QuantKernelSpec` in
    `src/graph/quant_kernel_compiler.zig`.
 2. Add or update `GeneratedArtifact` route metadata.
-3. For a Metal small-batch family, add the kernel body and helper constants,
-   extend the `metal_runtime_quant_sections` section-order table, and assemble
-   the file constant with `metalSmallBatchFileSource`. For CUDA, add the
-   canonical checked-in source template.
+3. For a Metal small-batch family, add a `FormatDecoder` + a
+   `metal_production_schedules` entry; the renderer generates the body at
+   `--write` time (no hand-written body/helper constants, no section table). For
+   CUDA, add the canonical checked-in source template.
 4. From `zig/pkg/inference`, run:
 
    ```sh
@@ -191,14 +250,13 @@ zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- \
 ```
 
 **Re-tuning an already-promoted route** (change its schedule, keep it promoted):
-edit its `metal_production_schedules` entry, render the new body at that schedule
-(`quant-kernel-metal-check` writes each route's rendered v2 to `/tmp`), paste it
-into the route's `metal_rt_body_*` constant keeping the kernel_id and
-dequant-helper names (identical math, so wiring is untouched), update the
-schedule-marker guardrail tests (e.g. the hybrid reduction's `lane_id >= {N}u`
-where `N = threads/32`), `--write`, then run the production-regression gate. The
-gate's decode-runtime timing is the real arbiter — verify a genuine improvement
-via a before/after A/B (`git stash` the change, re-run the gate), not the sweep.
+edit its `metal_production_schedules` entry, update the schedule-marker guardrail
+tests (e.g. the hybrid reduction's `lane_id >= {N}u` where `N = threads/32`), then
+`quant-kernel-codegen -- --write` — the renderer regenerates the body, the
+`.metal` file, and the runtime region from the new schedule (no hand-paste of a
+body constant), and run the production-regression gate. The gate's decode-runtime
+timing is the real arbiter — verify a genuine improvement via a before/after A/B
+(`git stash` the change, re-run the gate), not the sweep.
 
 **Promoting a candidate to production** additionally requires: flip the
 `GeneratedArtifact.production_enabled` to true and update the source constant's
@@ -522,38 +580,68 @@ zig build quant-kernel-metal-blocker-strict-check -Dmetal=true -Dcuda=false
 
 ## Adding A Format Or Epilogue
 
-The minimal path is:
+The minimal path for a matmul format/epilogue is:
 
 1. Add the descriptor data: block values, block bytes, fields, decode ops,
    schedules, epilogues, dtype policy, and backend support.
-2. Add generated source/artifact metadata for one schedule.
-3. For Metal small-batch kernels, add the body and helper constants to the
-   codegen-owned runtime region data so the generated file and the
-   `metal_kernels.m` copy stay byte-for-byte single-sourced.
+2. Add a `FormatDecoder` (dequant leaf fragment over the shared `antfly_qk_*`
+   vocabulary) and a `metal_production_schedules` entry (threads/cols/reduction)
+   for the route. **There is no body constant to write — the renderer generates
+   the kernel from the schedule + decoder + epilogue.**
+3. Add generated source/artifact metadata for the route.
 4. Add route/conformance expectations.
-5. Regenerate manifests.
+5. `zig build quant-kernel-codegen -- --write` to regenerate the `.metal` file,
+   the `metal_kernels.m` region, and the manifests; `--check` to byte-verify.
 6. Prove CPU/reference correctness and route coverage.
 7. Leave the route opt-in until promotion evidence and production regression
    both pass.
 
+To add a **microkernel op-kind** (worked example — RMSNorm is the reference
+implementation):
+
+1. Add a `renderMicrokernel` skeleton (self-contained MSL; no `FormatDecoder`,
+   no epilogue) and a comptime `renderMetalMicrokernelSource` source constant.
+2. Add a `GeneratedArtifact` with `op_kind = .microkernel` to the separate
+   `first_generated_microkernel_artifacts` list (keeps the matmul machinery
+   byte-identical), and append its `RegionKernel` to the runtime region.
+3. Wire the `.microkernel` arm of `compiledSourceForArtifact`.
+4. Add a conformance case: a CPU reference and (if the buffer layout differs from
+   matmul) a sister on-device FFI runner. Validate bit-identical vs the
+   hand-written baseline.
+5. Add an opt-in kill switch + pipeline/dispatch in `metal_kernels.m`; keep the
+   hand-written kernel as the production baseline until the route is promoted.
+
 Do not add a general compiler abstraction unless it removes real duplicated
-format/schedule work in this file and the backend lowering.
+format/schedule/op work in this file and the backend lowering. In particular, do
+not generate large dense GEMM (see the non-goal in Scope).
 
 ## Extension Points
 
-**CUDA renderer.** The `KernelSchedule` / `FormatDecoder` data model in
-`quant_kernel_metal_renderer.zig` is backend-neutral by design. A CUDA renderer
-would add a `lane_decode_cuda` fragment per `FormatDecoder` and a CUDA skeleton
-that consumes the same `KernelSchedule`, reusing the sweep and promotion
-machinery unchanged (the sweep harness already benchmarks any kernel from source
-text). Only the Metal renderer exists today; the CUDA generated kernels remain
-the checked-in hand-written `.cu` templates.
+**Full single-sourcing (DONE).** The renderer is the single source of truth for
+both the `metal_kernels.m` runtime region and the checked-in `.metal` files; the
+frozen `metal_rt_body_*` constants and the `metal_runtime_quant_sections` table
+are gone. A schedule edit + `--write` fully regenerates the kernel — no hand-paste.
+See Source Of Truth above.
 
-**Further single-sourcing.** The renderer currently produces v2 kernels that are
-checked in as the `metal_rt_body_*` constants (re-tuned routes paste the
-renderer's output into the constant). A future step is to have the codegen tool
-render the `metal_runtime_quant_sections` bodies directly from
-`metal_production_schedules` at `--write` time, so the frozen body constants go
-away entirely and a schedule edit fully regenerates the kernel. That is a larger
-refactor of the comptime source path and is deliberately deferred; the current
-in-place body-swap workflow is documented above.
+**Attention family.** The op-kind framework is in place (RMSNorm is the first
+non-matmul route). The main remaining value is a *family* of narrowly-routed
+attention kernels — decode hot paths (fixed Gemma/Qwen head layouts, paged,
+GQA/MQA, causal/windowed), paged/quantized-KV read, and the prefill flash kernel
+as a `--sweep`-tunable route (key-chunk 32/64, SG count, gather-vs-direct,
+rescale-skip) — plus more fused microkernels (head-rope, KV write/read). Each is a
+`renderAttention`/`renderMicrokernel` skeleton + conformance case + dispatch +
+evidence, gated on bit-identical model tokens.
+
+**Autotune automation.** `--sweep` is a directional filter followed by a manual
+decode-runtime A/B before promotion. A closer-to-automated
+sweep → conformance → decode-runtime-gate → promote loop (with the existing
+machine-load-aware timing discipline) would make exploiting the new op-kinds
+cheap.
+
+**CUDA renderer.** The `KernelSchedule` / `FormatDecoder` data model is
+backend-neutral by design. A CUDA renderer would add a `lane_decode_cuda` fragment
+per `FormatDecoder` and a CUDA skeleton consuming the same `KernelSchedule`,
+reusing the sweep and promotion machinery unchanged. Only the Metal renderer
+exists today; the CUDA generated kernels remain the checked-in hand-written `.cu`
+templates. Bringing single-sourcing + the op-kind framework to CUDA is the
+remaining *multi-backend* industry-grade gap.
