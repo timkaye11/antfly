@@ -49,6 +49,18 @@ pub const Backend = enum(u8) {
     metal,
 };
 
+/// The kind of kernel a generated artifact represents. The renderer, evidence,
+/// and manifest machinery are keyed by `kernel_id` and are op-agnostic; `op_kind`
+/// is the routing dimension that selects which skeleton/spec a route uses. Today
+/// every generated route is `small_batch_matmul`; `attention` and `microkernel`
+/// are the extension points (a family of narrowly-routed attention kernels and
+/// fused attention-adjacent microkernels — RMSNorm/rope/KV read-write).
+pub const OpKind = enum(u8) {
+    small_batch_matmul,
+    attention,
+    microkernel,
+};
+
 pub const Epilogue = enum(u8) {
     none,
     bias,
@@ -684,6 +696,9 @@ pub const GeneratedArtifact = struct {
     promotion_evidence_command: []const u8 = "",
     promotion_check_command: []const u8 = "",
     production_enabled: bool,
+    /// Routing dimension for the codegen renderer. Defaults to the only op-kind
+    /// generated today; `attention`/`microkernel` routes are wired in later.
+    op_kind: OpKind = .small_batch_matmul,
 };
 
 pub const QuantKernelCompileRequest = struct {
@@ -8736,6 +8751,15 @@ test "quant kernel compiler compiles promoted Metal source from descriptor route
     );
     defer std.testing.allocator.free(wrong_kernel_header);
     try std.testing.expect(!try sourceHeaderMatchesCompiledPlan(std.testing.allocator, compiled, wrong_kernel_header));
+}
+
+test "quant kernel compiler generated artifacts are all small_batch_matmul op_kind" {
+    // The op-kind routing dimension exists; every artifact generated today is a
+    // small-batch matmul. When an attention/microkernel route is added, wire its
+    // codegen arm in compiledSourceForArtifact and update this invariant.
+    for (first_generated_artifacts) |artifact| {
+        try std.testing.expectEqual(OpKind.small_batch_matmul, artifact.op_kind);
+    }
 }
 
 test "quant kernel compiler emits single-sourced Metal source for every generated artifact" {

@@ -260,6 +260,13 @@ fn compiledSourceForArtifact(
     allocator: std.mem.Allocator,
     artifact: quant_kernel_compiler.GeneratedArtifact,
 ) !CompiledSourceData {
+    // Routing seam for the op-kind framework. Only the small-batch matmul path
+    // is generated today; attention/microkernel op-kinds render through their
+    // own path (wired in a later phase).
+    switch (artifact.op_kind) {
+        .small_batch_matmul => {},
+        .attention, .microkernel => return error.UnsupportedGeneratedOpKind,
+    }
     const compiled = quant_kernel_compiler.compileQuantKernelSource(.{
         .backend = artifact.backend,
         .format = artifact.format,
