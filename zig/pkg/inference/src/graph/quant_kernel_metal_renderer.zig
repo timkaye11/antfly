@@ -276,8 +276,7 @@ pub fn renderKernel(
     errdefer out.deinit(allocator);
 
     // Helper vocabulary (deduped by name across decoder + gelu).
-    var emitted_names = std.ArrayListUnmanaged([]const u8).empty;
-    defer emitted_names.deinit(allocator);
+    var emitted_names = EmittedNames{};
     for (decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
     if (epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
     try out.appendSlice(allocator, decoder.lane_decode_msl);
@@ -310,8 +309,7 @@ pub fn renderRuntimeRegion(
 
     // Pass 1: emit the deduped helper vocabulary + dequant fragments once each,
     // in the order they are first referenced across the routes.
-    var emitted_names = std.ArrayListUnmanaged([]const u8).empty;
-    defer emitted_names.deinit(allocator);
+    var emitted_names = EmittedNames{};
     for (kernels) |k| {
         try k.schedule.validate(k.decoder.format.valuesPerBlock() orelse return error.MissingBlockValues);
         try validateEpilogueSchedule(k.schedule, k.epilogue);
@@ -329,16 +327,38 @@ pub fn renderRuntimeRegion(
     return out.toOwnedSlice(allocator);
 }
 
+/// Tracks the helper names already emitted so the shared vocabulary is written
+/// exactly once. Backed by a fixed buffer (no allocation) so `renderKernel` and
+/// `renderRuntimeRegion` stay usable at comptime — the checked-in `.metal`
+/// sources render this way (a heap `ArrayList([]const u8)` would need pointer
+/// alignment via `@intFromPtr`, which comptime cannot evaluate). The region has
+/// ~18 distinct helper names across all routes; 64 leaves ample headroom.
+const EmittedNames = struct {
+    names: [64][]const u8 = undefined,
+    len: usize = 0,
+
+    fn contains(self: *const EmittedNames, name: []const u8) bool {
+        for (self.names[0..self.len]) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
+        return false;
+    }
+
+    fn add(self: *EmittedNames, name: []const u8) void {
+        std.debug.assert(self.len < self.names.len);
+        self.names[self.len] = name;
+        self.len += 1;
+    }
+};
+
 fn emitHelper(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
-    emitted: *std.ArrayListUnmanaged([]const u8),
+    emitted: *EmittedNames,
     helper: HelperFragment,
 ) !void {
-    for (emitted.items) |name| {
-        if (std.mem.eql(u8, name, helper.name)) return;
-    }
-    try emitted.append(allocator, helper.name);
+    if (emitted.contains(helper.name)) return;
+    emitted.add(helper.name);
     try out.appendSlice(allocator, helper.msl);
     try out.append(allocator, '\n');
 }

@@ -24,11 +24,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float antfly_q5_0_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-inline uint antfly_q5_0_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
-inline float antfly_q5_0_dequant_lane(device const uchar *block, int lane) { float d = antfly_q5_0_half_le_to_float(block); uint qh = antfly_q5_0_u32_le(block + 2); int packed_index = lane & 15; uchar packed = block[6 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float((low4 | (high << 4)) - 16); }
+inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
+inline uint antfly_qk_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
+inline float antfly_q5_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); uint qh = antfly_qk_u32_le(block + 2); int packed_index = lane & 15; uchar packed = block[6 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float((low4 | (high << 4)) - 16); }
 kernel void antfly_q5_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_0 + ((col * block_count + block_idx) * 22); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q5_0_dequant_lane(block, lane); } }
+    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_0 + ((col * block_count + block_idx) * 22); int base = block_idx << 5; for (int lane = int(tid); lane < 32; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q5_0_dequant_lane_v2(block, lane); }
     acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
 }

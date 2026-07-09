@@ -3688,8 +3688,9 @@ const first_general_cuda_q4_0_down_q8_source =
 // generated sources under src/ops/metal/generated/ and the runtime-embedded
 // copy in src/backends/metal_kernels.m (the marker-delimited region that
 // `zig build quant-kernel-codegen -- --write` rewrites). Production Metal
-// compiles the metal_kernels.m region, which is assembled verbatim from the
-// section table below, so the two copies cannot drift by construction.
+// compiles the metal_kernels.m region, which the codegen tool renders from
+// the same descriptor-driven renderer as these sources, so the two copies
+// cannot drift by construction.
 // ---------------------------------------------------------------------------
 
 const metal_generated_source_license_header =
@@ -3708,129 +3709,6 @@ const metal_generated_source_license_header =
     \\// limitations under the License.
 ;
 
-const metal_rt_helper_antfly_q4_0_half_le_to_float =
-    \\inline float antfly_q4_0_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q4_0_dequant_lane =
-    \\inline float antfly_q4_0_dequant_lane(device const uchar *block, int lane) { float d = antfly_q4_0_half_le_to_float(block); int packed_index = lane & 15; uchar packed = block[2 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) - 8 : int(packed >> 4) - 8; return d * float(q); }
-;
-
-const metal_rt_helper_antfly_q4_1_half_le_to_float =
-    \\inline float antfly_q4_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q4_1_dequant_lane =
-    \\inline float antfly_q4_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q4_1_half_le_to_float(block); float m = antfly_q4_1_half_le_to_float(block + 2); int packed_index = lane & 15; uchar packed = block[4 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); return d * float(q) + m; }
-;
-
-const metal_rt_helper_antfly_q5_0_half_le_to_float =
-    \\inline float antfly_q5_0_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q5_0_u32_le =
-    \\inline uint antfly_q5_0_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
-;
-
-const metal_rt_helper_antfly_q5_0_dequant_lane =
-    \\inline float antfly_q5_0_dequant_lane(device const uchar *block, int lane) { float d = antfly_q5_0_half_le_to_float(block); uint qh = antfly_q5_0_u32_le(block + 2); int packed_index = lane & 15; uchar packed = block[6 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float((low4 | (high << 4)) - 16); }
-;
-
-const metal_rt_helper_antfly_q5_1_half_le_to_float =
-    \\inline float antfly_q5_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q5_1_u32_le =
-    \\inline uint antfly_q5_1_u32_le(device const uchar *p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
-;
-
-const metal_rt_helper_antfly_q5_1_dequant_lane =
-    \\inline float antfly_q5_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q5_1_half_le_to_float(block); float m = antfly_q5_1_half_le_to_float(block + 2); uint qh = antfly_q5_1_u32_le(block + 4); int packed_index = lane & 15; uchar packed = block[8 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float(low4 | (high << 4)) + m; }
-;
-
-const metal_rt_helper_antfly_q8_1_half_le_to_float =
-    \\inline float antfly_q8_1_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q8_1_dequant_lane =
-    \\inline float antfly_q8_1_dequant_lane(device const uchar *block, int lane) { float d = antfly_q8_1_half_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }
-;
-
-const metal_rt_helper_antfly_q8_k_f32_le_to_float =
-    \\inline float antfly_q8_k_f32_le_to_float(device const uchar *p) { uint bits = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); return as_type<float>(bits); }
-;
-
-const metal_rt_helper_antfly_q8_k_dequant_lane =
-    \\inline float antfly_q8_k_dequant_lane(device const uchar *block, int lane) { float d = antfly_q8_k_f32_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }
-;
-
-const metal_rt_helper_antfly_q2_k_half_le_to_float =
-    \\inline float antfly_q2_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q2_k_dequant_lane =
-    \\inline float antfly_q2_k_dequant_lane(device const uchar *block, int lane) {
-    \\    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uchar scale_byte = block[sub]; float dsc = antfly_q2_k_half_le_to_float(block + 16) * float(scale_byte & 0x0fu); float dmn = antfly_q2_k_half_le_to_float(block + 18) * float(scale_byte >> 4);
-    \\    uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;
-    \\    return dsc * float(q) - dmn;
-    \\}
-;
-
-const metal_rt_helper_antfly_q2_k_gelu =
-    \\inline float antfly_q2_k_gelu(float x) { return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
-;
-
-const metal_rt_helper_antfly_q3_k_half_le_to_float =
-    \\inline float antfly_q3_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q3_k_raw_scale =
-    \\inline int antfly_q3_k_raw_scale(device const uchar *scale_data, uint sub) {
-    \\    uint i = sub & 3u; uint low = 0u; uint high = 0u;
-    \\    if (sub < 4u) { low = uint(scale_data[i] & 0x0fu); high = uint(scale_data[8u + i] & 0x03u); }
-    \\    else if (sub < 8u) { low = uint(scale_data[4u + i] & 0x0fu); high = uint((scale_data[8u + i] >> 2) & 0x03u); }
-    \\    else if (sub < 12u) { low = uint((scale_data[i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 4) & 0x03u); }
-    \\    else { low = uint((scale_data[4u + i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 6) & 0x03u); }
-    \\    return int(low | (high << 4)) - 32;
-    \\}
-;
-
-const metal_rt_helper_antfly_q3_k_dequant_lane =
-    \\inline float antfly_q3_k_dequant_lane(device const uchar *block, int lane) {
-    \\    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l = ((sub & 1u) << 4) + i; uint q_base = chunk << 5; uint shift = group << 1; uint hm_bit = (chunk << 2) + group;
-    \\    int low2 = int((uint(block[32u + q_base + l]) >> shift) & 0x03u); int high1 = int((uint(block[l]) >> hm_bit) & 0x01u); int q = low2 + high1 * 4 - 4;
-    \\    return antfly_q3_k_half_le_to_float(block + 108) * float(antfly_q3_k_raw_scale(block + 96, sub)) * float(q);
-    \\}
-;
-
-const metal_rt_helper_antfly_q3_k_gelu =
-    \\inline float antfly_q3_k_gelu(float x) { return 0.5f * x * (1.0f + fast::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
-;
-
-const metal_rt_helper_antfly_q4_k_half_le_to_float =
-    \\inline float antfly_q4_k_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q4_k_unpack_scale_min =
-    \\inline void antfly_q4_k_unpack_scale_min(device const uchar *scales, int sub, thread float &scale, thread float &min_v) {
-    \\    if (sub < 4) { scale = float(scales[sub] & 63u); min_v = float(scales[sub + 4] & 63u); return; }
-    \\    scale = float((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4)); min_v = float((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-;
-
-const metal_rt_helper_antfly_q4_k_dequant_lane =
-    \\inline float antfly_q4_k_dequant_lane(device const uchar *block, int lane) {
-    \\    device const uchar *scales = block + 4; device const uchar *qs = block + 16; int sub = lane >> 5; int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    uchar packed = qs[q_index]; int q = (sub & 1) == 0 ? int(packed & 0x0fu) : int(packed >> 4);
-    \\    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q4_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return antfly_q4_k_half_le_to_float(block) * raw_scale * float(q) - antfly_q4_k_half_le_to_float(block + 2) * raw_min;
-    \\}
-;
-
-const metal_rt_helper_antfly_q4_k_bias_gelu =
-    \\inline float antfly_q4_k_bias_gelu(float x) { float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); return 0.5f * x * (1.0f + fast::tanh(inner)); }
-;
-
 // Shared Metal helper defined in src/backends/metal_kernels.m OUTSIDE the
 // codegen-owned quant kernel region (the termite q8_0 kernels own it there).
 // The runtime-embedded antfly_q8_0_dequant_lane calls it, so standalone
@@ -3844,316 +3722,6 @@ const metal_rt_external_helper_termite_q8_0_block_scale =
 // outside the marker-delimited region.
 pub const metal_runtime_external_helpers = [_][]const u8{
     metal_rt_external_helper_termite_q8_0_block_scale,
-};
-
-const metal_rt_helper_antfly_q8_0_dequant_lane =
-    \\inline float antfly_q8_0_dequant_lane(device const uchar *block, int lane) { float d = termite_q8_0_block_scale(block, 0u); int q = int(as_type<char>(block[2 + lane])); return d * float(q); }
-;
-
-const metal_rt_helper_antfly_qk_half_le_to_float =
-    \\inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-;
-
-const metal_rt_helper_antfly_q5_k_unpack_scale_min =
-    \\inline void antfly_q5_k_unpack_scale_min(device const uchar *scales, int sub, thread float &scale, thread float &min_v) {
-    \\    if (sub < 4) { scale = float(scales[sub] & 63u); min_v = float(scales[sub + 4] & 63u); return; }
-    \\    scale = float((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4)); min_v = float((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-;
-
-const metal_rt_helper_antfly_q5_k_dequant_lane =
-    \\inline float antfly_q5_k_dequant_lane(device const uchar *block, int lane) {
-    \\    device const uchar *scales = block + 4; device const uchar *qh = block + 16; device const uchar *ql = block + 48; int sub = lane >> 5; int i = lane & 31; int q_index = (sub >> 1) * 32 + i;
-    \\    uchar packed = ql[q_index]; int low = (sub & 1) == 0 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh[i] >> sub) & 1u); int q = low + high * 16;
-    \\    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_q5_k_unpack_scale_min(scales, sub, raw_scale, raw_min);
-    \\    return antfly_qk_half_le_to_float(block) * raw_scale * float(q) - antfly_qk_half_le_to_float(block + 2) * raw_min;
-    \\}
-;
-
-const metal_rt_helper_antfly_q6_k_dequant_lane =
-    \\inline float antfly_q6_k_dequant_lane(device const uchar *block, int lane) {
-    \\    device const uchar *ql = block; device const uchar *qh = block + 128; device const uchar *scales = block + 192; int sub = lane >> 4; int i = lane & 15; int half_idx = sub >> 3; int group = (sub & 7) >> 1; int l = ((sub & 1) << 4) + i;
-    \\    int ql_off = half_idx * 64 + (group & 1) * 32; int qh_off = half_idx * 32; int qh_shift = group * 2; int nibble_shift = (group >> 1) * 4; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u);
-    \\    int scale_u = int(scales[sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; return antfly_qk_half_le_to_float(block + 208) * float(scale) * float((low4 | (high2 << 4)) - 32);
-    \\}
-;
-
-const metal_rt_body_antfly_q4_0_small_batch_msl_v1 =
-    \\kernel void antfly_q4_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_0 + ((col * block_count + block_idx) * 18); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q4_0_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-;
-
-const metal_rt_body_antfly_q4_1_small_batch_msl_v1 =
-    \\kernel void antfly_q4_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
-    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q4_1 + col0 * block_count * 20; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q4_1 + col1 * block_count * 20 : col0_weight;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 20; acc0 += x * antfly_q4_1_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 20; acc1 += x * antfly_q4_1_dequant_lane(block1, lane); } }
-    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = acc0; if (has_col1) output[row * out_dim + col1] = acc1; }
-    \\}
-;
-
-const metal_rt_body_antfly_q5_0_small_batch_msl_v1 =
-    \\kernel void antfly_q5_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_0 + ((col * block_count + block_idx) * 22); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q5_0_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-;
-
-const metal_rt_body_antfly_q5_1_small_batch_msl_v1 =
-    \\kernel void antfly_q5_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
-    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q5_1 + col0 * block_count * 24; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q5_1 + col1 * block_count * 24 : col0_weight;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 24; acc0 += x * antfly_q5_1_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 24; acc1 += x * antfly_q5_1_dequant_lane(block1, lane); } }
-    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = acc0; if (has_col1) output[row * out_dim + col1] = acc1; }
-    \\}
-;
-
-const metal_rt_body_antfly_q8_1_small_batch_msl_v1 =
-    \\kernel void antfly_q8_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q8_1 + ((col * block_count + block_idx) * 36); int lane = int(tid); acc += input[row * in_dim + (block_idx << 5) + lane] * antfly_q8_1_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-;
-
-const metal_rt_body_antfly_q8_k_small_batch_msl_v1 =
-    \\kernel void antfly_q8_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q8_k + ((col * block_count + block_idx) * 292); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q8_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 2u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
-    \\}
-;
-
-// Schedule re-tuned to 128 threads / hybrid-simd (from 32 threads / simd_sum)
-// after the schedule sweep + decode-runtime A/B. Body is the renderer's
-// 128/hybrid output with kernel_id/dequant-helper names kept.
-const metal_rt_body_antfly_q2_k_small_batch_msl_v1 =
-    \\kernel void antfly_q2_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
-    \\}
-;
-
-const metal_rt_body_antfly_q2_k_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q2_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc + bias[col];
-    \\}
-;
-
-const metal_rt_body_antfly_q2_k_small_batch_bias_gelu_msl_v1 =
-    \\kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q2_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q2_k + ((col * block_count + block_idx) * 84); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q2_k_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = antfly_q2_k_gelu(acc + bias[col]);
-    \\}
-;
-
-const metal_rt_body_antfly_q3_k_small_batch_msl_v1 =
-    \\kernel void antfly_q3_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q3_k_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc;
-    \\}
-;
-
-const metal_rt_body_antfly_q3_k_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q3_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q3_k_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc + bias[col];
-    \\}
-;
-
-const metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1 =
-    \\kernel void antfly_q3_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 32) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q3_k + ((col * block_count + block_idx) * 110); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q3_k_dequant_lane(block, lane); } }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = antfly_q3_k_gelu(acc + bias[col]);
-    \\}
-;
-
-const metal_rt_body_antfly_q4_k_small_batch_msl_v1 =
-    \\kernel void antfly_q4_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
-    \\}
-;
-
-// Schedule re-tuned to 256 threads / hybrid-simd reduction (from 64 threads /
-// threadgroup-tree) after the descriptor-driven schedule sweep found a ~1.4x
-// kernel speedup for this route. Body is the renderer's 256/hybrid output with
-// the kernel_id and dequant-helper names kept (identical math) so the existing
-// wiring and helpers are unchanged. Promotion re-confirmed by the
-// production-regression gate (decode-runtime, apples-to-apples).
-const metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q4_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
-    \\}
-;
-
-const metal_rt_body_antfly_q4_k_small_batch_bias_gelu_msl_v1 =
-    \\kernel void antfly_q4_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; threadgroup float partial[64]; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 64) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_k + ((col * block_count + block_idx) * 144); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 64) acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane); } }
-    \\    if (tid < 64) partial[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = 32; stride > 0; stride >>= 1) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0) output[row * out_dim + col] = antfly_q4_k_bias_gelu(partial[0] + bias[col]);
-    \\}
-;
-
-const metal_rt_body_antfly_q8_0_small_batch_msl_v1 =
-    \\kernel void antfly_q8_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
-    \\    device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q8_0 + col0 * block_count * 34; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q8_0 + col1 * block_count * 34 : col0_weight;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block0 = col0_weight + block_idx * 34; device const uchar *block1 = col1_weight + block_idx * 34; int base = block_idx << 5; for (int lane = int(tid); lane < 32; lane += 32) { float x = row_input[base + lane]; acc0 += x * antfly_q8_0_dequant_lane(block0, lane); if (has_col1) acc1 += x * antfly_q8_0_dequant_lane(block1, lane); } }
-    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = acc0; if (has_col1) output[row * out_dim + col1] = acc1; }
-    \\}
-;
-
-const metal_rt_body_antfly_q8_0_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q8_0_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col_weight = weight_q8_0 + col * block_count * 34; for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = col_weight + block_idx * 34; acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane); }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = acc + bias[col];
-    \\}
-;
-
-const metal_rt_body_antfly_q8_0_small_batch_bias_gelu_msl_v1 =
-    \\kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
-    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q8_0 + col0 * block_count * 34; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q8_0 + col1 * block_count * 34 : col0_weight; for (int block_idx = 0; block_idx < block_count; ++block_idx) { float x = row_input[(block_idx << 5) + lane]; device const uchar *block0 = col0_weight + block_idx * 34; acc0 += x * antfly_q8_0_dequant_lane(block0, lane); if (has_col1) { device const uchar *block1 = col1_weight + block_idx * 34; acc1 += x * antfly_q8_0_dequant_lane(block1, lane); } }
-    \\    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1); if (tid == 0) { output[row * out_dim + col0] = antfly_q4_k_bias_gelu(acc0 + bias[col0]); if (has_col1) output[row * out_dim + col1] = antfly_q4_k_bias_gelu(acc1 + bias[col1]); }
-    \\}
-;
-
-const metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1 =
-    \\kernel void antfly_q8_0_small_batch_relu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
-    \\    int lane = int(tid); device const float *row_input = input + row * in_dim; device const uchar *col_weight = weight_q8_0 + col * block_count * 34; for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = col_weight + block_idx * 34; acc += row_input[(block_idx << 5) + lane] * antfly_q8_0_dequant_lane(block, lane); }
-    \\    acc = simd_sum(acc); if (tid == 0) output[row * out_dim + col] = max(acc, 0.0f);
-    \\}
-;
-
-const metal_rt_body_antfly_q5_k_small_batch_msl_v1 =
-    \\kernel void antfly_q5_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
-    \\}
-;
-
-const metal_rt_body_antfly_q5_k_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q5_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
-    \\}
-;
-
-const metal_rt_body_antfly_q5_k_small_batch_bias_gelu_msl_v1 =
-    \\kernel void antfly_q5_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q5_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q5_k + ((col * block_count + block_idx) * 176); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q5_k_dequant_lane(block, lane); } }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_q4_k_bias_gelu(total + bias[col]);
-    \\}
-;
-
-const metal_rt_body_antfly_q6_k_small_batch_msl_v1 =
-    \\kernel void antfly_q6_k_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total;
-    \\}
-;
-
-const metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1 =
-    \\kernel void antfly_q6_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 256) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = total + bias[col];
-    \\}
-;
-
-const metal_rt_body_antfly_q6_k_small_batch_bias_gelu_msl_v1 =
-    \\kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    \\    uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;
-    \\    if (tid < 128) { for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q6_k + ((col * block_count + block_idx) * 210); int base = block_idx << 8; for (int lane = int(tid); lane < 256; lane += 128) acc += input[row * in_dim + base + lane] * antfly_q6_k_dequant_lane(block, lane); } }
-    \\    threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]); if (lane_id == 0u && simdgroup_id == 0u) output[row * out_dim + col] = antfly_q4_k_bias_gelu(total + bias[col]);
-    \\}
-;
-
-pub const MetalRuntimeQuantSection = struct {
-    name: []const u8,
-    text: []const u8,
-};
-
-// Verbatim section order of the runtime-embedded Metal quant kernel region in
-// src/backends/metal_kernels.m. Rendering this table back into C string
-// fragment lines must reproduce the region byte-for-byte.
-pub const metal_runtime_quant_sections = [_]MetalRuntimeQuantSection{
-    .{ .name = "antfly_q4_0_half_le_to_float", .text = metal_rt_helper_antfly_q4_0_half_le_to_float },
-    .{ .name = "antfly_q4_0_dequant_lane", .text = metal_rt_helper_antfly_q4_0_dequant_lane },
-    .{ .name = "antfly_q4_0_small_batch_msl_v1", .text = metal_rt_body_antfly_q4_0_small_batch_msl_v1 },
-    .{ .name = "antfly_q4_1_half_le_to_float", .text = metal_rt_helper_antfly_q4_1_half_le_to_float },
-    .{ .name = "antfly_q4_1_dequant_lane", .text = metal_rt_helper_antfly_q4_1_dequant_lane },
-    .{ .name = "antfly_q4_1_small_batch_msl_v1", .text = metal_rt_body_antfly_q4_1_small_batch_msl_v1 },
-    .{ .name = "antfly_q5_0_half_le_to_float", .text = metal_rt_helper_antfly_q5_0_half_le_to_float },
-    .{ .name = "antfly_q5_0_u32_le", .text = metal_rt_helper_antfly_q5_0_u32_le },
-    .{ .name = "antfly_q5_0_dequant_lane", .text = metal_rt_helper_antfly_q5_0_dequant_lane },
-    .{ .name = "antfly_q5_0_small_batch_msl_v1", .text = metal_rt_body_antfly_q5_0_small_batch_msl_v1 },
-    .{ .name = "antfly_q5_1_half_le_to_float", .text = metal_rt_helper_antfly_q5_1_half_le_to_float },
-    .{ .name = "antfly_q5_1_u32_le", .text = metal_rt_helper_antfly_q5_1_u32_le },
-    .{ .name = "antfly_q5_1_dequant_lane", .text = metal_rt_helper_antfly_q5_1_dequant_lane },
-    .{ .name = "antfly_q5_1_small_batch_msl_v1", .text = metal_rt_body_antfly_q5_1_small_batch_msl_v1 },
-    .{ .name = "antfly_q8_1_half_le_to_float", .text = metal_rt_helper_antfly_q8_1_half_le_to_float },
-    .{ .name = "antfly_q8_1_dequant_lane", .text = metal_rt_helper_antfly_q8_1_dequant_lane },
-    .{ .name = "antfly_q8_1_small_batch_msl_v1", .text = metal_rt_body_antfly_q8_1_small_batch_msl_v1 },
-    .{ .name = "antfly_q8_k_f32_le_to_float", .text = metal_rt_helper_antfly_q8_k_f32_le_to_float },
-    .{ .name = "antfly_q8_k_dequant_lane", .text = metal_rt_helper_antfly_q8_k_dequant_lane },
-    .{ .name = "antfly_q8_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q8_k_small_batch_msl_v1 },
-    .{ .name = "antfly_q2_k_half_le_to_float", .text = metal_rt_helper_antfly_q2_k_half_le_to_float },
-    .{ .name = "antfly_q2_k_dequant_lane", .text = metal_rt_helper_antfly_q2_k_dequant_lane },
-    .{ .name = "antfly_q2_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q2_k_small_batch_msl_v1 },
-    .{ .name = "antfly_q2_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q2_k_small_batch_bias_msl_v1 },
-    .{ .name = "antfly_q2_k_gelu", .text = metal_rt_helper_antfly_q2_k_gelu },
-    .{ .name = "antfly_q2_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q2_k_small_batch_bias_gelu_msl_v1 },
-    .{ .name = "antfly_q3_k_half_le_to_float", .text = metal_rt_helper_antfly_q3_k_half_le_to_float },
-    .{ .name = "antfly_q3_k_raw_scale", .text = metal_rt_helper_antfly_q3_k_raw_scale },
-    .{ .name = "antfly_q3_k_dequant_lane", .text = metal_rt_helper_antfly_q3_k_dequant_lane },
-    .{ .name = "antfly_q3_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q3_k_small_batch_msl_v1 },
-    .{ .name = "antfly_q3_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q3_k_small_batch_bias_msl_v1 },
-    .{ .name = "antfly_q3_k_gelu", .text = metal_rt_helper_antfly_q3_k_gelu },
-    .{ .name = "antfly_q3_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1 },
-    .{ .name = "antfly_q4_k_half_le_to_float", .text = metal_rt_helper_antfly_q4_k_half_le_to_float },
-    .{ .name = "antfly_q4_k_unpack_scale_min", .text = metal_rt_helper_antfly_q4_k_unpack_scale_min },
-    .{ .name = "antfly_q4_k_dequant_lane", .text = metal_rt_helper_antfly_q4_k_dequant_lane },
-    .{ .name = "antfly_q4_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q4_k_small_batch_msl_v1 },
-    .{ .name = "antfly_q4_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1 },
-    .{ .name = "antfly_q4_k_bias_gelu", .text = metal_rt_helper_antfly_q4_k_bias_gelu },
-    .{ .name = "antfly_q4_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q4_k_small_batch_bias_gelu_msl_v1 },
-    .{ .name = "antfly_q8_0_dequant_lane", .text = metal_rt_helper_antfly_q8_0_dequant_lane },
-    .{ .name = "antfly_q8_0_small_batch_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_msl_v1 },
-    .{ .name = "antfly_q8_0_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_bias_msl_v1 },
-    .{ .name = "antfly_q8_0_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_bias_gelu_msl_v1 },
-    .{ .name = "antfly_q8_0_small_batch_relu_msl_v1", .text = metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1 },
-    .{ .name = "antfly_qk_half_le_to_float", .text = metal_rt_helper_antfly_qk_half_le_to_float },
-    .{ .name = "antfly_q5_k_unpack_scale_min", .text = metal_rt_helper_antfly_q5_k_unpack_scale_min },
-    .{ .name = "antfly_q5_k_dequant_lane", .text = metal_rt_helper_antfly_q5_k_dequant_lane },
-    .{ .name = "antfly_q5_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q5_k_small_batch_msl_v1 },
-    .{ .name = "antfly_q5_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q5_k_small_batch_bias_msl_v1 },
-    .{ .name = "antfly_q5_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q5_k_small_batch_bias_gelu_msl_v1 },
-    .{ .name = "antfly_q6_k_dequant_lane", .text = metal_rt_helper_antfly_q6_k_dequant_lane },
-    .{ .name = "antfly_q6_k_small_batch_msl_v1", .text = metal_rt_body_antfly_q6_k_small_batch_msl_v1 },
-    .{ .name = "antfly_q6_k_small_batch_bias_msl_v1", .text = metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1 },
-    .{ .name = "antfly_q6_k_small_batch_bias_gelu_msl_v1", .text = metal_rt_body_antfly_q6_k_small_batch_bias_gelu_msl_v1 },
 };
 
 // Renders the runtime-embedded quant kernel region of
@@ -4204,13 +3772,6 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
         try out.appendSlice(allocator, "\\n\"\n");
     }
     return out.toOwnedSlice(allocator);
-}
-
-pub fn metalRuntimeQuantSectionFor(name: []const u8) ?MetalRuntimeQuantSection {
-    for (metal_runtime_quant_sections) |section| {
-        if (std.mem.eql(u8, section.name, name)) return section;
-    }
-    return null;
 }
 
 /// Renders the C launch-shape table + lookup for metal_kernels.m from
@@ -4277,16 +3838,30 @@ const MetalSmallBatchHeader = struct {
     promotion_comment: []const u8,
 };
 
-// Table-driven assembler for the checked-in generated Metal sources: license
-// header + plan metadata + the exact helper and kernel body bytes from the
-// runtime region above.
-fn metalSmallBatchFileSource(
+// Renders a checked-in generated Metal small-batch source: the license header +
+// plan/promotion metadata comment block, then the descriptor-driven kernel
+// (shared vocabulary helpers + dequant fragment + body) produced by the same
+// renderer that emits the runtime-embedded region. Single-sourced from the
+// schedule table + FormatDecoder, so re-tuning a route updates this file and the
+// runtime region together; only the header metadata is per-artifact. The
+// existing runtime renderer runs at comptime here via a FixedBufferAllocator.
+fn renderMetalSmallBatchSource(
     comptime header: MetalSmallBatchHeader,
-    comptime helpers: []const []const u8,
-    comptime body: []const u8,
+    comptime format: quant_matmul.Format,
+    comptime epilogue: Epilogue,
 ) []const u8 {
-    comptime {
-        var out: []const u8 = metal_generated_source_license_header ++ "\n\n" ++
+    return comptime blk: {
+        @setEvalBranchQuota(50_000_000);
+        const decoder = metal_renderer.decoderFor(format) orelse
+            @compileError("missing Metal FormatDecoder for " ++ @tagName(format));
+        const schedule = metalRouteScheduleFor(format, .rows_2_8, epilogue) orelse
+            @compileError("missing production schedule for " ++ header.kernel_id);
+        var buf: [1 << 17]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const rendered = metal_renderer.renderKernel(fba.allocator(), header.kernel_id, decoder, schedule, epilogue) catch
+            @compileError("renderKernel failed for " ++ header.kernel_id);
+        const kernel: [rendered.len]u8 = rendered[0..rendered.len].*;
+        break :blk metal_generated_source_license_header ++ "\n\n" ++
             "// " ++ header.source_kind ++ " from graph/quant_kernel_compiler.zig.\n" ++
             "// plan_id=" ++ header.plan_id ++ "\n" ++
             "// kernel_id=" ++ header.kernel_id ++ "\n" ++
@@ -4296,14 +3871,12 @@ fn metalSmallBatchFileSource(
             "\n" ++
             "#include <metal_stdlib>\n" ++
             "using namespace metal;\n" ++
-            "\n";
-        for (helpers) |helper| out = out ++ helper ++ "\n";
-        out = out ++ body ++ "\n";
-        return out;
-    }
+            "\n" ++
+            kernel;
+    };
 }
 
-const first_lazy_metal_source = metalSmallBatchFileSource(
+const first_lazy_metal_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q4_k/rows_2_8/bias_gelu/small_batch",
@@ -4313,11 +3886,11 @@ const first_lazy_metal_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane, metal_rt_helper_antfly_q4_k_bias_gelu },
-    metal_rt_body_antfly_q4_k_small_batch_bias_gelu_msl_v1,
+    .q4_k,
+    .bias_gelu,
 );
 
-const first_general_metal_q4_0_source = metalSmallBatchFileSource(
+const first_general_metal_q4_0_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q4_0/rows_2_8/none/small_batch",
@@ -4327,11 +3900,11 @@ const first_general_metal_q4_0_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_0_half_le_to_float, metal_rt_helper_antfly_q4_0_dequant_lane },
-    metal_rt_body_antfly_q4_0_small_batch_msl_v1,
+    .q4_0,
+    .none,
 );
 
-const first_general_metal_q4_1_source = metalSmallBatchFileSource(
+const first_general_metal_q4_1_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q4_1/rows_2_8/none/small_batch",
@@ -4341,11 +3914,11 @@ const first_general_metal_q4_1_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_1_half_le_to_float, metal_rt_helper_antfly_q4_1_dequant_lane },
-    metal_rt_body_antfly_q4_1_small_batch_msl_v1,
+    .q4_1,
+    .none,
 );
 
-const first_general_metal_q5_0_source = metalSmallBatchFileSource(
+const first_general_metal_q5_0_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q5_0/rows_2_8/none/small_batch",
@@ -4355,11 +3928,11 @@ const first_general_metal_q5_0_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q5_0_half_le_to_float, metal_rt_helper_antfly_q5_0_u32_le, metal_rt_helper_antfly_q5_0_dequant_lane },
-    metal_rt_body_antfly_q5_0_small_batch_msl_v1,
+    .q5_0,
+    .none,
 );
 
-const first_general_metal_q5_1_source = metalSmallBatchFileSource(
+const first_general_metal_q5_1_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q5_1/rows_2_8/none/small_batch",
@@ -4369,11 +3942,11 @@ const first_general_metal_q5_1_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q5_1_half_le_to_float, metal_rt_helper_antfly_q5_1_u32_le, metal_rt_helper_antfly_q5_1_dequant_lane },
-    metal_rt_body_antfly_q5_1_small_batch_msl_v1,
+    .q5_1,
+    .none,
 );
 
-const first_general_metal_q4_source = metalSmallBatchFileSource(
+const first_general_metal_q4_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q4_k/rows_2_8/none/small_batch",
@@ -4382,11 +3955,11 @@ const first_general_metal_q4_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after the schedule sweep re-tuned this route to 128-thread" ++ "\n" ++
             "// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.",
     },
-    &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane },
-    metal_rt_body_antfly_q4_k_small_batch_msl_v1,
+    .q4_k,
+    .none,
 );
 
-const first_general_metal_q4_bias_source = metalSmallBatchFileSource(
+const first_general_metal_q4_bias_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q4_k/rows_2_8/bias/small_batch",
@@ -4395,11 +3968,11 @@ const first_general_metal_q4_bias_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_k_half_le_to_float, metal_rt_helper_antfly_q4_k_unpack_scale_min, metal_rt_helper_antfly_q4_k_dequant_lane },
-    metal_rt_body_antfly_q4_k_small_batch_bias_msl_v1,
+    .q4_k,
+    .bias,
 );
 
-const first_general_metal_q8_source = metalSmallBatchFileSource(
+const first_general_metal_q8_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q8_0/rows_2_8/none/small_batch",
@@ -4408,11 +3981,11 @@ const first_general_metal_q8_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
-    metal_rt_body_antfly_q8_0_small_batch_msl_v1,
+    .q8_0,
+    .none,
 );
 
-const first_general_metal_q8_bias_source = metalSmallBatchFileSource(
+const first_general_metal_q8_bias_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q8_0/rows_2_8/bias/small_batch",
@@ -4421,11 +3994,11 @@ const first_general_metal_q8_bias_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
-    metal_rt_body_antfly_q8_0_small_batch_bias_msl_v1,
+    .q8_0,
+    .bias,
 );
 
-const first_general_metal_q8_bias_gelu_source = metalSmallBatchFileSource(
+const first_general_metal_q8_bias_gelu_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q8_0/rows_2_8/bias_gelu/small_batch",
@@ -4435,11 +4008,11 @@ const first_general_metal_q8_bias_gelu_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_k_bias_gelu, metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
-    metal_rt_body_antfly_q8_0_small_batch_bias_gelu_msl_v1,
+    .q8_0,
+    .bias_gelu,
 );
 
-const first_general_metal_q8_relu_source = metalSmallBatchFileSource(
+const first_general_metal_q8_relu_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q8_0/rows_2_8/relu/small_batch",
@@ -4449,11 +4022,11 @@ const first_general_metal_q8_relu_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_external_helper_termite_q8_0_block_scale, metal_rt_helper_antfly_q8_0_dequant_lane },
-    metal_rt_body_antfly_q8_0_small_batch_relu_msl_v1,
+    .q8_0,
+    .relu,
 );
 
-const first_general_metal_q2_source = metalSmallBatchFileSource(
+const first_general_metal_q2_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q2_k/rows_2_8/none/small_batch",
@@ -4462,11 +4035,11 @@ const first_general_metal_q2_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, and speedup gates.",
     },
-    &.{ metal_rt_helper_antfly_q2_k_half_le_to_float, metal_rt_helper_antfly_q2_k_dequant_lane },
-    metal_rt_body_antfly_q2_k_small_batch_msl_v1,
+    .q2_k,
+    .none,
 );
 
-const first_general_metal_q2_bias_source = metalSmallBatchFileSource(
+const first_general_metal_q2_bias_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q2_k/rows_2_8/bias/small_batch",
@@ -4476,11 +4049,11 @@ const first_general_metal_q2_bias_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q2_k_half_le_to_float, metal_rt_helper_antfly_q2_k_dequant_lane },
-    metal_rt_body_antfly_q2_k_small_batch_bias_msl_v1,
+    .q2_k,
+    .bias,
 );
 
-const first_general_metal_q2_bias_gelu_source = metalSmallBatchFileSource(
+const first_general_metal_q2_bias_gelu_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q2_k/rows_2_8/bias_gelu/small_batch",
@@ -4490,11 +4063,11 @@ const first_general_metal_q2_bias_gelu_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q2_k_half_le_to_float, metal_rt_helper_antfly_q2_k_dequant_lane, metal_rt_helper_antfly_q2_k_gelu },
-    metal_rt_body_antfly_q2_k_small_batch_bias_gelu_msl_v1,
+    .q2_k,
+    .bias_gelu,
 );
 
-const first_general_metal_q3_source = metalSmallBatchFileSource(
+const first_general_metal_q3_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q3_k/rows_2_8/none/small_batch",
@@ -4503,11 +4076,11 @@ const first_general_metal_q3_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_helper_antfly_q3_k_half_le_to_float, metal_rt_helper_antfly_q3_k_raw_scale, metal_rt_helper_antfly_q3_k_dequant_lane },
-    metal_rt_body_antfly_q3_k_small_batch_msl_v1,
+    .q3_k,
+    .none,
 );
 
-const first_general_metal_q3_bias_source = metalSmallBatchFileSource(
+const first_general_metal_q3_bias_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q3_k/rows_2_8/bias/small_batch",
@@ -4517,11 +4090,11 @@ const first_general_metal_q3_bias_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q3_k_half_le_to_float, metal_rt_helper_antfly_q3_k_raw_scale, metal_rt_helper_antfly_q3_k_dequant_lane },
-    metal_rt_body_antfly_q3_k_small_batch_bias_msl_v1,
+    .q3_k,
+    .bias,
 );
 
-const first_general_metal_q3_bias_gelu_source = metalSmallBatchFileSource(
+const first_general_metal_q3_bias_gelu_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q3_k/rows_2_8/bias_gelu/small_batch",
@@ -4531,11 +4104,11 @@ const first_general_metal_q3_bias_gelu_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q3_k_half_le_to_float, metal_rt_helper_antfly_q3_k_raw_scale, metal_rt_helper_antfly_q3_k_dequant_lane, metal_rt_helper_antfly_q3_k_gelu },
-    metal_rt_body_antfly_q3_k_small_batch_bias_gelu_msl_v1,
+    .q3_k,
+    .bias_gelu,
 );
 
-const first_general_metal_q8_1_source = metalSmallBatchFileSource(
+const first_general_metal_q8_1_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Dev-only generated Metal candidate",
         .plan_id = "metal/q8_1/rows_2_8/none/small_batch",
@@ -4545,11 +4118,11 @@ const first_general_metal_q8_1_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q8_1_half_le_to_float, metal_rt_helper_antfly_q8_1_dequant_lane },
-    metal_rt_body_antfly_q8_1_small_batch_msl_v1,
+    .q8_1,
+    .none,
 );
 
-const first_general_metal_q8_k_source = metalSmallBatchFileSource(
+const first_general_metal_q8_k_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q8_k/rows_2_8/none/small_batch",
@@ -4558,11 +4131,11 @@ const first_general_metal_q8_k_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after the schedule sweep re-tuned this route to 64-thread" ++ "\n" ++
             "// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.",
     },
-    &.{ metal_rt_helper_antfly_q8_k_f32_le_to_float, metal_rt_helper_antfly_q8_k_dequant_lane },
-    metal_rt_body_antfly_q8_k_small_batch_msl_v1,
+    .q8_k,
+    .none,
 );
 
-const first_general_metal_q5_source = metalSmallBatchFileSource(
+const first_general_metal_q5_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q5_k/rows_2_8/none/small_batch",
@@ -4571,11 +4144,11 @@ const first_general_metal_q5_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after the schedule sweep re-tuned this route to 256-thread" ++ "\n" ++
             "// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.",
     },
-    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q5_k_unpack_scale_min, metal_rt_helper_antfly_q5_k_dequant_lane },
-    metal_rt_body_antfly_q5_k_small_batch_msl_v1,
+    .q5_k,
+    .none,
 );
 
-const first_general_metal_q5_bias_source = metalSmallBatchFileSource(
+const first_general_metal_q5_bias_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q5_k/rows_2_8/bias/small_batch",
@@ -4584,11 +4157,11 @@ const first_general_metal_q5_bias_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q5_k_unpack_scale_min, metal_rt_helper_antfly_q5_k_dequant_lane },
-    metal_rt_body_antfly_q5_k_small_batch_bias_msl_v1,
+    .q5_k,
+    .bias,
 );
 
-const first_general_metal_q5_bias_gelu_source = metalSmallBatchFileSource(
+const first_general_metal_q5_bias_gelu_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal artifact source",
         .plan_id = "metal/q5_k/rows_2_8/bias_gelu/small_batch",
@@ -4598,11 +4171,11 @@ const first_general_metal_q5_bias_gelu_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_k_bias_gelu, metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q5_k_unpack_scale_min, metal_rt_helper_antfly_q5_k_dequant_lane },
-    metal_rt_body_antfly_q5_k_small_batch_bias_gelu_msl_v1,
+    .q5_k,
+    .bias_gelu,
 );
 
-const first_general_metal_q6_source = metalSmallBatchFileSource(
+const first_general_metal_q6_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q6_k/rows_2_8/none/small_batch",
@@ -4611,11 +4184,11 @@ const first_general_metal_q6_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q6_k_dequant_lane },
-    metal_rt_body_antfly_q6_k_small_batch_msl_v1,
+    .q6_k,
+    .none,
 );
 
-const first_general_metal_q6_bias_source = metalSmallBatchFileSource(
+const first_general_metal_q6_bias_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q6_k/rows_2_8/bias/small_batch",
@@ -4624,11 +4197,11 @@ const first_general_metal_q6_bias_source = metalSmallBatchFileSource(
         .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
             "// route, provider-route, and speedup gates.",
     },
-    &.{ metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q6_k_dequant_lane },
-    metal_rt_body_antfly_q6_k_small_batch_bias_msl_v1,
+    .q6_k,
+    .bias,
 );
 
-const first_general_metal_q6_bias_gelu_source = metalSmallBatchFileSource(
+const first_general_metal_q6_bias_gelu_source = renderMetalSmallBatchSource(
     .{
         .source_kind = "Generated Metal candidate artifact",
         .plan_id = "metal/q6_k/rows_2_8/bias_gelu/small_batch",
@@ -4638,8 +4211,8 @@ const first_general_metal_q6_bias_gelu_source = metalSmallBatchFileSource(
             "// Production Metal dispatch stays on native handwritten MSL until this" ++ "\n" ++
             "// candidate clears correctness and benchmark gates.",
     },
-    &.{ metal_rt_helper_antfly_q4_k_bias_gelu, metal_rt_helper_antfly_qk_half_le_to_float, metal_rt_helper_antfly_q6_k_dequant_lane },
-    metal_rt_body_antfly_q6_k_small_batch_bias_gelu_msl_v1,
+    .q6_k,
+    .bias_gelu,
 );
 
 pub const first_coverage = buildFirstCoverage();
@@ -6567,8 +6140,8 @@ pub fn compileMetalKernelSource(
 }
 
 pub fn emitCompiledSource(allocator: std.mem.Allocator, compiled: QuantKernelCompiledSource) !EmittedCompiledSource {
-    // Metal small-batch sources are assembled from the codegen-owned runtime
-    // region data (metal_runtime_quant_sections); CUDA sources are borrowed
+    // Metal small-batch sources are the descriptor-rendered constants (shared
+    // vocabulary helpers + body from the renderer); CUDA sources are borrowed
     // verbatim. Either way compiled.source is already the canonical text.
     _ = allocator;
     return .{ .data = compiled.source };
@@ -9122,7 +8695,7 @@ test "quant kernel compiler first Metal lazy target stays blocked by timing drif
     try std.testing.expectEqualStrings(emitted.data, contents);
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "for (int lane = int(tid); lane < 256; lane += 64)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "threadgroup float partial[64];"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (tid < 64) partial[tid] = acc;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "partial[tid] += partial[tid + stride];"));
 }
 
 test "quant kernel compiler compiles promoted Metal source from descriptor route" {
@@ -9183,12 +8756,15 @@ test "quant kernel compiler emits single-sourced Metal source for every generate
         try std.testing.expectEqualStrings(compiled.source, emitted.data);
         try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, compiled, emitted.data));
 
-        // The emitted kernel body is the runtime-region body byte-for-byte,
-        // and the source ends with it (body is the last section of the file).
-        const section = metalRuntimeQuantSectionFor(artifact.kernel_id) orelse return error.MissingRuntimeQuantSection;
-        try std.testing.expect(emitted.data.len > section.text.len + 1);
-        try std.testing.expect(std.mem.endsWith(u8, emitted.data, "\n"));
-        try std.testing.expectEqualStrings(section.text, emitted.data[emitted.data.len - section.text.len - 1 .. emitted.data.len - 1]);
+        // The emitted .metal source ends with the descriptor-rendered kernel
+        // (shared vocabulary helpers + body) for this route -- the same renderer
+        // that produces the runtime-embedded region, so the two are single-sourced.
+        const decoder = metal_renderer.decoderFor(artifact.format) orelse return error.MissingRuntimeQuantDecoder;
+        const schedule = metalRouteScheduleFor(artifact.format, artifact.row_bucket, artifact.epilogue) orelse return error.MissingRuntimeQuantSchedule;
+        const rendered_kernel = try metal_renderer.renderKernel(std.testing.allocator, artifact.kernel_id, decoder, schedule, artifact.epilogue);
+        defer std.testing.allocator.free(rendered_kernel);
+        try std.testing.expect(emitted.data.len > rendered_kernel.len + 1);
+        try std.testing.expect(std.mem.endsWith(u8, emitted.data, rendered_kernel));
     }
 
     // CUDA sources keep their existing borrowed-source path.
@@ -9687,7 +9263,7 @@ test "quant kernel compiler generated q5 k and q6 k sources share the qk half he
     };
 
     for (qk_sources) |source| {
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, metal_rt_helper_antfly_qk_half_le_to_float));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, metal_renderer.helper_qk_half_le_to_float.msl));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_qk_half_le_to_float(block"));
     }
 }
@@ -10191,38 +9767,27 @@ test "quant kernel compiler metal_production_schedules reproduces the launch-sha
     }
 }
 
-test "quant kernel compiler v1 bodies carry their schedule cols marker" {
+test "quant kernel compiler rendered bodies carry their schedule cols marker" {
     // cols==2 kernels compute two output columns per threadgroup via
-    // `group_pos.x << 1`; cols==1 kernels do not. Locks the table's cols column
-    // to the frozen v1 body text.
+    // `group_pos.x << 1`; cols==1 kernels do not. Renders each route through the
+    // descriptor-driven renderer (the single source for these bodies) and locks
+    // the table's cols column + reduction to the emitted body text.
     for (metal_production_schedules) |entry| {
-        const section_name = try metalV1SectionNameForTest(std.testing.allocator, entry.format, entry.epilogue);
-        defer std.testing.allocator.free(section_name);
-        const section = metalRuntimeQuantSectionFor(section_name) orelse {
-            std.debug.print("missing v1 body section {s}\n", .{section_name});
-            return error.MissingBodySection;
-        };
-        const has_two_col = std.mem.containsAtLeast(u8, section.text, 1, "group_pos.x << 1");
+        const decoder = metal_renderer.decoderFor(entry.format) orelse return error.MissingDecoder;
+        const kernel_id = try metalRuntimeKernelId(std.testing.allocator, entry.format, entry.epilogue);
+        defer std.testing.allocator.free(kernel_id);
+        const body = try metal_renderer.renderKernel(std.testing.allocator, kernel_id, decoder, entry.schedule, entry.epilogue);
+        defer std.testing.allocator.free(body);
+        const has_two_col = std.mem.containsAtLeast(u8, body, 1, "group_pos.x << 1");
         try std.testing.expectEqual(entry.schedule.cols_per_threadgroup == 2, has_two_col);
         // Reduction primitive must be present in the body.
         switch (entry.schedule.reduction) {
-            .simd_sum => try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "simd_sum")),
-            .threadgroup_tree => try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "partial[")),
+            .simd_sum => try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum")),
+            .threadgroup_tree => try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "partial[")),
             .hybrid_simd => {
-                try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "simd_sum"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, section.text, 1, "simdgroup_id"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simdgroup_id"));
             },
         }
     }
-}
-
-fn metalV1SectionNameForTest(allocator: std.mem.Allocator, format: quant_matmul.Format, epilogue: Epilogue) ![]u8 {
-    const epi_suffix = switch (epilogue) {
-        .none => "",
-        .bias => "_bias",
-        .bias_gelu => "_bias_gelu",
-        .relu => "_relu",
-        else => return error.UnsupportedEpilogueForSection,
-    };
-    return std.fmt.allocPrint(allocator, "antfly_{s}_small_batch{s}_msl_v1", .{ @tagName(format), epi_suffix });
 }
