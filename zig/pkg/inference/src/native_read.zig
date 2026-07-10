@@ -113,7 +113,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     });
     if (debug_cuda_session) std.log.info("read: inference done model={s}", .{opts.model_dir});
     defer result.deinit();
-    try writeResultJson(allocator, opts.model_dir, result);
+    try writeResultJson(allocator, io, opts.model_dir, result);
 }
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -294,7 +294,7 @@ fn parseJsonFloatArray(data: []const u8, key: []const u8) ?[3]f32 {
     return result;
 }
 
-fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, result: readers_mod.Result) !void {
+fn writeResultJson(allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, result: readers_mod.Result) !void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
 
@@ -338,7 +338,14 @@ fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, result:
     }
     try buf.appendSlice(allocator, "}\n");
 
-    print("{s}", .{buf.items});
+    try writeToStdout(io, buf.items);
+}
+
+fn writeToStdout(io: std.Io, data: []const u8) !void {
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+    try stdout_writer.interface.writeAll(data);
+    try stdout_writer.interface.flush();
 }
 
 fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, opts: Options, result: ReadBenchmarkResult) !void {
@@ -429,7 +436,7 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     if (opts.json_timing_path) |path| {
         try compat.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
     }
-    print("{s}", .{buf.items});
+    try writeToStdout(io, buf.items);
 }
 
 fn appendFloatJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: anytype) !void {
