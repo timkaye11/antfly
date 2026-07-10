@@ -548,6 +548,11 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> rms_norm_reduce_pipeline;
     id<MTLComputePipelineState> rms_inv_scale_pipeline;
     id<MTLComputePipelineState> rms_norm_rows_pipeline;
+    // Threadgroup-per-row reduce variant of rms_norm_rows for small row counts
+    // (rows 2-8, hidden >= 1024): the thread-per-row kernel dispatches `rows`
+    // total threads, which is pure serial latency on the planned frame
+    // encoders at MTP-verify shapes.
+    id<MTLComputePipelineState> rms_norm_rows_reduce_pipeline;
     id<MTLComputePipelineState> rms_norm_add_pipeline;
     id<MTLComputePipelineState> rms_norm_add_sumsq_pipeline;
     id<MTLComputePipelineState> rms_norm_add_scale_sumsq_pipeline;
@@ -3935,6 +3940,18 @@ static NSString *termite_metal_shader_source(void) {
            "    mean_square /= float(p.hidden_size);\n"
            "    float inv_rms = rsqrt(mean_square + p.eps);\n"
            "    for (uint i = 0; i < p.hidden_size; ++i) output[row_base + i] = input[row_base + i] * inv_rms * weight[i];\n"
+           "}\n"
+           "kernel void termite_apply_rms_norm_rows_reduce(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_row_norm_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           "    if (row >= p.rows) return;\n"
+           "    if (p.hidden_size == 0) return;\n"
+           "    uint row_base = row * p.hidden_size;\n"
+           "    float mean_square = 0.0f;\n"
+           "    for (uint i = tid; i < p.hidden_size; i += tpg) { float x = input[row_base + i]; mean_square += x * x; }\n"
+           "    shmem[tid] = mean_square;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = tpg >> 1; stride > 0; stride >>= 1) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    float inv_rms = rsqrt(shmem[0] / float(p.hidden_size) + p.eps);\n"
+           "    for (uint i = tid; i < p.hidden_size; i += tpg) output[row_base + i] = input[row_base + i] * inv_rms * weight[i];\n"
            "}\n"
            "kernel void termite_apply_head_rms_rope(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_head_rms_rope_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint tpg [[threads_per_threadgroup]], uint head [[threadgroup_position_in_grid]]) {\n"
            "    if (head >= p.total_heads || p.head_dim == 0u || p.rope_dim == 0u) return;\n"
@@ -14020,6 +14037,46 @@ static int termite_metal_encode_rms_norm_add_rows_for(
     );
 }
 
+// Small row counts over a wide hidden dim (the MTP-verify shapes) route to
+// the threadgroup-per-row reduce kernel: the thread-per-row kernel dispatches
+// only `rows` threads total, each serially scanning hidden_size twice, which
+// on the serial planned frame encoder is a near-idle GPU stall per norm. The
+// gate is deliberately narrow — rows 2-8 AND hidden >= 1024 — so plain-decode
+// v_norm (rows=kv_heads over head_dim) and real prefill (rows > 8) keep their
+// existing kernel and stay byte-identical.
+static bool termite_metal_rms_norm_rows_reduce_preferred(
+    termite_metal_decode_runtime *runtime,
+    size_t rows,
+    size_t hidden_size
+) {
+    if (rows < 2 || rows > 8) return false;
+    if (hidden_size < 1024) return false;
+    if (runtime == NULL || runtime->rms_norm_rows_reduce_pipeline == nil) return false;
+    if (runtime->rms_norm_rows_reduce_pipeline.maxTotalThreadsPerThreadgroup < 256) return false;
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *disabled = getenv("TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE");
+        enabled = (disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0) ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static void termite_metal_dispatch_rms_norm_rows(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    size_t rows,
+    size_t hidden_size
+) {
+    if (termite_metal_rms_norm_rows_reduce_preferred(runtime, rows, hidden_size)) {
+        [encoder setComputePipelineState:runtime->rms_norm_rows_reduce_pipeline];
+        [encoder setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+    }
+    [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
+    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+}
+
 static int termite_metal_encode_rms_norm_rows(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -14069,12 +14126,11 @@ static int termite_metal_encode_rms_norm_rows(
         encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
         if (encoder == nil) return failure_code;
     }
-    [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
     [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
     [encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:1];
     [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
-    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+    termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
     if (!planned_encoder) [encoder endEncoding];
     return 0;
 }
@@ -14582,6 +14638,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->rms_norm_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_1x_reduce");
         runtime->rms_inv_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_compute_rms_inv_scale_1x");
         runtime->rms_norm_rows_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows");
+        runtime->rms_norm_rows_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_rows_reduce");
         runtime->rms_norm_add_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_1x");
         runtime->rms_norm_add_sumsq_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_1x_sumsq");
         runtime->rms_norm_add_scale_sumsq_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_rms_norm_add_scale_1x_sumsq");
@@ -15091,6 +15148,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->rms_norm_reduce_pipeline = nil;
     runtime->rms_inv_scale_pipeline = nil;
     runtime->rms_norm_rows_pipeline = nil;
+    runtime->rms_norm_rows_reduce_pipeline = nil;
     runtime->rms_norm_generated_pipeline = nil;
     runtime->rms_norm_add_pipeline = nil;
     runtime->rms_norm_add_sumsq_pipeline = nil;
@@ -19406,12 +19464,11 @@ int termite_metal_decode_runtime_apply_rms_norm_rows_device(
             encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
             if (encoder == nil) return -10;
         }
-        [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
         [encoder setBuffer:runtime->rms_norm_weight_buffers[slot] offset:0 atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
         [command_buffer commit];
@@ -19468,12 +19525,11 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_device(
             encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
             if (encoder == nil) return -8;
         }
-        [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
         [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
         if (!planned_encoder) [encoder endEncoding];
         if (!frame_owned) return 0;
         [command_buffer commit];
@@ -19531,12 +19587,11 @@ int termite_metal_decode_runtime_apply_rms_norm_weight_scratch_device(
             encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
             if (encoder == nil) return -8;
         }
-        [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
         [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:0 atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows), 1, 1)];
+        termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows, hidden_size);
         if (!planned_encoder) [encoder endEncoding];
         if (frame_owned) {
             [command_buffer commit];
@@ -23246,12 +23301,11 @@ int termite_metal_decode_runtime_apply_prefill_quantized_setup_device(
                 .eps = eps,
             };
             if (rc == 0) {
-                [encoder setComputePipelineState:runtime->rms_norm_rows_pipeline];
                 [encoder setBuffer:v_projected_buffer offset:0 atIndex:0];
                 [encoder setBuffer:value_norm_weight_buffer offset:value_norm_weight_offset atIndex:1];
                 [encoder setBuffer:v_ready_buffer offset:0 atIndex:2];
                 [encoder setBytes:&params length:sizeof(params) atIndex:3];
-                [encoder dispatchThreads:MTLSizeMake(rows * num_kv_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->rms_norm_rows_pipeline, rows * num_kv_heads), 1, 1)];
+                termite_metal_dispatch_rms_norm_rows(runtime, encoder, rows * num_kv_heads, head_dim);
             }
         }
         const int end_rc = (rc != 0 || keep_scope_open_after == 0)
