@@ -1637,6 +1637,10 @@ pub const ComputeBackend = struct {
         /// small list of suppressed token ids.
         argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
 
+        /// Consume an active decoder-runtime frame with a batched masked
+        /// argmax. Backends return null when there is no compatible frame.
+        decoderRuntimeArgmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+
         /// Return the argmax token id as a backend tensor while masking a small
         /// list of suppressed token ids. Used by pure-greedy decode paths that
         /// must avoid full-logit host transfers.
@@ -3244,6 +3248,13 @@ pub const ComputeBackend = struct {
 
     pub fn argmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
         if (self.vtable.argmaxRowsSuppress) |argmax_rows_suppress| {
+            return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeArgmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
+        if (self.vtable.decoderRuntimeArgmaxRowsSuppress) |argmax_rows_suppress| {
             return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
         }
         return null;

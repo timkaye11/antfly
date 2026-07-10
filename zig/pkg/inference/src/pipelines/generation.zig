@@ -900,7 +900,7 @@ fn gemma4MtpProbeK() usize {
 }
 
 fn gemma4MtpAutoMaxK() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MAX_K") orelse 2;
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MAX_K") orelse 1;
 }
 
 fn gemma4MtpAutoCostProbeRounds() usize {
@@ -908,7 +908,7 @@ fn gemma4MtpAutoCostProbeRounds() usize {
 }
 
 fn gemma4MtpAutoMinAcceptedPerRoundMilli() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_ACCEPTED_PER_ROUND_MILLI") orelse 2000;
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_ACCEPTED_PER_ROUND_MILLI") orelse 1500;
 }
 
 fn gemma4MtpHiddenOnlyMaterializeEnabled() bool {
@@ -951,8 +951,19 @@ fn gemma4MtpMaterializeReplayEnabled() bool {
 /// Fold the correction/bonus materialize forward into the next verify: the
 /// committed token stays pending (KV unwritten) and the next round's verify
 /// prepends it as row 0, whose suffix write materializes the KV.
-fn gemma4MtpDeferMaterializeEnabled() bool {
-    return platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE");
+fn gemma4MtpDeferMaterializeEnabled(kind: ops.BackendKind) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", kind == .metal);
+}
+
+/// Reuse the target verify row as the next draft activation after a folded
+/// correction/bonus instead of the assistant chain projection.
+fn gemma4MtpDeferMaterializeTargetActivationEnabled(kind: ops.BackendKind) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION", kind == .metal);
+}
+
+fn gemma4MtpDeferredTargetActivationRow(cached_first: bool, logit_base_row: usize, accepted: usize) ?usize {
+    if (cached_first) return if (accepted >= 2) accepted - 2 else null;
+    return if (accepted != 0) logit_base_row + accepted - 1 else null;
 }
 
 fn gemma4MtpDraftEmbeddingCacheSize() usize {
@@ -963,8 +974,8 @@ fn gemma4MtpResidentDraftBackendAllowed(kind: ops.BackendKind) bool {
     return kind == .cuda or kind == .metal;
 }
 
-fn gemma4MtpMetalAutoEnabled() bool {
-    return platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO");
+pub fn gemma4MtpMetalAutoEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO", true);
 }
 
 fn gemma4MetalDirectGreedyDefault() bool {
@@ -4721,10 +4732,13 @@ pub const NativeGenerationPipeline = struct {
         pre_norm_hidden: ?ops.CT,
         rows: usize,
         greedy_token_id: ?u32 = null,
+        prepared_tail_choices: ?[]u32 = null,
+        choices_allocator: ?std.mem.Allocator = null,
 
         fn deinit(self: *ForwardHiddenDevice) void {
             self.cb.free(self.hidden);
             if (self.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
+            if (self.prepared_tail_choices) |choices| self.choices_allocator.?.free(choices);
             self.* = undefined;
         }
     };
@@ -5065,6 +5079,29 @@ pub const NativeGenerationPipeline = struct {
             hidden_source,
             replay_label,
             gemma4MtpUnsafeTargetReplayEnabled(),
+            null,
+        );
+    }
+
+    fn forwardMtpTargetHiddenDevicePreparedArgmax(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        replay_label: []const u8,
+        suppress_token_ids: []const i32,
+    ) !ForwardHiddenDevice {
+        return self.forwardMtpTargetHiddenDeviceReplayMode(
+            input_ids,
+            batch,
+            seq_len,
+            decode_context,
+            hidden_source,
+            replay_label,
+            gemma4MtpUnsafeTargetReplayEnabled(),
+            suppress_token_ids,
         );
     }
 
@@ -5084,6 +5121,7 @@ pub const NativeGenerationPipeline = struct {
             hidden_source,
             "",
             false,
+            null,
         );
     }
 
@@ -5096,6 +5134,7 @@ pub const NativeGenerationPipeline = struct {
         hidden_source: Gemma4MtpTargetHiddenSource,
         replay_label: []const u8,
         allow_replay: bool,
+        prepared_tail_suppress_token_ids: ?[]const i32,
     ) !ForwardHiddenDevice {
         if (hidden_source != .final) {
             return self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
@@ -5112,15 +5151,28 @@ pub const NativeGenerationPipeline = struct {
             const verify_trace = enableGemma4MtpVerifyTrace();
             const trace_stats_before = if (verify_trace) decoder_gated_runtime.getTimingStats() else undefined;
             const trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
-            if (try decoder_gated_runtime.forwardFinalHiddenRows(
-                &self.cb,
-                allocator,
-                self.gpt_config,
-                self.gpt_config.num_hidden_layers,
-                input_ids,
-                seq_len,
-                decode_context,
-            )) |direct| {
+            const direct_result = if (prepared_tail_suppress_token_ids) |suppress_token_ids|
+                try decoder_gated_runtime.forwardFinalHiddenRowsPreparedArgmax(
+                    &self.cb,
+                    allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    input_ids,
+                    seq_len,
+                    decode_context,
+                    suppress_token_ids,
+                )
+            else
+                try decoder_gated_runtime.forwardFinalHiddenRows(
+                    &self.cb,
+                    allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    input_ids,
+                    seq_len,
+                    decode_context,
+                );
+            if (direct_result) |direct| {
                 if (verify_trace) {
                     const wall_ns = mtpProfileElapsedNs(true, self.io, trace_started_at);
                     const after = decoder_gated_runtime.getTimingStats();
@@ -5145,6 +5197,8 @@ pub const NativeGenerationPipeline = struct {
                     .hidden = direct.final_hidden,
                     .pre_norm_hidden = null,
                     .rows = direct.rows,
+                    .prepared_tail_choices = direct.prepared_tail_choices,
+                    .choices_allocator = direct.choices_allocator,
                 };
             }
         }
@@ -5728,7 +5782,7 @@ pub const NativeGenerationPipeline = struct {
         var round_penalties = try penalty_state.clone(allocator);
         defer round_penalties.deinit(allocator);
 
-        const defer_materialize = gemma4MtpDeferMaterializeEnabled();
+        const defer_materialize = gemma4MtpDeferMaterializeEnabled(self.cb.kind());
         const entry_pending = mtp_activation.pendingCount();
         mtp_activation.assertKvTokensInSync(decode_state, seq_len.*);
 
@@ -5962,24 +6016,41 @@ pub const NativeGenerationPipeline = struct {
             var used_fused_verify = false;
             {
                 const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                var target_hidden = self.forwardMtpTargetHiddenDevice(
-                    token_ids[verify_start..verify_seq],
-                    1,
-                    verify_seq,
-                    &target_ctx,
-                    hidden_source,
-                    "gpt.mtp_verify_final_hidden",
-                ) catch |err| {
+                const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
+                const logit_base_row = target_query_len - target_lm_rows;
+                const suppress_token_ids = self.gpt_config.suppressTokenIds();
+                const target_hidden_result = if (logit_base_row == 0)
+                    self.forwardMtpTargetHiddenDevicePreparedArgmax(
+                        token_ids[verify_start..verify_seq],
+                        1,
+                        verify_seq,
+                        &target_ctx,
+                        hidden_source,
+                        "gpt.mtp_verify_final_hidden",
+                        suppress_token_ids,
+                    )
+                else
+                    self.forwardMtpTargetHiddenDevice(
+                        token_ids[verify_start..verify_seq],
+                        1,
+                        verify_seq,
+                        &target_ctx,
+                        hidden_source,
+                        "gpt.mtp_verify_final_hidden",
+                    );
+                var target_hidden = target_hidden_result catch |err| {
                     decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                     return err;
                 };
                 defer target_hidden.deinit();
+                var prepared_tail_choices = target_hidden.prepared_tail_choices;
+                target_hidden.prepared_tail_choices = null;
+                target_hidden.choices_allocator = null;
+                defer if (prepared_tail_choices) |choices| allocator.free(choices);
                 mtp_activation.notePendingKvWritten();
 
                 const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
                 const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
-                const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
-                const logit_base_row = target_query_len - target_lm_rows;
                 const verify_trace = enableGemma4MtpVerifyTrace();
                 const tail_trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
                 var lm_input = target_hidden.hidden;
@@ -5994,12 +6065,11 @@ pub const NativeGenerationPipeline = struct {
                 const lm_w = try self.graphWeight("lm_head.weight");
                 defer self.cb.free(lm_w);
                 const trace_lmw_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
-                const suppress_token_ids = self.gpt_config.suppressTokenIds();
                 // Prefer the prepared final-lm-head slot (same quantized weight
                 // the planned decode frames use for their tail) over the dense
                 // lm_head fallback inside the generic linearNoBias path.
-                var prepared_tail_choices: ?[]u32 = if (self.cb.kind() == .metal)
-                    try decoder_gated_runtime.forwardPreparedLmHeadArgmaxRows(
+                if (prepared_tail_choices == null and self.cb.kind() == .metal) {
+                    prepared_tail_choices = try decoder_gated_runtime.forwardPreparedLmHeadArgmaxRows(
                         &self.cb,
                         self.gpt_config,
                         self.gpt_config.num_hidden_layers,
@@ -6007,10 +6077,8 @@ pub const NativeGenerationPipeline = struct {
                         target_lm_rows,
                         suppress_token_ids,
                         allocator,
-                    )
-                else
-                    null;
-                defer if (prepared_tail_choices) |choices| allocator.free(choices);
+                    );
+                }
                 if (cached_first_target_choice) |cached_choice| {
                     const target_tail_choices = blk: {
                         if (prepared_tail_choices) |choices| {
@@ -6257,6 +6325,34 @@ pub const NativeGenerationPipeline = struct {
                         used_fused_verify = true;
                     }
                 }
+                if (used_fused_verify and
+                    defer_materialize and
+                    gemma4MtpDeferMaterializeTargetActivationEnabled(self.cb.kind()) and
+                    (verify_result.correction_added or verify_result.had_bonus) and
+                    !verify_result.hit_eos and
+                    !verify_result.hit_grammar_stop)
+                {
+                    // Option C: the verify already produced the target hidden
+                    // that scored the pending token, so reuse it directly.
+                    const row = gemma4MtpDeferredTargetActivationRow(
+                        cached_first_target_choice != null,
+                        logit_base_row,
+                        verify_result.accepted,
+                    ) orelse return error.InvalidTensorShape;
+                    if (row >= target_hidden.rows) return error.InvalidTensorShape;
+                    const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                    if (use_resident_draft) {
+                        next_device_activation = (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, &draft_pipeline.cb)) orelse return error.UnsupportedBackend;
+                        if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(next_device_activation.?) catch {};
+                    } else {
+                        next_host_activation = try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source);
+                    }
+                    if (mtp_profile.enabled) {
+                        mtp_profile.activation_copies += 1;
+                        mtp_profile.accepted_hidden_reuse_rows += 1;
+                        mtp_profile.activation_copy_ns +|= mtpProfileElapsedNs(true, self.io, activation_started_at);
+                    }
+                }
             }
 
             if (!used_fused_verify) {
@@ -6404,22 +6500,19 @@ pub const NativeGenerationPipeline = struct {
                 // shape) and the suffix write materializes its KV. Draft
                 // quality only (the verify still decides every token): the
                 // next round drafts without the committed token's donor KV
-                // row, and its step 1 consumes the assistant's chained
-                // projection instead of the target hidden — positionally
-                // exact for corrections (slot[m] sits at the committed
-                // position), one chain position short for bonus (no k+1-th
-                // step exists; the bonus token enters via the embedding).
-                const step_index = if (verify_result.correction_added) matched_drafts else draft_count - 1;
-                if (use_resident_draft) {
-                    const retained = draft_step_device_activations[step_index] orelse return error.MissingGemma4MtpActivation;
-                    draft_step_device_activations[step_index] = null;
-                    if (next_device_activation) |old| draft_pipeline.cb.free(old);
-                    next_device_activation = retained;
-                } else {
-                    const retained = draft_step_host_activations[step_index] orelse return error.MissingGemma4MtpActivation;
-                    draft_step_host_activations[step_index] = null;
-                    if (next_host_activation) |old| allocator.free(old);
-                    next_host_activation = retained;
+                // row. The target verify activation above is preferred; this
+                // retained assistant-chain activation is its fallback.
+                if (next_device_activation == null and next_host_activation == null) {
+                    const step_index = if (verify_result.correction_added) matched_drafts else draft_count - 1;
+                    if (use_resident_draft) {
+                        const retained = draft_step_device_activations[step_index] orelse return error.MissingGemma4MtpActivation;
+                        draft_step_device_activations[step_index] = null;
+                        next_device_activation = retained;
+                    } else {
+                        const retained = draft_step_host_activations[step_index] orelse return error.MissingGemma4MtpActivation;
+                        draft_step_host_activations[step_index] = null;
+                        next_host_activation = retained;
+                    }
                 }
                 next_cached_target_choice = null;
                 mtp_activation.notePendingUnmaterialized();
@@ -9150,8 +9243,18 @@ test "Gemma4 MTP active materialization is default" {
     try std.testing.expectEqual(true, gemma4MtpActiveMaterializeEnabled());
 }
 
-test "Gemma4 MTP defer materialize is opt-in" {
-    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled());
+test "Gemma4 MTP defer materialize and target activation default on only for Metal" {
+    try std.testing.expectEqual(true, gemma4MtpDeferMaterializeEnabled(.metal));
+    try std.testing.expectEqual(true, gemma4MtpDeferMaterializeTargetActivationEnabled(.metal));
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled(.cuda));
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeTargetActivationEnabled(.cuda));
+}
+
+test "Gemma4 MTP Metal auto defaults to calibrated k1" {
+    try std.testing.expectEqual(true, gemma4MtpMetalAutoEnabled());
+    try std.testing.expectEqual(@as(usize, 1), gemma4MtpAutoMaxK());
+    try std.testing.expectEqual(@as(usize, 16), gemma4MtpAutoCostProbeRounds());
+    try std.testing.expectEqual(@as(usize, 1500), gemma4MtpAutoMinAcceptedPerRoundMilli());
 }
 
 test "gemma4 mtp pending token bookkeeping holds kv invariant across round shapes" {
@@ -9256,6 +9359,13 @@ test "Gemma4 MTP cached first choice requires multi draft" {
     try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(0));
     try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(1));
     try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(2));
+}
+
+test "Gemma4 MTP deferred target activation maps cached verify rows" {
+    try std.testing.expectEqual(@as(?usize, null), gemma4MtpDeferredTargetActivationRow(true, 0, 1));
+    try std.testing.expectEqual(@as(?usize, 0), gemma4MtpDeferredTargetActivationRow(true, 0, 2));
+    try std.testing.expectEqual(@as(?usize, 2), gemma4MtpDeferredTargetActivationRow(true, 0, 4));
+    try std.testing.expectEqual(@as(?usize, 3), gemma4MtpDeferredTargetActivationRow(false, 1, 3));
 }
 
 test "Gemma4 Metal direct greedy is default" {

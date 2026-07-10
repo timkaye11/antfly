@@ -224,13 +224,15 @@ run_mtp_policy_check() {
   fi
   local out="$ROOT_OUT_DIR/qat-mtp-policy"
   mkdir -p "$out"
+  local policy_tokens="${ANTFLY_INFERENCE_GEMMA4_MTP_POLICY_TOKENS:-32}"
   local target_out="$out/target.txt"
-  local auto_out="$out/auto.txt"
+  local auto_out="$out/auto-positive.txt"
+  local uncalibrated_out="$out/auto-uncalibrated.txt"
   local force_out="$out/force.txt"
   local force_k1_out="$out/force-k1.txt"
   run_antfly_inference generate "$model" "$ORACLE_RENDERED_PROMPT" \
     --backend metal \
-    --max-tokens "$ORACLE_TOKENS" \
+    --max-tokens "$policy_tokens" \
     --temperature 0 \
     --raw-prompt \
     --print-token-count \
@@ -238,7 +240,6 @@ run_mtp_policy_check() {
     --print-token-ids \
     >"$target_out" 2>&1
   ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
-  ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=0 \
   ANTFLY_GEMMA4_MTP_PROFILE=1 \
   run_antfly_inference generate "$model" "$ORACLE_RENDERED_PROMPT" \
     --backend metal \
@@ -246,7 +247,7 @@ run_mtp_policy_check() {
     --speculative-k "${ANTFLY_INFERENCE_GEMMA4_COMPARE_SPECULATIVE_K:-${ANTFLY_INFERENCE_GEMMA4_SPECULATIVE_K:-2}}" \
     --speculation-policy auto \
     --speculation-calibration positive \
-    --max-tokens "$ORACLE_TOKENS" \
+    --max-tokens "$policy_tokens" \
     --temperature 0 \
     --raw-prompt \
     --print-token-count \
@@ -258,13 +259,41 @@ run_mtp_policy_check() {
   target_ids="$(token_ids_from_output "$target_out")"
   auto_ids="$(token_ids_from_output "$auto_out")"
   if [[ -z "$target_ids" || -z "$auto_ids" || "$target_ids" != "$auto_ids" ]]; then
-    echo "Gemma4 QAT MTP auto policy changed token IDs" >&2
+    echo "Gemma4 QAT calibrated MTP auto policy changed token IDs" >&2
     echo "target: ${target_ids:-<missing>} ($target_out)" >&2
     echo "auto:   ${auto_ids:-<missing>} ($auto_out)" >&2
     exit 1
   fi
-  if grep -Eq '^speculative: .*mtp_enabled=true' "$auto_out"; then
-    echo "Gemma4 QAT Metal MTP auto enabled without explicit opt-in: $auto_out" >&2
+  if ! grep -Eq '^speculative: .*decision=active.*mtp_enabled=true' "$auto_out"; then
+    echo "Gemma4 QAT calibrated Metal MTP auto did not enable: $auto_out" >&2
+    exit 1
+  fi
+  ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
+  ANTFLY_GEMMA4_MTP_PROFILE=1 \
+  run_antfly_inference generate "$model" "$ORACLE_RENDERED_PROMPT" \
+    --backend metal \
+    --draft-model "$draft" \
+    --speculative-k "${ANTFLY_INFERENCE_GEMMA4_COMPARE_SPECULATIVE_K:-${ANTFLY_INFERENCE_GEMMA4_SPECULATIVE_K:-2}}" \
+    --speculation-policy auto \
+    --speculation-calibration none \
+    --max-tokens "$policy_tokens" \
+    --temperature 0 \
+    --raw-prompt \
+    --print-token-count \
+    --print-finish-reason \
+    --print-token-ids \
+    --print-timing \
+    >"$uncalibrated_out" 2>&1
+  local uncalibrated_ids
+  uncalibrated_ids="$(token_ids_from_output "$uncalibrated_out")"
+  if [[ -z "$uncalibrated_ids" || "$target_ids" != "$uncalibrated_ids" ]]; then
+    echo "Gemma4 QAT uncalibrated MTP auto policy changed token IDs" >&2
+    echo "target:       ${target_ids:-<missing>} ($target_out)" >&2
+    echo "uncalibrated: ${uncalibrated_ids:-<missing>} ($uncalibrated_out)" >&2
+    exit 1
+  fi
+  if ! grep -Eq '^speculative: .*decision=disabled_uncalibrated.*mtp_enabled=false' "$uncalibrated_out"; then
+    echo "Gemma4 QAT uncalibrated Metal MTP auto did not stay off: $uncalibrated_out" >&2
     exit 1
   fi
   ANTFLY_GEMMA4_MTP_PROFILE=1 \
@@ -273,7 +302,7 @@ run_mtp_policy_check() {
     --draft-model "$draft" \
     --speculative-k "${ANTFLY_INFERENCE_GEMMA4_COMPARE_SPECULATIVE_K:-${ANTFLY_INFERENCE_GEMMA4_SPECULATIVE_K:-2}}" \
     --speculation-policy force \
-    --max-tokens "$ORACLE_TOKENS" \
+    --max-tokens "$policy_tokens" \
     --temperature 0 \
     --raw-prompt \
     --print-token-count \
@@ -299,7 +328,7 @@ run_mtp_policy_check() {
     --draft-model "$draft" \
     --speculative-k 1 \
     --speculation-policy force \
-    --max-tokens "$ORACLE_TOKENS" \
+    --max-tokens "$policy_tokens" \
     --temperature 0 \
     --raw-prompt \
     --print-token-count \

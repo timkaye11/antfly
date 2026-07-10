@@ -1505,9 +1505,12 @@ pub const GreedyTokenAndFinalHidden = struct {
 pub const FinalHiddenRows = struct {
     final_hidden: ops.CT,
     rows: usize,
+    prepared_tail_choices: ?[]u32 = null,
+    choices_allocator: ?std.mem.Allocator = null,
 
     pub fn deinit(self: *FinalHiddenRows, cb: *const ops.ComputeBackend) void {
         cb.free(self.final_hidden);
+        if (self.prepared_tail_choices) |choices| self.choices_allocator.?.free(choices);
         self.* = undefined;
     }
 };
@@ -6060,7 +6063,7 @@ pub fn forwardPrefillLastPreparedTail(
     };
 }
 
-pub fn forwardFinalHiddenRows(
+fn forwardFinalHiddenRowsInternal(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     gpt_config: gpt_mod.Config,
@@ -6068,6 +6071,7 @@ pub fn forwardFinalHiddenRows(
     input_ids: []const i64,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
+    prepared_tail_suppress_token_ids: ?[]const i32,
 ) !?FinalHiddenRows {
     if (!supportsConfig(gpt_config)) return null;
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
@@ -6146,10 +6150,75 @@ pub fn forwardFinalHiddenRows(
         return null;
     };
     if (final_hidden != hidden_result.hidden) cb.free(hidden_result.hidden);
+    errdefer cb.free(final_hidden);
+    var prepared_tail_choices: ?[]u32 = null;
+    errdefer if (prepared_tail_choices) |choices| allocator.free(choices);
+    if (prepared_tail_suppress_token_ids) |suppress_token_ids| {
+        if (!getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME")) {
+            prepared_tail_choices = try forwardPreparedLmHeadArgmaxRows(
+                cb,
+                gpt_config,
+                configured_layer_count,
+                final_hidden,
+                hidden_result.total_rows,
+                suppress_token_ids,
+                allocator,
+            );
+            // The on-encoder argmax submits and waits the whole frame so the
+            // shared token buffer can be read. Keep the local frame state in
+            // sync and avoid submitting a second, empty frame on return.
+            if (!cb.decoderRuntimeHasActiveFrame()) decoder_frame_active = false;
+        }
+    }
     return .{
         .final_hidden = final_hidden,
         .rows = hidden_result.total_rows,
+        .prepared_tail_choices = prepared_tail_choices,
+        .choices_allocator = if (prepared_tail_choices != null) allocator else null,
     };
+}
+
+pub fn forwardFinalHiddenRows(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?FinalHiddenRows {
+    return forwardFinalHiddenRowsInternal(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        input_ids,
+        seq_len,
+        decode_context,
+        null,
+    );
+}
+
+pub fn forwardFinalHiddenRowsPreparedArgmax(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    suppress_token_ids: []const i32,
+) !?FinalHiddenRows {
+    return forwardFinalHiddenRowsInternal(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        input_ids,
+        seq_len,
+        decode_context,
+        suppress_token_ids,
+    );
 }
 
 /// Multi-row lm_head argmax over the prepared final-lm-head slot. The MTP
@@ -6187,7 +6256,8 @@ pub fn forwardPreparedLmHeadArgmaxRows(
             .out_dim = vocab_size,
         })) orelse break :multi_row;
         defer cb.free(logits);
-        const row_choices = (try cb.argmaxRowsSuppress(logits, 0, rows, vocab_size, suppress_token_ids, allocator)) orelse break :multi_row;
+        const row_choices = (try cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, rows, vocab_size, suppress_token_ids, allocator)) orelse
+            (try cb.argmaxRowsSuppress(logits, 0, rows, vocab_size, suppress_token_ids, allocator)) orelse break :multi_row;
         defer allocator.free(row_choices);
         if (row_choices.len < rows) break :multi_row;
         @memcpy(choices, row_choices[0..rows]);

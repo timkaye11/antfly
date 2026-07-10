@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Deterministic gates for ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE (spec-decode P2
-# fold): with the fold on, every run must produce token ids identical to the
+# Deterministic gates for default-on ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE
+# (spec-decode P2 fold): with the fold on, every run must produce token ids identical to the
 # plain target, materializations must drop to 0 (replaced by
 # deferred_materializations), and pending tokens must be flushed before the
 # mid-generation standardDecode fallbacks.
@@ -140,7 +140,6 @@ for K in 1 2 4; do
   echo "== fold-on identity: force k=$K + bonus =="
   out="$OUT_DIR/fold-k$K.txt"
   run_spec "$out" "$K" force \
-    ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1 \
     ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1
   check_identity "fold-k$K" "$out"
   mat="$(profile_counter "$out" materializations)"
@@ -159,7 +158,6 @@ done
 echo "== fold-on + zero-match fallback (pending must flush before standardDecode) =="
 out="$OUT_DIR/fold-fallback-zero-match.txt"
 run_spec "$out" 1 auto \
-  ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1 \
   ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1 \
   ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1 \
   ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
@@ -179,7 +177,6 @@ echo "   ok: pending flushed once before fallback"
 echo "== fold-on + acceptance-gate fallback =="
 out="$OUT_DIR/fold-fallback-acceptance.txt"
 run_spec "$out" 2 auto \
-  ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1 \
   ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1 \
   ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1 \
   ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
@@ -196,7 +193,6 @@ echo "   ok"
 echo "== fold-on + cost-gate fallback =="
 out="$OUT_DIR/fold-fallback-cost.txt"
 run_spec "$out" 2 auto \
-  ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1 \
   ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1 \
   ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1 \
   ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
@@ -213,6 +209,7 @@ echo "   ok"
 echo "== fold-off control: force k=2 + bonus (no behavior change) =="
 out="$OUT_DIR/foldoff-k2.txt"
 run_spec "$out" 2 force \
+  ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=0 \
   ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1
 check_identity "foldoff-k2" "$out"
 deferred="$(profile_counter "$out" deferred_materializations)"

@@ -19095,6 +19095,27 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder(
 // Row i reads logits at logits_offset + i*out_dim*4 and writes its token id to
 // token_buffer[i*4] with topk scratch at i*partial_bytes; ranges are disjoint
 // so rows may interleave on the GPU.
+int termite_metal_decode_runtime_reserve_argmax_rows(
+    termite_metal_decode_runtime *runtime,
+    size_t rows,
+    size_t out_dim
+) {
+    if (runtime == NULL || rows == 0 || out_dim == 0 || out_dim > UINT32_MAX) return -1;
+    if (rows > SIZE_MAX / sizeof(uint32_t)) return -2;
+    const size_t token_bytes = rows * sizeof(uint32_t);
+    if (runtime->token_capacity < token_bytes || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
+        id<MTLBuffer> token = [runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared];
+        if (token == nil) return -3;
+        runtime->token_buffer = token;
+        runtime->token_capacity = token_bytes;
+    }
+    const size_t block_count = (out_dim + 1023u) / 1024u;
+    if (block_count == 0 || block_count > SIZE_MAX / sizeof(float)) return -4;
+    const size_t partial_bytes = block_count * sizeof(float);
+    if (rows > SIZE_MAX / partial_bytes) return -4;
+    return termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, rows * partial_bytes);
+}
+
 int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
     termite_metal_decode_runtime *runtime,
     void *logits_handle,
@@ -19103,7 +19124,8 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
     size_t out_dim,
     const int32_t *suppress_token_ids,
     size_t suppress_count,
-    uint32_t *output_token_ids
+    uint32_t *output_token_ids,
+    int consume_active_frame
 ) {
     if (runtime == NULL || logits_handle == NULL || output_token_ids == NULL) return -1;
     if (rows == 0 || out_dim == 0 || out_dim > UINT32_MAX || suppress_count > UINT32_MAX) return -2;
@@ -19117,16 +19139,9 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
         if (logits_offset > logits_buffer.length || logits_bytes > logits_buffer.length - logits_offset) return -5;
 
         // Pre-size shared output + scratch so nothing reallocates mid-encode.
-        const size_t token_bytes = rows * sizeof(uint32_t);
-        if (runtime->token_capacity < token_bytes || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared];
-            if (token == nil) return -6;
-            runtime->token_buffer = token;
-            runtime->token_capacity = token_bytes;
-        }
+        if (termite_metal_decode_runtime_reserve_argmax_rows(runtime, rows, out_dim) != 0) return -6;
         const size_t block_count = (out_dim + 1023u) / 1024u;
         const size_t partial_bytes = block_count * sizeof(float);
-        if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, rows * partial_bytes) != 0) return -7;
 
         id<MTLBuffer> suppress_buffer = nil;
         if (suppress_count > 0) {
@@ -19136,7 +19151,10 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
             if (suppress_buffer == nil) return -8;
         }
 
-        const bool restore_active_frame = (runtime->active_frame_cb != nil);
+        const bool encode_on_active_frame =
+            consume_active_frame != 0 &&
+            runtime->active_frame_cb != nil && runtime->active_planned_compute_encoder != nil;
+        const bool restore_active_frame = runtime->active_frame_cb != nil && !encode_on_active_frame;
         if (restore_active_frame) {
             if (!termite_metal_decode_runtime_active_frame_empty(runtime)) {
                 int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
@@ -19150,10 +19168,14 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
         }
 
         bool frame_owned = true;
-        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
-        if (command_buffer == nil) return -11;
-        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (encoder == nil) return -12;
+        id<MTLCommandBuffer> command_buffer = nil;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        if (!encode_on_active_frame) {
+            command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+            if (command_buffer == nil) return -11;
+            encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+            if (encoder == nil) return -12;
+        }
         int encode_rc = 0;
         for (size_t row = 0; row < rows; ++row) {
             encode_rc = termite_metal_encode_argmax_logits_suppress_on_encoder_at(
@@ -19169,15 +19191,26 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
                 -13);
             if (encode_rc != 0) break;
         }
-        [encoder endEncoding];
-        if (encode_rc != 0) return encode_rc;
-        if (!frame_owned) {
-            int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
-            if (flush_rc != 0) return -14;
+        if (encode_on_active_frame) {
+            // The logits producer, row argmaxes, and token writeback now share
+            // the verify frame. Submit+wait closes the planned encoder without
+            // reopening an empty frame, so this is the only synchronization.
+            int submit_rc = termite_metal_decode_runtime_submit_frame(runtime);
+            if (submit_rc != 0) return -14;
+            int wait_rc = termite_metal_decode_runtime_wait_frame(runtime);
+            if (wait_rc != 0) return -14;
+            if (encode_rc != 0) return encode_rc;
         } else {
-            [command_buffer commit];
-            [command_buffer waitUntilCompleted];
-            if (command_buffer.status != MTLCommandBufferStatusCompleted) return -15;
+            [encoder endEncoding];
+            if (encode_rc != 0) return encode_rc;
+            if (!frame_owned) {
+                int flush_rc = termite_metal_decode_runtime_flush_active_frame(runtime);
+                if (flush_rc != 0) return -14;
+            } else {
+                [command_buffer commit];
+                [command_buffer waitUntilCompleted];
+                if (command_buffer.status != MTLCommandBufferStatusCompleted) return -15;
+            }
         }
         const uint32_t *result = (const uint32_t *)runtime->token_buffer.contents;
         if (result == NULL) return -16;

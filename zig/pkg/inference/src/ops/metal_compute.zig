@@ -17753,6 +17753,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             traceMetalPrefillFramePlan("decline=qwen3-shape batch={d} seq={d} rows={d} ple={d} tail={}", .{ request.batch, request.seq_len, request.rows, request.ple_hidden_size, request.include_tail });
             return false;
         }
+        // The verify tail writes one token and one top-k scratch range per row.
+        // Reserve both before any frame work is encoded; replacing either
+        // buffer after row 0 would strand earlier dispatches on stale storage.
+        if (request.include_tail and request.rows <= 16 and !metal_runtime.reserveArgmaxRows(self.provider_impl, request.rows, request.vocab_size)) {
+            traceMetalPrefillFramePlan("decline=tail-argmax-reserve rows={d} vocab={d}", .{ request.rows, request.vocab_size });
+            return false;
+        }
         const plan_key = prefillFramePlanKey(request);
         if (self.hasReusablePrefillFramePlan(plan_key)) {
             plan_success = true;
@@ -19289,6 +19296,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return tokens;
     }
 
+    fn decoderRuntimeArgmaxRowsSuppressOp(
+        ctx: *anyopaque,
+        tensor: CT,
+        row_start: usize,
+        row_count: usize,
+        dim: usize,
+        suppress_token_ids: []const i32,
+        allocator: std.mem.Allocator,
+    ) anyerror!?[]u32 {
+        if (row_count == 0 or dim == 0) return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null) return null;
+        const metal_tensor = buf.metal_tensor orelse return null;
+        if (!metal_tensor.isDevice()) return null;
+
+        const tokens = try allocator.alloc(u32, row_count);
+        errdefer allocator.free(tokens);
+        if (try metal_runtime.argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(
+            self.provider_impl,
+            metal_tensor,
+            row_start,
+            dim,
+            suppress_token_ids,
+            tokens,
+        )) return tokens;
+        allocator.free(tokens);
+        return null;
+    }
+
     fn argmaxLastRowSuppressTensorOp(ctx: *anyopaque, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) anyerror!?CT {
         if (rows == 0 or dim == 0) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -19862,6 +19899,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
         vt.linearNoBiasGrouped = linearNoBiasGroupedOp;
         vt.linearNoBiasArgmaxRowsSuppress = linearNoBiasArgmaxRowsSuppressOp;
+        vt.decoderRuntimeArgmaxRowsSuppress = decoderRuntimeArgmaxRowsSuppressOp;
         vt.gemma4MtpVerifyCommit = gemma4MtpVerifyCommitOp;
         vt.linearNoBiasPair = linearNoBiasPairOp;
         vt.splitLastDim3 = splitLastDim3Op;

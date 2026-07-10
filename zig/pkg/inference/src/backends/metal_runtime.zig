@@ -2518,6 +2518,29 @@ pub fn argmaxLogitsRowsSuppressDevice(
     suppress_token_ids: []const i32,
     out: []u32,
 ) !bool {
+    return argmaxLogitsRowsSuppressDeviceWithFrameMode(self, input, row_start, dim, suppress_token_ids, out, false);
+}
+
+pub fn argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(
+    self: anytype,
+    input: MetalTensor,
+    row_start: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    out: []u32,
+) !bool {
+    return argmaxLogitsRowsSuppressDeviceWithFrameMode(self, input, row_start, dim, suppress_token_ids, out, true);
+}
+
+fn argmaxLogitsRowsSuppressDeviceWithFrameMode(
+    self: anytype,
+    input: MetalTensor,
+    row_start: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    out: []u32,
+    consume_active_frame: bool,
+) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (!input.isDevice()) return false;
@@ -2539,8 +2562,15 @@ pub fn argmaxLogitsRowsSuppressDevice(
         if (suppress_token_ids.len == 0) null else suppress_token_ids.ptr,
         suppress_token_ids.len,
         out.ptr,
+        @intFromBool(consume_active_frame),
     );
     return rc == 0;
+}
+
+pub fn reserveArgmaxRows(self: anytype, rows: usize, out_dim: usize) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    return termite_metal_decode_runtime_reserve_argmax_rows(runtime, rows, out_dim) == 0;
 }
 
 pub fn encodeArgmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !bool {
@@ -8438,6 +8468,12 @@ pub extern fn termite_metal_decode_runtime_argmax_from_logits_rows_suppress_devi
     suppress_token_ids: [*c]const i32,
     suppress_count: usize,
     output_token_ids: [*c]u32,
+    consume_active_frame: c_int,
+) c_int;
+pub extern fn termite_metal_decode_runtime_reserve_argmax_rows(
+    runtime: ?*RawMetalDecodeRuntime,
+    rows: usize,
+    out_dim: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_encode_argmax_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -26993,6 +27029,25 @@ test "metal native decoder runtime batched multi-row argmax matches per-row" {
     var small_tokens: [small_rows]u32 = undefined;
     try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, small_tensor, 0, small_dim, &.{}, small_tokens[0..small_rows]));
     for (0..small_rows) |row| try std.testing.expectEqual(@as(u32, @intCast(small_maxima[row])), small_tokens[row]);
+
+    // The generic helper preserves its historical frame lifecycle.
+    try std.testing.expect(reserveArgmaxRows(&provider, rows, dim));
+    try beginFrame(runtime);
+    defer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.tail), .tail);
+    var generic_frame_tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDevice(&provider, logits_tensor, 0, dim, &suppress, generic_frame_tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), generic_frame_tokens[row]);
+    try std.testing.expect(hasActiveFrame(runtime));
+    try cancelFrame(runtime);
+
+    // The explicit tail helper consumes the planned frame in one submit/wait.
+    try beginFrame(runtime);
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.tail), .tail);
+    var frame_tokens: [rows]u32 = undefined;
+    try std.testing.expect(try argmaxLogitsRowsSuppressDeviceConsumeActiveFrame(&provider, logits_tensor, 0, dim, &suppress, frame_tokens[0..rows]));
+    for (0..rows) |row| try std.testing.expectEqual(@as(u32, @intCast((maxima[row] + 11) % dim)), frame_tokens[row]);
+    try std.testing.expect(!hasActiveFrame(runtime));
 }
 
 test "metal native decoder runtime can prepare bf16 linear without copying model-owned bytes" {

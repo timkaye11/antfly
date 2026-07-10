@@ -124,19 +124,30 @@ const Options = struct {
     json_timing_path: ?[]const u8 = null,
 };
 
-fn shouldDisableMetalAutoDraft(opts: Options) bool {
+fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
     return opts.backend == .metal and
         opts.speculation_policy == .auto and
-        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO");
+        (!draft_is_gemma4_mtp or !generation.gemma4MtpMetalAutoEnabled());
 }
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    const effective_draft_model = if (opts.speculation_policy == .off or shouldDisableMetalAutoDraft(opts)) null else opts.draft_model;
+    try native_backend_choice.validate(opts.backend);
+    var preflight_draft_gpt_config: ?gpt_mod.Config = null;
+    const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
+        const draft_model_dir = opts.draft_model orelse break :blk null;
+        var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
+        defer draft_manifest.deinit();
+        const draft_cfg = try session_factory.loadGptConfigFromModelDir(allocator, draft_model_dir, draft_manifest);
+        if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg) or shouldSkipMetalAutoDraftLoad(opts, draft_cfg.gemma4_mtp_assistant)) {
+            preflight_draft_gpt_config = draft_cfg;
+            break :blk null;
+        }
+        break :blk draft_model_dir;
+    } else opts.draft_model;
     if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
     if (opts.raw_decode_bench and effective_draft_model != null) return error.RawDecodeBenchSpeculationUnsupported;
     if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
-    try native_backend_choice.validate(opts.backend);
     const require_server = requireWarmServer(opts);
     if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
     if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
@@ -224,7 +235,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .prefill_chunk_size = opts.prefill_chunk_size,
         .draft_model = effective_draft_model,
         .speculative_k = opts.speculative_k,
-        .speculation_requested = effective_draft_model != null,
+        .speculation_requested = opts.draft_model != null and opts.speculation_policy != .off,
         .speculation_policy = opts.speculation_policy,
         .speculation_calibration = opts.speculation_calibration,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
@@ -399,13 +410,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
-    var draft_gpt_config: ?gpt_mod.Config = null;
+    var draft_gpt_config = preflight_draft_gpt_config;
     const draft_model = if (effective_draft_model) |draft_model_dir| blk: {
         if (opts.speculation_policy == .auto) {
             var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
             defer draft_manifest.deinit();
             const draft_cfg = try session_factory.loadGptConfigFromModelDir(allocator, draft_model_dir, draft_manifest);
-            if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg)) {
+            if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg) or shouldSkipMetalAutoDraftLoad(opts, draft_cfg.gemma4_mtp_assistant)) {
                 draft_gpt_config = draft_cfg;
                 break :blk null;
             }
@@ -4703,7 +4714,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
 ) !bool {
     if (!liveWholeModelExecutorRequested(opts)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
-    if (config.draft_model != null) return false;
+    if (config.draft_model != null or config.speculation_requested) return false;
     if (opts.image_count > 0 or opts.audio_count > 0) return false;
 
     gpt_arch.resetDebugTimingStats();
@@ -6708,6 +6719,17 @@ test "raw decode bench json includes metal compact stats" {
     try std.testing.expectEqual(@as(i64, 3), metal.get("quant_kernel_plan").?.object.get("generated_candidates").?.integer);
     try std.testing.expectEqualStrings("unsupported_shape", metal.get("quant_kernel_plan").?.object.get("top_fallback_reason").?.string);
     try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);
+}
+
+test "explicit Metal auto draft admission stays Gemma4 MTP-only" {
+    const opts = Options{
+        .model_dir = "model",
+        .prompt = "prompt",
+        .backend = .metal,
+        .speculation_policy = .auto,
+    };
+    try std.testing.expect(shouldSkipMetalAutoDraftLoad(opts, false));
+    try std.testing.expect(!shouldSkipMetalAutoDraftLoad(opts, true));
 }
 
 test "parseArgs accepts artifact dir" {
