@@ -118,6 +118,7 @@ test {
     _ = native_rerank;
     _ = native_transcribe;
     _ = native_read;
+    _ = @import("readers/reader.zig");
     _ = native_recognize;
     _ = native_extract;
     _ = compare_generate;

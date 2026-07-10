@@ -256,22 +256,52 @@ fn detectParserKind(allocator: std.mem.Allocator, model_path: []const u8) !Parse
 }
 
 fn parseOutput(allocator: std.mem.Allocator, parser_kind: ParserKind, text: []const u8, prompt: ?[]const u8) !Result {
+    // Generation cut off at max_tokens can end mid-multibyte character, leaving
+    // invalid UTF-8. std.json serializes such slices as arrays of byte integers
+    // instead of strings, breaking API clients — drop invalid sequences first.
+    const sanitized = try sanitizeUtf8Alloc(allocator, text);
+    defer if (sanitized) |s| allocator.free(s);
+    const clean_text = sanitized orelse text;
+
     return switch (parser_kind) {
         .default => .{
-            .text = try allocator.dupe(u8, std.mem.trim(u8, text, " \t\r\n")),
+            .text = try allocator.dupe(u8, std.mem.trim(u8, clean_text, " \t\r\n")),
             .allocator = allocator,
         },
         .florence => .{
-            .text = try parseFlorenceText(allocator, text),
+            .text = try parseFlorenceText(allocator, clean_text),
             .allocator = allocator,
         },
-        .donut => try parseDonutResult(allocator, text, prompt),
-        .moondream => try parseMoondreamResult(allocator, text),
+        .donut => try parseDonutResult(allocator, clean_text, prompt),
+        .moondream => try parseMoondreamResult(allocator, clean_text),
         .pix2struct => .{
-            .text = try allocator.dupe(u8, std.mem.trim(u8, text, " \t\r\n")),
+            .text = try allocator.dupe(u8, std.mem.trim(u8, clean_text, " \t\r\n")),
             .allocator = allocator,
         },
     };
+}
+
+/// Returns a copy of `text` with invalid UTF-8 byte sequences removed, or null
+/// when `text` is already valid (no allocation needed).
+fn sanitizeUtf8Alloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return null;
+    var out = try std.ArrayListUnmanaged(u8).initCapacity(allocator, text.len);
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1; // invalid lead byte
+            continue;
+        };
+        if (i + seq_len > text.len) break; // sequence truncated at end of text
+        if (std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
+            out.appendSliceAssumeCapacity(text[i .. i + seq_len]);
+            i += seq_len;
+        } else {
+            i += 1; // invalid continuation byte; resync on next byte
+        }
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 pub fn normalizePromptForFamily(parser_kind: ParserKind, prompt: ?[]const u8) ?[]const u8 {
@@ -627,6 +657,34 @@ test "florence parser inserts likely line breaks" {
     defer allocator.free(parsed);
 
     try std.testing.expectEqualStrings("heading\nThis is next.\nLineTwo", parsed);
+}
+
+test "sanitizeUtf8Alloc passes valid text through without allocating" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try sanitizeUtf8Alloc(allocator, "hello 世界"));
+}
+
+test "sanitizeUtf8Alloc drops sequence truncated at end of text" {
+    const allocator = std.testing.allocator;
+    // "世" is E4 B8 96; cut after two bytes to simulate a max_tokens cutoff.
+    const sanitized = (try sanitizeUtf8Alloc(allocator, "abc\xE4\xB8")).?;
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("abc", sanitized);
+}
+
+test "sanitizeUtf8Alloc drops interior invalid bytes and resyncs" {
+    const allocator = std.testing.allocator;
+    const sanitized = (try sanitizeUtf8Alloc(allocator, "a\xFFb\xE4\xB8\x96c")).?;
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("ab世c", sanitized);
+}
+
+test "parseOutput sanitizes truncated utf8 for florence" {
+    const allocator = std.testing.allocator;
+    var result = try parseOutput(allocator, .florence, "5月普\xE8\xA7", null);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("5月普", result.text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.text));
 }
 
 test "moondream prompt uses default instruction" {
