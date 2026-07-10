@@ -812,6 +812,7 @@ pub const CudaCompute = struct {
     dense_host_prefetch: DenseHostPrefetchQueue = undefined,
     dense_host_prefetch_initialized: bool = false,
     dense_host_prefetch_epoch: u64 = 1,
+    temp_buffer_mutex: std.atomic.Mutex = .unlocked,
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
@@ -944,7 +945,7 @@ pub const CudaCompute = struct {
         self.temp_buffers.deinit(self.allocator);
         if (self.deferred_device_frees.items.len != 0) {
             synchronizeAndDrainDeferredDeviceFrees(self) catch {};
-            drainDeferredDeviceFreesAfterSync(self);
+            drainDeferredDeviceFreesAfterSyncUnlocked(self);
         }
         self.deferred_device_frees.deinit(self.allocator);
         self.temp_ids_masks.deinit(&self.ctx);
@@ -1658,8 +1659,12 @@ const CudaKvDeviceStorage = struct {
                 try new_k.copyFromDevice(&self.compute.ctx, layer.k, old_k_bytes);
                 try new_v.copyFromDevice(&self.compute.ctx, layer.v, old_v_bytes);
             }
-            layer.k.free(&self.compute.ctx);
-            layer.v.free(&self.compute.ctx);
+            // The old-to-new copies are asynchronous on the CUDA stream.
+            // Releasing through the compute cache/deferred-free path keeps
+            // the source allocations alive until ordered stream work can no
+            // longer reference them; cuMemFree here races the growth copy.
+            releaseDeviceBuffer(self.compute, &layer.k);
+            releaseDeviceBuffer(self.compute, &layer.v);
             layer.k = new_k;
             layer.v = new_v;
             layer.capacity_tokens = new_capacity;
@@ -2372,6 +2377,17 @@ fn backendKind(_: *anyopaque) ops.BackendKind {
 fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvStorageRuntime) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     invalidateDebugFinalHiddenGraph(self);
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET", false)) {
+        // A server reuses CudaCompute across requests, unlike the CLI benchmark.
+        // Start each request's pinned-temp capture schedule from the same point
+        // after all prior stream work is complete. The server tuning wrapper
+        // disables concurrent batching while this request-scoped replay mode is
+        // active, so no peer can be using the shared allocation sequence.
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        self.temp_trace_seq = 0;
+        self.temp_buffer_mutex.unlock();
+    }
     if (storage.device_write_hook != null) return;
     const config = storage.storage.config;
     if (config.dtype != .f32 and cudaPagedKvFormat(config.dtype) == null) return;
@@ -4090,7 +4106,7 @@ fn retainPinnedTempSlot(self: *CudaCompute, buffer: buffer_mod.DeviceBuffer) boo
     return false;
 }
 
-fn drainDeferredDeviceFreesAfterSync(self: *CudaCompute) void {
+fn drainDeferredDeviceFreesAfterSyncUnlocked(self: *CudaCompute) void {
     if (self.deferred_device_frees.items.len == 0) return;
     var reclaimed: usize = 0;
     for (self.deferred_device_frees.items) |*buffer| {
@@ -4105,13 +4121,25 @@ fn drainDeferredDeviceFreesAfterSync(self: *CudaCompute) void {
 }
 
 fn synchronizeAndDrainDeferredDeviceFrees(self: *CudaCompute) !void {
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
+}
+
+fn synchronizeAndDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
     try self.ctx.synchronize();
-    drainDeferredDeviceFreesAfterSync(self);
+    drainDeferredDeviceFreesAfterSyncUnlocked(self);
 }
 
 fn forceDrainDeferredDeviceFrees(self: *CudaCompute) !void {
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    try forceDrainDeferredDeviceFreesUnlocked(self);
+}
+
+fn forceDrainDeferredDeviceFreesUnlocked(self: *CudaCompute) !void {
     if (self.deferred_device_frees.items.len == 0) return;
-    try synchronizeAndDrainDeferredDeviceFrees(self);
+    try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
     self.stats.deferred_free_forced_drains += 1;
 }
 
@@ -4201,6 +4229,8 @@ fn touchBytesForPageCache(bytes: []const u8) void {
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
     const seq = self.temp_trace_seq;
     self.temp_trace_seq = seq + 1;
     if (try allocPinnedTempSlot(self, seq, len)) |buffer| return buffer;
@@ -4235,7 +4265,7 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     self.stats.temp_buffer_misses += 1;
     const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
         if (self.deferred_device_frees.items.len != 0) {
-            try forceDrainDeferredDeviceFrees(self);
+            try forceDrainDeferredDeviceFreesUnlocked(self);
             const retry = try buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
             self.noteDeviceBytes(len);
             self.stats.device_alloc_calls += 1;
@@ -4252,6 +4282,8 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
     if (releasePinnedTempSlot(self, buffer)) return;
     const cache_budget = cudaTempCacheBudgetBytes();
     var cached_bytes: usize = 0;
@@ -4271,7 +4303,7 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     if (cudaDeferredFreeEnabled()) {
         self.deferred_device_frees.append(self.allocator, buffer.*) catch {
             self.stats.device_free_calls += 1;
-            synchronizeAndDrainDeferredDeviceFrees(self) catch {};
+            synchronizeAndDrainDeferredDeviceFreesUnlocked(self) catch {};
             buffer.free(&self.ctx);
             return;
         };
@@ -4279,12 +4311,12 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
         self.stats.deferred_free_queued += 1;
         buffer.* = .{};
         if (self.deferred_device_free_bytes >= cudaDeferredFreeBudgetBytes()) {
-            forceDrainDeferredDeviceFrees(self) catch {};
+            forceDrainDeferredDeviceFreesUnlocked(self) catch {};
         }
         return;
     }
     self.stats.device_free_calls += 1;
-    synchronizeAndDrainDeferredDeviceFrees(self) catch {};
+    synchronizeAndDrainDeferredDeviceFreesUnlocked(self) catch {};
     buffer.free(&self.ctx);
 }
 

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shlex
 import socket
 import statistics
 import subprocess
@@ -105,19 +106,22 @@ class Server:
         env = os.environ.copy()
         env.setdefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE", "1")
         env.pop("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING", None)
+        command = [
+            str(self.args.antfly_bin),
+            "run",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--models-dir",
+            str(self.args.models_dir),
+            "--config",
+            str(config_path),
+        ]
+        if self.args.server_prefix:
+            command = shlex.split(self.args.server_prefix) + command
         self.process = subprocess.Popen(
-            [
-                str(self.args.antfly_bin),
-                "run",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.port),
-                "--models-dir",
-                str(self.args.models_dir),
-                "--config",
-                str(config_path),
-            ],
+            command,
             stdout=self.log,
             stderr=subprocess.STDOUT,
             env=env,
@@ -213,10 +217,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--decode-wait-us", type=int, default=1000)
-    parser.add_argument("--max-step-items", type=int, default=1)
+    parser.add_argument("--max-step-items", type=int, default=2)
     parser.add_argument("--min-c4-speedup", type=float, default=2.0)
     parser.add_argument("--max-c1-p95-ratio", type=float, default=1.05)
     parser.add_argument("--startup-timeout", type=float, default=600.0)
+    parser.add_argument("--server-prefix", default=os.environ.get("ANTFLY_BATCH_SERVER_PREFIX", ""))
     return parser.parse_args()
 
 
@@ -259,6 +264,7 @@ def main() -> None:
             "cache_dtype": args.cache_dtype,
             "concurrency": args.concurrency,
             "decode_wait_us": args.decode_wait_us,
+            "max_step_items": args.max_step_items,
         },
         "baseline": baseline,
         "batched": batched,

@@ -2120,7 +2120,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
-        ready: bool = false,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     const PendingPrefillBatchWork = struct {
@@ -2132,7 +2132,7 @@ pub const NativeGenerationPipeline = struct {
         wants_last_logits: bool,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
-        ready: bool = false,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     pub fn generate(self: *NativeGenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
@@ -3650,7 +3650,7 @@ pub const NativeGenerationPipeline = struct {
         var tokens_generated: usize = 0;
         var finish_reason: []const u8 = "length";
         var device_token_tensor: ?ops.CT = null;
-        defer if (device_token_tensor) |tensor| self.cb.free(tensor);
+        defer if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
         debugGenerationStage(
             "standardDecode enter seq_len={d} max_tokens={d} prefill_cached={}",
             .{ seq_len.*, max_tokens, prefill_last_logits.* != null },
@@ -3680,7 +3680,7 @@ pub const NativeGenerationPipeline = struct {
         while (tokens_generated < max_tokens) {
             var used_decode_microbatch = false;
             var next_device_token_tensor: ?ops.CT = null;
-            errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
+            errdefer if (next_device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
             debugGenerationStage(
                 "standardDecode iter={d} seq_len={d} device_token_handoff={}",
                 .{ tokens_generated, seq_len.*, device_token_tensor != null },
@@ -3813,7 +3813,7 @@ pub const NativeGenerationPipeline = struct {
             // Check EOS
             if (self.shouldStopOnEos(config, next_token)) {
                 if (next_device_token_tensor) |tensor| {
-                    self.cb.free(tensor);
+                    self.freeDeviceTokenTensor(tensor);
                     next_device_token_tensor = null;
                 }
                 finish_reason = "stop";
@@ -3824,7 +3824,7 @@ pub const NativeGenerationPipeline = struct {
                 next_device_token_tensor = try self.makeDeviceTokenTensor(next_token);
                 if (next_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
             }
-            if (device_token_tensor) |tensor| self.cb.free(tensor);
+            if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
             device_token_tensor = next_device_token_tensor;
             next_device_token_tensor = null;
 
@@ -4464,9 +4464,21 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
+        if (self.execution_lock) |mutex| {
+            while (!mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
         return try self.cb.fromInt32Shape(&data, &shape);
+    }
+
+    fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
+        if (self.execution_lock) |mutex| {
+            while (!mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        self.cb.free(tensor);
     }
 
     fn forwardLastLogits(
@@ -7108,7 +7120,7 @@ pub const NativeGenerationPipeline = struct {
             .seq_len = seq_len,
         };
         try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
-        defer if (!work.ready) scheduler.cancelDecodeWork(@ptrCast(&work));
+        defer if (!work.ready.load(.acquire)) scheduler.cancelDecodeWork(@ptrCast(&work));
         notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .decode, 1);
         notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .decode);
 
@@ -7154,7 +7166,7 @@ pub const NativeGenerationPipeline = struct {
             .wants_last_logits = wants_last_logits,
         };
         try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
-        defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
+        defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
         notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .prefill, query_seq_len);
         notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .prefill);
         if (self.execution_lock != null) {
@@ -7297,6 +7309,8 @@ pub const NativeGenerationPipeline = struct {
         }
         defer if (self.execution_lock) |mutex| mutex.unlock();
 
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+
         const result = self.forwardScheduledStep(claimed) catch |err| {
             markStepFailed(claimed, err);
             scheduler.completeStep(lease, claimed);
@@ -7368,12 +7382,12 @@ pub const NativeGenerationPipeline = struct {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     work.failure = err;
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     work.failure = err;
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .waiting => {},
             }
@@ -7396,12 +7410,12 @@ pub const NativeGenerationPipeline = struct {
                     .decode => {
                         const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                         work.failure = error.InvalidBatchDecodeState;
-                        work.ready = true;
+                        work.ready.store(true, .release);
                     },
                     .prefill => {
                         const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                         if (work.wants_last_logits) work.failure = error.InvalidBatchDecodeState;
-                        work.ready = true;
+                        work.ready.store(true, .release);
                     },
                     .waiting => {},
                 }
@@ -7420,7 +7434,7 @@ pub const NativeGenerationPipeline = struct {
                     } else |dupe_err| {
                         work.failure = dupe_err;
                     }
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -7431,7 +7445,7 @@ pub const NativeGenerationPipeline = struct {
                             work.failure = dupe_err;
                         }
                     }
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .waiting => {},
             }
@@ -7482,7 +7496,7 @@ const DecodeStepDriver = struct {
     decode_state: *NativeDecodeState,
 
     fn isReady(self: *const DecodeStepDriver) bool {
-        return self.work.ready;
+        return self.work.ready.load(.acquire);
     }
 
     fn stepBudget(self: *const DecodeStepDriver) runtime.scheduler.native_generate.StepBudget {
@@ -7490,6 +7504,7 @@ const DecodeStepDriver = struct {
     }
 
     fn preStep(self: *DecodeStepDriver) void {
+        if (self.pipeline.execution_lock != null) return;
         self.pipeline.cb.drainPrefetchBudget(NativeGenerationPipeline.prefetch_drain_budget_per_step);
     }
 
@@ -7510,7 +7525,7 @@ const PrefillStepDriver = struct {
     decode_state: *NativeDecodeState,
 
     fn isReady(self: *const PrefillStepDriver) bool {
-        return self.work.ready;
+        return self.work.ready.load(.acquire);
     }
 
     fn stepBudget(self: *const PrefillStepDriver) runtime.scheduler.native_generate.StepBudget {
@@ -7785,11 +7800,11 @@ test "markStepFailed marks every claimed work failed and ready" {
 
     NativeGenerationPipeline.markStepFailed(&items, error.OutOfMemory);
 
-    try std.testing.expect(dec_a.ready);
+    try std.testing.expect(dec_a.ready.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), dec_a.failure);
     try std.testing.expect(dec_a.logits == null);
 
-    try std.testing.expect(pre_a.ready);
+    try std.testing.expect(pre_a.ready.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), pre_a.failure);
     try std.testing.expect(pre_a.logits == null);
 }
@@ -7846,11 +7861,11 @@ test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {
 
     NativeGenerationPipeline.dispatchStepLogits(vocab_size, &items, &logits, max_query);
 
-    try std.testing.expect(dec_w.ready);
+    try std.testing.expect(dec_w.ready.load(.acquire));
     try std.testing.expectEqualSlices(f32, &.{ 10, 11 }, dec_w.logits.?);
-    try std.testing.expect(pre_with_logits.ready);
+    try std.testing.expect(pre_with_logits.ready.load(.acquire));
     try std.testing.expectEqualSlices(f32, &.{ 22, 23 }, pre_with_logits.logits.?);
-    try std.testing.expect(pre_no_logits.ready);
+    try std.testing.expect(pre_no_logits.ready.load(.acquire));
     try std.testing.expect(pre_no_logits.logits == null);
 }
 
@@ -7896,16 +7911,16 @@ test "dispatchStepLogits records dupe failure per-work without aborting peers" {
 
     NativeGenerationPipeline.dispatchStepLogits(vocab_size, &items, &logits, 1);
 
-    try std.testing.expect(dec_a.ready);
+    try std.testing.expect(dec_a.ready.load(.acquire));
     try std.testing.expect(dec_a.failure == null);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, dec_a.logits.?);
 
-    try std.testing.expect(dec_b.ready);
+    try std.testing.expect(dec_b.ready.load(.acquire));
     try std.testing.expect(dec_b.failure != null);
     try std.testing.expect(dec_b.logits == null);
 
     // The failing dupe must not stop dec_c's dispatch.
-    try std.testing.expect(dec_c.ready);
+    try std.testing.expect(dec_c.ready.load(.acquire));
     try std.testing.expect(dec_c.failure == null);
     try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, dec_c.logits.?);
 }

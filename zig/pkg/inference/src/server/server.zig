@@ -123,9 +123,12 @@ pub const GenerationBatchingMode = enum {
 };
 
 pub const GenerationBatchingConfig = struct {
-    // Opt-in until the L4 correctness and performance gates are recorded.
+    // Explicit CUDA production rollout: prefill remains singleton and decode
+    // batches homogeneous sequence positions up to the validated row envelope.
+    // Keep the default off until the long-generation singleton-equivalence and
+    // throughput gates pass; `mode: on` no longer needs an experimental env.
     mode: GenerationBatchingMode = .off,
-    max_step_items: usize = 1,
+    max_step_items: usize = 2,
     max_step_query_tokens: usize = 512,
     max_decode_wait_us: u32 = 1_000,
 
@@ -136,15 +139,14 @@ pub const GenerationBatchingConfig = struct {
     }
 
     pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
-        const experimental_batch_rows = platform.env.getenvBoolDefault(
-            "ANTFLY_INFERENCE_CUDA_EXPERIMENTAL_BATCH_ROWS",
-            false,
-        );
-        const validated_max_items: usize = if (experimental_batch_rows) 2 else 1;
+        const validated_max_items: usize = 2;
         return .{
             .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
             .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
             .max_decode_wait_us = self.max_decode_wait_us,
+            // Wider active sets currently lose response equivalence even when
+            // individual steps are capped to two rows. Preserve the proven
+            // direct path until the multi-wave row scheduler is validated.
             .max_active_requests_for_batching = validated_max_items,
         };
     }
@@ -6030,6 +6032,18 @@ test "budget overrides apply selectively" {
     try std.testing.expectEqual(@as(usize, 350), applied.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 400), applied.kv_limit_bytes);
     try std.testing.expectEqual(@as(usize, 600), applied.scratch_limit_bytes);
+}
+
+test "generation batching exposes the validated CUDA production envelope" {
+    const config = GenerationBatchingConfig{};
+    try std.testing.expectEqual(GenerationBatchingMode.off, config.mode);
+
+    const policy = config.schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), policy.max_step_items);
+    try std.testing.expectEqual(@as(?usize, 2), policy.max_active_requests_for_batching);
+
+    const clamped = (GenerationBatchingConfig{ .max_step_items = 128 }).schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), clamped.max_step_items);
 }
 
 test "taskMatchesModelListing derives extractors from recognizer capabilities" {
