@@ -414,7 +414,12 @@ fn maskedEmbeddingArgmax(
 }
 
 fn wantsMaskedEmbeddingArgmax(draft_cfg: gpt_mod.Config) bool {
+    // Default OFF: costs ~3ms per draft step and repeated A/Bs show acceptance
+    // is unchanged (identical drafted/matched counters) without it. Opt back in
+    // with ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING=1; the old DISABLE env
+    // still force-disables.
     if (getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_MASKED_EMBEDDING")) return false;
+    if (!getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_MASKED_EMBEDDING")) return false;
     return draft_cfg.mtp_use_ordered_embeddings and
         draft_cfg.mtp_num_centroids != 0 and
         draft_cfg.mtp_centroid_intermediate_top_k != 0;
