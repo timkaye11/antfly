@@ -6057,6 +6057,39 @@ fn whereSelectConsumeFalseOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: C
     return on_false;
 }
 
+/// Repack token-major [batch*seq, num_heads*head_dim] into head-major
+/// [batch*num_heads, seq, head_dim].
+fn packTokenMajorHeads(allocator: std.mem.Allocator, src: []const f32, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) ![]f32 {
+    const hidden = num_heads * head_dim;
+    const out = try allocator.alloc(f32, batch * seq_len * hidden);
+    for (0..batch) |b| {
+        for (0..seq_len) |s| {
+            const src_row = (b * seq_len + s) * hidden;
+            for (0..num_heads) |h| {
+                const dst = ((b * num_heads + h) * seq_len + s) * head_dim;
+                @memcpy(out[dst..][0..head_dim], src[src_row + h * head_dim ..][0..head_dim]);
+            }
+        }
+    }
+    return out;
+}
+
+/// Inverse of packTokenMajorHeads.
+fn unpackHeadMajorTokens(allocator: std.mem.Allocator, src: []const f32, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) ![]f32 {
+    const hidden = num_heads * head_dim;
+    const out = try allocator.alloc(f32, batch * seq_len * hidden);
+    for (0..batch) |b| {
+        for (0..seq_len) |s| {
+            const dst_row = (b * seq_len + s) * hidden;
+            for (0..num_heads) |h| {
+                const src_off = ((b * num_heads + h) * seq_len + s) * head_dim;
+                @memcpy(out[dst_row + h * head_dim ..][0..head_dim], src[src_off..][0..head_dim]);
+            }
+        }
+    }
+    return out;
+}
+
 fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const Q = getData(q_ct);
@@ -6106,6 +6139,38 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     const bh = effective_batch * num_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
+    // Mirror the Metal runtime's layout contract (decoderRuntimeSdpaF32Device):
+    // a stored 2D shape of [batch*seq, num_heads*head_dim] means Q/K/V come
+    // token-major straight from the QKV linears. The kernels below index
+    // head-major [batch*heads, seq, head_dim], so pack token-major inputs and
+    // unpack the output; 3D/4D (or absent) shapes are already head-major.
+    const hidden_dim = num_heads * head_dim;
+    const expected_len = effective_batch * effective_seq_len * hidden_dim;
+    var token_major = false;
+    if (num_heads > 1 and Q.len == expected_len and K.len == expected_len and V.len == expected_len) {
+        if (tensorStoredShape(q_ct)) |shape| {
+            token_major = shape.len == 2 and
+                shape[0] == @as(i64, @intCast(effective_batch * effective_seq_len)) and
+                shape[1] == @as(i64, @intCast(hidden_dim));
+        }
+    }
+    var q_data: []const f32 = Q;
+    var k_data: []const f32 = K;
+    var v_data: []const f32 = V;
+    var packed_qkv: ?[3][]f32 = null;
+    defer if (packed_qkv) |bufs| for (bufs) |packed_buf| self.allocator.free(packed_buf);
+    if (token_major) {
+        const q_packed = try packTokenMajorHeads(self.allocator, Q, effective_batch, effective_seq_len, num_heads, head_dim);
+        errdefer self.allocator.free(q_packed);
+        const k_packed = try packTokenMajorHeads(self.allocator, K, effective_batch, effective_seq_len, num_heads, head_dim);
+        errdefer self.allocator.free(k_packed);
+        const v_packed = try packTokenMajorHeads(self.allocator, V, effective_batch, effective_seq_len, num_heads, head_dim);
+        packed_qkv = .{ q_packed, k_packed, v_packed };
+        q_data = q_packed;
+        k_data = k_packed;
+        v_data = v_packed;
+    }
+
     // Flash path: tile Q/K/V and run streaming softmax instead of materializing
     // the [seq, seq] score matrix.  Benchmarked to win at every shape tested
     // (1.13x at seq=32, 1.4x at seq=1500), so we apply it broadly.  Bench at
@@ -6121,9 +6186,9 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     if (flash_eligible) {
         const flash_output = try linalg.flashAttentionHost(
             self.allocator,
-            Q,
-            K,
-            V,
+            q_data,
+            k_data,
+            v_data,
             bias,
             mask,
             effective_batch,
@@ -6133,6 +6198,18 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
         );
         var raw_flash_output: ?[]f32 = flash_output;
         errdefer if (raw_flash_output) |raw| self.allocator.free(raw);
+        if (token_major) {
+            const unpacked = try unpackHeadMajorTokens(self.allocator, flash_output, effective_batch, effective_seq_len, num_heads, head_dim);
+            self.allocator.free(flash_output);
+            raw_flash_output = null;
+            var raw_unpacked: ?[]f32 = unpacked;
+            errdefer if (raw_unpacked) |raw| self.allocator.free(raw);
+            const result = try self.makeBuf(unpacked, true);
+            raw_unpacked = null;
+            errdefer freeTensor(self, result);
+            const token_shape = [_]i64{ @intCast(effective_batch * effective_seq_len), @intCast(hidden_dim) };
+            return self.withLogicalShape(result, &token_shape);
+        }
         const result = try self.makeBuf(flash_output, true);
         raw_flash_output = null;
         errdefer freeTensor(self, result);
@@ -6166,9 +6243,9 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
         const b = bh_idx / num_heads;
         const h = bh_idx % num_heads;
         for (0..effective_seq_len) |qi| {
-            const q_ptr = Q[(bh_idx * effective_seq_len + qi) * head_dim ..].ptr;
+            const q_ptr = q_data[(bh_idx * effective_seq_len + qi) * head_dim ..].ptr;
             for (0..effective_seq_len) |ki| {
-                const k_ptr = K[(bh_idx * effective_seq_len + ki) * head_dim ..].ptr;
+                const k_ptr = k_data[(bh_idx * effective_seq_len + ki) * head_dim ..].ptr;
                 scores[qi * effective_seq_len + ki] = linalg.dot(q_ptr[0..head_dim], k_ptr[0..head_dim]) * scale;
             }
         }
@@ -6207,10 +6284,23 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
             for (0..effective_seq_len) |vi| {
                 const w = scores[qi * effective_seq_len + vi];
                 if (w == 0.0) continue;
-                const v_ptr = V[(bh_idx * effective_seq_len + vi) * head_dim ..].ptr;
+                const v_ptr = v_data[(bh_idx * effective_seq_len + vi) * head_dim ..].ptr;
                 linalg.axpy(w, v_ptr[0..head_dim], out_ptr[0..head_dim]);
             }
         }
+    }
+
+    if (token_major) {
+        const unpacked = try unpackHeadMajorTokens(self.allocator, output, effective_batch, effective_seq_len, num_heads, head_dim);
+        self.allocator.free(output);
+        raw_output = null;
+        var raw_unpacked: ?[]f32 = unpacked;
+        errdefer if (raw_unpacked) |raw| self.allocator.free(raw);
+        const result = try self.makeBuf(unpacked, true);
+        raw_unpacked = null;
+        errdefer freeTensor(self, result);
+        const token_shape = [_]i64{ @intCast(effective_batch * effective_seq_len), @intCast(hidden_dim) };
+        return self.withLogicalShape(result, &token_shape);
     }
 
     const result = try self.makeBuf(output, true);
@@ -46138,6 +46228,75 @@ fn referenceCrossSeqMajorAttention(
     }
 
     return ref;
+}
+
+test "packTokenMajorHeads reorders per-token head slices" {
+    const allocator = std.testing.allocator;
+    // 1 batch, 2 tokens, 2 heads, head_dim 2: token-major rows are
+    // [t0h0a, t0h0b, t0h1a, t0h1b], [t1h0a, ...].
+    const tok = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const packed_hm = try packTokenMajorHeads(allocator, &tok, 1, 2, 2, 2);
+    defer allocator.free(packed_hm);
+    // head-major: h0 rows for both tokens first, then h1 rows.
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 5, 6, 3, 4, 7, 8 }, packed_hm);
+    const roundtrip = try unpackHeadMajorTokens(allocator, packed_hm, 1, 2, 2, 2);
+    defer allocator.free(roundtrip);
+    try std.testing.expectEqualSlices(f32, &tok, roundtrip);
+}
+
+test "sdpa token-major 2d layout matches head-major reference" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+
+    // seq 40 exercises the flash path, seq 8 the legacy materialized path.
+    for ([_]usize{ 40, 8 }) |seq_len| {
+        const batch: usize = 1;
+        const num_heads: usize = 3;
+        const head_dim: usize = 4;
+        const hidden = num_heads * head_dim;
+        const total = batch * seq_len * hidden;
+
+        const q_tok = try allocator.alloc(f32, total);
+        defer allocator.free(q_tok);
+        const k_tok = try allocator.alloc(f32, total);
+        defer allocator.free(k_tok);
+        const v_tok = try allocator.alloc(f32, total);
+        defer allocator.free(v_tok);
+        for (0..total) |i| {
+            q_tok[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) * 0.07;
+            k_tok[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 19)) - 9)) * 0.09;
+            v_tok[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 17)) - 8)) * 0.11;
+        }
+        const mask = try allocator.alloc(i64, batch * seq_len);
+        defer allocator.free(mask);
+        @memset(mask, 1);
+
+        const token_shape = [_]i64{ @intCast(batch * seq_len), @intCast(hidden) };
+        const q_ct = try compute.withLogicalShape(try compute.makeBuf(q_tok, false), &token_shape);
+        defer freeTensor(&compute, q_ct);
+        const k_ct = try compute.withLogicalShape(try compute.makeBuf(k_tok, false), &token_shape);
+        defer freeTensor(&compute, k_ct);
+        const v_ct = try compute.withLogicalShape(try compute.makeBuf(v_tok, false), &token_shape);
+        defer freeTensor(&compute, v_ct);
+
+        const out_ct = try cb.scaledDotProductAttention(q_ct, k_ct, v_ct, mask, null, batch, seq_len, num_heads, head_dim);
+        defer freeTensor(&compute, out_ct);
+
+        const q_hm = try packTokenMajorHeads(allocator, q_tok, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(q_hm);
+        const k_hm = try packTokenMajorHeads(allocator, k_tok, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(k_hm);
+        const v_hm = try packTokenMajorHeads(allocator, v_tok, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(v_hm);
+        const ref_hm = try referenceBidirectionalHeadMajorAttention(allocator, q_hm, k_hm, v_hm, null, mask, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(ref_hm);
+        const ref_tok = try unpackHeadMajorTokens(allocator, ref_hm, batch, seq_len, num_heads, head_dim);
+        defer allocator.free(ref_tok);
+
+        try expectApproxEqSlice(ref_tok, getData(out_ct), 1e-4);
+    }
 }
 
 test "ComputeBackend scaledDotProductAttention call site exercises flash layout" {
