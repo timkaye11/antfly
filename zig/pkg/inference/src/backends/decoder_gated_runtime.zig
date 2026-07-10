@@ -6173,12 +6173,34 @@ pub fn forwardPreparedLmHeadArgmaxRows(
     const lm_head_slot = finalLmHeadSlot(configured_layer_count);
     const trace = getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
     const trace_started_at = if (trace) monotonicNowNs() else 0;
-    // Dispatch the lm_head one row at a time: the per-row mmv route is what
-    // the planned decode frames use for their tail and stays bandwidth-bound
-    // at this out_dim, while the multi-row small-batch kernel collapses on
-    // vocab-sized outputs.
     const choices = try allocator.alloc(u32, rows);
     errdefer allocator.free(choices);
+    // Preferred at rows 2-8: ONE multi-row apply — the q6_k head rides the
+    // r2-reduce kernel (pairs of rows share a single pass over the ~550MB
+    // weight stream) instead of re-reading the head once per row. Falls back
+    // to the per-row loop below on any unsupported condition.
+    if (rows >= 2) multi_row: {
+        const logits = (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = lm_head_slot,
+            .input = final_hidden,
+            .in_dim = hidden_size,
+            .out_dim = vocab_size,
+        })) orelse break :multi_row;
+        defer cb.free(logits);
+        const row_choices = (try cb.argmaxRowsSuppress(logits, 0, rows, vocab_size, suppress_token_ids, allocator)) orelse break :multi_row;
+        defer allocator.free(row_choices);
+        if (row_choices.len < rows) break :multi_row;
+        @memcpy(choices, row_choices[0..rows]);
+        if (trace) {
+            std.debug.print(
+                "prepared-lmhead-argmax-trace: rows={d} suppress={d} total_us={d} multi_row=1\n",
+                .{ rows, suppress_token_ids.len, (monotonicNowNs() - trace_started_at) / std.time.ns_per_us },
+            );
+        }
+        return choices;
+    }
+    // Per-row fallback: the planned decode frames' tail route (bandwidth-bound
+    // mmv, but re-reads the head once per row).
     for (0..rows) |row| {
         const row_input = try cb.sliceRows2D(allocator, final_hidden, row, 1, hidden_size);
         defer cb.free(row_input);

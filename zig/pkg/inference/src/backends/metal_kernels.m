@@ -713,6 +713,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> antfly_q6_k_small_batch_bias_pipeline;
     id<MTLComputePipelineState> antfly_q6_k_small_batch_bias_gelu_pipeline;
     id<MTLComputePipelineState> q6_k_reduce_pipeline;
+    id<MTLComputePipelineState> q6_k_r2_reduce_pipeline;
     id<MTLComputePipelineState> q6_k_reduce_f16_input_pipeline;
     id<MTLComputePipelineState> q6_k_pair_pipeline;
     id<MTLComputePipelineState> q8_k_pipeline;
@@ -4960,6 +4961,19 @@ static NSString *termite_metal_shader_source(void) {
            "    const ushort tid = lane / 2u; const ushort ix = lane % 2u; const ushort ip = tid / 8u; const ushort il = tid % 8u; const ushort l0 = 4u * il; const ushort is = 8u * ip + l0 / 16u; const uint y_offset = 128u * uint(ip) + uint(l0); const uint q_offset_l = 64u * uint(ip) + uint(l0); const uint q_offset_h = 32u * uint(ip) + uint(l0); const uint row_limit = min(NR0, p.out_dim - first_row);\n"
            "    for (uint i = ix; i < nb; i += 2u) { device const float *y = yy + i * 256u + y_offset; for (ushort l = 0; l < 4u; ++l) { yl[4u * l + 0u] = y[l]; yl[4u * l + 1u] = y[l + 32u]; yl[4u * l + 2u] = y[l + 64u]; yl[4u * l + 3u] = y[l + 96u]; } device const uchar *q1 = x0 + i * 210u + q_offset_l; device const uchar *q2 = q1 + 32u; device const uchar *qh = x0 + i * 210u + 128u + q_offset_h; device const char *sc = reinterpret_cast<device const char *>(x0 + i * 210u + 192u) + is; device const uchar *dp = x0 + i * 210u + 208u; for (uint row = 0; row < row_limit; ++row) { float4 sums = {0.0f, 0.0f, 0.0f, 0.0f}; for (ushort l = 0; l < 4u; ++l) { sums[0] += yl[4u * l + 0u] * float(char((q1[l] & 0x0Fu) | ((qh[l] & 0x03u) << 4)) - 32); sums[1] += yl[4u * l + 1u] * float(char((q2[l] & 0x0Fu) | ((qh[l] & 0x0Cu) << 2)) - 32); sums[2] += yl[4u * l + 2u] * float(char((q1[l] >> 4) | (qh[l] & 0x30u)) - 32); sums[3] += yl[4u * l + 3u] * float(char((q2[l] >> 4) | ((qh[l] & 0xC0u) >> 2)) - 32); } ushort d_bits = (ushort(dp[1]) << 8) | ushort(dp[0]); float d = float(as_type<half>(d_bits)); sumf[row] += d * (sums[0] * float(sc[0]) + sums[1] * float(sc[2]) + sums[2] * float(sc[4]) + sums[3] * float(sc[6])); q1 += row_bytes; q2 += row_bytes; qh += row_bytes; sc += row_bytes; dp += row_bytes; } }\n"
            "    for (uint row = 0; row < row_limit; ++row) { float total = simd_sum(sumf[row]); if (lane == 0u) output[r * p.out_dim + first_row + row] = total; }\n"
+           "}\n"
+           "// q6_k mmv with TWO input rows sharing one weight stream (the MTP verify\n"
+           "// lm_head tail: rows=2-3 x vocab-sized out_dim, where per-row mmv re-reads\n"
+           "// the ~550MB head once per row and the generic small-batch kernel collapses).\n"
+           "// Same structure as termite_q6_k_linear_1x_reduce (ggml mul_mv_q6_K port:\n"
+           "// NR0=2 output rows per SG, 2-lane block parity, pointer-bump row iteration)\n"
+           "// with both rows' activations staged in registers.\n"
+           "kernel void termite_q6_k_linear_r2_reduce(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    const uint NR0 = 2u; const uint NSG = 2u; const uint nb = p.row_blocks; uint first_row = (tg.x * NSG + uint(sgitg)) * NR0; uint r0 = tg.y * 2u; if (r0 >= p.rows || first_row >= p.out_dim) return; const bool has_r1 = (r0 + 1u) < p.rows;\n"
+           "    const uint row_bytes = nb * 210u; device const uchar *x0 = weight + first_row * row_bytes; device const float *yy0 = input + r0 * p.in_dim; device const float *yy1 = has_r1 ? input + (r0 + 1u) * p.in_dim : yy0; float sumf[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}}; float yl0[16]; float yl1[16];\n"
+           "    const ushort tid = lane / 2u; const ushort ix = lane % 2u; const ushort ip = tid / 8u; const ushort il = tid % 8u; const ushort l0 = 4u * il; const ushort is = 8u * ip + l0 / 16u; const uint y_offset = 128u * uint(ip) + uint(l0); const uint q_offset_l = 64u * uint(ip) + uint(l0); const uint q_offset_h = 32u * uint(ip) + uint(l0); const uint row_limit = min(NR0, p.out_dim - first_row);\n"
+           "    for (uint i = ix; i < nb; i += 2u) { device const float *y0 = yy0 + i * 256u + y_offset; device const float *y1 = yy1 + i * 256u + y_offset; for (ushort l = 0; l < 4u; ++l) { yl0[4u * l + 0u] = y0[l]; yl0[4u * l + 1u] = y0[l + 32u]; yl0[4u * l + 2u] = y0[l + 64u]; yl0[4u * l + 3u] = y0[l + 96u]; yl1[4u * l + 0u] = y1[l]; yl1[4u * l + 1u] = y1[l + 32u]; yl1[4u * l + 2u] = y1[l + 64u]; yl1[4u * l + 3u] = y1[l + 96u]; } device const uchar *q1 = x0 + i * 210u + q_offset_l; device const uchar *q2 = q1 + 32u; device const uchar *qh = x0 + i * 210u + 128u + q_offset_h; device const char *sc = reinterpret_cast<device const char *>(x0 + i * 210u + 192u) + is; device const uchar *dp = x0 + i * 210u + 208u; for (uint row = 0; row < row_limit; ++row) { float4 sums0 = {0.0f, 0.0f, 0.0f, 0.0f}; float4 sums1 = {0.0f, 0.0f, 0.0f, 0.0f}; for (ushort l = 0; l < 4u; ++l) { float w0 = float(char((q1[l] & 0x0Fu) | ((qh[l] & 0x03u) << 4)) - 32); float w1 = float(char((q2[l] & 0x0Fu) | ((qh[l] & 0x0Cu) << 2)) - 32); float w2 = float(char((q1[l] >> 4) | (qh[l] & 0x30u)) - 32); float w3 = float(char((q2[l] >> 4) | ((qh[l] & 0xC0u) >> 2)) - 32); sums0[0] += yl0[4u * l + 0u] * w0; sums0[1] += yl0[4u * l + 1u] * w1; sums0[2] += yl0[4u * l + 2u] * w2; sums0[3] += yl0[4u * l + 3u] * w3; sums1[0] += yl1[4u * l + 0u] * w0; sums1[1] += yl1[4u * l + 1u] * w1; sums1[2] += yl1[4u * l + 2u] * w2; sums1[3] += yl1[4u * l + 3u] * w3; } ushort d_bits = (ushort(dp[1]) << 8) | ushort(dp[0]); float d = float(as_type<half>(d_bits)); float s0 = float(sc[0]); float s2 = float(sc[2]); float s4 = float(sc[4]); float s6 = float(sc[6]); sumf[row][0] += d * (sums0[0] * s0 + sums0[1] * s2 + sums0[2] * s4 + sums0[3] * s6); sumf[row][1] += d * (sums1[0] * s0 + sums1[1] * s2 + sums1[2] * s4 + sums1[3] * s6); q1 += row_bytes; q2 += row_bytes; qh += row_bytes; sc += row_bytes; dp += row_bytes; } }\n"
+           "    for (uint row = 0; row < row_limit; ++row) { float total0 = simd_sum(sumf[row][0]); float total1 = simd_sum(sumf[row][1]); if (lane == 0u) { output[r0 * p.out_dim + first_row + row] = total0; if (has_r1) output[(r0 + 1u) * p.out_dim + first_row + row] = total1; } }\n"
            "}\n"
            "kernel void termite_q6_k_linear_1x_reduce_in_f16(device const half *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
@@ -10025,6 +10039,19 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                 reduce_shmem_floats = 16u;
                 reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 3u) / 4u, descriptor->rows, 1);
                 reduce_threads = MTLSizeMake(64, 1, 1);
+            } else if (descriptor->rows >= 2 && descriptor->rows <= 8 && !use_f16_input &&
+                descriptor->out_dim >= 32768u &&
+                runtime->q6_k_r2_reduce_pipeline != nil &&
+                !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q6_K_R2_REDUCE"))) {
+                // Vocab-sized out_dim at small rows (the MTP verify lm_head tail):
+                // pairs of input rows share one pass over the weight stream. The
+                // generic small-batch kernel collapses at this out_dim and the
+                // per-row mmv re-reads the whole head once per row.
+                pipeline = runtime->q6_k_r2_reduce_pipeline;
+                use_reduce = YES;
+                reduce_shmem_floats = 16u;
+                reduce_threadgroups = MTLSizeMake((descriptor->out_dim + 3u) / 4u, (descriptor->rows + 1u) / 2u, 1);
+                reduce_threads = MTLSizeMake(64, 1, 1);
             } else {
                 pipeline = pipeline != nil ? pipeline : runtime->q6_k_pipeline;
             }
@@ -14819,6 +14846,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->antfly_q6_k_small_batch_bias_pipeline = termite_metal_make_pipeline(device, library, @"antfly_q6_k_small_batch_bias_msl_v1");
         runtime->antfly_q6_k_small_batch_bias_gelu_pipeline = termite_metal_make_pipeline(device, library, @"antfly_q6_k_small_batch_bias_gelu_msl_v1");
         runtime->q6_k_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_q6_k_linear_1x_reduce");
+        runtime->q6_k_r2_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_q6_k_linear_r2_reduce");
         runtime->q6_k_reduce_f16_input_pipeline = termite_metal_make_pipeline(device, library, @"termite_q6_k_linear_1x_reduce_in_f16");
         runtime->q6_k_pair_pipeline = termite_metal_make_pipeline(device, library, @"termite_q6_k_pair_linear");
         runtime->q8_k_pipeline = termite_metal_make_pipeline(device, library, @"termite_q8_k_linear");
@@ -15302,6 +15330,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->antfly_q6_k_small_batch_bias_pipeline = nil;
     runtime->antfly_q6_k_small_batch_bias_gelu_pipeline = nil;
     runtime->q6_k_reduce_pipeline = nil;
+    runtime->q6_k_r2_reduce_pipeline = nil;
     runtime->q6_k_reduce_f16_input_pipeline = nil;
     runtime->q6_k_pair_pipeline = nil;
     runtime->q8_k_pipeline = nil;
